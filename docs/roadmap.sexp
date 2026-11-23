@@ -101,7 +101,7 @@
    :rows (
      ("l2-profile" "Profile of where the batched path's 58 ms fixed cost goes")
      ("l2-spans" "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers")
-     ("l2-attention" "Attention per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span")
+     ("l2-attention" "Attention per span through the same kernels for every span length, so chunking never changes a token's numbers")
      ("l2-state" "Each lane's convolution state and cache written by its own span only")
      ("l2-sampling" "Per-lane sampling with one step in flight, seeded by the request")
      ("l2-gate-invariant" "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits")
@@ -120,11 +120,11 @@
      ("l2-gate-perf" "done" "t-l2-gate-perf")
    ))
   (:id "t-l2-profile" :type :task :title "Profile of where the batched path's 58 ms fixed cost goes" :state :done :evidence ("docs/DESIGN.md: Where the batched path's time goes"))
-  (:id "t-l2-spans" :type :task :title "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers" :state :todo)
-  (:id "t-l2-attention" :type :task :title "Attention per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span" :state :todo)
-  (:id "t-l2-state" :type :task :title "Each lane's convolution state and cache written by its own span only" :state :todo)
+  (:id "t-l2-spans" :type :task :title "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
+  (:id "t-l2-attention" :type :task :title "Attention per span through the same kernels for every span length, so chunking never changes a token's numbers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
+  (:id "t-l2-state" :type :task :title "Each lane's convolution state and cache written by its own span only" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
   (:id "t-l2-sampling" :type :task :title "Per-lane sampling with one step in flight, seeded by the request" :state :todo)
-  (:id "t-l2-gate-invariant" :type :task :title "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits" :state :todo)
+  (:id "t-l2-gate-invariant" :type :task :title "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
   (:id "t-l2-gate-reference" :type :task :title "Gate: agreement with llama.cpp as CI checks it" :state :todo)
   (:id "t-l2-gate-perf" :type :task :title "Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table" :state :todo)
   (:id "layer-3" :type :roadmap :title "Layer 3: block cache"
@@ -276,6 +276,7 @@
   (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :todo)
   (:id "later" :type :roadmap :title "After the first build"
    :rows (
+     ("later-attention" "One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill" :later t)
      ("later-fixed-cost" "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :later t)
      ("later-prefix-reads" "A shared prefix is read once per step for all lanes' queries" :later t)
      ("later-quality" "A quality replay: landed cards run again and compared with a reference route" :later t)
@@ -289,6 +290,7 @@
    )
    :columns (("done" "done"))
    :cells (
+     ("later-attention" "done" "t-later-attention")
      ("later-fixed-cost" "done" "t-later-fixed-cost")
      ("later-prefix-reads" "done" "t-later-prefix-reads")
      ("later-quality" "done" "t-later-quality")
@@ -300,6 +302,7 @@
      ("later-gpu-sampling" "done" "t-later-gpu-sampling")
      ("later-upstream" "done" "t-later-upstream")
    ))
+  (:id "t-later-attention" :type :task :title "One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill" :state :todo)
   (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :state :todo)
   (:id "t-later-prefix-reads" :type :task :title "A shared prefix is read once per step for all lanes' queries" :state :todo)
   (:id "t-later-quality" :type :task :title "A quality replay: landed cards run again and compared with a reference route" :state :todo)

@@ -80,14 +80,14 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 | feature | done |
 |---|:---:|
 | Profile of where the batched path's 58 ms fixed cost goes | ✅ |
-| One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ❌ |
-| Attention per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span | ❌ |
-| Each lane's convolution state and cache written by its own span only | ❌ |
+| One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ✅ |
+| Attention per span through the same kernels for every span length, so chunking never changes a token's numbers | ✅ |
+| Each lane's convolution state and cache written by its own span only | ✅ |
 | Per-lane sampling with one step in flight, seeded by the request | ❌ |
-| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ❌ |
+| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |
 | Gate: agreement with llama.cpp as CI checks it | ❌ |
 | Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ❌ |
-| complete | 12% |
+| complete | 62% |
 
 [Source data](roadmap.sexp)
 
@@ -222,6 +222,7 @@ Improvements that wait for the layers above. Those that change the model's numbe
 
 | feature | done |
 |---|:---:|
+| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
 | A shared prefix is read once per step for all lanes' queries (later) | ❌ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
