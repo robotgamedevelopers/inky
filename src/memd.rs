@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(lim.get(), 70000, "the next session saves the owner's newer limit afresh");
     }
     #[test] fn the_socket_directory_must_be_a_real_directory() {
-        let base = std::env::temp_dir().join(format!("inky-memd-dirtest-{}", std::process::id()));
+        let base = std::env::current_dir().unwrap().join(format!("inky-memd-dirtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         assert!(check_socket_dir(&base).is_ok(), "a real directory is accepted");

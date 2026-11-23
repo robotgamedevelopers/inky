@@ -12,9 +12,11 @@
 \* after a confirmed restore (the in-memory save is still cleared, so the next connect reads the owner's limit
 \* afresh; the stale file is overwritten by that connect's save). A starting helper whose restore fails seeds
 \* its in-memory save from the file, so its first connect restores the seeded limit instead of mistaking the
-\* still-raised limit for the found one. The owner changing the limit by hand is modelled only while no save is
-\* pending (none in memory, none on disk): a hand change racing a pending restore is outside the model, and the
-\* helper's saved value wins there by design until its restore is confirmed.
+\* still-raised limit for the found one. The owner changing the limit by hand is modelled while no restore is
+\* owed: a stale in-memory save left by a confirmed restore does not block it (the running helper's next connect
+\* is what overwrites it), while a hand change racing an owed restore, or one made while only the saved file
+\* remains, is outside the model — there the helper's saved value wins by design until its restore is confirmed
+\* or the next connect overwrites the file.
 EXTENDS Integers, FiniteSets
 NONE == -1     \* nothing saved
 CONSTANTS Clients, Values, Target, Bug
@@ -29,8 +31,9 @@ VARIABLES limit,      \* the OS setting iogpu.wired_limit_mb
 vars == <<limit, saved, disk, conns, alive, owed, owner>>
 Init == /\ limit \in Values /\ owner = limit /\ saved = NONE /\ disk = NONE /\ conns = {} /\ alive = TRUE /\ owed = FALSE
 
-\* the owner changes the limit by hand outside inky mode, while no save is pending
-OwnerSets(v) == alive /\ conns = {} /\ saved = NONE /\ disk = NONE /\ v \in Values /\ limit' = v /\ owner' = v /\ UNCHANGED <<saved, disk, conns, alive, owed>>
+\* the owner changes the limit by hand outside inky mode, while no restore is owed (a stale in-memory save
+\* does not block it; a save still owed, or one left only on disk, does — see the header)
+OwnerSets(v) == alive /\ conns = {} /\ ~owed /\ (saved # NONE \/ disk = NONE) /\ v \in Values /\ limit' = v /\ owner' = v /\ UNCHANGED <<saved, disk, conns, alive, owed>>
 Connect(c) == /\ alive /\ c \notin conns
               /\ IF conns # {} THEN /\ conns' = conns \cup {c} /\ UNCHANGED <<saved, limit, disk, owed>>
                  ELSE \/ \* admitted: the limit found (or the seeded save) is kept on disk, then the limit is raised
@@ -38,12 +41,24 @@ Connect(c) == /\ alive /\ c \notin conns
                          /\ saved' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN (IF Bug = "no_persist" THEN NONE ELSE limit) ELSE disk
                       \/ \* refused: the raise moved the limit and rolling it back failed too, so the save is kept
-                         \* with no clients, for the helper's exit paths (a raise that never moved the limit, a
-                         \* kept save that could not be written, and a successful rollback all end unchanged
-                         \* here and are not separate steps)
+                         \* with no clients, for the helper's exit paths
                          /\ conns' = {} /\ limit' = Target /\ owed' = TRUE
                          /\ saved' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN (IF Bug = "no_persist" THEN NONE ELSE limit) ELSE disk
+                      \/ \* refused and forgotten: the raise never moved the limit, or rolling it back is
+                         \* confirmed (the limit ends at the value found), so no client is counted and the
+                         \* save is forgotten — in memory always, on disk too unless forgetting it fails
+                         \* (a kept save that could not be written ends unchanged and is not a separate
+                         \* step). Modelled only while no restore is owed at entry; Bug "stale_saved"
+                         \* keeps the in-memory save when forgetting the file fails, as it does after a
+                         \* confirmed restore.
+                         /\ (saved = NONE \/ ~owed) /\ conns' = {} /\ owed' = FALSE
+                         /\ limit' = IF saved = NONE THEN limit ELSE saved
+                         /\ saved' = NONE /\ disk' = NONE
+                      \/ /\ (saved = NONE \/ ~owed) /\ conns' = {} /\ owed' = FALSE
+                         /\ limit' = IF saved = NONE THEN limit ELSE saved
+                         /\ disk' = IF saved = NONE THEN limit ELSE saved
+                         /\ saved' = IF Bug = "stale_saved" THEN (IF saved = NONE THEN limit ELSE saved) ELSE NONE
               /\ UNCHANGED <<alive, owner>>
 Close(c) == /\ alive /\ c \in conns /\ conns' = conns \ {c}
             /\ IF conns' # {} /\ Bug # "release_early"
@@ -77,7 +92,7 @@ RestoredWhenIdle == alive /\ conns = {} /\ saved = NONE /\ disk = NONE => limit 
 \* the limit found is on disk exactly while it is raised
 SavedIsOwner == alive /\ conns # {} => saved = owner /\ disk = owner
 \* a save held by a running helper is always a restore still owed; a save left behind by a confirmed
-\* restore (Bug "stale_saved") breaks this
+\* restore or a forgotten failed raise (Bug "stale_saved") breaks this
 SavedIsOwed == alive /\ saved # NONE => owed
 \* whatever happens, once the helper runs with no clients the owner's limit is back, or a restore of it is
 \* still pending in memory and has not been silently dropped
