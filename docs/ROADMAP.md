@@ -128,6 +128,8 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget | ❌ |
 | No Ready, Restoring or Queued lane is passed over more than W ticks | ❌ |
 | Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ❌ |
+| The memory budget read from Metal's recommended working set at start, never passed by hand | ❌ |
+| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ❌ |
 | Cancel in a step waits for the step's GPU work and disk I/O | ❌ |
 | Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ❌ |
 | Restoring reserves the whole working set atomically before reading | ❌ |

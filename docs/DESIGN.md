@@ -130,6 +130,15 @@ Liveness: every admitted lane finishes or is cancelled; every queued request is 
 
 The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
 
+## Inky mode: memory in, memory out
+
+The Mac goes in and out of inky mode. Starting inky gives the GPU the memory it needs; stopping inky gives it back.
+
+- **A one-time install, by the owner:** `sudo inky tune-memory` installs a small root LaunchDaemon. It does two things only: raise the GPU's wired-memory limit (`iogpu.wired_limit_mb`) and put it back. It accepts no other setting and runs nothing else. `sudo inky tune-memory --undo` removes it.
+- **Entering:** inky connects to the helper over a Unix socket only the owner's user can open. The helper records the limit it finds and raises it to a value sized from the Mac's memory (118000 MB on 128 GB, leaving about 13 GB for macOS).
+- **Leaving:** when inky's connection closes, the helper restores exactly the limit it found. A clean exit, a crash, `kill -9` or a sleep all close the connection, so the memory is always given back. With several inky processes, the limit is held while any is connected.
+- **Inside inky mode,** inky asks Metal for the recommended working set, subtracts the weights, scratch and a margin, and sizes lanes and admission from that. Nobody passes a memory budget by hand. Without the helper, inky runs inside the default limit and says, once, what installing it would give.
+
 ## Layers, bottom up
 
 Each is secured before the next starts.
