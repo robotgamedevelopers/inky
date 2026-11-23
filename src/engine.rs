@@ -1076,6 +1076,13 @@ impl Engine {
         Seg { w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, in_off, in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0, out_off, ..Default::default() }
     }
     #[inline]
+    /// `go` without the barrier: for dispatches that do not depend on each other (one per lane), followed by one barrier
+    fn go_nb<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
+        if self.skip.get() & (1 << cls) != 0 { return; }
+        e.pso(&self.gpu.pso(pso));
+        e.bytes(args, 5);
+        e.dispatch(grid, tg);
+    }
     fn go<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
         if self.skip.get() & (1 << cls) != 0 { return; }
         e.pso(&self.gpu.pso(pso));
@@ -1451,30 +1458,46 @@ impl Engine {
     /// preparation and cache writes, attention, the convolutions and their state) runs span by span with that lane's
     /// buffers bound. Optionally computes each span's logits (and argmax, written to the lane's tokens) for its last row:
     /// in the decode arena for a single span (`logits()`), in the batch arena for several (`span_logits`).
-    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
+    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false); }
+    /// Encode one decode step: one token for each lane in `spans` (every span has t = 1). Row-wise work runs through the
+    /// batched tensor path as in `encode_spans`; each lane's attention is the decode path's fused kernel (K/V conv, cache
+    /// write, split-K attention over its own cache). A decode step's arithmetic is its own: a token's numbers depend
+    /// neither on the other lanes in the step nor on how many there are, but differ from a prefill row's, so cache
+    /// blocks written by decode steps are never shared (docs/DESIGN.md).
+    pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
+        assert!(spans.iter().all(|s| s.t == 1));
+        self.encode_spans_x(cb, spans, logits, argmax, true);
+    }
+    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool) {
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
         let t: usize = spans.iter().map(|s| s.t).sum();
         for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
+        assert!(!dec || (self.hgemm && 2 * spans.len() <= self.ba.get().cap), "a decode step needs the fp16 path and room for f32 queries");
+        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
+                "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         let mut row0 = Vec::with_capacity(spans.len());
         { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
         let e = Enc::new(cb);
         self.bind_eng(&e);
         self.bind_lane(&e, spans[0].lane);
-        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero
-        let bz = self.ba.get();
-        let zr = [bz.sk, bz.perm - bz.sk];
-        e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
-        e.barrier();
+        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step does not use it)
+        if !dec {
+            let bz = self.ba.get();
+            let zr = [bz.sk, bz.perm - bz.sk];
+            e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
+            e.barrier();
+        }
         let b = self.ba.get();
         for (si, sp) in spans.iter().enumerate() {
             let r0 = (row0[si] * E) as u32;
             let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
                                  norm_off: self.tok_norm, out0: b.vec(0) + r0, out1: b.vec(0) + r0, tok_index: sp.p0 as u32, eps: self.eps };
             e.buf(&sp.lane.toks, 0, 6);
-            self.go(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
+            self.go_nb(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
         }
+        e.barrier();
         // Last layer: nothing after the batch reads its outputs except the final token (logits) and the conv states (last 3
         // rows of the two branch outputs). It is a full-attention layer, so K/V still cover every token, but queries, attention,
         // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
@@ -1483,7 +1506,7 @@ impl Engine {
         let mut va = VecAlloc { next: 1, n: B_NVEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
-        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
@@ -1491,10 +1514,10 @@ impl Engine {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
+            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         if logits {
             let ar = self.ar;
             for (si, sp) in spans.iter().enumerate() {
@@ -1518,7 +1541,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
                msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
         let l = &self.layers[ip];
         let b = self.ba.get();
@@ -1576,7 +1599,7 @@ impl Engine {
             let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
                               Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
             // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
-            if hatt && qgh { hq[0].hout = 1; hq[1].hout = 1; }
+            if hatt && qgh && !dec { hq[0].hout = 1; hq[1].hout = 1; }     // a decode step keeps them f32 for k_attn
             let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
             if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
             if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
@@ -1594,7 +1617,47 @@ impl Engine {
         // the next span: every dispatch ends with a barrier), and the ring (exactly one window) only receives the last window
         // of keys. Full layers address their cache directly.
         let scap = (EXT + b.cap + 2 * KGUARD) as u32;
+        if dec {
+            // a decode step: each lane's token through the decode path's fused attention (K/V conv from the lane's state,
+            // cache write, split-K attention over the lane's cache, combine + output gate), into qp as f32 rows. The lanes'
+            // attention dispatches are independent (own cache, state, rows and split partials): no barrier between them.
+            let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
+            for (si, sp) in spans.iter().enumerate() {
+                let run = self.on(sp.lane);
+                let (pos, r0) = (sp.p0, row0[si]);
+                self.bind_lane(e, sp.lane);
+                let (kb, vb, kcap) = run.kv_slot(slot);
+                let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+                let ar = self.ar;
+                let base = AttnArgs {
+                    pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
+                    q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
+                    r_off: b.rel + (r0 * NH * NREL) as u32, sink_off: b.sink + (r0 * NH) as u32,
+                    kdyn_off: if l.swa { -1 } else { (b.kdyn + (r0 * 32) as u32) as i32 }, vdyn_off: if l.swa { -1 } else { (b.vdyn + (r0 * 32) as u32) as i32 },
+                    part_off: self.dstart.get() + si as u32 * ar.total + ar.part, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
+                    ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
+                    ..Default::default()
+                };
+                run.bind_kv(e, l.swa);
+                let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
+                let kps = Run::split_kps(nkeys);
+                let nsplit = nkeys.div_ceil(kps);
+                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                                    pad: self.sep_comb as u32, ..base };
+                assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
+                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
+            }
+            e.barrier();
+            for ca in &combs { self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128); }
+            e.barrier();
+            e.buf(&self.act.borrow(), 0, 3);
+            // f32 attention outputs -> the half rows the output projection reads
+            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+            e.barrier();
+        }
         for (si, sp) in spans.iter().enumerate() {
+        if dec { break; }
         let run = self.on(sp.lane);
         let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
         let tt = t as u32;
@@ -1661,15 +1724,21 @@ impl Engine {
         let mid = va.alloc(&live);
         // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
         // post-conv and its state: span by span (the convolution runs along each lane's own rows, from its own state)
+        // (each span's convolution reads its lane's state before the state update overwrites it; spans are independent)
         for (si, sp) in spans.iter().enumerate() {
             let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
             e.buf(&sp.lane.cs, 0, 4);
             let cv = ConvBArgs { y_off: b.wo_y + q0, ldy: es, res_off: vo(cur) + q0, out_off: vo(mid) + q0, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
                                  convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
-            self.go(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
-            let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-            self.go(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
         }
+        e.barrier();
+        for (si, sp) in spans.iter().enumerate() {
+            e.buf(&sp.lane.cs, 0, 4);
+            let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+        }
+        e.barrier();
         if block_start { blocks.push(cur); }
         // ---- FFN input
         let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect(); st.push(sh(vo(mid), E));
@@ -1758,10 +1827,15 @@ impl Engine {
             e.buf(&sp.lane.cs, 0, 4);
             let cv = ConvBArgs { y_off: b.ffn_y + q0, ldy: es, res_off: vo(mid) + q0, out_off: vo(out) + q0, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
                                  convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
-            self.go(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
-            let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-            self.go(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
         }
+        e.barrier();
+        for (si, sp) in spans.iter().enumerate() {
+            e.buf(&sp.lane.cs, 0, 4);
+            let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+        }
+        e.barrier();
         out
     }
 

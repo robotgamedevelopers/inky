@@ -448,10 +448,11 @@ fn lanebench(o: &Opts) {
             for q in 0..=steps { t[c + q] = base[(97 * i + q) % base.len()]; }
             r.set_tokens(0, &t); eng.copy_lane(&src, &l); l
         }).collect();
+        eng.ensure_dbatch(nmax);
         for &n in &counts {
             // a warm-up step, then the timed steps: lanes decode positions c, c + 1, ... (the context grows by `steps` at most)
             let step = |q: usize| { let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
-                                    let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted(); };
+                                    let cb = eng.gpu.cmd(); if std::env::var("INK_SPANS_DEC").is_ok() { eng.encode_spans(&cb, &sp, true, false) } else { eng.encode_decode(&cb, &sp, true, false) }; cb.commit(); cb.waitUntilCompleted(); };
             step(0);
             let t0 = std::time::Instant::now();
             for q in 0..steps { step(q); }
@@ -467,10 +468,13 @@ fn lanebench(o: &Opts) {
 /// INK_PF tokens, then INK_DECODE decode steps, twice: each lane alone through the single-stream decode path, and all
 /// lanes together through `encode_dbatch`. Every lane's logits at every step and its final cache and convolution rows
 /// must be bit-identical; the time per step of both is printed. INK_LANES lists the lane counts.
+/// lanes the decode-batch gate can use
+const MAX_SPANS_DB: usize = 128;
 fn dbatch(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(MAX_SPANS_DB);
     let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
     let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
     let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
@@ -484,13 +488,17 @@ fn dbatch(o: &Opts) {
         l
     };
     let nmax = *counts.iter().max().unwrap();
+    // INK_DB_OLD: the decode-path batch (encode_dbatch) against the single-stream decode path; otherwise decode steps
+    // (encode_decode) of N lanes against each lane's decode steps alone
+    let old = std::env::var("INK_DB_OLD").is_ok();
     // dev: INK_DB_PROF=1 times the batch with each kernel class skipped in turn (results then differ; timing only)
     if std::env::var("INK_DB_PROF").is_ok() {
         for &n in &counts {
             let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
             eng.ensure_dbatch(n);
             let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf)).collect();
-            let time = |skip: u32| { eng.skip.set(skip); let mut best = f64::MAX; for _ in 0..3 { let cb = eng.gpu.cmd(); eng.encode_dbatch(&cb, &b, true); cb.commit(); cb.waitUntilCompleted();
+            let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect();
+            let time = |skip: u32| { eng.skip.set(skip); let mut best = f64::MAX; for _ in 0..3 { let cb = eng.gpu.cmd(); if old { eng.encode_dbatch(&cb, &b, true); } else { eng.encode_decode(&cb, &sp, true, false); } cb.commit(); cb.waitUntilCompleted();
                 best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3); } eng.skip.set(0); best };
             let full = time(0);
             println!("{n} lanes: {full:.1} ms GPU per step");
@@ -505,12 +513,16 @@ fn dbatch(o: &Opts) {
         let l = prefilled(i); let r = eng.on(&l);
         let mut hs = Vec::new();
         let t0 = std::time::Instant::now();
-        for q in 0..nd { let cb = eng.gpu.cmd(); r.encode_step(&cb, pf + q, true, false); cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(eng.logits())); }
+        for q in 0..nd {
+            let cb = eng.gpu.cmd();
+            if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
+            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(eng.logits()));
+        }
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
     }
     let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
-    println!("alone (decode path): {ms_alone:.1} ms/token, {:.0} tok/s", 1e3 / ms_alone);
+    println!("alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s", if old { "decode path" } else { "decode steps of one lane" }, 1e3 / ms_alone);
     let mut ok = true;
     for &n in &counts {
         let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
@@ -519,8 +531,10 @@ fn dbatch(o: &Opts) {
         let t0 = std::time::Instant::now();
         for q in 0..nd {
             let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
-            let cb = eng.gpu.cmd(); eng.encode_dbatch(&cb, &b, true); cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(eng.dbatch_logits(j))); }
+            let cb = eng.gpu.cmd();
+            if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
+            cb.commit(); cb.waitUntilCompleted();
+            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else if n == 1 { eng.logits() } else { eng.span_logits(j) })); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
