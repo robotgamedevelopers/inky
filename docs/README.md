@@ -23,7 +23,7 @@ INKY_API_KEY=... inky serve --bind 0.0.0.0:8090 --key-env INKY_API_KEY --lanes 1
 | `--effort E` | medium | thinking effort when a request does not set `reasoning_effort` |
 | `-n MAX` | 16384 | most tokens per reply when a request does not set `max_tokens` |
 
-Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new.
+Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. That kept prompt may also start another lane: when the lane holding it is busy, a free lane copies its prefill-written prefix and the prompt-end convolution state and prefills only the suffix (`inky xcopy` gates that the copy is bit-identical to a cold prefill; a partial overlap with a kept prompt still starts cold, because the state exists only at a prompt's end).
 
 **As a nova-worker provider.** The worker's key proxy takes the endpoint and the key's name, and the harness reaches inky through it:
 

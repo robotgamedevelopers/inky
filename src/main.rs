@@ -441,6 +441,66 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
+/// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
+/// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
+/// same logits at every shared boundary and decode step, and the same cache and convolution rows at the end,
+/// with the scratch poisoned before every step. Two tails share the one head. The copy must not move the
+/// source. INK_XCOPY_SABOTAGE=1 is the reversed witness: it copies one head token too few while the tail
+/// still starts at the head's end, and the gate must then fail (tests/ci.sh requires that failure).
+fn xcopy(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(2);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let (head, tail, ndec) = (384usize, 256usize, 8usize);
+    assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
+    let mut rot = base.clone(); rot.rotate_left(997);
+    let stream = |which: usize| -> Vec<u32> { let mut v: Vec<u32> = base[..head].to_vec(); v.extend_from_slice(if which == 0 { &base[head..head + tail + ndec] } else { &rot[head..head + tail + ndec] }); v };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let sabotage = std::env::var("INK_XCOPY_SABOTAGE").is_ok();
+    let step = |lane: &Lane, p0: usize, t: usize, dec: bool| -> u64 {
+        eng.poison_scratch();
+        let cb = eng.gpu.cmd();
+        if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
+        cb.commit(); cb.waitUntilCompleted();
+        fnv(if dec { eng.span_logits(0) } else { eng.logits() })
+    };
+    let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
+        let mut hs = Vec::new(); let mut p = from;
+        for &t in chunks { hs.push((p + t, step(lane, p, t, false))); p += t; }
+        let mut ds = Vec::new();
+        if decode { for q in 0..ndec { ds.push(step(lane, head + tail + q, 1, true)); } }
+        (hs, ds)
+    };
+    // cold: head and tail prefilled on one lane, split at 101, 384 and 640
+    let cold = |which: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(which));
+                                let out = run_stream(&l, &[101, 283, 256], 0, true); (l, out) };
+    // the source: the shared head alone, split at 101 and 384; its state at the head's end is kept
+    let src = Lane::new(&eng);
+    { let r = eng.on(&src); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(0)[..head]); run_stream(&src, &[101, 283], 0, false); }
+    let cs_head = eng.on(&src).get_cs();
+    let src_before = eng.lane_hash(&src);
+    let mut ok = true;
+    for which in 0..2 {
+        let (cl, (chs, cds)) = cold(which);
+        let l = Lane::new(&eng); let r = eng.on(&l);
+        r.reset(); r.reserve(head + tail + ndec + 1, false);
+        eng.copy_lane_prefix(&src, &l, if sabotage { head - 1 } else { head });
+        r.set_cs(&cs_head); r.set_tokens(0, &stream(which));
+        let (hs, ds) = run_stream(&l, &[63, 193], head, true);
+        let at = |v: &[(usize, u64)], p: usize| v.iter().find(|(q, _)| *q == p).map(|(_, h)| *h);
+        let same = at(&hs, head + tail) == at(&chs, head + tail) && ds == cds && eng.lane_hash(&l) == eng.lane_hash(&cl);
+        println!("tail {}: copied head {} + tail {} {} cold (logits at {}, decode steps, final state)", which, head, tail, if same { "matches" } else { "DIFFERS from" }, head + tail);
+        ok &= same;
+    }
+    if eng.lane_hash(&src) != src_before { println!("the copy moved the source lane"); ok = false; }
+    if sabotage { println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head); }
+    println!("{}", if ok { "xcopy lossless: two tails from one copied head match cold prefill bit for bit" } else { "XCOPY NOT LOSSLESS" });
+    if !ok { std::process::exit(1); }
+}
+
 /// dev, layer 2's performance gate: decode steps over N lanes at a given context. Each context is prefilled once (the
 /// --ref tokens repeated) and copied into every lane; lane i then decodes its own stream (the --ref tokens rotated by
 /// 97 i), so routing differs across lanes as it would in use. INK_CTXS and INK_LANES list what to measure.
@@ -845,6 +905,7 @@ fn main() {
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
+        "xcopy" => xcopy(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "maxctx" => maxctx(&o),
