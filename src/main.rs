@@ -15,9 +15,9 @@ use tokenizer::Tokenizer;
 
 const DEFAULT_MODEL: &str = "~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf";
 
-const USAGE: &str = "inkling - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
+const USAGE: &str = "inky - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
 
-usage: inkling <command> [options]
+usage: inky <command> [options]
 
 commands:
   chat              interactive multi-turn chat (KV cache reused across turns)
@@ -117,7 +117,7 @@ fn run(o: &Opts) {
     sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
     r.end(&mut out);
     let s = sess.stats;
-    eprintln!("\n[inkling] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
+    eprintln!("\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
               s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, s.gen_tokens as f64 / s.gen_time.as_secs_f64(),
               if sampler.greedy() { " (greedy)" } else { "" }, kv_note(sess.run(), sess.n_past), sess.n_past);
 }
@@ -129,7 +129,7 @@ fn chat(o: &Opts) {
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    eprintln!("[inkling] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
+    eprintln!("[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
               o.effort, if sampler.greedy() { "greedy".to_string() } else { format!("temp {}", o.temp) });
     let mut turn = 0;
     loop {
@@ -291,6 +291,70 @@ fn binv(o: &Opts) {
         println!("split at {k:5}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
+/// each lane exactly the logits it gives alone. Lane A is the --ref tokens, lane B the same tokens rotated by a third (a
+/// different stream of the same length). Each lane prefills its first INK_PF tokens in chunks of INK_LANE_CHUNK, then
+/// decodes the rest one step at a time.
+fn lanes(o: &Opts) {
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let a: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let mut b = a.clone(); b.rotate_left(a.len() / 3);
+    let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000).min(a.len() - 1);
+    let ch: usize = std::env::var("INK_LANE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    // the work of one lane as a list of (p0, t): prefill chunks, then single decode steps
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let mut p = 0; while p < pf { let t = (pf - p).min(ch); work.push((p, t)); p += t; }
+    for p in pf..a.len() { work.push((p, 1)); }
+    let poison = std::env::var("INK_NO_POISON").is_err();
+    let hash_step = |run: &engine::Run, (p0, t): (usize, usize), h: &mut u64| {
+        if poison { run.poison_scratch(); }
+        let cb = run.gpu.cmd();
+        if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
+        cb.commit(); cb.waitUntilCompleted();
+        for x in run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+    };
+    // per-step hashes, to name the first step where two runs part
+    let trace = |run: &engine::Run, toks: &[u32], other: Option<&engine::Run>| -> Vec<u64> {
+        let mut v = Vec::new();
+        for &w in &work {
+            if let Some(o) = other { let mut x = 0u64; hash_step(o, w, &mut x); }
+            let mut h = 0xcbf29ce484222325u64; hash_step(run, w, &mut h); v.push(h);
+        }
+        let _ = toks; v
+    };
+    let alone = |toks: &[u32]| -> u64 {
+        let lane = Lane::new(&eng); let run = eng.on(&lane);
+        run.reserve(toks.len() + 1, false); run.set_tokens(0, toks);
+        let mut h = 0xcbf29ce484222325u64;
+        for &w in &work { hash_step(&run, w, &mut h); }
+        h
+    };
+    if std::env::var("INK_ARENA_MAP").is_ok() { println!("{}", eng.arena_map()); }
+    let (ha, hb) = (alone(&a), alone(&b));
+    let (la, lb) = (Lane::new(&eng), Lane::new(&eng));
+    let (ra, rb) = (eng.on(&la), eng.on(&lb));
+    for (r, t) in [(&ra, &a), (&rb, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+    let (mut ia, mut ib) = (0xcbf29ce484222325u64, 0xcbf29ce484222325u64);
+    for &w in &work { hash_step(&ra, w, &mut ia); hash_step(&rb, w, &mut ib); }
+    if std::env::var("INK_LANE_TRACE").is_ok() {
+        let (l1, l2, l3) = (Lane::new(&eng), Lane::new(&eng), Lane::new(&eng));
+        let (r1, r2, r3) = (eng.on(&l1), eng.on(&l2), eng.on(&l3));
+        for (r, t) in [(&r1, &a), (&r2, &a), (&r3, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+        let solo = trace(&r1, &a, None);
+        let mixed = trace(&r2, &a, Some(&r3));
+        match solo.iter().zip(&mixed).position(|(x, y)| x != y) {
+            Some(i) => println!("first difference at step {i}: work {:?} ({} steps)", work[i], work.len()),
+            None => println!("per-step traces agree"),
+        }
+    }
+    println!("lane A alone {ha:016x} interleaved {ia:016x} {}", if ha == ia { "same" } else { "DIFFERENT" });
+    println!("lane B alone {hb:016x} interleaved {ib:016x} {}", if hb == ib { "same" } else { "DIFFERENT" });
+    let ok = ha == ia && hb == ib && ha != hb;
+    println!("{}", if ok { "lanes independent: interleaved and poisoned, each lane gives exactly its own logits" } else { "LANES NOT INDEPENDENT" });
     if !ok { std::process::exit(1); }
 }
 
@@ -465,6 +529,7 @@ fn main() {
     match cmd.as_str() {
         "check" => check(&o),
         "binv" => binv(&o),
+        "lanes" => lanes(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),

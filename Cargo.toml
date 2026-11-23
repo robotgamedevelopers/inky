@@ -1,5 +1,5 @@
 [package]
-name = "inkling"
+name = "inky"
 version = "0.1.0"
 edition = "2021"
 description = "Hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini (inkling2_loop)"

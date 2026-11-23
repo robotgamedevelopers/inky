@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "inkling"
+name = "inky"
 version = "0.1.0"
 dependencies = [
  "block2",

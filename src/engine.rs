@@ -83,7 +83,7 @@ pub const KERNELS: &[&str] = &[
     "k_embed", "k_mix", "k_mv", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -193,7 +193,7 @@ struct AttnBArgs { t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u3
 struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_off: u32, sv_off: u32, scap: u32, kpos0: i32, to_ring: u32, pad: [u32; 2] }
 
 /// batch (prefill) arena: per-token activation arrays [T][dim], f32 offsets into the same arena buffer
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct BArena {
     vec0: u32, q: u32, gate: u32, k: u32, v: u32, rel: u32, sink: u32, kdyn: u32, vdyn: u32, qp: u32, rp: u32, attn_g: u32,
     inp: [u32; 3], msg: [u32; 4], cin: [u32; 3], fin: u32, finc: u32, ctrlg: [u32; 4],
@@ -297,6 +297,7 @@ impl Pb {
 
 // ----------------------------------------------------------------------------- activation arena (f32 offsets)
 #[derive(Clone, Copy)]
+#[derive(Debug)]
 pub struct Arena {
     pub q: u32, pub gate: u32, pub k: u32, pub v: u32, pub rel: u32, pub sink: u32, pub kdyn: u32, pub vdyn: u32,
     pub attn_g: u32, pub inp: [u32; 3], pub msg: [u32; 4], pub cin: [u32; 3], pub ctrlg: [u32; 4], pub ssp: [u32; 4],
@@ -397,7 +398,7 @@ impl Lane {
         let gpu = &eng.gpu;
         let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
             assert!(!eng.kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
-            let path = std::env::temp_dir().join(format!("inkling-kv-{}-{}.bin", std::process::id(), LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let path = std::env::temp_dir().join(format!("inky-kv-{}-{}.bin", std::process::id(), LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
             let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
             // uncached I/O: the point of the file is that its contents are NOT in memory
             unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1); }
@@ -533,7 +534,7 @@ impl Engine {
         }
         assert!(n_full * 2 * NKV * max_ctx * HD < u32::MAX as usize, "KV cache too large for 32-bit offsets");
         let ctr = gpu.buffer(4096 * 4);
-        eprintln!("[inkling] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
+        eprintln!("[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
         let eng = Engine {
             eps: g.f(&a("attention.layer_norm_rms_epsilon")) as f32,
@@ -558,7 +559,7 @@ impl Engine {
         let ok = !eng.hgemm || eng.layout_ok();
         eng.release_batch();
         if !ok {
-            eprintln!("[inkling] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
+            eprintln!("[inky] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
             eng.hgemm = false;
         }
         if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
@@ -750,7 +751,7 @@ impl Engine {
             off += chunk;
         }
         e.end(); cb.commit(); cb.waitUntilCompleted();
-        eprintln!("[inkling] warmed {:.1} GiB of weights in {:.0?}", self.g.file_len as f64 / (1u64 << 30) as f64, t0.elapsed());
+        eprintln!("[inky] warmed {:.1} GiB of weights in {:.0?}", self.g.file_len as f64 / (1u64 << 30) as f64, t0.elapsed());
     }
 
     /// raw GPU read bandwidth over the mapped weights
@@ -977,6 +978,17 @@ impl Engine {
         best
     }
 
+    /// dev: overwrite the scratch arenas (decode and batch) with NaN in both f32 and fp16 readings, so a result that still
+    /// depends on what a previous step left there shows. The counters are not touched: their kernels leave them at zero.
+    pub fn arena_map(&self) -> String { format!("{:?}\nbatch {:?}", self.ar, self.ba.get()) }
+    pub fn poison_scratch(&self) {
+        let a = self.act.borrow();
+        let p = a.contents().as_ptr() as *mut u32;
+        // dev: INK_POISON_RANGE=lo,hi poisons only words [lo, hi), to find a region that is read before it is written
+        let (lo, hi) = std::env::var("INK_POISON_RANGE").ok().and_then(|v| v.split_once(',').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())))
+            .unwrap_or((0usize, usize::MAX));
+        for i in lo..hi.min(a.length() / 4) { unsafe { *p.add(i) = 0x7fc0_7fc0; } }
+    }
     /// bind the engine's buffers: weights, parameters, scratch arenas, counters
     fn bind_eng(&self, e: &Enc) {
         e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.ctr, 0, 7);
@@ -1485,7 +1497,7 @@ impl<'a> Run<'a> {
             } else {
                 // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
                 // keys, summed in a different grouping
-                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inkling] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
+                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inky] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
                 let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
                 let (mut c, mut sp) = (w0, 0usize);
                 while c < lo {
@@ -1959,6 +1971,11 @@ impl<'a> Run<'a> {
         assert!(t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         let e = Enc::new(cb);
         self.bind(&e);
+        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero
+        let bz = self.ba.get();
+        let zr = [bz.sk, bz.perm - bz.sk];
+        e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
+        e.barrier();
         let b = self.ba.get();
         let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
                              norm_off: self.tok_norm, out0: b.vec(0), out1: b.vec(0), tok_index: p0 as u32, eps: self.eps };

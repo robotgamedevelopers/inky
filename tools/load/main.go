@@ -40,7 +40,7 @@ func main() {
 			for k := 0; k < *pad; k++ {
 				p = fmt.Sprintf("Background note %d-%d: the system under discussion handles requests in a loop, validates each input, and logs every refusal with its reason.\n", i, k) + p
 			}
-			body, _ := json.Marshal(map[string]any{"model": "inkling", "max_tokens": *predict, "temperature": 0.7, "reasoning_effort": "none",
+			body, _ := json.Marshal(map[string]any{"model": "inky", "max_tokens": *predict, "temperature": 0.7, "reasoning_effort": "none",
 				"messages": []map[string]string{{"role": "user", "content": p}}})
 			r, err := http.Post(*url, "application/json", bytes.NewReader(body))
 			if err != nil {
