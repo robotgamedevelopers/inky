@@ -1,0 +1,10 @@
+decode haiku         546384f34e0a1858
+decode long          d762d9d1b44353ad
+prefill+decode long  24afc330c170f131
+kv8 decode haiku     edf7850c8e032467
+kv-disk decode long  089de01b2b8f6206
+binv long            7 splits same
+run greedy           e732eb2bbfa78d2e
+run sampled          a086e77c34bfea5c
+chat two turns       d6e0b347dbf526b3
+lanes long           lanes independent: interleaved and poisoned, each lane gives exactly its own logits

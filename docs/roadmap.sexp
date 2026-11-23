@@ -94,7 +94,7 @@
      ("l1-lane" "done" "t-l1-lane")
      ("l1-gate" "done" "t-l1-gate")
    ))
-  (:id "t-l1-ci" :type :task :title "Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change" :state :todo)
+  (:id "t-l1-ci" :type :task :title "Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change" :state :done :evidence (".github/workflows/ci.yml" "tests/ci.sh"))
   (:id "t-l1-lane" :type :task :title "A lane owns its state (cache, convolution rows, loop-controller state, position); the engine owns only the weights" :state :done :evidence ("src/engine.rs: Lane, Run" "src/session.rs: Session owns its lane"))
   (:id "t-l1-gate" :type :task :title "Gate: one lane's logit hash is identical to the unmodified engine" :state :done :evidence ("tests/golden.sh: nine scenarios byte-identical before and after, M5 Max" "src/main.rs: lanes (two lanes interleaved, scratch poisoned at every switch)"))
   (:id "layer-2" :type :roadmap :title "Layer 2: batched step over spans"
