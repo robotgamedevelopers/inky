@@ -17,20 +17,21 @@ One process on one Apple silicon machine serves Inkling 2 Mini to many low-prior
 
 The card took 62 turns and 7 min 38 s: 345 s generating (20,118 tokens), 63 s prefill, about 50 s in tools. The context reached 64K. Six turns missed the cache and prefilled again from the start, which was 60 of the 63 prefill seconds. The harness prefix (system prompt and tool declarations) is about 9,300 tokens and is the same for every card.
 
-The batched path fits **58 ms + 0.21 ms per token**. A decode step for B lanes is that pass with one token per lane, plus each lane's own cache read. So the calibrated step time is
+The batched path fits **58 ms + 0.21 ms per token**. A decode step for B lanes is that pass with one token per lane, plus each lane's own cache read. A lane reads its whole cache for every token: 160 MiB of window keys once it is past 1024 tokens, plus 32 KiB per token of context. Single-stream decode slows from 9.4 ms to 13.3 ms between a short context and 20K, so today's attention reads the cache at about 210 GB/s, not at the bus's 565. The calibrated step time is
 
-    step(B) = 58 ms + B x (0.21 ms + lane cache bytes / 565 GB/s)
+    step(B) = 58 ms + B x (0.21 ms + lane cache bytes / 210 GB/s)
 
-| active lanes | total tok/s at 20K context | per lane | with 8-bit cache | per lane |
-|---:|---:|---:|---:|---:|
-| 1 (today's decode path) | 75 | 75 | | |
-| 16 | 210 | 13 | 240 | 15 |
-| 32 | 340 | 10.7 | 400 | 12.6 |
-| 64 | 500 | 7.8 | 640 | 10 |
-| 128 | 640 | 5.0 | 900 | 7 |
-| limit | 910 | | 1500 | |
+| active lanes | total tok/s at 2K context | at 20K | at 42K |
+|---:|---:|---:|---:|
+| 1 (today's decode path) | 96 | 75 | 58 |
+| 16 | 200 | 130 | 90 |
+| 32 | 320 | 170 | 107 |
+| 64 | 450 | 200 | 119 |
+| 128 | 560 | 220 | 125 |
 
-These replace the earlier bandwidth-only estimates, which were too high below 64 lanes. About half of the 58 ms can be removed (see "Where the batched path's time goes"). The knee is near 64 active lanes.
+The tracer card ran at about 42K on average. So lanes pay well at short context and little at long context: the per-lane cache read is the limit, not the weights. A first version of this table assumed the cache was read at 565 GB/s and left the shared prefix out of each lane's reads; the cold read caught both. The table still leaves out the output layer and sampling for B tokens, which the calibration ran for one.
+
+What moves the long-context numbers, in order: reading a shared prefix once per step, an attention kernel for many lanes that reads the cache near bus speed, the 8-bit cache, far-key pruning, and keeping card contexts short. With the first two, 64 lanes at 42K come to about 290 tok/s; with the 8-bit cache as well, about 450.
 
 ### Baseline: llama.cpp's own batching
 
@@ -41,7 +42,7 @@ llama-server (master 44d5087, Metal, 64 parallel slots, short prompts, 256 token
 | total tok/s | 41 | 62 | 100 | 142 | 155 | 194 | 215 |
 | per stream | 41 | 34 | 27 | 19 | 10 | 6.4 | 3.6 |
 
-It flattens near 200 tok/s, about twice one inky stream. inky's batched path, at 58 ms + 0.21 ms per token, would give about 260, 490 and 900 tok/s at 16, 32 and 64 lanes at the same short context. That is an estimate from timing one sequence's tokens, not a built decode step. So llama.cpp's batching is not close enough to build on; the engine work is needed.
+It flattens near 200 tok/s, about twice one inky stream. inky's batched path, at 58 ms + 0.21 ms per token, would give about 240, 430 and 710 tok/s at 16, 32 and 64 lanes at the same short context. That is an estimate from timing one sequence's tokens, not a built decode step. So llama.cpp's batching is not close enough to build on; the engine work is needed.
 
 ### Where the batched path's time goes
 
@@ -58,6 +59,36 @@ So the 58 ms is not a fixed overhead. It is the experts a batch touches, read by
 ### Batch invariance
 
 `inkling binv` prefills the same tokens split at different points and hashes the final logits. A split moves every later token to a different batch, tile slot and set of neighbours. On two prompts (2403 and 61 tokens), every split gives bit-identical logits, at chunk sizes from 64 to 4096. The check found one bug: a batch of exactly one token went to the decode kernel with batch-layout arguments and gave wrong, non-repeatable logits (fixed in `mix_t`). Upstream never sends a one-token batch; a lane decoding alone would.
+
+## Findings from the cold read, to fold in before layer 2
+
+A second reader read this page and the code cold on 2026-11-22. These findings are accepted or still to be verified; none is folded into the sections below yet, so where they disagree with the text, they win.
+
+Accepted:
+
+- **A prefix is a start point only while its window blocks are kept.** A new request starting at boundary k needs the recurrent state at k, every full block before it, and the window blocks covering the 1024 positions before it. Releasing a shared prefix's window blocks when its lanes move on leaves a prefix nothing can start from.
+- **The recurrent state at a boundary is 3.66 MiB**, larger than a 2 MiB full block. It cannot be stored at every boundary: keep it at lane heads, turn ends and a sparse stride.
+- **A prefill span of C tokens pins up to ceil((1023 + C) / 64) + 1 window blocks**, not 17.
+- **Worst-case admission bounds the lane count.** A 64K lane holds about 1.9 GiB, so 64 worst-case lanes do not fit in 128 GB; about 42 to 52 do.
+- **Cache offsets are 32-bit** in the kernels, which caps one cache buffer at 8 GiB. Blocks need 64-bit or per-block addressing before layer 3.
+- **Cancel during a step must wait for the step.** Command buffers do not retain their buffers, so a block released while the GPU or the disk is still using it is a write after free. A lane goes InStep, Cancelling, then Cancelled when the step ends.
+- **Park lazily, under memory pressure.** Writing a lane's blocks to the SSD on every tool wait would write on the order of a gigabyte a second across 64 cards.
+- **Restoring needs an atomic reservation**, or two lanes restoring at once can each hold half the memory and neither can finish. Blocks shared only by parked lanes must be spillable too, and the bypass bound must cover parked and queued lanes, not only ready ones.
+- **The cache and the scheduler are one model for these properties.** The window hole, the cancel fence and the restore deadlock each cross the line between BlockCache and LaneScheduler. Liveness is checked by TLC on the model; trace checking binds the code to its safety properties only.
+- **An unsealed tail block stays private**, is zero-filled past its length, and is dropped at finish, never sealed short.
+- **The thinking tokens of earlier turns must round-trip without a content-keyed map.** The tracer keyed generated tokens by the visible text and tool calls; two turns with the same empty text and the same tool call collide, and the map is lost on restart. This is the likely cause of some of the tracer's cache misses. Settle the protocol before layer 3.
+- **Layers 4 and 5 are one layer.** Admission cannot be exercised without parking and restoring.
+- **A performance and memory gate at 20K and 42K context belongs right after layer 2**, before the cache is built on it.
+- **Grouping by the previous token's experts saves nothing when every ready lane steps**, and needs a pool larger than the batch, which costs memory.
+
+To verify (claims from reading the code, not yet measured here):
+
+- Expert routing packs tokens with an atomic counter, which could make results depend on thread timing when one expert has more than 128 tokens. `binv` has been repeatable across runs so far.
+- Kernel variants switch at 64 tokens per batch and per expert; attention's position handling could depend on chunk offsets. `binv` passes at splits of 1, 5, 23, 100 and 1001, which crosses these.
+- The last layer's trimming in a prefill leaves its convolution state wrong at boundaries inside the chunk, which matters once blocks are sealed mid-chunk.
+- Attention in the batched path launches every query head separately and wastes most of a tile on a one-token span, so each lane's cache may be read up to three times. This and the 210 GB/s above make a many-lane attention kernel the first kernel to write.
+
+The gates in the layer table need the same strengthening: two interleaved lanes past 2048 tokens with poisoned scratch for layer 1; bit-identical cache, recurrent state and multi-step logits at batch sizes 1, 2, 64, 65 and 129 with prime-sized splits for layer 2; poisoned pool slots and explicit reversed witnesses for layer 3; a bimodal 2K and 64K workload, mid-step disconnects and kill -9 through the HTTP server for the scheduler and parking; concurrent cards issuing identical tool calls for the server.
 
 ## Decisions
 
@@ -124,7 +155,7 @@ Each is secured before the next starts.
 
 ## Follow-ons, not in the first build
 
-- **A kernel for decode-size batches.** The largest known gain: about 2x at 16 to 64 lanes. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and give the dense projections the same treatment (see "Where the batched path's time goes"). The first build uses the existing batched path, which is correct and batch-invariant today.
+- **A kernel for decode-size batches.** Up to 2x at 16 to 32 lanes of short context, and less as more lanes touch more of the experts: independent lanes touch more experts than one sequence's tokens do. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and give the dense projections the same treatment (see "Where the batched path's time goes"). The first build uses the existing batched path, which is correct and batch-invariant today.
 - **Read a shared prefix once per step** for all lanes' queries, then each lane's own keys, merged with the online softmax the engine already has. Version one shares the memory and skips the prefill; this shares the reads too.
 - **8-bit cache and far-key pruning**, behind the quality replay.
 - **Quality replay**: N landed low-priority cards against the current flash route, comparing how many land.

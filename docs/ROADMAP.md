@@ -27,6 +27,33 @@ What was measured and tried before any design, and the design itself.
 
 <!-- nova-work:evaluation:end -->
 
+## Design revision
+
+The cold read's findings, folded into the design before layer 2 starts. Layer 1 does not depend on them.
+
+<!-- nova-work:revision:start -->
+
+| feature | done |
+|---|:---:|
+| The lane table corrected: the cache is read at about 210 GB/s and a lane reads all of it | ✅ |
+| The four invariance and attention claims from the cold read measured | ❌ |
+| Blocks: a prefix keeps the window blocks and recurrent state that make it a start point | ❌ |
+| Blocks: recurrent state kept at lane heads, turn ends and a sparse stride, not at every boundary | ❌ |
+| Blocks: 64-bit or per-block cache addressing | ❌ |
+| Admission: the worst-case memory bound sets the lane limit | ❌ |
+| Scheduler: cancel during a step waits for the step | ❌ |
+| Parking: lazy under memory pressure, atomic reservation to restore, a bound for parked and queued lanes | ❌ |
+| Models: one coupled cache and scheduler model for the cross-cutting properties | ❌ |
+| Server: earlier turns' thinking tokens round-trip without a content-keyed map | ❌ |
+| Layers 4 and 5 merged; a performance and memory gate at 20K and 42K context after layer 2 | ❌ |
+| Every layer's gate strengthened as the cold read lists | ❌ |
+| An attention kernel for many lanes named as the first kernel to write | ❌ |
+| complete | 7% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:revision:end -->
+
 ## Layer 1: lane state out of the engine
 
 A refactor with no change in behaviour: everything that belongs to one stream moves out of the engine.
@@ -206,7 +233,7 @@ Improvements that wait for the layers above. Those that change the model's numbe
 
 | feature | done |
 |---|:---:|
-| A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes (later) | ❌ |
+| A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
 | A shared prefix is read once per step for all lanes' queries (later) | ❌ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |
