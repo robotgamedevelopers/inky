@@ -463,6 +463,75 @@ fn lanebench(o: &Opts) {
     println!("recommended GPU working set: {:.1} GiB", gib(ws));
 }
 
+/// dev, the batched decode gate: N lanes on different streams (the --ref tokens rotated by 97 i), each prefilled to
+/// INK_PF tokens, then INK_DECODE decode steps, twice: each lane alone through the single-stream decode path, and all
+/// lanes together through `encode_dbatch`. Every lane's logits at every step and its final cache and convolution rows
+/// must be bit-identical; the time per step of both is printed. INK_LANES lists the lane counts.
+fn dbatch(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,8".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let len = pf + nd + 1;
+    let stream = |i: usize| -> Vec<u32> { (0..len).map(|q| base[(97 * i + q) % base.len()]).collect() };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let prefilled = |i: usize| -> Lane {
+        let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false); r.set_tokens(0, &stream(i));
+        let mut p = 0; while p < pf { let t = (pf - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
+        l
+    };
+    let nmax = *counts.iter().max().unwrap();
+    // dev: INK_DB_PROF=1 times the batch with each kernel class skipped in turn (results then differ; timing only)
+    if std::env::var("INK_DB_PROF").is_ok() {
+        for &n in &counts {
+            let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
+            eng.ensure_dbatch(n);
+            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf)).collect();
+            let time = |skip: u32| { eng.skip.set(skip); let mut best = f64::MAX; for _ in 0..3 { let cb = eng.gpu.cmd(); eng.encode_dbatch(&cb, &b, true); cb.commit(); cb.waitUntilCompleted();
+                best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3); } eng.skip.set(0); best };
+            let full = time(0);
+            println!("{n} lanes: {full:.1} ms GPU per step");
+            for (c, name) in engine::CLS_NAMES.iter().enumerate() { let d = full - time(1 << c); if d > 0.5 { println!("  {name:>11}: {d:7.1} ms ({:4.1}%)", d / full * 100.0); } }
+        }
+        return;
+    }
+    // alone, through the decode path
+    let mut alone = Vec::new();
+    let mut t_alone = 0.0;
+    for i in 0..nmax {
+        let l = prefilled(i); let r = eng.on(&l);
+        let mut hs = Vec::new();
+        let t0 = std::time::Instant::now();
+        for q in 0..nd { let cb = eng.gpu.cmd(); r.encode_step(&cb, pf + q, true, false); cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(eng.logits())); }
+        t_alone += t0.elapsed().as_secs_f64();
+        alone.push((hs, eng.lane_hash(&l)));
+    }
+    let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
+    println!("alone (decode path): {ms_alone:.1} ms/token, {:.0} tok/s", 1e3 / ms_alone);
+    let mut ok = true;
+    for &n in &counts {
+        let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
+        eng.ensure_dbatch(n);
+        let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let t0 = std::time::Instant::now();
+        for q in 0..nd {
+            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            let cb = eng.gpu.cmd(); eng.encode_dbatch(&cb, &b, true); cb.commit(); cb.waitUntilCompleted();
+            for j in 0..n { hs[j].push(fnv(eng.dbatch_logits(j))); }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
+        let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
+        println!("{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}", n as f64 * 1e3 / ms, 1e3 / ms,
+                 if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) });
+        ok &= bad.is_empty();
+    }
+    println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
+    if !ok { std::process::exit(1); }
+}
+
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -637,6 +706,7 @@ fn main() {
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "lanebench" => lanebench(&o),
+        "dbatch" => dbatch(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),

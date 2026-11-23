@@ -400,6 +400,56 @@ kernel void k_mv(device const uchar * W [[buffer(0)]], device const uchar * PB [
         topk_sg(A, PB, args.seg[0].out_off, args.bias_off, args.sel_off, args.wscale, lane);
 }
 
+// k_mv over the same weights for nv.x vectors at a stride of nv.y floats (the lanes of a decode batch): each weight row
+// is read from memory once per step and applied to every vector; each vector's dot product is the same code, in the same
+// order, as k_mv's. No epilogue (k_epi applies it per lane); the fused top-k, when asked, runs for every vector.
+kernel void k_mvb(device const uchar * W [[buffer(0)]], device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                  constant MvArgs & args [[buffer(5)]], device atomic_uint * CTR [[buffer(7)]], constant uint2 & nv [[buffer(8)]],
+                  uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]],
+                  ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint flag;
+    uint si = 0;
+    while (si + 1 < args.nseg && tg >= args.seg[si + 1].tg_start) si++;
+    constant Seg & S = args.seg[si];
+    const uint row0 = (tg - S.tg_start) * MV_ROWS + sg * MV_NR;
+    if (row0 < S.nrows) {
+        const ulong wbase = ulong(S.w_hi) << 32 | S.w_lo;
+        device const uchar * base = (S.wtype == 30) ? PB : W;
+        device const uchar * wp[MV_NR];
+        for (int rr = 0; rr < MV_NR; rr++) wp[rr] = base + wbase + (ulong) min(row0 + rr, S.nrows - 1) * S.row_bytes;
+        for (uint v = 0; v < nv.x; v++) {
+            float sumf[MV_NR] = {0, 0};
+            device const float * x = A + S.in_off + v * nv.y;
+            if (S.wtype == 12) dot_q4k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+            else if (S.wtype == 14) dot_q6k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+            else dot_bf16<MV_NR>(wp, S.K, x, lane, sumf);
+            for (int rr = 0; rr < MV_NR; rr++) {
+                const float y = simd_sum(sumf[rr]);
+                if (lane == 0 && row0 + rr < S.nrows) A[S.out_off + v * nv.y + row0 + rr] = y;
+            }
+        }
+    }
+    if (args.post == 1 && last_tg(CTR + args.ctr, ntg, sg * 32 + lane, &flag) && sg == 0)
+        for (uint v = 0; v < nv.x; v++) topk_sg(A, PB, args.seg[0].out_off + v * nv.y, args.bias_off, args.sel_off + v * nv.y, args.wscale, lane);
+}
+
+// mv_epilogue for one lane, after k_mvb wrote the raw projection y to out_off: the post short-conv over each channel
+// from the lane's state, the residual, the result written back to out_off. Same arithmetic as mv_epilogue.
+struct EpiArgs { uint out_off; int res_off; uint cs_off; uint convw_off; uint n; uint pad0, pad1, pad2; };
+kernel void k_epi(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device float * CS [[buffer(4)]],
+                  constant EpiArgs & a [[buffer(5)]], uint row [[thread_position_in_grid]]) {
+    if (row >= a.n) return;
+    const float y = A[a.out_off + row];
+    device float * h = CS + a.cs_off + row * 3;
+    device const float * w = (device const float *) (PB + a.convw_off) + row * 4;
+    const float h0 = h[0], h1 = h[1], h2 = h[2];
+    const float conv = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * y;
+    h[0] = h1; h[1] = h2; h[2] = y;
+    float o = (y + conv) * 0.4472135954999579f;  // 1/sqrt(5)
+    if (a.res_off >= 0) o += A[a.res_off + row];
+    A[a.out_off + row] = o;
+}
+
 // RMSNorm of up to 3 vectors from precomputed partial sums of squares (written by k_ctrl_apply). 1 TG per vector.
 struct NormJob { uint in_off, out_off, w_off, ss_off; };
 struct NormArgs { uint n, nparts; float eps; uint tstride; NormJob job[4]; };

@@ -82,7 +82,7 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_mix", "k_mv", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
+    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
     "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
@@ -128,6 +128,8 @@ struct DevCopyArgs { src: u32, dst: u32, n: u32, pad: u32 }
 pub struct Prune { bag: Buf, rows: usize, r0: usize, lastbias: f32, use_sum: bool }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CombineArgs { part_off: u32, nsplit: u32, gate_off: u32, out_off: u32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct EpiArgs { out_off: u32, res_off: i32, cs_off: u32, convw_off: u32, n: u32, pad: [u32; 3] }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct MoeArgs {
@@ -333,9 +335,18 @@ impl Arena {
         Arena { q, gate, k, v, rel, sink, kdyn, vdyn, attn_g, inp, msg, cin, ctrlg, ssp, cat, fin, finc, fout, rlog, sel, sel_log, act, part, logits, amax, total: o }
     }
     pub fn vec(i: usize) -> u32 { (i * E) as u32 }
+    /// the same layout starting `b` floats further into the activation buffer (a lane's own copy in a decode batch)
+    fn shift(&self, b: u32) -> Arena {
+        let mut a = *self;
+        for f in [&mut a.q, &mut a.gate, &mut a.k, &mut a.v, &mut a.rel, &mut a.sink, &mut a.kdyn, &mut a.vdyn, &mut a.attn_g, &mut a.fin, &mut a.finc,
+                  &mut a.fout, &mut a.rlog, &mut a.sel, &mut a.sel_log, &mut a.act, &mut a.part, &mut a.logits, &mut a.amax] { *f += b; }
+        for f in a.inp.iter_mut().chain(a.msg.iter_mut()).chain(a.cin.iter_mut()).chain(a.ctrlg.iter_mut()).chain(a.ssp.iter_mut()).chain(a.cat.iter_mut()) { *f += b; }
+        a
+    }
 }
 
 // round-robin vector allocator that never hands out a live vector
+#[derive(Clone)]
 struct VecAlloc { next: usize, n: usize }
 impl VecAlloc {
     fn alloc(&mut self, live: &[usize]) -> usize {
@@ -362,6 +373,10 @@ pub struct Engine {
     loops: Vec<LoopW>,
     tok_embd: QW, tok_norm: u32, output: QW, output_norm: u32, output_res_query: u32,
     pub ar: Arena,
+    /// where the decode path's arena starts in the activation buffer: 0, or a lane's copy during a decode batch
+    abase: Cell<u32>,
+    /// first float of the decode batch's lane arenas (see `ensure_dbatch`)
+    dstart: Cell<u32>,
     pub kv8: bool, kvb: usize, ba: std::cell::Cell<BArena>, pub chunk: usize, pub tensor: bool, pub hgemm: bool, sep_comb: bool, sep_topk: bool,
     /// last-layer tail mode of the prefill (dev tools switch it off to profile full layers)
     pub tail: std::cell::Cell<bool>,
@@ -456,6 +471,27 @@ impl Engine {
     /// the logits of span `i` of the last step with several spans
     pub fn span_logits(&self, i: usize) -> &[f32] {
         let off = self.ba.get().lg as usize + i * self.vocab_pad();
+        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
+    }
+    /// the decode path's arena at the current base
+    fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
+    /// offset of residual vector `i` of the decode path at the current base
+    fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) as u32 }
+    /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, after everything else in the activation
+    /// buffer. Call after `ensure_batch` (a later batch arena may overlap it). Nothing may be in flight on the GPU.
+    pub fn ensure_dbatch(&self, n: usize) {
+        let start = (self.ar.total).max(self.ba.get().end);
+        let need = (start as usize + n * self.ar.total as usize) * 4;
+        self.dstart.set(start);
+        if self.act.borrow().length() < need {
+            let nb = self.gpu.buffer(need);
+            unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.act.borrow().length()); }
+            *self.act.borrow_mut() = nb;
+        }
+    }
+    /// the logits lane `j` of the last decode batch produced
+    pub fn dbatch_logits(&self, j: usize) -> &[f32] {
+        let off = (self.dstart.get() + j as u32 * self.ar.total + self.ar.logits) as usize;
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
     /// the engine working on `lane`
@@ -579,7 +615,7 @@ impl Engine {
             softcap: g.f(&a("final_logit_softcapping")) as f32,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
             slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
-            ar, kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
+            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
             tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
@@ -1058,6 +1094,18 @@ impl Engine {
         }
         self.go(e, cls, "k_mv", &a, (tg as usize, 1, 1), 128);
     }
+    /// k_mv for the `n` lanes of a decode batch (segments at lane 0's offsets; lane j's are `j * ar.total` further)
+    fn mvb(&self, e: &Enc, cls: u32, segs: &[Seg], post: MvArgs, n: usize) {
+        if self.skip.get() & (1 << cls) != 0 { return; }
+        let mut a = MvArgs { nseg: segs.len() as u32, eps: self.eps, ..post };
+        let mut tg = 0u32;
+        for (i, s) in segs.iter().enumerate() { assert!(s.epi == 0); a.seg[i] = *s; a.seg[i].tg_start = tg; tg += s.nrows.div_ceil(8); }
+        e.pso(&self.gpu.pso("k_mvb"));
+        e.bytes(&a, 5);
+        e.bytes(&[n as u32, self.ar.total], 8);
+        e.dispatch((tg as usize, 1, 1), 128);
+        e.barrier();
+    }
     /// decode: one token, the decode arena's layout
     fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_impl(e, cls, jobs, 1, false); }
     /// prefill: `t` tokens in the batch arena's layout. A batch of one token is still a batch: its jobs carry the batch
@@ -1083,7 +1131,7 @@ impl Engine {
         e.barrier();
     }
     fn mix_job(&self, states: &[usize], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32]) -> MixJob {
-        let offs: Vec<u32> = states.iter().map(|&s| Arena::vec(s)).collect();
+        let offs: Vec<u32> = states.iter().map(|&s| self.v(s)).collect();
         self.mix_job_off(&offs, q_off, n_q, outs, norms, 0)
     }
     fn mix_job_off(&self, states: &[u32], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32], tstride: u32) -> MixJob {
@@ -1100,7 +1148,7 @@ impl Engine {
     /// decode loop controllers: g = D.cat[j] (bf16 matvec on the mix kernel's normalized copies), then gain/forget apply
     /// with the RMSNorm fused into the last threadgroup of each controller
     fn ctrl_dec(&self, e: &Enc, jobs: &[CtrlJob]) {
-        let ar = self.ar;
+        let ar = self.ar_at();
         let segs: Vec<Seg> = jobs.iter().map(|j| {
             let c = ar.ctrlg.iter().position(|&o| o == j.out_off).unwrap();
             Self::seg_pb(j.d_off, 64, (2 * E) as u32, ar.cat[c], j.out_off)
@@ -1189,6 +1237,214 @@ impl Engine {
                in_off, out_off, ldo: w.rows, ..Default::default() }
     }
 
+
+    /// Encode one decode step for each of `lanes` (lane, position of the token it decodes) in one command buffer, through
+    /// the decode path: every lane runs today's single-stream kernels on its own copy of the decode arena with its own
+    /// buffers bound, layer by layer, so each lane's numbers are exactly what it gets decoding alone. Logits for each lane
+    /// land in its arena (`dbatch_logits`). Needs `ensure_dbatch(lanes.len())`; no disk tier, no pruning.
+    pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
+        let n = lanes.len();
+        let (start, tot) = (self.dstart.get(), self.ar.total);
+        assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
+                "decode batch arenas: call ensure_dbatch() after ensure_batch()");
+        for (l, pos) in lanes { assert!(l.tier.is_none() && l.prune.borrow().is_none() && *pos < self.on(l).kv_capacity(), "K/V capacity: call reserve() first"); }
+        let base = |j: usize| start + j as u32 * tot;
+        let mut cx = Cx { e: Enc::new(cb), cb: None };
+        self.bind_eng(&cx.e);
+        for (j, (l, pos)) in lanes.iter().enumerate() {
+            self.abase.set(base(j));
+            self.bind_lane(&cx.e, l);
+            let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
+                                 norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: *pos as u32, eps: self.eps };
+            self.go(&cx.e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
+        }
+        // the residual bookkeeping is the same for every lane: run it once per layer, and every lane's layer from it
+        let (mut cur, mut blocks, mut va, mut exec) = (0usize, Vec::<usize>::new(), VecAlloc { next: 1, n: N_VEC }, 0usize);
+        let stage_a = std::env::var("INK_DBATCH_A").is_ok();
+        let mut layer_all = |cx: &mut Cx, cur: &mut usize, blocks: &mut Vec<usize>, va: &mut VecAlloc, slot: usize, ip: usize, msg: Option<(usize, usize)>, pinned: &[usize]| {
+            if !stage_a {
+                *cur = self.layer_db(&cx.e, lanes, start, exec, slot, ip, *cur, blocks, msg, va, pinned);
+                exec += 1;
+                return;
+            }
+            let mut after = None;
+            for (j, (l, pos)) in lanes.iter().enumerate() {
+                self.abase.set(base(j));
+                self.bind_lane(&cx.e, l);
+                self.done.set(exec);
+                let (mut b2, mut v2) = (blocks.clone(), va.clone());
+                let c2 = self.on(l).layer(cx, *pos, slot, ip, *cur, &mut b2, msg, &mut v2, pinned);
+                after = Some((c2, b2, v2));
+            }
+            let (c2, b2, v2) = after.unwrap();
+            *cur = c2; *blocks = b2; *va = v2; exec += 1;
+        };
+        for ip in 0..LOOP_START { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        let prelude = cur;
+        let prelude_blocks = blocks.clone();
+        let mut bank = (0usize, 0usize);
+        for pass in 0..N_PASS {
+            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            let msg = if pass > 0 { Some(bank) } else { None };
+            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            for ip in LOOP_START..LOOP_END { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, slot_of(pass, ip), ip, msg, &pinned); }
+            bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
+        }
+        for ip in LOOP_END..N_PHYS { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        if logits {
+            self.abase.set(base(0));
+            let ar = self.ar_at();
+            let mut st = blocks.clone(); st.push(cur);
+            let mut jb = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
+            jb.tstride = tot;
+            self.mix_impl(&cx.e, C_OMIX, &[jb], n, false);
+            self.mvb(&cx.e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)], MvArgs::default(), n);
+        }
+        self.abase.set(0);
+        cx.e.end();
+    }
+
+    /// One layer execution of a decode batch: the decode path's layer for every lane, with the row-wise work (mixes,
+    /// projections, output projection, router) run once over all lanes and the rest per lane. Each lane's arithmetic is
+    /// the decode path's, so its numbers are exactly what it gets decoding alone.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_db(&self, e: &Enc, lanes: &[(&Lane, usize)], start: u32, exec: usize, slot: usize, ip: usize, cur: usize,
+                blocks: &mut Vec<usize>, msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
+        let n = lanes.len();
+        let tot = self.ar.total;
+        let at = |j: usize| self.abase.set(start + j as u32 * tot);
+        let l = &self.layers[ip];
+        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
+        let cs_slot = (slot * NCH * 3) as u32;
+        let ts = |mut j: MixJob| { j.tstride = tot; j };
+        at(0);
+        let ar = self.ar_at();
+        // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
+        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
+        let mut st = blocks.clone(); st.push(cur);
+        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
+        let xin: [u32; 3];
+        if let Some(lw) = ctl {
+            let (b0, b1) = msg.unwrap();
+            let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
+            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
+            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
+            let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
+            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
+            self.mix_impl(e, C_MIXA, &[ts(ja), ts(jm)], n, false);
+            for jl in 0..n {
+                at(jl);
+                let ar = self.ar_at();
+                let mut cj = Vec::new();
+                for j in 0..3 {
+                    let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
+                    cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
+                                      forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
+                }
+                self.ctrl_dec(e, &cj);
+            }
+            at(0);
+            xin = ar.cin;
+        } else {
+            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
+            self.mix_impl(e, C_MIXA, &[ts(self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn))], n, false);
+            xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
+        }
+        // ---- fused projections, once for every lane
+        let mut segs = vec![Engine::seg(&l.wq, xin[0], ar.q), Engine::seg(&l.wgate, xin[0], ar.gate), Engine::seg(&l.wrel, xin[0], ar.rel),
+                            Engine::seg(&l.wsink, xin[0], ar.sink), Engine::seg(&l.wk, xin[1], ar.k), Engine::seg(&l.wv, xin[2], ar.v)];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::seg(kp, xin[1], ar.kdyn)); segs.push(Engine::seg(vp, xin[2], ar.vdyn)); }
+        self.mvb(e, C_QKV, &segs, MvArgs::default(), n);
+        // ---- attention (split-K, fused K/V conv and cache write) per lane, on the lane's cache and state
+        for (jl, (lane, pos)) in lanes.iter().enumerate() {
+            at(jl);
+            let ar = self.ar_at();
+            let run = self.on(lane);
+            self.bind_lane(e, lane);
+            let pos = *pos;
+            let (kb, vb, kcap) = run.kv_slot(slot);
+            let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+            let base = AttnArgs {
+                pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
+                q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
+                kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
+                kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
+                ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
+            };
+            run.bind_kv(e, l.swa);
+            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
+            let kps = Run::split_kps(nkeys);
+            let nsplit = nkeys.div_ceil(kps);
+            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                                pad: self.sep_comb as u32, ..base };
+            self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+            if self.sep_comb {
+                let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
+                self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
+            }
+        }
+        at(0);
+        // ---- output projection once for every lane, then each lane's post-conv (+ residual) on its own state
+        let block_start = ip % BLOCK == 0;
+        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mid = va.alloc(&live);
+        self.mvb(e, C_WO, &[Engine::seg(&l.wo, ar.attn_g, self.v(mid))], MvArgs::default(), n);
+        for (jl, (lane, _)) in lanes.iter().enumerate() {
+            at(jl);
+            self.bind_lane(e, lane);
+            let ea = EpiArgs { out_off: self.v(mid), res_off: if block_start { -1 } else { self.v(cur) as i32 }, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                               convw_off: l.attn_post_conv, n: E as u32, pad: [0; 3] };
+            self.go(e, C_WO, "k_epi", &ea, (E.div_ceil(256), 1, 1), 256);
+        }
+        at(0);
+        if block_start { blocks.push(cur); }
+        // ---- FFN input: depth mix (+ control) -> normalized
+        let mut st = blocks.clone(); st.push(mid);
+        let x_off = if let Some(lw) = ctl {
+            let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
+            jf.ncopy[0][0] = ar.cat[3] as i32;
+            self.mix_impl(e, C_MIXF, &[ts(jf)], n, false);
+            for jl in 0..n {
+                at(jl);
+                let ar = self.ar_at();
+                self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
+                                             forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
+            }
+            at(0);
+            ar.finc
+        } else {
+            self.mix_impl(e, C_MIXF, &[ts(self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32]))], n, false);
+            ar.fin
+        };
+        // ---- router with fused top-k, once for every lane
+        assert!(!self.sep_topk);
+        let sel = ar.sel_log + (exec * 16) as u32;
+        let rpost = MvArgs { post: 1, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        self.mvb(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost, n);
+        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let out = va.alloc(&live);
+        // ---- experts per lane (the down projection's epilogue updates the lane's state)
+        for (jl, (lane, _)) in lanes.iter().enumerate() {
+            at(jl);
+            let ar = self.ar_at();
+            self.bind_lane(e, lane);
+            let sel = ar.sel_log + (exec * 16) as u32;
+            let x = if ctl.is_some() { ar.finc } else { ar.fin };
+            let ma = MoeArgs {
+                logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off: x,
+                norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
+                gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
+                act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
+                dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                convw_off: l.ffn_post_conv, pad: [0; 3],
+            };
+            self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
+            self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
+        }
+        at(0);
+        out
+    }
 
     /// Encode one step over `spans`, each lane's positions [p0, p0 + t), as one batch: row-wise work (mixes, controllers,
     /// projections, router, experts) runs once over every span's rows; what couples a row to its lane (embedding, K/V
@@ -2126,10 +2382,10 @@ impl<'a> Run<'a> {
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
         let e = &cx.e;
         self.bind(e);
-        let ar = self.ar;
+        let ar = self.ar_at();
         // embedding -> vec 0 (x0)
         let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                             norm_off: self.tok_norm, out0: Arena::vec(0), out1: Arena::vec(0), tok_index: pos as u32, eps: self.eps };
+                             norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: pos as u32, eps: self.eps };
         self.go(e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
 
         self.done.set(0);
@@ -2173,7 +2429,7 @@ impl<'a> Run<'a> {
         self.done.set(self.done.get() + 1);
         let e = &cx.e;
         let l = &self.layers[ip];
-        let ar = self.ar;
+        let ar = self.ar_at();
         let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
         let cs_slot = (slot * NCH * 3) as u32;
 
@@ -2279,8 +2535,8 @@ impl<'a> Run<'a> {
         let block_start = ip % BLOCK == 0;
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
-        let mut so = Engine::seg(&l.wo, ar.attn_g, Arena::vec(mid));
-        so.epi = 1; so.res_off = if block_start { -1 } else { Arena::vec(cur) as i32 };
+        let mut so = Engine::seg(&l.wo, ar.attn_g, self.v(mid));
+        so.epi = 1; so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
         so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
         self.mv(e, C_WO, &[so]);
         if block_start { blocks.push(cur); }
@@ -2311,7 +2567,7 @@ impl<'a> Run<'a> {
             gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
             act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
             dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
-            dn_type: l.dn.ty, out_off: Arena::vec(out), res_off: Arena::vec(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+            dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
             convw_off: l.ffn_post_conv, pad: [0; 3],
         };
         // ---- experts
