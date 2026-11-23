@@ -12,9 +12,23 @@ B=./target/release/inky
 REF=${INKY_REF:-$HOME/inky-ci/ref}
 fail=0
 agree() {  # name, env, ref
-    local out; out=$(env $2 $B check --ref $REF/$3 -c 4096 2>&1 | grep 'argmax agreement')
-    echo "$1: $out"
-    echo "$out" | awk '{split($3, a, "/"); if (a[1] != a[2] || $6 > 0.01) exit 1}' || { echo "FAIL: $1"; fail=1; }
+    local out
+    if ! out=$(env "$2" "$B" check --ref "$REF/$3" -c 4096 2>&1); then
+        print -r -- "$out"
+        echo "FAIL: $1"
+        fail=1
+        return
+    fi
+    print -r -- "$out" | awk -v name="$1" '
+        /^argmax agreement / {
+            print name ": " $0
+            seen++
+            split($3, a, "/")
+            if (NF != 6 || $3 !~ /^[0-9]+\/[0-9]+$/ || a[2]+0 == 0 || a[1]+0 != a[2]+0 ||
+                $4 != "worst" || $5 != "KL" || $6 !~ /^[0-9]+([.][0-9]+)?$/ || $6+0 > 0.01) bad=1
+        }
+        END { exit (seen != 1 || bad) }
+    ' || { echo "FAIL: $1"; fail=1; }
 }
 agree "decode, short prompt vs llama.cpp " "INK_PF=0" short
 agree "prefill, long prompt vs llama.cpp " "INK_PF=2380" long
