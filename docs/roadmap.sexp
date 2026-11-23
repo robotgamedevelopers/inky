@@ -215,6 +215,7 @@
      ("l6-health" "A health endpoint, and binding to loopback or a private network only")
      ("l6-gate-replay" "Gate: the tracer card and a recorded replay set land through it")
      ("l6-gate-concurrent" "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation")
+     ("l6-gate-memd-traces" "Gate: memd traces are behaviours of MemMode.tla, checked in CI")
    )
    :columns (("done" "done"))
    :cells (
@@ -226,6 +227,7 @@
      ("l6-health" "done" "t-l6-health")
      ("l6-gate-replay" "done" "t-l6-gate-replay")
      ("l6-gate-concurrent" "done" "t-l6-gate-concurrent")
+     ("l6-gate-memd-traces" "done" "t-l6-gate-memd-traces")
    ))
   (:id "t-l6-endpoint" :type :task :title "OpenAI-compatible chat completions, streaming and not, over the lanes" :state :done :evidence ("src/serve.rs"))
   (:id "t-l6-template" :type :task :title "The chat template rendered exactly, tested against the GGUF's own template" :state :done :evidence ("src/serve.rs: render (the GGUF chat template)"))
@@ -235,6 +237,7 @@
   (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :done :evidence ("src/serve.rs: /health, --bind, --key-env"))
   (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max (four cards at once)"))
   (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :todo)
+  (:id "t-l6-gate-memd-traces" :type :task :title "Gate: memd traces are behaviours of MemMode.tla, checked in CI" :state :todo)
   (:id "layer-7" :type :roadmap :title "Layer 6: the lane-count sweep"
    :rows (
      ("l7-record" "Real card traffic recorded as a replay set")
