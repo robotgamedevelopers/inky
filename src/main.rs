@@ -363,6 +363,65 @@ fn lanes(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, layer 2's gate: N lanes advanced together in steps of several spans must each give exactly what they give alone:
+/// the same logits at every step, the same cache and convolution rows at the end. Lane i reads the --ref tokens rotated by
+/// 17 i; it prefills in prime-sized chunks with one-token chunks among them, then decodes; lanes start staggered, so a step
+/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try.
+fn spans(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let chunks = [31usize, 1, 23, 7, 17, 1, 29];
+    let ndec: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let plen: usize = chunks.iter().sum();
+    let len = plen + ndec;
+    let work: Vec<(usize, usize)> = { let mut w = Vec::new(); let mut p = 0; for &c in &chunks { w.push((p, c)); p += c; } for q in plen..len { w.push((q, 1)); } w };
+    let stream = |i: usize| -> Vec<u32> { let mut v = base.clone(); v.rotate_left((17 * i) % base.len()); v.truncate(len + 1); v };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let nmax = *counts.iter().max().unwrap();
+    // each lane alone: one span per step
+    let mut alone: Vec<(Vec<u64>, u64)> = Vec::new();
+    for i in 0..nmax {
+        let l = fresh(i);
+        let mut hs = Vec::new();
+        for &(p0, t) in &work {
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); cb.waitUntilCompleted();
+            hs.push(fnv(eng.logits()));
+        }
+        alone.push((hs, eng.lane_hash(&l)));
+    }
+    let mut ok = true;
+    for &n in &counts {
+        let lanes: Vec<Lane> = (0..n).map(fresh).collect();
+        let delay = |i: usize| i % 3;                       // lane i starts i % 3 steps late
+        let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let steps = work.len() + 2;
+        let (mut nsteps, mut mixed) = (0, 0);
+        for s in 0..steps {
+            let mut sp = Vec::new(); let mut who = Vec::new();
+            for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
+            if sp.is_empty() { continue; }
+            if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
+            nsteps += 1;
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
+            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
+        }
+        let mut bad = Vec::new();
+        for i in 0..n {
+            let step = hs[i].iter().zip(&alone[i].0).position(|(a, b)| a != b);
+            let cache = eng.lane_hash(&lanes[i]) != alone[i].1;
+            if step.is_some() || cache { bad.push(format!("lane {i}: {}{}", step.map_or(String::new(), |s| format!("logits differ from step {s} ({:?}) ", work[s])), if cache { "cache or state differs" } else { "" })); }
+        }
+        println!("{n:4} lanes, {nsteps} steps ({mixed} mixing prefill and decode spans): {}", if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER, first: {}", bad.len(), bad[0]) });
+        ok &= bad.is_empty();
+    }
+    println!("{}", if ok { "spans invariant: every lane, in every batch, gives exactly what it gives alone" } else { "SPANS NOT INVARIANT" });
+    if !ok { std::process::exit(1); }
+}
+
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -535,6 +594,7 @@ fn main() {
         "check" => check(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
+        "spans" => spans(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),
