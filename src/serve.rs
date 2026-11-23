@@ -503,6 +503,18 @@ struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String
              conns: Arc<std::sync::atomic::AtomicUsize> }
 const MAX_CONNS: usize = 512;
 
+/// Whether a request can never fit a lane: prompt + generation + the two tokens the
+/// scheduler reserves past the prompt. Checked on the connection thread before any
+/// header is written, so a streaming refusal is a clean HTTP error, not a raw status
+/// mid-SSE; the scheduler keeps the same check as a backstop.
+fn context_over(prompt: usize, max: usize, ctx: usize) -> bool {
+    prompt.saturating_add(max).saturating_add(2) > ctx
+}
+
+fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
+    format!("context full: {prompt} prompt tokens and {max} to generate, {ctx} per lane")
+}
+
 /// releases a request's in-flight count however the request ends
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
@@ -521,6 +533,7 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
     if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
+    if context_over(toks.len(), max, cx.ctx) { return bad(context_full_message(toks.len(), max, cx.ctx)); }
     // the seed is the request's own: its `seed`, or a hash of what decides the output (the rendered tokens and sampling)
     let seed = req["seed"].as_u64().unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
@@ -625,6 +638,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
     if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if context_over(prompt_len, max, cx.ctx) { return anthropic_error(s, 400, "invalid_request_error", &context_full_message(prompt_len, max, cx.ctx)); }
     // the seed is the request's own: a hash of what decides the output, as on the chat path
     let seed = {
         let mut h = 0xcbf29ce484222325u64;
@@ -818,6 +832,18 @@ mod tests {
         v.extend(tk.encode("{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}", false));
         v.extend([sp.end, sp.end_sampling]);
         v
+    }
+
+    #[test] fn over_cap_requests_are_refused_before_any_header() {
+        // exactly fitting (prompt + max + 2 == ctx) is admitted; one token over is not
+        assert!(!context_over(10, 5, 17));
+        assert!(context_over(11, 5, 17));
+        assert!(context_over(10, 6, 17));
+        assert!(context_over(0, 1, 2));
+        assert!(!context_over(0, 1, 3));
+        // saturating: a huge prompt can never wrap into fitting
+        assert!(context_over(usize::MAX, 1, 100));
+        assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
     }
 
     #[test] fn routes_ignore_query_strings_and_trailing_slashes() {
