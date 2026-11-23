@@ -345,18 +345,13 @@ impl VecAlloc {
 pub struct Engine {
     pub g: Gguf,
     pub gpu: Gpu,
-    w: Buf, pub pb: Buf, cs: Buf, pub toks: Buf, ctr: Buf,
+    w: Buf, pub pb: Buf, ctr: Buf,
     /// activations: the small decode arena, followed by the batch (prefill) arena while a prefill needs one
     act: std::cell::RefCell<Buf>,
-    /// K/V cache (fp16). Sliding-window layers keep exactly their window (a ring of EXT keys per slot), full-attention
-    /// layers every key. Both buffers are sized to the context and grow with it.
-    kv_swa: std::cell::RefCell<Buf>, kv_full: std::cell::RefCell<Buf>, swa_cap: std::cell::Cell<usize>, full_cap: std::cell::Cell<usize>,
     /// per slot: (is sliding-window, index among the slots of its kind)
     slot_kind: Vec<(bool, usize)>,
-    tier: Option<Tier>,
     /// dev: capture of the full-attention layers' prepared queries and sinks during a prefill (per slot: n x 24 x 128 fp16, n x 24 f32)
     qcap: RefCell<Option<(Buf, usize)>>,
-    pub prune: RefCell<Option<Prune>>,
     pub layers: Vec<Layer>,
     loops: Vec<LoopW>,
     tok_embd: QW, tok_norm: u32, output: QW, output_norm: u32, output_res_query: u32,
@@ -371,11 +366,66 @@ pub struct Engine {
     eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
 }
 
+/// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
+/// Two lanes on one engine are independent streams; the engine works on one lane at a time (`Engine::on`).
+pub struct Lane {
+    /// K/V cache (fp16). Sliding-window layers keep exactly their window (a ring of EXT keys per slot), full-attention
+    /// layers every key. Both buffers are sized to the context and grow with it.
+    kv_swa: RefCell<Buf>, kv_full: RefCell<Buf>, swa_cap: Cell<usize>, full_cap: Cell<usize>,
+    /// causal-convolution rows of every slot (the recurrent state)
+    cs: Buf,
+    /// the stream's tokens by position (greedy decoding writes each step's argmax here, GPU to GPU)
+    pub toks: Buf,
+    tier: Option<Tier>,
+    pub prune: RefCell<Option<Prune>>,
+}
+
+/// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
+/// `Run` reaches through Deref.
+#[derive(Clone, Copy)]
+pub struct Run<'a> { pub eng: &'a Engine, pub lane: &'a Lane }
+impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Engine { self.eng } }
+
+static LANE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Lane {
+    /// A fresh, empty stream for `eng`: a small cache that grows with the context, zeroed convolution rows.
+    pub fn new(eng: &Engine) -> Lane {
+        let n_swa = eng.slot_kind.iter().filter(|k| k.0).count();
+        let n_full = N_SLOT - n_swa;
+        let cap0 = KV_CAP0.min(eng.max_ctx);
+        let gpu = &eng.gpu;
+        let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(!eng.kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
+            let path = std::env::temp_dir().join(format!("inkling-kv-{}-{}.bin", std::process::id(), LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
+            // uncached I/O: the point of the file is that its contents are NOT in memory
+            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1); }
+            let _ = std::fs::remove_file(&path);       // it lives as long as the lane
+            Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
+                        min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
+                        stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
+                        plan: RefCell::new(Vec::new()), execs: RefCell::new(Vec::new()), loaded: Cell::new(usize::MAX),
+                        read_bytes: Cell::new(0), read_time: Cell::new(Default::default()), unaligned: Cell::new(false) })
+        } else { None };
+        Lane {
+            kv_swa: RefCell::new(gpu.buffer(n_swa * 2 * NKV * cap0 * HD * eng.kvb)),
+            kv_full: RefCell::new(gpu.buffer(n_full * 2 * NKV * cap0 * HD * eng.kvb)),
+            swa_cap: Cell::new(cap0), full_cap: Cell::new(cap0),
+            cs: gpu.buffer(N_SLOT * NCH * 3 * 4),
+            toks: gpu.buffer((eng.max_ctx + 8) * 4),
+            tier, prune: RefCell::new(None),
+        }
+    }
+}
+
 fn slot_of(pass: usize, ip: usize) -> usize {
     if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) { ip } else { N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START) }
 }
 
 impl Engine {
+    /// the engine working on `lane`
+    pub fn on<'a>(&'a self, lane: &'a Lane) -> Run<'a> { Run { eng: self, lane } }
     pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
     pub fn load_with(path: &str, max_ctx: usize, kv8: bool) -> Engine {
@@ -482,27 +532,9 @@ impl Engine {
             if layers[phys].swa { slot_kind.push((true, n_swa)); n_swa += 1; } else { slot_kind.push((false, n_full)); n_full += 1; }
         }
         assert!(n_full * 2 * NKV * max_ctx * HD < u32::MAX as usize, "KV cache too large for 32-bit offsets");
-        let cap0 = KV_CAP0.min(max_ctx);
-        let kv_swa = gpu.buffer(n_swa * 2 * NKV * cap0 * HD * kvb);
-        let kv_full = gpu.buffer(n_full * 2 * NKV * cap0 * HD * kvb);
-        let cs = gpu.buffer(N_SLOT * NCH * 3 * 4);
-        let toks = gpu.buffer((max_ctx + 8) * 4);
         let ctr = gpu.buffer(4096 * 4);
         eprintln!("[inkling] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
-        let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
-            assert!(!kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
-            let path = std::env::temp_dir().join(format!("inkling-kv-{}.bin", std::process::id()));
-            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
-            // uncached I/O: the point of the file is that its contents are NOT in memory
-            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1); }
-            let _ = std::fs::remove_file(&path);       // it lives as long as the process
-            Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
-                        min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
-                        stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
-                        plan: RefCell::new(Vec::new()), execs: RefCell::new(Vec::new()), loaded: Cell::new(usize::MAX),
-                        read_bytes: Cell::new(0), read_time: Cell::new(Default::default()), unaligned: Cell::new(false) })
-        } else { None };
         let eng = Engine {
             eps: g.f(&a("attention.layer_norm_rms_epsilon")) as f32,
             log_alpha: g.f(&a("attention.log_scale_alpha")) as f32,
@@ -511,8 +543,8 @@ impl Engine {
             situ_lbeta: g.f(&a("activation.situ_linear_beta")) as f32,
             wscale: g.f(&a("expert_weights_scale")) as f32,
             softcap: g.f(&a("final_logit_softcapping")) as f32,
-            g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act), kv_swa: std::cell::RefCell::new(kv_swa), kv_full: std::cell::RefCell::new(kv_full),
-            swa_cap: std::cell::Cell::new(cap0), full_cap: std::cell::Cell::new(cap0), slot_kind, tier, qcap: RefCell::new(None), prune: RefCell::new(None), cs, toks, ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
+            g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
+            slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
             ar, kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
@@ -533,50 +565,6 @@ impl Engine {
         eng
     }
 
-    /// (k_base, v_base, cap) of a slot's K/V inside its buffer (offsets in cache elements: fp16, or bytes with --kv8)
-    fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
-        let (swa, i) = self.slot_kind[slot];
-        let cap = if swa { self.swa_cap.get() } else { self.full_cap.get() };
-        ((i * 2 * NKV * cap * HD) as u32, ((i * 2 + 1) * NKV * cap * HD) as u32, cap as u32)
-    }
-    /// bind the K/V buffer a layer's kernels address through buffer 3
-    fn bind_kv(&self, e: &Enc, swa: bool) { if swa { e.buf(&self.kv_swa.borrow(), 0, 3); } else { e.buf(&self.kv_full.borrow(), 0, 3); } }
-    /// positions the K/V cache can hold right now
-    pub fn kv_capacity(&self) -> usize { if self.swa_cap.get() >= EXT { self.full_cap.get() } else { self.swa_cap.get().min(self.full_cap.get()) } }
-    /// first position a generation loop must call `gen_reserve` for (with an idle GPU) before it may run that step
-    pub fn gen_capacity(&self) -> usize {
-        match &self.tier { Some(t) if t.on.get() => t.next.get(), Some(t) => self.kv_capacity().min(t.min_n), None => self.kv_capacity() }
-    }
-    /// bytes of K/V cache held in memory (with the disk tier: the hot rings and the read staging)
-    pub fn kv_bytes(&self) -> usize {
-        self.kv_swa.borrow().length() + self.kv_full.borrow().length() + self.tier.as_ref().map_or(0, |t| if t.on.get() { t.stg.borrow().length() } else { 0 })
-    }
-    /// Make room for `n` positions in the K/V cache (no-op if they fit). Nothing may be in flight on the GPU.
-    /// Sliding-window layers keep one window (their ring is linear until the context reaches it, so it can grow like the
-    /// full-attention rows); `headroom` adds slack for the tokens about to be generated so growth stays rare.
-    pub fn reserve(&self, n: usize, headroom: bool) {
-        assert!(n <= self.max_ctx, "context full ({} tokens)", self.max_ctx);
-        let grow = |buf: &std::cell::RefCell<Buf>, capc: &std::cell::Cell<usize>, need: usize, limit: usize, nslots: usize| {
-            let old = capc.get();
-            if need <= old { return; }
-            // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
-            let (hd, hm) = std::env::var("INK_HEADROOM").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))).unwrap_or((16, 0));
-            let want = if headroom { need + (need / hd).max(hm) } else { need };
-            let cap = (want.div_ceil(64) * 64).min(limit);
-            let eb = self.kvb;
-            let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
-            // every (slot, K|V, group) row block moves to its place in the larger layout
-            unsafe {
-                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for blk in 0..nslots * 2 * NKV { std::ptr::copy_nonoverlapping(src.add(blk * old * HD * eb), dst.add(blk * cap * HD * eb), old * HD * eb); }
-            }
-            *buf.borrow_mut() = nb;
-            capc.set(cap);
-        };
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        grow(&self.kv_swa, &self.swa_cap, n.min(EXT), EXT, n_swa);
-        grow(&self.kv_full, &self.full_cap, n, self.max_ctx, N_SLOT - n_swa);
-    }
     /// Allocate (or enlarge) the batch arena for a prefill of `t` tokens. Nothing may be in flight on the GPU.
     pub fn ensure_batch(&self, t: usize) {
         let t = t.div_ceil(64) * 64;
@@ -584,25 +572,6 @@ impl Engine {
         let nb = BArena::new(self.ar.total, t, self.hgemm, self.kvb);
         self.realloc_act(nb.end as usize * 4);
         self.ba.set(nb);
-    }
-    /// Allocate everything a prefill of `t` tokens ending at context length `n` needs and let the GPU map it now.
-    /// The first use of a new buffer costs ~20 ms per GiB; a caller that knows its prompt before it starts the clock
-    /// (one-shot runs: while the model loads) pays that here instead of inside the prefill.
-    pub fn prepare(&self, n: usize, t: usize) {
-        self.reserve(n + 1, true);
-        self.ensure_batch(t.min(self.chunk));
-        let cb = self.gpu.cmd();
-        let e = Enc::new(&cb);
-        self.bind(&e);
-        // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
-        let b = self.ba.get();
-        let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
-                             kpos0: 0, to_ring: 0, pad: [0; 2] };
-        e.pso(&self.gpu.pso("k_kvcopy")); e.bytes(&a, 5);
-        self.bind_kv(&e, true); e.dispatch((1, 1, 1), 32);
-        e.barrier();
-        self.bind_kv(&e, false); e.dispatch((1, 1, 1), 32);
-        e.end(); cb.commit(); cb.waitUntilCompleted();
     }
     /// Give the batch arena back (the decode arena and the last logits stay). Nothing may be in flight on the GPU.
     pub fn release_batch(&self) {
@@ -615,541 +584,10 @@ impl Engine {
         unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.ar.total as usize * 4); }
         *self.act.borrow_mut() = nb;
     }
-    /// bytes of GPU working memory besides the weights: (K/V cache, activations incl. the batch arena if allocated)
-    pub fn mem(&self) -> (usize, usize) { (self.kv_bytes(), self.act.borrow().length()) }
-
-    // ======================================================================== disk tier of the K/V cache (--kv-disk)
-    pub fn tier_on(&self) -> bool { self.tier.as_ref().is_some_and(|t| t.on.get()) }
-    fn kind_bufs(&self, kind: usize) -> (&RefCell<Buf>, &Cell<usize>, usize) {
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        if kind == 0 { (&self.kv_swa, &self.swa_cap, n_swa) } else { (&self.kv_full, &self.full_cap, N_SLOT - n_swa) }
-    }
-    /// what the cache would hold in memory for `n` positions without the tier, bytes
-    pub fn kv_exact_bytes(&self, n: usize) -> usize {
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        (n_swa * n.min(EXT) + (N_SLOT - n_swa) * n) * REC
-    }
-    /// bytes of the cache that are on disk only (read back for every token)
-    pub fn kv_disk_bytes(&self, n: usize) -> usize {
-        let Some(t) = &self.tier else { return 0 };
-        if !t.on.get() { return 0; }
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        let cold = |kind: usize, w0: usize| t.lo[kind].get().saturating_sub(w0);
-        (n_swa * cold(0, n.saturating_sub(EXT)) + (N_SLOT - n_swa) * cold(1, 0)) * REC
-    }
-    /// (bytes read from the K/V file, time spent reading) since the engine was loaded
-    pub fn tier_io(&self) -> (u64, std::time::Duration) { self.tier.as_ref().map_or((0, Default::default()), |t| (t.read_bytes.get(), t.read_time.get())) }
-    /// hot ring sizes (positions) and staging bytes for a context of `n` positions: together at most half of what the
-    /// cache would take in memory
-    fn tier_targets(&self, n: usize) -> (usize, usize, usize) {
-        // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
-        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
-        let c = self.kv_exact_bytes(n);
-        // staging: two halves, each at least one split of the longest attention (see `step`)
-        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
-        let hot = (c / 2).saturating_sub(s);
-        ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
-    }
-    fn tier_foff(&self, kind: usize, i: usize, p: usize) -> u64 {
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
-    }
-    fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
-    /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
-    /// the same keys in the same order)
-    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
-    /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
-    /// file is a ring of one window)
-    fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
-        let mut v = Vec::new();
-        let mut p = a;
-        while p < b { let e = if kind == 0 { b.min((p / EXT + 1) * EXT) } else { b }; v.push((self.tier_foff(kind, i, p), e - p)); p = e; }
-        v
-    }
-    /// copy one position (16 rows of 128 fp16) between two cache buffers / between a cache buffer and a file record
-    unsafe fn rows_copy(src: *const u8, i: usize, cap_s: usize, idx_s: usize, dst: *mut u8, cap_d: usize, idx_d: usize) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap_s + idx_s) * HD * 2), dst.add(((i * 2 * NKV + r) * cap_d + idx_d) * HD * 2), HD * 2); }
-    }
-    unsafe fn rows_to_rec(src: *const u8, i: usize, cap: usize, idx: usize, rec: *mut u8) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), rec.add(r * HD * 2), HD * 2); }
-    }
-    unsafe fn rec_to_rows(rec: *const u8, dst: *mut u8, i: usize, cap: usize, idx: usize) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(rec.add(r * HD * 2), dst.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), HD * 2); }
-    }
-    /// write positions [a, b) of every slot of a kind to the file; `idx(p)` is where position p sits in the kind's buffer now
-    fn tier_write(&self, kind: usize, a: usize, b: usize, idx: impl Fn(usize) -> usize) {
-        if a >= b { return; }
-        let t = self.tier.as_ref().unwrap();
-        let (buf, capc, nsl) = self.kind_bufs(kind);
-        let (src, cap) = (buf.borrow().contents().as_ptr() as *const u8, capc.get());
-        let mut recs = vec![0u8; (b - a).min(2048) * REC];
-        for i in 0..nsl {
-            let mut p = a;
-            while p < b {
-                let e = b.min(p + 2048);
-                for q in p..e { unsafe { Self::rows_to_rec(src, i, cap, idx(q), recs.as_mut_ptr().add((q - p) * REC)); } }
-                let mut o = 0;
-                for (off, n) in self.tier_pieces(kind, i, p, e) { t.file.write_all_at(&recs[o..o + n * REC], off).expect("write the K/V file"); o += n * REC; }
-                p = e;
-            }
-        }
-    }
-    /// read file pieces (offset, bytes, destination) into memory, several at a time (uncached reads; large pieces are split)
-    fn tier_read(&self, jobs: &[(u64, usize, *mut u8)]) {
-        let t = self.tier.as_ref().unwrap();
-        let t0 = std::time::Instant::now();
-        let piece: usize = std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4) << 20;
-        let nthreads: usize = std::env::var("INK_TIER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-        let mut parts: Vec<(u64, usize, usize)> = Vec::new();        // (file offset, bytes, destination address)
-        for &(off, bytes, dst) in jobs {
-            let mut o = 0;
-            while o < bytes { let n = (bytes - o).min(piece); parts.push((off + o as u64, n, dst as usize + o)); o += n; }
-        }
-        let total: usize = parts.iter().map(|p| p.1).sum();
-        let file = &t.file;
-        let read = |&(off, n, dst): &(u64, usize, usize)| {
-            let sl = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, n) };
-            file.read_exact_at(sl, off).expect("read the K/V file");
-        };
-        if parts.len() <= 1 { parts.iter().for_each(read); }
-        else {
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let (parts, next, read) = (&parts, &next, &read);
-            std::thread::scope(|sc| {
-                for _ in 0..parts.len().min(nthreads) {
-                    sc.spawn(move || loop {
-                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if k >= parts.len() { break; }
-                        read(&parts[k]);
-                    });
-                }
-            });
-        }
-        t.read_bytes.set(t.read_bytes.get() + total as u64);
-        t.read_time.set(t.read_time.get() + t0.elapsed());
-    }
-    fn tier_wait(&self) {
-        let t = self.tier.as_ref().unwrap();
-        for p in t.pending.borrow_mut().iter_mut() { if let Some(cb) = p.take() { cb.waitUntilCompleted(); } }
-    }
-    /// Start keeping only the newest positions in memory: `n` positions are cached, in the normal layout. GPU idle.
-    fn tier_enter(&self, n: usize) {
-        let t = self.tier.as_ref().unwrap();
-        if t.on.get() || n < t.min_n { return; }
-        let (hs, hf, s) = self.tier_targets(n);
-        for (kind, h) in [(0usize, hs), (1usize, hf)] {
-            let (buf, capc, nsl) = self.kind_bufs(kind);
-            let old_cap = capc.get();
-            let h = h.min(n);
-            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n - h.min(n));
-            let idx_old = |p: usize| if kind == 0 { p % old_cap } else { p };
-            // the file runs one split ahead of the hot ring's start, so a split boundary always lies where both have the keys
-            let cold = (lo + Self::split_kps(n + 1 - first) + 64).min(n);
-            self.tier_write(kind, first.max(t.filed[kind].get()), cold, idx_old);
-            t.filed[kind].set(cold.max(t.filed[kind].get()));
-            let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
-            unsafe {
-                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for i in 0..nsl { for p in lo.max(first)..n { Self::rows_copy(src, i, old_cap, idx_old(p), dst, h, p % h); } }
-            }
-            *buf.borrow_mut() = nb;
-            capc.set(h);
-            t.lo[kind].set(lo); t.cold[kind].set(cold);
-        }
-        *t.stg.borrow_mut() = self.gpu.buffer(s);
-        t.half.set(0); t.loaded.set(usize::MAX);
-        t.on.set(true);
-        t.next.set(n + 64);
-    }
-    /// Bring the whole cache back into memory in the normal layout (a prefill attends through it directly). GPU idle.
-    pub fn tier_leave(&self, n: usize) {
-        let Some(t) = &self.tier else { return };
-        if !t.on.get() { return; }
-        self.tier_wait();
-        for kind in 0..2 {
-            let (buf, capc, nsl) = self.kind_bufs(kind);
-            let (h, lo) = (capc.get(), t.lo[kind].get());
-            let first = if kind == 0 { n.saturating_sub(EXT) } else { 0 };
-            let cap = if kind == 0 { (n.min(EXT).div_ceil(64) * 64).clamp(KV_CAP0, EXT) } else { (n.div_ceil(64) * 64).clamp(KV_CAP0, self.max_ctx) };
-            let idx_new = |p: usize| if kind == 0 { p % cap } else { p };
-            let nb = self.gpu.buffer(nsl * 2 * NKV * cap * HD * 2);
-            let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-            let mut recs = vec![0u8; 2048 * REC];
-            let rp = recs.as_mut_ptr();
-            let cold_end = lo.max(first).min(n);
-            for i in 0..nsl {
-                let mut p = first;
-                while p < cold_end {
-                    let e = cold_end.min(p + 2048);
-                    let mut o = 0;
-                    let mut jobs: Vec<(u64, usize, *mut u8)> = Vec::new();
-                    for (off, k) in self.tier_pieces(kind, i, p, e) { jobs.push((off, k * REC, unsafe { rp.add(o) })); o += k * REC; }
-                    self.tier_read(&jobs);
-                    for q in p..e { unsafe { Self::rec_to_rows(rp.add((q - p) * REC), dst, i, cap, idx_new(q)); } }
-                    p = e;
-                }
-                for q in cold_end..n { unsafe { Self::rows_copy(src, i, h, q % h, dst, cap, idx_new(q)); } }
-            }
-            drop(recs);
-            *buf.borrow_mut() = nb;
-            capc.set(cap);
-        }
-        *t.stg.borrow_mut() = self.gpu.buffer(16384);
-        t.on.set(false);
-    }
-    /// forget the cache (a new session)
-    fn tier_reset(&self) {
-        let Some(t) = &self.tier else { return };
-        t.filed[0].set(0); t.filed[1].set(0);
-        if !t.on.get() { return; }
-        self.tier_wait();
-        for kind in 0..2 {
-            let (buf, capc, nsl) = self.kind_bufs(kind);
-            *buf.borrow_mut() = self.gpu.buffer(nsl * 2 * NKV * KV_CAP0 * HD * 2);
-            capc.set(KV_CAP0);
-        }
-        *t.stg.borrow_mut() = self.gpu.buffer(16384);
-        t.on.set(false);
-    }
-    /// Make room for the step at `pos` (positions 0..pos are cached). Nothing may be in flight on the GPU.
-    pub fn gen_reserve(&self, pos: usize) {
-        let Some(t) = &self.tier else { self.reserve(pos + 1, true); return };
-        if !t.on.get() { self.tier_enter(pos); }
-        if !t.on.get() { self.reserve(pos + 1, true); return; }
-        // the hot rings follow the context so memory stays at half of the cache
-        self.tier_wait();
-        let (hs, hf, s) = self.tier_targets(pos + 1);
-        for (kind, h) in [(0usize, hs), (1usize, hf)] {
-            let (buf, capc, nsl) = self.kind_bufs(kind);
-            let cap = capc.get();
-            if h < cap + 64 { continue; }
-            let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
-            unsafe {
-                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for i in 0..nsl { for p in t.lo[kind].get()..pos { Self::rows_copy(src, i, cap, p % cap, dst, h, p % h); } }
-            }
-            *buf.borrow_mut() = nb;
-            capc.set(h);
-        }
-        if s > t.stg.borrow().length() { *t.stg.borrow_mut() = self.gpu.buffer(s); t.half.set(0); }
-        t.next.set(pos + 64);
-    }
-    /// One decode step, committed: returns the command buffer whose completion means the step is done.
-    pub fn step(&self, pos: usize, logits: bool, argmax: bool) -> CmdBuf {
-        let cb = self.gpu.cmd();
-        if !self.tier_on() { self.encode_step(&cb, pos, logits, argmax); cb.commit(); return cb; }
-        let t = self.tier.as_ref().unwrap();
-        // Rows this step overwrites go to the file first - in fact one split earlier than that (and in batches of 16), so the
-        // keys around the hot ring's start are in both places. Rows older than 32 steps are final (2 steps are in flight).
-        for kind in 0..2 {
-            let (_, capc, _) = self.kind_bufs(kind);
-            let cap = capc.get();
-            let need = (pos + 1).saturating_sub(cap);
-            let lo = t.lo[kind].get().max(need);
-            let done = pos.saturating_sub(32);
-            let want = (lo + Self::split_kps(if kind == 0 { (pos + 1).min(EXT) } else { pos + 1 })).min(done).max(need);
-            if t.cold[kind].get() < want {
-                let upto = (want + 15).min(done).max(want);
-                self.tier_write(kind, t.cold[kind].get().max(t.filed[kind].get()), upto, |p| p % cap);
-                t.cold[kind].set(upto);
-                t.filed[kind].set(upto.max(t.filed[kind].get()));
-            }
-            t.lo[kind].set(lo);
-        }
-        // Plan this step's file reads: per layer execution the splits older than its hot ring, packed into staging halves.
-        // The layer's keys are divided into splits exactly as without the tier (same kps from the window start); the file
-        // supplies whole splits up to a boundary b that the hot ring also reaches, so every split sums the same keys in the
-        // same order as the in-memory path and the results are bit-identical.
-        let half_recs = t.stg.borrow().length() / 2 / REC;
-        let (mut plan, mut execs) = (Vec::new(), Vec::new());
-        let (mut round, mut room) = (0usize, half_recs);
-        let mut order: Vec<usize> = (0..LOOP_START).collect();
-        for pass in 0..N_PASS { for ip in LOOP_START..LOOP_END { order.push(slot_of(pass, ip)); } }
-        order.extend(LOOP_END..N_PHYS);
-        for (exec, &slot) in order.iter().enumerate() {
-            let (swa, i) = self.slot_kind[slot];
-            let kind = if swa { 0 } else { 1 };
-            let w0 = if swa { (pos + 1).saturating_sub(EXT) } else { 0 };
-            let lo = t.lo[kind].get().max(w0);
-            let nk = pos + 1 - w0;
-            let kps = Self::split_kps(nk);
-            let b = w0 + (lo - w0).div_ceil(kps) * kps;
-            if b <= pos && b <= t.cold[kind].get().max(w0) && kps <= half_recs {
-                let (mut c, mut sp) = (w0, 0usize);
-                while c < b {
-                    if room < kps { round += 1; room = half_recs; }
-                    let ns = (room / kps).min((b - c) / kps);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + ns * kps, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
-                    c += ns * kps; sp += ns; room -= ns * kps;
-                }
-                let nsplit = nk.div_ceil(kps);
-                execs.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp });
-            } else {
-                // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
-                // keys, summed in a different grouping
-                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inkling] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
-                let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
-                let (mut c, mut sp) = (w0, 0usize);
-                while c < lo {
-                    if room < (lo - c).min(64) { round += 1; room = half_recs; }
-                    let n = room.min(lo - c);
-                    let (kps, ns) = spl(n);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
-                    c += n; sp += ns; room -= n;
-                }
-                let (kps, ns) = spl(pos + 1 - lo);
-                assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
-                execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns });
-            }
-        }
-        *t.execs.borrow_mut() = execs;
-        *t.plan.borrow_mut() = plan;
-        t.loaded.set(usize::MAX);
-        let mut cx = Cx { e: Enc::new(&cb), cb: Some(cb) };
-        self.encode_step_cx(&mut cx, pos, logits, argmax);
-        let Cx { e, cb } = cx;
-        e.end();
-        let cb = cb.unwrap();
-        cb.commit();
-        // the next step starts in the other staging half
-        let h = t.half.get();
-        t.pending.borrow_mut()[h] = Some(cb.clone());
-        t.half.set(h ^ 1);
-        cb
-    }
-    /// make the staging round of chunk `k` of the plan available: switch halves if it is a new one and read it from the file
-    fn tier_load(&self, cx: &mut Cx, k: usize) {
-        let t = self.tier.as_ref().unwrap();
-        let plan = t.plan.borrow();
-        let round = plan[k].round;
-        if t.loaded.get() == round { return; }
-        if round > 0 {
-            // hand the commands written so far to the GPU; they keep reading the half we are leaving
-            let ncb = self.gpu.cmd();
-            let oe = std::mem::replace(&mut cx.e, Enc::new(&ncb));
-            oe.end();
-            let ocb = cx.cb.replace(ncb).unwrap();
-            ocb.commit();
-            let h = t.half.get();
-            t.pending.borrow_mut()[h] = Some(ocb);
-            t.half.set(h ^ 1);
-            self.bind(&cx.e);
-        }
-        // whatever last used this half must be finished before it is overwritten
-        let h = t.half.get();
-        let prev = t.pending.borrow_mut()[h].take();
-        if let Some(cb) = prev { cb.waitUntilCompleted(); }
-        let stg = t.stg.borrow();
-        let base = unsafe { (stg.contents().as_ptr() as *mut u8).add(h * (stg.length() / 2)) };
-        let mut jobs = Vec::new();
-        for c in plan.iter().filter(|c| c.round == round) {
-            let mut o = c.off;
-            for (off, n) in self.tier_pieces(c.kind, c.i, c.c0, c.c1) { jobs.push((off, n * REC, unsafe { base.add(o) })); o += n * REC; }
-        }
-        self.tier_read(&jobs);
-        t.loaded.set(round);
-    }
-
     // ======================================================================== dev: key eviction experiments
     pub fn qcap_alloc(&self, n: usize) {
         let nf = self.slot_kind.iter().filter(|k| !k.0).count();
         *self.qcap.borrow_mut() = Some((self.gpu.buffer(nf * n * (NH * HD / 2 + NH) * 4), n));
-    }
-    /// conv state and sliding-window rings, to rerun the same decode steps
-    pub fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
-        let g = |b: &Buf| unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()).to_vec() };
-        (g(&self.cs), g(&self.kv_swa.borrow()))
-    }
-    pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.0.as_ptr(), self.cs.contents().as_ptr() as *mut u8, s.0.len());
-            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.kv_swa.borrow().contents().as_ptr() as *mut u8, s.1.len());
-        }
-    }
-    /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received
-    /// from a sample of the prompt's own queries, keep the best `keep` share per (slot, group) and optionally one summary
-    /// key (mean of the evicted keys and values, score bias ln(count)). Returns (far keys, kept per group).
-    pub fn prune_build(&self, n: usize, keep: f64, use_sum: bool, nq: usize, mode: &str) -> (usize, usize) {
-        assert!(!self.kv8 && !self.tier_on() && n > EXT);
-        let qc = self.qcap.borrow();
-        let (qbuf, ncap) = qc.as_ref().expect("qcap_alloc + prefill first");
-        let r0 = n - EXT;
-        let f = ((r0 as f64 * keep).round() as usize).min(r0);
-        let rows = f + 1;
-        let nf = self.slot_kind.iter().filter(|k| !k.0).count();
-        let bag = self.gpu.buffer(nf * 2 * NKV * rows * HD * 2);
-        let lut: Vec<f32> = (0..65536u32).map(|h| { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else if e == 31 { 0.0 } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } }).collect();
-        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-            if v == 0.0 || exp <= 0 { sign } else { let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
-                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 }; if h >= 0x7c00 { h = 0x7bff; } sign | h as u16 } };
-        let cap = self.full_cap.get();
-        let (kvp, qp, bp) = (self.kv_full.borrow().contents().as_ptr() as usize, qbuf.contents().as_ptr() as usize, bag.contents().as_ptr() as usize);
-        let per = ncap * (NH * HD / 2 + NH) * 4;
-        // sampled query positions: spread over the context, denser at the end
-        let mut qpos: Vec<usize> = (0..nq).map(|i| (n - 1) - i * (n - 1) / nq.max(1)).collect();
-        qpos.dedup();
-        let tasks: Vec<(usize, usize)> = (0..nf).flat_map(|fi| (0..NKV).map(move |g| (fi, g))).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let (lut, qpos, tasks, f2h) = (&lut, &qpos, &tasks, &f2h);
-        std::thread::scope(|sc| {
-            for _ in 0..8 { sc.spawn(|| loop {
-                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if k >= tasks.len() { break; }
-                let (fi, g) = tasks[k];
-                let row = |kv: usize, j: usize| unsafe { std::slice::from_raw_parts((kvp as *const u16).add(((fi * 2 + kv) * NKV + g) * cap * HD + j * HD), HD) };
-                let keys: Vec<f32> = (0..n).flat_map(|j| row(0, j).iter().map(|&h| lut[h as usize])).collect();
-                let mut imp = vec![0f32; n];
-                let mut sc_ = vec![0f32; n];
-                for &t in qpos.iter() { for hh in 0..3 {
-                    let h = g * 3 + hh;
-                    let q: Vec<f32> = unsafe { std::slice::from_raw_parts((qp + fi * per) as *const u16, ncap * NH * HD) }[(t * NH + h) * HD..(t * NH + h + 1) * HD].iter().map(|&x| lut[x as usize]).collect();
-                    let sink = unsafe { *((qp + fi * per + ncap * NH * HD * 2) as *const f32).add(t * NH + h) };
-                    let mut m = sink;
-                    for j in 0..=t {
-                        let kr = &keys[j * HD..(j + 1) * HD];
-                        let mut a = [0f32; 8];
-                        for c in (0..HD).step_by(8) { for u in 0..8 { a[u] += q[c + u] * kr[c + u]; } }
-                        let s = a.iter().sum::<f32>();
-                        sc_[j] = s; if s > m { m = s; }
-                    }
-                    let mut z = (sink - m).exp();
-                    for j in 0..=t { sc_[j] = (sc_[j] - m).exp(); z += sc_[j]; }
-                    match mode {
-                        "max" => for j in 0..=t { let p = sc_[j] / z; if p > imp[j] { imp[j] = p; } },
-                        // only what a key received while it was inside one window of the query / only from further away
-                        "near" => for j in t.saturating_sub(EXT - 1)..=t { imp[j] += sc_[j] / z; },
-                        "far" => for j in 0..=t.saturating_sub(EXT) { imp[j] += sc_[j] / z; },
-                        _ => for j in 0..=t { imp[j] += sc_[j] / z; },
-                    }
-                } }
-                if mode == "rand" { for (j, x) in imp.iter_mut().enumerate() { *x = ((j as u64 * 0x9E3779B97F4A7C15 + (k as u64) * 0xD1B54A32D192ED03) >> 40) as f32; } }
-                let mut order: Vec<usize> = (0..r0).collect();
-                order.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
-                let mut kept: Vec<usize> = order[..f].to_vec();
-                kept.sort();
-                let out = |kv: usize, r: usize| unsafe { std::slice::from_raw_parts_mut((bp as *mut u16).add(((fi * 2 + kv) * NKV + g) * rows * HD + r * HD), HD) };
-                for kv in 0..2 {
-                    for (r, &j) in kept.iter().enumerate() { out(kv, r).copy_from_slice(row(kv, j)); }
-                    let mut mean = vec![0f64; HD];
-                    for &j in &order[f..] { for (mm, &h) in mean.iter_mut().zip(row(kv, j)) { *mm += lut[h as usize] as f64; } }
-                    let cnt = (r0 - f).max(1) as f64;
-                    for (o, mm) in out(kv, f).iter_mut().zip(&mean) { *o = f2h((*mm / cnt) as f32); }
-                }
-            }); }
-        });
-        drop(qc);
-        *self.prune.borrow_mut() = Some(Prune { bag, rows, r0, lastbias: ((r0 - f).max(1) as f32).ln(), use_sum: use_sum && r0 > f });
-        (r0, f)
-    }
-    /// dev: how peaked is full attention? After a prefill of `n` tokens (tail mode off) the arena still holds the last layer's
-    /// prepared queries. For the last `nq` query tokens and every head: how many of its keys score within `margin` logits of
-    /// the best one (keys further down contribute less than e^-margin of it). Relative bias is ignored (it only exists within
-    /// 1024 tokens). Returns per margin the mean fraction of keys that are within it, and the worst head's fraction.
-    pub fn kv_screen(&self, n: usize, nq: usize, margins: &[f32]) -> Vec<(f32, f64, f64)> {
-        assert!(!self.kv8, "this dev tool reads the fp16 cache");
-        let b = self.ba.get();
-        let slot = N_PHYS - 1;
-        assert!(!self.slot_kind[slot].0, "last layer is expected to be a full-attention layer");
-        let (kb, _, cap) = self.kv_slot(slot);
-        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
-        let kv = self.kv_full.borrow();
-        let kp = kv.contents().as_ptr() as *const u16;
-        let act = self.act.borrow();
-        let qp = unsafe { (act.contents().as_ptr() as *const u16).add(b.qp as usize * 2) };
-        let sink = unsafe { (act.contents().as_ptr() as *const f32).add(b.sink as usize) };
-        let mut within = vec![(0.0f64, 0.0f64); margins.len()];
-        let mut cnt = 0usize;
-        for g in 0..NKV {
-            // keys of this group as f32
-            let keys: Vec<f32> = (0..n * HD).map(|i| h2f(unsafe { *kp.add(kb as usize + g * cap as usize * HD + i) })).collect();
-            for t in n - nq..n { for hh in 0..3 {
-                let h = g * 3 + hh;
-                let q: Vec<f32> = (0..HD).map(|d| h2f(unsafe { *qp.add((t * NH + h) * HD + d) })).collect();
-                let sc: Vec<f32> = (0..=t).map(|j| { let k = &keys[j * HD..(j + 1) * HD]; q.iter().zip(k).map(|(a, c)| a * c).sum::<f32>() }).collect();
-                let m = sc.iter().cloned().fold(unsafe { *sink.add(t * NH + h) }, f32::max);
-                for (i, &mg) in margins.iter().enumerate() {
-                    let f = sc.iter().filter(|&&x| x > m - mg).count() as f64 / sc.len() as f64;
-                    within[i].0 += f; within[i].1 = within[i].1.max(f);
-                }
-                cnt += 1;
-            } }
-        }
-        margins.iter().zip(within).map(|(&m, (s, w))| (m, s / cnt as f64, w)).collect()
-    }
-    /// dev: what would storing the cache at `bits` per value cost in accuracy? Rounds the keys and values of positions
-    /// [from, to) in place to a per-vector linear grid (the storage stays fp16; nothing gets smaller). kbits / vbits = 0: untouched.
-    pub fn kv_quant_sim(&self, from: usize, to: usize, kbits: u32, vbits: u32) {
-        assert!(!self.kv8, "this dev tool reads the fp16 cache");
-        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
-        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-            if v == 0.0 || exp <= 0 { sign } else {
-                let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
-                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 };
-                if h >= 0x7c00 { h = 0x7bff; }
-                sign | h as u16 } };
-        for slot in 0..N_SLOT {
-            let (is_swa, _) = self.slot_kind[slot];
-            let (kb, vb, cap) = self.kv_slot(slot);
-            let buf = if is_swa { self.kv_swa.borrow() } else { self.kv_full.borrow() };
-            let base = buf.contents().as_ptr() as *mut u16;
-            for (b, bits) in [(kb, kbits), (vb, vbits)] {
-                if bits == 0 { continue; }
-                let lv = ((1u32 << (bits - 1)) - 1) as f32;
-                for g in 0..NKV { for pos in from.max(if is_swa { to.saturating_sub(EXT) } else { 0 })..to {
-                    let idx = if is_swa { pos % cap as usize } else { pos };
-                    let row = unsafe { std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD) };
-                    let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
-                    if bits >= 100 {
-                        // floating formats: 100 + m = round every value to m mantissa bits; 200 + m = the same with a 3-bit exponent
-                        // (binades [0.25, 32), fixed step 2^-(m+2) below)
-                        let (m, lim) = ((bits % 100) as i32, bits >= 200);
-                        for (r, &x) in row.iter_mut().zip(&v) {
-                            if x == 0.0 { continue; }
-                            let mut e = x.abs().log2().floor() as i32;
-                            if lim { e = e.clamp(-2, 4); }
-                            let q = 2f32.powi(e - m);
-                            let mut y = (x / q).round() * q;
-                            if lim { y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q); }
-                            *r = f2h(y);
-                        }
-                        continue;
-                    }
-                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
-                    if mx == 0.0 { continue; }
-                    for (r, x) in row.iter_mut().zip(&v) { *r = f2h((x / mx * lv).round() * mx / lv); }
-                } }
-            }
-        }
-    }
-    /// dev: raw bytes of the K/V cache holding real keys after `n` positions: (sliding-window rings, full-attention rows)
-    pub fn kv_dump(&self, n: usize) -> (Vec<u8>, Vec<u8>) {
-        assert!(!self.kv8, "this dev tool reads the fp16 cache");
-        let (mut swa, mut full) = (Vec::new(), Vec::new());
-        for slot in 0..N_SLOT {
-            let (is_swa, _) = self.slot_kind[slot];
-            let (kb, vb, cap) = self.kv_slot(slot);
-            let buf = if is_swa { self.kv_swa.borrow() } else { self.kv_full.borrow() };
-            let base = buf.contents().as_ptr() as *const u8;
-            let rows = if is_swa { n.min(EXT) } else { n };
-            for b in [kb, vb] { for g in 0..NKV {
-                let sl = unsafe { std::slice::from_raw_parts(base.add((b as usize + g * cap as usize * HD) * 2), rows * HD * 2) };
-                if is_swa { swa.extend_from_slice(sl); } else { full.extend_from_slice(sl); }
-            } }
-        }
-        (swa, full)
-    }
-
-    pub fn reset(&self) {
-        self.tier_reset();
-        unsafe { std::ptr::write_bytes(self.cs.contents().as_ptr() as *mut u8, 0, self.cs.length()); }
-    }
-
-    pub fn set_tokens(&self, start: usize, toks: &[u32]) {
-        let p = self.toks.contents().as_ptr() as *mut i32;
-        for (i, &t) in toks.iter().enumerate() { unsafe { *p.add(start + i) = t as i32; } }
     }
     pub fn arena(&self, off: u32, n: usize) -> Vec<f32> {
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off as usize), n).to_vec() }
@@ -1175,7 +613,7 @@ impl Engine {
             let out_off = self.ba.get().yd;
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             e.pso(&self.gpu.pso("k_layout_sg")); e.bytes(&out_off, 5);
             e.dispatch((1, 1, 1), 32);
             e.end(); cb.commit(); cb.waitUntilCompleted();
@@ -1196,7 +634,7 @@ impl Engine {
             let out_off = self.ba.get().yd;
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             e.pso(&self.gpu.pso("k_layout_att")); e.bytes(&out_off, 5);
             e.dispatch((1, 1, 1), 256);
             e.end(); cb.commit(); cb.waitUntilCompleted();
@@ -1212,7 +650,6 @@ impl Engine {
         }
         true
     }
-    pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
     pub fn logits(&self) -> &[f32] {
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(self.ar.logits as usize), self.n_vocab) }
     }
@@ -1226,7 +663,7 @@ impl Engine {
         for rep in 0..4 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             e.pso(&self.gpu.pso(name));
             let mut bytes = 0usize;
             for l in 0..N_PHYS {
@@ -1263,7 +700,7 @@ impl Engine {
         for rep in 0..4 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             let mut bytes = 0usize;
             let mut sels = Vec::new();
             for l in 0..N_PHYS {
@@ -1304,7 +741,7 @@ impl Engine {
         let chunk = 1usize << 30;
         let mut off = 0usize;
         let cb = self.gpu.cmd();
-        let e = Enc::new(&cb); self.bind(&e);
+        let e = Enc::new(&cb); self.bind_eng(&e);
         e.pso(&self.gpu.pso("k_touch"));
         while off < self.g.file_len {
             let n = chunk.min(self.g.file_len - off) / 16;
@@ -1325,7 +762,7 @@ impl Engine {
             for rep in 0..3 {
                 let off = (1u64 << 30) + rep as u64 * (1u64 << 28);
                 let cb = self.gpu.cmd();
-                let e = Enc::new(&cb); self.bind(&e);
+                let e = Enc::new(&cb); self.bind_eng(&e);
                 let ta = TouchArgs { lo: off as u32, hi: (off >> 32) as u32, n16: ((gb << 30) / 16) as u32, pad: 0 };
                 e.pso(&self.gpu.pso("k_touch")); e.bytes(&ta, 5); e.dispatch((tgs, 1, 1), 256);
                 e.end(); cb.commit(); cb.waitUntilCompleted();
@@ -1343,7 +780,7 @@ impl Engine {
         for rep in 0..5 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             let mut bytes = 0usize;
             for l in 0..N_PHYS {
                 for it in 0..2 {
@@ -1394,7 +831,7 @@ impl Engine {
         for _ in 0..3 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             let tt = t as u32;
             let mut flops = 0.0;
             for l in &self.layers {
@@ -1424,7 +861,7 @@ impl Engine {
             for _ in 0..3 {
                 let cb = self.gpu.cmd();
                 let e = Enc::new(&cb);
-                self.bind(&e);
+                self.bind_eng(&e);
                 for l in &self.layers {
                     for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
                         let g = if which == 0 { MoeGemmHArgs {
@@ -1461,7 +898,7 @@ impl Engine {
         for _ in 0..3 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             let tt = t as u32;
             for _ in 0..8 {
                 let sg = GSeg { k: E as u32, in_off: b.inp[0], out_off: b.gain_o[0], ldo: rows as u32, nrows: rows as u32, ..Default::default() };
@@ -1492,7 +929,7 @@ impl Engine {
             for _ in 0..3 {
                 let cb = self.gpu.cmd();
                 let e = Enc::new(&cb);
-                self.bind(&e);
+                self.bind_eng(&e);
                 let tt = t as u32;
                 for _ in 0..8 {
                     let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
@@ -1522,7 +959,7 @@ impl Engine {
         for _ in 0..3 {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
-            self.bind(&e);
+            self.bind_eng(&e);
             let tt = (t | nact << 16) as u32;
             let mut flops = 0.0;
             for l in &self.layers {
@@ -1540,9 +977,9 @@ impl Engine {
         best
     }
 
-    fn bind(&self, e: &Enc) {
-        e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.kv_swa.borrow(), 0, 3); e.buf(&self.cs, 0, 4); e.buf(&self.toks, 0, 6);
-        e.buf(&self.ctr, 0, 7);
+    /// bind the engine's buffers: weights, parameters, scratch arenas, counters
+    fn bind_eng(&self, e: &Enc) {
+        e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.ctr, 0, 7);
     }
 
     fn seg(w: &QW, in_off: u32, out_off: u32) -> Seg {
@@ -1625,214 +1062,6 @@ impl Engine {
         self.go(e, C_CTRLA, "k_ctrl_apply", &a, (E / 32, jobs.len(), 1), 256);
     }
 
-    /// Encode one full decode step for token at `pos` (input token read from toks[pos]).
-    /// If `logits` is set, also computes lm_head and writes argmax to toks[pos+1].
-    pub fn encode_step(&self, cb: &CmdBuf, pos: usize, logits: bool, argmax: bool) {
-        assert!(!self.tier_on(), "with the disk tier a step spans several command buffers: use step()");
-        assert!(pos < self.kv_capacity(), "K/V capacity: call reserve() first");
-        let mut cx = Cx { e: Enc::new(cb), cb: None };
-        self.encode_step_cx(&mut cx, pos, logits, argmax);
-        cx.e.end();
-    }
-    fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
-        let e = &cx.e;
-        self.bind(e);
-        let ar = self.ar;
-        // embedding -> vec 0 (x0)
-        let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                             norm_off: self.tok_norm, out0: Arena::vec(0), out1: Arena::vec(0), tok_index: pos as u32, eps: self.eps };
-        self.go(e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
-
-        self.done.set(0);
-        let mut va = VecAlloc { next: 1, n: N_VEC };
-        let mut blocks: Vec<usize> = Vec::new();
-        let mut cur = 0usize;
-        for ip in 0..LOOP_START { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
-        let prelude = cur;
-        let prelude_blocks = blocks.clone();
-        let mut bank = (0usize, 0usize);
-        for pass in 0..N_PASS {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
-            let msg = if pass > 0 { Some(bank) } else { None };
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END {
-                cur = self.layer(cx, pos, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned);
-            }
-            bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
-        }
-        for ip in LOOP_END..N_PHYS { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
-
-        let e = &cx.e;
-        if logits {
-            let mut st = blocks.clone(); st.push(cur);
-            let j = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
-            self.mix(e, C_OMIX, &[j]);
-            self.mv(e, C_LMHEAD, &[Self::seg(&self.output, ar.fout, ar.logits)]);
-        }
-        if logits && argmax {
-            let nparts = 128u32;
-            let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: pos as u32 + 1, pad: [0; 3] };
-            self.go(e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
-            self.go(e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn layer(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-             msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
-        if self.done.get() >= self.stop.get() { return cur; }
-        self.done.set(self.done.get() + 1);
-        let e = &cx.e;
-        let l = &self.layers[ip];
-        let ar = self.ar;
-        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
-        let cs_slot = (slot * NCH * 3) as u32;
-
-        // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
-        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
-        let mut st = blocks.clone(); st.push(cur);
-        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
-        let xin: [u32; 3];
-        if let Some(lw) = ctl {
-            let (b0, b1) = msg.unwrap();
-            // raw mixed inputs u_j -> inp[j]; RMSNorm'd copies -> cat[j][0:E]; messages m_j -> msg[j], normalized -> cat[j][E:2E]
-            let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
-            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
-            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
-            let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
-            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
-            self.mix(e, C_MIXA, &[ja, jm]);
-            let mut cj = Vec::new();
-            for j in 0..3 {
-                let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
-                cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
-                                  forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
-            }
-            self.ctrl_dec(e, &cj);
-            xin = ar.cin;
-        } else {
-            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
-            self.mix(e, C_MIXA, &[self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn)]);
-            xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
-        }
-        // ---- fused projections (one dispatch)
-        let mut segs = vec![Self::seg(&l.wq, xin[0], ar.q), Self::seg(&l.wgate, xin[0], ar.gate), Self::seg(&l.wrel, xin[0], ar.rel),
-                            Self::seg(&l.wsink, xin[0], ar.sink), Self::seg(&l.wk, xin[1], ar.k), Self::seg(&l.wv, xin[2], ar.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Self::seg(kp, xin[1], ar.kdyn)); segs.push(Self::seg(vp, xin[2], ar.vdyn)); }
-        self.mv(e, C_QKV, &segs);
-        // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
-        let (kb, vb, kcap) = self.kv_slot(slot);
-        let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
-        let base = AttnArgs {
-            pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
-            q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
-            kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
-            kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
-            ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
-        };
-        let nsplit;
-        if self.tier_on() {
-            // disk tier: the keys older than the hot ring come from the file (staged in chunks, each its own dispatch writing
-            // its share of the split partials); the hot ring is one more dispatch and also stores this token's K/V
-            let t = self.tier.as_ref().unwrap();
-            let exec = self.done.get() - 1;
-            let x = t.execs.borrow()[exec];
-            let chunks: Vec<(usize, Chunk)> = t.plan.borrow().iter().cloned().enumerate().filter(|(_, c)| c.exec == exec).collect();
-            for (k, c) in chunks {
-                self.tier_load(cx, k);
-                let e = &cx.e;
-                let off = ((t.half.get() * (t.stg.borrow().length() / 2) + c.off) / 2) as u32;       // in fp16 elements
-                let a = AttnArgs { nkeys: (c.c1 - c.c0) as u32, first_pos: c.c0 as u32, ring: 0, idx0: c.c0 as u32, k_base: off, v_base: off + (NKV * HD) as u32,
-                                   gstr: HD as u32, istr: (2 * NKV * HD) as u32, kps: c.kps as u32, nsplit: x.nsplit as u32, sp0: c.sp0 as u32, noown: 1, pad: 1, ..base };
-                e.buf(&t.stg.borrow(), 0, 3);
-                self.go(e, C_ATTN, "k_attn", &a, (c.ns, NKV, 1), 128);
-            }
-            let e = &cx.e;
-            let a = AttnArgs { nkeys: (pos + 1 - x.b) as u32, first_pos: x.b as u32, ring: 1, kps: x.kps as u32, nsplit: x.nsplit as u32, sp0: x.sp0 as u32, pad: 1, ..base };
-            self.bind_kv(e, l.swa);
-            self.go(e, C_ATTN, "k_attn", &a, (x.ns, NKV, 1), 128);
-            let total = x.nsplit;
-            nsplit = total;
-        } else if let (false, Some(pr)) = (l.swa, self.prune.borrow().as_ref()) {
-            // dev: far keys from the selection, recent keys from the cache
-            let fi = self.slot_kind[slot].1;
-            let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
-            let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
-            let ((k1, n1), (k2, n2)) = (if nb > 0 { spl(nb) } else { (32, 0) }, spl(pos + 1 - pr.r0));
-            if nb > 0 {
-                let kb2 = (fi * 2 * NKV * pr.rows * HD) as u32;
-                let a = AttnArgs { nkeys: nb as u32, first_pos: 0, ring: 0, cap: pr.rows as u32, k_base: kb2, v_base: kb2 + (NKV * pr.rows * HD) as u32,
-                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1,
-                                   lastbias: if pr.use_sum { pr.lastbias } else { 0.0 }, ..base };
-                e.buf(&pr.bag, 0, 3);
-                self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
-            }
-            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1, ..base };
-            self.bind_kv(e, false);
-            self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
-            nsplit = n1 + n2;
-        } else {
-            // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
-            self.bind_kv(e, l.swa);
-            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-            let kps = Self::split_kps(nkeys);
-            nsplit = nkeys.div_ceil(kps);
-            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                pad: self.sep_comb as u32, ..base };
-            self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
-        }
-        let e = &cx.e;
-        if self.sep_comb || self.tier_on() || self.prune.borrow().is_some() {
-            let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
-            self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
-        }
-        // ---- output projection + post-conv (+ residual unless this layer starts a new block)
-        let block_start = ip % BLOCK == 0;
-        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
-        let mid = va.alloc(&live);
-        let mut so = Self::seg(&l.wo, ar.attn_g, Arena::vec(mid));
-        so.epi = 1; so.res_off = if block_start { -1 } else { Arena::vec(cur) as i32 };
-        so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
-        self.mv(e, C_WO, &[so]);
-        if block_start { blocks.push(cur); }
-        // ---- FFN input: depth mix (+ control) -> normalized
-        let mut st = blocks.clone(); st.push(mid);
-        let x_off = if let Some(lw) = ctl {
-            let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
-            jf.ncopy[0][0] = ar.cat[3] as i32;
-            self.mix(e, C_MIXF, &[jf]);
-            self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
-                                         forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
-            ar.finc
-        } else {
-            self.mix(e, C_MIXF, &[self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32])]);
-            ar.fin
-        };
-        // ---- router with fused top-k (last threadgroup)
-        let sel = ar.sel_log + ((self.done.get() - 1) * 16) as u32;
-        let rpost = MvArgs { post: (!self.sep_topk) as u32, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
-        self.mv_post(e, C_ROUTER, &[Self::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost);
-        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
-        let out = va.alloc(&live);
-        let topk_args = MoeArgs { logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
-        if self.sep_topk { self.go(e, C_ROUTER, "k_topk", &topk_args, (1, 1, 1), 32); }
-        let ma = MoeArgs {
-            logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off,
-            norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
-            gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
-            act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
-            dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
-            dn_type: l.dn.ty, out_off: Arena::vec(out), res_off: Arena::vec(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-            convw_off: l.ffn_post_conv, pad: [0; 3],
-        };
-        // ---- experts
-        self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
-        self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
-        self.last_out.set(out); self.last_mid.set(mid);
-        out
-    }
-
-    // ======================================================================== batched prefill
     fn gemm(&self, e: &Enc, cls: u32, segs: &[GSeg], t: usize) {
         let mut a = GemmArgs { nseg: segs.len() as u32, t: t as u32, ..Default::default() };
         let mut tiles = 0u32;
@@ -1911,6 +1140,819 @@ impl Engine {
                in_off, out_off, ldo: w.rows, ..Default::default() }
     }
 
+}
+
+/// The engine working on one lane: every method that reads or writes a stream's state (its K/V cache, convolution
+/// rows, tokens, disk tier) lives here; the weights, kernels and scratch arenas are the engine's, reached through Deref.
+impl<'a> Run<'a> {
+    /// bind everything a kernel may read: the engine's buffers and this lane's cache, convolution rows and tokens
+    fn bind(&self, e: &Enc) {
+        self.bind_eng(e);
+        e.buf(&self.lane.kv_swa.borrow(), 0, 3); e.buf(&self.lane.cs, 0, 4); e.buf(&self.lane.toks, 0, 6);
+    }
+    /// (k_base, v_base, cap) of a slot's K/V inside its buffer (offsets in cache elements: fp16, or bytes with --kv8)
+    fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
+        let (swa, i) = self.slot_kind[slot];
+        let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };
+        ((i * 2 * NKV * cap * HD) as u32, ((i * 2 + 1) * NKV * cap * HD) as u32, cap as u32)
+    }
+    /// bind the K/V buffer a layer's kernels address through buffer 3
+    fn bind_kv(&self, e: &Enc, swa: bool) { if swa { e.buf(&self.lane.kv_swa.borrow(), 0, 3); } else { e.buf(&self.lane.kv_full.borrow(), 0, 3); } }
+    /// positions the K/V cache can hold right now
+    pub fn kv_capacity(&self) -> usize { if self.lane.swa_cap.get() >= EXT { self.lane.full_cap.get() } else { self.lane.swa_cap.get().min(self.lane.full_cap.get()) } }
+    /// first position a generation loop must call `gen_reserve` for (with an idle GPU) before it may run that step
+    pub fn gen_capacity(&self) -> usize {
+        match &self.lane.tier { Some(t) if t.on.get() => t.next.get(), Some(t) => self.kv_capacity().min(t.min_n), None => self.kv_capacity() }
+    }
+    /// bytes of K/V cache held in memory (with the disk tier: the hot rings and the read staging)
+    pub fn kv_bytes(&self) -> usize {
+        self.lane.kv_swa.borrow().length() + self.lane.kv_full.borrow().length() + self.lane.tier.as_ref().map_or(0, |t| if t.on.get() { t.stg.borrow().length() } else { 0 })
+    }
+    /// Make room for `n` positions in the K/V cache (no-op if they fit). Nothing may be in flight on the GPU.
+    /// Sliding-window layers keep one window (their ring is linear until the context reaches it, so it can grow like the
+    /// full-attention rows); `headroom` adds slack for the tokens about to be generated so growth stays rare.
+    pub fn reserve(&self, n: usize, headroom: bool) {
+        assert!(n <= self.max_ctx, "context full ({} tokens)", self.max_ctx);
+        let grow = |buf: &std::cell::RefCell<Buf>, capc: &std::cell::Cell<usize>, need: usize, limit: usize, nslots: usize| {
+            let old = capc.get();
+            if need <= old { return; }
+            // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
+            let (hd, hm) = std::env::var("INK_HEADROOM").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))).unwrap_or((16, 0));
+            let want = if headroom { need + (need / hd).max(hm) } else { need };
+            let cap = (want.div_ceil(64) * 64).min(limit);
+            let eb = self.kvb;
+            let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
+            // every (slot, K|V, group) row block moves to its place in the larger layout
+            unsafe {
+                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
+                for blk in 0..nslots * 2 * NKV { std::ptr::copy_nonoverlapping(src.add(blk * old * HD * eb), dst.add(blk * cap * HD * eb), old * HD * eb); }
+            }
+            *buf.borrow_mut() = nb;
+            capc.set(cap);
+        };
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        grow(&self.lane.kv_swa, &self.lane.swa_cap, n.min(EXT), EXT, n_swa);
+        grow(&self.lane.kv_full, &self.lane.full_cap, n, self.max_ctx, N_SLOT - n_swa);
+    }
+    /// Allocate everything a prefill of `t` tokens ending at context length `n` needs and let the GPU map it now.
+    /// The first use of a new buffer costs ~20 ms per GiB; a caller that knows its prompt before it starts the clock
+    /// (one-shot runs: while the model loads) pays that here instead of inside the prefill.
+    pub fn prepare(&self, n: usize, t: usize) {
+        self.reserve(n + 1, true);
+        self.ensure_batch(t.min(self.chunk));
+        let cb = self.gpu.cmd();
+        let e = Enc::new(&cb);
+        self.bind(&e);
+        // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
+        let b = self.ba.get();
+        let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
+                             kpos0: 0, to_ring: 0, pad: [0; 2] };
+        e.pso(&self.gpu.pso("k_kvcopy")); e.bytes(&a, 5);
+        self.bind_kv(&e, true); e.dispatch((1, 1, 1), 32);
+        e.barrier();
+        self.bind_kv(&e, false); e.dispatch((1, 1, 1), 32);
+        e.end(); cb.commit(); cb.waitUntilCompleted();
+    }
+    /// bytes of GPU working memory besides the weights: (K/V cache, activations incl. the batch arena if allocated)
+    pub fn mem(&self) -> (usize, usize) { (self.kv_bytes(), self.act.borrow().length()) }
+
+    // ======================================================================== disk tier of the K/V cache (--kv-disk)
+    pub fn tier_on(&self) -> bool { self.lane.tier.as_ref().is_some_and(|t| t.on.get()) }
+    fn kind_bufs(&self, kind: usize) -> (&RefCell<Buf>, &Cell<usize>, usize) {
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        if kind == 0 { (&self.lane.kv_swa, &self.lane.swa_cap, n_swa) } else { (&self.lane.kv_full, &self.lane.full_cap, N_SLOT - n_swa) }
+    }
+    /// what the cache would hold in memory for `n` positions without the tier, bytes
+    pub fn kv_exact_bytes(&self, n: usize) -> usize {
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        (n_swa * n.min(EXT) + (N_SLOT - n_swa) * n) * REC
+    }
+    /// bytes of the cache that are on disk only (read back for every token)
+    pub fn kv_disk_bytes(&self, n: usize) -> usize {
+        let Some(t) = &self.lane.tier else { return 0 };
+        if !t.on.get() { return 0; }
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let cold = |kind: usize, w0: usize| t.lo[kind].get().saturating_sub(w0);
+        (n_swa * cold(0, n.saturating_sub(EXT)) + (N_SLOT - n_swa) * cold(1, 0)) * REC
+    }
+    /// (bytes read from the K/V file, time spent reading) since the engine was loaded
+    pub fn tier_io(&self) -> (u64, std::time::Duration) { self.lane.tier.as_ref().map_or((0, Default::default()), |t| (t.read_bytes.get(), t.read_time.get())) }
+    /// hot ring sizes (positions) and staging bytes for a context of `n` positions: together at most half of what the
+    /// cache would take in memory
+    fn tier_targets(&self, n: usize) -> (usize, usize, usize) {
+        // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
+        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
+        let c = self.kv_exact_bytes(n);
+        // staging: two halves, each at least one split of the longest attention (see `step`)
+        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
+        let hot = (c / 2).saturating_sub(s);
+        ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
+    }
+    fn tier_foff(&self, kind: usize, i: usize, p: usize) -> u64 {
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
+    }
+    fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
+    /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
+    /// the same keys in the same order)
+    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
+    /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
+    /// file is a ring of one window)
+    fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
+        let mut v = Vec::new();
+        let mut p = a;
+        while p < b { let e = if kind == 0 { b.min((p / EXT + 1) * EXT) } else { b }; v.push((self.tier_foff(kind, i, p), e - p)); p = e; }
+        v
+    }
+    /// copy one position (16 rows of 128 fp16) between two cache buffers / between a cache buffer and a file record
+    unsafe fn rows_copy(src: *const u8, i: usize, cap_s: usize, idx_s: usize, dst: *mut u8, cap_d: usize, idx_d: usize) {
+        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap_s + idx_s) * HD * 2), dst.add(((i * 2 * NKV + r) * cap_d + idx_d) * HD * 2), HD * 2); }
+    }
+    unsafe fn rows_to_rec(src: *const u8, i: usize, cap: usize, idx: usize, rec: *mut u8) {
+        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), rec.add(r * HD * 2), HD * 2); }
+    }
+    unsafe fn rec_to_rows(rec: *const u8, dst: *mut u8, i: usize, cap: usize, idx: usize) {
+        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(rec.add(r * HD * 2), dst.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), HD * 2); }
+    }
+    /// write positions [a, b) of every slot of a kind to the file; `idx(p)` is where position p sits in the kind's buffer now
+    fn tier_write(&self, kind: usize, a: usize, b: usize, idx: impl Fn(usize) -> usize) {
+        if a >= b { return; }
+        let t = self.lane.tier.as_ref().unwrap();
+        let (buf, capc, nsl) = self.kind_bufs(kind);
+        let (src, cap) = (buf.borrow().contents().as_ptr() as *const u8, capc.get());
+        let mut recs = vec![0u8; (b - a).min(2048) * REC];
+        for i in 0..nsl {
+            let mut p = a;
+            while p < b {
+                let e = b.min(p + 2048);
+                for q in p..e { unsafe { Self::rows_to_rec(src, i, cap, idx(q), recs.as_mut_ptr().add((q - p) * REC)); } }
+                let mut o = 0;
+                for (off, n) in self.tier_pieces(kind, i, p, e) { t.file.write_all_at(&recs[o..o + n * REC], off).expect("write the K/V file"); o += n * REC; }
+                p = e;
+            }
+        }
+    }
+    /// read file pieces (offset, bytes, destination) into memory, several at a time (uncached reads; large pieces are split)
+    fn tier_read(&self, jobs: &[(u64, usize, *mut u8)]) {
+        let t = self.lane.tier.as_ref().unwrap();
+        let t0 = std::time::Instant::now();
+        let piece: usize = std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4) << 20;
+        let nthreads: usize = std::env::var("INK_TIER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let mut parts: Vec<(u64, usize, usize)> = Vec::new();        // (file offset, bytes, destination address)
+        for &(off, bytes, dst) in jobs {
+            let mut o = 0;
+            while o < bytes { let n = (bytes - o).min(piece); parts.push((off + o as u64, n, dst as usize + o)); o += n; }
+        }
+        let total: usize = parts.iter().map(|p| p.1).sum();
+        let file = &t.file;
+        let read = |&(off, n, dst): &(u64, usize, usize)| {
+            let sl = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, n) };
+            file.read_exact_at(sl, off).expect("read the K/V file");
+        };
+        if parts.len() <= 1 { parts.iter().for_each(read); }
+        else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (parts, next, read) = (&parts, &next, &read);
+            std::thread::scope(|sc| {
+                for _ in 0..parts.len().min(nthreads) {
+                    sc.spawn(move || loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k >= parts.len() { break; }
+                        read(&parts[k]);
+                    });
+                }
+            });
+        }
+        t.read_bytes.set(t.read_bytes.get() + total as u64);
+        t.read_time.set(t.read_time.get() + t0.elapsed());
+    }
+    fn tier_wait(&self) {
+        let t = self.lane.tier.as_ref().unwrap();
+        for p in t.pending.borrow_mut().iter_mut() { if let Some(cb) = p.take() { cb.waitUntilCompleted(); } }
+    }
+    /// Start keeping only the newest positions in memory: `n` positions are cached, in the normal layout. GPU idle.
+    fn tier_enter(&self, n: usize) {
+        let t = self.lane.tier.as_ref().unwrap();
+        if t.on.get() || n < t.min_n { return; }
+        let (hs, hf, s) = self.tier_targets(n);
+        for (kind, h) in [(0usize, hs), (1usize, hf)] {
+            let (buf, capc, nsl) = self.kind_bufs(kind);
+            let old_cap = capc.get();
+            let h = h.min(n);
+            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n - h.min(n));
+            let idx_old = |p: usize| if kind == 0 { p % old_cap } else { p };
+            // the file runs one split ahead of the hot ring's start, so a split boundary always lies where both have the keys
+            let cold = (lo + Self::split_kps(n + 1 - first) + 64).min(n);
+            self.tier_write(kind, first.max(t.filed[kind].get()), cold, idx_old);
+            t.filed[kind].set(cold.max(t.filed[kind].get()));
+            let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
+            unsafe {
+                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
+                for i in 0..nsl { for p in lo.max(first)..n { Self::rows_copy(src, i, old_cap, idx_old(p), dst, h, p % h); } }
+            }
+            *buf.borrow_mut() = nb;
+            capc.set(h);
+            t.lo[kind].set(lo); t.cold[kind].set(cold);
+        }
+        *t.stg.borrow_mut() = self.gpu.buffer(s);
+        t.half.set(0); t.loaded.set(usize::MAX);
+        t.on.set(true);
+        t.next.set(n + 64);
+    }
+    /// Bring the whole cache back into memory in the normal layout (a prefill attends through it directly). GPU idle.
+    pub fn tier_leave(&self, n: usize) {
+        let Some(t) = &self.lane.tier else { return };
+        if !t.on.get() { return; }
+        self.tier_wait();
+        for kind in 0..2 {
+            let (buf, capc, nsl) = self.kind_bufs(kind);
+            let (h, lo) = (capc.get(), t.lo[kind].get());
+            let first = if kind == 0 { n.saturating_sub(EXT) } else { 0 };
+            let cap = if kind == 0 { (n.min(EXT).div_ceil(64) * 64).clamp(KV_CAP0, EXT) } else { (n.div_ceil(64) * 64).clamp(KV_CAP0, self.max_ctx) };
+            let idx_new = |p: usize| if kind == 0 { p % cap } else { p };
+            let nb = self.gpu.buffer(nsl * 2 * NKV * cap * HD * 2);
+            let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
+            let mut recs = vec![0u8; 2048 * REC];
+            let rp = recs.as_mut_ptr();
+            let cold_end = lo.max(first).min(n);
+            for i in 0..nsl {
+                let mut p = first;
+                while p < cold_end {
+                    let e = cold_end.min(p + 2048);
+                    let mut o = 0;
+                    let mut jobs: Vec<(u64, usize, *mut u8)> = Vec::new();
+                    for (off, k) in self.tier_pieces(kind, i, p, e) { jobs.push((off, k * REC, unsafe { rp.add(o) })); o += k * REC; }
+                    self.tier_read(&jobs);
+                    for q in p..e { unsafe { Self::rec_to_rows(rp.add((q - p) * REC), dst, i, cap, idx_new(q)); } }
+                    p = e;
+                }
+                for q in cold_end..n { unsafe { Self::rows_copy(src, i, h, q % h, dst, cap, idx_new(q)); } }
+            }
+            drop(recs);
+            *buf.borrow_mut() = nb;
+            capc.set(cap);
+        }
+        *t.stg.borrow_mut() = self.gpu.buffer(16384);
+        t.on.set(false);
+    }
+    /// forget the cache (a new session)
+    fn tier_reset(&self) {
+        let Some(t) = &self.lane.tier else { return };
+        t.filed[0].set(0); t.filed[1].set(0);
+        if !t.on.get() { return; }
+        self.tier_wait();
+        for kind in 0..2 {
+            let (buf, capc, nsl) = self.kind_bufs(kind);
+            *buf.borrow_mut() = self.gpu.buffer(nsl * 2 * NKV * KV_CAP0 * HD * 2);
+            capc.set(KV_CAP0);
+        }
+        *t.stg.borrow_mut() = self.gpu.buffer(16384);
+        t.on.set(false);
+    }
+    /// Make room for the step at `pos` (positions 0..pos are cached). Nothing may be in flight on the GPU.
+    pub fn gen_reserve(&self, pos: usize) {
+        let Some(t) = &self.lane.tier else { self.reserve(pos + 1, true); return };
+        if !t.on.get() { self.tier_enter(pos); }
+        if !t.on.get() { self.reserve(pos + 1, true); return; }
+        // the hot rings follow the context so memory stays at half of the cache
+        self.tier_wait();
+        let (hs, hf, s) = self.tier_targets(pos + 1);
+        for (kind, h) in [(0usize, hs), (1usize, hf)] {
+            let (buf, capc, nsl) = self.kind_bufs(kind);
+            let cap = capc.get();
+            if h < cap + 64 { continue; }
+            let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
+            unsafe {
+                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
+                for i in 0..nsl { for p in t.lo[kind].get()..pos { Self::rows_copy(src, i, cap, p % cap, dst, h, p % h); } }
+            }
+            *buf.borrow_mut() = nb;
+            capc.set(h);
+        }
+        if s > t.stg.borrow().length() { *t.stg.borrow_mut() = self.gpu.buffer(s); t.half.set(0); }
+        t.next.set(pos + 64);
+    }
+    /// One decode step, committed: returns the command buffer whose completion means the step is done.
+    pub fn step(&self, pos: usize, logits: bool, argmax: bool) -> CmdBuf {
+        let cb = self.gpu.cmd();
+        if !self.tier_on() { self.encode_step(&cb, pos, logits, argmax); cb.commit(); return cb; }
+        let t = self.lane.tier.as_ref().unwrap();
+        // Rows this step overwrites go to the file first - in fact one split earlier than that (and in batches of 16), so the
+        // keys around the hot ring's start are in both places. Rows older than 32 steps are final (2 steps are in flight).
+        for kind in 0..2 {
+            let (_, capc, _) = self.kind_bufs(kind);
+            let cap = capc.get();
+            let need = (pos + 1).saturating_sub(cap);
+            let lo = t.lo[kind].get().max(need);
+            let done = pos.saturating_sub(32);
+            let want = (lo + Self::split_kps(if kind == 0 { (pos + 1).min(EXT) } else { pos + 1 })).min(done).max(need);
+            if t.cold[kind].get() < want {
+                let upto = (want + 15).min(done).max(want);
+                self.tier_write(kind, t.cold[kind].get().max(t.filed[kind].get()), upto, |p| p % cap);
+                t.cold[kind].set(upto);
+                t.filed[kind].set(upto.max(t.filed[kind].get()));
+            }
+            t.lo[kind].set(lo);
+        }
+        // Plan this step's file reads: per layer execution the splits older than its hot ring, packed into staging halves.
+        // The layer's keys are divided into splits exactly as without the tier (same kps from the window start); the file
+        // supplies whole splits up to a boundary b that the hot ring also reaches, so every split sums the same keys in the
+        // same order as the in-memory path and the results are bit-identical.
+        let half_recs = t.stg.borrow().length() / 2 / REC;
+        let (mut plan, mut execs) = (Vec::new(), Vec::new());
+        let (mut round, mut room) = (0usize, half_recs);
+        let mut order: Vec<usize> = (0..LOOP_START).collect();
+        for pass in 0..N_PASS { for ip in LOOP_START..LOOP_END { order.push(slot_of(pass, ip)); } }
+        order.extend(LOOP_END..N_PHYS);
+        for (exec, &slot) in order.iter().enumerate() {
+            let (swa, i) = self.slot_kind[slot];
+            let kind = if swa { 0 } else { 1 };
+            let w0 = if swa { (pos + 1).saturating_sub(EXT) } else { 0 };
+            let lo = t.lo[kind].get().max(w0);
+            let nk = pos + 1 - w0;
+            let kps = Self::split_kps(nk);
+            let b = w0 + (lo - w0).div_ceil(kps) * kps;
+            if b <= pos && b <= t.cold[kind].get().max(w0) && kps <= half_recs {
+                let (mut c, mut sp) = (w0, 0usize);
+                while c < b {
+                    if room < kps { round += 1; room = half_recs; }
+                    let ns = (room / kps).min((b - c) / kps);
+                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + ns * kps, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
+                    c += ns * kps; sp += ns; room -= ns * kps;
+                }
+                let nsplit = nk.div_ceil(kps);
+                execs.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp });
+            } else {
+                // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
+                // keys, summed in a different grouping
+                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inkling] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
+                let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+                let (mut c, mut sp) = (w0, 0usize);
+                while c < lo {
+                    if room < (lo - c).min(64) { round += 1; room = half_recs; }
+                    let n = room.min(lo - c);
+                    let (kps, ns) = spl(n);
+                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
+                    c += n; sp += ns; room -= n;
+                }
+                let (kps, ns) = spl(pos + 1 - lo);
+                assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
+                execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns });
+            }
+        }
+        *t.execs.borrow_mut() = execs;
+        *t.plan.borrow_mut() = plan;
+        t.loaded.set(usize::MAX);
+        let mut cx = Cx { e: Enc::new(&cb), cb: Some(cb) };
+        self.encode_step_cx(&mut cx, pos, logits, argmax);
+        let Cx { e, cb } = cx;
+        e.end();
+        let cb = cb.unwrap();
+        cb.commit();
+        // the next step starts in the other staging half
+        let h = t.half.get();
+        t.pending.borrow_mut()[h] = Some(cb.clone());
+        t.half.set(h ^ 1);
+        cb
+    }
+    /// make the staging round of chunk `k` of the plan available: switch halves if it is a new one and read it from the file
+    fn tier_load(&self, cx: &mut Cx, k: usize) {
+        let t = self.lane.tier.as_ref().unwrap();
+        let plan = t.plan.borrow();
+        let round = plan[k].round;
+        if t.loaded.get() == round { return; }
+        if round > 0 {
+            // hand the commands written so far to the GPU; they keep reading the half we are leaving
+            let ncb = self.gpu.cmd();
+            let oe = std::mem::replace(&mut cx.e, Enc::new(&ncb));
+            oe.end();
+            let ocb = cx.cb.replace(ncb).unwrap();
+            ocb.commit();
+            let h = t.half.get();
+            t.pending.borrow_mut()[h] = Some(ocb);
+            t.half.set(h ^ 1);
+            self.bind(&cx.e);
+        }
+        // whatever last used this half must be finished before it is overwritten
+        let h = t.half.get();
+        let prev = t.pending.borrow_mut()[h].take();
+        if let Some(cb) = prev { cb.waitUntilCompleted(); }
+        let stg = t.stg.borrow();
+        let base = unsafe { (stg.contents().as_ptr() as *mut u8).add(h * (stg.length() / 2)) };
+        let mut jobs = Vec::new();
+        for c in plan.iter().filter(|c| c.round == round) {
+            let mut o = c.off;
+            for (off, n) in self.tier_pieces(c.kind, c.i, c.c0, c.c1) { jobs.push((off, n * REC, unsafe { base.add(o) })); o += n * REC; }
+        }
+        self.tier_read(&jobs);
+        t.loaded.set(round);
+    }
+
+    /// conv state and sliding-window rings, to rerun the same decode steps
+    pub fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
+        let g = |b: &Buf| unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()).to_vec() };
+        (g(&self.lane.cs), g(&self.lane.kv_swa.borrow()))
+    }
+    pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.0.as_ptr(), self.lane.cs.contents().as_ptr() as *mut u8, s.0.len());
+            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8, s.1.len());
+        }
+    }
+    /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received
+    /// from a sample of the prompt's own queries, keep the best `keep` share per (slot, group) and optionally one summary
+    /// key (mean of the evicted keys and values, score bias ln(count)). Returns (far keys, kept per group).
+    pub fn prune_build(&self, n: usize, keep: f64, use_sum: bool, nq: usize, mode: &str) -> (usize, usize) {
+        assert!(!self.kv8 && !self.tier_on() && n > EXT);
+        let qc = self.qcap.borrow();
+        let (qbuf, ncap) = qc.as_ref().expect("qcap_alloc + prefill first");
+        let r0 = n - EXT;
+        let f = ((r0 as f64 * keep).round() as usize).min(r0);
+        let rows = f + 1;
+        let nf = self.slot_kind.iter().filter(|k| !k.0).count();
+        let bag = self.gpu.buffer(nf * 2 * NKV * rows * HD * 2);
+        let lut: Vec<f32> = (0..65536u32).map(|h| { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
+            if e == 0 { sg * m * 2f32.powi(-24) } else if e == 31 { 0.0 } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } }).collect();
+        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            if v == 0.0 || exp <= 0 { sign } else { let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
+                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 }; if h >= 0x7c00 { h = 0x7bff; } sign | h as u16 } };
+        let cap = self.lane.full_cap.get();
+        let (kvp, qp, bp) = (self.lane.kv_full.borrow().contents().as_ptr() as usize, qbuf.contents().as_ptr() as usize, bag.contents().as_ptr() as usize);
+        let per = ncap * (NH * HD / 2 + NH) * 4;
+        // sampled query positions: spread over the context, denser at the end
+        let mut qpos: Vec<usize> = (0..nq).map(|i| (n - 1) - i * (n - 1) / nq.max(1)).collect();
+        qpos.dedup();
+        let tasks: Vec<(usize, usize)> = (0..nf).flat_map(|fi| (0..NKV).map(move |g| (fi, g))).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (lut, qpos, tasks, f2h) = (&lut, &qpos, &tasks, &f2h);
+        std::thread::scope(|sc| {
+            for _ in 0..8 { sc.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k >= tasks.len() { break; }
+                let (fi, g) = tasks[k];
+                let row = |kv: usize, j: usize| unsafe { std::slice::from_raw_parts((kvp as *const u16).add(((fi * 2 + kv) * NKV + g) * cap * HD + j * HD), HD) };
+                let keys: Vec<f32> = (0..n).flat_map(|j| row(0, j).iter().map(|&h| lut[h as usize])).collect();
+                let mut imp = vec![0f32; n];
+                let mut sc_ = vec![0f32; n];
+                for &t in qpos.iter() { for hh in 0..3 {
+                    let h = g * 3 + hh;
+                    let q: Vec<f32> = unsafe { std::slice::from_raw_parts((qp + fi * per) as *const u16, ncap * NH * HD) }[(t * NH + h) * HD..(t * NH + h + 1) * HD].iter().map(|&x| lut[x as usize]).collect();
+                    let sink = unsafe { *((qp + fi * per + ncap * NH * HD * 2) as *const f32).add(t * NH + h) };
+                    let mut m = sink;
+                    for j in 0..=t {
+                        let kr = &keys[j * HD..(j + 1) * HD];
+                        let mut a = [0f32; 8];
+                        for c in (0..HD).step_by(8) { for u in 0..8 { a[u] += q[c + u] * kr[c + u]; } }
+                        let s = a.iter().sum::<f32>();
+                        sc_[j] = s; if s > m { m = s; }
+                    }
+                    let mut z = (sink - m).exp();
+                    for j in 0..=t { sc_[j] = (sc_[j] - m).exp(); z += sc_[j]; }
+                    match mode {
+                        "max" => for j in 0..=t { let p = sc_[j] / z; if p > imp[j] { imp[j] = p; } },
+                        // only what a key received while it was inside one window of the query / only from further away
+                        "near" => for j in t.saturating_sub(EXT - 1)..=t { imp[j] += sc_[j] / z; },
+                        "far" => for j in 0..=t.saturating_sub(EXT) { imp[j] += sc_[j] / z; },
+                        _ => for j in 0..=t { imp[j] += sc_[j] / z; },
+                    }
+                } }
+                if mode == "rand" { for (j, x) in imp.iter_mut().enumerate() { *x = ((j as u64 * 0x9E3779B97F4A7C15 + (k as u64) * 0xD1B54A32D192ED03) >> 40) as f32; } }
+                let mut order: Vec<usize> = (0..r0).collect();
+                order.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
+                let mut kept: Vec<usize> = order[..f].to_vec();
+                kept.sort();
+                let out = |kv: usize, r: usize| unsafe { std::slice::from_raw_parts_mut((bp as *mut u16).add(((fi * 2 + kv) * NKV + g) * rows * HD + r * HD), HD) };
+                for kv in 0..2 {
+                    for (r, &j) in kept.iter().enumerate() { out(kv, r).copy_from_slice(row(kv, j)); }
+                    let mut mean = vec![0f64; HD];
+                    for &j in &order[f..] { for (mm, &h) in mean.iter_mut().zip(row(kv, j)) { *mm += lut[h as usize] as f64; } }
+                    let cnt = (r0 - f).max(1) as f64;
+                    for (o, mm) in out(kv, f).iter_mut().zip(&mean) { *o = f2h((*mm / cnt) as f32); }
+                }
+            }); }
+        });
+        drop(qc);
+        *self.lane.prune.borrow_mut() = Some(Prune { bag, rows, r0, lastbias: ((r0 - f).max(1) as f32).ln(), use_sum: use_sum && r0 > f });
+        (r0, f)
+    }
+    /// dev: how peaked is full attention? After a prefill of `n` tokens (tail mode off) the arena still holds the last layer's
+    /// prepared queries. For the last `nq` query tokens and every head: how many of its keys score within `margin` logits of
+    /// the best one (keys further down contribute less than e^-margin of it). Relative bias is ignored (it only exists within
+    /// 1024 tokens). Returns per margin the mean fraction of keys that are within it, and the worst head's fraction.
+    pub fn kv_screen(&self, n: usize, nq: usize, margins: &[f32]) -> Vec<(f32, f64, f64)> {
+        assert!(!self.kv8, "this dev tool reads the fp16 cache");
+        let b = self.ba.get();
+        let slot = N_PHYS - 1;
+        assert!(!self.slot_kind[slot].0, "last layer is expected to be a full-attention layer");
+        let (kb, _, cap) = self.kv_slot(slot);
+        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
+            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
+        let kv = self.lane.kv_full.borrow();
+        let kp = kv.contents().as_ptr() as *const u16;
+        let act = self.act.borrow();
+        let qp = unsafe { (act.contents().as_ptr() as *const u16).add(b.qp as usize * 2) };
+        let sink = unsafe { (act.contents().as_ptr() as *const f32).add(b.sink as usize) };
+        let mut within = vec![(0.0f64, 0.0f64); margins.len()];
+        let mut cnt = 0usize;
+        for g in 0..NKV {
+            // keys of this group as f32
+            let keys: Vec<f32> = (0..n * HD).map(|i| h2f(unsafe { *kp.add(kb as usize + g * cap as usize * HD + i) })).collect();
+            for t in n - nq..n { for hh in 0..3 {
+                let h = g * 3 + hh;
+                let q: Vec<f32> = (0..HD).map(|d| h2f(unsafe { *qp.add((t * NH + h) * HD + d) })).collect();
+                let sc: Vec<f32> = (0..=t).map(|j| { let k = &keys[j * HD..(j + 1) * HD]; q.iter().zip(k).map(|(a, c)| a * c).sum::<f32>() }).collect();
+                let m = sc.iter().cloned().fold(unsafe { *sink.add(t * NH + h) }, f32::max);
+                for (i, &mg) in margins.iter().enumerate() {
+                    let f = sc.iter().filter(|&&x| x > m - mg).count() as f64 / sc.len() as f64;
+                    within[i].0 += f; within[i].1 = within[i].1.max(f);
+                }
+                cnt += 1;
+            } }
+        }
+        margins.iter().zip(within).map(|(&m, (s, w))| (m, s / cnt as f64, w)).collect()
+    }
+    /// dev: what would storing the cache at `bits` per value cost in accuracy? Rounds the keys and values of positions
+    /// [from, to) in place to a per-vector linear grid (the storage stays fp16; nothing gets smaller). kbits / vbits = 0: untouched.
+    pub fn kv_quant_sim(&self, from: usize, to: usize, kbits: u32, vbits: u32) {
+        assert!(!self.kv8, "this dev tool reads the fp16 cache");
+        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
+            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
+        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            if v == 0.0 || exp <= 0 { sign } else {
+                let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
+                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 };
+                if h >= 0x7c00 { h = 0x7bff; }
+                sign | h as u16 } };
+        for slot in 0..N_SLOT {
+            let (is_swa, _) = self.slot_kind[slot];
+            let (kb, vb, cap) = self.kv_slot(slot);
+            let buf = if is_swa { self.lane.kv_swa.borrow() } else { self.lane.kv_full.borrow() };
+            let base = buf.contents().as_ptr() as *mut u16;
+            for (b, bits) in [(kb, kbits), (vb, vbits)] {
+                if bits == 0 { continue; }
+                let lv = ((1u32 << (bits - 1)) - 1) as f32;
+                for g in 0..NKV { for pos in from.max(if is_swa { to.saturating_sub(EXT) } else { 0 })..to {
+                    let idx = if is_swa { pos % cap as usize } else { pos };
+                    let row = unsafe { std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD) };
+                    let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
+                    if bits >= 100 {
+                        // floating formats: 100 + m = round every value to m mantissa bits; 200 + m = the same with a 3-bit exponent
+                        // (binades [0.25, 32), fixed step 2^-(m+2) below)
+                        let (m, lim) = ((bits % 100) as i32, bits >= 200);
+                        for (r, &x) in row.iter_mut().zip(&v) {
+                            if x == 0.0 { continue; }
+                            let mut e = x.abs().log2().floor() as i32;
+                            if lim { e = e.clamp(-2, 4); }
+                            let q = 2f32.powi(e - m);
+                            let mut y = (x / q).round() * q;
+                            if lim { y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q); }
+                            *r = f2h(y);
+                        }
+                        continue;
+                    }
+                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+                    if mx == 0.0 { continue; }
+                    for (r, x) in row.iter_mut().zip(&v) { *r = f2h((x / mx * lv).round() * mx / lv); }
+                } }
+            }
+        }
+    }
+    /// dev: raw bytes of the K/V cache holding real keys after `n` positions: (sliding-window rings, full-attention rows)
+    pub fn kv_dump(&self, n: usize) -> (Vec<u8>, Vec<u8>) {
+        assert!(!self.kv8, "this dev tool reads the fp16 cache");
+        let (mut swa, mut full) = (Vec::new(), Vec::new());
+        for slot in 0..N_SLOT {
+            let (is_swa, _) = self.slot_kind[slot];
+            let (kb, vb, cap) = self.kv_slot(slot);
+            let buf = if is_swa { self.lane.kv_swa.borrow() } else { self.lane.kv_full.borrow() };
+            let base = buf.contents().as_ptr() as *const u8;
+            let rows = if is_swa { n.min(EXT) } else { n };
+            for b in [kb, vb] { for g in 0..NKV {
+                let sl = unsafe { std::slice::from_raw_parts(base.add((b as usize + g * cap as usize * HD) * 2), rows * HD * 2) };
+                if is_swa { swa.extend_from_slice(sl); } else { full.extend_from_slice(sl); }
+            } }
+        }
+        (swa, full)
+    }
+
+    pub fn reset(&self) {
+        self.tier_reset();
+        unsafe { std::ptr::write_bytes(self.lane.cs.contents().as_ptr() as *mut u8, 0, self.lane.cs.length()); }
+    }
+
+    pub fn set_tokens(&self, start: usize, toks: &[u32]) {
+        let p = self.lane.toks.contents().as_ptr() as *mut i32;
+        for (i, &t) in toks.iter().enumerate() { unsafe { *p.add(start + i) = t as i32; } }
+    }
+    pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.lane.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
+    /// Encode one full decode step for token at `pos` (input token read from toks[pos]).
+    /// If `logits` is set, also computes lm_head and writes argmax to toks[pos+1].
+    pub fn encode_step(&self, cb: &CmdBuf, pos: usize, logits: bool, argmax: bool) {
+        assert!(!self.tier_on(), "with the disk tier a step spans several command buffers: use step()");
+        assert!(pos < self.kv_capacity(), "K/V capacity: call reserve() first");
+        let mut cx = Cx { e: Enc::new(cb), cb: None };
+        self.encode_step_cx(&mut cx, pos, logits, argmax);
+        cx.e.end();
+    }
+    fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
+        let e = &cx.e;
+        self.bind(e);
+        let ar = self.ar;
+        // embedding -> vec 0 (x0)
+        let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
+                             norm_off: self.tok_norm, out0: Arena::vec(0), out1: Arena::vec(0), tok_index: pos as u32, eps: self.eps };
+        self.go(e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
+
+        self.done.set(0);
+        let mut va = VecAlloc { next: 1, n: N_VEC };
+        let mut blocks: Vec<usize> = Vec::new();
+        let mut cur = 0usize;
+        for ip in 0..LOOP_START { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
+        let prelude = cur;
+        let prelude_blocks = blocks.clone();
+        let mut bank = (0usize, 0usize);
+        for pass in 0..N_PASS {
+            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            let msg = if pass > 0 { Some(bank) } else { None };
+            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            for ip in LOOP_START..LOOP_END {
+                cur = self.layer(cx, pos, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned);
+            }
+            bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
+        }
+        for ip in LOOP_END..N_PHYS { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
+
+        let e = &cx.e;
+        if logits {
+            let mut st = blocks.clone(); st.push(cur);
+            let j = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
+            self.mix(e, C_OMIX, &[j]);
+            self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
+        }
+        if logits && argmax {
+            let nparts = 128u32;
+            let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: pos as u32 + 1, pad: [0; 3] };
+            self.go(e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+            self.go(e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layer(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+             msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
+        if self.done.get() >= self.stop.get() { return cur; }
+        self.done.set(self.done.get() + 1);
+        let e = &cx.e;
+        let l = &self.layers[ip];
+        let ar = self.ar;
+        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
+        let cs_slot = (slot * NCH * 3) as u32;
+
+        // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
+        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
+        let mut st = blocks.clone(); st.push(cur);
+        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
+        let xin: [u32; 3];
+        if let Some(lw) = ctl {
+            let (b0, b1) = msg.unwrap();
+            // raw mixed inputs u_j -> inp[j]; RMSNorm'd copies -> cat[j][0:E]; messages m_j -> msg[j], normalized -> cat[j][E:2E]
+            let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
+            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
+            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
+            let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
+            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
+            self.mix(e, C_MIXA, &[ja, jm]);
+            let mut cj = Vec::new();
+            for j in 0..3 {
+                let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
+                cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
+                                  forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
+            }
+            self.ctrl_dec(e, &cj);
+            xin = ar.cin;
+        } else {
+            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
+            self.mix(e, C_MIXA, &[self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn)]);
+            xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
+        }
+        // ---- fused projections (one dispatch)
+        let mut segs = vec![Engine::seg(&l.wq, xin[0], ar.q), Engine::seg(&l.wgate, xin[0], ar.gate), Engine::seg(&l.wrel, xin[0], ar.rel),
+                            Engine::seg(&l.wsink, xin[0], ar.sink), Engine::seg(&l.wk, xin[1], ar.k), Engine::seg(&l.wv, xin[2], ar.v)];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::seg(kp, xin[1], ar.kdyn)); segs.push(Engine::seg(vp, xin[2], ar.vdyn)); }
+        self.mv(e, C_QKV, &segs);
+        // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
+        let (kb, vb, kcap) = self.kv_slot(slot);
+        let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+        let base = AttnArgs {
+            pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
+            q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
+            kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
+            kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
+            ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
+        };
+        let nsplit;
+        if self.tier_on() {
+            // disk tier: the keys older than the hot ring come from the file (staged in chunks, each its own dispatch writing
+            // its share of the split partials); the hot ring is one more dispatch and also stores this token's K/V
+            let t = self.lane.tier.as_ref().unwrap();
+            let exec = self.done.get() - 1;
+            let x = t.execs.borrow()[exec];
+            let chunks: Vec<(usize, Chunk)> = t.plan.borrow().iter().cloned().enumerate().filter(|(_, c)| c.exec == exec).collect();
+            for (k, c) in chunks {
+                self.tier_load(cx, k);
+                let e = &cx.e;
+                let off = ((t.half.get() * (t.stg.borrow().length() / 2) + c.off) / 2) as u32;       // in fp16 elements
+                let a = AttnArgs { nkeys: (c.c1 - c.c0) as u32, first_pos: c.c0 as u32, ring: 0, idx0: c.c0 as u32, k_base: off, v_base: off + (NKV * HD) as u32,
+                                   gstr: HD as u32, istr: (2 * NKV * HD) as u32, kps: c.kps as u32, nsplit: x.nsplit as u32, sp0: c.sp0 as u32, noown: 1, pad: 1, ..base };
+                e.buf(&t.stg.borrow(), 0, 3);
+                self.go(e, C_ATTN, "k_attn", &a, (c.ns, NKV, 1), 128);
+            }
+            let e = &cx.e;
+            let a = AttnArgs { nkeys: (pos + 1 - x.b) as u32, first_pos: x.b as u32, ring: 1, kps: x.kps as u32, nsplit: x.nsplit as u32, sp0: x.sp0 as u32, pad: 1, ..base };
+            self.bind_kv(e, l.swa);
+            self.go(e, C_ATTN, "k_attn", &a, (x.ns, NKV, 1), 128);
+            let total = x.nsplit;
+            nsplit = total;
+        } else if let (false, Some(pr)) = (l.swa, self.lane.prune.borrow().as_ref()) {
+            // dev: far keys from the selection, recent keys from the cache
+            let fi = self.slot_kind[slot].1;
+            let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+            let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
+            let ((k1, n1), (k2, n2)) = (if nb > 0 { spl(nb) } else { (32, 0) }, spl(pos + 1 - pr.r0));
+            if nb > 0 {
+                let kb2 = (fi * 2 * NKV * pr.rows * HD) as u32;
+                let a = AttnArgs { nkeys: nb as u32, first_pos: 0, ring: 0, cap: pr.rows as u32, k_base: kb2, v_base: kb2 + (NKV * pr.rows * HD) as u32,
+                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1,
+                                   lastbias: if pr.use_sum { pr.lastbias } else { 0.0 }, ..base };
+                e.buf(&pr.bag, 0, 3);
+                self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
+            }
+            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1, ..base };
+            self.bind_kv(e, false);
+            self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
+            nsplit = n1 + n2;
+        } else {
+            // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
+            self.bind_kv(e, l.swa);
+            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
+            let kps = Self::split_kps(nkeys);
+            nsplit = nkeys.div_ceil(kps);
+            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                                pad: self.sep_comb as u32, ..base };
+            self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+        }
+        let e = &cx.e;
+        if self.sep_comb || self.tier_on() || self.lane.prune.borrow().is_some() {
+            let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
+            self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
+        }
+        // ---- output projection + post-conv (+ residual unless this layer starts a new block)
+        let block_start = ip % BLOCK == 0;
+        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mid = va.alloc(&live);
+        let mut so = Engine::seg(&l.wo, ar.attn_g, Arena::vec(mid));
+        so.epi = 1; so.res_off = if block_start { -1 } else { Arena::vec(cur) as i32 };
+        so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
+        self.mv(e, C_WO, &[so]);
+        if block_start { blocks.push(cur); }
+        // ---- FFN input: depth mix (+ control) -> normalized
+        let mut st = blocks.clone(); st.push(mid);
+        let x_off = if let Some(lw) = ctl {
+            let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
+            jf.ncopy[0][0] = ar.cat[3] as i32;
+            self.mix(e, C_MIXF, &[jf]);
+            self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
+                                         forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
+            ar.finc
+        } else {
+            self.mix(e, C_MIXF, &[self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32])]);
+            ar.fin
+        };
+        // ---- router with fused top-k (last threadgroup)
+        let sel = ar.sel_log + ((self.done.get() - 1) * 16) as u32;
+        let rpost = MvArgs { post: (!self.sep_topk) as u32, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        self.mv_post(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost);
+        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let out = va.alloc(&live);
+        let topk_args = MoeArgs { logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        if self.sep_topk { self.go(e, C_ROUTER, "k_topk", &topk_args, (1, 1, 1), 32); }
+        let ma = MoeArgs {
+            logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off,
+            norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
+            gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
+            act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
+            dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
+            dn_type: l.dn.ty, out_off: Arena::vec(out), res_off: Arena::vec(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+            convw_off: l.ffn_post_conv, pad: [0; 3],
+        };
+        // ---- experts
+        self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
+        self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
+        self.last_out.set(out); self.last_mid.set(mid);
+        out
+    }
+
+    // ======================================================================== batched prefill
     /// Encode prefill of `t` tokens (toks[p0..p0+t]) as one batch. Optionally computes logits/argmax for the last token.
     pub fn encode_prefill(&self, cb: &CmdBuf, p0: usize, t: usize, logits: bool, argmax: bool) {
         assert!(t >= 1 && t <= self.chunk && p0 + t <= self.kv_capacity(), "K/V capacity: call reserve() first");
@@ -1948,7 +1990,7 @@ impl Engine {
             st.push(b.vec(cur) + last);
             let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
             self.mix(&e, C_OMIX, &[j]);
-            self.mv(&e, C_LMHEAD, &[Self::seg(&self.output, ar.fout, ar.logits)]);
+            self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
             if argmax {
                 let nparts = 128u32;
                 let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (p0 + t) as u32, pad: [0; 3] };
@@ -2008,19 +2050,19 @@ impl Engine {
             xin = if l.swa { [b.inp[0]; 3] } else { [b.inp[0], b.inp[1], b.inp[2]] };
         }
         // ---- projections (one batched GEMM over all segments)
-        let mut segs = vec![Self::gseg(&l.wq, xin[0], b.q), Self::gseg(&l.wgate, xin[0], b.gate), Self::gseg(&l.wrel, xin[0], b.rel),
-                            Self::gseg(&l.wsink, xin[0], b.sink), Self::gseg(&l.wk, xin[1], b.k), Self::gseg(&l.wv, xin[2], b.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Self::gseg(kp, xin[1], b.kdyn)); segs.push(Self::gseg(vp, xin[2], b.vdyn)); }
+        let mut segs = vec![Engine::gseg(&l.wq, xin[0], b.q), Engine::gseg(&l.wgate, xin[0], b.gate), Engine::gseg(&l.wrel, xin[0], b.rel),
+                            Engine::gseg(&l.wsink, xin[0], b.sink), Engine::gseg(&l.wk, xin[1], b.k), Engine::gseg(&l.wv, xin[2], b.v)];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::gseg(kp, xin[1], b.kdyn)); segs.push(Engine::gseg(vp, xin[2], b.vdyn)); }
         if self.hgemm {
             // the fp16 inputs b.xh[..] were written by the mix / controller kernels: one shared input in an uncontrolled
             // sliding-window layer, separate q / k / v inputs otherwise
             let xi: [usize; 3] = if ctl.is_some() || !l.swa { [0, 1, 2] } else { [0, 0, 0] };
-            let mut hq = vec![Self::hseg(&l.wq, b.xh[xi[0]], b.q), Self::hseg(&l.wgate, b.xh[xi[0]], b.gate), Self::hseg(&l.wrel, b.xh[xi[0]], b.rel),
-                              Self::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
+            let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
+                              Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
             // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
             if hatt && qgh { hq[0].hout = 1; hq[1].hout = 1; }
-            let mut hs = vec![Self::hseg(&l.wk, b.xh[xi[1]], b.k), Self::hseg(&l.wv, b.xh[xi[2]], b.v)];
-            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Self::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Self::hseg(vp, b.xh[xi[2]], b.vdyn)); }
+            let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
+            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
             if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
             else {
                 // query-side projections for the tail rows only (the two GEMMs are independent)
@@ -2039,7 +2081,7 @@ impl Engine {
         let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
         let kcopy = |n: usize, pos0: usize, to_ring: u32| {
             let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
-            e.buf(&self.kv_swa.borrow(), 0, 3);
+            e.buf(&self.lane.kv_swa.borrow(), 0, 3);
             self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
             e.buf(&self.act.borrow(), 0, 3);
         };
@@ -2080,9 +2122,9 @@ impl Engine {
         // ---- output projection + post-conv (+ residual)
         if self.hgemm {
             if !hatt { self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None); e.barrier(); }
-            self.gemm_h(e, C_WO, &[Self::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
+            self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
         } else {
-            self.gemm(e, C_WO, &[Self::gseg(&l.wo, b.attn_g, b.wo_y)], t);
+            self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
         }
         let block_start = ip % BLOCK == 0;
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
@@ -2112,7 +2154,7 @@ impl Engine {
         // ---- router + top-k + expert grouping
         let rs = GSeg { w_lo: l.router, w_hi: 0, row_bytes: es * 2, wtype: T_BF16, nrows: NEXP as u32, k: es, in_off: sh(x, E), out_off: b.rlog,
                         ldo: NEXP as u32, wsrc: 1, ..Default::default() };
-        if rth { self.gemm_h(e, C_ROUTER, &[Self::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
+        if rth { self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
         else { self.gemm(e, C_ROUTER, &[rs], n); }
         let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
         self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
