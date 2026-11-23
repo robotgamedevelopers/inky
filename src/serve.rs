@@ -456,7 +456,7 @@ pub fn serve(o: ServeOpts) {
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
                             key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
     let l = TcpListener::bind(&o.bind).expect("bind");
-    eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", o.bind, o.lanes, o.ctx, o.effort, o.queue,
+    eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", l.local_addr().expect("bound address"), o.lanes, o.ctx, o.effort, o.queue,
               if o.key.is_some() { "a bearer key required" } else { "no key (loopback use only)" });
     std::thread::spawn(move || {
         for c in l.incoming() {
