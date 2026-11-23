@@ -60,86 +60,75 @@ So the 58 ms is not a fixed overhead. It is the experts a batch touches, read by
 
 `inky binv` prefills the same tokens split at different points and hashes the final logits. A split moves every later token to a different batch, tile slot and set of neighbours. On two prompts (2403 and 61 tokens), every split gives bit-identical logits, at chunk sizes from 64 to 4096. The check found one bug: a batch of exactly one token went to the decode kernel with batch-layout arguments and gave wrong, non-repeatable logits (fixed in `mix_t`). Upstream never sends a one-token batch; a lane decoding alone would.
 
-## Findings from the cold read, to fold in before layer 2
+### What CI checks
 
-A second reader read this page and the code cold on 2026-11-22. These findings are accepted or still to be verified; none is folded into the sections below yet, so where they disagree with the text, they win.
+CI checks agreement with llama.cpp on a short prompt's decode path and a long prompt's prefill path. It does not check the long prompt's decode path position by position: near the end of that prompt some positions are ill-conditioned in the model itself, and llama.cpp disagrees with its own batched run on 16 of the last 64 (inky decoding token by token agrees with llama.cpp's batched run on 47, and with its token-by-token run on 50).
 
-Accepted:
+## The cold read, and what it changed
 
-- **A prefix is a start point only while its window blocks are kept.** A new request starting at boundary k needs the recurrent state at k, every full block before it, and the window blocks covering the 1024 positions before it. Releasing a shared prefix's window blocks when its lanes move on leaves a prefix nothing can start from.
-- **The recurrent state at a boundary is 3.66 MiB**, larger than a 2 MiB full block. It cannot be stored at every boundary: keep it at lane heads, turn ends and a sparse stride.
-- **A prefill span of C tokens pins up to ceil((1023 + C) / 64) + 1 window blocks**, not 17.
-- **Worst-case admission bounds the lane count.** A 64K lane holds about 1.9 GiB, so 64 worst-case lanes do not fit in 128 GB; about 42 to 52 do.
-- **Cache offsets are 32-bit** in the kernels, which caps one cache buffer at 8 GiB. Blocks need 64-bit or per-block addressing before layer 3.
-- **Cancel during a step must wait for the step.** Command buffers do not retain their buffers, so a block released while the GPU or the disk is still using it is a write after free. A lane goes InStep, Cancelling, then Cancelled when the step ends.
-- **Park lazily, under memory pressure.** Writing a lane's blocks to the SSD on every tool wait would write on the order of a gigabyte a second across 64 cards.
-- **Restoring needs an atomic reservation**, or two lanes restoring at once can each hold half the memory and neither can finish. Blocks shared only by parked lanes must be spillable too, and the bypass bound must cover parked and queued lanes, not only ready ones.
-- **The cache and the scheduler are one model for these properties.** The window hole, the cancel fence and the restore deadlock each cross the line between BlockCache and LaneScheduler. Liveness is checked by TLC on the model; trace checking binds the code to its safety properties only.
-- **An unsealed tail block stays private**, is zero-filled past its length, and is dropped at finish, never sealed short.
-- **The thinking tokens of earlier turns must round-trip without a content-keyed map.** The tracer keyed generated tokens by the visible text and tool calls; two turns with the same empty text and the same tool call collide, and the map is lost on restart. This is the likely cause of some of the tracer's cache misses. Settle the protocol before layer 3.
-- **Layers 4 and 5 are one layer.** Admission cannot be exercised without parking and restoring.
-- **A performance and memory gate at 20K and 42K context belongs right after layer 2**, before the cache is built on it.
-- **Grouping by the previous token's experts saves nothing when every ready lane steps**, and needs a pool larger than the batch, which costs memory.
+A second reader read this design and the code cold on 2026-11-22 (verdict: revise before layer 2). The sections below include its accepted findings. Its claims about the engine, measured on 2026-11-23:
 
-Fixed in layer 1: prefill attention read the batch's window K/V scratch (guard rows and unfilled history) through the tensor multiply with a zero weight, which does not cancel a NaN. `inky lanes`, which poisons all scratch between steps, found it; the scratch is now zeroed on the GPU at the start of every prefill (`k_zero`). With that, two lanes interleaved over 2403 tokens with every scratch byte poisoned at each switch give exactly the logits each gives alone.
-
-CI (layer 1) checks agreement with llama.cpp on a short prompt's decode path and a long prompt's prefill path. It does not check the long prompt's decode path position by position: near the end of that prompt some positions are ill-conditioned in the model itself, and llama.cpp disagrees with its own batched run on 16 of the last 64 (inky decoding token by token agrees with llama.cpp's batched run on 47, and with its token-by-token run on 50).
-
-To verify (claims from reading the code, not yet measured here):
-
-- Expert routing packs tokens with an atomic counter, which could make results depend on thread timing when one expert has more than 128 tokens. `binv` has been repeatable across runs so far.
-- Kernel variants switch at 64 tokens per batch and per expert; attention's position handling could depend on chunk offsets. `binv` passes at splits of 1, 5, 23, 100 and 1001, which crosses these.
-- The last layer's trimming in a prefill leaves its convolution state wrong at boundaries inside the chunk, which matters once blocks are sealed mid-chunk.
-- Attention in the batched path launches every query head separately and wastes most of a tile on a one-token span, so each lane's cache may be read up to three times. This and the 210 GB/s above make a many-lane attention kernel the first kernel to write.
-
-The gates in the layer table need the same strengthening: two interleaved lanes past 2048 tokens with poisoned scratch for layer 1; bit-identical cache, recurrent state and multi-step logits at batch sizes 1, 2, 64, 65 and 129 with prime-sized splits for layer 2; poisoned pool slots and explicit reversed witnesses for layer 3; a bimodal 2K and 64K workload, mid-step disconnects and kill -9 through the HTTP server for the scheduler and parking; concurrent cards issuing identical tool calls for the server.
+- **The batched path is repeatable and batch-invariant.** 16 prefills in a row give identical bits, and splits at prime offsets and on both sides of 64, 512, 1024 and 2048 (`inky binv`, which takes several boundaries per split) give identical logits. The atomic packing of tokens by expert has not shown up in results.
+- **One-token batches** were a real bug, fixed before layer 1 (`mix_t`).
+- **Masked rows reaching the tensor multiply** were real: the window K/V scratch is now zeroed at every prefill (`k_zero`), found by `inky lanes`.
+- **The convolution state exists only at the end of a step.** Inside a prefill chunk it is never kept, so a block boundary is a start point only where a step ended there (Blocks, below).
+- **Batched attention does not suit decode spans.** At 3K context it takes about 5 ms for a tile of 32 queries, where the decode path's split-K attention takes about 1.3 ms for one token; a lane's single token would pay for the whole tile. Decode spans use the split-K kernel (Decisions, 2).
+- **The cache is read at about 210 GB/s and every lane reads all of its own:** the lane table above.
 
 ## Decisions
 
 1. **One process, one copy of the weights.** Separate processes cannot share weight reads.
-2. **One kind of step.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token; a prefilling lane brings up to a chunk. Decode and prefill are the same operation, so there is one path to make correct and one to tune. Today's single-stream decode path stays only as the reference the batched step is checked against.
-3. **The server is stateless; the cache is a tree of blocks.** A request is a token list. It is matched against a prefix tree of sealed cache blocks, a lane starts at the deepest match, and when the lane finishes its blocks stay in the tree. There are no sessions. A shared prefix, a resumed conversation, a harness side request (the title turn that reset the tracer's cache) and a rollback are all the same case: a match at a block boundary.
-4. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
-5. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
-6. **The Mac only generates tokens.** Harness and tools run on other machines and reach it over a private network. 64 cards' builds do not fit beside 64 lanes.
+2. **One kind of step.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token, a prefilling lane up to a chunk. The projections, router, experts and controllers run once over every span's tokens through the batched path. Attention runs per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span. The reference for a lane's numbers is that lane alone in a step, and a lane's numbers do not change with what else shares its step.
+3. **The server is stateless; the cache is a tree of blocks.** A request is a token list, matched against a prefix tree of sealed cache blocks. A lane lives for one request: it starts at the deepest start point the tree holds for its tokens, and when the request ends its blocks stay in the tree. There are no sessions. A shared prefix, a resumed conversation, a harness side request and a rollback are all the same case.
+4. **The cache never changes an answer.** A request's output is a function of the request and its seed; the cache only changes how fast it comes. This rests on batch invariance and on start points being exact. The seed is the request's own (its `seed`, or a hash of the request), never arrival order.
+5. **Earlier turns are rendered exactly as the client sends them.** A client that drops the reasoning of earlier turns gets them rendered without it, as the chat template does. The tokens a lane generated are therefore reused only up to where its turn began; the turn itself is prefilled again with the next request (its visible text and tool calls: short). No map from visible text back to generated tokens exists.
+6. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
+7. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
+8. **The Mac only generates tokens.** Harness and tools run on other machines and reach it over a private network.
 
 ## Blocks
 
 A block holds the cache for 64 consecutive positions. Two kinds, because the model has two kinds of attention:
 
-- **window block**: the 40 sliding-window layer passes, 10 MiB. A lane references only the blocks covering its last 1024 positions (17 at most).
-- **full block**: the 8 full-attention layer passes, 2 MiB. A lane references all of them back to position 0.
+- **window block**: the 40 sliding-window layer passes, 10 MiB.
+- **full block**: the 8 full-attention layer passes, 2 MiB.
 
-At each block boundary the block also stores the small recurrent state (convolution rows, loop-controller state), so any boundary is a point a lane can start from.
+A block is written by exactly one lane, then sealed, then never written again. Sharing is a reference count; because blocks are append-only there is no copy-on-write. The cache for position p depends only on tokens 0..p, so two requests with the same first N tokens share the same blocks exactly.
 
-A block is written by exactly one lane, then sealed, then never written again. Sharing is a reference count. Because blocks are append-only there is no copy-on-write. The cache for position p depends only on tokens 0..p, so two requests with the same first N tokens share the same blocks exactly. This needs the step to be batch-invariant (Gate 2).
+**Start points.** The recurrent state (convolution rows, 3.66 MiB) exists only at the end of a step. A position k is a start point when the tree keeps all three of: the state at k, the full blocks before k, and the window blocks covering the 1024 positions before k. A start point references those window blocks, so they are not released while it is kept. Start points are kept at the end of every request's prompt, at every 16th block boundary a prefill crosses, and at a running lane's head. Prefill chunks end on block boundaries, so a chunk's end can be a start point. A request starts at the deepest start point its tokens match and prefills from there: at most 1023 positions more than the deepest block it matches.
 
-Each block is in memory, on disk, or both. A lane that is waiting has its private blocks written to the SSD and dropped from memory. Blocks no lane references are kept as cache and dropped least-recently-used, memory first, then disk. A request whose blocks were dropped prefills again: slower, never wrong.
+**Unsealed tails.** A lane's last, partly written block is private, zero-filled past its length on allocation, never matched, and dropped when the lane ends. Pool slots are zero-filled on reuse, so a masked read never meets a non-finite value.
 
-Attention reads keys through a per-lane block table, 64 keys per entry, in place of one contiguous buffer.
+**A span pins** the window blocks its attention reads: up to ceil((1023 + C) / 64) + 1 for a span of C tokens, and every full block of its lane.
+
+**Addressing.** Blocks live in a pool of GPU buffers. Attention reads keys through a per-lane block table whose entries hold 64-bit offsets, so no buffer or offset limits the cache to 8 GiB.
+
+**Tiers.** A block is in memory, on disk, or both. Blocks no lane references (the tree's cold blocks) are written to the SSD lazily, only under memory pressure, least recently used first, and dropped from memory; they are dropped from disk under disk pressure. A request whose blocks were dropped prefills again: slower, never wrong.
 
 ## Scheduler
 
-Lane states: `Matching -> Restoring -> Ready -> InStep -> Ready ... -> Finished`, with `Cancelled` reachable from every state and `Parked` for a lane that must wait for memory.
+Lane states: `Queued -> Admitted -> Restoring -> Ready <-> InStep -> Finished`, with `Cancelling` from `InStep` and `Cancelled` from every other state.
 
-Each tick builds one step:
-
-1. The longest-waiting Ready lane goes in first.
-2. Decoding lanes are added by fewest new experts, predicted from each lane's previous token (48 x 128 bits per lane). Simulated on the engine's routing dumps this saves about 20% of weight bytes.
-3. Prefill spans fill what is left of the step's token budget, so a large tool result is taken in over several steps and never stalls the decoders.
-4. No Ready lane is passed over more than W steps in a row.
-
-Admission: a request is admitted only if its worst case fits in memory with every admitted lane's. Otherwise it queues, and beyond the queue limit the server answers 429 with Retry-After.
+- **Admission.** A lane's worst case is its window blocks, its full blocks at the request's maximum context, its state and its tail. A request is admitted only when the worst cases of all admitted lanes fit the memory budget: the GPU's working-set limit less the weights, scratch and a margin, measured on the machine. At 64K context a lane's worst case is about 1.9 GiB, so 128 GB admits about 42 to 52 lanes. Otherwise it queues; beyond the queue limit the server answers 429 with Retry-After.
+- **Restoring** reserves the lane's whole working set in memory, atomically, before it reads any block back from disk.
+- **Each tick builds one step:** the longest-waiting Ready lane first, then other Ready decoding lanes, then prefill spans to fill the step's token budget, so a large tool result is taken over several steps and never stalls the decoders. No Ready, Restoring or Queued lane is passed over more than W ticks in a row.
+- **Cancel during a step waits for the step.** Command buffers do not retain their buffers, so a lane cancelled while `InStep` goes to `Cancelling` and releases its references only when the GPU and any disk I/O of that step have finished. A client that disconnects cancels its lane.
 
 ## Models (TLA+, before code; TLC on a bench)
 
-**BlockCache.** State: each block's reference count, tier, sealed flag and parent; each lane's block lists; the memory and disk budgets. Actions: Match, AllocTail, Seal, SlideWindow, Finish, Park, Restore, DropUnreferenced. Invariants: a step reads only blocks in memory; a sealed block is never written; a referenced block is never dropped; a count equals its referrers; a child's tokens extend its parent's; memory stays within budget. Liveness: an admitted lane eventually steps.
+**CacheScheduler.** One model, because the dangerous properties cross between the cache and the scheduler. State: blocks of both kinds with reference counts, tier and sealed flag; start points; lanes with their state, block lists and reservations; the step in flight with the blocks it pins and its pending disk I/O; the memory and disk budgets. Checked exhaustively by TLC at small bounds, for safety and liveness. Invariants:
 
-**BlockLayout.** The same cache with the real arithmetic at capacity 3 or 4: slot reuse in the block pool with generation counters, the window's sliding over the block list, the block table's indexing. One reversed witness per bug class (a reused slot read through a stale table entry; a window off by one block).
+- a step reads only blocks in memory, and every block a step or its I/O uses stays in memory and owned until the step completes;
+- a sealed block is never written; an unsealed block has one referrer, is invisible to matching, and is zero past its length;
+- a referenced block is never dropped, and a count equals its referrers;
+- a start point's state, full blocks and window blocks are all kept;
+- the reservations of Restoring, Ready and InStep lanes fit the memory budget, and every block no lane references can be spilled.
 
-**LaneScheduler.** State: lane states, the step in flight, wait counters. Invariants: a lane is in at most one step; a lane's tokens advance in order with no gap or repeat; the bypass bound W holds; a cancelled lane releases every reference. Liveness: every Ready lane steps; every request ends Finished, Cancelled or refused.
+Liveness: every admitted lane finishes or is cancelled; every queued request is admitted or refused.
 
-The engine's random walk emits traces of all three and TLC checks them in CI.
+**BlockLayout.** The pool and table arithmetic at capacity 3 or 4: slot reuse with generation counters, the window's sliding over the block list, the table's indexing with 64-bit offsets. One reversed witness per bug class: a reused slot read through a stale entry; a window off by one block; a span of 512 tokens pinning 17 window blocks instead of 25; a start point whose window blocks were released.
+
+The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
 
 ## Layers, bottom up
 
@@ -147,20 +136,21 @@ Each is secured before the next starts.
 
 | | layer | gate |
 |---|---|---|
-| 1 | Lane state out of the engine: one lane behaves exactly as today | logit hash identical to the unmodified engine |
-| 2 | Batched step over spans | a lane's logits are bit-identical alone and in any batch; within today's tolerance of the llama.cpp reference |
-| 3 | Block cache in memory: tree, references, window sliding | BlockCache and BlockLayout hold on traces; outputs identical to layer 2 |
-| 4 | Scheduler and admission | LaneScheduler holds on traces; no lane starves in a soak |
-| 5 | Disk tier and parking | identical outputs after park and restore; kill -9 loses cache, never correctness |
-| 6 | Server: the OpenAI endpoint, template, tool calls, 429, health | the tracer card and a replay set land through it |
-| 7 | Sweep: replay recorded card traffic at 8 to 128 lanes | the knee becomes the route's concurrency |
-| 8 | Fleet wiring: a provider entry, concurrency, a priority ceiling | a real low-priority card lands from the fleet |
-| 9 | Soak under real load | days, not hours |
+| 1 | Lane state out of the engine (done) | logits identical to the unmodified engine; two interleaved lanes with poisoned scratch give each lane its own logits |
+| 2 | Batched step over spans, on today's per-lane cache buffers | bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits; agreement with llama.cpp; then measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table |
+| 3 | Block cache: pool, table, tree, start points, unsealed tails | CacheScheduler and BlockLayout hold in TLC with their reversed witnesses; traces checked in CI; outputs identical to layer 2 with poisoned pool slots |
+| 4 | Scheduler, admission, disk tier | traces checked; a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step; kill -9 in mid-write loses cache and never correctness; temperature 1 with fixed seeds gives the same outputs with and without the cache |
+| 5 | Server: the OpenAI endpoint, template, tool calls, 429, health | the tracer card and a replay set land; concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation |
+| 6 | Sweep: replay recorded card traffic at 8 to 128 lanes | the knee becomes the route's concurrency |
+| 7 | Fleet wiring: a provider entry, concurrency, a priority ceiling | a real low-priority card lands from the fleet |
+| 8 | Soak under real load | days, not hours |
 
 ## Follow-ons, not in the first build
 
-- **A kernel for decode-size batches.** Up to 2x at 16 to 32 lanes of short context, and less as more lanes touch more of the experts: independent lanes touch more experts than one sequence's tokens do. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and give the dense projections the same treatment (see "Where the batched path's time goes"). The first build uses the existing batched path, which is correct and batch-invariant today.
-- **Read a shared prefix once per step** for all lanes' queries, then each lane's own keys, merged with the online softmax the engine already has. Version one shares the memory and skips the prefill; this shares the reads too.
+- **An attention kernel for many lanes.** One dispatch over every decoding lane's span, grouping the three query heads of each key head, split-K, reading the cache through the block table near bus speed. At long context this is the largest gain: today's per-lane split-K reads the cache at about 210 GB/s.
+- **A kernel for decode-size batches.** Up to 2x at 16 to 32 lanes of short context, less as more lanes touch more experts. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and the same for the dense projections (see "Where the batched path's time goes").
+- **Read a shared prefix once per step** for all lanes' queries, then each lane's own keys, merged with the online softmax the engine already has.
+- **Grouping lanes by predicted experts.** It saves nothing while every Ready lane steps; it pays only when more lanes are ready than a step takes.
 - **8-bit cache and far-key pruning**, behind the quality replay.
 - **Quality replay**: N landed low-priority cards against the current flash route, comparing how many land.
 
