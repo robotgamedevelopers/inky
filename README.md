@@ -11,8 +11,10 @@ With **inky**, you can:
 
 Next: many coding-agent tasks served at once from one process, each its own lane. The [design](docs/DESIGN.md) and the [roadmap](docs/ROADMAP.md) say how.
 
-The engine is [erisinky](https://github.com/Eriskii/erisinky) by Eris. inky is its fork by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)) and Rowan Claude, under the same licence, GPL-3.0-or-later.
+This is a fork of [erisinky](https://github.com/Eriskii/erisinky) by Eris.
+
+Built by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)), Rowan Claude and Eris.
 
 For more information, please ask your AI to [read the docs](docs/README.md).
 
-If it helps you, please [support the work](https://patreon.com/masbandwidth) and credit **inky — Eris, Glenn Fiedler and Rowan Claude**. Thank you!
+If it helps you, please [support the work](https://patreon.com/masbandwidth) and credit **inky — Glenn Fiedler, Rowan Claude and Eris**. Thank you!
