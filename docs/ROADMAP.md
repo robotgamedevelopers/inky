@@ -62,10 +62,10 @@ A refactor with no change in behaviour: everything that belongs to one stream mo
 
 | feature | done |
 |---|:---:|
-| Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change | ❌ |
+| Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change | ✅ |
 | A lane owns its state (cache, convolution rows, loop-controller state, position); the engine owns only the weights | ✅ |
 | Gate: one lane's logit hash is identical to the unmodified engine | ✅ |
-| complete | 66% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 

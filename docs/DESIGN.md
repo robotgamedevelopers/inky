@@ -83,6 +83,8 @@ Accepted:
 
 Fixed in layer 1: prefill attention read the batch's window K/V scratch (guard rows and unfilled history) through the tensor multiply with a zero weight, which does not cancel a NaN. `inky lanes`, which poisons all scratch between steps, found it; the scratch is now zeroed on the GPU at the start of every prefill (`k_zero`). With that, two lanes interleaved over 2403 tokens with every scratch byte poisoned at each switch give exactly the logits each gives alone.
 
+CI (layer 1) checks agreement with llama.cpp on a short prompt's decode path and a long prompt's prefill path. It does not check the long prompt's decode path position by position: near the end of that prompt some positions are ill-conditioned in the model itself, and llama.cpp disagrees with its own batched run on 16 of the last 64 (inky decoding token by token agrees with llama.cpp's batched run on 47, and with its token-by-token run on 50).
+
 To verify (claims from reading the code, not yet measured here):
 
 - Expert routing packs tokens with an atomic counter, which could make results depend on thread timing when one expert has more than 128 tokens. `binv` has been repeatable across runs so far.
