@@ -81,7 +81,7 @@ Crash == alive /\ alive' = FALSE /\ conns' = {} /\ saved' = NONE /\ owed' = FALS
 Restart == /\ ~alive /\ alive' = TRUE
            /\ IF disk = NONE THEN UNCHANGED <<limit, disk, saved, owed>>
               ELSE \/ /\ limit' = disk /\ saved' = NONE /\ owed' = FALSE /\ (disk' = NONE \/ disk' = disk)
-                   \/ /\ UNCHANGED <<limit, disk>> /\ saved' = (IF Bug = "lost_seed" THEN NONE ELSE disk) /\ owed' = (Bug # "lost_seed")
+                   \/ /\ limit' \in {limit, disk} /\ UNCHANGED disk /\ saved' = (IF Bug = "lost_seed" THEN NONE ELSE disk) /\ owed' = (Bug # "lost_seed")
            /\ UNCHANGED <<conns, owner>>
 Next == (\E c \in Clients : Connect(c) \/ Close(c)) \/ (\E v \in Values : OwnerSets(v)) \/ Crash \/ Restart
 Spec == Init /\ [][Next]_vars /\ WF_vars(Restart) /\ WF_vars(\E c \in Clients : Close(c))
