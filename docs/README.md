@@ -258,7 +258,7 @@ neural accelerators.
 
 ## Releasing
 
-A pushed tag vX.Y.Z releases inky (`.github/workflows/release.yml`). The workflow checks that the tag, less its v, equals the Cargo.toml version and that `docs/releases/<tag>.md` exists, then builds `inky_<tag>_darwin_arm64` on a GitHub-hosted Apple silicon runner, packs `tunings/` as `inky_<tag>_tunings.tar.gz`, writes `SHA256SUMS` and creates the release as a prerelease with that file as its notes.
+A pushed tag vX.Y.Z releases inky (`.github/workflows/release.yml`). The workflow checks that the tag, less its v, equals the Cargo.toml version and that `docs/releases/<tag>.md` exists, then builds `inky_<tag>_darwin_arm64` on a GitHub-hosted Apple silicon runner, packs `tunings/` as `inky_<tag>_tunings.tar.gz`, writes `SHA256SUMS` and creates the release as a prerelease with that file as its notes. It then runs `cargo publish` for the crate `inky-engine` (installed with `cargo install inky-engine`; the binary is `inky`) once the `CRATES_IO_TOKEN` Actions secret exists, and skips that step with a log line until it does.
 
 1. Bump `version` in Cargo.toml.
 2. Add `docs/releases/<tag>.md`: what ships, what you get, how to start.

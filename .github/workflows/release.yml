@@ -3,8 +3,9 @@
 # (gh release edit TAG --prerelease=false --latest). Assets are inky_<tag>_darwin_arm64,
 # inky_<tag>_tunings.tar.gz (the tunings/ folder the binary is built with) and SHA256SUMS.
 # The tag must equal Cargo.toml's version with a leading v, and the release notes are
-# docs/releases/<tag>.md; the run fails before building if either is wrong. The only credential
-# is the workflow's GITHUB_TOKEN.
+# docs/releases/<tag>.md; the run fails before building if either is wrong. The crate inky-engine
+# then publishes to crates.io when the CRATES_IO_TOKEN secret exists; without it that step logs a
+# line and is skipped. The release itself uses only the workflow's GITHUB_TOKEN.
 name: release
 on:
   push:
@@ -56,3 +57,16 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "$TAG" dist/* --title "inky $TAG" --notes-file "docs/releases/$TAG.md" --verify-tag --prerelease
+      - name: publish inky-engine to crates.io
+        # the crate publishes on each tag once the CRATES_IO_TOKEN secret exists; until then the step says so and
+        # the release stands without it
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CRATES_IO_TOKEN is not set: skipping cargo publish (the GitHub release above is complete)"
+            exit 0
+          fi
+          cargo publish --locked
