@@ -104,7 +104,7 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | feature | done |
 |---|:---:|
 | CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness | ❌ |
-| BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses | ❌ |
+| BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses | ✅ |
 | Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers | ❌ |
 | Attention reads keys through a per-lane block table of 64-bit offsets | ❌ |
 | A request matches the deepest start point in a prefix tree of sealed blocks | ❌ |
@@ -112,7 +112,7 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ❌ |
 | Gate: the engine's traces are behaviours of both models, checked in CI | ❌ |
 | Gate: outputs identical to layer 2 with poisoned pool slots | ❌ |
-| complete | 0% |
+| complete | 11% |
 
 [Source data](roadmap.sexp)
 
@@ -159,8 +159,8 @@ The endpoint a coding-agent harness talks to.
 | A health endpoint, and binding to loopback or a private network only | ✅ |
 | Gate: the tracer card and a recorded replay set land through it | ✅ |
 | Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ❌ |
-| Gate: memd traces are behaviours of MemMode.tla, checked in CI | ❌ |
-| complete | 77% |
+| Gate: memd traces are behaviours of MemMode.tla, checked in CI | ✅ |
+| complete | 88% |
 
 [Source data](roadmap.sexp)
 
