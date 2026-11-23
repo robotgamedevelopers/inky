@@ -3,6 +3,8 @@ mod gguf;
 mod metal;
 mod sampler;
 mod session;
+mod memd;
+mod tuning;
 mod tokenizer;
 mod unicode_tables;
 
@@ -578,7 +580,14 @@ fn maxctx(o: &Opts) {
     let last = *ckpts.iter().max().unwrap();
     assert!(last + steps + 1 <= eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
     toks.truncate(last + steps + 1);
-    let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0) * (1u64 << 30) as f64;
+    // lane memory: what Metal's working set leaves after everything allocated so far, less the tuning's margin
+    let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64).unwrap_or_else(|| {
+        let (alloc, ws) = eng.gpu_mem();
+        let (chip, mem) = tuning::this_machine();
+        let margin = tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64;
+        (ws as f64 - alloc as f64 - margin - 9.0 * (1u64 << 30) as f64).max(1.0)      // (9 GiB: the source lane at the longest context)
+    });
+    println!("lane budget {:.1} GiB", budget / (1u64 << 30) as f64);
     let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
     let src = Lane::new(&eng);
     let rs = eng.on(&src);
@@ -781,6 +790,28 @@ fn vcost(o: &Opts) {
 }
 
 fn main() {
+    // inky mode's helper and its install take their own arguments
+    let raw: Vec<String> = std::env::args().collect();
+    match raw.get(1).map(|s| s.as_str()) {
+        Some("memd") => { memd::daemon(&raw[2..]); return; }
+        Some("tune-memory") => { memd::install(&raw[2..]); return; }
+        _ => {}
+    }
+    if !matches!(raw.get(1).map(|s| s.as_str()), None | Some("help") | Some("-h") | Some("--help")) {
+        let (chip, mem) = tuning::this_machine();
+        let t = tuning::select(&chip, mem);
+        let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
+        match memd::enter(&sock) {
+            Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
+            None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
+        }
+    }
+    // `inky mode [SECONDS]`: enter inky mode (above) and hold it, then leave by exiting
+    if raw.get(1).map(|s| s.as_str()) == Some("mode") {
+        let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return;
+    }
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
