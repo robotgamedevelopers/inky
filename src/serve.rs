@@ -285,13 +285,26 @@ fn same_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// the client closed its end (checked without blocking or consuming anything)
+/// The client closed its end (checked without blocking or consuming anything). A peek error other than
+/// `WouldBlock` is treated as gone: failing toward cancellation is the safe direction (it frees the lane and the
+/// client can retry) rather than holding a lane for a peer that may be dead. `Interrupted` is transient, so the
+/// probe is retried a few times and, if it persists, the client is treated as still present.
 fn peer_gone(s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() { return true; }
     let mut b = [0u8; 1];
-    let r = s.peek(&mut b);
+    let mut tries = 0;
+    let gone = loop {
+        match s.peek(&mut b) {
+            Ok(0) => break true,
+            Ok(_) => break false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 3 => { tries += 1; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break false,
+            Err(_) => break true,
+        }
+    };
     let _ = s.set_nonblocking(false);
-    match r { Ok(0) => true, Ok(_) => false, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
+    gone
 }
 
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
@@ -401,6 +414,8 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
 }
 
 pub fn serve(o: ServeOpts) {
+    if o.ctx == 0 { eprintln!("--ctx must be greater than 0"); std::process::exit(2); }
+    if o.max_tokens == 0 || o.max_tokens >= o.ctx { eprintln!("-n must be between 1 and {} (less than --ctx {})", o.ctx - 1, o.ctx); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
