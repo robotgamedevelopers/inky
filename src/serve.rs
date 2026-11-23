@@ -528,6 +528,40 @@ fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
 }
 
+/// Why a chunked body was refused: over the cap (413) or malformed framing (400).
+#[derive(Debug)]
+enum BodyError { TooLarge, Malformed(String) }
+
+/// A chunked request body decoded under `max`: chunk sizes are hex with
+/// optional extensions, each chunk is followed by CRLF, the zero chunk is
+/// followed by header-like trailers and an empty line. Anything else fails
+/// closed; the cap is checked before a chunk's bytes are read.
+fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
+    let bad = |m: &str| BodyError::Malformed(m.to_string());
+    let mut body = Vec::new();
+    loop {
+        let mut line = String::new();
+        if r.by_ref().take(8192).read_line(&mut line).map_err(|e| bad(&format!("chunk size: {e}")))? == 0 { return Err(bad("body ended before a chunk size")); }
+        let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
+        let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
+        if n == 0 {
+            loop {
+                let mut t = String::new();
+                if r.by_ref().take(16384).read_line(&mut t).map_err(|e| bad(&format!("trailer: {e}")))? == 0 { return Err(bad("body ended inside the trailers")); }
+                if t == "\r\n" || t == "\n" { return Ok(body); }
+                if !t.contains(':') { return Err(bad("bad trailer")); }
+            }
+        }
+        if n > max - body.len().min(max) { return Err(BodyError::TooLarge); }
+        let at = body.len();
+        body.resize(at + n, 0);
+        r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
+        let mut eol = String::new();
+        r.read_line(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+        if eol != "\r\n" && eol != "\n" { return Err(bad("chunk not followed by CRLF")); }
+    }
+}
+
 /// compare without stopping at the first differing byte
 fn same_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
@@ -862,10 +896,19 @@ pub fn serve(o: ServeOpts) {
                         return;
                     }
                 }
-                if h.chunked { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 411, "invalid_request_error", "send a Content-Length body, not chunked") } else { respond(&mut s, 411, &json!({"error": {"message": "send a Content-Length body, not chunked"}}).to_string()) }; return; }
-                if h.len > MAX_BODY { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
-                let mut body = vec![0u8; h.len];
-                if r.read_exact(&mut body).is_err() { return; }
+                // the body is read only now, after the key check above
+                let body = if h.chunked {
+                    match read_chunked(&mut r, MAX_BODY) {
+                        Ok(b) => b,
+                        Err(BodyError::TooLarge) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
+                        Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
+                    }
+                } else {
+                    if h.len > MAX_BODY { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
+                    let mut body = vec![0u8; h.len];
+                    if r.read_exact(&mut body).is_err() { return; }
+                    body
+                };
                 drop(r);
                 let _ = s.set_read_timeout(None);
                 let r = match (method.as_str(), path.as_str()) {
@@ -933,6 +976,31 @@ mod tests {
         assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
     }
 
+    #[test] fn chunked_bodies_decode_bounded_and_fail_closed() {
+        // Stella's preflight (nova-sprint key proxy, Claude Code 2.1.330):
+        // the forwarded /v1/messages request arrives chunked, no
+        // Content-Length, and serve answered 411.
+        use std::io::Cursor;
+        let valid = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n".to_vec();
+        assert_eq!(read_chunked(&mut BufReader::new(Cursor::new(valid.clone())), MAX_BODY).unwrap(), b"Wikipedia");
+        // a body split across one-byte reads decodes the same
+        struct OneByte(Cursor<Vec<u8>>);
+        impl Read for OneByte { fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> { let n = b.len().min(1); self.0.read(&mut b[..n]) } }
+        impl BufRead for OneByte {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> { let p = self.0.position() as usize; let v = self.0.get_ref(); Ok(&v[p..(p + 1).min(v.len())]) }
+            fn consume(&mut self, n: usize) { self.0.set_position(self.0.position() + n as u64); }
+        }
+        assert_eq!(read_chunked(&mut OneByte(Cursor::new(valid)), MAX_BODY).unwrap(), b"Wikipedia", "split across reads");
+        // over the cap, declared or accumulated, is refused before reading on
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(format!("{:x}\r\n", MAX_BODY + 1).into_bytes())), MAX_BODY), Err(BodyError::TooLarge)), "a declared chunk over the cap");
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"6\r\n123456\r\n6\r\n123456\r\n0\r\n\r\n".to_vec())), 10), Err(BodyError::TooLarge)), "chunks accumulating over the cap");
+        // malformed framing fails closed
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"zz\r\nabc\r\n0\r\n\r\n".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "a non-hex chunk size");
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"0\r\nBadTrailer\r\n\r\n".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "a trailer without a colon");
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"5\r\nab".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "a chunk cut short");
+        assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"3\r\nabcXX\r\n0\r\n\r\n".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "no CRLF after the chunk data");
+    }
+
     #[test] fn routes_ignore_query_strings_and_trailing_slashes() {
         assert_eq!(route_path("/v1/messages?beta=true"), "/v1/messages");
         assert_eq!(route_path("/v1/messages/count_tokens?beta=true"), "/v1/messages/count_tokens");
@@ -979,15 +1047,15 @@ mod tests {
         let a = json!({"model": "inkling-2-mini", "max_tokens": 64,
             "system": [{"type": "text", "text": "Top system."}],
             "messages": [
-                {"role": "system", "content": [{"type": "text", "text": "First in-message system."}]},
                 {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+                {"role": "system", "content": [{"type": "text", "text": "First in-message system."}]},
                 {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
                 {"role": "system", "content": "Later system note."},
                 {"role": "user", "content": "Continue"}]});
         let o = anthropic_to_openai(&a).unwrap();
         assert_eq!(o["messages"][0], json!({"role": "system", "content": [{"type": "text", "text": "Top system."}]}));
-        assert_eq!(o["messages"][1], json!({"role": "system", "content": [{"type": "text", "text": "First in-message system."}]}));
-        assert_eq!(o["messages"][2], json!({"role": "user", "content": [{"type": "text", "text": "Hi"}]}));
+        assert_eq!(o["messages"][1], json!({"role": "user", "content": [{"type": "text", "text": "Hi"}]}));
+        assert_eq!(o["messages"][2], json!({"role": "system", "content": [{"type": "text", "text": "First in-message system."}]}));
         assert_eq!(o["messages"][3]["role"], "assistant");
         assert_eq!(o["messages"][4], json!({"role": "system", "content": "Later system note."}));
         assert_eq!(o["messages"][5], json!({"role": "user", "content": "Continue"}));
@@ -998,8 +1066,8 @@ mod tests {
         // the in-message system entries follow it in place
         let chat = json!({"messages": [
             {"role": "system", "content": [{"type": "text", "text": "Top system."}]},
-            {"role": "system", "content": "First in-message system."},
             {"role": "user", "content": "Hi"},
+            {"role": "system", "content": "First in-message system."},
             {"role": "assistant", "content": "Hello"},
             {"role": "system", "content": "Later system note."},
             {"role": "user", "content": "Continue"}]});
