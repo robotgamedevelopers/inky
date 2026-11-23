@@ -2,6 +2,7 @@ mod engine;
 mod gguf;
 mod metal;
 mod sampler;
+mod serve;
 mod session;
 mod tokenizer;
 mod unicode_tables;
@@ -628,6 +629,9 @@ fn main() {
         "run" => run(&o),
         "chat" => chat(&o),
         "bench" => bench(&o),
+        "serve" => serve::serve(serve::ServeOpts { model: o.model.clone(), ctx: o.ctx, effort: o.effort.clone(),
+            port: std::env::var("INK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8090),
+            max_tokens: if o.n_set { o.n } else { 16384 }, log: !o.quiet }),
         _ => println!("{USAGE}"),
     }
 }
