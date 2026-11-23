@@ -447,6 +447,17 @@ fn lanebench(o: &Opts) {
         let src = Lane::new(&eng);
         { let r = eng.on(&src); r.reserve(len, false); r.set_tokens(0, &toks);
           let mut p = 0; while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; } }
+        // the baseline: one stream on the single-stream decode path at this context
+        {
+            let r = eng.on(&src);
+            let tok = |q: usize| { let cb = eng.gpu.cmd(); r.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+            tok(0);
+            let t0 = std::time::Instant::now();
+            for q in 0..steps { tok(q); }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+            println!("{c:>6} {:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}  (one stream, decode path)", 1, 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+            // (the decode path advanced src's state by `steps` tokens: harmless here, this measures time only)
+        }
         let nmax = *counts.iter().max().unwrap();
         let lanes: Vec<Lane> = (0..nmax).map(|i| {
             let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false);
@@ -550,6 +561,57 @@ fn dbatch(o: &Opts) {
     }
     println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
     if !ok { std::process::exit(1); }
+}
+
+/// dev, the max-context eval: one lane prefills the --file text (real code) to the engine's limit, timing each stretch of
+/// prefill; at each checkpoint (INK_CKPTS) one stream decodes on the decode path, then as many lanes as fit a budget of
+/// INK_LANE_GIB GiB (copies of the prefilled cache, each decoding its own tokens) decode together. Timing only.
+fn maxctx(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(64);
+    let tk = Tokenizer::load(&eng.g);
+    let mut toks = tk.encode(&o.prompt, false);
+    let steps = 8usize;
+    let ckpts: Vec<usize> = std::env::var("INK_CKPTS").unwrap_or("16384,65536,131072,262000".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let last = *ckpts.iter().max().unwrap();
+    assert!(last + steps + 1 <= eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
+    toks.truncate(last + steps + 1);
+    let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(60.0) * (1u64 << 30) as f64;
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    let src = Lane::new(&eng);
+    let rs = eng.on(&src);
+    rs.reserve(last + steps + 1, false);
+    rs.set_tokens(0, &toks);
+    println!("{} tokens of text; KV per lane at {}: {:.1} GiB", toks.len(), last, gib(rs.kv_exact_bytes(last + steps + 1)));
+    println!("{:>7} {:>13} {:>11} {:>14} {:>6} {:>11} {:>9} {:>8}", "ctx", "prefill t/s", "TTFT s", "1 stream t/s", "lanes", "lanes t/s", "gain", "GPU GiB");
+    let (mut p, mut tpf) = (0usize, 0.0f64);
+    for &c in &ckpts {
+        let t0 = std::time::Instant::now();
+        let p_start = p;
+        while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
+        let dt = t0.elapsed().as_secs_f64(); tpf += dt;
+        let pf_rate = (c - p_start) as f64 / dt;
+        // one stream, decode path (timing only: it advances src's state; the prefill above already finished)
+        let tok = |q: usize| { let cb = eng.gpu.cmd(); rs.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        tok(0);
+        let t1 = std::time::Instant::now(); for q in 0..steps { tok(q); }
+        let one = steps as f64 / t1.elapsed().as_secs_f64();
+        // lanes: as many as fit the budget at this context
+        let per = rs.kv_exact_bytes(c + steps + 1) as f64;
+        let n = ((budget / per) as usize).clamp(1, 64);
+        let lanes: Vec<Lane> = (0..n).map(|i| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(c + steps + 1, false);
+            let mut t: Vec<u32> = toks[..=c + steps].to_vec(); for q in 0..=steps { t[c + q] = toks[(c + 7919 * (i + 1) + q) % c]; }
+            r.set_tokens(0, &t); eng.copy_lane_prefix(&src, &l, c); l }).collect();
+        let step = |q: usize| { let sp: Vec<Span> = lanes.iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                                let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        step(0);
+        let t2 = std::time::Instant::now(); for q in 0..steps { step(q); }
+        let lt = (n * steps) as f64 / t2.elapsed().as_secs_f64();
+        println!("{c:>7} {pf_rate:>13.0} {tpf:>11.1} {one:>14.1} {n:>6} {lt:>11.1} {:>8.2}x {:>8.1}", lt / one, gib(eng.gpu_mem().0));
+        drop(lanes);
+    }
 }
 
 fn stats(name: &str, v: &[f32]) {
@@ -727,6 +789,7 @@ fn main() {
         "spans" => spans(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
+        "maxctx" => maxctx(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),

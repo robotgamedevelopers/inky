@@ -463,6 +463,18 @@ impl Engine {
         let cp = |a: &Buf, b: &Buf| { assert_eq!(a.length(), b.length()); unsafe { std::ptr::copy_nonoverlapping(a.contents().as_ptr() as *const u8, b.contents().as_ptr() as *mut u8, a.length()); } };
         cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow()); cp(&src.cs, &dst.cs);
     }
+    /// dev: make `dst` hold `src`'s first `n` positions (cache rows of every slot, convolution rows); the two may have
+    /// different capacities
+    pub fn copy_lane_prefix(&self, src: &Lane, dst: &Lane, n: usize) {
+        for (sb, db, sc, dc, nk) in [(&src.kv_swa, &dst.kv_swa, src.swa_cap.get(), dst.swa_cap.get(), n.min(EXT)), (&src.kv_full, &dst.kv_full, src.full_cap.get(), dst.full_cap.get(), n)] {
+            assert!(nk <= sc && nk <= dc);
+            let (sp, dp) = (sb.borrow().contents().as_ptr() as *const u8, db.borrow().contents().as_ptr() as *mut u8);
+            let rows = sb.borrow().length() / (sc * HD * self.kvb);
+            assert_eq!(rows, db.borrow().length() / (dc * HD * self.kvb));
+            for r in 0..rows { unsafe { std::ptr::copy_nonoverlapping(sp.add(r * sc * HD * self.kvb), dp.add(r * dc * HD * self.kvb), nk * HD * self.kvb); } }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.cs.contents().as_ptr() as *const u8, dst.cs.contents().as_ptr() as *mut u8, src.cs.length()); }
+    }
     /// GPU memory the device has allocated (bytes) and the working set it recommends
     pub fn gpu_mem(&self) -> (usize, usize) {
         use objc2_metal::MTLDevice;
