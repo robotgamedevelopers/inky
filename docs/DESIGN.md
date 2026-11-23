@@ -2,7 +2,7 @@
 
 Status: design, 2026-11-22. Nothing here is built. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
 
-One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from the erisinky engine (GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
+One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
 
 ## What is measured (M5 Max, 128 GB, 2026-11-22)
 

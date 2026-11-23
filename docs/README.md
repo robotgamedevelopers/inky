@@ -1,6 +1,6 @@
 # inky
 
-> The engine's full guide, written by its original author, Eris ([erisinky](https://github.com/Eriskii/erisinky)), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
+> The engine's full guide, written by its original author, Eris, for [inkling](https://github.com/Eriskii/erisinky), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
 
 A from-scratch inference engine for **Thinking Machines' Inkling 2 Mini** (`inkling2_loop`, 26.4B total / 3.4B active MoE)
 on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GGUF directly (zero-copy mmap).
