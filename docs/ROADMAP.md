@@ -19,8 +19,9 @@ What was measured and tried before any design, and the design itself.
 | The batched path calibrated: 58 ms + 0.21 ms per token | ✅ |
 | llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s | ✅ |
 | The lanes design written | ✅ |
+| The batched path shown batch-invariant (inkling binv); a one-token batch bug found and fixed | ✅ |
 | The design cold-read by a second reader, findings folded in | ❌ |
-| complete | 87% |
+| complete | 88% |
 
 [Source data](roadmap.sexp)
 
@@ -51,13 +52,13 @@ Many lanes advance in one step, and each expert is read once for all of them.
 
 | feature | done |
 |---|:---:|
-| Profile of where the batched path's 58 ms fixed cost goes | ❌ |
+| Profile of where the batched path's 58 ms fixed cost goes | ✅ |
 | One kind of step: it advances a set of (lane, tokens) spans, so decode and prefill are the same operation | ❌ |
 | Each lane's attention reads only its own cache | ❌ |
 | Per-lane sampling with one step in flight | ❌ |
 | Gate: a lane's logits are bit-identical alone and in any batch | ❌ |
 | Gate: batched logits stay within today's tolerance of the llama.cpp reference | ❌ |
-| complete | 0% |
+| complete | 16% |
 
 [Source data](roadmap.sexp)
 
@@ -205,7 +206,7 @@ Improvements that wait for the layers above. Those that change the model's numbe
 
 | feature | done |
 |---|:---:|
-| A small-batch kernel that reads each needed weight row once at full bandwidth, to halve the fixed cost (later) | ❌ |
+| A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes (later) | ❌ |
 | A shared prefix is read once per step for all lanes' queries (later) | ❌ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |

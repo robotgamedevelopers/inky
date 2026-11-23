@@ -30,7 +30,7 @@ The batched path fits **58 ms + 0.21 ms per token**. A decode step for B lanes i
 | 128 | 640 | 5.0 | 900 | 7 |
 | limit | 910 | | 1500 | |
 
-These replace the earlier bandwidth-only estimates, which were too high below 64 lanes. The 58 ms fixed cost is the first thing to attack (see Follow-ons). The knee is near 64 active lanes.
+These replace the earlier bandwidth-only estimates, which were too high below 64 lanes. About half of the 58 ms can be removed (see "Where the batched path's time goes"). The knee is near 64 active lanes.
 
 ### Baseline: llama.cpp's own batching
 
@@ -42,6 +42,22 @@ llama-server (master 44d5087, Metal, 64 parallel slots, short prompts, 256 token
 | per stream | 41 | 34 | 27 | 19 | 10 | 6.4 | 3.6 |
 
 It flattens near 200 tok/s, about twice one inky stream. inky's batched path, at 58 ms + 0.21 ms per token, would give about 260, 490 and 900 tok/s at 16, 32 and 64 lanes at the same short context. That is an estimate from timing one sequence's tokens, not a built decode step. So llama.cpp's batching is not close enough to build on; the engine work is needed.
+
+### Where the batched path's time goes
+
+`inkling prof_pf` at 32 tokens in one batch (52 ms):
+
+| part | time | note |
+|---|---:|---|
+| Experts (up and down projections) | 31 ms | about 46 of 128 experts per layer are touched; they are read at about 330 GB/s, 58% of the memory bus, in 16-token tiles that are 35% full |
+| Dense projections, router, loop controllers | 16 ms | about 1.3 GB of weights, which the single-token decode path reads in 2 to 3 ms |
+| Everything else | 5 ms | mixes, attention, gathers |
+
+So the 58 ms is not a fixed overhead. It is the experts a batch touches, read by a path tuned for large batches. At full bandwidth the same 32 tokens would take about 25 ms. From 32 to 128 tokens the expert time grows only from 31 to 41 ms.
+
+### Batch invariance
+
+`inkling binv` prefills the same tokens split at different points and hashes the final logits. A split moves every later token to a different batch, tile slot and set of neighbours. On two prompts (2403 and 61 tokens), every split gives bit-identical logits, at chunk sizes from 64 to 4096. The check found one bug: a batch of exactly one token went to the decode kernel with batch-layout arguments and gave wrong, non-repeatable logits (fixed in `mix_t`). Upstream never sends a one-token batch; a lane decoding alone would.
 
 ## Decisions
 
@@ -108,7 +124,7 @@ Each is secured before the next starts.
 
 ## Follow-ons, not in the first build
 
-- **The 58 ms fixed cost.** One token through today's decode path costs 9.4 ms; 34 through the batched path cost 64 ms. A kernel for small batches that reads each needed weight row once at full bandwidth should cut the fixed cost by about half. Measure first where the 58 ms goes.
+- **A kernel for decode-size batches.** The largest known gain: about 2x at 16 to 64 lanes. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and give the dense projections the same treatment (see "Where the batched path's time goes"). The first build uses the existing batched path, which is correct and batch-invariant today.
 - **Read a shared prefix once per step** for all lanes' queries, then each lane's own keys, merged with the online softmax the engine already has. Version one shares the memory and skips the prefill; this shares the reads too.
 - **8-bit cache and far-key pruning**, behind the quality replay.
 - **Quality replay**: N landed low-priority cards against the current flash route, comparing how many land.

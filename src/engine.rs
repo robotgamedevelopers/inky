@@ -1572,10 +1572,14 @@ impl Engine {
         }
         self.go(e, cls, "k_mv", &a, (tg as usize, 1, 1), 128);
     }
-    fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_t(e, cls, jobs, 1); }
-    fn mix_t(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize) {
+    /// decode: one token, the decode arena's layout
+    fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_impl(e, cls, jobs, 1, false); }
+    /// prefill: `t` tokens in the batch arena's layout. A batch of one token is still a batch: its jobs carry the batch
+    /// layout (token stride, fp16 outputs), which the decode kernel does not read.
+    fn mix_t(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize) { self.mix_impl(e, cls, jobs, t, true); }
+    fn mix_impl(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize, batch: bool) {
         if self.skip.get() & (1 << cls) != 0 { return; }
-        if t > 1 && std::env::var("INK_OLD_MIXB").is_err() {
+        if batch && std::env::var("INK_OLD_MIXB").is_err() {
             // independent jobs run concurrently (no barrier between them)
             for j in jobs {
                 let j = MixJob { ntok: t as u32, ..*j };

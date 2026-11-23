@@ -257,6 +257,39 @@ fn check(o: &Opts) {
     }
 }
 
+/// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
+/// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
+fn binv(o: &Opts) {
+    let eng = Engine::load(&o.model, o.ctx);
+    let tk = Tokenizer::load(&eng.g);
+    let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let splits: Vec<usize> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let mut first = None;
+    let mut base: Vec<f32> = Vec::new();
+    let mut ok = true;
+    for k in splits {
+        let mut sess = Session::new(&eng, &tk);
+        if k > 0 { sess.prefill(&toks[..k]); }
+        sess.prefill(&toks[k..]);
+        let mut h = 0xcbf29ce484222325u64;
+        for x in eng.logits() { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        let same = *first.get_or_insert(h) == h;
+        if base.is_empty() { base = eng.logits().to_vec(); }
+        let maxdiff = eng.logits().iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
+        ok &= same;
+        // KL(first || this) over the soft-capped logits, as sampling sees them
+        let cap = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| softcap(x, eng.softcap)).collect() };
+        let (pa, pb) = (cap(&base), cap(eng.logits()));
+        let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+        let (l1, l2) = (lse(&pa), lse(&pb));
+        let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
+        println!("split at {k:5}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
+    }
+    println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
+    if !ok { std::process::exit(1); }
+}
+
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -417,6 +450,7 @@ fn main() {
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
+        "binv" => binv(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),
