@@ -280,6 +280,18 @@ fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
 }
 
+/// Decide header-only rejections before allocating or reading the request body.
+fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, String)> {
+    if let Some(k) = key {
+        if path != "/health" && !h.auth.as_deref().is_some_and(|a| same_key(a, k)) {
+            return Err((401, "a valid Authorization: Bearer key is required".into()));
+        }
+    }
+    if h.chunked { return Err((411, "send a Content-Length body, not chunked".into())); }
+    if h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
+    Ok(())
+}
+
 /// compare without stopping at the first differing byte
 fn same_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
@@ -429,6 +441,7 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
 
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
+    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -437,7 +450,6 @@ pub fn serve(o: ServeOpts) {
         c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
-    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
@@ -464,16 +476,11 @@ pub fn serve(o: ServeOpts) {
                 let Ok(h) = read_head(&mut r) else { return };
                 let path = h.path.trim_end_matches('/').to_string();
                 let method = h.method.clone();
-                // the key is checked before any body is read
-                if let Some(k) = &cx.key {
-                    if path != "/health" && !h.auth.as_deref().is_some_and(|a| same_key(a, k)) {
-                        drop(r);
-                        let _ = respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string());
-                        return;
-                    }
+                if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
+                    drop(r);
+                    let _ = respond(&mut s, code, &json!({"error": {"message": message}}).to_string());
+                    return;
                 }
-                if h.chunked { drop(r); let _ = respond(&mut s, 411, &json!({"error": {"message": "send a Content-Length body, not chunked"}}).to_string()); return; }
-                if h.len > MAX_BODY { drop(r); let _ = respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()); return; }
                 let mut body = vec![0u8; h.len];
                 if r.read_exact(&mut body).is_err() { return; }
                 drop(r);
@@ -497,6 +504,20 @@ pub fn serve(o: ServeOpts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn serve_header_policy() {
+        let mut head = Head {
+            method: "POST".into(), path: "/v1/chat/completions".into(),
+            len: MAX_BODY + 1, auth: None, chunked: false,
+        };
+        let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
+        assert_eq!(status(&head), Err(401), "authentication precedes length checks");
+        head.auth = Some("test".into());
+        assert_eq!(status(&head), Err(413));
+        head.len = MAX_BODY;
+        assert_eq!(status(&head), Ok(()), "the upper limit is inclusive");
+        head.chunked = true;
+        assert_eq!(status(&head), Err(411));
+    }
     #[test] fn serve_shape_refuses_an_empty_context_and_a_budget_outside_it() {
         assert!(check_serve_shape(0, 1).is_err(), "no context to serve in");
         assert!(check_serve_shape(4096, 0).is_err(), "no token budget");
