@@ -562,6 +562,20 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
     }
 }
 
+/// Decide header-only rejections before allocating or reading the request body.
+/// A chunked body has no length to check here: its cap is enforced chunk by
+/// chunk in `read_chunked`, after this gate and after the key check.
+fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, String)> {
+    if let Some(k) = key {
+        let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
+        if path != "/health" && !authed {
+            return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
+        }
+    }
+    if !h.chunked && h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
+    Ok(())
+}
+
 /// compare without stopping at the first differing byte
 fn same_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
@@ -851,6 +865,7 @@ fn count_tokens(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()>
 
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
+    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -859,7 +874,6 @@ pub fn serve(o: ServeOpts) {
         c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
-    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
@@ -887,16 +901,13 @@ pub fn serve(o: ServeOpts) {
                 let path = route_path(&h.path);
                 let method = h.method.clone();
                 // the key is checked before any body is read
-                if let Some(k) = &cx.key {
-                    let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
-                    if path != "/health" && !authed {
-                        drop(r);
-                        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 401, "authentication_error", "a valid x-api-key or Authorization: Bearer key is required") }
-                                else { respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string()) };
-                        return;
-                    }
+                if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
+                    drop(r);
+                    let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message) }
+                            else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
+                    return;
                 }
-                // the body is read only now, after the key check above
+                // the body is read only now, after the header gate above
                 let body = if h.chunked {
                     match read_chunked(&mut r, MAX_BODY) {
                         Ok(b) => b,
@@ -904,7 +915,6 @@ pub fn serve(o: ServeOpts) {
                         Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
                     }
                 } else {
-                    if h.len > MAX_BODY { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
                     let mut body = vec![0u8; h.len];
                     if r.read_exact(&mut body).is_err() { return; }
                     body
@@ -1324,6 +1334,28 @@ mod tests {
         assert!(c.starts_with("HTTP/1.1 400"), "chat over-cap must be an HTTP 400, got: {}", &c[..c.len().min(80)]);
         assert!(c.contains("context full"), "chat over-cap body: {c}");
         assert!(!c.contains("text/event-stream"), "no SSE headers may precede the refusal: {c}");
+    }
+
+    #[test] fn serve_header_policy() {
+        let mut head = Head {
+            method: "POST".into(), path: "/v1/chat/completions".into(),
+            len: MAX_BODY + 1, auth: None, api_key: None, chunked: false,
+        };
+        let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
+        assert_eq!(status(&head), Err(401), "authentication precedes length checks");
+        head.auth = Some("test".into());
+        assert_eq!(status(&head), Err(413));
+        head.len = MAX_BODY;
+        assert_eq!(status(&head), Ok(()), "the upper limit is inclusive");
+        // a chunked body passes the header gate: its cap is enforced chunk
+        // by chunk in read_chunked, never a 411 (Stella's proxied requests)
+        head.chunked = true;
+        head.len = 0;
+        assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), chunked: false };
+        assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
+        by_key.api_key = Some("wrong".into());
+        assert_eq!(status(&by_key), Err(401));
     }
     #[test] fn serve_shape_refuses_an_empty_context_and_a_budget_outside_it() {
         assert!(check_serve_shape(0, 1).is_err(), "no context to serve in");
