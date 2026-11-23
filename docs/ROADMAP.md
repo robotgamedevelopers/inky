@@ -233,7 +233,7 @@ Improvements that wait for the layers above. Those that change the model's numbe
 | Smaller weight quantizations, behind the quality replay (later) | ❌ |
 | Tool calls constrained to valid JSON while sampling (later) | ❌ |
 | Sampling on the GPU (later) | ❌ |
-| General fixes sent upstream to erisinky (later) | ❌ |
+| General fixes sent upstream to inkling (later) | ❌ |
 | complete | 0% |
 
 [Source data](roadmap.sexp)

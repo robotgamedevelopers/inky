@@ -291,7 +291,7 @@
      ("later-quant" "Smaller weight quantizations, behind the quality replay" :later t)
      ("later-grammar" "Tool calls constrained to valid JSON while sampling" :later t)
      ("later-gpu-sampling" "Sampling on the GPU" :later t)
-     ("later-upstream" "General fixes sent upstream to erisinky" :later t)
+     ("later-upstream" "General fixes sent upstream to inkling" :later t)
    )
    :columns (("done" "done"))
    :cells (
@@ -315,4 +315,4 @@
   (:id "t-later-quant" :type :task :title "Smaller weight quantizations, behind the quality replay" :state :todo)
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
-  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to erisinky" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")))
+  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to inkling" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")))
