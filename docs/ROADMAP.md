@@ -227,9 +227,14 @@ Improvements that wait for the layers above. Those that change the model's numbe
 |---|:---:|
 | The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ❌ |
 | Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ❌ |
-| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill (later) | ❌ |
+| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
-| A shared prefix is read once per step for all lanes' queries (later) | ❌ |
+| Shared-prefix design and measured overlap on four concurrent cards (later) | ✅ |
+| Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails (later) | ❌ |
+| Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks (later) | ❌ |
+| Grouped prefix reads match private fixed-split logits and goldens bit for bit (later) | ❌ |
+| Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries (later) | ❌ |
+| Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time (later) | ❌ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |
 | The 8-bit cache, behind the quality replay (later) | ❌ |
@@ -238,7 +243,7 @@ Improvements that wait for the layers above. Those that change the model's numbe
 | Tool calls constrained to valid JSON while sampling (later) | ❌ |
 | Sampling on the GPU (later) | ❌ |
 | General fixes sent upstream to erisinky (later) | ❌ |
-| complete | 0% |
+| complete | 5% |
 
 [Source data](roadmap.sexp)
 
