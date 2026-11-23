@@ -59,7 +59,14 @@ func (g *gate) checkHealth(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := r.expect(http.StatusOK); err != nil {
+	expected := http.StatusOK
+	if g.sabotage == "health-status" {
+		expected = http.StatusTeapot // CI negative control: a healthy server must disagree.
+	}
+	if err := r.expect(expected); err != nil {
+		if g.sabotage == "health-status" {
+			return fmt.Errorf("sabotage health-status: %w", err)
+		}
 		return err
 	}
 	if !r.OK {

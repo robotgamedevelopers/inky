@@ -1,5 +1,7 @@
 #!/bin/zsh
 # Usage: tests/serve.sh [release-binary [model.gguf]]
+# SERVECHECK_SABOTAGE=health-status deliberately expects the wrong health status.
+# CI runs normal success first, then requires this specific negative-control failure.
 set -eu
 cd "${0:A:h}/.."
 bin=${1:-./target/release/inky}

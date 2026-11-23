@@ -19,6 +19,7 @@ import (
 
 type gate struct {
 	url, key, log string
+	sabotage      string
 	failed        bool
 }
 
@@ -116,7 +117,11 @@ func execute() error {
 	// Redirects and proxies would take functional requests outside this test server.
 	http.DefaultTransport.(*http.Transport).Proxy = nil
 	http.DefaultClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	g := gate{key: "local-gate-test"}
+	sabotage := os.Getenv("SERVECHECK_SABOTAGE")
+	if sabotage != "" && sabotage != "health-status" {
+		return fmt.Errorf("unknown SERVECHECK_SABOTAGE probe %q", sabotage)
+	}
+	g := gate{key: "local-gate-test", sabotage: sabotage}
 	bin, model := os.Args[1], os.Args[2]
 	g.run("lane limit checked before model load", func() error { return checkLaneRange(ctx, bin, dir) })
 	if err = g.server(ctx, bin, model, dir, 1, func() { g.validation(); g.cancelJobs() }); err != nil {

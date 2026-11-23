@@ -50,4 +50,21 @@ jobs:
       # lifetime, and cancels/waits for each child server before removing logs.
       - name: serve API probes
         timeout-minutes: 10
+        env:
+          SERVECHECK_SABOTAGE: ''
         run: tests/serve.sh
+      - name: serve API negative control
+        timeout-minutes: 10
+        env:
+          SERVECHECK_SABOTAGE: health-status
+        run: |
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          if tests/serve.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
+          cat "$log"
+          # Require the deliberate mismatch and completed suite; a crash is not proof.
+          test "$rc" -eq 1
+          grep -Fxq 'FAIL bearer authentication and public health: sabotage health-status: got HTTP 200, want 418' "$log"
+          grep -Fxq 'one or more serve checks failed' "$log"
+          test "$(grep -c '^FAIL ' "$log")" -eq 1
+          echo 'serve health-status sabotage: detected, as required'
