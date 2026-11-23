@@ -155,9 +155,11 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 // `tool_choice` and `top_k` have no counterpart in the chat path and are ignored.
 
 /// An Anthropic request as the OpenAI request the chat path renders: `system` becomes leading
-/// system messages, text blocks keep their order and their per-block rendering, a user message's
-/// tool results become tool messages in place, and an assistant message's text and tool uses become
-/// its content and tool calls (rendered text first, as the chat path renders them).
+/// system messages, a `system` role inside `messages[]` (Claude Code 2.1.330) becomes a system
+/// message in place so its order is kept, text blocks keep their order and their per-block
+/// rendering, a user message's tool results become tool messages in place, and an assistant
+/// message's text and tool uses become its content and tool calls (rendered text first, as the
+/// chat path renders them).
 fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
     let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
     if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
@@ -177,6 +179,14 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
     for m in msgs_in {
         let role = m["role"].as_str().ok_or("message without role")?;
         match (role, &m["content"]) {
+            ("system", Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
+            ("system", Value::Array(blocks)) => {
+                let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
+                    Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                    t => Err(format!("unsupported content block type {} in a system message", t.unwrap_or("none"))),
+                }).collect::<Result<_, _>>()?;
+                msgs.push(json!({"role": "system", "content": parts}));
+            }
             ("user", Value::String(s)) => msgs.push(json!({"role": "user", "content": s})),
             ("assistant", Value::String(s)) => msgs.push(json!({"role": "assistant", "content": s})),
             ("user", Value::Array(blocks)) => {
@@ -230,7 +240,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 msgs.push(msg);
             }
-            ("user" | "assistant", _) => return Err("message content must be a string or an array of blocks".into()),
+            ("user" | "assistant" | "system", _) => return Err("message content must be a string or an array of blocks".into()),
             (r, _) => return Err(format!("unknown role {r}")),
         }
     }
@@ -960,9 +970,46 @@ mod tests {
         assert!(o.get("tools").is_none(), "no tools in, no tools out");
     }
 
+    #[test] fn system_role_messages_from_claude_code_translate_in_order() {
+        // Claude Code 2.1.330 (Rowan, MacBook, PR 19 at a696454) sends a
+        // role:"system" entry inside messages[] and serve refused it with
+        // 400 "unknown role system" at the first turn. It must fold into
+        // the system prompt in order, exactly as the chat path renders a
+        // system message in place.
+        let a = json!({"model": "inkling-2-mini", "max_tokens": 64,
+            "system": [{"type": "text", "text": "Top system."}],
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "First in-message system."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+                {"role": "system", "content": "Later system note."},
+                {"role": "user", "content": "Continue"}]});
+        let o = anthropic_to_openai(&a).unwrap();
+        assert_eq!(o["messages"][0], json!({"role": "system", "content": [{"type": "text", "text": "Top system."}]}));
+        assert_eq!(o["messages"][1], json!({"role": "system", "content": [{"type": "text", "text": "First in-message system."}]}));
+        assert_eq!(o["messages"][2], json!({"role": "user", "content": [{"type": "text", "text": "Hi"}]}));
+        assert_eq!(o["messages"][3]["role"], "assistant");
+        assert_eq!(o["messages"][4], json!({"role": "system", "content": "Later system note."}));
+        assert_eq!(o["messages"][5], json!({"role": "user", "content": "Continue"}));
+        // and it renders to the same tokens as the equivalent chat request
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        // a chat twin: the top-level system array is one system message,
+        // the in-message system entries follow it in place
+        let chat = json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "Top system."}]},
+            {"role": "system", "content": "First in-message system."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "system", "content": "Later system note."},
+            {"role": "user", "content": "Continue"}]});
+        assert_eq!(render(&tk, &sp, &o, "medium").unwrap(), render(&tk, &sp, &chat, "medium").unwrap(),
+            "a system role inside messages[] must render as the chat path renders a system message in place");
+    }
+
     #[test] fn anthropic_translation_refuses_what_it_cannot_render() {
         assert!(anthropic_to_openai(&json!({"messages": []})).is_err(), "no messages");
-        assert!(anthropic_to_openai(&json!({"messages": [{"role": "system", "content": "x"}]})).is_err(), "no system role inside messages");
+        assert!(anthropic_to_openai(&json!({"messages": [{"role": "system", "content": [{"type": "document", "source": {}}]}]})).is_err(), "an unsupported system block fails closed, never dropped");
         assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]})).is_err(), "an unsupported block fails closed, never dropped");
         assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]})).is_err(), "a tool result without its id");
         assert!(anthropic_to_openai(&json!({"tools": [{"description": "x"}], "messages": [{"role": "user", "content": "x"}]})).is_err(), "a tool without a name");
