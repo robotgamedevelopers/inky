@@ -207,6 +207,9 @@ fn check(o: &Opts) {
     eng.set_tokens(0, &toks);
     // --pf N: prefill the first N tokens as one batch, then decode the rest one by one
     let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
+    let dec_steps = std::env::var("INK_DEC").is_ok();
+    if dec_steps { eng.ensure_dbatch(1); }
     let mut agree = 0;
     let mut worst = 0f32;
     let kv_disk = engine::KV_DISK.load(std::sync::atomic::Ordering::Relaxed);
@@ -227,6 +230,8 @@ fn check(o: &Opts) {
         } else if kv_disk {
             eng.gen_reserve(pos);
             eng.step(pos, true, false).waitUntilCompleted();
+        } else if dec_steps {
+            eng.encode_decode(&cb, &[engine::Span { lane: eng.lane, p0: pos, t: 1 }], true, false);
         } else { eng.encode_step(&cb, pos, true, false); }
         cb.commit();
         cb.waitUntilCompleted();
@@ -235,8 +240,9 @@ fn check(o: &Opts) {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
-        let lg: Vec<f32> = eng.logits().iter().map(|&x| softcap(x, eng.softcap)).collect();
-        for x in eng.logits() { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        let raw: &[f32] = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.softcap)).collect();
+        for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
@@ -516,7 +522,7 @@ fn dbatch(o: &Opts) {
         for q in 0..nd {
             let cb = eng.gpu.cmd();
             if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
-            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(eng.logits()));
+            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(if old { eng.logits() } else { eng.span_logits(0) }));
         }
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
@@ -534,7 +540,7 @@ fn dbatch(o: &Opts) {
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else if n == 1 { eng.logits() } else { eng.span_logits(j) })); }
+            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();

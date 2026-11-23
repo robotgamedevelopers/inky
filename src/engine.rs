@@ -1518,7 +1518,28 @@ impl Engine {
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
         for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
-        if logits {
+        if logits && dec {
+            // a decode step: every lane's last row through the output mix and one tensor GEMM over the output matrix (read
+            // once for all lanes, whatever their number); logits in the batch arena (`span_logits`)
+            let ar = self.ar;
+            let n = spans.len();
+            let st: Vec<u32> = blocks.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur))).collect();
+            let mut j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
+            j.hout[0] = b.xh[0] as i32; j.nof32 = 1;
+            self.mix_t(&e, C_OMIX, &[j], n);
+            let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
+            hs.ldo = self.vocab_pad() as u32;
+            self.gemm_h(&e, C_LMHEAD, &[hs], n);
+            if argmax {
+                for (si, sp) in spans.iter().enumerate() {
+                    let nparts = 128u32;
+                    let am = ArgmaxArgs { logits_off: b.lg + (si * self.vocab_pad()) as u32, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + 1) as u32, pad: [0; 3] };
+                    e.buf(&sp.lane.toks, 0, 6);
+                    self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+                    self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+                }
+            }
+        } else if logits {
             let ar = self.ar;
             for (si, sp) in spans.iter().enumerate() {
                 let last = ((row0[si] + sp.t - 1) * E) as u32;
