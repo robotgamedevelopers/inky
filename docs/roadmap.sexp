@@ -13,6 +13,7 @@
      ("eval-batch" "The batched path calibrated: 58 ms + 0.21 ms per token")
      ("eval-llama" "llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s")
      ("eval-design" "The lanes design written")
+     ("eval-invariance" "The batched path shown batch-invariant (inkling binv); a one-token batch bug found and fixed")
      ("eval-coldread" "The design cold-read by a second reader, findings folded in")
    )
    :columns (("done" "done"))
@@ -24,6 +25,7 @@
      ("eval-batch" "done" "t-eval-batch")
      ("eval-llama" "done" "t-eval-llama")
      ("eval-design" "done" "t-eval-design")
+     ("eval-invariance" "done" "t-eval-invariance")
      ("eval-coldread" "done" "t-eval-coldread")
    ))
   (:id "t-eval-bench" :type :task :title "Single-stream speed and memory bandwidth measured on an M5 Max" :state :done :evidence ("docs/DESIGN.md: What is measured"))
@@ -33,6 +35,7 @@
   (:id "t-eval-batch" :type :task :title "The batched path calibrated: 58 ms + 0.21 ms per token" :state :done :evidence ("docs/DESIGN.md: What is measured"))
   (:id "t-eval-llama" :type :task :title "llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s" :state :done :evidence ("docs/DESIGN.md: Baseline: llama.cpp's own batching"))
   (:id "t-eval-design" :type :task :title "The lanes design written" :state :done :evidence ("docs/DESIGN.md"))
+  (:id "t-eval-invariance" :type :task :title "The batched path shown batch-invariant (inkling binv); a one-token batch bug found and fixed" :state :done :evidence ("src/main.rs: binv" "src/engine.rs: mix_t" "docs/DESIGN.md: Batch invariance"))
   (:id "t-eval-coldread" :type :task :title "The design cold-read by a second reader, findings folded in" :state :todo)
   (:id "layer-1" :type :roadmap :title "Layer 1: lane state out of the engine"
    :rows (
@@ -67,7 +70,7 @@
      ("l2-gate-invariant" "done" "t-l2-gate-invariant")
      ("l2-gate-reference" "done" "t-l2-gate-reference")
    ))
-  (:id "t-l2-profile" :type :task :title "Profile of where the batched path's 58 ms fixed cost goes" :state :todo)
+  (:id "t-l2-profile" :type :task :title "Profile of where the batched path's 58 ms fixed cost goes" :state :done :evidence ("docs/DESIGN.md: Where the batched path's time goes"))
   (:id "t-l2-spans" :type :task :title "One kind of step: it advances a set of (lane, tokens) spans, so decode and prefill are the same operation" :state :todo)
   (:id "t-l2-attention" :type :task :title "Each lane's attention reads only its own cache" :state :todo)
   (:id "t-l2-sampling" :type :task :title "Per-lane sampling with one step in flight" :state :todo)
@@ -225,7 +228,7 @@
   (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :todo)
   (:id "later" :type :roadmap :title "After the first build"
    :rows (
-     ("later-fixed-cost" "A small-batch kernel that reads each needed weight row once at full bandwidth, to halve the fixed cost" :later t)
+     ("later-fixed-cost" "A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes" :later t)
      ("later-prefix-reads" "A shared prefix is read once per step for all lanes' queries" :later t)
      ("later-quality" "A quality replay: landed cards run again and compared with a reference route" :later t)
      ("later-effort" "The lowest thinking effort that still lands cards, per kind of card" :later t)
@@ -249,7 +252,7 @@
      ("later-gpu-sampling" "done" "t-later-gpu-sampling")
      ("later-upstream" "done" "t-later-upstream")
    ))
-  (:id "t-later-fixed-cost" :type :task :title "A small-batch kernel that reads each needed weight row once at full bandwidth, to halve the fixed cost" :state :todo)
+  (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes" :state :todo)
   (:id "t-later-prefix-reads" :type :task :title "A shared prefix is read once per step for all lanes' queries" :state :todo)
   (:id "t-later-quality" :type :task :title "A quality replay: landed cards run again and compared with a reference route" :state :todo)
   (:id "t-later-effort" :type :task :title "The lowest thinking effort that still lands cards, per kind of card" :state :todo)
