@@ -88,5 +88,5 @@ if [ -f "$root/specs/CacheScheduler.tla" ]; then
 fi
 
 if [ -f "$root/scripts/check-memmode-traces.sh" ]; then
-    sh "$root/scripts/check-memmode-traces.sh"
+    bash "$root/scripts/check-memmode-traces.sh"
 fi
