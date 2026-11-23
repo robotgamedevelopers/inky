@@ -2467,6 +2467,10 @@ impl<'a> Run<'a> {
         (swa, full)
     }
 
+    /// a copy of this lane's convolution rows (its recurrent state at the current position)
+    pub fn get_cs(&self) -> Vec<u8> { unsafe { std::slice::from_raw_parts(self.lane.cs.contents().as_ptr() as *const u8, self.lane.cs.length()).to_vec() } }
+    /// put back convolution rows `get_cs` copied. Nothing may be in flight on the GPU.
+    pub fn set_cs(&self, v: &[u8]) { assert_eq!(v.len(), self.lane.cs.length()); unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.lane.cs.contents().as_ptr() as *mut u8, v.len()); } }
     pub fn reset(&self) {
         self.tier_reset();
         unsafe { std::ptr::write_bytes(self.lane.cs.contents().as_ptr() as *mut u8, 0, self.lane.cs.length()); }

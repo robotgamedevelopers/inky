@@ -4,6 +4,7 @@ mod metal;
 mod sampler;
 mod session;
 mod memd;
+mod serve;
 mod tuning;
 mod tokenizer;
 mod unicode_tables;
@@ -805,6 +806,20 @@ fn main() {
             Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
             None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
         }
+    }
+    // `inky serve [-m MODEL] [-c CTX] [--lanes N] [--bind ADDR] [--effort E] [-n MAX]`: the OpenAI endpoint over lanes
+    if raw.get(1).map(|s| s.as_str()) == Some("serve") {
+        let arg = |k: &str| raw.iter().position(|a| a == k).and_then(|i| raw.get(i + 1)).cloned();
+        let home = std::env::var("HOME").unwrap_or_default();
+        serve::serve(serve::ServeOpts {
+            model: arg("-m").unwrap_or(DEFAULT_MODEL.replace('~', &home)),
+            ctx: arg("-c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(65536).div_ceil(64) * 64,
+            bind: arg("--bind").unwrap_or("127.0.0.1:8090".into()),
+            lanes: arg("--lanes").and_then(|v| v.parse().ok()).unwrap_or(16),
+            effort: arg("--effort").unwrap_or("medium".into()),
+            max_tokens: arg("-n").and_then(|v| v.parse().ok()).unwrap_or(16384),
+        });
+        return;
     }
     // `inky mode [SECONDS]`: enter inky mode (above) and hold it, then leave by exiting
     if raw.get(1).map(|s| s.as_str()) == Some("mode") {
