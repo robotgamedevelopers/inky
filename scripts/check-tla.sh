@@ -87,8 +87,5 @@ if [ -f "$root/specs/CacheScheduler.tla" ]; then
     }
 fi
 
-if [ -f "$root/scripts/check-memmode-traces.sh" ]; then
-    bash "$root/scripts/check-memmode-traces.sh"
-else
-    echo "Production trace checker absent: PR #23 must land to enable this gate."
-fi
+# Required since PR #23: a missing checker must fail this gate.
+bash "$root/scripts/check-memmode-traces.sh"
