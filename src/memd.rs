@@ -10,7 +10,14 @@ use std::sync::{Arc, Mutex};
 
 pub const SOCKET: &str = "/var/run/inky/memd.sock";
 const LIMIT: &str = "iogpu.wired_limit_mb";
-const HELPER: &str = "/usr/local/libexec/inky-memd";
+/// the helper's binary: a root-owned copy in a directory only root can write
+const HELPER_DIR: &str = "/Library/PrivilegedHelperTools";
+const HELPER: &str = "/Library/PrivilegedHelperTools/inky-memd";
+/// where an earlier version installed it; removed on install
+const OLD_HELPER: &str = "/usr/local/libexec/inky-memd";
+/// the limit found when the helper raised it, kept on disk while raised, so a helper that dies while raised restores it
+/// when it starts again
+const SAVED: &str = "/var/db/inky-memd.saved";
 const PLIST: &str = "/Library/LaunchDaemons/com.robotgamedevelopers.inky.memd.plist";
 const LABEL: &str = "com.robotgamedevelopers.inky.memd";
 
@@ -19,23 +26,30 @@ const LABEL: &str = "com.robotgamedevelopers.inky.memd";
 pub struct Mode { pub saved: Option<u64>, pub clients: usize }
 
 impl Mode {
-    /// A client connected: the first one raises the limit to `target`, remembering the limit found.
-    pub fn connect(&mut self, target: u64, get: impl Fn() -> u64, set: impl Fn(u64)) {
-        if self.clients == 0 { self.saved = Some(get()); set(target); }
+    /// A client connected: the first one raises the limit to `target`, remembering the limit found (and `keep` stores it
+    /// before the raise). If the limit cannot be read, nothing is raised and the client is refused.
+    pub fn connect(&mut self, target: u64, get: impl Fn() -> Option<u64>, set: impl Fn(u64), keep: impl Fn(Option<u64>)) -> Result<(), String> {
+        if self.clients == 0 {
+            let found = get().ok_or("the current limit cannot be read; not raising it")?;
+            keep(Some(found));
+            self.saved = Some(found);
+            set(target);
+        }
         self.clients += 1;
+        Ok(())
     }
-    /// A client's connection closed: the last one restores the limit found.
-    pub fn close(&mut self, set: impl Fn(u64)) {
+    /// A client's connection closed: the last one restores the limit found, then forgets it on disk.
+    pub fn close(&mut self, set: impl Fn(u64), keep: impl Fn(Option<u64>)) {
         assert!(self.clients > 0);
         self.clients -= 1;
-        if self.clients == 0 { if let Some(v) = self.saved.take() { set(v); } }
+        if self.clients == 0 { if let Some(v) = self.saved.take() { set(v); keep(None); } }
     }
 }
 
-fn get_limit() -> u64 { crate::tuning::sysctl_u64(LIMIT).unwrap_or(0) }
+fn get_limit() -> Option<u64> { crate::tuning::sysctl_u64(LIMIT) }
 fn set_limit(v: u64) {
+    let Ok(mut x) = u32::try_from(v) else { eprintln!("[inky memd] {v} does not fit {LIMIT}; not set"); return };
     let n = std::ffi::CString::new(LIMIT).unwrap();
-    let mut x: u32 = v as u32;
     let r = unsafe { libc::sysctlbyname(n.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut x as *mut u32 as *mut libc::c_void, 4) };
     if r != 0 { eprintln!("[inky memd] setting {LIMIT}={v} failed: {}", std::io::Error::last_os_error()); }
     else { eprintln!("[inky memd] {LIMIT} = {v}"); }
@@ -53,25 +67,43 @@ pub fn daemon(args: &[String]) {
     let target = tuning.wired_limit_mb;
     let fake_limit = Arc::new(Mutex::new(0u64));
     let (fl1, fl2) = (fake_limit.clone(), fake_limit.clone());
-    let get: Arc<dyn Fn() -> u64 + Send + Sync> = if fake { Arc::new(move || *fl1.lock().unwrap()) } else { Arc::new(get_limit) };
+    let get: Arc<dyn Fn() -> Option<u64> + Send + Sync> = if fake { Arc::new(move || Some(*fl1.lock().unwrap())) } else { Arc::new(get_limit) };
     let set: Arc<dyn Fn(u64) + Send + Sync> = if fake { Arc::new(move |v| { *fl2.lock().unwrap() = v; eprintln!("[inky memd] (fake) limit = {v}"); }) } else { Arc::new(set_limit) };
-    if let Some(dir) = std::path::Path::new(&path).parent() { let _ = std::fs::create_dir_all(dir); }
+    // the saved limit on disk (beside the socket with --fake, so tests need no root)
+    let saved_path = if fake { format!("{path}.saved") } else { SAVED.to_string() };
+    let sp = saved_path.clone();
+    let keep: Arc<dyn Fn(Option<u64>) + Send + Sync> = Arc::new(move |v| match v {
+        Some(v) => { let tmp = format!("{sp}.tmp"); if std::fs::write(&tmp, v.to_string()).and_then(|_| std::fs::rename(&tmp, &sp)).is_err() { eprintln!("[inky memd] could not record the saved limit in {sp}"); } }
+        None => { let _ = std::fs::remove_file(&sp); }
+    });
+    // a helper that died while the limit was raised left the limit it found on disk: put it back first
+    if let Some(v) = std::fs::read_to_string(&saved_path).ok().and_then(|t| t.trim().parse::<u64>().ok()) {
+        eprintln!("[inky memd] the previous helper stopped while the limit was raised: restoring {v}");
+        set(v); keep(None);
+    }
+    // the socket lives in a directory only the owner (and root) can open, created before the socket exists
+    let dir = std::path::Path::new(&path).parent().expect("a socket path with a directory").to_path_buf();
+    let _ = std::fs::create_dir_all(&dir);
+    let cd = std::ffi::CString::new(dir.to_string_lossy().as_bytes()).unwrap();
+    unsafe { libc::chown(cd.as_ptr(), owner, libc::gid_t::MAX); libc::chmod(cd.as_ptr(), 0o700); }
     let _ = std::fs::remove_file(&path);
+    let old_mask = unsafe { libc::umask(0o077) };
     let l = UnixListener::bind(&path).expect("bind the memd socket");
+    unsafe { libc::umask(old_mask); }
     let c = std::ffi::CString::new(path.clone()).unwrap();
     unsafe { libc::chown(c.as_ptr(), owner, libc::gid_t::MAX); libc::chmod(c.as_ptr(), 0o600); }
     eprintln!("[inky memd] tuning {} ({chip}, {} GB): inky mode raises {LIMIT} to {target}; listening on {path}", tuning.name, tuning.memory_gb);
     let mode = Arc::new(Mutex::new(Mode::default()));
     // SIGTERM (launchctl bootout) and SIGINT: give the memory back, then exit
     {
-        let (mode, set) = (mode.clone(), set.clone());
+        let (mode, set, keep) = (mode.clone(), set.clone(), keep.clone());
         std::thread::spawn(move || unsafe {
             let mut sigs: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut sigs); libc::sigaddset(&mut sigs, libc::SIGTERM); libc::sigaddset(&mut sigs, libc::SIGINT);
             let mut sig = 0;
             libc::sigwait(&sigs, &mut sig);
             let m = mode.lock().unwrap();
-            if let Some(v) = m.saved { set(v); }
+            if let Some(v) = m.saved { set(v); keep(None); }
             std::process::exit(0);
         });
         unsafe {
@@ -82,17 +114,21 @@ pub fn daemon(args: &[String]) {
     }
     for s in l.incoming() {
         let Ok(s) = s else { continue };
-        let (mode, get, set) = (mode.clone(), get.clone(), set.clone());
+        let (mode, get, set, keep) = (mode.clone(), get.clone(), set.clone(), keep.clone());
         std::thread::spawn(move || {
             let mut r = BufReader::new(&s);
             let mut line = String::new();
             if r.read_line(&mut line).unwrap_or(0) == 0 || !line.starts_with("enter") { return; }
-            mode.lock().unwrap().connect(target, || get(), |v| set(v));
+            if let Err(e) = mode.lock().unwrap().connect(target, || get(), |v| set(v), |v| keep(v)) {
+                eprintln!("[inky memd] refused a client: {e}");
+                let _ = (&s).write_all(format!("err {e}\n").as_bytes());
+                return;
+            }
             let _ = (&s).write_all(format!("ok {target}\n").as_bytes());
             // hold until the client's end closes, however it closes
             let mut sink = String::new();
             while r.read_line(&mut sink).unwrap_or(0) > 0 { sink.clear(); }
-            mode.lock().unwrap().close(|v| set(v));
+            mode.lock().unwrap().close(|v| set(v), |v| keep(v));
         });
     }
 }
@@ -115,17 +151,27 @@ pub fn install(args: &[String]) {
     if unsafe { libc::geteuid() } != 0 { eprintln!("run it with sudo: sudo {} tune-memory{}", std::env::args().next().unwrap_or("inky".into()), if args.iter().any(|a| a == "--undo") { " --undo" } else { "" }); std::process::exit(1); }
     let sh = |cmd: &[&str]| { let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).status(); };
     if args.iter().any(|a| a == "--undo") {
-        sh(&["launchctl", "bootout", &format!("system/{LABEL}")]);
-        let _ = std::fs::remove_file(PLIST); let _ = std::fs::remove_file(HELPER); let _ = std::fs::remove_file(SOCKET);
-        println!("inky mode removed: the helper is gone and {LIMIT} is back to what it was");
+        sh(&["launchctl", "bootout", &format!("system/{LABEL}")]);       // SIGTERM: the helper restores what it raised
+        if let Some(v) = std::fs::read_to_string(SAVED).ok().and_then(|t| t.trim().parse::<u64>().ok()) { set_limit(v); }
+        for f in [PLIST, HELPER, OLD_HELPER, SOCKET, SAVED] { let _ = std::fs::remove_file(f); }
+        println!("inky mode removed. {LIMIT} is now {}", get_limit().map_or("unreadable".into(), |v| v.to_string()));
         return;
     }
     let owner: u32 = std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok()).expect("run it with sudo from the owner's account");
     sh(&["launchctl", "bootout", &format!("system/{LABEL}")]);
-    std::fs::create_dir_all("/usr/local/libexec").expect("create /usr/local/libexec");
-    std::fs::copy(std::env::current_exe().unwrap(), HELPER).expect("copy the helper");
-    let c = std::ffi::CString::new(HELPER).unwrap();
+    // the helper runs as root: its directory must be root's alone, and the copy must be root's before it is in place
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(HELPER_DIR).expect("read /Library/PrivilegedHelperTools");
+    if !md.is_dir() || md.uid() != 0 || md.mode() & 0o022 != 0 {
+        eprintln!("refused: {HELPER_DIR} must be a root-owned directory no one else can write"); std::process::exit(1);
+    }
+    let tmp = format!("{HELPER}.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(std::env::current_exe().unwrap(), &tmp).expect("copy the helper");
+    let c = std::ffi::CString::new(tmp.clone()).unwrap();
     unsafe { libc::chown(c.as_ptr(), 0, 0); libc::chmod(c.as_ptr(), 0o755); }
+    std::fs::rename(&tmp, HELPER).expect("put the helper in place");
+    let _ = std::fs::remove_file(OLD_HELPER);
     let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -148,22 +194,29 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     #[test] fn raised_while_connected_and_restored_after_the_last() {
-        let lim = Cell::new(50000u64);
+        let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
-        m.connect(118000, || lim.get(), |v| lim.set(v));
-        m.connect(118000, || lim.get(), |v| lim.set(v));
+        m.connect(118000, || Some(lim.get()), |v| lim.set(v), |v| disk.set(v)).unwrap();
+        assert_eq!(disk.get(), Some(50000), "the limit found is on disk before the raise");
+        m.connect(118000, || Some(lim.get()), |v| lim.set(v), |v| disk.set(v)).unwrap();
         assert_eq!(lim.get(), 118000);
-        m.close(|v| lim.set(v));
+        m.close(|v| lim.set(v), |v| disk.set(v));
         assert_eq!(lim.get(), 118000, "still one client: still raised");
-        m.close(|v| lim.set(v));
-        assert_eq!((lim.get(), m.saved), (50000, None), "the limit found, not the default");
+        m.close(|v| lim.set(v), |v| disk.set(v));
+        assert_eq!((lim.get(), m.saved, disk.get()), (50000, None, None), "the limit found, not the default; nothing left on disk");
     }
     #[test] fn a_second_session_saves_afresh() {
-        let lim = Cell::new(0u64);
+        let (lim, disk) = (Cell::new(0u64), Cell::new(None));
         let mut m = Mode::default();
-        m.connect(118000, || lim.get(), |v| lim.set(v)); m.close(|v| lim.set(v));
+        m.connect(118000, || Some(lim.get()), |v| lim.set(v), |v| disk.set(v)).unwrap(); m.close(|v| lim.set(v), |v| disk.set(v));
         lim.set(70000);     // the owner changes it between sessions
-        m.connect(118000, || lim.get(), |v| lim.set(v)); m.close(|v| lim.set(v));
+        m.connect(118000, || Some(lim.get()), |v| lim.set(v), |v| disk.set(v)).unwrap(); m.close(|v| lim.set(v), |v| disk.set(v));
         assert_eq!(lim.get(), 70000);
+    }
+    #[test] fn an_unreadable_limit_is_never_raised() {
+        let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
+        let mut m = Mode::default();
+        assert!(m.connect(118000, || None, |v| lim.set(v), |v| disk.set(v)).is_err());
+        assert_eq!((lim.get(), m.clients, disk.get()), (50000, 0, None));
     }
 }

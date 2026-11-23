@@ -42,7 +42,7 @@ impl Sampler {
                 floor = self.cand.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
             }
         }
-        self.cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0));     // total order: a NaN logit cannot panic the scheduler
         let c = self.softcap;
         let t = self.temp;
         let scaled: Vec<f32> = self.cand.iter().map(|&(x, _)| (if c > 0.0 { c * (x / c).tanh() } else { x }) / t).collect();

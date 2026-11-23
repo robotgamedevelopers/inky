@@ -142,7 +142,9 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 // ------------------------------------------------------------------------------------------------- scheduler
 
 struct Job { toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: Sender<Ev> }
-enum Ev { Tok(u32), Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String) }
+/// to a request's connection: a token, a sign of life after each prefill step (a send that fails means the client is gone),
+/// the end, or a refusal
+enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String) }
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
 struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, used: Instant, job: Option<Active> }
@@ -166,7 +168,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 .max_by_key(|(_, l)| (if l.cs_at_prompt.is_some() && l.prompt.len() < j.toks.len() && j.toks.starts_with(&l.prompt) { l.prompt.len() } else { 0 }, std::cmp::Reverse(l.used)));
             let Some((i, _)) = best else { break };
             let j = queue.pop_front().unwrap();
-            if j.toks.len() + j.max + 2 > eng.max_ctx { let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens, {} max", j.toks.len(), eng.max_ctx))); continue; }
+            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx { let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx))); continue; }
             let l = &mut lanes[i];
             let run = eng.on(&l.lane);
             let reuse = l.cs_at_prompt.is_some() && l.prompt.len() < j.toks.len() && j.toks.starts_with(&l.prompt);
@@ -207,6 +209,10 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     let lg = if many { eng.span_logits(k) } else { eng.logits() };
                     let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
                     a.pending = Some(tok);
+                } else if a.job.out.send(Ev::Alive).is_err() {
+                    // the client went away during its prefill: free the lane now
+                    eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed", a.n_past, a.pf_end);
+                    l.job = None; l.used = Instant::now();
                 }
             }
         } else if !need_dec.is_empty() {
@@ -235,6 +241,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
                          else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
             if let Some(r) = reason {
+                if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
                 let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
                 l.job = None; l.used = Instant::now();
             }
@@ -249,43 +256,83 @@ fn respond(s: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
     s.flush()
 }
 
-fn read_request(s: &TcpStream) -> std::io::Result<(String, String, Vec<u8>, Option<String>)> {
-    let mut r = BufReader::new(s);
+/// A request's line and headers; the body is read only after the caller has checked the key.
+struct Head { method: String, path: String, len: usize, auth: Option<String>, chunked: bool }
+const MAX_BODY: usize = 32 << 20;
+
+fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    (&mut *r).take(8192).read_line(&mut line)?;
     let mut it = line.split_whitespace();
-    let (method, path) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string());
-    let (mut len, mut auth) = (0usize, None);
-    loop {
-        let mut h = String::new();
-        if r.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" { break; }
-        if let Some((k, v)) = h.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") { len = v.trim().parse().unwrap_or(0); }
-            if k.eq_ignore_ascii_case("authorization") { auth = v.trim().strip_prefix("Bearer ").map(|t| t.trim().to_string()); }
+    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, chunked: false };
+    for _ in 0..128 {
+        let mut l = String::new();
+        if (&mut *r).take(16384).read_line(&mut l)? == 0 || l == "\r\n" || l == "\n" { return Ok(h); }
+        if let Some((k, v)) = l.split_once(':') {
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") { h.len = v.parse().unwrap_or(usize::MAX); }
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") { h.chunked = true; }
+            if k.eq_ignore_ascii_case("authorization") {
+                if let Some((scheme, tok)) = v.split_once(' ') { if scheme.eq_ignore_ascii_case("bearer") { h.auth = Some(tok.trim().to_string()); } }
+            }
         }
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
-    Ok((method, path, body, auth))
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
+}
+
+/// compare without stopping at the first differing byte
+fn same_key(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// the client closed its end (checked without blocking or consuming anything)
+fn peer_gone(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() { return true; }
+    let mut b = [0u8; 1];
+    let r = s.peek(&mut b);
+    let _ = s.set_nonblocking(false);
+    match r { Ok(0) => true, Ok(_) => false, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
 }
 
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
-             key: Option<String>, queue: usize, waiting: Arc<std::sync::atomic::AtomicUsize> }
+             key: Option<String>, ctx: usize,
+             /// requests admitted and not yet finished (generating, prefilling or queued for a lane); at most `limit`
+             inflight: std::sync::atomic::AtomicUsize, limit: usize,
+             /// connection threads alive; at most MAX_CONNS
+             conns: Arc<std::sync::atomic::AtomicUsize> }
+const MAX_CONNS: usize = 512;
+
+/// releases a request's in-flight count however the request ends
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
 
 fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     let toks = match render(&cx.tk, &cx.sp, req, &cx.effort) { Ok(t) => t, Err(e) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()) };
     let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let (tx, rx) = channel();
-    let max = req["max_tokens"].as_u64().or(req["max_completion_tokens"].as_u64()).map(|v| v as usize).unwrap_or(cx.max_tokens);
-    // the seed is the request's own: its `seed`, or a hash of the request
-    let seed = req["seed"].as_u64().unwrap_or_else(|| req.to_string().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
-    let job = Job { toks, max, temp: req["temperature"].as_f64().unwrap_or(1.0) as f32, top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32, seed, out: tx };
-    // admission: beyond the queue limit, refuse now rather than hold the client
-    if cx.waiting.load(std::sync::atomic::Ordering::Relaxed) >= cx.queue {
+    // every client-controlled number is checked here, never in the scheduler
+    let mut bad = |m: String| respond(s, 400, &json!({"error": {"message": m}}).to_string());
+    let max = match req["max_tokens"].as_u64().or(req["max_completion_tokens"].as_u64()) {
+        Some(v) if v == 0 || v as usize >= cx.ctx => return bad(format!("max_tokens must be between 1 and {}", cx.ctx - 1)),
+        Some(v) => v as usize, None => cx.max_tokens,
+    };
+    let temp = req["temperature"].as_f64().unwrap_or(1.0);
+    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
+    if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
+    if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
+    // the seed is the request's own: its `seed`, or a hash of what decides the output (the rendered tokens and sampling)
+    let seed = req["seed"].as_u64().unwrap_or_else(|| {
+        let mut h = 0xcbf29ce484222325u64;
+        for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
+        h
+    });
+    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
+    // admission: one atomic count of requests in flight; beyond the limit, refuse now rather than hold the client
+    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
         write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"error": {"message": "inky is busy: every lane is taken and the queue is full"}}))?;
         return s.flush();
     }
-    cx.waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _inflight = InFlight(&cx.inflight);
     if cx.jobs.send(job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
@@ -297,15 +344,20 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
         s.flush()?;
     }
     let sp = cx.sp;
-    let (mut gen, mut mode, mut pend, mut started) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new(), false);
-    struct Left<'a>(&'a std::sync::atomic::AtomicUsize, bool);
-    impl Drop for Left<'_> { fn drop(&mut self) { if !self.1 { self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); } } }
-    let mut left = Left(&cx.waiting, false);
+    let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
     loop {
-        match rx.recv() {
+        // wait for the scheduler, watching the client: a client gone drops `rx`, and the scheduler's next send to this
+        // request fails and frees its lane (prefill steps send Alive, decode steps a token)
+        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if peer_gone(s) { return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return respond(s, 500, &json!({"error": {"message": "the request was dropped"}}).to_string()),
+        };
+        match Ok::<Ev, ()>(ev) {
+            Ok(Ev::Alive) => { if peer_gone(s) { return Ok(()); } }
             Ok(Ev::Tok(t)) => {
-                if !started { started = true; left.1 = true; cx.waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
                 gen.push(t);
+                if !stream && gen.len() % 16 == 0 && peer_gone(s) { return Ok(()); }
                 if !stream { continue; }
                 if t == sp.c_think { mode = 1; continue; }
                 if t == sp.c_text { mode = 2; continue; }
@@ -343,7 +395,7 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
                 return respond(s, 200, &json!({"id": id, "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage}).to_string());
             }
             Ok(Ev::Err(e)) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()),
-            Err(_) => return respond(s, 500, &json!({"error": {"message": "the request was dropped"}}).to_string()),
+            Err(()) => unreachable!(),
         }
     }
 }
@@ -357,11 +409,12 @@ pub fn serve(o: ServeOpts) {
         c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
+    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
-                            key: o.key.clone(), queue: o.lanes + o.queue, waiting: Default::default() });
+                            key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
     let l = TcpListener::bind(&o.bind).expect("bind");
     eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", o.bind, o.lanes, o.ctx, o.effort, o.queue,
               if o.key.is_some() { "a bearer key required" } else { "no key (loopback use only)" });
@@ -369,13 +422,35 @@ pub fn serve(o: ServeOpts) {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
             let cx = cx.clone();
+            if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
+                cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+                continue;
+            }
             std::thread::spawn(move || {
-                let Ok((method, path, body, auth)) = read_request(&s) else { return };
-                if cx.key.is_some() && auth != cx.key && path != "/health" {
-                    let _ = respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string());
-                    return;
+                struct Conn(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
+                let _conn = Conn(cx.conns.clone());
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+                let mut r = BufReader::new(&s);
+                let Ok(h) = read_head(&mut r) else { return };
+                let path = h.path.trim_end_matches('/').to_string();
+                let method = h.method.clone();
+                // the key is checked before any body is read
+                if let Some(k) = &cx.key {
+                    if path != "/health" && !h.auth.as_deref().is_some_and(|a| same_key(a, k)) {
+                        drop(r);
+                        let _ = respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string());
+                        return;
+                    }
                 }
-                let r = match (method.as_str(), path.trim_end_matches('/')) {
+                if h.chunked { drop(r); let _ = respond(&mut s, 411, &json!({"error": {"message": "send a Content-Length body, not chunked"}}).to_string()); return; }
+                if h.len > MAX_BODY { drop(r); let _ = respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()); return; }
+                let mut body = vec![0u8; h.len];
+                if r.read_exact(&mut body).is_err() { return; }
+                drop(r);
+                let _ = s.set_read_timeout(None);
+                let r = match (method.as_str(), path.as_str()) {
                     ("GET", "/v1/models") => respond(&mut s, 200, &json!({"object": "list", "data": [{"id": "inkling-2-mini", "object": "model", "owned_by": "inky"}]}).to_string()),
                     ("GET", "/health") => respond(&mut s, 200, &json!({"ok": true}).to_string()),
                     ("POST", "/v1/chat/completions") => match serde_json::from_slice::<Value>(&body) {
