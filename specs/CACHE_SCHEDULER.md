@@ -56,16 +56,17 @@ property.
   references until both `gpuDone = TRUE` and `stepIO = {}` at `FinishStep`, which
   also prunes each surviving lane's `laneWin` table to `History(npos)` at fence
   completion so expired window blocks never accumulate past the lane's reservation.
-- **Stage-consistent age & bypass bound (`MaxBypass`, the scheduler's `W`)**:
-  `waitTicks` tracks consecutive bypasses within each waiting stage (`Queued` in
-  `Admit`/`Refuse429`, `ActiveRestoring` in `RestoreBlock`, and `SteppableReady`
-  in `BuildStep`), serving longest-waiting peers first, shedding youngest arrivals
-  first on 429 queue overflow, and locking out younger arrivals once any waiting
-  peer hits `MaxBypass`.
+- **Continuous waiting age & bypass bound (`MaxBypass`, the scheduler's `W`)**:
+  `waitTicks` carries continuously across `Queued -> Admitted -> Restoring -> Ready`
+  (preserved by `Admit`, `BeginRestore`, uncontested `RestoreBlock`, and
+  `FinishRestore`, so a request that waited in `Queued` is never reset behind
+  fresher arrivals upon entering `Restoring` or `Ready`), serving longest-waiting
+  peers first, shedding youngest arrivals first on 429 queue overflow, and
+  incrementing bypassed peers only when an equal-or-younger peer precedes them.
 
 ## Checked properties and bounded scope
 
-Safety invariants checked on healthy runs:
+Safety and action properties checked on healthy runs:
 
 - `TypeOK`: structural types and bounded ranges of all 17 state variables.
 - `StepBlocksInMemoryAndOwned`: while `stepActive` holds, every block in
@@ -89,9 +90,13 @@ Safety invariants checked on healthy runs:
   `DiskUsed <= DiskBudget`, `ReservedTotal <= MemBudget`, each active lane's
   reservation covers its working set, and every memory block unreferenced by any
   lane (and outside `stepIO`) is clean and spillable/reclaimable.
-- `BypassBoundHolds` and `StepBudgetHolds`: `waitTicks[l] <= MaxBypass` across
-  `Queued`, `Restoring`, and `Ready`, aggregate step tokens stay within
-  `StepTokenBudget`, and decoding lanes take `1`-token spans.
+- `BypassBoundHolds`, `StepBudgetHolds`, and `ActionDecodePriority`
+  (`[ ][DecodePriorityStep]_vars`): `waitTicks[l] <= MaxBypass` across `Queued`,
+  `Admitted`, `Restoring`, and `Ready`, aggregate step tokens stay within
+  `StepTokenBudget`, decoding lanes take `1`-token spans, and after the single
+  longest-waiting leader (with `maxW` ties broken toward Ready decoders), no
+  non-leader prefill lane (`waitTicks < MaxBypass`) or `> 1`-token prefill span
+  leaves out a Ready decoder that fits in memory.
 
 Liveness checked under weak fairness (`WF_vars`) of scheduler, tier-reclamation,
 and step-completion actions (with client `Arrive`, `Cancel`, `SlideWindow`, and
@@ -107,27 +112,31 @@ and step-completion actions (with client `Arrive`, `Cancel`, `SlideWindow`, and
 
 Bounded scope: these runs check small instances (`BlockSize = 2`,
 `WindowSize = 2`, `MaxPos \in {2, 4, 8}`, `StepTokenBudget = 2`, `2` or `3`
-reusable lane slots, `1` or `2` prefixes, `MemBudget \in {2, 4, 7}`,
-`DiskBudget \in {3, 4}`). Slot reuse generations and 64-bit byte offsets belong
+reusable lane slots, `1` or `2` prefixes, `MemBudget \in {2, 4, 7, 10}`,
+`DiskBudget \in {2, 3, 4}`). Slot reuse generations and 64-bit byte offsets belong
 to `BlockLayout.tla`; engine trace conformance belongs to the Layer 3/4 CI gates.
 
 ## Bench receipts (`space`)
 
 Validated on Linux bench `space` (32-core x86\_64, 125 GiB RAM), 2026-11-23,
-with TLC 2.19 (revision `5a47802`, `/opt/tla/tla2tools.jar`), Eclipse Temurin
-OpenJDK 21.0.12.1, `-workers 8`, `-Xmx8g`, `-XX:+UseParallelGC`. Wall times
-include JVM startup (`44.019 s` total across all 8 runs via `specs/run_cache_scheduler.sh`):
+with pinned TLA+ `v1.8.0` (`tla2tools.jar` SHA-256 `fdffef247f56...`) as well as
+TLC 2.19 (`5a47802`), Eclipse Temurin OpenJDK 21.0.12.1, `-Xmx8g`,
+`-XX:+UseParallelGC` (`TLC_WORKERS=8` wall times below; also verified 10/10 at
+CI's `TLC_WORKERS=2`, and `CacheSchedulerDecodePriority` also verified under full
+`Spec` `LiveRequestResolves` over all `417,054` distinct states):
 
 | Run | Bounds (`Lanes`, `Prefixes`, `MaxPos`, `StepTokenBudget`, `Mem`/`Disk`, `MaxQueue`, `W`) | Generated | Distinct | Wall seconds | Result |
 | --- | --- | ---: | ---: | ---: | --- |
-| `CacheScheduler` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 6,525 | 1,881 | 2.924 | PASS (exhaustive safety + liveness, decode priority) |
-| `CacheSchedulerQueue` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 126,532 | 23,964 | 18.766 | PASS (exhaustive safety + liveness, 429 refusal + bimodal `W`) |
-| `CacheSchedulerTwoPrefixes` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1` | 92,245 | 16,880 | 8.719 | PASS (exhaustive safety + liveness, cross-prefix disk spill/restore) |
-| `CacheSchedulerMaxPos8` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1` | 24,737 | 6,971 | 5.446 | PASS (exhaustive safety + liveness, multi-chunk prefill + fence window pruning) |
-| `CancelInStep` | `{a,b}`, `{p1,p2}`, `4` (`{2,4}`), `2`, `4`/`4`, `0`, `1`, `Bug="cancel_in_step"` | 787 | 295 | 1.056 | `StepBlocksInMemoryAndOwned` violated |
-| `RestoreSplitBudget` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1`, `Bug="restore_split"` | 46,805 | 12,234 | 4.102 | `LiveRequestResolves` violated (temporal stuttering) |
-| `BoundaryWindowDropped` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`4`, `1`, `1`, `Bug="boundary_window_dropped"` | 2,296 | 799 | 1.391 | `LaneHistoryCovered` violated |
-| `UnprunedWindow` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1`, `Bug="unpruned_window"` | 1,944 | 731 | 1.615 | `BudgetsAndReservations` violated |
+| `CacheScheduler` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 8,529 | 2,419 | 2.081 | PASS (exhaustive safety + liveness + `ActionDecodePriority`) |
+| `CacheSchedulerQueue` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 190,942 | 35,859 | 12.628 | PASS (exhaustive safety + liveness, 429 refusal + continuous `waitTicks`) |
+| `CacheSchedulerTwoPrefixes` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1` | 122,465 | 22,352 | 6.610 | PASS (exhaustive safety + liveness, cross-prefix disk spill/restore) |
+| `CacheSchedulerMaxPos8` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1` | 29,429 | 8,171 | 5.352 | PASS (exhaustive safety + liveness, multi-chunk prefill + fence window pruning) |
+| `CacheSchedulerDecodePriority` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `10`/`2`, `0`, `1` | 2,210,338 | 417,054 | 32.096 | PASS (exhaustive mixed-phase 3-lane `ActionDecodePriority` + safety) |
+| `CancelInStep` | `{a,b}`, `{p1,p2}`, `4` (`{2,4}`), `2`, `4`/`4`, `0`, `1`, `Bug="cancel_in_step"` | 761 | 306 | 0.833 | `StepBlocksInMemoryAndOwned` violated |
+| `RestoreSplitBudget` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1`, `Bug="restore_split"` | 44,351 | 12,361 | 4.078 | `LiveRequestResolves` violated (temporal stuttering) |
+| `BoundaryWindowDropped` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`4`, `1`, `1`, `Bug="boundary_window_dropped"` | 2,671 | 931 | 1.338 | `LaneHistoryCovered` violated |
+| `UnprunedWindow` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1`, `Bug="unpruned_window"` | 2,446 | 889 | 1.533 | `BudgetsAndReservations` violated |
+| `DecodeStalledByPrefill` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `10`/`2`, `0`, `1`, `Bug="no_decode_priority"` | 78,199 | 19,137 | 3.102 | `ActionDecodePriority` violated |
 
 ## Inspected reversed-witness counterexamples
 
@@ -155,3 +164,10 @@ include JVM startup (`44.019 s` total across all 8 runs via `specs/run_cache_sch
   `FinishStep` fence completion, three two-token prefill steps (`0 -> 2 -> 4 -> 6`)
   without an optional `SlideWindow` retain window blocks `0, 1, 2` alongside full
   blocks `0, 1, 2` (`6` blocks) at `lanePos[a] = 6`, giving `CurrentWorkingSet(a) = 8 > 7 = reservation[a]`.
+- **`DecodeStalledByPrefill` (`ActionDecodePriority`, state 14)**: with
+  `MemBudget = 10`, `StepTokenBudget = 2`, and three equally aged Ready lanes
+  (`waitTicks = 0` on `a, b, c`) holding mixed decode (`target = 2`) and prefill
+  (`target = 4`) phases, checking only `waitTicks[p] < maxW` fails to separate a
+  single longest-waiting leader from non-leader prefillers tied at `maxW`, allowing
+  a prefill span to take a token in `stepLanes` while a Ready decoder that fits in
+  memory is left out.

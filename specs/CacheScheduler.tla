@@ -26,7 +26,7 @@ CONSTANTS
     DiskBudget,      \* Disk budget in blocks
     MaxQueue,        \* Queue limit before 429 refusal
     MaxBypass,       \* Bypass bound W for Ready, Restoring, and Queued lanes
-    Bug              \* "none", "cancel_in_step", "restore_split", "boundary_window_dropped", "unpruned_window"
+    Bug              \* "none", "cancel_in_step", "restore_split", "boundary_window_dropped", "unpruned_window", "no_decode_priority"
 
 ASSUME
     /\ BlockSize > 0
@@ -41,7 +41,7 @@ ASSUME
     /\ DiskBudget >= 2
     /\ MaxQueue >= 0
     /\ MaxBypass >= 1
-    /\ Bug \in {"none", "cancel_in_step", "restore_split", "boundary_window_dropped", "unpruned_window"}
+    /\ Bug \in {"none", "cancel_in_step", "restore_split", "boundary_window_dropped", "unpruned_window", "no_decode_priority"}
 
 Kinds == {"full", "window"}
 Tiers == {"none", "memory", "disk", "both"}
@@ -101,7 +101,7 @@ LaneLifecycleStates == {
 SlotStates == {"Idle", "Refused"} \cup LaneLifecycleStates
 MemHoldingStates == {"Restoring", "Ready", "InStep", "Cancelling"}
 AdmittedStates == {"Admitted"} \cup MemHoldingStates
-WaitingStates == {"Queued", "Restoring", "Ready"}
+WaitingStates == {"Queued", "Admitted", "Restoring", "Ready"}
 
 RECURSIVE SumBy(_, _)
 SumBy(S, f) ==
@@ -288,11 +288,12 @@ Admit(l) ==
     /\ LET wc       == WorstCaseBlocks(laneTarget[l])
            splitBug == Bug = "restore_split" /\ DiskStartCount(lanePrefix[l], laneTarget[l]) >= 2
            bypassed == {q \in (QueuedLanes \ {l}) :
-                            waitTicks[l] < waitTicks[q] \/ waitTicks[q] < MaxBypass}
+                            waitTicks[l] <= waitTicks[q] /\ waitTicks[q] < MaxBypass}
        IN /\ laneState'   = [laneState EXCEPT ![l] = "Admitted"]
           /\ admitBudget' = [admitBudget EXCEPT ![l] = IF splitBug THEN 1 ELSE wc]
+          \* Preserve waitTicks[l] across Queued -> Admitted so queued age carries forward.
           /\ waitTicks'   = [q \in Lanes |->
-                                IF q = l THEN 0
+                                IF q = l THEN waitTicks[l]
                                 ELSE IF q \in bypassed THEN waitTicks[q] + 1
                                 ELSE waitTicks[q]]
     /\ UNCHANGED <<blocks, startPoints, lanePrefix, laneTarget, lanePos,
@@ -329,9 +330,9 @@ BeginRestore(l) ==
           /\ laneFull'    = nlf
           /\ laneWin'     = nlw
           /\ reservation' = [reservation EXCEPT ![l] = res]
-          /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
           /\ blocks'      = SyncRefCounts(blocks, nst, nlf, nlw, startPoints)
-    /\ UNCHANGED <<startPoints, lanePrefix, laneTarget, admitBudget,
+    \* Preserve waitTicks[l] across Admitted -> Restoring so queued age carries forward.
+    /\ UNCHANGED <<startPoints, lanePrefix, laneTarget, admitBudget, waitTicks,
                    stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 RestoreBlock(l, b) ==
@@ -339,19 +340,20 @@ RestoreBlock(l, b) ==
     /\ b \in LaneBlocks(l)
     /\ blocks[b].tier = "disk"
     /\ MemUsed < MemBudget
-    \* Longest-waiting restoring lane first; honest unclamped bypass count.
+    \* Longest-waiting restoring lane first; preserve carried age when uncontested.
     /\ \A r \in ActiveRestoring : waitTicks[l] >= waitTicks[r]
-    /\ \A r \in (ActiveRestoring \ {l}) : waitTicks[r] < MaxBypass
-    /\ blocks' = [blocks EXCEPT ![b].tier = "both"]
-    /\ reservation' = [reservation EXCEPT ![l] =
-                        IF Bug = "restore_split" /\ @ < WorstCaseBlocks(laneTarget[l])
-                        THEN @ + 1
-                        ELSE @]
-    /\ waitTicks' = [q \in Lanes |->
-                        IF q = l THEN 0
-                        ELSE IF q \in (ActiveRestoring \ {l})
-                        THEN waitTicks[q] + 1
-                        ELSE waitTicks[q]]
+    /\ \A r \in (ActiveRestoring \ {l}) : waitTicks[r] >= MaxBypass => waitTicks[l] >= waitTicks[r]
+    /\ LET others   == ActiveRestoring \ {l}
+           bypassed == {q \in others : waitTicks[l] < waitTicks[q] \/ waitTicks[q] < MaxBypass}
+       IN /\ blocks' = [blocks EXCEPT ![b].tier = "both"]
+          /\ reservation' = [reservation EXCEPT ![l] =
+                              IF Bug = "restore_split" /\ @ < WorstCaseBlocks(laneTarget[l])
+                              THEN @ + 1
+                              ELSE @]
+          /\ waitTicks' = [q \in Lanes |->
+                              IF q = l THEN (IF others = {} THEN waitTicks[l] ELSE 0)
+                              ELSE IF q \in bypassed THEN waitTicks[q] + 1
+                              ELSE waitTicks[q]]
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
                    laneFull, laneWin, admitBudget,
                    stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
@@ -360,9 +362,9 @@ FinishRestore(l) ==
     /\ laneState[l] = "Restoring"
     /\ \A b \in LaneBlocks(l) : InMemory(b)
     /\ laneState' = [laneState EXCEPT ![l] = "Ready"]
-    /\ waitTicks' = [waitTicks EXCEPT ![l] = 0]
+    \* Preserve waitTicks[l] across Restoring -> Ready so waiting age carries into BuildStep.
     /\ UNCHANGED <<blocks, startPoints, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget,
+                   laneFull, laneWin, reservation, admitBudget, waitTicks,
                    stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 \* ---- Lazy Spill & Tier Eviction Under Memory / Disk Pressure --------------
@@ -483,12 +485,23 @@ BuildStep(chosen, spans) ==
            FitUnchosenDecoders ==
                {d \in (SteppableReady \ chosen) :
                    IsDecoding(d) /\ MemUsed + allocCnt + NeedAllocMap[d] <= MemBudget}
-       IN /\ \E l \in chosen : waitTicks[l] = maxW
-          \* Longest-waiting Ready first, then other Ready decoders, then prefill spans.
-          /\ FitUnchosenDecoders # {} =>
-                 /\ SumBy(chosen, spans) = StepTokenBudget
-                 /\ ~\E p \in chosen : IsPrefilling(p) /\ waitTicks[p] < maxW
-                 /\ ~\E p \in chosen : IsPrefilling(p) /\ spans[p] > 1
+           HasMaxDecoder ==
+               \E d \in SteppableReady :
+                   IsDecoding(d) /\ waitTicks[d] = maxW /\ MemUsed + NeedAllocMap[d] <= MemBudget
+       IN /\ IF Bug = "no_decode_priority"
+             THEN /\ \E l \in chosen : waitTicks[l] = maxW
+                  /\ FitUnchosenDecoders # {} =>
+                         /\ SumBy(chosen, spans) = StepTokenBudget
+                         /\ ~\E p \in chosen : IsPrefilling(p) /\ waitTicks[p] < maxW
+                         /\ ~\E p \in chosen : IsPrefilling(p) /\ spans[p] > 1
+             ELSE \E leader \in chosen :
+                      /\ waitTicks[leader] = maxW
+                      /\ HasMaxDecoder => IsDecoding(leader)
+                      /\ FitUnchosenDecoders # {} =>
+                             /\ SumBy(chosen, spans) = StepTokenBudget
+                             /\ \A q \in (chosen \ {leader}) :
+                                    IsDecoding(q) \/ waitTicks[q] >= MaxBypass
+                             /\ IsPrefilling(leader) => spans[leader] = 1
           /\ \A r \in (SteppableReady \ chosen) : waitTicks[r] < MaxBypass
           /\ \A b \in NewIds : blocks[b].tier = "none"
           /\ MemUsed + allocCnt <= MemBudget
@@ -851,6 +864,28 @@ StepBudgetHolds ==
 \* minimal 2-state Buchi tableau in TLC.
 
 ActionSealedImmutable == [][SealedNeverWritten]_vars
+
+DecodePriorityStep ==
+    (~stepActive /\ stepActive') =>
+        LET maxW == CHOOSE w \in {waitTicks[r] : r \in SteppableReady} :
+                        \A u \in {waitTicks[r] : r \in SteppableReady} : w >= u
+            stepAlloc == SumBy(stepLanes', NeedAllocMap)
+            FitUnchosenDecoders ==
+                {d \in (SteppableReady \ stepLanes') :
+                    IsDecoding(d) /\ MemUsed + stepAlloc + NeedAllocMap[d] <= MemBudget}
+            HasMaxDecoder ==
+                \E d \in SteppableReady :
+                    IsDecoding(d) /\ waitTicks[d] = maxW /\ MemUsed + NeedAllocMap[d] <= MemBudget
+        IN \E leader \in stepLanes' :
+            /\ waitTicks[leader] = maxW
+            /\ HasMaxDecoder => IsDecoding(leader)
+            /\ FitUnchosenDecoders # {} =>
+                   /\ SumBy(stepLanes', stepSpan') = StepTokenBudget
+                   /\ \A q \in (stepLanes' \ {leader}) :
+                          IsDecoding(q) \/ waitTicks[q] >= MaxBypass
+                   /\ IsPrefilling(leader) => stepSpan'[leader] = 1
+
+ActionDecodePriority == [][DecodePriorityStep]_vars
 
 LiveRequestResolves ==
     (laneState[ProbeLane] \in ({"Queued"} \cup AdmittedStates))

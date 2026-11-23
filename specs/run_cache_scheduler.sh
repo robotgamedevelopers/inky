@@ -45,7 +45,7 @@ check_run() {
     t0=$(now_ms)
 
     if (cd "$output" && "$java_bin" -XX:+UseParallelGC -Xmx8g -cp "$jar" tlc2.TLC \
-        -workers "$workers" -metadir "$output/$name-states" \
+        -noGenerateSpecTE -workers "$workers" -metadir "$output/$name-states" \
         -config "$root/$name.cfg" "$root/$module.tla") >"$log" 2>&1; then
         rc=0
     else
@@ -76,9 +76,17 @@ check_run() {
             grep -q "^State 2:" "$log" || ok=false
             label="$expected violated"
             ;;
+        action)
+            [ "$rc" -ne 0 ] || ok=false
+            [ "$(grep -c "^Error: " "$log" || true)" = "2" ] || ok=false
+            grep -Fxq "Error: Action property $expected is violated." "$log" || ok=false
+            grep -Fxq "Error: The behavior up to this point is:" "$log" || ok=false
+            grep -q "^State 2:" "$log" || ok=false
+            label="$expected violated"
+            ;;
         temporal)
             [ "$rc" -ne 0 ] || ok=false
-            grep -Fxq "Error: Temporal properties were violated." "$log" || ok=false
+            grep -Eq "^Error: Temporal propert(ies were|y [A-Za-z0-9_]+ was) violated\.$" "$log" || ok=false
             grep -Fq "$expected" "$log" || ok=false
             label="LiveRequestResolves violated"
             ;;
@@ -102,7 +110,9 @@ check_run CacheScheduler CacheScheduler pass
 check_run CacheSchedulerQueue CacheScheduler pass
 check_run CacheSchedulerTwoPrefixes CacheScheduler pass
 check_run CacheSchedulerMaxPos8 CacheScheduler pass
+check_run CacheSchedulerDecodePriority CacheScheduler pass
 check_run CancelInStep CacheScheduler invariant StepBlocksInMemoryAndOwned
 check_run RestoreSplitBudget CacheScheduler temporal 'a :> "Restoring" @@ b :> "Restoring"'
 check_run BoundaryWindowDropped CacheScheduler invariant LaneHistoryCovered
 check_run UnprunedWindow CacheScheduler invariant BudgetsAndReservations
+check_run DecodeStalledByPrefill CacheScheduler action ActionDecodePriority
