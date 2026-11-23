@@ -175,6 +175,9 @@ TableIndex == \A l \in Lanes, k \in Keys : table[l][k] # NoEntry =>
  pool[table[l][k].slot].block = k[2]
 Address64 == \A l \in Lanes, k \in Keys : table[l][k] # NoEntry =>
  /\ table[l][k].offset.hi > 0
+ \* A stronger signed-31-bit bound ensures no low-32-bit carry in TLC.
+ /\ table[l][k].offset.lo >= 0
+ /\ table[l][k].offset.lo <= 2147483647 - (B-1)*2
  /\ \A i \in 0..(B-1) :
       AddBytes(table[l][k].offset, i * 2) = AddBytes(Offset(table[l][k].slot), i * 2)
 

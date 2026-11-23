@@ -3,21 +3,25 @@
 Read against the **Blocks** and **Models** sections of design revision PR #7
 (`f46a55d`). These are bounded safety models, not a proof of the engine or of
 scheduler liveness. `CacheScheduler` owns admission, cancellation fences,
-parking, restore reservations and liveness.
+parking, restore reservations, sealed-write immutability and liveness.
+BlockLayout does not assert that sealed payloads are never written; that
+transition property belongs to CacheScheduler.
 
-Run on a **Linux bench**, never the engine's MacBook. With Java and
+Run on the designated **mini-m5 bench**, never the engine's MacBook. With Java and
 [tla2tools.jar](https://github.com/tlaplus/tlaplus/releases) installed:
 
 ```sh
-python3 specs/run_tlc.py --jar /opt/tla/tla2tools.jar --output /tmp/block-layout-results
+TLC_OUTPUT=/tmp/block-layout-results zsh specs/run_tlc.zsh
 ```
 
+The runner defaults to `~/sdk/bin/java` and `~/sdk/tla/tla2tools.jar`;
+set `TLC_JAVA` or `TLC_JAR` to override those paths.
 The runner requires complete successful output for positive runs and the exact
 expected invariant failure for each witness. It keeps full TLC output, including
 counterexamples, in the output directory. For an individual run, from `specs/`:
 
 ```sh
-java -XX:+UseParallelGC -Xmx4g -cp /opt/tla/tla2tools.jar tlc2.TLC \
+~/sdk/bin/java -XX:+UseParallelGC -Xmx4g -cp ~/sdk/tla/tla2tools.jar tlc2.TLC \
   -workers 1 -config BlockLayout3.cfg BlockLayout.tla
 ```
 
@@ -63,7 +67,10 @@ idle-lane action, so both delayed and immediate reclamation are explored.
 TLC uses signed 32-bit integers. Offsets therefore use `(hi,lo)` 32-bit limbs:
 `hi=2`, `lo=(slot-1)*4096`, representing addresses at or above 8 GiB. Within-block reads
 preserve the high limb and add two bytes per position. The bounded additions
-never carry out of the low limb; this checks high-bit preservation and table
+never carry out of the low limb: `Address64` explicitly requires a nonnegative
+low limb and room for the last within-block byte addition below 2^31. This
+stronger bounded condition avoids TLC integer overflow and proves no 32-bit
+low-limb carry for these offsets. This checks high-bit preservation and table
 indexing, **not general 64-bit carry/overflow arithmetic or Metal kernels**.
 
 `SpanPins` separately checks the **production dimensions** `B=64, W=1024, C=512`
@@ -84,4 +91,4 @@ also selects the worst alignment). Healthy configurations enable every invariant
 | `StartReleased` | `StartRetained` | Keep a boundary-2 start point, finish its lane, then reuse its window slot; its full block remains retained but the window generation changes. |
 | `SpanPins17` | `Covered` | At offset 63, a 512-token span reads logical blocks 0 through 24; pinning 0 through 16 leaves eight blocks unpinned. |
 
-Results and timings from the Linux bench are recorded in [RESULTS.md](RESULTS.md).
+Results and timings from mini-m5 are recorded in [RESULTS.md](RESULTS.md).
