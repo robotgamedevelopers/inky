@@ -6,6 +6,8 @@
  ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
+     ("eval-cards" "Four real cards at once through inky serve, each landing the merged fix")
+     ("eval-maxctx" "Max-context eval: one stream and memory-bounded lanes from 16K to 256K on real code")
      ("eval-bench" "Single-stream speed and memory bandwidth measured on an M5 Max")
      ("eval-procs" "Separate processes measured as a baseline: 1.35x at best")
      ("eval-routes" "Grouping lanes by predicted experts simulated on the routing dumps: about 20% fewer weight bytes")
@@ -18,6 +20,8 @@
    )
    :columns (("done" "done"))
    :cells (
+     ("eval-cards" "done" "t-eval-cards")
+     ("eval-maxctx" "done" "t-eval-maxctx")
      ("eval-bench" "done" "t-eval-bench")
      ("eval-procs" "done" "t-eval-procs")
      ("eval-routes" "done" "t-eval-routes")
@@ -36,6 +40,8 @@
   (:id "t-eval-llama" :type :task :title "llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s" :state :done :evidence ("docs/DESIGN.md: Baseline: llama.cpp's own batching"))
   (:id "t-eval-design" :type :task :title "The lanes design written" :state :done :evidence ("docs/DESIGN.md"))
   (:id "t-eval-invariance" :type :task :title "The batched path shown batch-invariant (inky binv); a one-token batch bug found and fixed" :state :done :evidence ("src/main.rs: binv" "src/engine.rs: mix_t" "docs/DESIGN.md: Batch invariance"))
+  (:id "t-eval-maxctx" :type :task :title "Max-context eval: one stream and memory-bounded lanes from 16K to 256K on real code" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max" "src/main.rs: maxctx"))
+  (:id "t-eval-cards" :type :task :title "Four real cards at once through inky serve, each landing the merged fix" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max"))
   (:id "t-eval-coldread" :type :task :title "The design cold-read by a second reader, findings folded in" :state :done :evidence ("docs/DESIGN.md: The cold read, and what it changed"))
   (:id "revision" :type :roadmap :title "Design revision"
    :rows (
@@ -123,10 +129,10 @@
   (:id "t-l2-spans" :type :task :title "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
   (:id "t-l2-attention" :type :task :title "Attention per span through the same kernels for every span length, so chunking never changes a token's numbers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
   (:id "t-l2-state" :type :task :title "Each lane's convolution state and cache written by its own span only" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
-  (:id "t-l2-sampling" :type :task :title "Per-lane sampling with one step in flight, seeded by the request" :state :todo)
+  (:id "t-l2-sampling" :type :task :title "Per-lane sampling with one step in flight, seeded by the request" :state :done :evidence ("src/serve.rs: scheduler (per-lane Sampler, seed from the request)"))
   (:id "t-l2-gate-invariant" :type :task :title "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
-  (:id "t-l2-gate-reference" :type :task :title "Gate: agreement with llama.cpp as CI checks it" :state :todo)
-  (:id "t-l2-gate-perf" :type :task :title "Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table" :state :todo)
+  (:id "t-l2-gate-reference" :type :task :title "Gate: agreement with llama.cpp as CI checks it" :state :done :evidence ("tests/ci.sh: decode steps vs llama.cpp (INK_DEC=1)" "src/main.rs: dbatch"))
+  (:id "t-l2-gate-perf" :type :task :title "Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max" "src/main.rs: lanebench, maxctx"))
   (:id "layer-3" :type :roadmap :title "Layer 3: block cache"
    :rows (
      ("l3-model-cache" "CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness")
@@ -221,13 +227,13 @@
      ("l6-gate-replay" "done" "t-l6-gate-replay")
      ("l6-gate-concurrent" "done" "t-l6-gate-concurrent")
    ))
-  (:id "t-l6-endpoint" :type :task :title "OpenAI-compatible chat completions, streaming and not, over the lanes" :state :todo)
-  (:id "t-l6-template" :type :task :title "The chat template rendered exactly, tested against the GGUF's own template" :state :todo)
-  (:id "t-l6-tools" :type :task :title "Tool declarations, tool calls and tool results translated both ways" :state :todo)
-  (:id "t-l6-history" :type :task :title "Earlier turns rendered exactly as the client sends them" :state :todo)
-  (:id "t-l6-disconnect" :type :task :title "A client that disconnects cancels its lane" :state :todo)
-  (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :todo)
-  (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :todo)
+  (:id "t-l6-endpoint" :type :task :title "OpenAI-compatible chat completions, streaming and not, over the lanes" :state :done :evidence ("src/serve.rs"))
+  (:id "t-l6-template" :type :task :title "The chat template rendered exactly, tested against the GGUF's own template" :state :done :evidence ("src/serve.rs: render (the GGUF chat template)"))
+  (:id "t-l6-tools" :type :task :title "Tool declarations, tool calls and tool results translated both ways" :state :done :evidence ("src/serve.rs: render, parse"))
+  (:id "t-l6-history" :type :task :title "Earlier turns rendered exactly as the client sends them" :state :done :evidence ("src/serve.rs: render (earlier turns as sent)"))
+  (:id "t-l6-disconnect" :type :task :title "A client that disconnects cancels its lane" :state :done :evidence ("src/serve.rs: a failed send cancels the lane"))
+  (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :done :evidence ("src/serve.rs: /health, --bind, --key-env"))
+  (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max (four cards at once)"))
   (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :todo)
   (:id "layer-7" :type :roadmap :title "Layer 6: the lane-count sweep"
    :rows (
@@ -276,6 +282,8 @@
   (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :todo)
   (:id "later" :type :roadmap :title "After the first build"
    :rows (
+     ("later-m3" "The M3 Ultra tuning: decode steps on the non-tensor kernels" :later t)
+     ("later-dspark" "Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context" :later t)
      ("later-attention" "One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill" :later t)
      ("later-fixed-cost" "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :later t)
      ("later-prefix-reads" "A shared prefix is read once per step for all lanes' queries" :later t)
@@ -290,6 +298,8 @@
    )
    :columns (("done" "done"))
    :cells (
+     ("later-m3" "done" "t-later-m3")
+     ("later-dspark" "done" "t-later-dspark")
      ("later-attention" "done" "t-later-attention")
      ("later-fixed-cost" "done" "t-later-fixed-cost")
      ("later-prefix-reads" "done" "t-later-prefix-reads")
@@ -302,6 +312,8 @@
      ("later-gpu-sampling" "done" "t-later-gpu-sampling")
      ("later-upstream" "done" "t-later-upstream")
    ))
+  (:id "t-later-dspark" :type :task :title "Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context" :state :doing :note "acceptance on real card text being measured with llama.cpp PR 32218")
+  (:id "t-later-m3" :type :task :title "The M3 Ultra tuning: decode steps on the non-tensor kernels" :state :todo)
   (:id "t-later-attention" :type :task :title "One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill" :state :todo)
   (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :state :todo)
   (:id "t-later-prefix-reads" :type :task :title "A shared prefix is read once per step for all lanes' queries" :state :todo)

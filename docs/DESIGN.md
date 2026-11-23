@@ -75,6 +75,24 @@ A second reader read this design and the code cold on 2026-11-22 (verdict: revis
 - **Batched attention does not suit decode spans.** At 3K context it takes about 5 ms for a tile of 32 queries, where the decode path's split-K attention takes about 1.3 ms for one token; a lane's single token pays for the whole tile. The decode path's kernel cannot simply be used for decode spans: it gives different bits from the prefill path, which would make the cache change answers (Decisions, 2). The fix is one attention kernel for all spans (Follow-ons).
 - **The cache is read at about 210 GB/s and every lane reads all of its own:** the lane table above.
 
+## Measured: lanes on the M5 Max (2026-11-23)
+
+Decode steps (`encode_decode`): row-wise work through the tensor path, each lane's attention through the decode path's fused split-K kernel, lanes' independent dispatches overlapped, the output layer one GEMM for all lanes. Every lane is bit-identical to itself decoding alone (`inky dbatch`) and agrees with llama.cpp (short reference: 58/58, worst KL 0.0022).
+
+| context | one stream (decode path) | lanes | total | gain |
+|---:|---:|---:|---:|---:|
+| 2K | 93 tok/s | 64 | 578 tok/s | 6.2x |
+| 16K | 79 | 64 | 389 | 4.9x |
+| 64K | 53 | 27 | 150 | 2.9x |
+| 128K | 33 | 14 | 78 | 2.4x |
+| 256K | 21 | 7 | 40 | 1.9x |
+
+(16K and up from `inky maxctx` on real code, 60 GB for lanes.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to 256K runs at 875 tok/s: 214 s to the first token at 256K.
+
+**Four cards at once through `inky serve`** (8 lanes, 131K context per lane), the tracer card four times: all four landed the same two-line fix as the merged change. 208 requests, 10.6 M prompt tokens of which 97% came from the lanes' kept prompts, 314 K prefilled, 53 K generated, largest prompt 97 K.
+
+Tried and reverted: decode-step experts with the decode path's f32 dot products (exact, KL 0.0004, but compute-bound: 262 tok/s at 64 lanes against 578).
+
 ## Decisions
 
 1. **One process, one copy of the weights.** Separate processes cannot share weight reads.

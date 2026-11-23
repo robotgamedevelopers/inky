@@ -3,7 +3,8 @@
 # $INKY_REF (default ~/inky-ci/ref; tests/make-reference.sh writes them).
 #  1. agreement with llama.cpp: every checked position's argmax agrees and the worst KL is at most 0.01, on the decode
 #     path (a short prompt) and the prefill path (a 2394-token prompt).
-#  2. batch invariance (inky binv) and lane independence (inky lanes).
+#  2. batch invariance (inky binv), lane independence (inky lanes), steps over spans (inky spans) and decode steps over
+#     lanes (inky dbatch): every lane identical to itself alone; decode steps also agree with llama.cpp.
 #  3. tests/golden.sh is byte-identical to tests/golden-<chip>.txt: the logits did not change. A change that changes them
 #     on purpose updates that file in the same commit and says why.
 set -e
@@ -32,8 +33,11 @@ agree() {  # name, env, ref
 }
 agree "decode, short prompt vs llama.cpp " "INK_PF=0" short
 agree "prefill, long prompt vs llama.cpp " "INK_PF=2380" long
+agree "decode steps, short prompt vs llama.cpp " "INK_DEC=1" short
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
+INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
+INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
 chip=$(sysctl -n machdep.cpu.brand_string | sed 's/Apple //; s/ /-/g' | tr A-Z a-z)
 if [ -f tests/golden-$chip.txt ]; then
     tests/golden.sh $B > /tmp/inky-golden.$$ 2>&1

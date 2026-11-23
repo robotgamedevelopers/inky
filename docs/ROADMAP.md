@@ -1,6 +1,6 @@
 # inky roadmap
 
-inky serves Inkling 2 Mini to many coding-agent tasks at once from one process on one Apple silicon machine. The design is in [DESIGN.md](DESIGN.md). The work is built bottom up, one layer at a time: a layer's gates are green before the next layer starts, and nothing in "After the first build" starts before layer 8.
+inky serves Inkling 2 Mini to many coding-agent tasks at once from one process on one Apple silicon machine. The design is in [DESIGN.md](DESIGN.md). The work is built bottom up, one layer at a time: a layer's gates are green before the next layer starts, and nothing in "After the first build" starts before layer 8. At Glenn's direction (2026-11-23) the server (layer 5) was built ahead of the block cache and scheduler, so inky can serve as a provider now; layers 3 and 4 follow underneath it.
 
 <!-- The tables between the nova-work markers are generated from roadmap.sexp by nova-roadmap: edit the data and run `nova-roadmap render`. Everything else on this page is written by hand. -->
 
@@ -12,6 +12,8 @@ What was measured and tried before any design, and the design itself.
 
 | feature | done |
 |---|:---:|
+| Four real cards at once through inky serve, each landing the merged fix | ✅ |
+| Max-context eval: one stream and memory-bounded lanes from 16K to 256K on real code | ✅ |
 | Single-stream speed and memory bandwidth measured on an M5 Max | ✅ |
 | Separate processes measured as a baseline: 1.35x at best | ✅ |
 | Grouping lanes by predicted experts simulated on the routing dumps: about 20% fewer weight bytes | ✅ |
@@ -83,11 +85,11 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 | One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ✅ |
 | Attention per span through the same kernels for every span length, so chunking never changes a token's numbers | ✅ |
 | Each lane's convolution state and cache written by its own span only | ✅ |
-| Per-lane sampling with one step in flight, seeded by the request | ❌ |
+| Per-lane sampling with one step in flight, seeded by the request | ✅ |
 | Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |
-| Gate: agreement with llama.cpp as CI checks it | ❌ |
-| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ❌ |
-| complete | 62% |
+| Gate: agreement with llama.cpp as CI checks it | ✅ |
+| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -149,15 +151,15 @@ The endpoint a coding-agent harness talks to.
 
 | feature | done |
 |---|:---:|
-| OpenAI-compatible chat completions, streaming and not, over the lanes | ❌ |
-| The chat template rendered exactly, tested against the GGUF's own template | ❌ |
-| Tool declarations, tool calls and tool results translated both ways | ❌ |
-| Earlier turns rendered exactly as the client sends them | ❌ |
-| A client that disconnects cancels its lane | ❌ |
-| A health endpoint, and binding to loopback or a private network only | ❌ |
-| Gate: the tracer card and a recorded replay set land through it | ❌ |
+| OpenAI-compatible chat completions, streaming and not, over the lanes | ✅ |
+| The chat template rendered exactly, tested against the GGUF's own template | ✅ |
+| Tool declarations, tool calls and tool results translated both ways | ✅ |
+| Earlier turns rendered exactly as the client sends them | ✅ |
+| A client that disconnects cancels its lane | ✅ |
+| A health endpoint, and binding to loopback or a private network only | ✅ |
+| Gate: the tracer card and a recorded replay set land through it | ✅ |
 | Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ❌ |
-| complete | 0% |
+| complete | 87% |
 
 [Source data](roadmap.sexp)
 
@@ -222,6 +224,8 @@ Improvements that wait for the layers above. Those that change the model's numbe
 
 | feature | done |
 |---|:---:|
+| The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ❌ |
+| Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ❌ |
 | One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
 | A shared prefix is read once per step for all lanes' queries (later) | ❌ |
