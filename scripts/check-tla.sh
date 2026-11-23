@@ -70,6 +70,7 @@ check_memmode ReleaseEarly RaisedWhileConnected
 check_memmode NoPersist RestoredWhenIdle
 check_memmode LostSeed SavedIsOwner
 check_memmode StaleSaved RestoredWhenIdle
+check_memmode NoRollback RefusedRollbackSafe
 
 # The layer 3 models land separately. A model without its runner is an error.
 if [ -f "$root/specs/BlockLayout.tla" ]; then
