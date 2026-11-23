@@ -523,13 +523,40 @@ fn same_key(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-/// the client closed its end (checked without blocking or consuming anything)
+/// What a sequence of peek results means for the peer: closed (0 read) or a hard error is gone; data or
+/// `WouldBlock` is present. `Interrupted` is transient: the probe is retried a few times, and if it persists
+/// the client is treated as still present.
+fn gone_from_peek(mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> bool {
+    let mut b = [0u8; 1];
+    let mut tries = 0;
+    loop {
+        match peek(&mut b) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 3 => { tries += 1; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// The client closed its end (checked without blocking or consuming anything). A peek error other than
+/// `WouldBlock` is treated as gone: failing toward cancellation is the safe direction (it frees the lane and the
+/// client can retry) rather than holding a lane for a peer that may be dead. `Interrupted` is transient, so the
+/// probe is retried a few times and, if it persists, the client is treated as still present.
 fn peer_gone(s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() { return true; }
-    let mut b = [0u8; 1];
-    let r = s.peek(&mut b);
+    let gone = gone_from_peek(|b| s.peek(b));
     let _ = s.set_nonblocking(false);
-    match r { Ok(0) => true, Ok(_) => false, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
+    gone
+}
+
+/// The startup shape of a serve run: a context to serve in, and a token budget inside it.
+fn check_serve_shape(ctx: usize, max_tokens: usize) -> Result<(), String> {
+    if ctx == 0 { return Err("--ctx must be greater than 0".to_string()); }
+    if max_tokens == 0 || max_tokens >= ctx { return Err(format!("-n must be between 1 and {} (less than --ctx {})", ctx - 1, ctx)); }
+    Ok(())
 }
 
 /// What the handlers write to: the socket in production, a buffer in tests.
@@ -779,6 +806,7 @@ fn count_tokens(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()>
 }
 
 pub fn serve(o: ServeOpts) {
+    if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -858,7 +886,6 @@ pub fn serve(o: ServeOpts) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
@@ -1182,5 +1209,24 @@ mod tests {
         assert!(c.starts_with("HTTP/1.1 400"), "chat over-cap must be an HTTP 400, got: {}", &c[..c.len().min(80)]);
         assert!(c.contains("context full"), "chat over-cap body: {c}");
         assert!(!c.contains("text/event-stream"), "no SSE headers may precede the refusal: {c}");
+    }
+    #[test] fn serve_shape_refuses_an_empty_context_and_a_budget_outside_it() {
+        assert!(check_serve_shape(0, 1).is_err(), "no context to serve in");
+        assert!(check_serve_shape(4096, 0).is_err(), "no token budget");
+        assert!(check_serve_shape(4096, 4096).is_err(), "the budget must leave room for the prompt");
+        assert!(check_serve_shape(4096, 4097).is_err());
+        assert!(check_serve_shape(1, 1).is_err(), "a one-token context has no budget inside it");
+        assert_eq!(check_serve_shape(4096, 4095), Ok(()));
+        assert_eq!(check_serve_shape(2, 1), Ok(()));
+    }
+    #[test] fn peek_results_decide_whether_the_peer_is_gone() {
+        use std::io::{Error, ErrorKind};
+        let script = |v: Vec<std::io::Result<usize>>| { let mut q = VecDeque::from(v); move |_: &mut [u8]| q.pop_front().unwrap() };
+        assert!(gone_from_peek(script(vec![Ok(0)])), "a closed end is gone");
+        assert!(!gone_from_peek(script(vec![Ok(1)])), "data waiting is present");
+        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::WouldBlock))])), "nothing waiting yet is present");
+        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
+        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
+        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
     }
 }

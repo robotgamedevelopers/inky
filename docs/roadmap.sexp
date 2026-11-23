@@ -107,7 +107,7 @@
    :rows (
      ("l2-profile" "Profile of where the batched path's 58 ms fixed cost goes")
      ("l2-spans" "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers")
-     ("l2-attention" "Attention per span through the same kernels for every span length, so chunking never changes a token's numbers")
+     ("l2-attention" "Attention per span in two arithmetics — prefill rows and decode steps — each batch-invariant, so prefill chunking never changes a token's numbers")
      ("l2-state" "Each lane's convolution state and cache written by its own span only")
      ("l2-sampling" "Per-lane sampling with one step in flight, seeded by the request")
      ("l2-gate-invariant" "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits")
@@ -127,7 +127,7 @@
    ))
   (:id "t-l2-profile" :type :task :title "Profile of where the batched path's 58 ms fixed cost goes" :state :done :evidence ("docs/DESIGN.md: Where the batched path's time goes"))
   (:id "t-l2-spans" :type :task :title "One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
-  (:id "t-l2-attention" :type :task :title "Attention per span through the same kernels for every span length, so chunking never changes a token's numbers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
+  (:id "t-l2-attention" :type :task :title "Attention per span in two arithmetics — prefill rows and decode steps — each batch-invariant, so prefill chunking never changes a token's numbers" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)" "src/main.rs: dbatch (every lane in the batch bit-identical to decoding alone)"))
   (:id "t-l2-state" :type :task :title "Each lane's convolution state and cache written by its own span only" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
   (:id "t-l2-sampling" :type :task :title "Per-lane sampling with one step in flight, seeded by the request" :state :done :evidence ("src/serve.rs: scheduler (per-lane Sampler, seed from the request)"))
   (:id "t-l2-gate-invariant" :type :task :title "Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits" :state :done :evidence ("src/engine.rs: encode_spans, layer_b" "src/main.rs: spans (1 to 128 lanes bit-identical to alone)"))
@@ -215,6 +215,7 @@
      ("l6-health" "A health endpoint, and binding to loopback or a private network only")
      ("l6-gate-replay" "Gate: the tracer card and a recorded replay set land through it")
      ("l6-gate-concurrent" "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation")
+     ("l6-gate-memd-traces" "Gate: memd traces are behaviours of MemMode.tla, checked in CI")
    )
    :columns (("done" "done"))
    :cells (
@@ -226,6 +227,7 @@
      ("l6-health" "done" "t-l6-health")
      ("l6-gate-replay" "done" "t-l6-gate-replay")
      ("l6-gate-concurrent" "done" "t-l6-gate-concurrent")
+     ("l6-gate-memd-traces" "done" "t-l6-gate-memd-traces")
    ))
   (:id "t-l6-endpoint" :type :task :title "OpenAI-compatible chat completions, streaming and not, over the lanes" :state :done :evidence ("src/serve.rs"))
   (:id "t-l6-template" :type :task :title "The chat template rendered exactly, tested against the GGUF's own template" :state :done :evidence ("src/serve.rs: render (the GGUF chat template)"))
@@ -235,6 +237,7 @@
   (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :done :evidence ("src/serve.rs: /health, --bind, --key-env"))
   (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max (four cards at once)"))
   (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :todo)
+  (:id "t-l6-gate-memd-traces" :type :task :title "Gate: memd traces are behaviours of MemMode.tla, checked in CI" :state :todo)
   (:id "layer-7" :type :roadmap :title "Layer 6: the lane-count sweep"
    :rows (
      ("l7-record" "Real card traffic recorded as a replay set")
