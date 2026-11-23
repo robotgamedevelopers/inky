@@ -17,7 +17,11 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize }
+pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize,
+                      /// a request must carry `Authorization: Bearer <this>` (from the environment variable --key-env names)
+                      pub key: Option<String>,
+                      /// requests waiting beyond this many are refused with 429
+                      pub queue: usize }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -245,24 +249,28 @@ fn respond(s: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
     s.flush()
 }
 
-fn read_request(s: &TcpStream) -> std::io::Result<(String, String, Vec<u8>)> {
+fn read_request(s: &TcpStream) -> std::io::Result<(String, String, Vec<u8>, Option<String>)> {
     let mut r = BufReader::new(s);
     let mut line = String::new();
     r.read_line(&mut line)?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string());
-    let mut len = 0usize;
+    let (mut len, mut auth) = (0usize, None);
     loop {
         let mut h = String::new();
         if r.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" { break; }
-        if let Some((k, v)) = h.split_once(':') { if k.eq_ignore_ascii_case("content-length") { len = v.trim().parse().unwrap_or(0); } }
+        if let Some((k, v)) = h.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") { len = v.trim().parse().unwrap_or(0); }
+            if k.eq_ignore_ascii_case("authorization") { auth = v.trim().strip_prefix("Bearer ").map(|t| t.trim().to_string()); }
+        }
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    Ok((method, path, body))
+    Ok((method, path, body, auth))
 }
 
-struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64 }
+struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
+             key: Option<String>, queue: usize, waiting: Arc<std::sync::atomic::AtomicUsize> }
 
 fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     let toks = match render(&cx.tk, &cx.sp, req, &cx.effort) { Ok(t) => t, Err(e) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()) };
@@ -272,6 +280,12 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     // the seed is the request's own: its `seed`, or a hash of the request
     let seed = req["seed"].as_u64().unwrap_or_else(|| req.to_string().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
     let job = Job { toks, max, temp: req["temperature"].as_f64().unwrap_or(1.0) as f32, top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32, seed, out: tx };
+    // admission: beyond the queue limit, refuse now rather than hold the client
+    if cx.waiting.load(std::sync::atomic::Ordering::Relaxed) >= cx.queue {
+        write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"error": {"message": "inky is busy: every lane is taken and the queue is full"}}))?;
+        return s.flush();
+    }
+    cx.waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if cx.jobs.send(job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
@@ -283,10 +297,14 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
         s.flush()?;
     }
     let sp = cx.sp;
-    let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
+    let (mut gen, mut mode, mut pend, mut started) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new(), false);
+    struct Left<'a>(&'a std::sync::atomic::AtomicUsize, bool);
+    impl Drop for Left<'_> { fn drop(&mut self) { if !self.1 { self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); } } }
+    let mut left = Left(&cx.waiting, false);
     loop {
         match rx.recv() {
             Ok(Ev::Tok(t)) => {
+                if !started { started = true; left.1 = true; cx.waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
                 gen.push(t);
                 if !stream { continue; }
                 if t == sp.c_think { mode = 1; continue; }
@@ -342,15 +360,21 @@ pub fn serve(o: ServeOpts) {
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
-    let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default() });
+    let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
+                            key: o.key.clone(), queue: o.lanes + o.queue, waiting: Default::default() });
     let l = TcpListener::bind(&o.bind).expect("bind");
-    eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}", o.bind, o.lanes, o.ctx, o.effort);
+    eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", o.bind, o.lanes, o.ctx, o.effort, o.queue,
+              if o.key.is_some() { "a bearer key required" } else { "no key (loopback use only)" });
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
             let cx = cx.clone();
             std::thread::spawn(move || {
-                let Ok((method, path, body)) = read_request(&s) else { return };
+                let Ok((method, path, body, auth)) = read_request(&s) else { return };
+                if cx.key.is_some() && auth != cx.key && path != "/health" {
+                    let _ = respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string());
+                    return;
+                }
                 let r = match (method.as_str(), path.trim_end_matches('/')) {
                     ("GET", "/v1/models") => respond(&mut s, 200, &json!({"object": "list", "data": [{"id": "inkling-2-mini", "object": "model", "owned_by": "inky"}]}).to_string()),
                     ("GET", "/health") => respond(&mut s, 200, &json!({"ok": true}).to_string()),

@@ -818,6 +818,8 @@ fn main() {
             lanes: arg("--lanes").and_then(|v| v.parse().ok()).unwrap_or(16),
             effort: arg("--effort").unwrap_or("medium".into()),
             max_tokens: arg("-n").and_then(|v| v.parse().ok()).unwrap_or(16384),
+            key: arg("--key-env").map(|k| std::env::var(&k).unwrap_or_else(|_| { eprintln!("--key-env {k}: not in the environment"); std::process::exit(2) })),
+            queue: arg("--queue").and_then(|v| v.parse().ok()).unwrap_or(64),
         });
         return;
     }
