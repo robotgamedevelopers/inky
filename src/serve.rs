@@ -1,4 +1,4 @@
-//! `inky serve`: an OpenAI-compatible chat completions endpoint over many lanes. One scheduler thread owns the engine and
+//! `inky serve`: OpenAI chat completions and Anthropic Messages endpoints over many lanes. One scheduler thread owns the engine and
 //! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens) or a
 //! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
 //! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize,
-                      /// a request must carry `Authorization: Bearer <this>` (from the environment variable --key-env names)
+                      /// a request must carry this key, as `x-api-key` or `Authorization: Bearer <this>` (from the environment variable --key-env names)
                       pub key: Option<String>,
                       /// requests waiting beyond this many are refused with 429
                       pub queue: usize }
@@ -139,6 +139,206 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
     p
 }
 
+// ------------------------------------------------------------------------------------------------- Anthropic Messages
+// `POST /v1/messages` speaks the Anthropic Messages API over the same lanes. A request is translated
+// to the OpenAI shape above and rendered by the same `render`, so an Anthropic conversation and the
+// equivalent chat conversation are the same token stream and a lane's kept prompt is reused across
+// either API (decision 4). Thinking has no block in either direction here: a reply's thinking is
+// dropped, and thinking blocks in a sent history are dropped with it. Custom stop sequences,
+// `tool_choice` and `top_k` have no counterpart in the chat path and are ignored.
+
+/// An Anthropic request as the OpenAI request the chat path renders: `system` becomes leading
+/// system messages, text blocks keep their order and their per-block rendering, a user message's
+/// tool results become tool messages in place, and an assistant message's text and tool uses become
+/// its content and tool calls (rendered text first, as the chat path renders them).
+fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
+    let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
+    if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
+    let mut msgs: Vec<Value> = Vec::new();
+    match &req["system"] {
+        Value::Null => {}
+        Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
+        Value::Array(blocks) => {
+            let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
+                Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                t => Err(format!("unsupported system block type {}", t.unwrap_or("none"))),
+            }).collect::<Result<_, _>>()?;
+            if !parts.is_empty() { msgs.push(json!({"role": "system", "content": parts})); }
+        }
+        _ => return Err("system must be a string or an array of text blocks".into()),
+    }
+    for m in msgs_in {
+        let role = m["role"].as_str().ok_or("message without role")?;
+        match (role, &m["content"]) {
+            ("user", Value::String(s)) => msgs.push(json!({"role": "user", "content": s})),
+            ("assistant", Value::String(s)) => msgs.push(json!({"role": "assistant", "content": s})),
+            ("user", Value::Array(blocks)) => {
+                let mut texts: Vec<Value> = Vec::new();
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("text") => texts.push(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                        Some("tool_result") => {
+                            if !texts.is_empty() { msgs.push(json!({"role": "user", "content": std::mem::take(&mut texts)})); }
+                            let id = b["tool_use_id"].as_str().ok_or("tool_result without tool_use_id")?;
+                            let c = match &b["content"] {
+                                Value::Null => json!(""),
+                                Value::String(s) => json!(s),
+                                Value::Array(parts) => {
+                                    let ps: Vec<Value> = parts.iter().map(|p| match p["type"].as_str() {
+                                        Some("text") => Ok(json!({"type": "text", "text": p["text"].as_str().unwrap_or("")})),
+                                        t => Err(format!("unsupported tool_result content type {}", t.unwrap_or("none"))),
+                                    }).collect::<Result<_, _>>()?;
+                                    Value::Array(ps)
+                                }
+                                _ => return Err("tool_result content must be a string or an array of text blocks".into()),
+                            };
+                            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": c}));
+                        }
+                        t => return Err(format!("unsupported content block type {} in a user message", t.unwrap_or("none"))),
+                    }
+                }
+                if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
+            }
+            ("assistant", Value::Array(blocks)) => {
+                let mut text = String::new();
+                let mut calls: Vec<Value> = Vec::new();
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("text") => text.push_str(b["text"].as_str().unwrap_or("")),
+                        Some("tool_use") => {
+                            let id = b["id"].as_str().ok_or("tool_use without id")?;
+                            let name = b["name"].as_str().ok_or("tool_use without a name")?;
+                            let input = if b["input"].is_null() { json!({}) } else { b["input"].clone() };
+                            calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": input}}));
+                        }
+                        Some("thinking") | Some("redacted_thinking") => {}
+                        t => return Err(format!("unsupported content block type {} in an assistant message", t.unwrap_or("none"))),
+                    }
+                }
+                let mut msg = json!({"role": "assistant", "content": text});
+                if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
+                msgs.push(msg);
+            }
+            ("user" | "assistant", _) => return Err("message content must be a string or an array of blocks".into()),
+            (r, _) => return Err(format!("unknown role {r}")),
+        }
+    }
+    let mut out = json!({"messages": msgs});
+    if let Some(tools) = req.get("tools").filter(|t| !t.is_null()) {
+        let tools = tools.as_array().ok_or("tools must be an array")?;
+        if !tools.is_empty() {
+            let mapped: Vec<Value> = tools.iter().map(|t| {
+                let name = t["name"].as_str().ok_or("tool without a name")?;
+                Ok(json!({"type": "function", "function": {"name": name, "description": t["description"].as_str().unwrap_or(""),
+                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({}))}}))
+            }).collect::<Result<_, String>>()?;
+            out["tools"] = json!(mapped);
+        }
+    }
+    Ok(out)
+}
+
+/// The reply's stop reason: a tool call outranks the length stop, as the chat path's finish reason does.
+fn anthropic_stop_reason(has_calls: bool, reason: &str) -> &'static str {
+    if has_calls { "tool_use" } else if reason == "length" { "max_tokens" } else { "end_turn" }
+}
+
+/// A parsed reply as Anthropic content blocks: the text, then each tool call.
+fn anthropic_content(p: &Parsed, seq: u64) -> Vec<Value> {
+    let mut c = Vec::new();
+    if !p.text.is_empty() { c.push(json!({"type": "text", "text": p.text})); }
+    for (i, (name, args)) in p.calls.iter().enumerate() {
+        c.push(json!({"type": "tool_use", "id": format!("toolu_{seq}_{i}"), "name": name, "input": args}));
+    }
+    c
+}
+
+/// Usage in Anthropic's split: `input_tokens` is the part of the prompt no lane reused,
+/// `cache_read_input_tokens` the part it did, so the two sum to the prompt.
+fn anthropic_usage(prompt: usize, cached: usize, gen: usize) -> Value {
+    json!({"input_tokens": prompt.saturating_sub(cached), "output_tokens": gen,
+           "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached})
+}
+
+fn sse_text(event: &str, data: &Value) -> String { format!("event: {event}\ndata: {data}\n\n") }
+
+/// A streamed reply as content blocks, fed one generated token at a time. Text streams as it
+/// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
+/// the block must stream on their own. Thinking tokens open no block.
+struct BlockStream { seq: u64, next: usize, calls: usize, text_index: usize, open_text: bool,
+                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool }
+impl BlockStream {
+    fn new(seq: u64) -> BlockStream {
+        BlockStream { seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
+    }
+    fn flush_text(&mut self, out: &mut Vec<String>) {
+        if !self.open_text { self.pend.clear(); return; }
+        let valid = match std::str::from_utf8(&self.pend) { Ok(_) => self.pend.len(), Err(e) => e.valid_up_to() };
+        if valid > 0 {
+            let text = String::from_utf8_lossy(&self.pend[..valid]).to_string();
+            self.pend.drain(..valid);
+            out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
+                "delta": {"type": "text_delta", "text": text}})));
+        }
+    }
+    fn close_text(&mut self, out: &mut Vec<String>) {
+        if self.open_text {
+            self.flush_text(out);
+            out.push(sse_text("content_block_stop", &json!({"type": "content_block_stop", "index": self.text_index})));
+            self.open_text = false;
+        }
+        self.pend.clear();
+    }
+    fn emit_tool(&mut self, out: &mut Vec<String>) {
+        let s = String::from_utf8_lossy(&self.tool).to_string();
+        let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+        let name = v["name"].as_str().map(|x| x.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&self.header).to_string());
+        let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
+        let index = self.next; self.next += 1;
+        let id = format!("toolu_{}_{}", self.seq, self.calls); self.calls += 1;
+        out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})));
+        out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": args.to_string()}})));
+        out.push(sse_text("content_block_stop", &json!({"type": "content_block_stop", "index": index})));
+        self.tool.clear();
+    }
+    fn on_token(&mut self, tk: &Tokenizer, sp: &Specials, t: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        if t == sp.msg_model { self.close_text(&mut out); self.mode = 0; self.in_header = true; self.header.clear(); return out; }
+        if t == sp.c_think { self.close_text(&mut out); self.mode = 1; self.in_header = false; return out; }
+        if t == sp.c_text {
+            if !self.open_text {
+                self.text_index = self.next; self.next += 1; self.open_text = true;
+                out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": self.text_index,
+                    "content_block": {"type": "text", "text": ""}})));
+            }
+            self.mode = 2; self.in_header = false; return out;
+        }
+        if t == sp.c_tool { self.close_text(&mut out); self.mode = 3; self.in_header = false; self.tool.clear(); return out; }
+        if t == sp.end || t == sp.end_sampling || t == tk.eos {
+            if self.mode == 3 { self.emit_tool(&mut out); }
+            self.close_text(&mut out);
+            self.mode = 0; self.in_header = false; return out;
+        }
+        let b = tk.decode_bytes(t);
+        match self.mode {
+            2 => { self.pend.extend(&b); self.flush_text(&mut out); }
+            3 => self.tool.extend(&b),
+            _ if self.in_header => self.header.extend(&b),
+            _ => {}
+        }
+        out
+    }
+    /// whatever block is still open when the reply ends (a length stop can cut a tool call short)
+    fn close_all(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mode == 3 { self.emit_tool(&mut out); self.mode = 0; }
+        self.close_text(&mut out);
+        out
+    }
+}
+
 // ------------------------------------------------------------------------------------------------- scheduler
 
 struct Job { toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: Sender<Ev> }
@@ -257,14 +457,14 @@ fn respond(s: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, chunked: bool }
+struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
 
 fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
     let mut line = String::new();
     (&mut *r).take(8192).read_line(&mut line)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, chunked: false };
+    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, chunked: false };
     for _ in 0..128 {
         let mut l = String::new();
         if (&mut *r).take(16384).read_line(&mut l)? == 0 || l == "\r\n" || l == "\n" { return Ok(h); }
@@ -275,6 +475,7 @@ fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
             if k.eq_ignore_ascii_case("authorization") {
                 if let Some((scheme, tok)) = v.split_once(' ') { if scheme.eq_ignore_ascii_case("bearer") { h.auth = Some(tok.trim().to_string()); } }
             }
+            if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
@@ -400,6 +601,115 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     }
 }
 
+fn anthropic_error(s: &mut TcpStream, code: u16, kind: &str, msg: &str) -> std::io::Result<()> {
+    respond(s, code, &json!({"type": "error", "error": {"type": kind, "message": msg}}).to_string())
+}
+
+fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
+    let openai = match anthropic_to_openai(req) { Ok(v) => v, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
+    let toks = match render(&cx.tk, &cx.sp, &openai, &cx.effort) { Ok(t) => t, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
+    let prompt_len = toks.len();
+    let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (tx, rx) = channel();
+    // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+    let max = match req["max_tokens"].as_u64() {
+        Some(v) if v == 0 || v as usize >= cx.ctx => return anthropic_error(s, 400, "invalid_request_error", &format!("max_tokens must be between 1 and {}", cx.ctx - 1)),
+        Some(v) => v as usize,
+        None => return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"),
+    };
+    let temp = req["temperature"].as_f64().unwrap_or(1.0);
+    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
+    if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    // the seed is the request's own: a hash of what decides the output, as on the chat path
+    let seed = {
+        let mut h = 0xcbf29ce484222325u64;
+        for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
+        h
+    };
+    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
+    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
+        write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"type": "error", "error": {"type": "rate_limit_error", "message": "inky is busy: every lane is taken and the queue is full"}}))?;
+        return s.flush();
+    }
+    let _inflight = InFlight(&cx.inflight);
+    if cx.jobs.send(job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    let stream = req["stream"].as_bool().unwrap_or(false);
+    let id = format!("msg_{seq}");
+    let model = req["model"].as_str().unwrap_or("inkling-2-mini").to_string();
+    let sp = cx.sp;
+    if stream {
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        write!(s, "{}", sse_text("message_start", &json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
+            "model": model, "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": prompt_len, "output_tokens": 0}}})))?;
+        s.flush()?;
+        let mut bs = BlockStream::new(seq);
+        loop {
+            let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if peer_gone(s) { return Ok(()); }
+                    write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
+                    return s.flush();
+                }
+            };
+            match ev {
+                Ev::Alive => { if peer_gone(s) { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Tok(t) => { for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?; }
+                Ev::Done { prompt, cached, gen: ng, reason } => {
+                    for text in bs.close_all() { write!(s, "{text}")?; }
+                    let stop = anthropic_stop_reason(bs.calls > 0, reason);
+                    eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls}", calls = bs.calls);
+                    write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
+                        "delta": {"stop_reason": stop, "stop_sequence": null},
+                        "usage": {"output_tokens": ng, "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached}})))?;
+                    write!(s, "{}", sse_text("message_stop", &json!({"type": "message_stop"})))?;
+                    return s.flush();
+                }
+                Ev::Err(e) => {
+                    for text in bs.close_all() { write!(s, "{text}")?; }
+                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
+                    return s.flush();
+                }
+            }
+        }
+    }
+    let mut gen = Vec::<u32>::new();
+    loop {
+        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(ev) => ev,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if peer_gone(s) { return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return anthropic_error(s, 500, "api_error", "the request was dropped"),
+        };
+        match ev {
+            Ev::Alive => { if peer_gone(s) { return Ok(()); } }
+            Ev::Tok(t) => { gen.push(t); if gen.len() % 16 == 0 && peer_gone(s) { return Ok(()); } }
+            Ev::Done { prompt, cached, gen: ng, reason } => {
+                let p = parse(&cx.tk, &sp, &gen);
+                let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
+                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
+                return respond(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
+                    "content": anthropic_content(&p, seq), "stop_reason": stop, "stop_sequence": null,
+                    "usage": anthropic_usage(prompt, cached, ng)}).to_string());
+            }
+            Ev::Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e),
+        }
+    }
+}
+
+/// The would-be prompt's token count; no lane is taken, nothing is generated.
+fn count_tokens(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
+    let openai = match anthropic_to_openai(req) { Ok(v) => v, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
+    match render(&cx.tk, &cx.sp, &openai, &cx.effort) {
+        Ok(t) => respond(s, 200, &json!({"input_tokens": t.len()}).to_string()),
+        Err(e) => anthropic_error(s, 400, "invalid_request_error", &e),
+    }
+}
+
 pub fn serve(o: ServeOpts) {
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Arc::new(Tokenizer::load(&eng.g));
@@ -438,14 +748,16 @@ pub fn serve(o: ServeOpts) {
                 let method = h.method.clone();
                 // the key is checked before any body is read
                 if let Some(k) = &cx.key {
-                    if path != "/health" && !h.auth.as_deref().is_some_and(|a| same_key(a, k)) {
+                    let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
+                    if path != "/health" && !authed {
                         drop(r);
-                        let _ = respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string());
+                        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 401, "authentication_error", "a valid x-api-key or Authorization: Bearer key is required") }
+                                else { respond(&mut s, 401, &json!({"error": {"message": "a valid Authorization: Bearer key is required"}}).to_string()) };
                         return;
                     }
                 }
-                if h.chunked { drop(r); let _ = respond(&mut s, 411, &json!({"error": {"message": "send a Content-Length body, not chunked"}}).to_string()); return; }
-                if h.len > MAX_BODY { drop(r); let _ = respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()); return; }
+                if h.chunked { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 411, "invalid_request_error", "send a Content-Length body, not chunked") } else { respond(&mut s, 411, &json!({"error": {"message": "send a Content-Length body, not chunked"}}).to_string()) }; return; }
+                if h.len > MAX_BODY { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
                 let mut body = vec![0u8; h.len];
                 if r.read_exact(&mut body).is_err() { return; }
                 drop(r);
@@ -457,11 +769,169 @@ pub fn serve(o: ServeOpts) {
                         Ok(v) => chat(&cx, &v, &mut s),
                         Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
                     },
-                    _ => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
+                    ("POST", "/v1/messages") => match serde_json::from_slice::<Value>(&body) {
+                        Ok(v) => messages(&cx, &v, &mut s),
+                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
+                    },
+                    ("POST", "/v1/messages/count_tokens") => match serde_json::from_slice::<Value>(&body) {
+                        Ok(v) => count_tokens(&cx, &v, &mut s),
+                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
+                    },
+                    _ => if path.starts_with("/v1/messages") { anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")) }
+                         else { respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()) },
                 };
                 if let Err(e) = r { eprintln!("[serve] client: {e}"); }
             });
         }
     });
     scheduler(&eng, &tk, sp, o.lanes, jrx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sp(tk: &Tokenizer) -> Specials {
+        Specials {
+            msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
+            msg_tool: special(tk, "<|message_tool|>"), c_text: special(tk, "<|content_text|>"), c_think: special(tk, "<|content_thinking|>"),
+            c_xml: special(tk, "<|content_xml|>"), c_tool: special(tk, "<|content_invoke_tool_json|>"), end: special(tk, "<|end_message|>"),
+            end_sampling: special(tk, "<|content_model_end_sampling|>"),
+        }
+    }
+
+    /// a reply token stream, as the scheduler would send it: thinking, text, then a tool call
+    fn reply_stream(tk: &Tokenizer, sp: &Specials) -> Vec<u32> {
+        let mut v = vec![sp.msg_model, sp.c_think];
+        v.extend(tk.encode("hmm", false));
+        v.push(sp.end);
+        v.extend([sp.msg_model, sp.c_text]);
+        v.extend(tk.encode("Hello", false));
+        v.push(sp.end);
+        v.push(sp.msg_model);
+        v.extend(tk.encode("get_weather", false));
+        v.push(sp.c_tool);
+        v.extend(tk.encode("{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}", false));
+        v.extend([sp.end, sp.end_sampling]);
+        v
+    }
+
+    #[test] fn anthropic_requests_translate_to_the_chat_shape() {
+        let a = json!({"model": "inkling-2-mini", "max_tokens": 64,
+            "system": [{"type": "text", "text": "Be terse."}, {"type": "text", "text": "Be kind."}],
+            "tools": [{"name": "get_weather", "description": "Weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Weather in SF?"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "Sunny"}]},
+                    {"type": "text", "text": "Thanks"}]}]});
+        let o = anthropic_to_openai(&a).unwrap();
+        assert_eq!(o["messages"][0], json!({"role": "system", "content": [{"type": "text", "text": "Be terse."}, {"type": "text", "text": "Be kind."}]}));
+        assert_eq!(o["messages"][1], json!({"role": "user", "content": [{"type": "text", "text": "Weather in SF?"}]}));
+        assert_eq!(o["messages"][2]["role"], "assistant");
+        assert_eq!(o["messages"][2]["content"], "Checking.");
+        assert_eq!(o["messages"][2]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["arguments"], json!({"city": "SF"}));
+        assert_eq!(o["messages"][3], json!({"role": "tool", "tool_call_id": "toolu_1", "content": [{"type": "text", "text": "Sunny"}]}));
+        assert_eq!(o["messages"][4], json!({"role": "user", "content": [{"type": "text", "text": "Thanks"}]}));
+        assert_eq!(o["tools"][0]["type"], "function");
+        assert_eq!(o["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(o["tools"][0]["function"]["parameters"], json!({"type": "object", "properties": {"city": {"type": "string"}}}));
+        // string system and string content take the plain path
+        let o = anthropic_to_openai(&json!({"system": "Sys", "messages": [{"role": "user", "content": "Hi"}]})).unwrap();
+        assert_eq!(o["messages"][0], json!({"role": "system", "content": "Sys"}));
+        assert_eq!(o["messages"][1], json!({"role": "user", "content": "Hi"}));
+        assert!(o.get("tools").is_none(), "no tools in, no tools out");
+    }
+
+    #[test] fn anthropic_translation_refuses_what_it_cannot_render() {
+        assert!(anthropic_to_openai(&json!({"messages": []})).is_err(), "no messages");
+        assert!(anthropic_to_openai(&json!({"messages": [{"role": "system", "content": "x"}]})).is_err(), "no system role inside messages");
+        assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]})).is_err(), "an image block fails closed, never dropped");
+        assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]})).is_err(), "a tool result without its id");
+        assert!(anthropic_to_openai(&json!({"tools": [{"description": "x"}], "messages": [{"role": "user", "content": "x"}]})).is_err(), "a tool without a name");
+        // a thinking block in a sent history is the one block dropped: it has no rendering in either API here
+        let o = anthropic_to_openai(&json!({"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "Done"}]}]})).unwrap();
+        assert_eq!(o["messages"][0]["content"], "Done");
+    }
+
+    #[test] fn anthropic_and_chat_requests_render_the_same_tokens() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let anthropic = json!({"model": "inkling-2-mini", "max_tokens": 64, "system": "Be terse.",
+            "tools": [{"name": "get_weather", "description": "Weather", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Weather in SF?"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Sunny"}]}]});
+        // the same conversation written as a chat request (arguments as the string a chat client sends)
+        let chat = json!({"tools": [{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object"}}}],
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Weather in SF?"},
+                {"role": "assistant", "content": "Checking.", "tool_calls": [{"id": "toolu_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}}]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "Sunny"}]});
+        let a = render(&tk, &sp, &anthropic_to_openai(&anthropic).unwrap(), "medium").unwrap();
+        let c = render(&tk, &sp, &chat, "medium").unwrap();
+        assert_eq!(a, c, "the Anthropic request must render to the chat path's token stream, or prompt reuse misses");
+        // and the next turn extends the last, which is what makes a lane's kept prompt hit
+        let mut next = anthropic.clone();
+        next["messages"].as_array_mut().unwrap().push(json!({"role": "assistant", "content": [{"type": "text", "text": "Sunny in SF."}]}));
+        next["messages"].as_array_mut().unwrap().push(json!({"role": "user", "content": "And in LA?"}));
+        let n = render(&tk, &sp, &anthropic_to_openai(&next).unwrap(), "medium").unwrap();
+        assert!(n.starts_with(&a), "a following Anthropic turn must extend the previous prompt");
+    }
+
+    #[test] fn a_generated_reply_parses_to_anthropic_blocks() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let p = parse(&tk, &sp, &reply_stream(&tk, &sp));
+        assert_eq!(p.text, "Hello");
+        assert_eq!(p.thinking, "hmm");
+        assert_eq!(p.calls.len(), 1);
+        assert_eq!(p.calls[0], ("get_weather".to_string(), json!({"city": "SF"})));
+        let content = anthropic_content(&p, 7);
+        assert_eq!(content[0], json!({"type": "text", "text": "Hello"}));
+        assert_eq!(content[1], json!({"type": "tool_use", "id": "toolu_7_0", "name": "get_weather", "input": {"city": "SF"}}));
+        assert_eq!(anthropic_stop_reason(true, "stop"), "tool_use");
+        assert_eq!(anthropic_stop_reason(false, "length"), "max_tokens");
+        assert_eq!(anthropic_stop_reason(false, "stop"), "end_turn");
+        assert_eq!(anthropic_usage(100, 80, 5), json!({"input_tokens": 20, "output_tokens": 5, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 80}));
+    }
+
+    #[test] fn a_streamed_reply_is_the_claude_code_event_sequence() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        assert_eq!(sse_text("ping", &json!({"type": "ping"})), "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+        let mut bs = BlockStream::new(7);
+        let mut events: Vec<Value> = Vec::new();
+        for t in reply_stream(&tk, &sp) {
+            for text in bs.on_token(&tk, &sp, t) {
+                let data = text.strip_prefix("event: ").unwrap().split("\ndata: ").nth(1).unwrap().trim_end();
+                events.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        events.extend(bs.close_all().iter().map(|text| serde_json::from_str(text.split("\ndata: ").nth(1).unwrap().trim_end()).unwrap()));
+        // the thinking opens no block; the text streams (one delta per character token here), then the tool block
+        assert_eq!(events[0]["type"], "content_block_start");
+        assert_eq!(events[0]["content_block"], json!({"type": "text", "text": ""}));
+        let text: String = events.iter().filter(|e| e["delta"]["type"] == "text_delta")
+            .map(|e| e["delta"]["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(text, "Hello");
+        let tool_at = events.iter().position(|e| e["content_block"]["type"] == "tool_use").unwrap();
+        assert!(events[..tool_at].iter().all(|e| e["type"] != "content_block_start" || e["index"] == events[0]["index"]),
+            "only the text block opens before the tool block");
+        assert_eq!(events[tool_at - 1]["type"], "content_block_stop", "the text block stops before the tool block starts");
+        assert_eq!(events[tool_at]["content_block"]["id"], "toolu_7_0");
+        assert_eq!(events[tool_at]["content_block"]["name"], "get_weather");
+        assert_eq!(events[tool_at + 1]["delta"]["type"], "input_json_delta");
+        assert_eq!(serde_json::from_str::<Value>(events[tool_at + 1]["delta"]["partial_json"].as_str().unwrap()).unwrap(), json!({"city": "SF"}));
+        assert_eq!(events[tool_at + 2]["type"], "content_block_stop");
+        assert_eq!(events[tool_at + 2]["index"], events[tool_at]["index"], "a block stops at its own index");
+        assert_eq!(bs.calls, 1);
+    }
 }

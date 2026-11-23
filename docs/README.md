@@ -23,7 +23,7 @@ INKY_API_KEY=... inky serve --bind 0.0.0.0:8090 --key-env INKY_API_KEY --lanes 1
 | `--effort E` | medium | thinking effort when a request does not set `reasoning_effort` |
 | `-n MAX` | 16384 | most tokens per reply when a request does not set `max_tokens` |
 
-Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new.
+Endpoints: `POST /v1/chat/completions`, `POST /v1/messages` and `POST /v1/messages/count_tokens` (the Anthropic Messages API: text, `tool_use` and `tool_result` blocks, streamed as `message_start` to `message_stop`; the key is accepted as `x-api-key` or as a Bearer token, and usage splits the prompt into `input_tokens` and `cache_read_input_tokens`), `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. The Anthropic and chat paths render through the one chat template, so a conversation can cross between them and still reuse its prompt.
 
 **As a nova-worker provider.** The worker's key proxy takes the endpoint and the key's name, and the harness reaches inky through it:
 
