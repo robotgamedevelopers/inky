@@ -1,5 +1,7 @@
 # inkling
 
+> **inky** is a fork of [erisinky](https://github.com/Eriskii/erisinky) that adds many lanes in one process, for serving many coding-agent tasks at once. Nothing of that is built yet: see [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md). Everything below is upstream's README.
+
 A from-scratch inference engine for **Thinking Machines' Inkling 2 Mini** (`inkling2_loop`, 26.4B total / 3.4B active MoE)
 on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GGUF directly (zero-copy mmap).
 
