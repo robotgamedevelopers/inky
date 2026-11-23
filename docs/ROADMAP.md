@@ -83,7 +83,7 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 |---|:---:|
 | Profile of where the batched path's 58 ms fixed cost goes | ✅ |
 | One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ✅ |
-| Attention per span through the same kernels for every span length, so chunking never changes a token's numbers | ✅ |
+| Attention per span in two arithmetics — prefill rows and decode steps — each batch-invariant, so prefill chunking never changes a token's numbers | ✅ |
 | Each lane's convolution state and cache written by its own span only | ✅ |
 | Per-lane sampling with one step in flight, seeded by the request | ✅ |
 | Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |

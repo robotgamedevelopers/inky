@@ -1261,6 +1261,8 @@ impl Engine {
     /// the decode path: every lane runs today's single-stream kernels on its own copy of the decode arena with its own
     /// buffers bound, layer by layer, so each lane's numbers are exactly what it gets decoding alone. Logits for each lane
     /// land in its arena (`dbatch_logits`). Needs `ensure_dbatch(lanes.len())`; no disk tier, no pruning.
+    /// This is the decode-path reference the `dbatch` harness checks (`INK_DB_OLD`), not the serving path:
+    /// `inky serve` decodes through `encode_decode`.
     pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
         let n = lanes.len();
         let (start, tot) = (self.dstart.get(), self.ar.total);

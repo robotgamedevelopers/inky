@@ -376,6 +376,8 @@ fn lanes(o: &Opts) {
 /// the same logits at every step, the same cache and convolution rows at the end. Lane i reads the --ref tokens rotated by
 /// 17 i; it prefills in prime-sized chunks with one-token chunks among them, then decodes; lanes start staggered, so a step
 /// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try.
+/// INK_SPANS_SABOTAGE=1 is the negative control: one span is bound to the next lane's state, and the gate must then
+/// fail; tests/ci.sh runs it and requires that failure, so the gate is known to catch a wrong-lane binding.
 fn spans(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);
@@ -390,6 +392,7 @@ fn spans(o: &Opts) {
     let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
     let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let sabotage = std::env::var("INK_SPANS_SABOTAGE").is_ok();
     let nmax = *counts.iter().max().unwrap();
     // each lane alone: one span per step
     let mut alone: Vec<(Vec<u64>, u64)> = Vec::new();
@@ -404,6 +407,7 @@ fn spans(o: &Opts) {
     }
     let mut ok = true;
     for &n in &counts {
+        let mut sabotaged = false;
         let lanes: Vec<Lane> = (0..n).map(fresh).collect();
         let delay = |i: usize| i % 3;                       // lane i starts i % 3 steps late
         let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
@@ -413,6 +417,12 @@ fn spans(o: &Opts) {
             let mut sp = Vec::new(); let mut who = Vec::new();
             for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
             if sp.is_empty() { continue; }
+            if sabotage && !sabotaged && sp.len() >= 2 {
+                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
+                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
+                sp[0].lane = &lanes[who[1]];
+                sabotaged = true;
+            }
             if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
             nsteps += 1;
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
