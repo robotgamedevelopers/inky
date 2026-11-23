@@ -11,7 +11,7 @@ With **inky**, you can:
 * Get the same answers as llama.cpp, checked position by position in CI
 * Run many coding-agent tasks served at once from one process, each its own lane. The [design](docs/DESIGN.md) and the [roadmap](docs/ROADMAP.md) say how.
 
-This is a fork of [erisinky](https://github.com/Eriskii/erisinky) by Eris.
+This is a fork of [erisinkling](https://github.com/Eriskii/erisinkling) by Eris.
 
 Built by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)), Rowan Claude and Eris.
 
