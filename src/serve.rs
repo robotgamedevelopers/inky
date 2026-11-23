@@ -83,7 +83,14 @@ fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> R
                                    for p in content_parts(&m["content"]) { t.push(h); t.push(sp.c_text); text(&mut t, &p); t.push(sp.end); } }
             "tool" => {
                 let name = m["name"].as_str().map(|s| s.to_string()).or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).cloned())).unwrap_or_default();
-                for p in content_parts(&m["content"]) { t.push(sp.msg_tool); text(&mut t, &name); t.push(sp.c_text); text(&mut t, &p); t.push(sp.end); }
+                let mut parts = content_parts(&m["content"]);
+                if parts.is_empty() { parts.push(String::new()); }
+                let is_error = m["is_error"].as_bool().unwrap_or(false);
+                for (i, p) in parts.iter().enumerate() {
+                    t.push(sp.msg_tool); text(&mut t, &name); t.push(sp.c_text);
+                    if is_error && i == 0 { text(&mut t, "Error: "); }
+                    text(&mut t, p); t.push(sp.end);
+                }
             }
             "assistant" => {
                 let content = content_parts(&m["content"]).join("");
@@ -186,13 +193,16 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                                 Value::Array(parts) => {
                                     let ps: Vec<Value> = parts.iter().map(|p| match p["type"].as_str() {
                                         Some("text") => Ok(json!({"type": "text", "text": p["text"].as_str().unwrap_or("")})),
+                                        Some("image") => Ok(json!({"type": "text", "text": "[image]"})),
                                         t => Err(format!("unsupported tool_result content type {}", t.unwrap_or("none"))),
                                     }).collect::<Result<_, _>>()?;
                                     Value::Array(ps)
                                 }
                                 _ => return Err("tool_result content must be a string or an array of text blocks".into()),
                             };
-                            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": c}));
+                            let mut tool_msg = json!({"role": "tool", "tool_call_id": id, "content": c});
+                            if b["is_error"].as_bool().unwrap_or(false) { tool_msg["is_error"] = json!(true); }
+                            msgs.push(tool_msg);
                         }
                         t => return Err(format!("unsupported content block type {} in a user message", t.unwrap_or("none"))),
                     }
@@ -243,12 +253,28 @@ fn anthropic_stop_reason(has_calls: bool, reason: &str) -> &'static str {
     if has_calls { "tool_use" } else if reason == "length" { "max_tokens" } else { "end_turn" }
 }
 
+/// A random per-process nonce (hex), read once at startup: tool ids carry it so an id
+/// issued before a restart never repeats after one. `/dev/urandom` is the source; the
+/// time-and-pid scramble is only the fallback for a machine without it.
+fn startup_nonce() -> String {
+    let mut b = [0u8; 8];
+    let have = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok();
+    if !have {
+        let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+            ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        for byte in b.iter_mut() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; *byte = (x >> 56) as u8; }
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn tool_use_id(nonce: &str, seq: u64, i: usize) -> String { format!("toolu_{nonce}_{seq}_{i}") }
+
 /// A parsed reply as Anthropic content blocks: the text, then each tool call.
-fn anthropic_content(p: &Parsed, seq: u64) -> Vec<Value> {
+fn anthropic_content(p: &Parsed, nonce: &str, seq: u64) -> Vec<Value> {
     let mut c = Vec::new();
     if !p.text.is_empty() { c.push(json!({"type": "text", "text": p.text})); }
     for (i, (name, args)) in p.calls.iter().enumerate() {
-        c.push(json!({"type": "tool_use", "id": format!("toolu_{seq}_{i}"), "name": name, "input": args}));
+        c.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, i), "name": name, "input": args}));
     }
     c
 }
@@ -260,16 +286,23 @@ fn anthropic_usage(prompt: usize, cached: usize, gen: usize) -> Value {
            "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached})
 }
 
+/// The final streaming usage, carried by `message_delta`: the same split as a
+/// non-streaming reply. `message_start` is sent before the lane's reuse is known and
+/// provisionally reports the whole prompt as `input_tokens`; the delta's split
+/// supersedes it, so the client's final accounting sums to the prompt, not to the
+/// prompt plus its cached part a second time.
+fn streaming_delta_usage(prompt: usize, cached: usize, gen: usize) -> Value { anthropic_usage(prompt, cached, gen) }
+
 fn sse_text(event: &str, data: &Value) -> String { format!("event: {event}\ndata: {data}\n\n") }
 
 /// A streamed reply as content blocks, fed one generated token at a time. Text streams as it
 /// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
 /// the block must stream on their own. Thinking tokens open no block.
-struct BlockStream { seq: u64, next: usize, calls: usize, text_index: usize, open_text: bool,
+struct BlockStream { nonce: String, seq: u64, next: usize, calls: usize, text_index: usize, open_text: bool,
                      mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool }
 impl BlockStream {
-    fn new(seq: u64) -> BlockStream {
-        BlockStream { seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
+    fn new(nonce: &str, seq: u64) -> BlockStream {
+        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
     }
     fn flush_text(&mut self, out: &mut Vec<String>) {
         if !self.open_text { self.pend.clear(); return; }
@@ -295,7 +328,7 @@ impl BlockStream {
         let name = v["name"].as_str().map(|x| x.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&self.header).to_string());
         let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
         let index = self.next; self.next += 1;
-        let id = format!("toolu_{}_{}", self.seq, self.calls); self.calls += 1;
+        let id = tool_use_id(&self.nonce, self.seq, self.calls); self.calls += 1;
         out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": index,
             "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})));
         out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": index,
@@ -330,10 +363,13 @@ impl BlockStream {
         }
         out
     }
-    /// whatever block is still open when the reply ends (a length stop can cut a tool call short)
+    /// whatever block is still open when the reply ends. A tool call still open here was
+    /// cut short (a length stop sends no end token): it is dropped, never emitted as a
+    /// tool_use, exactly as `parse` drops a trailing call with no end. `calls` therefore
+    /// counts completed calls only, and the stop reason derives from it alone.
     fn close_all(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.mode == 3 { self.emit_tool(&mut out); self.mode = 0; }
+        if self.mode == 3 { self.tool.clear(); self.mode = 0; }
         self.close_text(&mut out);
         out
     }
@@ -496,7 +532,7 @@ fn peer_gone(s: &TcpStream) -> bool {
 }
 
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
-             key: Option<String>, ctx: usize,
+             nonce: String, key: Option<String>, ctx: usize,
              /// requests admitted and not yet finished (generating, prefilling or queued for a lane); at most `limit`
              inflight: std::sync::atomic::AtomicUsize, limit: usize,
              /// connection threads alive; at most MAX_CONNS
@@ -662,7 +698,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
             "model": model, "content": [], "stop_reason": null, "stop_sequence": null,
             "usage": {"input_tokens": prompt_len, "output_tokens": 0}}})))?;
         s.flush()?;
-        let mut bs = BlockStream::new(seq);
+        let mut bs = BlockStream::new(&cx.nonce, seq);
         loop {
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
@@ -684,7 +720,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls}", calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
-                        "usage": {"output_tokens": ng, "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached}})))?;
+                        "usage": streaming_delta_usage(prompt, cached, ng)})))?;
                     write!(s, "{}", sse_text("message_stop", &json!({"type": "message_stop"})))?;
                     return s.flush();
                 }
@@ -711,7 +747,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
                 eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
                 return respond(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
-                    "content": anthropic_content(&p, seq), "stop_reason": stop, "stop_sequence": null,
+                    "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string());
             }
             Ev::Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e),
@@ -742,7 +778,7 @@ pub fn serve(o: ServeOpts) {
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
-                            key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
+                            nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
     let l = TcpListener::bind(&o.bind).expect("bind");
     eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", o.bind, o.lanes, o.ctx, o.effort, o.queue,
               if o.key.is_some() { "a bearer key required" } else { "no key (loopback use only)" });
@@ -931,9 +967,9 @@ mod tests {
         assert_eq!(p.thinking, "hmm");
         assert_eq!(p.calls.len(), 1);
         assert_eq!(p.calls[0], ("get_weather".to_string(), json!({"city": "SF"})));
-        let content = anthropic_content(&p, 7);
+        let content = anthropic_content(&p, "abc123", 7);
         assert_eq!(content[0], json!({"type": "text", "text": "Hello"}));
-        assert_eq!(content[1], json!({"type": "tool_use", "id": "toolu_7_0", "name": "get_weather", "input": {"city": "SF"}}));
+        assert_eq!(content[1], json!({"type": "tool_use", "id": "toolu_abc123_7_0", "name": "get_weather", "input": {"city": "SF"}}));
         assert_eq!(anthropic_stop_reason(true, "stop"), "tool_use");
         assert_eq!(anthropic_stop_reason(false, "length"), "max_tokens");
         assert_eq!(anthropic_stop_reason(false, "stop"), "end_turn");
@@ -944,7 +980,7 @@ mod tests {
         let tk = Tokenizer::for_test();
         let sp = test_sp(&tk);
         assert_eq!(sse_text("ping", &json!({"type": "ping"})), "event: ping\ndata: {\"type\":\"ping\"}\n\n");
-        let mut bs = BlockStream::new(7);
+        let mut bs = BlockStream::new("abc123", 7);
         let mut events: Vec<Value> = Vec::new();
         for t in reply_stream(&tk, &sp) {
             for text in bs.on_token(&tk, &sp, t) {
@@ -963,12 +999,117 @@ mod tests {
         assert!(events[..tool_at].iter().all(|e| e["type"] != "content_block_start" || e["index"] == events[0]["index"]),
             "only the text block opens before the tool block");
         assert_eq!(events[tool_at - 1]["type"], "content_block_stop", "the text block stops before the tool block starts");
-        assert_eq!(events[tool_at]["content_block"]["id"], "toolu_7_0");
+        assert_eq!(events[tool_at]["content_block"]["id"], "toolu_abc123_7_0");
         assert_eq!(events[tool_at]["content_block"]["name"], "get_weather");
         assert_eq!(events[tool_at + 1]["delta"]["type"], "input_json_delta");
         assert_eq!(serde_json::from_str::<Value>(events[tool_at + 1]["delta"]["partial_json"].as_str().unwrap()).unwrap(), json!({"city": "SF"}));
         assert_eq!(events[tool_at + 2]["type"], "content_block_stop");
         assert_eq!(events[tool_at + 2]["index"], events[tool_at]["index"], "a block stops at its own index");
         assert_eq!(bs.calls, 1);
+    }
+
+    #[test] fn a_tool_call_cut_off_by_length_is_not_a_tool_use() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        // a tool call with no end token: generation stopped (length) mid-call
+        let mut bs = BlockStream::new("abc123", 7);
+        let mut toks = vec![sp.msg_model];
+        toks.extend(tk.encode("get_weather", false));
+        toks.push(sp.c_tool);
+        toks.extend(tk.encode("{\"name\":\"get_weather\",\"args\":{\"ci", false));
+        let mut events: Vec<Value> = Vec::new();
+        for t in toks { for text in bs.on_token(&tk, &sp, t) {
+            events.push(serde_json::from_str(text.split("\ndata: ").nth(1).unwrap().trim_end()).unwrap());
+        } }
+        for text in bs.close_all() {
+            events.push(serde_json::from_str(text.split("\ndata: ").nth(1).unwrap().trim_end()).unwrap());
+        }
+        assert!(events.iter().all(|e| e["content_block"]["type"] != "tool_use"),
+            "a partial tool call must not stream as a tool_use block: {events:?}");
+        assert_eq!(bs.calls, 0, "only completed calls count toward the stop reason");
+        assert_eq!(anthropic_stop_reason(bs.calls > 0, "length"), "max_tokens");
+    }
+
+    #[test] fn error_and_empty_and_image_tool_results_render() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let render_one = |content: Value, is_error: bool| -> Vec<u32> {
+            let mut block = json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": content});
+            if is_error { block["is_error"] = json!(true); }
+            let a = json!({"messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}]},
+                {"role": "user", "content": [block]}]});
+            render(&tk, &sp, &anthropic_to_openai(&a).unwrap(), "medium").unwrap()
+        };
+        // an error result is marked, so the model can tell it from a success with the same text
+        let ok = render_one(json!("Boom"), false);
+        let err = render_one(json!("Boom"), true);
+        assert_ne!(ok, err, "an error tool result must render differently from a successful one");
+        let err_text: Vec<u32> = tk.encode("Error", false);
+        assert!(err.windows(err_text.len()).any(|w| w == err_text.as_slice()), "the error mark must be in the rendered tokens");
+        // an image inside a tool result becomes a text placeholder, never a 400
+        let img = render_one(json!([{"type": "image", "source": {"type": "base64", "data": "AA=="}}]), false);
+        assert!(img.contains(&sp.msg_tool), "an image tool result must still render as a tool result");
+        // an empty result still renders a tool block (an empty success, not silence)
+        let empty = render_one(json!([]), false);
+        assert!(empty.contains(&sp.msg_tool), "an empty tool result must render a tool block");
+        let empty_str = render_one(json!(""), false);
+        assert_eq!(empty, empty_str, "an empty array and an empty string are the same empty result");
+    }
+
+    #[test] fn streaming_delta_usage_matches_the_non_streaming_split() {
+        // the delta must carry the corrected split: input (uncached) + cache_read == prompt.
+        // Before the fix the delta carried no input_tokens at all, so a client adding its
+        // cache_read to message_start's whole-prompt input_tokens counted the prompt twice.
+        let d = streaming_delta_usage(100, 80, 5);
+        assert_eq!(d, anthropic_usage(100, 80, 5), "streaming and non-streaming usage must agree");
+        assert_eq!(d["input_tokens"], 20);
+        assert_eq!(d["cache_read_input_tokens"], 80);
+        assert_eq!(d["input_tokens"].as_u64().unwrap() + d["cache_read_input_tokens"].as_u64().unwrap(), 100);
+        assert_eq!(streaming_delta_usage(50, 0, 3)["input_tokens"], 50, "nothing cached, everything is input");
+        assert_eq!(streaming_delta_usage(50, 50, 3)["input_tokens"], 0, "fully cached, no fresh input");
+    }
+
+    #[test] fn tool_ids_carry_the_startup_nonce() {
+        assert_eq!(tool_use_id("abc123", 7, 0), "toolu_abc123_7_0");
+        assert_ne!(tool_use_id("abc123", 7, 0), tool_use_id("def456", 7, 0),
+            "the same seq and index under another process's nonce must not repeat the id");
+        let n = startup_nonce();
+        assert_eq!(n.len(), 16, "the nonce is eight bytes as hex: {n}");
+        assert!(n.chars().all(|c| c.is_ascii_hexdigit()), "the nonce is hex: {n}");
+    }
+
+    #[test] fn over_cap_streaming_requests_are_refused_at_the_call_sites() {
+        // the actual handlers, not just the context_over helper: a streamed over-cap
+        // request gets a clean HTTP 400 before any SSE header, on both routes.
+        use std::io::Read as _;
+        let tk0 = Tokenizer::for_test();
+        let (jtx, _jrx) = channel::<Job>();
+        let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
+                       max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       inflight: Default::default(), limit: 4, conns: Default::default() };
+        let long = "x".repeat(200);
+        let roundtrip = |serve_fn: fn(&Ctx, &Value, &mut TcpStream) -> std::io::Result<()>, req: &Value| -> String {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (mut srv, _) = l.accept().unwrap();
+            serve_fn(&cx, req, &mut srv).unwrap();
+            drop(srv);
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut out = String::new();
+            let _ = client.read_to_string(&mut out);
+            out
+        };
+        let a = roundtrip(messages, &json!({"model": "m", "max_tokens": 8, "stream": true,
+            "messages": [{"role": "user", "content": long}]}));
+        assert!(a.starts_with("HTTP/1.1 400"), "messages over-cap must be an HTTP 400, got: {}", &a[..a.len().min(80)]);
+        assert!(a.contains("invalid_request_error") && a.contains("context full"), "messages over-cap body: {a}");
+        assert!(!a.contains("text/event-stream"), "no SSE headers may precede the refusal: {a}");
+        let c = roundtrip(chat, &json!({"model": "m", "max_tokens": 8, "stream": true,
+            "messages": [{"role": "user", "content": long}]}));
+        assert!(c.starts_with("HTTP/1.1 400"), "chat over-cap must be an HTTP 400, got: {}", &c[..c.len().min(80)]);
+        assert!(c.contains("context full"), "chat over-cap body: {c}");
+        assert!(!c.contains("text/event-stream"), "no SSE headers may precede the refusal: {c}");
     }
 }
