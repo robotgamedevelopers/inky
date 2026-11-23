@@ -137,7 +137,14 @@ The Mac goes in and out of inky mode. Starting inky gives the GPU the memory it 
 - **A one-time install, by the owner:** `sudo inky tune-memory` installs a small root LaunchDaemon. It does two things only: raise the GPU's wired-memory limit (`iogpu.wired_limit_mb`) and put it back. It accepts no other setting and runs nothing else. `sudo inky tune-memory --undo` removes it.
 - **Entering:** inky connects to the helper over a Unix socket only the owner's user can open. The helper records the limit it finds and raises it to a value sized from the Mac's memory (118000 MB on 128 GB, leaving about 13 GB for macOS).
 - **Leaving:** when inky's connection closes, the helper restores exactly the limit it found. A clean exit, a crash, `kill -9` or a sleep all close the connection, so the memory is always given back. With several inky processes, the limit is held while any is connected.
+- **In the sprint,** nova-worker drives it: it starts inky when it brings local lanes up, and stops it when it stops serving them, so the laptop goes into inky mode for sprint work and out of it afterwards.
 - **Inside inky mode,** inky asks Metal for the recommended working set, subtracts the weights, scratch and a margin, and sizes lanes and admission from that. Nobody passes a memory budget by hand. Without the helper, inky runs inside the default limit and says, once, what installing it would give.
+
+## Tunings
+
+A tuning is one machine's settings, in a file under `tunings/`, matched by chip and memory: the GPU wired-memory limit in inky mode, the margin kept free of lane caches, and in time the kernel choices that suit that GPU. inky picks the tuning that matches the machine it runs on; a machine without one runs on defaults derived from its memory. Tunings are how inky reaches other machines: anyone with a Mac it does not know yet can measure, write a tuning and contribute it back.
+
+inky is tuned 100% for the first one, `m5-max-128gb`: the Apple M5 Max MacBook Pro with 128 GB. The next are an M3 Ultra Mac Studio with 512 GB and, when there is one, an M5 Ultra Mac Studio.
 
 ## Layers, bottom up
 

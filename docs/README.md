@@ -16,7 +16,14 @@ sudo sysctl iogpu.wired_limit_mb=118000      # about 115 GiB for the GPU, about 
 sudo sysctl iogpu.wired_limit_mb=0           # back to the default
 ```
 
-The setting lasts until the next reboot. With it, Metal's recommended working set on the 128 GB MacBook Pro is 115.2 GiB. inky will do this itself in inky mode (docs/DESIGN.md): a one-time `sudo inky tune-memory`, after which starting inky raises the limit and stopping it restores it.
+The setting lasts until the next reboot. With it, Metal's recommended working set on the 128 GB MacBook Pro is 115.2 GiB. inky does this itself in inky mode (docs/DESIGN.md). Install the helper once:
+
+```sh
+sudo inky tune-memory           # starting inky now raises the limit; stopping it restores the limit it found
+sudo inky tune-memory --undo    # remove it
+```
+
+The value comes from this machine's tuning (`tunings/`; `m5-max-128gb` sets 118000).
 
 **Memory per lane.** A lane's cache is 160 MiB for the sliding-window layers plus 32 KiB per token of context for the full-attention layers. After the 17.5 GB of weights and a few GB of scratch, about 90 GiB is left for lanes:
 
