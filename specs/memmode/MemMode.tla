@@ -40,22 +40,23 @@ Connect(c) == /\ alive /\ c \notin conns
                          /\ conns' = {c} /\ limit' = Target /\ owed' = TRUE
                          /\ saved' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN (IF Bug = "no_persist" THEN NONE ELSE limit) ELSE disk
-                      \/ \* refused: the raise moved the limit and rolling it back failed too, so the save is kept
+                      \/ \* refused: raise/rollback or read-back failed, so the save is kept
+                         \* even if the limit actually reached its original value but could not be confirmed
                          \* with no clients, for the helper's exit paths
-                         /\ conns' = {} /\ limit' = Target /\ owed' = TRUE
+                         /\ conns' = {} /\ limit' \in {limit, Target, IF saved = NONE THEN limit ELSE saved} /\ owed' = TRUE
                          /\ saved' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN (IF Bug = "no_persist" THEN NONE ELSE limit) ELSE disk
                       \/ \* refused and forgotten: the raise never moved the limit, or rolling it back is
                          \* confirmed (the limit ends at the value found), so no client is counted and the
                          \* save is forgotten — in memory always, on disk too unless forgetting it fails
                          \* (a kept save that could not be written ends unchanged and is not a separate
-                         \* step). Modelled only while no restore is owed at entry; Bug "stale_saved"
+                         \* step). A seeded save may also be restored here; Bug "stale_saved"
                          \* keeps the in-memory save when forgetting the file fails, as it does after a
                          \* confirmed restore.
-                         /\ (saved = NONE \/ ~owed) /\ conns' = {} /\ owed' = FALSE
+                         /\ conns' = {} /\ owed' = FALSE
                          /\ limit' = IF saved = NONE THEN limit ELSE saved
                          /\ saved' = NONE /\ disk' = NONE
-                      \/ /\ (saved = NONE \/ ~owed) /\ conns' = {} /\ owed' = FALSE
+                      \/ /\ conns' = {} /\ owed' = FALSE
                          /\ limit' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN limit ELSE saved
                          /\ saved' = IF Bug = "stale_saved" THEN (IF saved = NONE THEN limit ELSE saved) ELSE NONE
@@ -64,7 +65,8 @@ Close(c) == /\ alive /\ c \in conns /\ conns' = conns \ {c}
             /\ IF conns' # {} /\ Bug # "release_early"
                   THEN UNCHANGED <<limit, saved, disk, owed>>
                   ELSE IF saved = NONE THEN UNCHANGED <<limit, saved, disk, owed>>
-                       ELSE \/ UNCHANGED <<limit, saved, disk, owed>>     \* the restore fails: the save is kept
+                       ELSE \/ /\ limit' \in {limit, saved} /\ UNCHANGED <<saved, disk, owed>>
+                               \* failed or unconfirmed restore may have moved the limit: keep the save
                             \/ /\ limit' = IF Bug = "restore_default" THEN 0 ELSE saved
                                /\ owed' = FALSE /\ saved' = NONE /\ disk' = NONE
                             \/ /\ limit' = IF Bug = "restore_default" THEN 0 ELSE saved
@@ -79,7 +81,7 @@ Crash == alive /\ alive' = FALSE /\ conns' = {} /\ saved' = NONE /\ owed' = FALS
 Restart == /\ ~alive /\ alive' = TRUE
            /\ IF disk = NONE THEN UNCHANGED <<limit, disk, saved, owed>>
               ELSE \/ /\ limit' = disk /\ saved' = NONE /\ owed' = FALSE /\ (disk' = NONE \/ disk' = disk)
-                   \/ /\ UNCHANGED <<limit, disk>> /\ saved' = (IF Bug = "lost_seed" THEN NONE ELSE disk) /\ owed' = (Bug # "lost_seed")
+                   \/ /\ limit' \in {limit, disk} /\ UNCHANGED disk /\ saved' = (IF Bug = "lost_seed" THEN NONE ELSE disk) /\ owed' = (Bug # "lost_seed")
            /\ UNCHANGED <<conns, owner>>
 Next == (\E c \in Clients : Connect(c) \/ Close(c)) \/ (\E v \in Values : OwnerSets(v)) \/ Crash \/ Restart
 Spec == Init /\ [][Next]_vars /\ WF_vars(Restart) /\ WF_vars(\E c \in Clients : Close(c))
