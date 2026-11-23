@@ -6,7 +6,7 @@ mod session;
 mod tokenizer;
 mod unicode_tables;
 
-use engine::Engine;
+use engine::{Engine, Lane};
 use objc2_metal::{MTLBuffer, MTLCommandBuffer};
 use sampler::Sampler;
 use session::{Renderer, Session};
@@ -15,9 +15,9 @@ use tokenizer::Tokenizer;
 
 const DEFAULT_MODEL: &str = "~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf";
 
-const USAGE: &str = "inkling - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
+const USAGE: &str = "inky - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
 
-usage: inkling <command> [options]
+usage: inky <command> [options]
 
 commands:
   chat              interactive multi-turn chat (KV cache reused across turns)
@@ -105,21 +105,21 @@ fn softcap(x: f32, c: f32) -> f32 { if c > 0.0 { c * (x / c).tanh() } else { x }
 fn run(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Tokenizer::load(&eng.g);
-    if std::env::var("INK_KV_PREALLOC").is_ok() { eng.reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
     let mut sess = Session::new(&eng, &tk);
+    if std::env::var("INK_KV_PREALLOC").is_ok() { sess.run().reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let toks = tk.encode(&text, true);
-    eng.prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
+    sess.run().prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
     let first = sess.prefill(&toks);
     let mut out = std::io::stdout();
     let mut r = Renderer::new(!o.hide_thinking, o.raw);
     sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
     r.end(&mut out);
     let s = sess.stats;
-    eprintln!("\n[inkling] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
+    eprintln!("\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
               s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, s.gen_tokens as f64 / s.gen_time.as_secs_f64(),
-              if sampler.greedy() { " (greedy)" } else { "" }, kv_note(&eng, sess.n_past), sess.n_past);
+              if sampler.greedy() { " (greedy)" } else { "" }, kv_note(sess.run(), sess.n_past), sess.n_past);
 }
 
 fn chat(o: &Opts) {
@@ -129,7 +129,7 @@ fn chat(o: &Opts) {
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    eprintln!("[inkling] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
+    eprintln!("[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
               o.effort, if sampler.greedy() { "greedy".to_string() } else { format!("temp {}", o.temp) });
     let mut turn = 0;
     loop {
@@ -138,7 +138,7 @@ fn chat(o: &Opts) {
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
         let line = line.trim_end_matches(['\n', '\r']).to_string();
         if line.trim().is_empty() { break; }
-        if line.trim() == "/reset" { sess = Session::new(&eng, &tk); turn = 0; eprintln!("[context cleared]"); continue; }
+        if line.trim() == "/reset" { sess = Session::with_lane(&eng, &tk, sess.into_lane()); turn = 0; eprintln!("[context cleared]"); continue; }
         let text = if turn == 0 { first_turn(o, &line) } else { format!("<|message_user|><|content_text|>{line}<|end_message|>") };
         turn += 1;
         let before = sess.stats;
@@ -153,7 +153,7 @@ fn chat(o: &Opts) {
         let (pt, gt) = (s.prompt_tokens - before.prompt_tokens, s.gen_tokens - before.gen_tokens);
         eprintln!("\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
                   pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(), gt as f64 / (s.gen_time - before.gen_time).as_secs_f64(),
-                  sess.n_past, eng.max_ctx, kv_note(&eng, sess.n_past));
+                  sess.n_past, eng.max_ctx, kv_note(sess.run(), sess.n_past));
     }
 }
 
@@ -166,9 +166,9 @@ fn bench(o: &Opts) {
     let toks = tk.encode(&text, true);
     let mut sampler = Sampler::new(0.0, 1, 1.0, eng.softcap, 0);
     // warm-up pass (pipelines, page mappings)
-    { let mut s = Session::new(&eng, &tk); let f = s.prefill(&toks[..toks.len().min(64)]); s.generate(f, 8, &mut sampler, |_| true); }
-    let mut sess = Session::new(&eng, &tk);
-    eng.prepare(toks.len(), toks.len());       // as `run` does: working memory allocated and mapped before the clock starts
+    let warm = { let mut s = Session::new(&eng, &tk); let f = s.prefill(&toks[..toks.len().min(64)]); s.generate(f, 8, &mut sampler, |_| true); s.into_lane() };
+    let mut sess = Session::with_lane(&eng, &tk, warm);     // the warm-up's buffers, already mapped
+    sess.run().prepare(toks.len(), toks.len());       // as `run` does: working memory allocated and mapped before the clock starts
     let first = sess.prefill(&toks);
     sess.generate(first, n, &mut sampler, |_| true);
     let s = sess.stats;
@@ -176,16 +176,16 @@ fn bench(o: &Opts) {
              s.prompt_tokens, s.prompt_time.as_secs_f64() * 1e3, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
              s.gen_tokens, s.gen_time.as_secs_f64() * 1e3, s.gen_tokens as f64 / s.gen_time.as_secs_f64());
     println!("memory besides the weights: {} at {} tokens | prefill scratch {:.0} MiB while prefilling, {:.1} MiB while generating",
-             kv_note(&eng, sess.n_past), sess.n_past, s.peak_scratch as f64 / 1048576.0, eng.mem().1 as f64 / 1048576.0);
-    if eng.tier_on() {
-        let (rb, rt) = eng.tier_io();
+             kv_note(sess.run(), sess.n_past), sess.n_past, s.peak_scratch as f64 / 1048576.0, sess.run().mem().1 as f64 / 1048576.0);
+    if sess.run().tier_on() {
+        let (rb, rt) = sess.run().tier_io();
         println!("K/V file: {:.0} MiB read per token, {:.1} GiB/s, {:.1} ms of each token's {:.1} ms", rb as f64 / 1048576.0 / s.gen_tokens as f64,
                  rb as f64 / 1073741824.0 / rt.as_secs_f64(), rt.as_secs_f64() * 1e3 / s.gen_tokens as f64, s.gen_time.as_secs_f64() * 1e3 / s.gen_tokens as f64);
     }
 }
 
 /// the K/V cache as it is held right now (with --kv-disk: the part in memory and the part that is only in the file)
-fn kv_note(eng: &Engine, n: usize) -> String {
+fn kv_note(eng: engine::Run, n: usize) -> String {
     let mib = |b: usize| b as f64 / 1048576.0;
     if eng.tier_on() { format!("K/V cache {:.0} MiB in memory + {:.0} MiB on disk (all in memory: {:.0} MiB)", mib(eng.mem().0), mib(eng.kv_disk_bytes(n)), mib(eng.kv_exact_bytes(n))) }
     else { format!("K/V cache {:.0} MiB", mib(eng.mem().0)) }
@@ -193,6 +193,8 @@ fn kv_note(eng: &Engine, n: usize) -> String {
 
 fn check(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     let toks: Vec<u32> = std::fs::read_to_string(format!("{}.tokens", o.reference)).unwrap().lines().map(|l| l.trim().parse().unwrap()).collect();
     let raw = std::fs::read(format!("{}.logits", o.reference)).unwrap();
@@ -261,6 +263,8 @@ fn check(o: &Opts) {
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
 fn binv(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     let tk = Tokenizer::load(&eng.g);
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
     let splits: Vec<usize> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',').map(|v| v.parse().unwrap()).collect();
@@ -290,6 +294,70 @@ fn binv(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
+/// each lane exactly the logits it gives alone. Lane A is the --ref tokens, lane B the same tokens rotated by a third (a
+/// different stream of the same length). Each lane prefills its first INK_PF tokens in chunks of INK_LANE_CHUNK, then
+/// decodes the rest one step at a time.
+fn lanes(o: &Opts) {
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let a: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let mut b = a.clone(); b.rotate_left(a.len() / 3);
+    let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000).min(a.len() - 1);
+    let ch: usize = std::env::var("INK_LANE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    // the work of one lane as a list of (p0, t): prefill chunks, then single decode steps
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let mut p = 0; while p < pf { let t = (pf - p).min(ch); work.push((p, t)); p += t; }
+    for p in pf..a.len() { work.push((p, 1)); }
+    let poison = std::env::var("INK_NO_POISON").is_err();
+    let hash_step = |run: &engine::Run, (p0, t): (usize, usize), h: &mut u64| {
+        if poison { run.poison_scratch(); }
+        let cb = run.gpu.cmd();
+        if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
+        cb.commit(); cb.waitUntilCompleted();
+        for x in run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+    };
+    // per-step hashes, to name the first step where two runs part
+    let trace = |run: &engine::Run, toks: &[u32], other: Option<&engine::Run>| -> Vec<u64> {
+        let mut v = Vec::new();
+        for &w in &work {
+            if let Some(o) = other { let mut x = 0u64; hash_step(o, w, &mut x); }
+            let mut h = 0xcbf29ce484222325u64; hash_step(run, w, &mut h); v.push(h);
+        }
+        let _ = toks; v
+    };
+    let alone = |toks: &[u32]| -> u64 {
+        let lane = Lane::new(&eng); let run = eng.on(&lane);
+        run.reserve(toks.len() + 1, false); run.set_tokens(0, toks);
+        let mut h = 0xcbf29ce484222325u64;
+        for &w in &work { hash_step(&run, w, &mut h); }
+        h
+    };
+    if std::env::var("INK_ARENA_MAP").is_ok() { println!("{}", eng.arena_map()); }
+    let (ha, hb) = (alone(&a), alone(&b));
+    let (la, lb) = (Lane::new(&eng), Lane::new(&eng));
+    let (ra, rb) = (eng.on(&la), eng.on(&lb));
+    for (r, t) in [(&ra, &a), (&rb, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+    let (mut ia, mut ib) = (0xcbf29ce484222325u64, 0xcbf29ce484222325u64);
+    for &w in &work { hash_step(&ra, w, &mut ia); hash_step(&rb, w, &mut ib); }
+    if std::env::var("INK_LANE_TRACE").is_ok() {
+        let (l1, l2, l3) = (Lane::new(&eng), Lane::new(&eng), Lane::new(&eng));
+        let (r1, r2, r3) = (eng.on(&l1), eng.on(&l2), eng.on(&l3));
+        for (r, t) in [(&r1, &a), (&r2, &a), (&r3, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+        let solo = trace(&r1, &a, None);
+        let mixed = trace(&r2, &a, Some(&r3));
+        match solo.iter().zip(&mixed).position(|(x, y)| x != y) {
+            Some(i) => println!("first difference at step {i}: work {:?} ({} steps)", work[i], work.len()),
+            None => println!("per-step traces agree"),
+        }
+    }
+    println!("lane A alone {ha:016x} interleaved {ia:016x} {}", if ha == ia { "same" } else { "DIFFERENT" });
+    println!("lane B alone {hb:016x} interleaved {ib:016x} {}", if hb == ib { "same" } else { "DIFFERENT" });
+    let ok = ha == ia && hb == ib && ha != hb;
+    println!("{}", if ok { "lanes independent: interleaved and poisoned, each lane gives exactly its own logits" } else { "LANES NOT INDEPENDENT" });
+    if !ok { std::process::exit(1); }
+}
+
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -298,6 +366,8 @@ fn stats(name: &str, v: &[f32]) {
 
 fn debug(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
     let toks = tk.encode(&o.prompt, true);
@@ -329,6 +399,8 @@ fn debug(o: &Opts) {
 
 fn prof(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     eng.reset();
     let vary = std::env::var("INK_VARY").is_ok();
@@ -358,6 +430,8 @@ fn prof(o: &Opts) {
 
 fn prof_pf(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     eng.reset();
     eng.set_tokens(0, &(0..8192).map(|i| 1000 + (i * 7) % 5000).collect::<Vec<u32>>());
@@ -403,6 +477,8 @@ fn prof_pf(o: &Opts) {
 /// dev: greedy-generate and log tokens + per-layer expert routing of every step (for speculation analysis)
 fn routes(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
@@ -429,6 +505,8 @@ fn routes(o: &Opts) {
 /// dev: cost of a batched pass of T tokens vs one decode step
 fn vcost(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    let lane = Lane::new(&eng);
+    let eng = eng.on(&lane);
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     eng.reset();
     eng.set_tokens(0, &(0..4096).map(|i| 1000 + (i * 7) % 5000).collect::<Vec<u32>>());
@@ -451,6 +529,7 @@ fn main() {
     match cmd.as_str() {
         "check" => check(&o),
         "binv" => binv(&o),
+        "lanes" => lanes(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),
@@ -458,12 +537,16 @@ fn main() {
         "prof_pf" => prof_pf(&o),
         "kmoe" => {
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
 
             println!("k_moe_gu   (prod): {:6.1} GB/s", eng.kbench_moe("k_moe_gu", (engine::FF / 4, 8), 128));
             println!("k_moe_down (prod): {:6.1} GB/s", eng.kbench_moe("k_moe_down", (engine::E / 4, 1), 64));
         }
         "kgemm" => {
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             let t: usize = std::env::var("INK_T").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
             for (n, bm, bn) in [("kgs_64_128_8", 64, 128), ("kgs_64_64_4", 64, 64), ("kgs_64_32_4", 64, 32), ("kgs_64_96_6", 64, 96), ("kgs_64_112_7", 64, 112), ("kgs_64_192_12", 64, 192), ("kgs_64_256_16", 64, 256), ("kgb_64_128_8", 64, 128), ("kgb_64_64_4", 64, 64), ("kg_iso0_3", 64, 64), ("kg_iso2_3", 64, 64)] {
                 println!("{n:>16}: {:5.1} TFLOPs", eng.kbench_gemm(n, bm, bn, t));
@@ -472,6 +555,8 @@ fn main() {
         "kmoepf" => {
             // MoE GEMM kernels alone, on the real routing of the prompt's last layer
             let eng = Engine::load(&o.model, o.ctx);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
@@ -487,6 +572,8 @@ fn main() {
         "ksg" => {
             // per-simdgroup tile ops: cost of a tile vs threadgroup size and number of simdgroups that have tokens
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             for (name, nsg, nact) in [("kgsg_8", 8, 8), ("kgsgf0_8", 8, 8), ("kgsgf0_8", 8, 6), ("kgsgf0_8", 8, 4), ("kgsgf0_8", 8, 2), ("kgsg_4", 4, 4),
                                       ("kgsgf0_4", 4, 4), ("kgsgf0_4", 4, 2), ("kgsgf0_4", 4, 1), ("kgsg_16", 16, 16), ("kgsgf0_16", 16, 16)] {
                 let tf = eng.kbench_sgn(name, nsg, nact, 3840);
@@ -496,6 +583,8 @@ fn main() {
         "qclip" => {
             // dev: are any key dimensions unused by all three query heads of their group?
             let eng = Engine::load(&o.model, 64);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             let pb = unsafe { std::slice::from_raw_parts(eng.pb.contents().as_ptr() as *const f32, eng.pb.length() / 4) };
             for (i, l) in eng.layers.iter().enumerate() {
                 let w = &pb[l.q_clip as usize / 4..l.q_clip as usize / 4 + 24 * 128];
@@ -557,6 +646,8 @@ fn main() {
             // dev: what does evicting far keys of the full-attention layers cost? Prefill the prompt, decode -n tokens with the
             // whole cache (the reference), then decode the same tokens again with only a share of the far keys kept.
             let eng = Engine::load(&o.model, o.ctx);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
@@ -604,10 +695,12 @@ fn main() {
                 println!("score {mode:3} keep {:5.1}% of {far} far keys{}: full-attention cache {:.0} -> {:.0} MiB | argmax {agree}/{d}  KL mean {mean:.5} worst {worst:.5} | {ms:.2} ms/step (selection {tb:.1} s)",
                          keep * 100.0, if sum { " + summary key" } else { "              " }, full_mib(n + d), full_mib(kept + sum as usize + 1024 + d));
             } } }
-            *eng.prune.borrow_mut() = None;
+            *eng.lane.prune.borrow_mut() = None;
         }
         "kvscreen" => {
             let eng = Engine::load(&o.model, o.ctx);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
@@ -623,6 +716,8 @@ fn main() {
         "kvdump" => {
             // dev: prefill the prompt and write the K/V payload to <ref>.swa / <ref>.full (to study its redundancy)
             let eng = Engine::load(&o.model, o.ctx);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
             let mut sess = Session::new(&eng, &tk);
@@ -634,20 +729,28 @@ fn main() {
         }
         "kpeak" => {
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             for (n, nsg) in [("kgpeak_8_0", 8), ("kgpeak_8_576", 8), ("kgpeak_8_128", 8), ("kgpeak_8_32", 8), ("kgpeak_4_0", 4), ("kgpeak_1_0", 1)] {
                 println!("{n:>13}: {:5.1} TFLOPs", eng.kbench_peak(n, nsg, 1024));
             }
         }
         "kmode" => {
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             for n in ["kgmode_0_0", "kgmode_1_0", "kgmode_0_1", "kgmode_1_1"] {
                 let (tf, rel, mx) = eng.kbench_mode(n, 1024);
                 println!("{n}: {tf:5.1} TFLOPs   relative RMS error {rel:.2e}   max error / output RMS {mx:.2e}");
             }
         }
-        "bw" => { let eng = Engine::load(&o.model, 4096); eng.bw_weights(); }
+        "bw" => { let eng = Engine::load(&o.model, 4096);
+ let lane = Lane::new(&eng);
+ let eng = eng.on(&lane); eng.bw_weights(); }
         "kbench" => {
             let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
             if std::env::var("INK_KB_Q4").is_ok() { for (n, nr, nsg) in [("kb_dev_2_2", 2, 2), ("kb_dev_2_4", 2, 4), ("kb_dev_4_2", 4, 2),
                                  ("kb_dev_4_4", 4, 4), ("kb_dev_8_2", 8, 2), ("kb_dev_1_4", 1, 4), ("kb_blk_2_4", 2, 4), ("kb_blk_4_4", 4, 4),
                                  ("kb_blk_8_2", 8, 2), ("kb_blk_4_8", 4, 8)] {

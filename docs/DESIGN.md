@@ -46,7 +46,7 @@ It flattens near 200 tok/s, about twice one inky stream. inky's batched path, at
 
 ### Where the batched path's time goes
 
-`inkling prof_pf` at 32 tokens in one batch (52 ms):
+`inky prof_pf` at 32 tokens in one batch (52 ms):
 
 | part | time | note |
 |---|---:|---|
@@ -58,7 +58,7 @@ So the 58 ms is not a fixed overhead. It is the experts a batch touches, read by
 
 ### Batch invariance
 
-`inkling binv` prefills the same tokens split at different points and hashes the final logits. A split moves every later token to a different batch, tile slot and set of neighbours. On two prompts (2403 and 61 tokens), every split gives bit-identical logits, at chunk sizes from 64 to 4096. The check found one bug: a batch of exactly one token went to the decode kernel with batch-layout arguments and gave wrong, non-repeatable logits (fixed in `mix_t`). Upstream never sends a one-token batch; a lane decoding alone would.
+`inky binv` prefills the same tokens split at different points and hashes the final logits. A split moves every later token to a different batch, tile slot and set of neighbours. On two prompts (2403 and 61 tokens), every split gives bit-identical logits, at chunk sizes from 64 to 4096. The check found one bug: a batch of exactly one token went to the decode kernel with batch-layout arguments and gave wrong, non-repeatable logits (fixed in `mix_t`). Upstream never sends a one-token batch; a lane decoding alone would.
 
 ## Findings from the cold read, to fold in before layer 2
 
@@ -80,6 +80,8 @@ Accepted:
 - **Layers 4 and 5 are one layer.** Admission cannot be exercised without parking and restoring.
 - **A performance and memory gate at 20K and 42K context belongs right after layer 2**, before the cache is built on it.
 - **Grouping by the previous token's experts saves nothing when every ready lane steps**, and needs a pool larger than the batch, which costs memory.
+
+Fixed in layer 1: prefill attention read the batch's window K/V scratch (guard rows and unfilled history) through the tensor multiply with a zero weight, which does not cancel a NaN. `inky lanes`, which poisons all scratch between steps, found it; the scratch is now zeroed on the GPU at the start of every prefill (`k_zero`). With that, two lanes interleaved over 2403 tokens with every scratch byte poisoned at each switch give exactly the logits each gives alone.
 
 To verify (claims from reading the code, not yet measured here):
 
@@ -162,7 +164,7 @@ Each is secured before the next starts.
 
 ## Settled, 2026-11-22
 
-- **Machine:** an M5 Max with 128 GB for now. An M5 Pro has about half the memory bandwidth and should run near half these rates. Each candidate machine is measured with `inkling bw` and `inkling bench`.
+- **Machine:** an M5 Max with 128 GB for now. An M5 Pro has about half the memory bandwidth and should run near half these rates. Each candidate machine is measured with `inky bw` and `inky bench`.
 - **Per-card speed:** no floor. The lane count is one route setting, started at the knee the sweep finds.
 - **Stay on Mac:** the engine is Metal only and needs an M5 or later.
 

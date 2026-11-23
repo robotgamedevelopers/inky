@@ -1,6 +1,6 @@
 //! A generation session: owns the context (tokens + KV/conv state on the GPU), prefill and decode loops.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, Lane, Run};
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 pub struct Session<'a> {
     pub eng: &'a Engine,
+    /// this session's stream state (cache, convolution rows, tokens)
+    pub lane: Lane,
     pub tk: &'a Tokenizer,
     /// tokens whose K/V and conv state are in the cache
     pub n_past: usize,
@@ -24,10 +26,16 @@ pub struct Stats { pub prompt_tokens: usize, pub prompt_time: Duration, pub gen_
                    pub peak_scratch: usize }
 
 impl<'a> Session<'a> {
-    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> {
-        eng.reset();
-        Session { eng, tk, n_past: 0, pending: None, stats: Stats::default() }
+    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> { Self::with_lane(eng, tk, Lane::new(eng)) }
+    /// a new session on an existing lane: its buffers are kept (no regrowth), its contents forgotten
+    pub fn with_lane(eng: &'a Engine, tk: &'a Tokenizer, lane: Lane) -> Session<'a> {
+        eng.on(&lane).reset();
+        Session { eng, tk, lane, n_past: 0, pending: None, stats: Stats::default() }
     }
+    /// give the lane back, to start another session on it
+    pub fn into_lane(self) -> Lane { self.lane }
+    /// the engine working on this session's lane
+    pub fn run(&self) -> Run<'_> { self.eng.on(&self.lane) }
 
     pub fn ctx_left(&self) -> usize { self.eng.max_ctx.saturating_sub(self.n_past + 1) }
 
@@ -39,18 +47,18 @@ impl<'a> Session<'a> {
         assert!(!all.is_empty());
         assert!(self.n_past + all.len() < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
         let t0 = Instant::now();
-        self.eng.tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
-        self.eng.set_tokens(self.n_past, &all);
+        self.run().tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
+        self.run().set_tokens(self.n_past, &all);
         let end = self.n_past + all.len();
-        self.eng.reserve(end + 1, true);
+        self.run().reserve(end + 1, true);
         self.eng.ensure_batch(all.len().min(self.eng.chunk));
-        self.stats.peak_scratch = self.stats.peak_scratch.max(self.eng.mem().1);
+        self.stats.peak_scratch = self.stats.peak_scratch.max(self.run().mem().1);
         let mut p0 = self.n_past;
         let mut last: Option<CmdBuf> = None;
         while p0 < end {
             let t = (end - p0).min(self.eng.chunk);
             let cb = self.eng.gpu.cmd();
-            self.eng.encode_prefill(&cb, p0, t, p0 + t == end, true);
+            self.run().encode_prefill(&cb, p0, t, p0 + t == end, true);
             cb.commit();
             last = Some(cb);
             p0 += t;
@@ -59,7 +67,7 @@ impl<'a> Session<'a> {
         self.n_past = end;
         self.stats.prompt_tokens += all.len();
         self.stats.prompt_time += t0.elapsed();
-        self.eng.token_at(end)
+        self.run().token_at(end)
     }
 
     /// Generate up to `max` tokens after a prefill. `on_token` returns false to stop early.
@@ -69,7 +77,7 @@ impl<'a> Session<'a> {
     /// Sampling reads the logits back each step.
     pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> usize {
         let t0 = Instant::now();
-        let eng = self.eng;
+        let eng = self.eng.on(&self.lane);
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
         let mut tok = if sampler.greedy() { first } else { sampler.sample(eng.logits()) };

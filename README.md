@@ -1,13 +1,13 @@
-# inkling
+# inky
 
-> **inky** is a fork of [erisinky](https://github.com/Eriskii/erisinky) that adds many lanes in one process, for serving many coding-agent tasks at once. Nothing of that is built yet: see [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md). Everything below is upstream's README.
+> **inky** is a fork of [erisinky](https://github.com/Eriskii/erisinky) that adds many lanes in one process, for serving many coding-agent tasks at once. Nothing of that is built yet: see [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md). Everything below is upstream's README, with the program renamed inky.
 
 A from-scratch inference engine for **Thinking Machines' Inkling 2 Mini** (`inkling2_loop`, 26.4B total / 3.4B active MoE)
 on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GGUF directly (zero-copy mmap).
 
 ## Results (Apple M5 Pro, 48 GB, `Inkling-2-Mini-Q4_K_M.gguf`, greedy)
 
-| | LM Studio runtime (llama.cpp 2.80.1) | llama.cpp master | **inkling** | speedup vs LM Studio |
+| | LM Studio runtime (llama.cpp 2.80.1) | llama.cpp master | **inky** | speedup vs LM Studio |
 |---|---:|---:|---:|---:|
 | decode, short context | 33.1 tok/s | 32.7 tok/s | **63.0 tok/s** | **1.90x** |
 | decode @ 2.4K context | 31.7 tok/s | – | **58.2 tok/s** | **1.84x** |
@@ -25,10 +25,10 @@ costs ~3% vs greedy (one CPU round trip per token).
 
 ```sh
 cargo build --release
-./target/release/inkling chat                       # interactive, multi-turn (KV cache reused across turns)
-./target/release/inkling run -p "Explain RoPE in one paragraph" --effort low
-./target/release/inkling run -f prompt.txt --greedy  # greedy = fully GPU-pipelined, fastest
-./target/release/inkling bench -f prompt.txt -n 256  # prefill + decode throughput
+./target/release/inky chat                       # interactive, multi-turn (KV cache reused across turns)
+./target/release/inky run -p "Explain RoPE in one paragraph" --effort low
+./target/release/inky run -f prompt.txt --greedy  # greedy = fully GPU-pipelined, fastest
+./target/release/inky bench -f prompt.txt -n 256  # prefill + decode throughput
 ```
 Options: `--effort none|minimal|low|medium|high|xhigh`, `--temp/--top-p/--top-k/--seed`, `--system`, `-c CTX`,
 `--hide-thinking`, `--raw`, `--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
@@ -130,12 +130,12 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
   reasoning text (simulated best case 1.02-1.12x); even perfect drafts cap at ~2.2x. A trained draft model (EAGLE-style)
   would be needed — not done here.
 - **Prefill.** The GEMMs are 8.9 TFLOP per 1024 tokens (20.8 TFLOP for the 2394-token prompt). The tensor units do
-  ~30 TFLOPs of fp16 with no weight staging at all and one op call per tile (`inkling kpeak`), 33 with the weights in
+  ~30 TFLOPs of fp16 with no weight staging at all and one op call per tile (`inky kpeak`), 33 with the weights in
   threadgroup memory: so the GEMMs alone cannot take less than ~270 ms per 1024 tokens (~3800 tok/s with everything else
   free). The engine takes ~455 ms: dense GEMM tiles at 29-30 TFLOPs (at the ceiling), the ragged MoE at 24-26 (one weight
   staging per expert tile, partially filled last tile), attention ~37 ms, and ~70 ms of memory-bound glue (depth mixes,
   gathers, expert sum, convolutions). There is no faster exact mode: `relaxed_precision` changes neither speed nor
-  results, fp16 accumulators are slower and 0.1% off (`inkling kmode`).
+  results, fp16 accumulators are slower and 0.1% off (`inky kmode`).
   Things that measured well in isolation and lost in the kernel:
   - *the tensor units reading the quantized weights directly* (fp16 x packed 4-bit / int8 straight from the GGUF: 32 TFLOPs
     at any tile size, exact). Q4_K scales change every 32 weights per row, so every k-step needs its partial products pulled
@@ -144,20 +144,20 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
   - wider tiles (256+ tokens per staging), larger k-steps, static extents, spreading the dequantization over more
     threads, pre-touching weight rows, reading MoE inputs through the routing permutation instead of a gathered copy.
 - **K/V cache.** The payload cannot shrink without changing its numbers: the cached fp16 keys and values carry 13.7 bits of
-  entropy per 16-bit value (mantissas are uniform noise, there are no zeros; xz saves 10%; `inkling kvdump` writes the payload
+  entropy per 16-bit value (mantissas are uniform noise, there are no zeros; xz saves 10%; `inky kvdump` writes the payload
   out). The floor for this model is min(context, 1024) x 160 KiB + context x 32 KiB, and the cache is now within 6% of it.
   A buffer cannot be left partly unbacked either: Metal makes a no-copy buffer over untouched anonymous memory resident
-  in full the first time the GPU uses it (`inkling lazytest`: 1 GiB resident after a one-word write), and the process
+  in full the first time the GPU uses it (`inky lazytest`: 1 GiB resident after a one-word write), and the process
   footprint does not count those pages, so footprint numbers for such a buffer would look smaller than the memory used.
   Nothing exact gets near half of that: split into bytes, the low byte of every cached value (8 mantissa bits, exactly half
   the cache) does not compress at all (xz: 100.0%), nor do the 2 mantissa bits above it, so 10 of every 16 bits are
   irreducible and any exact store is above 62.5%; sign and exponent bring the practical floor to 85%. Every key dimension is
-  read by a query head (`inkling qclip`: no zero query scales), so no dimension can be left out. Also measured and ruled out: the three loop passes' K/V differ by 50-106% (no sharing);
+  read by a query head (`inky qclip`: no zero query scales), so no dimension can be left out. Also measured and ruled out: the three loop passes' K/V differ by 50-106% (no sharing);
   K and V are full rank (a rank-64 subspace loses 5-20% of the energy); the full-attention layers really use their history
   (bounding it to the last 2048 / 1024 / 512 keys leaves 22 / 18 / 17 of 25 next-token choices intact); attention there is
-  diffuse (`inkling kvscreen`: 69% of all keys score within 12 logits of the best one, 96% within 17), so no exact scheme can
+  diffuse (`inky kvscreen`: 69% of all keys score within 12 logits of the best one, 96% within 17), so no exact scheme can
   skip keys either.
-- **Dropping keys instead of bits (measured, not in the engine yet).** `inkling kvprune -f prompt.txt` prefills a prompt,
+- **Dropping keys instead of bits (measured, not in the engine yet).** `inky kvprune -f prompt.txt` prefills a prompt,
   decodes with the whole cache, then decodes the same tokens again with only a share of the full-attention layers' far keys
   (older than one window; they carry no position information, so they are an unordered set): the ones that received the
   most attention from a sample of the prompt's own queries. At 14.5K tokens, keeping half of them takes the cache from 614 to
@@ -173,7 +173,7 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
   at every context from 512 tokens up (process footprint while generating at 15K tokens: 952 -> 622 MB). The attention
   keeps the split boundaries of the in-memory path (the file runs one split ahead of the ring so a boundary always lies
   where both have the keys), so every partial sum covers the same keys in the same order: logits are bit-identical
-  (`inkling check` prints a hash of all logit bits), and greedy, sampled and multi-turn outputs are byte-identical to the
+  (`inky check` prints a hash of all logit bits), and greedy, sampled and multi-turn outputs are byte-identical to the
   in-memory engine. The cost is the SSD: half the cache is read per token at 7-9 GiB/s.
 
   | context | in memory | `--kv-disk` memory | decode in memory | decode `--kv-disk` |
@@ -192,7 +192,7 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
   prompt (fp16: 0.0008 / 0.0069); all 66 checked next-token choices agree; a greedy generation departs from the fp16 one
   after about 20 tokens and stays coherent. This model reacts to cache precision more than the usual 8-bit-cache experience
   suggests: the same check run token by token flips one prediction inside the prompt (KL 2.9), and in simulation
-  (`INK_KVQ=kbits,vbits inkling check`, which rounds the fp16 cache in place) even 12 bits per value flip two of 61.
+  (`INK_KVQ=kbits,vbits inky check`, which rounds the fp16 cache in place) even 12 bits per value flip two of 61.
 - Multi-sequence batching would roughly double aggregate decode throughput at ~16 concurrent streams (not implemented:
   this engine targets single-stream latency).
 
@@ -210,10 +210,10 @@ src/gguf.rs           zero-copy GGUF reader
 tools/ref_logits.cpp  llama.cpp reference-logit dumper (validation oracle)
 ```
 
-`inkling prof -n POS` / `inkling prof_pf -f prompt.txt` attribute GPU time per kernel class (skip-mask method);
-`inkling kmoepf -f prompt.txt` times the MoE GEMMs alone on the prompt's real routing, `inkling ksg` the tile kernel vs
-threadgroup size and fill, `inkling kpeak` / `kmode` the tensor units' ceiling and precision modes, `inkling kvdump` dumps the K/V payload, `inkling kvscreen` measures how
-concentrated full attention is over its keys, `INK_KVQ=kbits,vbits inkling check` simulates a coarser cache; `INK_TIER_MIN=n` / `INK_TIER_HOT=n` make `--kv-disk` start at a smaller context / with tiny rings for tests. `INK_CHUNK=N` caps the prefill batch (default 4096 tokens). If the tensor ops' accumulator layout is not the one the register epilogues expect, the engine
+`inky prof -n POS` / `inky prof_pf -f prompt.txt` attribute GPU time per kernel class (skip-mask method);
+`inky kmoepf -f prompt.txt` times the MoE GEMMs alone on the prompt's real routing, `inky ksg` the tile kernel vs
+threadgroup size and fill, `inky kpeak` / `kmode` the tensor units' ceiling and precision modes, `inky kvdump` dumps the K/V payload, `inky kvscreen` measures how
+concentrated full attention is over its keys, `INK_KVQ=kbits,vbits inky check` simulates a coarser cache; `INK_TIER_MIN=n` / `INK_TIER_HOT=n` make `--kv-disk` start at a smaller context / with tiny rings for tests. `INK_CHUNK=N` caps the prefill batch (default 4096 tokens). If the tensor ops' accumulator layout is not the one the register epilogues expect, the engine
 falls back to a slower tensor path (`INK_NO_HGEMM=1` forces it); `INK_NO_TENSOR=1` uses simdgroup matrices instead of the
 neural accelerators.
 

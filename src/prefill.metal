@@ -414,6 +414,15 @@ kernel void k_state_upd(device float * A [[buffer(2)]], device float * CS [[buff
 // The persistent cache of a sliding-window layer holds exactly its window; a prefill batch attends through a scratch copy
 // [window history | batch keys] and afterwards leaves the last window of keys in the ring. grid (n, NKV), 32 threads.
 struct KvCopyArgs { uint n, pos0, ring_k, ring_v, cap, sk_off, sv_off, scap; int kpos0; uint to_ring, pad0, pad1; };
+// Zero words [r.x, r.x + r.y) of the arena: 4 per thread. The batch's sliding-window K/V scratch is cleared this way at the
+// start of every prefill, because attention reads its guard rows and unfilled history (masked with a zero weight) through
+// the tensor multiply, and a zero weight does not cancel a NaN: those rows must hold finite values whatever was there.
+kernel void k_zero(device uint * A [[buffer(2)]], constant uint2 & r [[buffer(5)]], uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    const uint i = (tg * 256 + tid) * 4;
+    for (uint j = 0; j < 4; j++) { if (i + j < r.y) A[r.x + i + j] = 0; }
+}
+
 kernel void k_kvcopy(device float * A [[buffer(2)]], device kv_t * KV [[buffer(3)]], constant KvCopyArgs & a [[buffer(5)]],
                      uint2 tgp [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
     const uint pos = a.pos0 + tgp.x, g = tgp.y;

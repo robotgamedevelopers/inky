@@ -19,7 +19,7 @@ What was measured and tried before any design, and the design itself.
 | The batched path calibrated: 58 ms + 0.21 ms per token | ✅ |
 | llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s | ✅ |
 | The lanes design written | ✅ |
-| The batched path shown batch-invariant (inkling binv); a one-token batch bug found and fixed | ✅ |
+| The batched path shown batch-invariant (inky binv); a one-token batch bug found and fixed | ✅ |
 | The design cold-read by a second reader, findings folded in | ❌ |
 | complete | 88% |
 
@@ -63,9 +63,9 @@ A refactor with no change in behaviour: everything that belongs to one stream mo
 | feature | done |
 |---|:---:|
 | Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change | ❌ |
-| A lane owns its state (cache, convolution rows, loop-controller state, position); the engine owns only the weights | ❌ |
-| Gate: one lane's logit hash is identical to the unmodified engine | ❌ |
-| complete | 0% |
+| A lane owns its state (cache, convolution rows, loop-controller state, position); the engine owns only the weights | ✅ |
+| Gate: one lane's logit hash is identical to the unmodified engine | ✅ |
+| complete | 66% |
 
 [Source data](roadmap.sexp)
 
