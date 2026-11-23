@@ -4,42 +4,81 @@
 
 ## Serving: inky as a provider
 
-`inky serve` is an OpenAI-compatible chat completions endpoint over many lanes: any OpenAI client, harness or agent fleet can use it as a provider. Each request gets a lane; the lanes share every weight read (docs/DESIGN.md). Tool calls, tool results, streaming and `reasoning_content` follow the OpenAI shapes; earlier turns are rendered exactly as sent.
+Run `inky serve` on an Apple Silicon Mac with Metal 4 and an Inkling 2 Mini GGUF. Claude Code 2.1.330 uses the Anthropic Messages API through the nova-sprint v2.0.58 worker key proxy. OpenAI clients can use Chat Completions on the same server. Both APIs share the inference lanes and prompt cache.
+
+### Build and choose a tuning
+
+Build the release binary from the inky checkout.
 
 ```sh
-# on loopback, for one machine
-inky serve --lanes 16 -c 131072
-# on the tailnet, for a fleet: a bearer key from the environment, 429 beyond 64 waiting requests
-INKY_API_KEY=... inky serve --bind 0.0.0.0:8090 --key-env INKY_API_KEY --lanes 16 -c 131072 --queue 64
+cargo build --locked --release
 ```
 
-| flag | default | |
+The default model file is `~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf`. Pass `-m /path/to/model.gguf` to use another location.
+
+Inky selects a compiled-in [tuning](../tunings/) by the Mac's chip and unified memory. The shipped M5 Max 128 GB tuning sets the inky-mode wired-memory limit to 118000 MB. Other Macs use a memory-derived default that leaves the greater of 8 GiB or 10% of RAM for macOS. Size lanes and context for the host and its other workloads. Each active lane needs its own KV cache.
+
+To enable inky mode, the Mac's owner installs the memory helper once from the checkout.
+
+```sh
+sudo ./target/release/inky tune-memory
+```
+
+The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while inky is connected. It restores the prior limit after the last inky process disconnects. Inky runs under the owner's account and logs whether it entered inky mode. Without the helper, the server uses the macOS default limit. To remove it, run `sudo ./target/release/inky tune-memory --undo`.
+
+### Start the server
+
+Make `INKY_SERVE_KEY` available to the server and worker through their nova-secrets seats. Use the same value for both processes. Start the server on the Mac that runs the worker.
+
+```sh
+nova-secrets exec --only INKY_SERVE_KEY -- \
+  ./target/release/inky serve --bind 127.0.0.1:8096 \
+  --key-env INKY_SERVE_KEY --lanes 4 -c 65536 --queue 64
+```
+
+| Flag | Default | What it controls |
 |---|---|---|
-| `--lanes N` | 16 | concurrent requests; each lane is one card's stream |
-| `-c CTX` | 65536 | context per lane |
-| `--bind ADDR` | 127.0.0.1:8090 | listen address; anything beyond loopback should use a key |
-| `--key-env NAME` | none | require `Authorization: Bearer <$NAME>` (`/health` is open) |
-| `--queue N` | 64 | requests waiting beyond the lanes; more are refused with 429 and `Retry-After` |
-| `--effort E` | medium | thinking effort when a request does not set `reasoning_effort` |
-| `-n MAX` | 16384 | most tokens per reply when a request does not set `max_tokens` |
+| `-m PATH` | LM Studio path above | Model GGUF |
+| `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
+| `--key-env NAME` | unset | Reads the key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
+| `--lanes N` | 16 | Concurrent requests |
+| `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens |
+| `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
+| `--effort E` | `medium` | Default model thinking effort |
+| `-n MAX` | 16384 | Default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
-Endpoints: `POST /v1/chat/completions`, `POST /v1/messages` and `POST /v1/messages/count_tokens` (the Anthropic Messages API: text, `tool_use` and `tool_result` blocks, streamed as `message_start` to `message_stop`; the key is accepted as `x-api-key` or as a Bearer token, and usage splits the prompt into `input_tokens` and `cache_read_input_tokens`), `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. The Anthropic and chat paths render through the one chat template, so a conversation can cross between them and still reuse its prompt.
+`GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `http://127.0.0.1:8096/v1` as their base URL, with model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 
-**As a nova-worker provider.** The worker's key proxy takes the endpoint and the key's name, and the harness reaches inky through it:
+### Route Claude Code through nova-sprint
+
+On the sprint's configuration host, register the provider with concurrency matching the server's lane count. Use the URL the worker can reach. Here the worker runs on the server Mac.
 
 ```sh
-nova-sprint worker ... --providers inky=http://<mac>.<tailnet>.ts.net:8090/v1@INKY_API_KEY
+nova-config provider add inky --url http://127.0.0.1:8096 \
+  --api anthropic --key INKY_SERVE_KEY --concurrency 4
+nova-config model add inky/inkling-2-mini --harness claude
 ```
 
-with `INKY_API_KEY` in the worker's environment (nova-secrets) and the model `inky/inkling-2-mini`. In nova-config: `nova-config provider add inky --url http://<mac>.<tailnet>.ts.net:8090/v1 --api openai --key INKY_API_KEY --concurrency <lanes>`.
+Put Claude Code on the worker's PATH. Set `NOVA_PG_DSN` and `NOVA_BUS_REDIS` for the sprint. In the active sprint policy, list `inky/inkling-2-mini` as a bench model for the tiers this worker should serve. The worker probes its configured models before it hooks in.
 
-**Without a fleet.** Any OpenAI-compatible harness works. For opencode:
+Start the v2.0.58 worker for its assigned row, replacing `<row>` with that row's name. Include `NOVA_BUS_PASSWORD` in `--only` and set `NOVA_BUS_USER` if the sprint bus requires authentication.
 
-```json
-{"provider": {"inky": {"npm": "@ai-sdk/openai-compatible", "name": "inky",
-  "options": {"baseURL": "http://127.0.0.1:8090/v1", "apiKey": "local"},
-  "models": {"inkling-2-mini": {"name": "inkling-2-mini", "limit": {"context": 131072, "output": 16384}}}}}}
+```sh
+nova-secrets exec --only INKY_SERVE_KEY,NOVA_SPRINT_PG_PASSWORD,GH_GATE_TOKEN -- \
+  nova-sprint worker --as '<row>' --harness claude \
+  --providers inky=http://127.0.0.1:8096@INKY_SERVE_KEY
 ```
+
+Deal the row work using model `inky/inkling-2-mini`. The worker gives Claude Code the local proxy URL, the bare model ID `inkling-2-mini`, and a per-job placeholder token. The proxy forwards the request to inky with `INKY_SERVE_KEY` as a Bearer token. Use the server origin in the provider URL. Claude Code supplies the `/v1/messages` path. Keep the secret name in the configuration and command arguments. Nova-secrets supplies the value to the server and worker.
+
+### Troubleshoot
+
+- **Connection refused.** Run `curl --fail http://127.0.0.1:8096/health` on the worker Mac. Inky loads the model before listening. Check its startup log for the model path and bind address.
+- **HTTP 404 on Messages.** Check the inky revision for Messages support and verify the worker route points to the Anthropic provider's server origin.
+- **HTTP 401 from inky or HTTP 503 with “missing API key” from the proxy.** Check that both processes started through `nova-secrets exec` with the same `INKY_SERVE_KEY`. Verify the secret name in `--key-env` and `--providers`.
+- **HTTP 400 for context.** The rendered prompt, requested output budget, and two reserved tokens must fit the lane's context. Shorten the prompt or output budget, or raise `-c` if the Mac has room.
+- **Worker probe times out.** The v2.0.58 worker holds the row if its Claude Code startup probe exceeds the launch timeout. Inspect the worker's probe log. On a shared M5 Pro, the probe reached Inky and generated a tool call before hitting the 20-second limit. A healthy server can still have a held worker.
+- **HTTP 429 or memory pressure.** For sustained 429s, lower the worker load or add lanes if memory permits. For memory pressure, reduce lanes or context and check the inky-mode line in the startup log.
 
 A from-scratch inference engine for **Thinking Machines' Inkling 2 Mini** (`inkling2_loop`, 26.4B total / 3.4B active MoE)
 on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GGUF directly (zero-copy mmap).
