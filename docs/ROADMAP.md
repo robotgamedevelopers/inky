@@ -242,3 +242,18 @@ Improvements that wait for the layers above. Those that change the model's numbe
 [Source data](roadmap.sexp)
 
 <!-- nova-work:later:end -->
+
+## Provider
+
+The target tier is flash+: at least halfway between flash and pro. The gate is the tier test, a mixed batch of real flash and flash+ cards through inky on the MacBook.
+
+<!-- nova-work:provider:start -->
+
+| feature | done |
+|---|:---:|
+| inky as a flash+ provider | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:provider:end -->

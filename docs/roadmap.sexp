@@ -1,9 +1,9 @@
 ; docs/roadmap.sexp: the data the tables in ROADMAP.md are generated from (nova-roadmap render).
 (:schema 1
  :root "goal"
- :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
  :nodes
- ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
      ("eval-cards" "Four real cards at once through inky serve, each landing the merged fix")
@@ -324,4 +324,13 @@
   (:id "t-later-quant" :type :task :title "Smaller weight quantizations, behind the quality replay" :state :todo)
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
-  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to erisinky" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")))
+  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to erisinky" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")
+  (:id "provider" :type :roadmap :title "Provider"
+   :rows (
+     ("provider-flash-plus" "inky as a flash+ provider")
+   )
+   :columns (("done" "done"))
+   :cells (
+     ("provider-flash-plus" "done" "t-provider-flash-plus")
+   ))
+  (:id "t-provider-flash-plus" :type :task :title "inky as a flash+ provider" :state :todo :note "Gate: a mixed batch of real flash and flash+ cards through inky on the MacBook, land rate, context length per card, and tool round trips, compared with the flash and pro providers. Glenn named the tier flash+ on 2026-11-23: at least halfway between flash and pro.")))
