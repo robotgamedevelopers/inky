@@ -601,6 +601,10 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     }
 }
 
+/// The route a request path names: the query string and trailing slashes are not part of it
+/// (Claude Code posts to `/v1/messages?beta=true`).
+fn route_path(p: &str) -> String { p.split('?').next().unwrap_or("").trim_end_matches('/').to_string() }
+
 fn anthropic_error(s: &mut TcpStream, code: u16, kind: &str, msg: &str) -> std::io::Result<()> {
     respond(s, code, &json!({"type": "error", "error": {"type": kind, "message": msg}}).to_string())
 }
@@ -744,7 +748,7 @@ pub fn serve(o: ServeOpts) {
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(60)));
                 let mut r = BufReader::new(&s);
                 let Ok(h) = read_head(&mut r) else { return };
-                let path = h.path.trim_end_matches('/').to_string();
+                let path = route_path(&h.path);
                 let method = h.method.clone();
                 // the key is checked before any body is read
                 if let Some(k) = &cx.key {
@@ -814,6 +818,13 @@ mod tests {
         v.extend(tk.encode("{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}", false));
         v.extend([sp.end, sp.end_sampling]);
         v
+    }
+
+    #[test] fn routes_ignore_query_strings_and_trailing_slashes() {
+        assert_eq!(route_path("/v1/messages?beta=true"), "/v1/messages");
+        assert_eq!(route_path("/v1/messages/count_tokens?beta=true"), "/v1/messages/count_tokens");
+        assert_eq!(route_path("/v1/chat/completions/"), "/v1/chat/completions");
+        assert_eq!(route_path("/health"), "/health");
     }
 
     #[test] fn anthropic_requests_translate_to_the_chat_shape() {
