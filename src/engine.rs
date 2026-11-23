@@ -85,7 +85,7 @@ pub const KERNELS: &[&str] = &[
     "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -184,6 +184,8 @@ struct MoeCombArgs { yd_off: u32, inv_off: u32, sel_off: u32, out_off: u32 }
 struct ConvBArgs { y_off: u32, ldy: u32, res_off: u32, out_off: u32, cs_off: u32, convw_off: u32, has_res: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct StateArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, pad: [u32; 3] }
+#[repr(C)] #[derive(Clone, Copy)]
+struct StateKeepArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, snap_off: u32, stride: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct KvPrepArgs {
     t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, cs_off: u32, q_off: u32,
@@ -389,6 +391,11 @@ pub struct Engine {
     pub max_ctx: usize,
     pub n_vocab: usize,
     eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
+    /// Convolution images for the verify span in flight, one per position, plus the K/V bytes that span overwrote.
+    /// Not `cs_at_prompt`: a rejected tail must not become the next turn's resume point.
+    verify_keep: RefCell<Option<VerifyKeep>>,
+    /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
+    verify_record: Cell<bool>,
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
@@ -414,6 +421,24 @@ impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Eng
 /// One lane's part of a step: positions [p0, p0 + t) of that lane.
 #[derive(Clone, Copy)]
 pub struct Span<'a> { pub lane: &'a Lane, pub p0: usize, pub t: usize }
+
+/// K/V rows one verify position overwrote, copied before the span ran.
+#[derive(Clone)]
+struct KvUndo { pos: usize, rows: Vec<u8> }
+struct VerifySpan {
+    lane: *const Lane,
+    p0: usize,
+    kv: Vec<KvUndo>,
+    /// `p0 + n_keep` after rollback. Absent until then. Not a seal of the span's end, and not `cs_at_prompt`.
+    accepted_end: Option<usize>,
+}
+struct VerifyKeep {
+    /// `spans * (1+k)` convolution images, span-major, each `cs`'s layout. Transient.
+    cs: Buf,
+    stride: usize,
+    t: usize,
+    spans: Vec<VerifySpan>,
+}
 
 static LANE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -455,6 +480,8 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
+    pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
     /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
     pub fn lane_hash(&self, lane: &Lane) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
@@ -642,6 +669,7 @@ impl Engine {
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
+            verify_keep: RefCell::new(None), verify_record: Cell::new(false),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -1487,7 +1515,119 @@ impl Engine {
     /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
     pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
         assert!(!spans.is_empty() && spans.iter().all(|s| s.t == 1 + k), "a verify span has length 1 + k");
+        // A --kv-disk lane stages cache from the single-token step path. This span does not, and it must not run there.
+        assert!(spans.iter().all(|s| s.lane.tier.is_none()), "verify does not run on a --kv-disk lane");
+        let t = 1 + k;
+        let stride = N_SLOT * NCH * 3;
+        let cs = self.gpu.buffer(spans.len() * t * stride * 4);
+        unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
+        let kept = spans.iter().map(|sp| VerifySpan {
+            lane: sp.lane as *const Lane,
+            p0: sp.p0,
+            kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
+            accepted_end: None,
+        }).collect();
+        *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
         self.encode_spans_x(cb, spans, true, false, false, Some(k));
+    }
+    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
+    /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
+    /// the span, so a rejected draft and anything after it do not stay. The recorded length is `p0 + n_keep`, never
+    /// a seal of the span's end. The images live on `verify_keep`, not in serve's `cs_at_prompt`. Nothing may be in
+    /// flight on the GPU. The correction token is not written here: its K and V land when that token is encoded.
+    pub fn rollback_verify(&self, lane: &Lane, si: usize, n_keep: usize) {
+        assert!(lane.tier.is_none(), "verify does not run on a --kv-disk lane");
+        let tail = {
+            let mut slot = self.verify_keep.borrow_mut();
+            let g = slot.as_mut().expect("rollback_verify without encode_verify");
+            assert!(si < g.spans.len(), "verify span {si} is out of range");
+            let t = g.t;
+            let stride = g.stride;
+            let cs = g.cs.clone();
+            assert!(n_keep >= 1 && n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
+            let rec = &mut g.spans[si];
+            assert!(std::ptr::eq(rec.lane, lane), "rollback lane is not the lane encode_verify ran");
+            let end = rec.p0 + n_keep;
+            // Layer 2 has no block table. The only length this step records is the accepted prefix.
+            rec.accepted_end = Some(end);
+            assert!(end <= rec.p0 + t);
+            if n_keep < t { assert!(end < rec.p0 + t, "a rejected tail is not sealed"); }
+            let bytes = stride * 4;
+            assert_eq!(bytes, lane.cs.length());
+            unsafe {
+                let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
+                std::ptr::copy_nonoverlapping(src, lane.cs.contents().as_ptr() as *mut u8, bytes);
+            }
+            rec.kv.iter().skip(n_keep).cloned().collect::<Vec<_>>()
+        };
+        for undo in &tail { self.restore_kv_pos(lane, undo); }
+    }
+    /// Bytes of every slot's K and V row at positions [p0, p0+t), before the span writes them.
+    fn snapshot_kv_positions(&self, lane: &Lane, p0: usize, t: usize) -> Vec<KvUndo> {
+        let eb = self.kvb;
+        let row = HD * eb;
+        let mut out = Vec::with_capacity(t);
+        for d in 0..t {
+            let pos = p0 + d;
+            let mut rows = Vec::new();
+            for slot in 0..N_SLOT {
+                let (swa, i) = self.slot_kind[slot];
+                let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
+                assert!(swa || pos < cap, "full-attention row {pos} is past the cache");
+                let idx = if swa { pos % cap } else { pos };
+                let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
+                let base = buf.contents().as_ptr() as *const u8;
+                let k0 = i * 2 * NKV * cap * HD * eb;
+                for which in 0..2 {
+                    let b0 = k0 + which * NKV * cap * HD * eb;
+                    for g in 0..NKV {
+                        let off = b0 + (g * cap + idx) * row;
+                        rows.extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), row) });
+                    }
+                }
+            }
+            out.push(KvUndo { pos, rows });
+        }
+        out
+    }
+    fn restore_kv_pos(&self, lane: &Lane, undo: &KvUndo) {
+        let eb = self.kvb;
+        let row = HD * eb;
+        let pos = undo.pos;
+        let mut at = 0usize;
+        for slot in 0..N_SLOT {
+            let (swa, i) = self.slot_kind[slot];
+            let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
+            let idx = if swa { pos % cap } else { pos };
+            let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
+            let base = buf.contents().as_ptr() as *mut u8;
+            let k0 = i * 2 * NKV * cap * HD * eb;
+            for which in 0..2 {
+                let b0 = k0 + which * NKV * cap * HD * eb;
+                for g in 0..NKV {
+                    let off = b0 + (g * cap + idx) * row;
+                    unsafe { std::ptr::copy_nonoverlapping(undo.rows.as_ptr().add(at), base.add(off), row); }
+                    at += row;
+                }
+            }
+        }
+        assert_eq!(at, undo.rows.len());
+    }
+    /// Write this conv site's state after every prefix of the span. Runs only while a verify span is recording,
+    /// and only before `k_state_upd` overwrites `cs` with the state at the end.
+    fn keep_state(&self, e: &Enc, si: usize, su: &StateArgs, cls: u32, grid: (usize, usize, usize)) {
+        if !self.verify_record.get() { return; }
+        let (sk, buf) = {
+            let slot = self.verify_keep.borrow();
+            let g = slot.as_ref().expect("verify recording without convolution images");
+            let sk = StateKeepArgs {
+                x_off: su.x_off, ldx: su.ldx, cs_off: su.cs_off, nch: su.nch, t: su.t,
+                snap_off: (si * g.t * g.stride) as u32, stride: g.stride as u32, pad: 0,
+            };
+            (sk, g.cs.clone())
+        };
+        e.buf(&buf, 0, 9);
+        self.go(e, cls, "k_state_keep", &sk, grid, 256);
     }
     /// Encode one decode step: one token for each lane in `spans` (every span has t = 1). Row-wise work runs through the
     /// batched tensor path as in `encode_spans`; each lane's attention is the decode path's fused kernel (K/V conv, cache
@@ -1544,6 +1684,7 @@ impl Engine {
         let mut va = VecAlloc { next: 1, n: B_NVEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
+        if verify_k.is_some() { self.verify_record.set(true); }
         for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
@@ -1556,6 +1697,7 @@ impl Engine {
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
         for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
         // use of b.lg, for that span only: 1+k rows, one per position, argmax off.
@@ -1774,8 +1916,10 @@ impl Engine {
         }
         if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
         let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
         self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
         let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
         self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
         // ---- attention (causal, query-tiled)
         let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv,
@@ -1813,6 +1957,7 @@ impl Engine {
         for (si, sp) in spans.iter().enumerate() {
             e.buf(&sp.lane.cs, 0, 4);
             let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
             self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
         }
         e.barrier();
@@ -1910,6 +2055,7 @@ impl Engine {
         for (si, sp) in spans.iter().enumerate() {
             e.buf(&sp.lane.cs, 0, 4);
             let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
             self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
         }
         e.barrier();
@@ -2756,5 +2902,15 @@ mod tests {
         assert_eq!(bytes, 1_791_665_152);
         assert!(4 <= b.lg_rows as usize, "k=3 is 4 rows and must fit the existing lg");
         assert!(b.lg_rows as usize * 32 == 4096);
+    }
+
+    /// One image is N_SLOT × NCH × 3 floats. At k=3 the span holds 4 of them (the page's 14.64 MiB); at k=7, 8 (29.28 MiB).
+    #[test]
+    fn verify_cs_image_is_one_convolution_state() {
+        let one = N_SLOT * NCH * 3 * 4;
+        assert_eq!(one, 3_833_856);
+        assert_eq!(one * 4, 15_335_424);
+        assert_eq!(one * 8, 30_670_848);
+        assert_eq!(Engine::cs_image_bytes(), one);
     }
 }
