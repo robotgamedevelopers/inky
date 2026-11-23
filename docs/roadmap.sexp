@@ -1,9 +1,9 @@
 ; docs/roadmap.sexp: the data the tables in ROADMAP.md are generated from (nova-roadmap render).
 (:schema 1
  :root "goal"
- :page (:roadmaps ("evaluation" "layer-1" "layer-2" "layer-3" "layer-4" "layer-5" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-5" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
  :nodes
- ((:id "goal" :type :work-set :children ("evaluation" "layer-1" "layer-2" "layer-3" "layer-4" "layer-5" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-5" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
      ("eval-bench" "Single-stream speed and memory bandwidth measured on an M5 Max")
@@ -36,7 +36,52 @@
   (:id "t-eval-llama" :type :task :title "llama.cpp's parallel slots measured as a baseline: flat near 200 tok/s" :state :done :evidence ("docs/DESIGN.md: Baseline: llama.cpp's own batching"))
   (:id "t-eval-design" :type :task :title "The lanes design written" :state :done :evidence ("docs/DESIGN.md"))
   (:id "t-eval-invariance" :type :task :title "The batched path shown batch-invariant (inkling binv); a one-token batch bug found and fixed" :state :done :evidence ("src/main.rs: binv" "src/engine.rs: mix_t" "docs/DESIGN.md: Batch invariance"))
-  (:id "t-eval-coldread" :type :task :title "The design cold-read by a second reader, findings folded in" :state :todo)
+  (:id "t-eval-coldread" :type :task :title "The design cold-read by a second reader, findings folded in" :state :doing :note "read received 2026-11-22; findings listed in docs/DESIGN.md, folding is the Design revision table")
+  (:id "revision" :type :roadmap :title "Design revision"
+   :rows (
+     ("rev-table" "The lane table corrected: the cache is read at about 210 GB/s and a lane reads all of it")
+     ("rev-verify" "The four invariance and attention claims from the cold read measured")
+     ("rev-startable" "Blocks: a prefix keeps the window blocks and recurrent state that make it a start point")
+     ("rev-state" "Blocks: recurrent state kept at lane heads, turn ends and a sparse stride, not at every boundary")
+     ("rev-offsets" "Blocks: 64-bit or per-block cache addressing")
+     ("rev-admission" "Admission: the worst-case memory bound sets the lane limit")
+     ("rev-cancel" "Scheduler: cancel during a step waits for the step")
+     ("rev-parking" "Parking: lazy under memory pressure, atomic reservation to restore, a bound for parked and queued lanes")
+     ("rev-model" "Models: one coupled cache and scheduler model for the cross-cutting properties")
+     ("rev-thinking" "Server: earlier turns' thinking tokens round-trip without a content-keyed map")
+     ("rev-layers" "Layers 4 and 5 merged; a performance and memory gate at 20K and 42K context after layer 2")
+     ("rev-gates" "Every layer's gate strengthened as the cold read lists")
+     ("rev-attention" "An attention kernel for many lanes named as the first kernel to write")
+   )
+   :columns (("done" "done"))
+   :cells (
+     ("rev-table" "done" "t-rev-table")
+     ("rev-verify" "done" "t-rev-verify")
+     ("rev-startable" "done" "t-rev-startable")
+     ("rev-state" "done" "t-rev-state")
+     ("rev-offsets" "done" "t-rev-offsets")
+     ("rev-admission" "done" "t-rev-admission")
+     ("rev-cancel" "done" "t-rev-cancel")
+     ("rev-parking" "done" "t-rev-parking")
+     ("rev-model" "done" "t-rev-model")
+     ("rev-thinking" "done" "t-rev-thinking")
+     ("rev-layers" "done" "t-rev-layers")
+     ("rev-gates" "done" "t-rev-gates")
+     ("rev-attention" "done" "t-rev-attention")
+   ))
+  (:id "t-rev-table" :type :task :title "The lane table corrected: the cache is read at about 210 GB/s and a lane reads all of it" :state :done :evidence ("docs/DESIGN.md: What is measured"))
+  (:id "t-rev-verify" :type :task :title "The four invariance and attention claims from the cold read measured" :state :todo)
+  (:id "t-rev-startable" :type :task :title "Blocks: a prefix keeps the window blocks and recurrent state that make it a start point" :state :todo)
+  (:id "t-rev-state" :type :task :title "Blocks: recurrent state kept at lane heads, turn ends and a sparse stride, not at every boundary" :state :todo)
+  (:id "t-rev-offsets" :type :task :title "Blocks: 64-bit or per-block cache addressing" :state :todo)
+  (:id "t-rev-admission" :type :task :title "Admission: the worst-case memory bound sets the lane limit" :state :todo)
+  (:id "t-rev-cancel" :type :task :title "Scheduler: cancel during a step waits for the step" :state :todo)
+  (:id "t-rev-parking" :type :task :title "Parking: lazy under memory pressure, atomic reservation to restore, a bound for parked and queued lanes" :state :todo)
+  (:id "t-rev-model" :type :task :title "Models: one coupled cache and scheduler model for the cross-cutting properties" :state :todo)
+  (:id "t-rev-thinking" :type :task :title "Server: earlier turns' thinking tokens round-trip without a content-keyed map" :state :todo)
+  (:id "t-rev-layers" :type :task :title "Layers 4 and 5 merged; a performance and memory gate at 20K and 42K context after layer 2" :state :todo)
+  (:id "t-rev-gates" :type :task :title "Every layer's gate strengthened as the cold read lists" :state :todo)
+  (:id "t-rev-attention" :type :task :title "An attention kernel for many lanes named as the first kernel to write" :state :todo)
   (:id "layer-1" :type :roadmap :title "Layer 1: lane state out of the engine"
    :rows (
      ("l1-ci" "Tests and CI on a Mac runner: the llama.cpp reference-logits check runs on every change")
@@ -228,7 +273,7 @@
   (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :todo)
   (:id "later" :type :roadmap :title "After the first build"
    :rows (
-     ("later-fixed-cost" "A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes" :later t)
+     ("later-fixed-cost" "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :later t)
      ("later-prefix-reads" "A shared prefix is read once per step for all lanes' queries" :later t)
      ("later-quality" "A quality replay: landed cards run again and compared with a reference route" :later t)
      ("later-effort" "The lowest thinking effort that still lands cards, per kind of card" :later t)
@@ -252,7 +297,7 @@
      ("later-gpu-sampling" "done" "t-later-gpu-sampling")
      ("later-upstream" "done" "t-later-upstream")
    ))
-  (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: about 2x at 16 to 64 lanes" :state :todo)
+  (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :state :todo)
   (:id "t-later-prefix-reads" :type :task :title "A shared prefix is read once per step for all lanes' queries" :state :todo)
   (:id "t-later-quality" :type :task :title "A quality replay: landed cards run again and compared with a reference route" :state :todo)
   (:id "t-later-effort" :type :task :title "The lowest thinking effort that still lands cards, per kind of card" :state :todo)
@@ -261,4 +306,4 @@
   (:id "t-later-quant" :type :task :title "Smaller weight quantizations, behind the quality replay" :state :todo)
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
-  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to erisinky" :state :todo)))
+  (:id "t-later-upstream" :type :task :title "General fixes sent upstream to erisinky" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")))
