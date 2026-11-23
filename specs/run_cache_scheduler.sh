@@ -101,6 +101,8 @@ echo "run | generated | distinct | wall seconds | result"
 check_run CacheScheduler CacheScheduler pass
 check_run CacheSchedulerQueue CacheScheduler pass
 check_run CacheSchedulerTwoPrefixes CacheScheduler pass
+check_run CacheSchedulerMaxPos8 CacheScheduler pass
 check_run CancelInStep CacheScheduler invariant StepBlocksInMemoryAndOwned
 check_run RestoreSplitBudget CacheScheduler temporal 'a :> "Restoring" @@ b :> "Restoring"'
 check_run BoundaryWindowDropped CacheScheduler invariant LaneHistoryCovered
+check_run UnprunedWindow CacheScheduler invariant BudgetsAndReservations

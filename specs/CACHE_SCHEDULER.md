@@ -46,21 +46,28 @@ property.
   deepest kept start point and reserves the lane's working set atomically in
   `MemBudget` before restoring disk-only blocks.
 - **One step in flight (`stepActive`, `stepLanes`, `stepSpan`, `stepPins`,
-  `stepIO`, `gpuDone`)**: `BuildStep` allocates any missing tail blocks in
-  `"memory"` and pins every `Full(pos + c)` and `SpanWindow(pos, c)` block (plus
-  any pending background writeback `stepIO`). Cancelling a lane in `InStep`
-  transitions it to `Cancelling` and holds its references until both
-  `gpuDone = TRUE` and `stepIO = {}` at `FinishStep`.
-- **Bypass bound (`MaxBypass`, the scheduler's `W`)**: `waitTicks` covers
-  `Queued`, `Restoring`, and `Ready` lanes so no waiting lane is passed over
-  more than `MaxBypass` times in a row, even under repeated bimodal or
-  zero-step cache-hit arrivals.
+  `stepIO`, `gpuDone`)**: `BuildStep` enforces the aggregate step-token budget
+  (`StepTokenBudget`) with longest-waiting Ready lane first, then Ready decoding
+  lanes (`1`-token spans), then prefill spans (up to `MaxSpan`) to fill the
+  remaining token budget without stalling Ready decoders that fit in memory. It
+  allocates any missing tail blocks in `"memory"` and pins every `Full(pos + c)`
+  and `SpanWindow(pos, c)` block (plus any pending background writeback `stepIO`).
+  Cancelling a lane in `InStep` transitions it to `Cancelling` and holds its
+  references until both `gpuDone = TRUE` and `stepIO = {}` at `FinishStep`, which
+  also prunes each surviving lane's `laneWin` table to `History(npos)` at fence
+  completion so expired window blocks never accumulate past the lane's reservation.
+- **Stage-consistent age & bypass bound (`MaxBypass`, the scheduler's `W`)**:
+  `waitTicks` tracks consecutive bypasses within each waiting stage (`Queued` in
+  `Admit`/`Refuse429`, `ActiveRestoring` in `RestoreBlock`, and `SteppableReady`
+  in `BuildStep`), serving longest-waiting peers first, shedding youngest arrivals
+  first on 429 queue overflow, and locking out younger arrivals once any waiting
+  peer hits `MaxBypass`.
 
 ## Checked properties and bounded scope
 
 Safety invariants checked on healthy runs:
 
-- `TypeOK`: structural types and bounded ranges of all 18 state variables.
+- `TypeOK`: structural types and bounded ranges of all 17 state variables.
 - `StepBlocksInMemoryAndOwned`: while `stepActive` holds, every block in
   `stepPins \cup stepIO` is in `"memory"` (or `"both"`) and owned by a lane in
   `InStep` or `Cancelling`, and every span's `Full` and `SpanWindow` blocks are
@@ -82,8 +89,9 @@ Safety invariants checked on healthy runs:
   `DiskUsed <= DiskBudget`, `ReservedTotal <= MemBudget`, each active lane's
   reservation covers its working set, and every memory block unreferenced by any
   lane (and outside `stepIO`) is clean and spillable/reclaimable.
-- `BypassBoundHolds`: `waitTicks[l] <= MaxBypass` across `Queued`, `Restoring`,
-  and `Ready`.
+- `BypassBoundHolds` and `StepBudgetHolds`: `waitTicks[l] <= MaxBypass` across
+  `Queued`, `Restoring`, and `Ready`, aggregate step tokens stay within
+  `StepTokenBudget`, and decoding lanes take `1`-token spans.
 
 Liveness checked under weak fairness (`WF_vars`) of scheduler, tier-reclamation,
 and step-completion actions (with client `Arrive`, `Cancel`, `SlideWindow`, and
@@ -98,26 +106,28 @@ and step-completion actions (with client `Arrive`, `Cancel`, `SlideWindow`, and
   finishes or is cancelled.
 
 Bounded scope: these runs check small instances (`BlockSize = 2`,
-`WindowSize = 2`, `MaxPos \in {2, 4}`, `2` or `3` reusable lane slots, `1` or
-`2` prefixes, `MemBudget \in {2, 4}`, `DiskBudget \in {3, 4}`). Slot reuse
-generations and 64-bit byte offsets belong to `BlockLayout.tla`; engine trace
-conformance belongs to the Layer 3/4 CI gates.
+`WindowSize = 2`, `MaxPos \in {2, 4, 8}`, `StepTokenBudget = 2`, `2` or `3`
+reusable lane slots, `1` or `2` prefixes, `MemBudget \in {2, 4, 7}`,
+`DiskBudget \in {3, 4}`). Slot reuse generations and 64-bit byte offsets belong
+to `BlockLayout.tla`; engine trace conformance belongs to the Layer 3/4 CI gates.
 
 ## Bench receipts (`space`)
 
 Validated on Linux bench `space` (32-core x86\_64, 125 GiB RAM), 2026-11-23,
 with TLC 2.19 (revision `5a47802`, `/opt/tla/tla2tools.jar`), Eclipse Temurin
 OpenJDK 21.0.12.1, `-workers 8`, `-Xmx8g`, `-XX:+UseParallelGC`. Wall times
-include JVM startup (`30.032 s` total across all 6 runs via `specs/run_cache_scheduler.sh`):
+include JVM startup (`44.019 s` total across all 8 runs via `specs/run_cache_scheduler.sh`):
 
-| Run | Bounds (`Lanes`, `Prefixes`, `MaxPos`, `Mem`/`Disk`, `MaxQueue`, `W`) | Generated | Distinct | Wall seconds | Result |
+| Run | Bounds (`Lanes`, `Prefixes`, `MaxPos`, `StepTokenBudget`, `Mem`/`Disk`, `MaxQueue`, `W`) | Generated | Distinct | Wall seconds | Result |
 | --- | --- | ---: | ---: | ---: | --- |
-| `CacheScheduler` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `4`/`3`, `1`, `1` | 8,919 | 2,571 | 2.531 | PASS (exhaustive safety + liveness) |
-| `CacheSchedulerQueue` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `4`/`3`, `1`, `1` | 187,990 | 35,328 | 14.998 | PASS (exhaustive safety + liveness, 429 refusal + bimodal `W`) |
-| `CacheSchedulerTwoPrefixes` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`/`4`, `1`, `1` | 95,289 | 17,504 | 5.988 | PASS (exhaustive safety + liveness, cross-prefix disk spill/restore) |
-| `CancelInStep` | `{a,b}`, `{p1,p2}`, `4` (`{2,4}`), `4`/`4`, `0`, `1`, `Bug="cancel_in_step"` | 584 | 251 | 1.054 | `StepBlocksInMemoryAndOwned` violated |
-| `RestoreSplitBudget` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`/`4`, `1`, `1`, `Bug="restore_split"` | 41,623 | 11,328 | 4.137 | `LiveRequestResolves` violated (temporal stuttering) |
-| `BoundaryWindowDropped` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `4`/`4`, `1`, `1`, `Bug="boundary_window_dropped"` | 2,758 | 1,000 | 1.324 | `LaneHistoryCovered` violated |
+| `CacheScheduler` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 6,525 | 1,881 | 2.924 | PASS (exhaustive safety + liveness, decode priority) |
+| `CacheSchedulerQueue` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1` | 126,532 | 23,964 | 18.766 | PASS (exhaustive safety + liveness, 429 refusal + bimodal `W`) |
+| `CacheSchedulerTwoPrefixes` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1` | 92,245 | 16,880 | 8.719 | PASS (exhaustive safety + liveness, cross-prefix disk spill/restore) |
+| `CacheSchedulerMaxPos8` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1` | 24,737 | 6,971 | 5.446 | PASS (exhaustive safety + liveness, multi-chunk prefill + fence window pruning) |
+| `CancelInStep` | `{a,b}`, `{p1,p2}`, `4` (`{2,4}`), `2`, `4`/`4`, `0`, `1`, `Bug="cancel_in_step"` | 787 | 295 | 1.056 | `StepBlocksInMemoryAndOwned` violated |
+| `RestoreSplitBudget` | `{a,b}`, `{p1,p2}`, `2` (`{2}`), `2`, `2`/`4`, `1`, `1`, `Bug="restore_split"` | 46,805 | 12,234 | 4.102 | `LiveRequestResolves` violated (temporal stuttering) |
+| `BoundaryWindowDropped` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`4`, `1`, `1`, `Bug="boundary_window_dropped"` | 2,296 | 799 | 1.391 | `LaneHistoryCovered` violated |
+| `UnprunedWindow` | `{a,b}`, `{p1}`, `8` (`{8}`), `2`, `7`/`4`, `0`, `1`, `Bug="unpruned_window"` | 1,944 | 731 | 1.615 | `BudgetsAndReservations` violated |
 
 ## Inspected reversed-witness counterexamples
 
@@ -126,17 +136,22 @@ include JVM startup (`30.032 s` total across all 6 runs via `specs/run_cache_sch
   with `stepPins = {<<"priv", a, "full">>, <<"priv", a, "window">>}`. In state 7
   (`Cancel`), bypassing `Cancelling` sends `a` straight to `Cancelled` and
   clears its block table while the GPU step is still in flight.
-- **`RestoreSplitBudget` (`LiveRequestResolves`, state 34 stuttering)**: cold
+- **`RestoreSplitBudget` (`LiveRequestResolves`, stuttering)**: cold
   start points `<<p1, 2>>` and `<<p2, 2>>` each hold 2 blocks on disk under
   `MemBudget = 2`. Without atomic working-set reservation in `BeginRestore`,
-  lanes `a` (`p1`) and `b` (`p2`) both enter `Restoring` (states 31–32), restore
-  one block each into `"memory"` (`MemUsed = 2 = MemBudget`, state 33), and
+  lanes `a` (`p1`) and `b` (`p2`) both enter `Restoring`, restore
+  one block each into `"memory"` (`MemUsed = 2 = MemBudget`), and
   stutter forever in `laneState = (a :> "Restoring" @@ b :> "Restoring")` because
   all memory blocks are actively referenced and neither lane can load its second
   block.
 - **`BoundaryWindowDropped` (`LaneHistoryCovered`, state 13)**: lane `a` steps
-  to boundary `pos = 2` and seals `<<p1, 2>>` (state 10), then finishes
-  (state 11). Without start-point retention on `History(2)`, `DropUnreferenced`
-  evicts `<<"tree", p1, "window", 0>>` while `<<"tree", p1, "full", 0>>` stays
-  kept (state 12). In state 13 (`BeginRestore(b)`), lane `b` matches boundary
-  `pos = 2` with its required window block missing (`tier = "none"`).
+  to boundary `pos = 2` and seals `<<p1, 2>>`, then finishes. Without start-point
+  retention on `History(2)`, `DropUnreferenced` evicts `<<"tree", p1, "window", 0>>`
+  while `<<"tree", p1, "full", 0>>` stays kept. On `BeginRestore(b)`, lane `b`
+  matches boundary `pos = 2` with its required window block missing (`tier = "none"`).
+- **`UnprunedWindow` (`BudgetsAndReservations`, state 16)**: with `W = B = 2`,
+  `RequestLengths = {8}`, and `MemBudget = 7`, lane `a` reserves `WorstCaseBlocks(8) = 7`
+  blocks (`4` full + `3` window). Without pruning `laneWin` to `History(npos)` at
+  `FinishStep` fence completion, three two-token prefill steps (`0 -> 2 -> 4 -> 6`)
+  without an optional `SlideWindow` retain window blocks `0, 1, 2` alongside full
+  blocks `0, 1, 2` (`6` blocks) at `lanePos[a] = 6`, giving `CurrentWorkingSet(a) = 8 > 7 = reservation[a]`.
