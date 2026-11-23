@@ -1,5 +1,7 @@
 [![ci](https://github.com/robotgamedevelopers/inky/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/robotgamedevelopers/inky/actions/workflows/ci.yml)
 
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/1ae045b5-9adc-4590-8746-bd55b8bedad8" />
+
 Fast local inference for **Inkling 2 Mini** on Apple silicon.
 
 With **inky**, you can:
