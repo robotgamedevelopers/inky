@@ -89,4 +89,6 @@ fi
 
 if [ -f "$root/scripts/check-memmode-traces.sh" ]; then
     bash "$root/scripts/check-memmode-traces.sh"
+else
+    echo "Production trace checker absent: PR #23 must land to enable this gate."
 fi
