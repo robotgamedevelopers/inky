@@ -221,6 +221,8 @@ Run it for days.
 
 Improvements that wait for the layers above. Those that change the model's numbers also wait for the quality replay.
 
+Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in parallel lanes and lands the first whose check passes; the N attempts share their prompt through cross-lane prompt-prefix reuse (pull request 22). Its gate is the tier test from the flash+ provider goal (pull request 17): land rate per tier, 1 attempt against best-of-4, on mas-bandwidth/sprint-corpus. Aggregation and critic start only if pro still misses the flash+ bar after best-of-N.
+
 <!-- nova-work:later:start -->
 
 | feature | done |
@@ -243,7 +245,10 @@ Improvements that wait for the layers above. Those that change the model's numbe
 | Tool calls constrained to valid JSON while sampling (later) | ❌ |
 | Sampling on the GPU (later) | ❌ |
 | General fixes sent upstream to erisinky (later) | ❌ |
-| complete | 5% |
+| Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
+| Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
+| Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
+| complete | 4% |
 
 [Source data](roadmap.sexp)
 
