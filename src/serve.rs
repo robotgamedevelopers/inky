@@ -184,6 +184,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                 for b in blocks {
                     match b["type"].as_str() {
                         Some("text") => texts.push(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                        Some("image") => texts.push(json!({"type": "text", "text": "[image]"})),
                         Some("tool_result") => {
                             if !texts.is_empty() { msgs.push(json!({"role": "user", "content": std::mem::take(&mut texts)})); }
                             let id = b["tool_use_id"].as_str().ok_or("tool_result without tool_use_id")?;
@@ -487,7 +488,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
 
 // ------------------------------------------------------------------------------------------------- HTTP
 
-fn respond(s: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
+fn respond<W: Write + ?Sized>(s: &mut W, code: u16, body: &str) -> std::io::Result<()> {
     write!(s, "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if code == 200 { "OK" } else { "Error" }, body.len())?;
     s.flush()
 }
@@ -531,6 +532,19 @@ fn peer_gone(s: &TcpStream) -> bool {
     match r { Ok(0) => true, Ok(_) => false, Err(e) => e.kind() != std::io::ErrorKind::WouldBlock }
 }
 
+/// What the handlers write to: the socket in production, a buffer in tests.
+/// `client_gone` is the socket's peek for a closed peer; a buffer's client never leaves,
+/// so a handler driven against a buffer never takes the gone path and needs no socket or timeout.
+trait ClientWrite: Write {
+    fn client_gone(&self) -> bool;
+}
+impl ClientWrite for TcpStream {
+    fn client_gone(&self) -> bool { peer_gone(self) }
+}
+impl ClientWrite for Vec<u8> {
+    fn client_gone(&self) -> bool { false }
+}
+
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
              /// requests admitted and not yet finished (generating, prefilling or queued for a lane); at most `limit`
@@ -555,7 +569,7 @@ fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
 
-fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
+fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
     let toks = match render(&cx.tk, &cx.sp, req, &cx.effort) { Ok(t) => t, Err(e) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()) };
     let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let (tx, rx) = channel();
@@ -600,14 +614,14 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
         // request fails and frees its lane (prefill steps send Alive, decode steps a token)
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if peer_gone(s) { return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { return Ok(()); } continue; }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return respond(s, 500, &json!({"error": {"message": "the request was dropped"}}).to_string()),
         };
         match Ok::<Ev, ()>(ev) {
-            Ok(Ev::Alive) => { if peer_gone(s) { return Ok(()); } }
+            Ok(Ev::Alive) => { if s.client_gone() { return Ok(()); } }
             Ok(Ev::Tok(t)) => {
                 gen.push(t);
-                if !stream && gen.len() % 16 == 0 && peer_gone(s) { return Ok(()); }
+                if !stream && gen.len() % 16 == 0 && s.client_gone() { return Ok(()); }
                 if !stream { continue; }
                 if t == sp.c_think { mode = 1; continue; }
                 if t == sp.c_text { mode = 2; continue; }
@@ -654,11 +668,11 @@ fn chat(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
 /// (Claude Code posts to `/v1/messages?beta=true`).
 fn route_path(p: &str) -> String { p.split('?').next().unwrap_or("").trim_end_matches('/').to_string() }
 
-fn anthropic_error(s: &mut TcpStream, code: u16, kind: &str, msg: &str) -> std::io::Result<()> {
+fn anthropic_error<W: Write + ?Sized>(s: &mut W, code: u16, kind: &str, msg: &str) -> std::io::Result<()> {
     respond(s, code, &json!({"type": "error", "error": {"type": kind, "message": msg}}).to_string())
 }
 
-fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
+fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
     let openai = match anthropic_to_openai(req) { Ok(v) => v, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
     let toks = match render(&cx.tk, &cx.sp, &openai, &cx.effort) { Ok(t) => t, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
     let prompt_len = toks.len();
@@ -703,7 +717,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if peer_gone(s) { return Ok(()); }
+                    if s.client_gone() { return Ok(()); }
                     write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -712,7 +726,7 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
                 }
             };
             match ev {
-                Ev::Alive => { if peer_gone(s) { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => { if s.client_gone() { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
                 Ev::Tok(t) => { for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?; }
                 Ev::Done { prompt, cached, gen: ng, reason } => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
@@ -736,12 +750,12 @@ fn messages(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     loop {
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if peer_gone(s) { return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { return Ok(()); } continue; }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return anthropic_error(s, 500, "api_error", "the request was dropped"),
         };
         match ev {
-            Ev::Alive => { if peer_gone(s) { return Ok(()); } }
-            Ev::Tok(t) => { gen.push(t); if gen.len() % 16 == 0 && peer_gone(s) { return Ok(()); } }
+            Ev::Alive => { if s.client_gone() { return Ok(()); } }
+            Ev::Tok(t) => { gen.push(t); if gen.len() % 16 == 0 && s.client_gone() { return Ok(()); } }
             Ev::Done { prompt, cached, gen: ng, reason } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
@@ -922,7 +936,7 @@ mod tests {
     #[test] fn anthropic_translation_refuses_what_it_cannot_render() {
         assert!(anthropic_to_openai(&json!({"messages": []})).is_err(), "no messages");
         assert!(anthropic_to_openai(&json!({"messages": [{"role": "system", "content": "x"}]})).is_err(), "no system role inside messages");
-        assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]})).is_err(), "an image block fails closed, never dropped");
+        assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]})).is_err(), "an unsupported block fails closed, never dropped");
         assert!(anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]})).is_err(), "a tool result without its id");
         assert!(anthropic_to_openai(&json!({"tools": [{"description": "x"}], "messages": [{"role": "user", "content": "x"}]})).is_err(), "a tool without a name");
         // a thinking block in a sent history is the one block dropped: it has no rendering in either API here
@@ -957,6 +971,71 @@ mod tests {
         next["messages"].as_array_mut().unwrap().push(json!({"role": "user", "content": "And in LA?"}));
         let n = render(&tk, &sp, &anthropic_to_openai(&next).unwrap(), "medium").unwrap();
         assert!(n.starts_with(&a), "a following Anthropic turn must extend the previous prompt");
+    }
+
+    #[test] fn corrupted_equivalents_do_not_render_the_same_tokens() {
+        // reversed witness for the equivalence above: a deliberately broken equivalent
+        // must NOT render to the same tokens. If render ever dropped the system block
+        // or stopped caring about message order, this test goes red.
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let anthropic = json!({"model": "inkling-2-mini", "max_tokens": 64, "system": "Be terse.",
+            "tools": [{"name": "get_weather", "description": "Weather", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "Weather in SF?"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Sunny"}]}]});
+        let chat = json!({"tools": [{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object"}}}],
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Weather in SF?"},
+                {"role": "assistant", "content": "Checking.", "tool_calls": [{"id": "toolu_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}}]},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "Sunny"}]});
+        let a = render(&tk, &sp, &anthropic_to_openai(&anthropic).unwrap(), "medium").unwrap();
+        let good = render(&tk, &sp, &chat, "medium").unwrap();
+        assert_eq!(a, good, "sanity: the uncorrupted equivalent still renders the same tokens");
+        // corruption 1: the system block dropped from the chat equivalent
+        let mut no_system = chat.clone();
+        no_system["messages"].as_array_mut().unwrap().retain(|m| m["role"] != "system");
+        let dropped = render(&tk, &sp, &no_system, "medium").unwrap();
+        assert_ne!(a, dropped, "dropping the system block must change the rendered token stream");
+        // corruption 2: the tool result reordered ahead of the assistant call it answers
+        let mut reordered = chat.clone();
+        let msgs = reordered["messages"].as_array_mut().unwrap();
+        let tool = msgs.remove(3);
+        msgs.insert(2, tool);
+        let moved = render(&tk, &sp, &reordered, "medium").unwrap();
+        assert_ne!(a, moved, "reordering the tool result ahead of its call must change the rendered token stream");
+    }
+
+    #[test] fn a_user_message_image_renders_the_placeholder_not_a_refusal() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        // an image directly in a user message (not inside a tool_result) renders the
+        // same [image] placeholder as an image in a tool result, never a 400 that
+        // would poison every later turn carrying the same history
+        let req = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}]},
+            {"role": "assistant", "content": "seen"},
+            {"role": "user", "content": "again?"}]});
+        let o = anthropic_to_openai(&req).unwrap();
+        assert_eq!(o["messages"][0]["content"][1], json!({"type": "text", "text": "[image]"}),
+            "a user-message image becomes the [image] text placeholder");
+        let toks = render(&tk, &sp, &o, "medium").unwrap();
+        let img: Vec<u32> = tk.encode("[image]", false);
+        assert!(toks.windows(img.len()).any(|w| w == img.as_slice()), "the placeholder must be in the rendered tokens");
+        // history carrying the image still extends: a following turn renders on top of it
+        let mut next = req.clone();
+        next["messages"].as_array_mut().unwrap().push(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}));
+        next["messages"].as_array_mut().unwrap().push(json!({"role": "user", "content": "and now?"}));
+        let n = render(&tk, &sp, &anthropic_to_openai(&next).unwrap(), "medium").unwrap();
+        assert!(n.starts_with(&toks), "a history with a user-message image must extend, not poison later turns");
+        // an image-only user message renders the placeholder too
+        let only = anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]})).unwrap();
+        assert_eq!(only["messages"][0]["content"][0], json!({"type": "text", "text": "[image]"}));
     }
 
     #[test] fn a_generated_reply_parses_to_anthropic_blocks() {
@@ -1081,33 +1160,25 @@ mod tests {
 
     #[test] fn over_cap_streaming_requests_are_refused_at_the_call_sites() {
         // the actual handlers, not just the context_over helper: a streamed over-cap
-        // request gets a clean HTTP 400 before any SSE header, on both routes.
-        use std::io::Read as _;
+        // request gets a clean HTTP 400 before any SSE header, on both routes. The
+        // handlers write to an in-memory buffer here: no socket, no timeout.
         let tk0 = Tokenizer::for_test();
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        inflight: Default::default(), limit: 4, conns: Default::default() };
         let long = "x".repeat(200);
-        let roundtrip = |serve_fn: fn(&Ctx, &Value, &mut TcpStream) -> std::io::Result<()>, req: &Value| -> String {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = l.local_addr().unwrap();
-            let mut client = TcpStream::connect(addr).unwrap();
-            let (mut srv, _) = l.accept().unwrap();
-            serve_fn(&cx, req, &mut srv).unwrap();
-            drop(srv);
-            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut out = String::new();
-            let _ = client.read_to_string(&mut out);
-            out
-        };
-        let a = roundtrip(messages, &json!({"model": "m", "max_tokens": 8, "stream": true,
-            "messages": [{"role": "user", "content": long}]}));
+        let mut out: Vec<u8> = Vec::new();
+        messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
+            "messages": [{"role": "user", "content": long}]}), &mut out).unwrap();
+        let a = String::from_utf8(out).unwrap();
         assert!(a.starts_with("HTTP/1.1 400"), "messages over-cap must be an HTTP 400, got: {}", &a[..a.len().min(80)]);
         assert!(a.contains("invalid_request_error") && a.contains("context full"), "messages over-cap body: {a}");
         assert!(!a.contains("text/event-stream"), "no SSE headers may precede the refusal: {a}");
-        let c = roundtrip(chat, &json!({"model": "m", "max_tokens": 8, "stream": true,
-            "messages": [{"role": "user", "content": long}]}));
+        let mut out: Vec<u8> = Vec::new();
+        chat(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
+            "messages": [{"role": "user", "content": long}]}), &mut out).unwrap();
+        let c = String::from_utf8(out).unwrap();
         assert!(c.starts_with("HTTP/1.1 400"), "chat over-cap must be an HTTP 400, got: {}", &c[..c.len().min(80)]);
         assert!(c.contains("context full"), "chat over-cap body: {c}");
         assert!(!c.contains("text/event-stream"), "no SSE headers may precede the refusal: {c}");
