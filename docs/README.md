@@ -2,6 +2,45 @@
 
 > The engine's full guide, written by its original author, Eris ([erisinky](https://github.com/Eriskii/erisinky)), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
 
+## Serving: inky as a provider
+
+`inky serve` is an OpenAI-compatible chat completions endpoint over many lanes: any OpenAI client, harness or agent fleet can use it as a provider. Each request gets a lane; the lanes share every weight read (docs/DESIGN.md). Tool calls, tool results, streaming and `reasoning_content` follow the OpenAI shapes; earlier turns are rendered exactly as sent.
+
+```sh
+# on loopback, for one machine
+inky serve --lanes 16 -c 131072
+# on the tailnet, for a fleet: a bearer key from the environment, 429 beyond 64 waiting requests
+INKY_API_KEY=... inky serve --bind 0.0.0.0:8090 --key-env INKY_API_KEY --lanes 16 -c 131072 --queue 64
+```
+
+| flag | default | |
+|---|---|---|
+| `--lanes N` | 16 | concurrent requests; each lane is one card's stream |
+| `-c CTX` | 65536 | context per lane |
+| `--bind ADDR` | 127.0.0.1:8090 | listen address; anything beyond loopback should use a key |
+| `--key-env NAME` | none | require `Authorization: Bearer <$NAME>` (`/health` is open) |
+| `--queue N` | 64 | requests waiting beyond the lanes; more are refused with 429 and `Retry-After` |
+| `--effort E` | medium | thinking effort when a request does not set `reasoning_effort` |
+| `-n MAX` | 16384 | most tokens per reply when a request does not set `max_tokens` |
+
+Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new.
+
+**As a nova-worker provider.** The worker's key proxy takes the endpoint and the key's name, and the harness reaches inky through it:
+
+```sh
+nova-sprint worker ... --providers inky=http://<mac>.<tailnet>.ts.net:8090/v1@INKY_API_KEY
+```
+
+with `INKY_API_KEY` in the worker's environment (nova-secrets) and the model `inky/inkling-2-mini`. In nova-config: `nova-config provider add inky --url http://<mac>.<tailnet>.ts.net:8090/v1 --api openai --key INKY_API_KEY --concurrency <lanes>`.
+
+**Without a fleet.** Any OpenAI-compatible harness works. For opencode:
+
+```json
+{"provider": {"inky": {"npm": "@ai-sdk/openai-compatible", "name": "inky",
+  "options": {"baseURL": "http://127.0.0.1:8090/v1", "apiKey": "local"},
+  "models": {"inkling-2-mini": {"name": "inkling-2-mini", "limit": {"context": 131072, "output": 16384}}}}}}
+```
+
 A from-scratch inference engine for **Thinking Machines' Inkling 2 Mini** (`inkling2_loop`, 26.4B total / 3.4B active MoE)
 on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GGUF directly (zero-copy mmap).
 
