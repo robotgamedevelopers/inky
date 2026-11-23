@@ -422,6 +422,47 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, layer 2's performance gate: decode steps over N lanes at a given context. Each context is prefilled once (the
+/// --ref tokens repeated) and copied into every lane; lane i then decodes its own stream (the --ref tokens rotated by
+/// 97 i), so routing differs across lanes as it would in use. INK_CTXS and INK_LANES list what to measure.
+fn lanebench(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let ctxs: Vec<usize> = std::env::var("INK_CTXS").unwrap_or("2048,20480".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,8,16,32,64".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let steps: usize = std::env::var("INK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    println!("{:>6} {:>5} {:>9} {:>10} {:>9} {:>10}", "ctx", "lanes", "ms/step", "total t/s", "per lane", "GPU GiB");
+    for &c in &ctxs {
+        let len = c + steps + 1;
+        let toks: Vec<u32> = (0..len).map(|i| base[i % base.len()]).collect();
+        let src = Lane::new(&eng);
+        { let r = eng.on(&src); r.reserve(len, false); r.set_tokens(0, &toks);
+          let mut p = 0; while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; } }
+        let nmax = *counts.iter().max().unwrap();
+        let lanes: Vec<Lane> = (0..nmax).map(|i| {
+            let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false);
+            let mut t = toks.clone();
+            for q in 0..=steps { t[c + q] = base[(97 * i + q) % base.len()]; }
+            r.set_tokens(0, &t); eng.copy_lane(&src, &l); l
+        }).collect();
+        for &n in &counts {
+            // a warm-up step, then the timed steps: lanes decode positions c, c + 1, ... (the context grows by `steps` at most)
+            let step = |q: usize| { let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                                    let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted(); };
+            step(0);
+            let t0 = std::time::Instant::now();
+            for q in 0..steps { step(q); }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+            println!("{c:>6} {n:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}", n as f64 * 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+        }
+    }
+    let (_, ws) = eng.gpu_mem();
+    println!("recommended GPU working set: {:.1} GiB", gib(ws));
+}
+
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
@@ -595,6 +636,7 @@ fn main() {
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
+        "lanebench" => lanebench(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),

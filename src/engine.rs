@@ -443,6 +443,16 @@ impl Engine {
         eat(&lane.kv_swa.borrow()); eat(&lane.kv_full.borrow()); eat(&lane.cs);
         h
     }
+    /// dev: make `dst` a copy of `src` (cache and convolution rows); `dst` must have been reserved to the same capacity
+    pub fn copy_lane(&self, src: &Lane, dst: &Lane) {
+        let cp = |a: &Buf, b: &Buf| { assert_eq!(a.length(), b.length()); unsafe { std::ptr::copy_nonoverlapping(a.contents().as_ptr() as *const u8, b.contents().as_ptr() as *mut u8, a.length()); } };
+        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow()); cp(&src.cs, &dst.cs);
+    }
+    /// GPU memory the device has allocated (bytes) and the working set it recommends
+    pub fn gpu_mem(&self) -> (usize, usize) {
+        use objc2_metal::MTLDevice;
+        (self.gpu.dev.currentAllocatedSize(), self.gpu.dev.recommendedMaxWorkingSetSize() as usize)
+    }
     /// the logits of span `i` of the last step with several spans
     pub fn span_logits(&self, i: usize) -> &[f32] {
         let off = self.ba.get().lg as usize + i * self.vocab_pad();
