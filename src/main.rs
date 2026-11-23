@@ -267,14 +267,19 @@ fn binv(o: &Opts) {
     let eng = eng.on(&lane);
     let tk = Tokenizer::load(&eng.g);
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
-    let splits: Vec<usize> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    // each entry is one way to split the prompt: boundaries joined by '+' ("37+190": three prefills); an entry may repeat,
+    // which tests that the same split gives the same bits run after run
+    let splits: Vec<Vec<usize>> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',')
+        .map(|v| v.split('+').map(|x| x.parse().unwrap()).filter(|&x| x > 0).collect()).collect();
     let mut first = None;
     let mut base: Vec<f32> = Vec::new();
     let mut ok = true;
     for k in splits {
         let mut sess = Session::new(&eng, &tk);
-        if k > 0 { sess.prefill(&toks[..k]); }
-        sess.prefill(&toks[k..]);
+        let mut p = 0;
+        for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b]); p = b; } }
+        let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
+        let k = if k.is_empty() { "0".to_string() } else { k };
         let mut h = 0xcbf29ce484222325u64;
         for x in eng.logits() { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         let same = *first.get_or_insert(h) == h;
@@ -288,7 +293,7 @@ fn binv(o: &Opts) {
         let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
         let (l1, l2) = (lse(&pa), lse(&pb));
         let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
-        println!("split at {k:5}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
+        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
