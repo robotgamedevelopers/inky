@@ -74,7 +74,12 @@ check UnheldWindow StartTails StartRetained
 check PrunedUnderStart StartTails StartRetained
 check TailOverread StartTails ReadsWritten
 check ReuseNotZeroed StartTails TailPrivateZero
-# Three slots per kind takes about a minute on one worker: nightly, not per push.
+# Three slots per kind takes about a minute on one worker: the nightly workflow's tla job sets TLC_NIGHTLY.
 if [[ -n ${TLC_NIGHTLY:-} ]]; then
     check StartTails3 StartTails
 fi
+check PoisonGate3 PoisonGate
+check PoisonGate4 PoisonGate
+check PoisonUnguarded PoisonGate NoFalsePoison
+check PoisonNoSave PoisonGate LiveIntact
+check PoisonOwnedOnly PoisonGate Coverage

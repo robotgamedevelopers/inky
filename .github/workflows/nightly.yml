@@ -1,0 +1,32 @@
+name: nightly
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  # The long GPU gates that do not fit the pull request budget (tests/nightly.sh).
+  # No time limit beyond GitHub's default: a slow nightly is not a failure.
+  m5:
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cargo build --release --locked
+      - name: long GPU gates
+        run: tests/nightly.sh
+  # The TLA+ checks at sizes too slow for a pull request (TLC_NIGHTLY: StartTails3),
+  # with every per-push model, witness and trace check again. Hosted, CPU only.
+  tla:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: TLA models at nightly sizes
+        env:
+          TLC_NIGHTLY: '1'
+        run: scripts/check-tla.sh

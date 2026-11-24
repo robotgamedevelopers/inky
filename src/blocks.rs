@@ -1,4 +1,5 @@
 //! Layer 3 block cache, the types the rest of the layer builds on.
+#![allow(dead_code)] // the pool, the table and the prefix tree are the callers; cargo check does not compile the unit tests
 //!
 //! The GPU buffers and the attention read are not allocated here.
 //! A block is 64 positions. A window block is 10 MiB and a full block is 2 MiB

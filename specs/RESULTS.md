@@ -77,8 +77,8 @@ On hetzner1 (16-core x86_64, Linux), 2026-11-24, with the pinned v1.8.0 tools ja
 | StartTails3 (nightly, `TLC_NIGHTLY=1`) | 1,800,308 | 372,626 | 61.2 | PASS |
 
 StartTails3, three slots per kind, takes about a minute on one worker, so the
-runner checks it only with `TLC_NIGHTLY=1`; per push, StartTails2 covers two slots
-per kind.
+runner checks it only with `TLC_NIGHTLY=1`, which the nightly workflow's `tla` job
+sets; per push, StartTails2 covers two slots per kind.
 
 Inspected counterexamples:
 
@@ -106,3 +106,25 @@ TLC finds no error. Each mutation is rejected: `unheld-window`,
 `no-zero` by `TailPrivateZero`, `every-off` by `Conforms`. The seven runs go in
 parallel: 32 seconds on a loaded hetzner1. Negative controls
 `TLC_JAVA=/usr/bin/true` and `TLC_JAVA=/usr/bin/false` were both rejected.
+
+## Poisoned-slot gate
+
+Run on `mini-m5`, 2026-11-24 02:30 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| PoisonGate3 | 158,849 | 34,504 | 1.104 | PASS |
+| PoisonGate4 | 3,239,729 | 563,728 | 8.197 | PASS |
+| PoisonUnguarded | 17 | 17 | 0.677 | NoFalsePoison violated |
+| PoisonNoSave | 124 | 79 | 0.673 | LiveIntact violated |
+| PoisonOwnedOnly | 74 | 51 | 0.695 | Coverage violated |
+
+Inspected counterexamples, each checked against `poison_plan` by hand:
+
+- **PoisonUnguarded, state 3:** lane `a` takes slot 1 and steps alone; slot 1
+  is poisoned in its own step (`poison_plan(.., guard = false)`, the
+  `INK_POOLGATE_SABOTAGE` run on the GPU).
+- **PoisonNoSave, state 4:** lane `a` owns slot 1, lane `b` steps; slot 1 is
+  poisoned, not saved, and still poison after the restore.
+- **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
+  the next step leaves the free slot 1 unpoisoned.
