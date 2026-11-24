@@ -64,6 +64,16 @@ impl Gpu {
     }
 
     pub fn cmd(&self) -> CmdBuf { self.queue.commandBufferWithUnretainedReferences().expect("cmdbuf") }
+
+    /// Metal's recommended maximum working set size in bytes, queried directly from MTLDevice.
+    pub fn recommended_max_working_set_size(&self) -> u64 {
+        self.dev.recommendedMaxWorkingSetSize()
+    }
+
+    /// Bytes currently allocated on the Metal device.
+    pub fn current_allocated_size(&self) -> usize {
+        self.dev.currentAllocatedSize()
+    }
 }
 
 pub struct Enc {

@@ -572,8 +572,34 @@ impl Engine {
     }
     /// GPU memory the device has allocated (bytes) and the working set it recommends
     pub fn gpu_mem(&self) -> (usize, usize) {
-        use objc2_metal::MTLDevice;
-        (self.gpu.dev.currentAllocatedSize(), self.gpu.dev.recommendedMaxWorkingSetSize() as usize)
+        (self.gpu.current_allocated_size(), self.gpu.recommended_max_working_set_size() as usize)
+    }
+    /// Exact Metal buffer bytes currently allocated for model weights and shared scratch arenas.
+    /// Called after `ensure_batch` and before lanes are created; never undercounts Metal's own
+    /// reported device allocation.
+    pub fn model_and_scratch_bytes(&self) -> u64 {
+        let buffers = self.w.length()
+            .saturating_add(self.pb.length())
+            .saturating_add(self.ctr.length())
+            .saturating_add(self.act.borrow().length());
+        buffers.max(self.gpu.current_allocated_size()) as u64
+    }
+    /// Pure worst-case per-lane GPU memory formula at `max_ctx`: full KV + sliding-window KV +
+    /// convolution/recurrent state + per-lane token buffer + per-lane decode-batch arena slice.
+    pub fn lane_worst_case_bytes_for(n_swa: usize, n_full: usize, max_ctx: usize, kvb: usize, arena_floats: usize) -> u64 {
+        let kv_row = 2usize.saturating_mul(NKV).saturating_mul(HD).saturating_mul(kvb);
+        let swa_kv = n_swa.saturating_mul(max_ctx.min(EXT)).saturating_mul(kv_row);
+        let full_kv = n_full.saturating_mul(max_ctx).saturating_mul(kv_row);
+        let cs = Self::cs_image_bytes();
+        let toks = max_ctx.saturating_add(8).saturating_mul(4);
+        let dbatch_arena = arena_floats.saturating_mul(4);
+        swa_kv.saturating_add(full_kv).saturating_add(cs).saturating_add(toks).saturating_add(dbatch_arena) as u64
+    }
+    /// Worst-case GPU memory required by a single lane at `self.max_ctx`.
+    pub fn per_lane_worst_case_bytes(&self) -> u64 {
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let n_full = N_SLOT - n_swa;
+        Self::lane_worst_case_bytes_for(n_swa, n_full, self.max_ctx, self.kvb, self.ar.total as usize)
     }
     /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
     /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span

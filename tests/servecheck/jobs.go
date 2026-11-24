@@ -280,12 +280,23 @@ func (g *gate) cancelBuffered(prefill bool) error {
 type queueResult struct {
 	status int
 	retry  string
+	body   string
 }
 
 func (r queueResult) check() error {
 	n, e := strconv.Atoi(r.retry)
 	if r.status != 429 || e != nil || n <= 0 {
 		return fmt.Errorf("got HTTP %d, Retry-After %q", r.status, r.retry)
+	}
+	if r.body != "" {
+		var parsed struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(r.body), &parsed); err != nil || parsed.Error.Message == "" {
+			return fmt.Errorf("429 response lacks OpenAI JSON error message: %q", r.body)
+		}
 	}
 	return nil
 }
@@ -297,18 +308,42 @@ func (g *gate) queueJobs() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		var streams []*jobStream
-		for _, limit := range []int{128, 128, 12} {
+		for _, limit := range []int{256, 256} {
 			s, e := g.startStream(ctx, countPrompt, limit)
 			if e != nil {
 				return e
 			}
 			defer s.body.Close()
 			streams = append(streams, s)
-			if len(streams) <= 2 {
-				if e = s.read(true); e != nil {
-					return e
-				}
+			if e = s.read(true); e != nil {
+				return e
 			}
+		}
+		// Third request enters the bounded admission wait queue (blocks until a lane frees).
+		type queuedOutcome struct {
+			stream *jobStream
+			err    error
+		}
+		queuedCh := make(chan queuedOutcome, 1)
+		go func() {
+			s, e := g.startStream(ctx, countPrompt, 12)
+			queuedCh <- queuedOutcome{s, e}
+		}()
+		waitDeadline := time.Now().Add(5 * time.Second)
+		observedQueued := false
+		for time.Now().Before(waitDeadline) {
+			code, snap, err := g.fetchHealth("/health")
+			if err == nil && code == http.StatusOK &&
+				snap.ActiveLanes != nil && *snap.ActiveLanes == 2 &&
+				snap.QueuedRequests != nil && *snap.QueuedRequests == 1 &&
+				snap.Inflight != nil && *snap.Inflight == 3 {
+				observedQueued = true
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		if !observedQueued {
+			return fmt.Errorf("third request did not appear in /health as queued_requests=1 active_lanes=2 inflight=3")
 		}
 		var overflow [2]queueResult
 		for i := range overflow {
@@ -316,11 +351,12 @@ func (g *gate) queueJobs() {
 			if e != nil {
 				return e
 			}
-			overflow[i] = queueResult{r.StatusCode, r.Header.Get("Retry-After")}
+			bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+			overflow[i] = queueResult{r.StatusCode, r.Header.Get("Retry-After"), string(bodyBytes)}
 			r.Body.Close()
 		}
 		fifth = overflow[1]
-		if (queueResult{200, "5"}).check() == nil {
+		if (queueResult{200, "5", ""}).check() == nil {
 			return fmt.Errorf("queue assertion accepted fourth request")
 		}
 		if e := overflow[0].check(); e != nil {
@@ -331,6 +367,17 @@ func (g *gate) queueJobs() {
 				return fmt.Errorf("admitted request %d: %w", i+1, e)
 			}
 		}
+		q3 := <-queuedCh
+		if q3.err != nil {
+			return fmt.Errorf("queued third request failed to admit: %w", q3.err)
+		}
+		defer q3.stream.body.Close()
+		if e := q3.stream.read(false); e != nil {
+			return fmt.Errorf("admitted request 3: %w", e)
+		}
+		if _, e := g.waitHealthDrained(5 * time.Second); e != nil {
+			return e
+		}
 		firstPass = true
 		return nil
 	})
@@ -338,28 +385,32 @@ func (g *gate) queueJobs() {
 		if !firstPass {
 			return fmt.Errorf("first three requests did not complete")
 		}
-		if (queueResult{429, ""}).check() == nil {
+		if (queueResult{429, "", ""}).check() == nil {
 			return fmt.Errorf("queue assertion accepted missing retry header")
 		}
 		if e := fifth.check(); e != nil {
 			return e
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		var reopened []*jobStream
+		errs := make(chan error, 3)
 		for range 3 {
-			s, err := g.startStream(ctx, countPrompt, 32)
-			if err != nil {
+			go func() {
+				s, err := g.startStream(ctx, countPrompt, 32)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer s.body.Close()
+				errs <- s.read(false)
+			}()
+		}
+		for range 3 {
+			if err := <-errs; err != nil {
 				return err
 			}
-			defer s.body.Close()
-			reopened = append(reopened, s)
 		}
-		for _, s := range reopened {
-			if err := s.read(false); err != nil {
-				return err
-			}
-		}
-		return nil
+		_, err := g.waitHealthDrained(5 * time.Second)
+		return err
 	})
 }

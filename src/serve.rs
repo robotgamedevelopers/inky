@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAddr>, pub lanes: usize, pub effort: String, pub max_tokens: usize,
@@ -526,7 +526,7 @@ struct Job {
     thinking_budget: usize,
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
-    _permit: Permit,
+    _permit: LanePermit,
 }
 
 /// Hard thinking-token budget state machine (chadlyb/erisinky): after `budget` tokens inside
@@ -1154,10 +1154,204 @@ impl ClientWrite for Vec<u8> {
     fn client_gone(&self) -> bool { false }
 }
 
+/// Automatic Metal working-set memory budget computed once at engine startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoryBudget {
+    recommended_working_set_bytes: u64,
+    model_bytes: u64,
+    safety_headroom_bytes: u64,
+    available_kv_budget_bytes: u64,
+    per_lane_worst_case_bytes: u64,
+    max_admitted_lanes: usize,
+}
+
+impl MemoryBudget {
+    fn compute(
+        recommended_working_set_bytes: u64,
+        model_bytes: u64,
+        safety_headroom_bytes: u64,
+        per_lane_worst_case_bytes: u64,
+        configured_lanes: usize,
+    ) -> Self {
+        let reserved = model_bytes.saturating_add(safety_headroom_bytes);
+        let available_kv_budget_bytes = recommended_working_set_bytes.saturating_sub(reserved);
+        let max_budget_lanes = if per_lane_worst_case_bytes == 0 {
+            configured_lanes.max(1)
+        } else {
+            usize::try_from(available_kv_budget_bytes / per_lane_worst_case_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1)
+        };
+        let max_admitted_lanes = configured_lanes.min(max_budget_lanes).max(1);
+        Self {
+            recommended_working_set_bytes,
+            model_bytes,
+            safety_headroom_bytes,
+            available_kv_budget_bytes,
+            per_lane_worst_case_bytes,
+            max_admitted_lanes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionReject {
+    QueueFull,
+    QueueTimeout,
+    ClientGone,
+}
+
+struct AdmissionInner {
+    admitted: usize,
+    max_lanes: usize,
+    max_queue: usize,
+    next_ticket: u64,
+    waiters: VecDeque<u64>,
+}
+
+/// Bounded FIFO admission gate: up to `max_lanes` requests hold active lane slots,
+/// up to `max_queue` additional requests wait with a bounded timeout, and any request
+/// beyond queue capacity (or timing out waiting for admission) is refused with 429 + Retry-After.
+struct AdmissionGate {
+    inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+    queue_timeout: Duration,
+    poll_interval: Duration,
+    retry_after_secs: u64,
+}
+
+struct LanePermit {
+    inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+}
+
+impl Drop for LanePermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.admitted = st.admitted.saturating_sub(1);
+        cvar.notify_all();
+    }
+}
+
+struct WaiterGuard<'a> {
+    inner: &'a (Mutex<AdmissionInner>, Condvar),
+    ticket: u64,
+    armed: bool,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        let (lock, cvar) = self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = st.waiters.iter().position(|&t| t == self.ticket) {
+            st.waiters.remove(pos);
+            cvar.notify_all();
+        }
+    }
+}
+
+impl AdmissionGate {
+    fn new(max_lanes: usize, max_queue: usize, queue_timeout: Duration) -> Self {
+        Self::with_timings(max_lanes, max_queue, queue_timeout, QUEUE_POLL_INTERVAL, DEFAULT_RETRY_AFTER_SECS)
+    }
+
+    fn with_timings(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        poll_interval: Duration,
+        retry_after_secs: u64,
+    ) -> Self {
+        Self {
+            inner: Arc::new((
+                Mutex::new(AdmissionInner {
+                    admitted: 0,
+                    max_lanes,
+                    max_queue,
+                    next_ticket: 0,
+                    waiters: VecDeque::new(),
+                }),
+                Condvar::new(),
+            )),
+            queue_timeout,
+            poll_interval: poll_interval.max(Duration::from_millis(1)),
+            retry_after_secs: retry_after_secs.max(1),
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(&self) -> Option<LanePermit> {
+        let (lock, _) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if st.admitted < st.max_lanes && st.waiters.is_empty() {
+            st.admitted += 1;
+            return Some(LanePermit { inner: self.inner.clone() });
+        }
+        None
+    }
+
+    fn acquire_with_cancel(&self, is_gone: impl Fn() -> bool) -> Result<LanePermit, AdmissionReject> {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if st.admitted < st.max_lanes && st.waiters.is_empty() {
+            st.admitted += 1;
+            return Ok(LanePermit { inner: self.inner.clone() });
+        }
+        if st.waiters.len() >= st.max_queue {
+            return Err(AdmissionReject::QueueFull);
+        }
+        let ticket = st.next_ticket;
+        st.next_ticket = st.next_ticket.wrapping_add(1);
+        st.waiters.push_back(ticket);
+        let mut guard = WaiterGuard { inner: &self.inner, ticket, armed: true };
+        let deadline = Instant::now() + self.queue_timeout;
+        loop {
+            if st.waiters.front() == Some(&ticket) && st.admitted < st.max_lanes {
+                st.waiters.pop_front();
+                st.admitted += 1;
+                guard.armed = false;
+                cvar.notify_all();
+                return Ok(LanePermit { inner: self.inner.clone() });
+            }
+            if is_gone() {
+                drop(st);
+                drop(guard);
+                return Err(AdmissionReject::ClientGone);
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                drop(st);
+                drop(guard);
+                return Err(AdmissionReject::QueueTimeout);
+            }
+            let wait = rem.min(self.poll_interval);
+            let (next_st, _) = cvar.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
+            st = next_st;
+        }
+    }
+
+    fn queued(&self) -> usize {
+        let (lock, _) = &*self.inner;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).waiters.len()
+    }
+
+    fn inflight(&self) -> usize {
+        let (lock, _) = &*self.inner;
+        let st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.admitted.saturating_add(st.waiters.len())
+    }
+
+    fn retry_after_secs(&self) -> u64 {
+        self.retry_after_secs
+    }
+}
+
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, thinking_budget: usize, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
-             /// Generation requests rendering, queued, prefilling or decoding.
-             inflight: PermitPool,
+             /// Bounded lane admission and wait queue (admitted + queued <= max_admitted_lanes + max_queue).
+             admission: AdmissionGate,
+             /// Automatic Metal working-set memory budget measured at startup.
+             budget: MemoryBudget,
              /// Translation and rendering capacity shared with count_tokens.
              preprocess: PermitPool,
              /// Lanes currently occupied by an active job in the scheduler.
@@ -1169,8 +1363,12 @@ struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String
 const MAX_CONNS: usize = 512;
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
 
 const QUEUE_FULL: &str = "inky is busy: the request queue is full";
+const QUEUE_TIMED_OUT: &str = "inky is busy: timed out waiting for an inference lane";
 const PREPROCESS_BUSY: &str = "inky is busy: all prompt processors are in use";
 
 struct PermitPool {
@@ -1189,17 +1387,18 @@ impl PermitPool {
         }).ok()?;
         Some(Permit(self.used.clone()))
     }
-
-    fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
-    }
 }
 
 fn health_body(cx: &Ctx) -> String {
     json!({
         "ok": true,
         "active_lanes": cx.active_lanes.load(Ordering::Relaxed),
-        "inflight": cx.inflight.used(),
+        "inflight": cx.admission.inflight(),
+        "recommended_working_set_bytes": cx.budget.recommended_working_set_bytes,
+        "model_bytes": cx.budget.model_bytes,
+        "per_lane_worst_case_bytes": cx.budget.per_lane_worst_case_bytes,
+        "max_admitted_lanes": cx.budget.max_admitted_lanes,
+        "queued_requests": cx.admission.queued(),
     }).to_string()
 }
 
@@ -1211,22 +1410,36 @@ impl Drop for Permit {
     }
 }
 
+enum AdmitError {
+    Overloaded(&'static str),
+    ClientGone,
+}
+
 impl Ctx {
-    fn admit_for_render(&self) -> Result<(Permit, Permit), &'static str> {
-        let job = self.inflight.acquire().ok_or(QUEUE_FULL)?;
-        let preprocess = self.preprocess.acquire().ok_or(PREPROCESS_BUSY)?;
+    fn admit_for_render(&self, is_gone: impl Fn() -> bool) -> Result<(LanePermit, Permit), AdmitError> {
+        let job = self.admission.acquire_with_cancel(is_gone).map_err(|reject| match reject {
+            AdmissionReject::QueueFull => AdmitError::Overloaded(QUEUE_FULL),
+            AdmissionReject::QueueTimeout => AdmitError::Overloaded(QUEUE_TIMED_OUT),
+            AdmissionReject::ClientGone => AdmitError::ClientGone,
+        })?;
+        let preprocess = self.preprocess.acquire().ok_or(AdmitError::Overloaded(PREPROCESS_BUSY))?;
         Ok((job, preprocess))
     }
 }
 
-fn overloaded<W: Write + ?Sized>(s: &mut W, body: Value) -> std::io::Result<()> {
+fn overloaded<W: Write + ?Sized>(s: &mut W, retry_after_secs: u64, body: Value) -> std::io::Result<()> {
     let body = body.to_string();
-    write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let retry = retry_after_secs.max(1);
+    write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
     s.flush()
 }
 
-fn anthropic_overloaded<W: Write + ?Sized>(s: &mut W, message: &str) -> std::io::Result<()> {
-    overloaded(s, json!({"type": "error", "error": {"type": "rate_limit_error", "message": message}}))
+fn openai_overloaded<W: Write + ?Sized>(s: &mut W, retry_after_secs: u64, message: &str) -> std::io::Result<()> {
+    overloaded(s, retry_after_secs, json!({"error": {"type": "rate_limit_error", "code": "rate_limit_exceeded", "message": message}}))
+}
+
+fn anthropic_overloaded<W: Write + ?Sized>(s: &mut W, retry_after_secs: u64, message: &str) -> std::io::Result<()> {
+    overloaded(s, retry_after_secs, json!({"type": "error", "error": {"type": "rate_limit_error", "message": message}}))
 }
 
 /// Whether a request can never fit a lane: prompt + generation + the two tokens the
@@ -1330,11 +1543,15 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     };
     if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
     if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
-    let (permit, preprocess) = match cx.admit_for_render() {
+    let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(e) => {
+        Err(AdmitError::Overloaded(e)) => {
             record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, "overloaded", 429);
-            return overloaded(s, json!({"error": {"message": e}}));
+            return openai_overloaded(s, cx.admission.retry_after_secs(), e);
+        }
+        Err(AdmitError::ClientGone) => {
+            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, "cancelled", 499);
+            return Ok(());
         }
     };
     let prompt_limit = cx.ctx.saturating_sub(max.saturating_add(2));
@@ -1344,10 +1561,12 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         Ok(t) => t,
         Err(e) => {
             drop(permit);
-            return bad(match e {
+            let message = match e {
                 RenderError::Invalid(message) => message,
                 RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and {max} to generate, {} per lane", cx.ctx),
-            });
+            };
+            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, "invalid_request", 400);
+            return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
     let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1511,9 +1730,10 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     };
     if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
     if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
-    let (permit, preprocess) = match cx.admit_for_render() {
+    let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(e) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, e); }
+        Err(AdmitError::Overloaded(e)) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
+        Err(AdmitError::ClientGone) => { record_err(first_tok, 499, "cancelled", 0); return Ok(()); }
     };
     let rendered = render_messages(cx, req, cx.ctx);
     drop(preprocess);
@@ -1636,7 +1856,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
 
 /// The would-be prompt's token count; no lane is taken, nothing is generated.
 fn count_tokens<W: Write + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
-    let Some(preprocess) = cx.preprocess.acquire() else { return anthropic_overloaded(s, PREPROCESS_BUSY) };
+    let Some(preprocess) = cx.preprocess.acquire() else { return anthropic_overloaded(s, cx.admission.retry_after_secs(), PREPROCESS_BUSY) };
     let rendered = render_messages(cx, req, usize::MAX);
     drop(preprocess);
     match rendered {
@@ -1651,8 +1871,18 @@ pub fn serve(o: ServeOpts) {
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
-    if let Err(e) = eng.check_serve_decode(o.lanes) { eprintln!("{e}"); std::process::exit(2); }
-    eng.ensure_dbatch(o.lanes);
+    let (chip, mem) = crate::tuning::this_machine();
+    let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
+    let budget = MemoryBudget::compute(
+        eng.gpu.recommended_max_working_set_size(),
+        eng.model_and_scratch_bytes(),
+        safety_headroom_bytes,
+        eng.per_lane_worst_case_bytes(),
+        o.lanes,
+    );
+    let effective_lanes = budget.max_admitted_lanes;
+    if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
+    eng.ensure_dbatch(effective_lanes);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
@@ -1661,11 +1891,13 @@ pub fn serve(o: ServeOpts) {
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
     let (jtx, jrx) = channel::<Job>();
-    let admission_limit = o.lanes.saturating_add(o.queue).min(MAX_CONNS);
+    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::new(d.clone())));
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
-        nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: PermitPool::new(admission_limit),
+        nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
+        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
+        budget,
         preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
     // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
     let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
@@ -1673,7 +1905,21 @@ pub fn serve(o: ServeOpts) {
     let auth = if o.key.is_some() { "a key required" }
                else if addr.ip().to_canonical().is_loopback() { "no key (loopback)" }
                else { "no key (non-loopback explicitly enabled)" };
-    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", o.lanes, o.ctx, o.effort, o.queue);
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if effective_lanes < o.lanes {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB): capping lanes {} -> {}",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), o.lanes, effective_lanes
+        );
+    } else {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB, max_admitted_lanes {})",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
+        );
+    }
+    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, o.ctx, o.effort, effective_queue);
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
@@ -1750,7 +1996,7 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
-    scheduler(&eng, &tk, sp, o.lanes, jrx, active_lanes);
+    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes);
 }
 
 #[cfg(test)]
@@ -1765,15 +2011,42 @@ mod tests {
         }
     }
 
-    fn admission_test_ctx(lanes_and_queue: usize) -> (Ctx, Receiver<Job>) {
+    fn test_budget(max_lanes: usize) -> MemoryBudget {
+        MemoryBudget::compute(
+            128u64 << 30,
+            16u64 << 30,
+            4u64 << 30,
+            2u64 << 30,
+            max_lanes,
+        )
+    }
+
+    fn admission_test_ctx_with(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        preprocess_limit: usize,
+    ) -> (Ctx, Receiver<Job>) {
         let tk = Arc::new(Tokenizer::for_test());
         let (jobs, rx) = channel();
         let cx = Ctx {
             sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(lanes_and_queue), preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            admission: AdmissionGate::with_timings(
+                max_lanes,
+                max_queue,
+                queue_timeout,
+                Duration::from_millis(5),
+                DEFAULT_RETRY_AFTER_SECS,
+            ),
+            budget: test_budget(max_lanes),
+            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         };
         (cx, rx)
+    }
+
+    fn admission_test_ctx(lanes_and_queue: usize) -> (Ctx, Receiver<Job>) {
+        admission_test_ctx_with(lanes_and_queue, 0, Duration::from_millis(20), 1)
     }
 
     #[test]
@@ -1790,11 +2063,11 @@ mod tests {
         }
 
         let (cx, jobs) = admission_test_ctx(2);
-        let _active_job = cx.inflight.acquire().unwrap();
+        let _active_job = cx.admission.try_acquire().unwrap();
         let req = json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
         let error = chat(&cx, &req, &mut StalledWriter).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(cx.inflight.acquire().is_none(), "the timed-out job still occupies the channel");
+        assert!(cx.admission.try_acquire().is_none(), "the timed-out job still occupies the channel");
 
         let mut queue = VecDeque::from([jobs.try_recv().unwrap()]);
         assert!(queue[0].out.cancelled(), "the failed socket write signals cancellation");
@@ -1805,7 +2078,7 @@ mod tests {
 
         discard_cancelled_jobs(&mut queue);
         assert!(queue.is_empty(), "purging needs no free lane");
-        assert!(cx.inflight.acquire().is_some(), "the permit returns when the scheduler drops the job");
+        assert!(cx.admission.try_acquire().is_some(), "the permit returns when the scheduler drops the job");
     }
 
     #[test]
@@ -1838,7 +2111,7 @@ mod tests {
     fn overload_precedes_rendering_and_count_tokens_shares_the_preprocessing_limit() {
         let (cx, jobs) = admission_test_ctx(1);
         let req = json!({"max_tokens": 1, "messages": [{"role": "unsupported", "content": "hi"}]});
-        let generation = cx.inflight.acquire().unwrap();
+        let generation = cx.admission.try_acquire().unwrap();
         let mut response = Vec::new();
         chat(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"), "chat refuses overload before rendering the invalid role");
@@ -1862,7 +2135,7 @@ mod tests {
         response.clear();
         messages(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"));
-        assert!(cx.inflight.acquire().is_some(), "failed preprocessing admission returns the generation permit");
+        assert!(cx.admission.try_acquire().is_some(), "failed preprocessing admission returns the generation permit");
         assert!(jobs.try_recv().is_err());
     }
 
@@ -2293,7 +2566,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(64), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -2324,7 +2597,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv().unwrap();
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -2352,7 +2625,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv().unwrap();
                 let mut sent = 0usize;
@@ -2393,7 +2666,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -2415,7 +2688,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -2495,7 +2768,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    inflight: PermitPool::new(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv().unwrap();
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -2758,17 +3031,171 @@ mod tests {
     }
 
     #[test] fn health_body_reports_ok_active_lanes_and_inflight() {
-        let (cx, _jrx) = admission_test_ctx(4);
+        let (cx, _jrx) = admission_test_ctx_with(4, 2, Duration::from_secs(1), 4);
+        let b = cx.budget;
         let idle: Value = serde_json::from_str(&health_body(&cx)).unwrap();
-        assert_eq!(idle, json!({"ok": true, "active_lanes": 0, "inflight": 0}));
-        let p = cx.inflight.acquire().unwrap();
+        assert_eq!(idle, json!({
+            "ok": true,
+            "active_lanes": 0,
+            "inflight": 0,
+            "recommended_working_set_bytes": b.recommended_working_set_bytes,
+            "model_bytes": b.model_bytes,
+            "per_lane_worst_case_bytes": b.per_lane_worst_case_bytes,
+            "max_admitted_lanes": b.max_admitted_lanes,
+            "queued_requests": 0,
+        }));
+        let p = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
         let busy: Value = serde_json::from_str(&health_body(&cx)).unwrap();
-        assert_eq!(busy, json!({"ok": true, "active_lanes": 1, "inflight": 1}));
+        assert_eq!(busy["ok"], true);
+        assert_eq!(busy["active_lanes"], 1);
+        assert_eq!(busy["inflight"], 1);
+        assert_eq!(busy["queued_requests"], 0);
+        assert_eq!(busy["max_admitted_lanes"], 4);
         cx.active_lanes.store(0, Ordering::Relaxed);
         drop(p);
         let drained: Value = serde_json::from_str(&health_body(&cx)).unwrap();
-        assert_eq!(drained, json!({"ok": true, "active_lanes": 0, "inflight": 0}));
+        assert_eq!(drained["active_lanes"], 0);
+        assert_eq!(drained["inflight"], 0);
+        assert_eq!(drained["queued_requests"], 0);
+    }
+
+    #[test] fn memory_budget_caps_lanes_from_metal_working_set_and_floors_at_one() {
+        let gib = 1u64 << 30;
+        // Generous working set (115 GiB, 16 GiB model, 4 GiB margin -> 95 GiB avail; 2 GiB/lane -> 47 budget lanes).
+        // Configured 16 lanes stays 16.
+        let generous = MemoryBudget::compute(115 * gib, 16 * gib, 4 * gib, 2 * gib, 16);
+        assert_eq!(generous.available_kv_budget_bytes, 95 * gib);
+        assert_eq!(generous.max_admitted_lanes, 16);
+
+        // Tight working set (26 GiB, 16 GiB model, 4 GiB margin -> 6 GiB avail; 2 GiB/lane -> 3 budget lanes).
+        // Configured 16 lanes is capped to 3.
+        let tight = MemoryBudget::compute(26 * gib, 16 * gib, 4 * gib, 2 * gib, 16);
+        assert_eq!(tight.available_kv_budget_bytes, 6 * gib);
+        assert_eq!(tight.max_admitted_lanes, 3);
+
+        // Boundary: 1 byte short of 3 lanes caps to 2.
+        let boundary = MemoryBudget::compute(26 * gib - 1, 16 * gib, 4 * gib, 2 * gib, 16);
+        assert_eq!(boundary.max_admitted_lanes, 2);
+
+        // Exhausted budget (working set <= model + headroom) saturates to 0 avail and floors at 1 admitted lane.
+        let exhausted = MemoryBudget::compute(18 * gib, 16 * gib, 4 * gib, 2 * gib, 8);
+        assert_eq!(exhausted.available_kv_budget_bytes, 0);
+        assert_eq!(exhausted.max_admitted_lanes, 1);
+
+        // Verify exact worst-case per-lane byte accounting (40 SWA slots, 8 full slots, 64K ctx, fp16).
+        let per_lane = Engine::lane_worst_case_bytes_for(40, 8, 65536, 2, 1_000_000);
+        let expected_swa = 40u64 * 1024 * 4096;
+        let expected_full = 8u64 * 65536 * 4096;
+        let expected_cs = Engine::cs_image_bytes() as u64;
+        let expected_toks = (65536 + 8) * 4;
+        let expected_arena = 1_000_000 * 4;
+        assert_eq!(per_lane, expected_swa + expected_full + expected_cs + expected_toks + expected_arena);
+        // Short context (< EXT) caps SWA to max_ctx rather than EXT.
+        let short_lane = Engine::lane_worst_case_bytes_for(40, 8, 512, 2, 0);
+        assert_eq!(short_lane, (40 + 8) * 512 * 4096 + expected_cs + (512 + 8) * 4);
+    }
+
+    #[test] fn admission_queue_overflow_and_fifo_wakeup_with_health_telemetry() {
+        // Fake tight budget: 1 admitted lane, bounded queue of 1.
+        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        let cx = Arc::new(cx);
+        let held_lane = cx.admission.try_acquire().unwrap();
+        cx.active_lanes.store(1, Ordering::Relaxed);
+
+        // Request 2 enters the bounded wait queue and blocks until held_lane is dropped.
+        let cx_q = cx.clone();
+        let queued_worker = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            chat(&cx_q, &json!({"max_tokens": 4, "stream": false, "messages": [{"role": "user", "content": "queued"}]}), &mut out).unwrap();
+            out
+        });
+
+        // Wait until request 2 is visibly sitting in the wait queue via /health telemetry.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cx.admission.queued() != 1 {
+            assert!(Instant::now() < deadline, "queued request did not enter wait queue");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        assert_eq!(snap["active_lanes"], 1);
+        assert_eq!(snap["queued_requests"], 1);
+        assert_eq!(snap["inflight"], 2);
+        assert_eq!(snap["max_admitted_lanes"], 1);
+
+        // Request 3 exceeds queue capacity -> immediate 429 Too Many Requests + Retry-After + OpenAI error JSON.
+        let mut overflow_out = Vec::new();
+        chat(&cx, &json!({"max_tokens": 4, "stream": true, "messages": [{"role": "user", "content": "overflow"}]}), &mut overflow_out).unwrap();
+        let overflow = String::from_utf8(overflow_out).unwrap();
+        assert!(overflow.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "got: {overflow}");
+        assert!(overflow.contains("\r\nRetry-After: 5\r\n"), "missing Retry-After header: {overflow}");
+        let body_str = overflow.split("\r\n\r\n").nth(1).unwrap();
+        let body: Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(body["error"]["message"], QUEUE_FULL);
+
+        // Free lane 1 -> queued request 2 wakes up, enters scheduler, and completes with HTTP 200.
+        cx.active_lanes.store(0, Ordering::Relaxed);
+        drop(held_lane);
+        let job = jrx.recv_timeout(Duration::from_secs(2)).expect("queued job must be admitted once lane frees");
+        job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.c_text)).unwrap();
+        for tok in cx.tk.encode("ok", false) { job.out.send(Ev::Tok(tok)).unwrap(); }
+        job.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 4, reason: "stop" }).unwrap();
+        drop(job);
+
+        let queued_resp = String::from_utf8(queued_worker.join().unwrap()).unwrap();
+        assert!(queued_resp.starts_with("HTTP/1.1 200 OK\r\n"), "queued request failed: {queued_resp}");
+        assert_eq!(cx.admission.queued(), 0);
+        assert_eq!(cx.admission.inflight(), 0);
+    }
+
+    #[test] fn admission_queue_timeout_returns_429_with_retry_after_for_stream_and_nonstream() {
+        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_millis(25), 4);
+        let _held = cx.admission.try_acquire().unwrap();
+
+        for stream in [false, true] {
+            let mut out = Vec::new();
+            chat(&cx, &json!({"max_tokens": 4, "stream": stream, "messages": [{"role": "user", "content": "wait"}]}), &mut out).unwrap();
+            let resp = String::from_utf8(out).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "stream={stream}: {resp}");
+            assert!(resp.contains("\r\nRetry-After: 5\r\n"), "stream={stream}: {resp}");
+            assert!(!resp.contains("text/event-stream"), "timed-out stream must not leak SSE headers: {resp}");
+            let body: Value = serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["error"]["message"], QUEUE_TIMED_OUT);
+        }
+
+        // Anthropic /v1/messages also returns 429 + Retry-After on queue timeout.
+        let mut out = Vec::new();
+        messages(&cx, &json!({"max_tokens": 4, "stream": true, "messages": [{"role": "user", "content": "wait"}]}), &mut out).unwrap();
+        let resp = String::from_utf8(out).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "messages timeout: {resp}");
+        assert!(resp.contains("\r\nRetry-After: 5\r\n"), "messages timeout: {resp}");
+        assert_eq!(cx.admission.queued(), 0, "timed-out waiters must leave queue clean");
+        assert_eq!(cx.admission.inflight(), 1, "only the held lane remains inflight");
+        assert!(jrx.try_recv().is_err(), "timed-out requests must never reach the scheduler");
+    }
+
+    #[test] fn admission_queue_disconnect_releases_queue_slot() {
+        struct GoneWriter;
+        impl Write for GoneWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for GoneWriter {
+            fn client_gone(&self) -> bool { true }
+        }
+
+        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        let _held = cx.admission.try_acquire().unwrap();
+        let start = Instant::now();
+        chat(&cx, &json!({"max_tokens": 4, "stream": true, "messages": [{"role": "user", "content": "bye"}]}), &mut GoneWriter).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1), "disconnected queued client must exit promptly");
+        assert_eq!(cx.admission.queued(), 0, "disconnected client must free its queue slot");
+        assert_eq!(cx.admission.inflight(), 1);
+        assert!(jrx.try_recv().is_err());
     }
 
     #[test] fn serve_records_multi_turn_card_traffic_without_auth_headers() {
@@ -2784,7 +3211,7 @@ mod tests {
         let cx = Ctx {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
-            inflight: PermitPool::new(4), preprocess: PermitPool::new(2),
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
             active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
         };
 
