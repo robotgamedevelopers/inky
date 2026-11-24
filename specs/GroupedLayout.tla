@@ -10,10 +10,11 @@ TileSize == 2
 SplitSize == 4
 WindowSize == 3
 ASSUME /\ Capacity \in {3, 4}
-       /\ Bug \in {"none", "localMatch", "donorWindow", "tilePartial"}
+       /\ SplitSize % TileSize = 0
+       /\ Bug \in {"none", "localMatch", "donorWindow", "tilePartial", "restage", "stall"}
 
-VARIABLES lengths, shared, windowed, tile, loaded, visits, partials
-vars == <<lengths, shared, windowed, tile, loaded, visits, partials>>
+VARIABLES lengths, shared, windowed, tile, loaded, staged, visits, partials
+vars == <<lengths, shared, windowed, tile, loaded, staged, visits, partials>>
 Min(a,b) == IF a < b THEN a ELSE b
 Max(a,b) == IF a > b THEN a ELSE b
 LastBlock(n) == (n - 1) \div BlockSize
@@ -56,7 +57,7 @@ Init ==
     /\ shared \in 0..(Min(lengths[1],lengths[2]) \div BlockSize)
     /\ Cardinality(Resident) <= Capacity
     /\ windowed \in BOOLEAN
-    /\ tile = 0 /\ loaded = {}
+    /\ tile = 0 /\ loaded = {} /\ staged = <<>>
     /\ visits = [r \in Rows |-> <<>>] /\ partials = [r \in Rows |-> <<>>]
 
 \* Stage a physical tile once, serving every row that references it. The
@@ -67,14 +68,31 @@ Stage(s) ==
     /\ partials' = [r \in Rows |-> IF Uses(r,s) /\ EndPartial(r)
                            THEN Append(partials[r], <<Split,Stop(r)-1>>) ELSE partials[r]]
     /\ loaded' = loaded \cup {s}
+    /\ staged' = Append(staged, <<tile,s>>)
     /\ UNCHANGED <<lengths,shared,windowed,tile>>
 Advance ==
     /\ loaded = Requests
+    /\ Bug # "stall"
     /\ tile' = tile+1 /\ loaded' = {}
-    /\ UNCHANGED <<lengths,shared,windowed,visits,partials>>
-Next == \/ tile < TileCount /\ ((\E s \in Requests : Stage(s)) \/ Advance)
-        \/ tile = TileCount /\ UNCHANGED vars
-Spec == Init /\ [][Next]_vars
+    /\ UNCHANGED <<lengths,shared,windowed,staged,visits,partials>>
+\* A redundant memory load leaves the row's keys and partials unchanged.
+RedundantLoad(s) ==
+    /\ Bug = "restage" /\ s \in loaded
+    /\ Len(SelectSeq(staged, LAMBDA pair : pair = <<tile,s>>)) = 1
+    /\ staged' = Append(staged, <<tile,s>>)
+    /\ UNCHANGED <<lengths,shared,windowed,tile,loaded,visits,partials>>
+Work == /\ tile < TileCount
+        /\ (\E s \in Requests : Stage(s) \/ RedundantLoad(s)) \/ Advance
+Next == Work \/ (tile = TileCount /\ UNCHANGED vars)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Work)
+TraversalCompletes == <>(tile = TileCount)
+
+ExpectedStages == UNION {{<<p \div TileSize, Slot(r,p \div BlockSize)>> :
+                           p \in First(r)..(lengths[r]-1)} : r \in Rows}
+StagedOnce ==
+    LET pairs == {staged[i] : i \in 1..Len(staged)}
+    IN /\ Cardinality(pairs) = Len(staged)
+       /\ tile = TileCount => pairs = ExpectedStages
 
 VisitedKeys == tile = TileCount => \A r \in Rows : visits[r] = KeyRef(r)
 OrderedPartials == tile = TileCount => \A r \in Rows : partials[r] = PartRef(r)

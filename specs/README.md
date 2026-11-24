@@ -99,6 +99,13 @@ Results and timings from mini-m5 are recorded in [RESULTS.md](RESULTS.md).
 for a single attention pass over two pinned lane tables. It enumerates all
 positive row lengths and complete shared-prefix lengths that fit in three or
 four physical slots. Each block holds two keys and each split holds four keys.
+A tile is one block in this model. Production uses 64-key blocks, and the
+[private fixed-split kernel](https://github.com/robotgamedevelopers/inky/pull/37)
+uses 256-key full splits and 64-key window splits. A grouped kernel may stage
+several tiles per block. Its tile width and block crossings need their own
+kernel and trace checks. TLC requires that each modeled split contains whole
+tiles.
+
 A shared block occupies one slot across both rows; after divergence, each row
 needs a separate slot for each block, including its tail.
 
@@ -108,13 +115,22 @@ end and either full attention or a three-key sliding window. At completion TLC
 compares the sequence of key positions, physical identities and split indices
 with an independent scalar enumeration. It also compares the sequence of
 emitted partials, including the last key of each visible split. A split can
-start on a shared tile and finish on a private tile.
+start on a shared tile and finish on a private tile. A staging trace records
+the physical slot and tile of every load. Each pair must occur once, and the
+completed trace must cover every pair expected by the private rows.
 
-| Witness | Invariant | What changes |
+Under weak fairness of the enabled traversal action, each snapshot must finish.
+The liveness witness blocks the first advance after its tile's loads finish.
+That configuration turns off TLC's earlier deadlock diagnostic so the checker
+reports the infinite stutter that violates traversal completion.
+
+| Witness | Checked property | What changes |
 | --- | --- | --- |
 | `LocalMatch` | `VisitedKeys` | Two complete blocks have the same local tokens after their parents diverged. Row 2 reads row 1's slot. |
 | `DonorWindow` | `VisitedKeys` | Row 2 applies row 1's window start and visits the wrong keys. |
 | `TilePartial` | `OrderedPartials` | Emitting at the first tile end produces an extra partial inside a split. |
+| `Restage` | `StagedOnce` | A physical slot is loaded twice. The row's visited keys and emitted partials stay unchanged. |
+| `StalledTraversal` | `TraversalCompletes` | Both rows can finish their loads, yet the traversal stays on tile zero forever. |
 
 The ordered keys represent logical position and mask membership. SIMD lane
 assignment, floating-point operations and Metal execution require the kernel's

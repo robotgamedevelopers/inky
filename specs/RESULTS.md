@@ -48,8 +48,15 @@ with deadlock checking enabled. Times include JVM startup.
 
 | Run | Generated states | Distinct states | Wall seconds | Result |
 | --- | ---: | ---: | ---: | --- |
-| GroupedLayout3 | 483 | 389 | 0.310 | PASS |
-| GroupedLayout4 | 1,241 | 1,025 | 0.346 | PASS |
-| LocalMatch | 879 | 791 | 0.364 | VisitedKeys violated |
-| DonorWindow | 322 | 289 | 0.334 | VisitedKeys violated |
-| TilePartial | 319 | 285 | 0.305 | OrderedPartials violated |
+| GroupedLayout3 | 579 | 485 | 0.425 | PASS |
+| GroupedLayout4 | 1,553 | 1,329 | 0.509 | PASS |
+| LocalMatch | 1,007 | 981 | 0.392 | VisitedKeys violated |
+| DonorWindow | 361 | 343 | 0.336 | VisitedKeys violated |
+| TilePartial | 357 | 339 | 0.325 | OrderedPartials violated |
+| Restage | 149 | 149 | 0.335 | StagedOnce violated |
+| StalledTraversal | 195 | 195 | 0.397 | TraversalCompletes violated |
+
+As a separate negative-control check, the redundant-load mutant passed both
+output invariants across all 2,887 distinct states when `StagedOnce` was
+omitted. A test copy with a three-key split and a two-key tile was rejected by
+the divisibility assumption before exploring any states.
