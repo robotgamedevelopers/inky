@@ -2636,12 +2636,12 @@ impl ServeStepPlanner {
         }
     }
 
-    /// Deterministically plan the next GPU step obeying `ROADMAP.md:130-131`:
-    /// 1. Any ready lane at the starvation ceiling `W` (`wait_ticks >= max_bypass`),
-    /// 2. Longest-waiting ready lane first (decoders win ties over prefillers),
-    /// 3. Active 1-token decoding lanes,
-    /// 4. Prefill chunks sliced up to `step_token_budget` (aligned to 64-token boundaries
-    ///    unless finishing a prompt).
+    /// Deterministically plan the next GPU step (decode-first with strict starvation ceiling `W`):
+    /// 1. Active 1-token decoding lanes (`need_dec`) always win whenever `!need_dec.is_empty()`,
+    ///    UNLESS a runnable prefiller reached the starvation ceiling `W` (`max_pf_w >= W`)
+    ///    while no runnable decoder is at/above it (`max_dec_w < max_pf_w`).
+    /// 2. Otherwise prefill chunks sliced up to `step_token_budget` (aligned to 64-token
+    ///    boundaries unless finishing a prompt), reserving >= 1 token per ceiling prefiller.
     ///
     /// Transitions chosen lanes `Ready -> InStep`, resets their `wait_ticks = 0`, and
     /// increments `wait_ticks` on every bypassed runnable lane (enforcing `wait_ticks <= W`).
@@ -2673,18 +2673,12 @@ impl ServeStepPlanner {
         let max_pf_w = need_pf.iter().map(|&i| self.wait_ticks[i]).max();
 
         // Pick decode vs prefill batch:
-        // - If a prefiller reached W and no decoder reached W, prefill wins so wait_ticks <= W.
-        // - Otherwise longest-waiting lane wins, with active decoders winning ties!
+        // - Active decoders burst up to W steps while all prefillers remain below W.
+        // - Once a prefiller reaches W (and no decoder is at/above pw), prefill preempts so wait_ticks <= W.
         let choose_decode = match (max_dec_w, max_pf_w) {
             (Some(_), None) => true,
             (None, Some(_)) => false,
-            (Some(dw), Some(pw)) => {
-                if pw >= self.max_bypass && dw < self.max_bypass {
-                    false
-                } else {
-                    dw >= pw
-                }
-            }
+            (Some(dw), Some(pw)) => !(pw >= self.max_bypass && dw < pw),
             (None, None) => return None,
         };
 
@@ -3213,17 +3207,156 @@ mod tests {
         assert_eq!(p.state(2), LaneState::Cancelled);
         assert_eq!(p.state(0), LaneState::Ready);
 
-        // Step 2: lane 1 (wait_ticks=1) > lane 0 (wait_ticks=0) -> longest-waiting prefiller wins!
+        // Step 2: lane 1 wait_ticks=1 < W=2 -> decoder bursts a 2nd step; prefiller hits W=2.
         let inputs2 = [
             ServeLaneInput { runnable: true, n_past: 65, pf_end: 64, has_pending_decode: true },
             ServeLaneInput { runnable: true, n_past: 0, pf_end: 256, has_pending_decode: false },
             ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
         ];
         let plan2 = p.plan_and_begin_step(&inputs2, 128, 64).unwrap();
-        assert_eq!(plan2, ServeStepPlan::Prefill(vec![(1, 0, 128)]));
+        assert_eq!(plan2, ServeStepPlan::Decode(vec![0]));
+        assert_eq!(p.wait_ticks(1), 2);
+        assert_eq!(p.wait_ticks(0), 0);
+        assert!(p.complete_step().is_empty());
+
+        // Step 3: lane 1 hit ceiling W=2 while lane 0 is at 0 -> prefiller preempts!
+        let inputs3 = [
+            ServeLaneInput { runnable: true, n_past: 66, pf_end: 64, has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: 0, pf_end: 256, has_pending_decode: false },
+            ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
+        ];
+        let plan3 = p.plan_and_begin_step(&inputs3, 128, 64).unwrap();
+        assert_eq!(plan3, ServeStepPlan::Prefill(vec![(1, 0, 128)]));
         assert_eq!(p.wait_ticks(1), 0);
         assert_eq!(p.wait_ticks(0), 1);
         assert!(p.complete_step().is_empty());
+    }
+
+    #[test]
+    fn serve_step_planner_bursts_w_decodes_before_yielding_to_prefill() {
+        let w = 16u32;
+        let mut p = ServeStepPlanner::new(3, w);
+        for l in 0..3 {
+            p.on_admit(l);
+        }
+        let mut n_past = [64usize, 64, 0];
+        let pf_end = [64usize, 64, 8192];
+
+        // Round 1: decoders burst W=16 consecutive 1-token steps while prefiller waits 1..=16.
+        for step in 1..=w {
+            let inputs = [
+                ServeLaneInput { runnable: true, n_past: n_past[0], pf_end: pf_end[0], has_pending_decode: true },
+                ServeLaneInput { runnable: true, n_past: n_past[1], pf_end: pf_end[1], has_pending_decode: true },
+                ServeLaneInput { runnable: true, n_past: n_past[2], pf_end: pf_end[2], has_pending_decode: false },
+            ];
+            let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+            assert_eq!(plan, ServeStepPlan::Decode(vec![0, 1]), "step {step} must burst decode");
+            assert_eq!(p.wait_ticks(2), step);
+            assert_eq!(p.wait_ticks(0), 0);
+            assert_eq!(p.wait_ticks(1), 0);
+            n_past[0] += 1;
+            n_past[1] += 1;
+            assert!(p.complete_step().is_empty());
+        }
+
+        // Step W+1: prefiller reached W=16 -> prefill preempts for 1 step.
+        let inputs = [
+            ServeLaneInput { runnable: true, n_past: n_past[0], pf_end: pf_end[0], has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: n_past[1], pf_end: pf_end[1], has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: n_past[2], pf_end: pf_end[2], has_pending_decode: false },
+        ];
+        let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, ServeStepPlan::Prefill(vec![(2, 0, 4096)]));
+        assert_eq!(p.wait_ticks(2), 0);
+        assert_eq!(p.wait_ticks(0), 1);
+        assert_eq!(p.wait_ticks(1), 1);
+        n_past[2] += 4096;
+        assert!(p.complete_step().is_empty());
+
+        // Round 2: decoders immediately burst another W=16 steps before the remaining prefill runs.
+        for step in 1..=w {
+            let inputs = [
+                ServeLaneInput { runnable: true, n_past: n_past[0], pf_end: pf_end[0], has_pending_decode: true },
+                ServeLaneInput { runnable: true, n_past: n_past[1], pf_end: pf_end[1], has_pending_decode: true },
+                ServeLaneInput { runnable: true, n_past: n_past[2], pf_end: pf_end[2], has_pending_decode: false },
+            ];
+            let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+            assert_eq!(plan, ServeStepPlan::Decode(vec![0, 1]), "round 2 step {step} must burst decode");
+            assert_eq!(p.wait_ticks(2), step);
+            n_past[0] += 1;
+            n_past[1] += 1;
+            assert!(p.complete_step().is_empty());
+        }
+        let inputs = [
+            ServeLaneInput { runnable: true, n_past: n_past[0], pf_end: pf_end[0], has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: n_past[1], pf_end: pf_end[1], has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: n_past[2], pf_end: pf_end[2], has_pending_decode: false },
+        ];
+        let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, ServeStepPlan::Prefill(vec![(2, 4096, 4096)]));
+        assert!(p.complete_step().is_empty());
+    }
+
+    #[test]
+    fn serve_step_planner_adversarial_multi_prefill_wait_ticks_bounded() {
+        let w = 4u32;
+        let nlanes = 12usize;
+        let mut p = ServeStepPlanner::new(nlanes, w);
+        for l in 0..nlanes {
+            p.on_admit(l);
+        }
+        // Lanes 0..2 are active decoders; lanes 3..11 are 9 heavy prefillers (4096 tokens each)
+        // that will all hit wait_ticks == W simultaneously while step_token_budget == 4096.
+        let mut n_past = vec![64usize; nlanes];
+        let mut pf_end = vec![64usize; nlanes];
+        for l in 3..nlanes {
+            n_past[l] = 0;
+            pf_end[l] = 4096;
+        }
+        let mut decode_steps = 0usize;
+        let mut prefill_steps = 0usize;
+        for step in 0..80 {
+            let inputs: Vec<ServeLaneInput> = (0..nlanes)
+                .map(|l| {
+                    // Toggle lane 5 backpressure off/on on steps 7..10 to test staggered ceiling ties.
+                    let bp = l == 5 && (7..=10).contains(&step);
+                    ServeLaneInput {
+                        runnable: !bp && n_past[l] < pf_end[l] + 300,
+                        n_past: n_past[l],
+                        pf_end: pf_end[l],
+                        has_pending_decode: n_past[l] >= pf_end[l],
+                    }
+                })
+                .collect();
+            let Some(plan) = p.plan_and_begin_step(&inputs, 4096, 64) else {
+                break;
+            };
+            for l in 0..nlanes {
+                assert!(p.wait_ticks(l) <= w, "step {step} lane {l} exceeded W={w}: {}", p.wait_ticks(l));
+            }
+            match plan {
+                ServeStepPlan::Decode(lanes) => {
+                    decode_steps += 1;
+                    for l in lanes {
+                        n_past[l] += 1;
+                    }
+                }
+                ServeStepPlan::Prefill(spans) => {
+                    prefill_steps += 1;
+                    let total_toks: usize = spans.iter().map(|&(_, _, t)| t).sum();
+                    assert!(total_toks <= 4096);
+                    for (l, p0, t) in spans {
+                        assert_eq!(p0, n_past[l]);
+                        n_past[l] += t;
+                    }
+                }
+            }
+            assert!(p.complete_step().is_empty());
+        }
+        assert!(decode_steps > prefill_steps * 2, "decoders must burst between prefill rounds ({decode_steps} dec vs {prefill_steps} pf)");
+        for l in 3..nlanes {
+            assert!(n_past[l] >= pf_end[l], "prefiller {l} starved: n_past={} < {}", n_past[l], pf_end[l]);
+        }
     }
 
     #[test]
