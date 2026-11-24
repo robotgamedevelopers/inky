@@ -1,9 +1,9 @@
 ; docs/roadmap.sexp: the data the tables in ROADMAP.md are generated from (nova-roadmap render).
 (:schema 1
  :root "goal"
- :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
  :nodes
- ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
      ("eval-cards" "Four real cards at once through inky serve, each landing the merged fix")
@@ -355,6 +355,15 @@
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
   (:id "t-later-upstream" :type :task :title "General fixes sent upstream to inkling" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")
-  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test (pull request 17, not yet on layer2).")
+  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test.")
   (:id "t-later-aggregate" :type :task :title "Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N. The drafts share one prompt through cross-lane prompt-prefix reuse (pull request 22).")
-  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")))
+  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")
+  (:id "provider" :type :roadmap :title "Provider"
+   :rows (
+     ("provider-flash-plus" "inky as a flash+ provider")
+   )
+   :columns (("done" "done"))
+   :cells (
+     ("provider-flash-plus" "done" "t-provider-flash-plus")
+   ))
+  (:id "t-provider-flash-plus" :type :task :title "inky as a flash+ provider" :state :todo :note "Gate: a mixed batch of real flash and flash+ cards through inky on the MacBook, land rate, context length per card, and tool round trips, compared with the flash and pro providers. Glenn named the tier flash+ on 2026-11-23: at least halfway between flash and pro.")))

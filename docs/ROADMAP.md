@@ -255,3 +255,18 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 [Source data](roadmap.sexp)
 
 <!-- nova-work:later:end -->
+
+## Provider
+
+inky as a flash+ provider. Glenn named the tier flash+ on 2026-11-23: at least halfway between flash and pro. The gate is a mixed batch of real flash and flash+ cards through inky on the MacBook.
+
+<!-- nova-work:provider:start -->
+
+| feature | done |
+|---|:---:|
+| inky as a flash+ provider | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:provider:end -->
