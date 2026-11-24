@@ -713,10 +713,14 @@ mod tests {
     }
 
     fn tla_fn(values: &HashMap<Vec<u32>, i64>) -> String {
-        let parts: Vec<String> = tla_universe().iter()
-            .map(|s| format!("{} |-> {}", tla_seq(s), values.get(s).copied().unwrap_or(0)))
+        // a CASE function over the whole domain: explicit-point
+        // function literals ([<<>> |-> 0, ...]) do not parse
+        let cases: Vec<String> = tla_universe().iter()
+            .filter(|s| values.get(*s).copied().unwrap_or(0) != 0)
+            .map(|s| format!("s = {} -> {}", tla_seq(s), values[s]))
             .collect();
-        format!("[{}]", parts.join(", "))
+        if cases.is_empty() { return "[s \\in BlockSeqs |-> 0]".to_string(); }
+        format!("[s \\in BlockSeqs |-> CASE {} [] OTHER -> 0]", cases.join(" [] "))
     }
 
     /// The trace dump behind the `PrefixTreeTrace` TLC check: a seeded
@@ -753,15 +757,13 @@ mod tests {
                 gen_of.insert(seq.clone(), e.generation() as i64 - 1);
                 refs.insert(seq, 1);
             }
-            let pool: Vec<String> = (1..=3).map(|sl| {
-                let g = live.records.generation(Slot::new(sl).unwrap(), BlockKind::Full).unwrap();
-                format!("{sl} |-> {}", g - 1)
-            }).collect();
+            let g = |sl: u32| live.records.generation(Slot::new(sl).unwrap(), BlockKind::Full).unwrap() - 1;
+            let pool = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", g(1), g(2), g(3));
             format!(
                 "[op |-> \"{op}\", s |-> {}, slot |-> {slot}, sealed |-> {{{}}}, starts |-> {}, \
-                 slotOf |-> {}, genOf |-> {}, poolGen |-> [{}], refs |-> {}, result |-> {}, sought |-> {}]",
+                 slotOf |-> {}, genOf |-> {}, poolGen |-> {}, refs |-> {}, result |-> {}, sought |-> {}]",
                 tla_seq(s), sealed.join(", "), tla_fn(&starts), tla_fn(&slot_of_m),
-                tla_fn(&gen_of), pool.join(", "), tla_fn(&refs), tla_seq(result),
+                tla_fn(&gen_of), pool, tla_fn(&refs), tla_seq(result),
                 if sought { "TRUE" } else { "FALSE" })
         };
 
