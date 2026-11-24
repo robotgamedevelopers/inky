@@ -1,3 +1,4 @@
+mod blocks;
 mod engine;
 mod gguf;
 #[allow(dead_code)] // wired to the scheduler when Johnny's block interface lands (PR 49 v2)
