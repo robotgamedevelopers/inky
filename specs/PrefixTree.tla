@@ -203,6 +203,14 @@ Next ==
 \* every rule but only explores trees of at most MaxSealed blocks.
 SealedBound == Cardinality(sealed) <= MaxSealed
 
+\* The per-PR bound further: one chain only. A match walks a single
+\* chain from the root, so the deepest-start properties live there;
+\* branching is covered by the Rust tests and the any-parent witness.
+ChainBound ==
+    \A a, b \in sealed : IsPrefix(a, b) \/ IsPrefix(b, a)
+
+FastBound == SealedBound /\ ChainBound
+
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
