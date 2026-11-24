@@ -1,8 +1,9 @@
 #!/bin/sh
 # Check every available inky TLA+ model and its reversed witnesses.
 # Usage: scripts/check-tla.sh [all|memmode|layout|scheduler|traces]. all (the default; the nightly workflow) runs every
-# part. The pull-request workflow runs memmode, layout and traces as parallel jobs; the CacheScheduler models
-# (scheduler) are exhaustive and slow, so they run in the nightly workflow.
+# part, except that the CacheScheduler models run only with TLA_NIGHTLY=1. The pull-request workflow runs memmode,
+# layout and traces as parallel jobs; the CacheScheduler models (scheduler, which requires TLA_NIGHTLY=1) are
+# exhaustive and slow, so they run in the nightly workflow.
 set -eu
 
 section=${1:-all}
@@ -14,7 +15,11 @@ want() { [ "$section" = all ] || [ "$section" = "$1" ]; }
 # A part named on its own must have something to check; an empty pass is a failure.
 case $section in
     layout) [ -f "$(dirname -- "$0")/../specs/BlockLayout.tla" ] || { echo 'layout: specs/BlockLayout.tla missing' >&2; exit 1; } ;;
-    scheduler) [ -f "$(dirname -- "$0")/../specs/CacheScheduler.tla" ] || { echo 'scheduler: specs/CacheScheduler.tla missing' >&2; exit 1; } ;;
+    scheduler)
+        [ -f "$(dirname -- "$0")/../specs/CacheScheduler.tla" ] || { echo 'scheduler: specs/CacheScheduler.tla missing' >&2; exit 1; }
+        # The scheduler part exists to run the CacheScheduler models; without TLA_NIGHTLY=1 it would check nothing.
+        [ "${TLA_NIGHTLY:-0}" = 1 ] || { echo 'scheduler: refused without TLA_NIGHTLY=1 (the nightly workflow sets it)' >&2; exit 1; }
+        ;;
 esac
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -97,12 +102,28 @@ if want layout && [ -f "$root/specs/BlockLayout.tla" ]; then
         exit 1
     }
 fi
+# The CacheScheduler runner takes more than two minutes (its DecodePriority run
+# alone took 159 s on hetzner1, and the whole cpu TLA step 4 min 58 s on the
+# hosted runner, 2026-11-24). Pull request CI therefore leaves it to the nightly
+# workflow, which sets TLA_NIGHTLY=1. The runner must still exist. Asked for by
+# name (the scheduler part) without TLA_NIGHTLY=1, this script refuses above.
 if want scheduler && [ -f "$root/specs/CacheScheduler.tla" ]; then
     [ -f "$root/specs/run_cache_scheduler.sh" ] || { echo 'CacheScheduler runner missing' >&2; exit 1; }
-    TLC_OUTPUT=$work/cache-scheduler sh "$root/specs/run_cache_scheduler.sh" || {
-        find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
-        exit 1
-    }
+    case "${TLA_NIGHTLY:-0}" in
+        1)
+            TLC_OUTPUT=$work/cache-scheduler sh "$root/specs/run_cache_scheduler.sh" || {
+                find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
+                exit 1
+            }
+            ;;
+        0)
+            echo 'CacheScheduler: not run here; nightly only (.github/workflows/nightly.yml)'
+            ;;
+        *)
+            echo "TLA_NIGHTLY must be 0 or 1, not $TLA_NIGHTLY" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # Required since PR #23: a missing checker must fail this gate.

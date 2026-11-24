@@ -11,7 +11,8 @@ SplitSize == 4
 WindowSize == 3
 ASSUME /\ Capacity \in {3, 4}
        /\ SplitSize % TileSize = 0
-       /\ Bug \in {"none", "localMatch", "donorWindow", "tilePartial", "restage", "stall"}
+       /\ Bug \in {"none", "localMatch", "donorWindow", "tilePartial", "restage", "stall",
+                  "advanceUnfair"}
 
 VARIABLES lengths, shared, windowed, tile, loaded, staged, visits, partials
 vars == <<lengths, shared, windowed, tile, loaded, staged, visits, partials>>
@@ -84,7 +85,12 @@ RedundantLoad(s) ==
 Work == /\ tile < TileCount
         /\ (\E s \in Requests : Stage(s) \/ RedundantLoad(s)) \/ Advance
 Next == Work \/ (tile = TileCount /\ UNCHANGED vars)
-Spec == Init /\ [][Next]_vars /\ WF_vars(Work)
+\* The fair action is Work. The advanceUnfair witness narrows fairness to
+\* staging, so Advance may stay enabled forever without being taken.
+FairWork == IF Bug = "advanceUnfair"
+            THEN tile < TileCount /\ \E s \in Requests : Stage(s)
+            ELSE Work
+Spec == Init /\ [][Next]_vars /\ WF_vars(FairWork)
 TraversalCompletes == <>(tile = TileCount)
 
 ExpectedStages == UNION {{<<p \div TileSize, Slot(r,p \div BlockSize)>> :

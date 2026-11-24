@@ -13,7 +13,7 @@ concurrency:
 # Every job here must finish in about a minute (Glenn, 2026-11-23: pull request and push CI averages one minute or
 # less). Anything slower runs in .github/workflows/nightly.yml, where it still fails red:
 #   the CacheScheduler TLC models, the release-profile unit tests and clean release build, the slow GPU gates
-#   (binv, lanes, spans and its sabotage, dbatch, golden hashes) and the serve API negative control.
+#   (binv, lanes, spans and its sabotage, dbatch, crosspath, golden hashes) and the serve API negative control.
 jobs:
   # unit: a GitHub-hosted ARM Mac; the CPU-only unit tests in the test profile (overflow checks and debug asserts on).
   # Shaders compile at runtime, so the build needs no GPU. rust-cache keeps target/ and ~/.cargo keyed on Cargo.lock.
@@ -25,6 +25,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: unit tests
         run: cargo test --locked --bins
+      # tests/serve.sh's in-process header test runs here, not in m5-serve. Like serve.sh, require exactly one
+      # serve_header_policy test to run and pass, so a rename or removal fails this job.
+      - name: serve_header_policy runs exactly once
+        run: |
+          out=$(cargo test --locked --bins serve_header_policy 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
   # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel.
   tla:
     runs-on: macos-latest
@@ -43,13 +50,11 @@ jobs:
         run: scripts/check-tla.sh ${{ matrix.part }}
   # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
   # Pull requests from forks never run here (the repository also requires approval for outside contributors).
-  # Only pushes to main and pull requests into main run here: the two M5 runners are the bottleneck, so a pull
-  # request into a stream branch (layer3, rowan/stella-cover, rowan/land-*) runs unit and tla only, and the stream's
-  # own pull request into main runs the M5 gates once for the whole batch.
+  # Every same-repository pull request runs both, stream bases included: each takes about 40 s.
   # Both jobs build the `ci` profile (release without fat LTO, incremental), which rebuilds in about a second on a
   # runner's warm target/; the nightly workflow runs every gate on the true release profile.
   m5-gpu:
-    if: github.event_name == 'push' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
@@ -61,7 +66,7 @@ jobs:
           INKY_BIN: ./target/ci/inky
         run: tests/ci.sh pr
   m5-serve:
-    if: github.event_name == 'push' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:

@@ -5,7 +5,8 @@
 #     path (a short prompt) and the prefill path (a 2394-token prompt).
 #  2. batch invariance (inky binv), lane independence (inky lanes), steps over spans (inky spans), decode steps over
 #     lanes (inky dbatch) and the cross-lane prefix copy (inky xcopy): every lane identical to itself alone; decode
-#     steps also agree with llama.cpp. The sabotaged spans and xcopy runs are required to fail.
+#     steps also agree with llama.cpp. Crosspath compares tensor prefill and decode on the same row.
+#     The sabotaged spans and xcopy runs are required to fail.
 #  3. tests/golden.sh is byte-identical to tests/golden-<chip>.txt: the logits did not change. A change that changes them
 #     on purpose updates that file in the same commit and says why.
 # Usage: tests/ci.sh [full|pr]. full (the default; the nightly workflow) runs everything above. pr (every pull request
@@ -49,7 +50,7 @@ $B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -
 # negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
 if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
 if [ "$mode" = pr ]; then
-    echo "pr set done; binv, lanes, spans (and its sabotage), dbatch and golden run in the nightly workflow (tests/ci.sh full)"
+    echo "pr set done; binv, lanes, spans (and its sabotage), dbatch, crosspath and golden run in the nightly workflow (tests/ci.sh full)"
     exit $fail
 fi
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
@@ -59,6 +60,7 @@ INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee 
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other failure does not count
 if INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1 | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else echo "FAIL: spans sabotage not detected"; fail=1; fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
+$B crosspath --ref ref/long.tokens -c 4096 || { echo "FAIL: crosspath"; fail=1; }
 chip=$(sysctl -n machdep.cpu.brand_string | sed 's/Apple //; s/ /-/g' | tr A-Z a-z)
 if [ -f tests/golden-$chip.txt ]; then
     tests/golden.sh $B > /tmp/inky-golden.$$ 2>&1

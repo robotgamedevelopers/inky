@@ -1,10 +1,11 @@
 name: nightly
 # The checks too slow for the one-minute pull-request CI (ci.yml). Each still fails red here.
+# No timeout-minutes on any job or step: a nightly has no time limit, and a slow nightly is not a failure.
 # GitHub runs a schedule only from the default branch, so the cron starts once this file is on main;
 # workflow_dispatch runs it on any branch by hand (gh workflow run nightly.yml --ref <branch>).
 on:
   schedule:
-    - cron: '17 9 * * *'
+    - cron: '17 6 * * *'
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,7 +18,6 @@ jobs:
   # cargo test --release --bins, about 100 s cold).
   release-cpu:
     runs-on: macos-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: build
@@ -26,26 +26,42 @@ jobs:
         run: cargo test --locked --release --bins
   # The exhaustive CacheScheduler safety and liveness models and their reversed witnesses
   # (about 195 s with two TLC workers on hetzner2; CacheSchedulerTwoPrefixes alone is 61 s).
+  # run_cache_scheduler.sh gives TLC -Xmx8g. ubuntu-latest for a public repository has 4 CPUs and 16 GB of RAM;
+  # macos-latest (arm64) has 7 GB, too little for an 8 GB heap, so this job runs on Linux and checks the memory first.
   tla-scheduler:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
+      - name: memory for an 8 GB TLC heap
+        run: |
+          kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          echo "MemTotal ${kb} kB"
+          # 8 GiB of heap plus room for the JVM and the OS: at least 12 GiB.
+          test "$kb" -ge $((12 * 1024 * 1024)) || { echo "runner has too little memory for -Xmx8g" >&2; exit 1; }
       - name: TLA scheduler
         env:
+          TLA_NIGHTLY: '1'
           TLC_WORKERS: '4'
         run: scripts/check-tla.sh scheduler
+  # Self-hosted runners serve this repository only. A run anywhere else (a fork's dispatch) fails here, loudly,
+  # instead of skipping m5-full or leaving it queued for a runner that does not exist.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: this repository owns the M5 runners
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
   # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
-  # its sabotage, dbatch, the golden hashes (about 16 min together) and the serve API negative control.
+  # its sabotage, dbatch, crosspath, the golden hashes (about 16 min together) and the serve API negative control.
   m5-full:
-    # Self-hosted runners serve this repository only; a fork's schedule never reaches them.
-    if: github.repository == 'robotgamedevelopers/inky'
+    needs: guard
     runs-on: [self-hosted, macOS, ARM64, m5]
-    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: build
@@ -57,12 +73,10 @@ jobs:
           go-version: '1.26.10'
           cache: false
       - name: serve API probes
-        timeout-minutes: 10
         env:
           SERVECHECK_SABOTAGE: ''
         run: tests/serve.sh
       - name: serve API negative control
-        timeout-minutes: 10
         env:
           SERVECHECK_SABOTAGE: health-status
         run: |
