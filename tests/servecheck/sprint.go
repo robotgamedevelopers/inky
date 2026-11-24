@@ -446,12 +446,13 @@ func (g *gate) opencodeHarnessChatLoop() error {
 		return parseOpenAIUsageStream(resp.Body)
 	}
 
-	// Turn 1: streaming with stream_options.include_usage=true and tool_calls.
+	// Turn 1: streaming with stream_options.include_usage=true, opencode's default
+	// max_tokens=128000 (clamped cleanly to lane context), and tool_calls.
 	sum1, err := postChat(map[string]any{
 		"model":            "inky/inkling-2-mini",
 		"stream":           true,
 		"stream_options":   map[string]any{"include_usage": true},
-		"max_tokens":       128,
+		"max_tokens":       128000,
 		"seed":             4242,
 		"temperature":      0.0,
 		"reasoning_effort": "none",

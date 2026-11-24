@@ -91,3 +91,14 @@ INKY_URL=http://100.65.89.96:18096 INKY_SERVE_KEY="$KEY" ./tests/fleet_gate.sh
   - `FLEET_CARD_PASS card_id=fleet-card-amd3-tailscale turns=4 tools=read_file,edit_file,run_test prompt_tokens=3325 cached_tokens=2301 completion_tokens=281`
   - Post-card `go test -v ./...`: `PASS ok fleetcard`
 - **Operational note on `macbook` (`100.117.59.68`)**: `macbook` currently has macOS Application Firewall enabled (`socketfilterfw State = 1`), dropping non-allowlisted adhoc-signed binaries on non-loopback sockets; adding `target/release/inky` to `socketfilterfw` enables the identical `amd-3 -> macbook` Tailscale route.
+
+### Real `claude` CLI & `opencode` CLI Sprint Harness Qualification (2026-11-24)
+
+Both production `nova-sprint` coding-agent harnesses were qualified end-to-end against `inky serve` on `mini-m5` (`100.65.89.96:18096`) in isolated Git repositories (`DONE-WHEN: go test ./...`):
+
+1. **`claude` CLI (`2.1.311`, Anthropic `/v1/messages`)**:
+   - Bare mode (`claude --bare -p --model inkling-2-mini`): 5 turns (`1,294`–`1,923` prompt tokens/turn), read `clamp.go` & `clamp_test.go`, edited `clamp.go`, ran `go test ./...` -> `PASS ok clampcard`, `CLAUDE_EXIT=0` (`25.7s`).
+   - Full mode (`claude -p --model inkling-2-mini` with isolated `CLAUDE_CONFIG_DIR`): 6 turns (`12,800`–`13,507` prompt tokens/turn), fixed `clamp.go:9`, ran `go test ./... -count=1` -> `PASS ok clampcard`, `CLAUDE_FULL_EXIT=0` (`78.1s`).
+2. **`opencode` CLI (`1.18.20`, OpenAI `/v1/chat/completions`, `amd-3` -> `mini-m5` over Tailscale)**:
+   - Using `nova-sprint`'s exact `OPENCODE_CONFIG_CONTENT` (`@ai-sdk/openai-compatible`, `"models": {"inkling-2-mini": {}}`): surfaced `opencode`'s default `max_tokens: 128000` payload, fixed via `clamped_chat_max` in `src/serve.rs`.
+   - Re-run over Tailscale (`amd-3` -> `100.65.89.96:18096/v1`): concurrent title + build agent turns across 2 lanes (`8,278`–`8,997` prompt tokens/turn), read `clamp.go` & `clamp_test.go`, applied fix, verified `go test -count=1 ./...` -> `PASS ok clampcard 0.002s`, `OPENCODE_EXACT_EXIT=0`.

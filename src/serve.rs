@@ -1633,6 +1633,21 @@ fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
 /// 1M, so refusing here would kill every long card). When the prompt itself
 /// does not fit, the error is Anthropic's own over-long text, word for word,
 /// so the client's reactive compaction recognizes it.
+/// Maximum requested token budget accepted on `/v1/chat/completions` before clamping to the lane
+/// context. Real OpenAI coding-agent harnesses (such as `opencode` 1.x when a custom model omits
+/// a limit) send default budgets like `128000`; clamping positive budgets up to 1M matches
+/// `/v1/messages` while still rejecting overflow sentinels such as `u64::MAX`.
+const MAX_CHAT_TOKEN_BUDGET: usize = 1 << 20;
+
+/// The reply budget of a `/v1/chat/completions` request, adjusted to the lane: when
+/// `prompt + max + 2` exceeds `ctx` but the prompt fits with at least one reply token
+/// and the scheduler's two reserved tokens, clamp `max` to what fits.
+fn clamped_chat_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, String> {
+    if !context_over(prompt, max, ctx) { return Ok(max); }
+    if prompt.saturating_add(3) <= ctx { return Ok(ctx - prompt - 2); }
+    Err(context_full_message(prompt, 1, ctx))
+}
+
 fn clamped_messages_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, String> {
     if !context_over(prompt, max, ctx) { return Ok(max); }
     if prompt.saturating_add(3) <= ctx { return Ok(ctx - prompt - 2); }
@@ -1689,6 +1704,7 @@ fn record_turn_outcome(
     });
 }
 
+#[cfg(test)]
 fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
     chat_with_card(cx, req, None, s)
 }
@@ -1706,12 +1722,12 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
             match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
-                Some(v) if v > 0 && v < cx.ctx => budgets[i] = Some(v),
-                _ => return bad(format!("{name} must be between 1 and {}", cx.ctx - 1)),
+                Some(v) if v > 0 && v <= MAX_CHAT_TOKEN_BUDGET => budgets[i] = Some(v),
+                _ => return bad(format!("{name} must be between 1 and {MAX_CHAT_TOKEN_BUDGET}")),
             }
         }
     }
-    let max = budgets[0].or(budgets[1]).unwrap_or(cx.max_tokens);
+    let requested_max = budgets[0].or(budgets[1]).unwrap_or(cx.max_tokens);
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     let top_k = match req.get("top_k") {
@@ -1750,7 +1766,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             return Ok(());
         }
     };
-    let prompt_limit = cx.ctx.saturating_sub(max.saturating_add(2));
+    let prompt_limit = cx.ctx.saturating_sub(3);
     let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit);
     drop(preprocess);
     let toks = match rendered {
@@ -1759,8 +1775,16 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             drop(permit);
             let message = match e {
                 RenderError::Invalid(message) => message,
-                RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and {max} to generate, {} per lane", cx.ctx),
+                RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
             };
+            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+            return respond(s, 400, &json!({"error": {"message": message}}).to_string());
+        }
+    };
+    let max = match clamped_chat_max(toks.len(), requested_max, cx.ctx) {
+        Ok(m) => m,
+        Err(message) => {
+            drop(permit);
             record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
@@ -1898,6 +1922,7 @@ fn render_messages(cx: &Ctx, req: &Value, limit: usize) -> Result<Vec<u32>, Rend
     render_limited(&cx.tk, &cx.sp, &openai, &cx.effort, limit)
 }
 
+#[cfg(test)]
 fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
     messages_with_card(cx, req, None, s)
 }
@@ -2823,7 +2848,7 @@ mod tests {
             max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
-            for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(64), json!("8")] {
+            for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
                 req[name] = value;
                 let mut out = Vec::new();
@@ -2836,6 +2861,37 @@ mod tests {
         let mut out = Vec::new();
         chat(&cx, &req, &mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().starts_with("HTTP/1.1 400"));
+    }
+
+    #[test] fn chat_clamps_positive_budgets_to_remaining_lane_context() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let (jtx, jrx) = channel::<Job>();
+        let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
+            max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+        let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
+        let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
+        let expected_clamped = 64 - expected_prompt - 2;
+        assert!(expected_clamped > 0 && expected_clamped < 64);
+
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("opencode-style 128000 max_tokens request must reach scheduler");
+            assert_eq!(job.max, expected_clamped, "positive max_tokens above ctx must clamp to remaining lane budget");
+            let _ = job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() });
+        });
+        let mut out = Vec::new();
+        chat(&cx, &req, &mut out).unwrap();
+        scheduler.join().unwrap();
+        assert!(String::from_utf8(out).unwrap().starts_with("HTTP/1.1 200 OK"));
+
+        // Over-context prompt still fails cleanly with HTTP 400.
+        let too_long = json!({"messages": [{"role": "user", "content": "x".repeat(200)}], "max_tokens": 128000});
+        let mut err_out = Vec::new();
+        chat(&cx, &too_long, &mut err_out).unwrap();
+        let err_s = String::from_utf8(err_out).unwrap();
+        assert!(err_s.starts_with("HTTP/1.1 400"), "got: {err_s}");
+        assert!(err_s.contains("context full"), "got: {err_s}");
     }
 
     #[test] fn messages_stream_polls_even_during_hidden_thinking() {

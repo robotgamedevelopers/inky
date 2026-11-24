@@ -196,8 +196,8 @@ Real work arrives from a fleet of agents.
 |---|:---:|
 | A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling | ✅ |
 | Harness and tools run on other machines and reach the endpoint over a private network | ✅ |
-| Gate: a real low-priority card lands from the fleet | ❌ |
-| complete | 66% |
+| Gate: a real low-priority card lands from the fleet | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
