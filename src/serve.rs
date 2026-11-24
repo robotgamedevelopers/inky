@@ -960,7 +960,6 @@ pub fn serve(o: ServeOpts) {
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
     eng.ensure_batch(eng.chunk);
-    eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
                             nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
