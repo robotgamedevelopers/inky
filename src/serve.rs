@@ -248,6 +248,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
         }
     }
     let mut out = json!({"messages": msgs});
+    if let Some(e) = anthropic_effort(req) { out["reasoning_effort"] = json!(e); }
     if let Some(tools) = req.get("tools").filter(|t| !t.is_null()) {
         let tools = tools.as_array().ok_or("tools must be an array")?;
         if !tools.is_empty() {
@@ -260,6 +261,28 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
         }
     }
     Ok(out)
+}
+
+/// The thinking effort a Messages request asks for, as the `reasoning_effort`
+/// the chat path renders through `effort_num` — or none, when the request
+/// leaves the serve default standing. An explicit effort field wins (top
+/// level, `output_config`, or inside `thinking`); then `thinking` itself:
+/// disabled is none, an enabled budget maps by size (under 4096 low, under
+/// 16384 medium, else high), and adaptive — or no thinking at all — decides
+/// for itself, so it sets nothing.
+fn anthropic_effort(req: &Value) -> Option<String> {
+    let field = |v: &Value| v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(e) = req.get("output_config").and_then(|o| o.get("effort")).and_then(field) { return Some(e); }
+    if let Some(e) = req.get("effort").and_then(field) { return Some(e); }
+    let th = req.get("thinking")?;
+    if let Some(e) = th.get("effort").and_then(field) { return Some(e); }
+    match th["type"].as_str() {
+        Some("disabled") => Some("none".into()),
+        Some("enabled") => th["budget_tokens"].as_u64().map(|b| match b {
+            0 => "none", 1..=4095 => "low", 4096..=16383 => "medium", _ => "high",
+        }.to_string()),
+        _ => None,
+    }
 }
 
 /// The reply's stop reason: a tool call outranks the length stop, as the chat path's finish reason does.
@@ -1168,6 +1191,40 @@ mod tests {
             {"role": "user", "content": "Continue"}]});
         assert_eq!(render(&tk, &sp, &o, "medium").unwrap(), render(&tk, &sp, &chat, "medium").unwrap(),
             "a system role inside messages[] must render as the chat path renders a system message in place");
+    }
+
+    #[test] fn anthropic_thinking_maps_to_the_effort_line() {
+        // Claude Code on /v1/messages carries thinking settings, not the
+        // chat path's reasoning_effort; they must land on the same
+        // "Thinking effort level" line, through effort_num, or the serve
+        // --effort default stands.
+        let base = |extra: Value| {
+            let mut r = json!({"model": "inkling-2-mini", "max_tokens": 1024, "messages": [{"role": "user", "content": "Hi"}]});
+            for (k, v) in extra.as_object().unwrap() { r[k] = v.clone(); }
+            r
+        };
+        let effort_of = |r: Value| anthropic_to_openai(&r).unwrap().get("reasoning_effort").and_then(|v| v.as_str()).map(|s| s.to_string());
+        assert_eq!(effort_of(base(json!({}))), None, "no thinking settings: the --effort default stands");
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "adaptive"}}))), None, "adaptive decides for itself: no override");
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "disabled"}}))), Some("none".into()), "thinking off is effort none");
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}))), Some("low".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 8192}}))), Some("medium".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 32000}}))), Some("high".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 0}}))), Some("none".into()));
+        // an explicit effort field wins over the budget, wherever it sits
+        assert_eq!(effort_of(base(json!({"output_config": {"effort": "xhigh"}, "thinking": {"type": "enabled", "budget_tokens": 1024}}))), Some("xhigh".into()));
+        assert_eq!(effort_of(base(json!({"effort": "max", "thinking": {"type": "disabled"}}))), Some("max".into()));
+        // and it renders to the chat path's effort line, not a second spelling
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let a = anthropic_to_openai(&base(json!({"thinking": {"type": "disabled"}}))).unwrap();
+        let chat = json!({"reasoning_effort": "none", "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(render(&tk, &sp, &a, "high").unwrap(), render(&tk, &sp, &chat, "high").unwrap(),
+            "thinking disabled must render the effort-0 line even under a high serve default");
+        let a = anthropic_to_openai(&base(json!({"thinking": {"type": "enabled", "budget_tokens": 32000}}))).unwrap();
+        let chat = json!({"reasoning_effort": "high", "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(render(&tk, &sp, &a, "none").unwrap(), render(&tk, &sp, &chat, "none").unwrap(),
+            "a large budget must render the high effort line even under a none serve default");
     }
 
     #[test] fn anthropic_translation_refuses_what_it_cannot_render() {
