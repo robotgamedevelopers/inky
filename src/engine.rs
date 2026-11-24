@@ -21,6 +21,8 @@ pub const LOOP_START: usize = 6;
 pub const LOOP_END: usize = 18;
 pub const N_PASS: usize = 3;
 pub const N_SLOT: usize = N_PHYS + (N_PASS - 1) * (LOOP_END - LOOP_START);
+const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
+const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
 /// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
@@ -478,10 +480,26 @@ impl Lane {
         }
     }
 
-    /// The lane's block table. Empty until the table worker fills it.
+    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
     /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
+
+    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
+    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
+    /// is `NoSlots`. Does not allocate a GPU buffer.
+    #[allow(dead_code)]
+    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
+        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
+    }
+
+    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
+    /// The slot base comes from the lane table. The width is the pool's `kvb`.
+    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
+    #[allow(dead_code)]
+    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
+        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
+    }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
@@ -2095,7 +2113,9 @@ impl<'a> Run<'a> {
         self.bind_eng(e);
         e.buf(&self.lane.kv_swa.borrow(), 0, 3); e.buf(&self.lane.cs, 0, 4); e.buf(&self.lane.toks, 0, 6);
     }
-    /// (k_base, v_base, cap) of a slot's K/V inside its buffer (offsets in cache elements: fp16, or bytes with --kv8)
+    /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
+    /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
+    /// table. A block-cache key address is `Lane::attn_key_offset`, a `u64` from the table.
     fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
         let (swa, i) = self.slot_kind[slot];
         let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };
