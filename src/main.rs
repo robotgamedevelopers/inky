@@ -401,6 +401,144 @@ fn rollback(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, scheduler verify gate. One lane, synthetic drafts, no drafter, temperature 0.
+/// Kept tokens and the logit hash at each kept position match `encode_spans` of t=1, one position
+/// at a time. A forced reject leaves the correction and `lane_hash` the same as that run. A stop
+/// token in the middle of the drafts emits only the prefix. A verify at the K/V boundary clamps k
+/// and does not trip the capacity assert. The no-drafter serve path is not this command.
+/// Not this run: temperature, more than one lane, sealing a tail, tok/s.
+fn verify(o: &Opts) {
+    use engine::Span;
+    use serve::{logit_hash, verify_step, VerifyIn};
+    let k = 3usize;
+    let ctx = 128usize;
+    println!("verify gate: one lane, synthetic drafts, no drafter, temp 0, ctx {ctx}");
+    let eng = Engine::load(&o.model, ctx);
+    eng.ensure_batch(eng.chunk);
+    let prompt: Vec<u32> = (0..8).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+    let p0 = prompt.len() - 1;
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    // baseline: the same prompt, encode_spans of t=1, one position at a time. No encode_decode.
+    let base = Lane::new(&eng);
+    eng.on(&base).set_tokens(0, &prompt);
+    for pos in 0..p0 { step1(&base, pos, false); }
+    let mut gen_toks = Vec::new();
+    let mut gen_hash = Vec::new();
+    let mut hash_after = Vec::new();
+    for i in 0..=k {
+        let pos = p0 + i;
+        if i > 0 { eng.on(&base).set_tokens(pos, &[gen_toks[i - 1]]); }
+        step1(&base, pos, true);
+        let lg = eng.logits().to_vec();
+        gen_hash.push(logit_hash(&lg));
+        gen_toks.push(serve::argmax(&lg));
+        hash_after.push(eng.lane_hash(&base));
+    }
+    println!("fixed prompt {prompt:?}");
+    println!("baseline tokens {gen_toks:?}");
+    let prep = |toks: &[u32]| {
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.set_tokens(0, toks);
+        for pos in 0..toks.len() - 1 { step1(&lane, pos, false); }
+        let cs = run.get_cs();
+        step1(&lane, toks.len() - 1, false);
+        run.set_cs(&cs);
+        (lane, cs)
+    };
+    let mut ok = true;
+    // full accept: synthetic drafts are the baseline tokens. Not a drafter.
+    {
+        let (lane, cs) = prep(&prompt);
+        let drafts = gen_toks[..k].to_vec();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        if let Some(kept) = kept {
+            let same_tok = kept.emitted == gen_toks[..=k];
+            let same_hash = kept.hashes == gen_hash[..=k];
+            ok &= same_tok && same_hash;
+            println!("match kept {} logit hashes {}", if same_tok { "same" } else { "DIFFERENT" }, if same_hash { "same" } else { "DIFFERENT" });
+            if !same_tok { println!("  emitted {:?} baseline {:?}", kept.emitted, &gen_toks[..=k]); }
+        } else {
+            println!("match: verify waited");
+            ok = false;
+        }
+    }
+    // forced rejects, as in the rollback gate: middle draft, and the last draft.
+    for (name, at) in [("middle", 1usize), ("last", k - 1)] {
+        let (lane, cs) = prep(&prompt);
+        let mut drafts = gen_toks[..k].to_vec();
+        let right = drafts[at];
+        drafts[at] = right.wrapping_add(1);
+        assert_ne!(drafts[at], right);
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        let Some(kept) = kept else { println!("reject {name}: verify waited"); ok = false; continue; };
+        let next = kept.bonus;
+        let next_ok = next == Some(gen_toks[at]);
+        let pos = kept.p0 + kept.n_keep;
+        eng.on(&lane).set_tokens(pos, &[gen_toks[at]]);
+        step1(&lane, pos, false);
+        let hash_ok = eng.lane_hash(&lane) == hash_after[at + 1];
+        ok &= next_ok && hash_ok;
+        println!("reject {name} next token {} lane_hash {}", if next_ok { "same" } else { "DIFFERENT" }, if hash_ok { "same" } else { "DIFFERENT" });
+    }
+    // stop in the middle of a draft block that would otherwise have been kept.
+    {
+        let stop_tok = gen_toks[1];
+        let (lane, cs) = prep(&prompt);
+        let drafts = gen_toks[..k].to_vec();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[stop_tok]).pop().unwrap();
+        if let Some(kept) = kept {
+            let mut expect = Vec::new();
+            for &t in &drafts {
+                expect.push(t);
+                if t == stop_tok { break; }
+            }
+            let prefix_ok = kept.emitted == expect && kept.finished && kept.bonus.is_none();
+            ok &= prefix_ok;
+            println!("stop in the middle emitted {:?} (prefix {:?}) {}", kept.emitted, expect, if prefix_ok { "prefix only" } else { "DIFFERENT" });
+        } else {
+            println!("stop: verify waited");
+            ok = false;
+        }
+    }
+    // context boundary: the unclamped span would pass the cache. The clamp keeps the assert quiet.
+    {
+        let n = 61usize;
+        let toks: Vec<u32> = (0..n).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        let cap = run.kv_capacity();
+        run.set_tokens(0, &toks);
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane: &lane, p0: 0, t: n - 1 }], false, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let cs = run.get_cs();
+        step1(&lane, n - 1, false);
+        run.set_cs(&cs);
+        let p0b = n - 1;
+        let want = 7usize;
+        assert!(p0b + 1 + want > cap, "the unclamped span has to be past the cache");
+        let drafts = vec![1u32; want];
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        if let Some(kept) = kept {
+            let clamped = kept.k < want && p0b + 1 + kept.k <= cap;
+            ok &= clamped;
+            println!("boundary k clamped {want} -> {}, p0 {p0b} cap {cap}, {}", kept.k, if clamped { "no capacity assert" } else { "NOT CLAMPED" });
+        } else {
+            println!("boundary: verify waited");
+            ok = false;
+        }
+    }
+    println!("{}", if ok { "verify gate matches encode_spans of t=1" } else { "VERIFY GATE FAILED" });
+    if !ok { std::process::exit(1); }
+}
+
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
 fn binv(o: &Opts) {
@@ -1037,6 +1175,7 @@ fn main() {
         "check" => check(&o),
         "rows" => rows(&o),
         "rollback" => rollback(&o),
+        "verify" => verify(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),

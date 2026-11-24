@@ -1,12 +1,13 @@
 //! `inky serve`: OpenAI chat completions and Anthropic Messages endpoints over many lanes. One scheduler thread owns the engine and
-//! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens) or a
-//! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
-//! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
-//! prompt's end; a request whose tokens extend that prompt continues the lane from there, so a card's next turn prefills
-//! only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
-//! may also start a different lane: when the lane holding the longest matching prompt is busy, its prefill-written
-//! prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the suffix is
-//! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
+//! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens), a verify
+//! step (lanes that hold drafts; their own call, not mixed into prefill), or a decode step (one token for every generating
+//! lane that has no drafts). The no-drafter path never sets drafts and stays on `encode_decode`. Connection threads parse
+//! requests, render the chat template, and stream back what the scheduler sends them. A lane keeps its last prompt and its
+//! convolution state at the prompt's end; a request whose tokens extend that prompt continues the lane from there, so a
+//! card's next turn prefills only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5).
+//! The same kept prompt may also start a different lane: when the lane holding the longest matching prompt is busy, its
+//! prefill-written prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the
+//! suffix is prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
 use crate::engine::{Engine, Lane, Span};
@@ -407,6 +408,13 @@ struct Active {
     #[allow(dead_code)]
     draft_sampler: Sampler,
     pending: Option<u32>,
+    /// Synthetic drafts for one verify round, length k. None on the no-drafter path, which stays
+    /// `encode_decode`. This step does not run a drafter.
+    drafts: Option<Vec<u32>>,
+    /// Convolution state from before the token a verify span re-encodes (`p0`).
+    cs_before: Option<Vec<u8>>,
+    /// Tokens a verify step emits, 1 to k+1. Empty on the no-drafter path.
+    emit_q: VecDeque<u32>,
 }
 
 /// Tokens two token lists share at their start.
@@ -457,7 +465,156 @@ fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usi
     eng.copy_lane_prefix(&s.lane, &d.lane, n);
 }
 
-fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
+pub(crate) fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
+
+/// FNV-1a over the raw logit bits of one vocabulary row.
+pub(crate) fn logit_hash(row: &[f32]) -> u64 {
+    let mut h = 0u64;
+    for x in row { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+    h
+}
+
+/// One lane the verify planner can see. `lane` is the index the caller uses to map the plan back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerifyCand { pub lane: usize, pub p0: usize, pub k: usize, pub kv_cap: usize }
+
+/// A span chosen for this step. `k` is already clamped. The span length is `1 + k`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VerifySpanPlan { pub lane: usize, pub p0: usize, pub k: usize }
+
+/// `k` such that `p0 + 1 + k <= kv_cap`, or none when the committed token itself does not fit.
+/// That is the clamp that keeps `encode_spans_x`'s K/V capacity assert from firing.
+pub(crate) fn clamp_k(p0: usize, k: usize, kv_cap: usize) -> Option<usize> {
+    let room = kv_cap.saturating_sub(p0);
+    if room == 0 { return None; }
+    Some(k.min(room - 1))
+}
+
+/// Pack verify spans into one step. The budget is the prefill's: the sum of `1 + k` stays `<= chunk`.
+/// A span that does not fit the remaining budget stops the pack; that lane and every lane behind it
+/// wait for a later step. Spans are not split, and a span is not handed to the prefill call.
+/// Lanes in one step share one `k`, because `encode_verify` takes a single `k`. Without `multi`
+/// (no hgemm) only one span runs. A lane whose committed token does not fit the cache is skipped.
+pub(crate) fn plan_verify(cands: &[VerifyCand], chunk: usize, multi: bool) -> Vec<VerifySpanPlan> {
+    let mut budget = chunk;
+    let mut out = Vec::new();
+    for c in cands {
+        if !multi && !out.is_empty() { break; }
+        let Some(k) = clamp_k(c.p0, c.k, c.kv_cap) else { continue; };
+        let t = 1 + k;
+        if t > budget { break; }
+        if out.first().is_some_and(|p: &VerifySpanPlan| p.k != k) { break; }
+        budget -= t;
+        out.push(VerifySpanPlan { lane: c.lane, p0: c.p0, k });
+    }
+    out
+}
+
+/// What greedy acceptance kept. `rows` are the span rows whose logits predicted an emitted token.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GreedyKeep {
+    pub emitted: Vec<u32>,
+    pub n_keep: usize,
+    pub finished: bool,
+    pub rows: Vec<usize>,
+    /// Token past the accepted drafts. None when a stop token in the drafts ended the block:
+    /// drafts after that stop are not emitted, and there is no bonus.
+    pub bonus: Option<u32>,
+}
+
+/// Greedy verify, temperature 0. A draft is kept only when it equals that row's argmax.
+/// A mismatch keeps the target's token and stops. A stop token in the middle of the drafts
+/// emits only the prefix through the stop, and the lane finishes. `rows` has length `k + 1`
+/// (one argmax per draft, plus the bonus row). Emits 1 to `k + 1` tokens.
+pub(crate) fn accept_greedy(drafts: &[u32], rows: &[u32], stop: &[u32]) -> GreedyKeep {
+    assert_eq!(rows.len(), drafts.len() + 1, "one argmax per draft, plus the bonus row");
+    let mut emitted = Vec::new();
+    let mut used = Vec::new();
+    let mut n_acc = 0usize;
+    for i in 0..drafts.len() {
+        if rows[i] != drafts[i] { break; }
+        emitted.push(drafts[i]);
+        used.push(i);
+        n_acc += 1;
+        if stop.contains(&drafts[i]) {
+            return GreedyKeep { emitted, n_keep: 1 + n_acc, finished: true, rows: used, bonus: None };
+        }
+    }
+    let bonus = rows[n_acc];
+    emitted.push(bonus);
+    used.push(n_acc);
+    GreedyKeep { emitted, n_keep: 1 + n_acc, finished: stop.contains(&bonus), rows: used, bonus: Some(bonus) }
+}
+
+/// One lane ready for `verify_step`. `cs_before` is the convolution state from before `p0`.
+/// `drafts` are synthetic: this step does not draft.
+pub(crate) struct VerifyIn<'a> {
+    pub lane: &'a Lane,
+    pub p0: usize,
+    pub cs_before: &'a [u8],
+    pub drafts: &'a [u32],
+}
+
+/// One lane of a verify step that ran. `None` from `verify_step` means the lane waited.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifyKept {
+    pub p0: usize,
+    pub k: usize,
+    pub emitted: Vec<u32>,
+    pub n_keep: usize,
+    pub finished: bool,
+    pub hashes: Vec<u64>,
+    pub bonus: Option<u32>,
+}
+
+/// One verify step. `encode_verify` (the `encode_spans` path of length `1 + k`), never
+/// `encode_decode` and never `encode_prefill`. Lanes that do not fit this step are `None`.
+/// The bonus token is not encoded here: its K and V land on the next step, which is
+/// `encode_spans` of `t = 1` for the gate and `encode_decode` only when the lane has no
+/// further drafts. Rollback leaves the lane at the accepted prefix.
+pub(crate) fn verify_step(eng: &Engine, lanes: &[VerifyIn<'_>], stop: &[u32]) -> Vec<Option<VerifyKept>> {
+    let cands: Vec<VerifyCand> = lanes.iter().enumerate().map(|(i, v)| VerifyCand {
+        lane: i, p0: v.p0, k: v.drafts.len(), kv_cap: eng.on(v.lane).kv_capacity(),
+    }).collect();
+    let plans = plan_verify(&cands, eng.chunk, eng.hgemm);
+    let mut out = vec![None; lanes.len()];
+    if plans.is_empty() { return out; }
+    let k = plans[0].k;
+    for p in &plans {
+        let v = &lanes[p.lane];
+        debug_assert_eq!(p.k, k);
+        eng.on(v.lane).set_cs(v.cs_before);
+        if k > 0 { eng.on(v.lane).set_tokens(p.p0 + 1, &v.drafts[..k]); }
+    }
+    let spans: Vec<Span> = plans.iter().map(|p| Span { lane: lanes[p.lane].lane, p0: p.p0, t: 1 + k }).collect();
+    let cb = eng.gpu.cmd();
+    eng.encode_verify(&cb, &spans, k);
+    cb.commit();
+    cb.waitUntilCompleted();
+    struct Staged { si: usize, lane: usize, p0: usize, keep: GreedyKeep, hashes: Vec<u64> }
+    let mut staged = Vec::new();
+    for (si, p) in plans.iter().enumerate() {
+        let base = si * (1 + k);
+        let mut argmaxes = Vec::with_capacity(1 + k);
+        let mut every = Vec::with_capacity(1 + k);
+        for r in 0..=k {
+            let lg = eng.span_logits(base + r);
+            every.push(logit_hash(lg));
+            argmaxes.push(argmax(lg));
+        }
+        let keep = accept_greedy(&lanes[p.lane].drafts[..k], &argmaxes, stop);
+        let hashes = keep.rows.iter().map(|&r| every[r]).collect();
+        staged.push(Staged { si, lane: p.lane, p0: p.p0, keep, hashes });
+    }
+    for s in &staged { eng.rollback_verify(lanes[s.lane].lane, s.si, s.keep.n_keep); }
+    for s in staged {
+        out[s.lane] = Some(VerifyKept {
+            p0: s.p0, k, emitted: s.keep.emitted, n_keep: s.keep.n_keep, finished: s.keep.finished,
+            hashes: s.hashes, bonus: s.keep.bonus,
+        });
+    }
+    out
+}
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>) {
     let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
@@ -510,23 +667,35 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap, j.seed);
             let l = &mut lanes[i];
             l.prompt.clear(); l.cs_at_prompt = None;
-            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
+            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, drafts: None, cs_before: None, emit_q: VecDeque::new(), job: j });
         }
-        // a step: prefill when a lane has prompt left (alternating with decode while others generate), else decode
+        // a step: prefill when a lane has prompt left (alternating with generation), else verify
+        // (lanes holding drafts; not mixed into the prefill call), else decode. No drafts: decode.
         let need_pf: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past < a.pf_end)).collect();
-        let need_dec: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past >= a.pf_end && a.pending.is_some())).collect();
-        if !need_pf.is_empty() && (need_dec.is_empty() || !last_was_prefill) {
+        let need_ver: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past >= a.pf_end && a.n_past > 0 && a.drafts.is_some() && a.cs_before.is_some())).collect();
+        let need_dec: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past >= a.pf_end && a.pending.is_some() && a.drafts.is_none())).collect();
+        if !need_pf.is_empty() && ((need_dec.is_empty() && need_ver.is_empty()) || !last_was_prefill) {
             last_was_prefill = true;
             let mut budget = eng.chunk;
             let mut sp_list: Vec<(usize, usize, usize)> = Vec::new();      // (lane, p0, t)
+            let mut snap_last: Vec<(usize, Vec<u8>)> = Vec::new();
             for &i in &need_pf {
                 if budget == 0 { break; }
-                let a = lanes[i].job.as_ref().unwrap();
-                let t = (a.pf_end - a.n_past).min(budget);
-                // end chunks on 64-position boundaries unless they end the prompt (start points, docs/DESIGN.md)
-                let t = if a.n_past + t < a.pf_end && t > 64 { t - (a.n_past + t) % 64 } else { t };
-                sp_list.push((i, a.n_past, t)); budget -= t;
+                let (p0, t, snap) = {
+                    let a = lanes[i].job.as_ref().unwrap();
+                    let t = (a.pf_end - a.n_past).min(budget);
+                    // end chunks on 64-position boundaries unless they end the prompt (start points, docs/DESIGN.md)
+                    let t = if a.n_past + t < a.pf_end && t > 64 { t - (a.n_past + t) % 64 } else { t };
+                    // a verify lane re-encodes the last prompt token, so that token has to be its own step
+                    // and the convolution state from before it has to be kept. No-drafter lanes do not split.
+                    let t = if a.drafts.is_some() && a.cs_before.is_none() && a.n_past + t == a.pf_end && t > 1 { t - 1 } else { t };
+                    let snap = t == 1 && a.drafts.is_some() && a.cs_before.is_none() && a.n_past + t == a.pf_end;
+                    (a.n_past, t, snap)
+                };
+                if snap { snap_last.push((i, eng.on(&lanes[i].lane).get_cs())); }
+                sp_list.push((i, p0, t)); budget -= t;
             }
+            for (i, cs) in snap_last { lanes[i].job.as_mut().unwrap().cs_before = Some(cs); }
             let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
             let many = spans.len() > 1;
@@ -535,17 +704,58 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 let a = l.job.as_mut().unwrap();
                 a.n_past = p0 + t;
                 if a.n_past == a.pf_end {
-                    // the prompt is in: keep its state for the next turn, then sample the first token
+                    // the prompt is in: keep its state for the next turn, then sample the first token.
+                    // a lane that already holds drafts samples that token inside the verify span instead.
                     l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
                     l.prompt = a.job.toks.clone();
-                    let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                    let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
-                    a.pending = Some(tok);
+                    if a.drafts.is_none() || a.cs_before.is_none() {
+                        let lg = if many { eng.span_logits(k) } else { eng.logits() };
+                        let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
+                        a.pending = Some(tok);
+                    }
                 } else if a.job.out.send(Ev::Alive).is_err() {
                     // the client went away during its prefill: free the lane now
                     eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed", a.n_past, a.pf_end);
                     l.job = None; l.tick = tick_seq; tick_seq += 1;
                 }
+            }
+        } else if !need_ver.is_empty() {
+            last_was_prefill = false;
+            let mut runnable: Vec<usize> = Vec::new();
+            for &i in &need_ver {
+                let cap = eng.on(&lanes[i].lane).kv_capacity();
+                let (p0, fit) = {
+                    let a = lanes[i].job.as_ref().unwrap();
+                    let p0 = a.n_past - 1;
+                    let nk = a.drafts.as_ref().unwrap().len();
+                    (p0, clamp_k(p0, nk, cap).is_some_and(|k| 1 + k <= eng.chunk))
+                };
+                if fit { runnable.push(i); continue; }
+                let _ = lanes[i].job.as_ref().unwrap().job.out.send(Ev::Err(format!("verify span at {p0} does not fit the K/V cache ({cap}) or the chunk ({})", eng.chunk)));
+                lanes[i].job = None; lanes[i].tick = tick_seq; tick_seq += 1;
+            }
+            let owned: Vec<(usize, Vec<u8>, Vec<u32>, usize)> = runnable.iter().map(|&i| {
+                let a = lanes[i].job.as_ref().unwrap();
+                (i, a.cs_before.clone().unwrap(), a.drafts.clone().unwrap(), a.n_past - 1)
+            }).collect();
+            let kept = {
+                let input: Vec<VerifyIn> = owned.iter().map(|(i, cs, drafts, p0)| VerifyIn {
+                    lane: &lanes[*i].lane, p0: *p0, cs_before: cs, drafts,
+                }).collect();
+                verify_step(eng, &input, &stop)
+            };
+            for (slot, kopt) in kept.into_iter().enumerate() {
+                let Some(kpt) = kopt else { continue };
+                let i = owned[slot].0;
+                let l = &mut lanes[i];
+                let a = l.job.as_mut().unwrap();
+                a.emit_q.extend(kpt.emitted);
+                // the bonus is emitted now and encoded on the next step. With no further drafts that
+                // next step is encode_decode, the no-drafter path. n_past stays on the bonus.
+                a.n_past = kpt.p0 + kpt.n_keep;
+                a.pending = kpt.bonus;
+                a.drafts = None;
+                a.cs_before = None;
             }
         } else if !need_dec.is_empty() {
             last_was_prefill = false;
@@ -563,6 +773,22 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         // emit the tokens just sampled; finish lanes that stopped or whose client went away
         for l in lanes.iter_mut() {
             let Some(a) = l.job.as_mut() else { continue };
+            // a verify step emits 1 to k+1 tokens. The no-drafter path leaves this queue empty and emits one.
+            if !a.emit_q.is_empty() {
+                while let Some(tok) = a.emit_q.pop_front() {
+                    let gone = a.job.out.send(Ev::Tok(tok)).is_err();
+                    a.gen += 1;
+                    let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
+                                 else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
+                    if let Some(r) = reason {
+                        if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
+                        let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+                        l.job = None; l.tick = tick_seq; tick_seq += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
             let Some(tok) = a.pending else { continue };
             if a.n_past < a.pf_end { continue; }
             // a token is emitted once, right after it is sampled: then n_past - pf_end == gen
@@ -1497,5 +1723,58 @@ mod tests {
         assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
         assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
         assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
+    }
+
+    #[test] fn verify_budget_waits_and_clamps_to_capacity() {
+        let c = |lane, p0, k, kv_cap| VerifyCand { lane, p0, k, kv_cap };
+        // two spans of 4, chunk 4: the second does not fit and waits
+        let p = plan_verify(&[c(0, 10, 3, 100), c(1, 10, 3, 100)], 4, true);
+        assert_eq!(p, vec![VerifySpanPlan { lane: 0, p0: 10, k: 3 }]);
+        // without hgemm a second lane waits even when the budget remains
+        let p = plan_verify(&[c(0, 1, 1, 100), c(1, 1, 1, 100)], 100, false);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].lane, 0);
+        // near the cache: p0=60, cap=64, k=7 -> k=3 because 60+1+3 == 64
+        let p = plan_verify(&[c(0, 60, 7, 64)], 4096, false);
+        assert_eq!(p, vec![VerifySpanPlan { lane: 0, p0: 60, k: 3 }]);
+        assert!(60 + 1 + p[0].k <= 64);
+        // only the committed token fits: k clamps to 0, the span is t=1, the assert stays quiet
+        let p = plan_verify(&[c(0, 63, 7, 64)], 4096, true);
+        assert_eq!(p[0].k, 0);
+        // the committed token itself is past the cache: the lane waits, it does not call encode
+        assert!(plan_verify(&[c(0, 64, 1, 64)], 4096, true).is_empty());
+        // a different k is not packed into a step that already chose one
+        let p = plan_verify(&[c(0, 10, 3, 100), c(1, 10, 1, 100)], 100, true);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].k, 3);
+    }
+
+    #[test] fn verify_stop_in_the_middle_emits_only_the_prefix() {
+        let drafts = [1u32, 7, 2];
+        let rows = [1u32, 7, 2, 9];
+        let g = accept_greedy(&drafts, &rows, &[7]);
+        assert_eq!(g.emitted, vec![1, 7]);
+        assert!(g.finished);
+        assert_eq!(g.bonus, None, "drafts after the stop are not emitted, and there is no bonus");
+        assert_eq!(g.n_keep, 3);
+        assert!(!g.emitted.contains(&2) && !g.emitted.contains(&9));
+    }
+
+    #[test] fn verify_reject_keeps_the_target_token_and_a_full_accept_emits_the_bonus() {
+        let g = accept_greedy(&[1, 99, 3], &[1, 2, 3, 4], &[]);
+        assert_eq!(g.emitted, vec![1, 2], "the mismatch keeps the target token and stops");
+        assert_eq!(g.bonus, Some(2));
+        assert!(!g.finished);
+        assert_eq!(g.n_keep, 2);
+        let g = accept_greedy(&[1, 2, 3], &[1, 2, 3, 8], &[]);
+        assert_eq!(g.emitted, vec![1, 2, 3, 8]);
+        assert_eq!(g.bonus, Some(8));
+        assert_eq!(g.n_keep, 4);
+        assert_eq!(g.rows, vec![0, 1, 2, 3]);
+        // the bonus itself is the stop: it is emitted, and the lane finishes
+        let g = accept_greedy(&[1, 2], &[1, 2, 7], &[7]);
+        assert_eq!(g.emitted, vec![1, 2, 7]);
+        assert!(g.finished);
+        assert_eq!(g.bonus, Some(7));
     }
 }
