@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -24,6 +25,7 @@ type toolCall struct {
 }
 
 type toolEvent struct {
+	ID      string `json:"id"`
 	Choices []struct {
 		Delta struct {
 			Content   string `json:"content"`
@@ -62,92 +64,167 @@ func (g *gate) openStream(body string) (io.ReadCloser, *bufio.Scanner, error) {
 	return resp.Body, bufio.NewScanner(resp.Body), nil
 }
 
-// Drain one streamed reply to its tool calls, in call order.
-func drainToolCalls(lines *bufio.Scanner) ([]toolCall, string, error) {
-	var calls []toolCall
-	finish := ""
-	for lines.Scan() {
-		line := lines.Text()
+// One streamed reply, read incrementally: first to its first generated
+// delta (the overlap proof), then drained to its tool calls.
+type toolStream struct {
+	lines     *bufio.Scanner
+	id        string
+	calls     []toolCall
+	finish    string
+	lastDelta bool
+}
+
+func (s *toolStream) next() (done bool, err error) {
+	for s.lines.Scan() {
+		line := s.lines.Text()
 		if line == "" {
 			continue
 		}
 		data, ok := strings.CutPrefix(line, "data: ")
 		if !ok {
-			return nil, "", fmt.Errorf("unexpected SSE line %q", line)
+			return false, fmt.Errorf("unexpected SSE line %q", line)
 		}
 		if data == "[DONE]" {
-			return calls, finish, nil
+			return true, nil
 		}
 		var e toolEvent
 		if err := json.Unmarshal([]byte(data), &e); err != nil {
-			return nil, "", err
+			return false, err
 		}
-		if len(e.Choices) != 1 {
-			return nil, "", fmt.Errorf("missing completion choice: %s", data)
+		if len(e.Choices) != 1 || e.ID == "" || (s.id != "" && s.id != e.ID) {
+			return false, fmt.Errorf("inconsistent stream ID or choice count: %s", data)
 		}
+		s.id = e.ID
 		ch := e.Choices[0]
 		for _, c := range ch.Delta.Calls {
-			for len(calls) <= c.Index {
-				calls = append(calls, toolCall{Index: len(calls)})
+			for len(s.calls) <= c.Index {
+				s.calls = append(s.calls, toolCall{Index: len(s.calls)})
 			}
 			if c.ID != "" {
-				calls[c.Index].ID = c.ID
+				s.calls[c.Index].ID = c.ID
 			}
 			if c.Function.Name != "" {
-				calls[c.Index].Name = c.Function.Name
+				s.calls[c.Index].Name = c.Function.Name
 			}
-			calls[c.Index].Args += c.Function.Arguments
+			s.calls[c.Index].Args += c.Function.Arguments
 		}
 		if ch.Finish != "" {
-			finish = ch.Finish
+			s.finish = ch.Finish
+		}
+		s.lastDelta = ch.Delta.Content != "" || ch.Delta.Reasoning != "" || len(ch.Delta.Calls) > 0
+		return false, nil
+	}
+	if err := s.lines.Err(); err != nil {
+		return false, err
+	}
+	return false, io.ErrUnexpectedEOF
+}
+
+// Read events until the reply has generated something (a content or
+// reasoning delta, or a tool call): the stream is mid-generation here.
+func (s *toolStream) firstDelta() error {
+	for {
+		done, err := s.next()
+		if err != nil {
+			return err
+		}
+		if done {
+			return fmt.Errorf("stream ended before any generated delta")
+		}
+		if s.lastDelta {
+			return nil
 		}
 	}
-	if err := lines.Err(); err != nil {
-		return nil, "", err
+}
+
+// Drain the rest of the stream to [DONE].
+func (s *toolStream) drain() error {
+	for {
+		done, err := s.next()
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
 	}
-	return nil, "", io.ErrUnexpectedEOF
 }
 
 func (g *gate) concurrentToolCalls() error {
-	// Both streams are open before either is drained: the requests really
-	// are in flight together, on two lanes, with the same seed.
-	bodies := make([]io.ReadCloser, 2)
-	scans := make([]*bufio.Scanner, 2)
-	for i := range bodies {
+	// Both streams are opened, then each is read to its first generated
+	// delta before either is drained: as in seededReplies, that plus the
+	// serve log (neither request finished yet) proves the two requests
+	// really were generating together, not serialised by the server.
+	streams := make([]*toolStream, 2)
+	for i := range streams {
 		body, lines, err := g.openStream(toolBody)
 		if err != nil {
 			return fmt.Errorf("open stream %d: %w", i, err)
 		}
 		defer body.Close()
-		bodies[i], scans[i] = body, lines
+		streams[i] = &toolStream{lines: lines}
+	}
+	type firstResult struct {
+		i   int
+		id  string
+		err error
+	}
+	firsts := make(chan firstResult, 2)
+	for i, s := range streams {
+		go func() {
+			err := s.firstDelta()
+			firsts <- firstResult{i, s.id, err}
+		}()
+	}
+	ids := make(map[string]bool)
+	seen := 0
+	timeout := time.After(60 * time.Second)
+	for seen < 2 {
+		select {
+		case f := <-firsts:
+			if f.err != nil {
+				return fmt.Errorf("stream %d first delta: %w", f.i, f.err)
+			}
+			if !strings.HasPrefix(f.id, "chatcmpl-") || ids[f.id] {
+				return fmt.Errorf("invalid or duplicated chat id %q", f.id)
+			}
+			ids[f.id] = true
+			seen++
+		case <-timeout:
+			return fmt.Errorf("only %d of 2 streams produced a first delta in 60s; not concurrent", seen)
+		}
+	}
+	serverLog, err := os.ReadFile(g.log)
+	if err != nil {
+		return err
+	}
+	for id := range ids {
+		if strings.Contains(string(serverLog), "[serve] #"+strings.TrimPrefix(id, "chatcmpl-")+" prompt ") {
+			return fmt.Errorf("%s already finished before both first deltas; the requests did not overlap", id)
+		}
 	}
 	type outcome struct {
-		calls  []toolCall
-		finish string
-		err    error
+		i   int
+		err error
 	}
 	ends := make(chan outcome, 2)
-	for i := range scans {
-		go func(lines *bufio.Scanner) {
-			c, f, e := drainToolCalls(lines)
-			ends <- outcome{c, f, e}
-		}(scans[i])
+	for i, s := range streams {
+		go func() { ends <- outcome{i, s.drain()} }()
 	}
-	var got [2]outcome
-	for i := range got {
-		got[i] = <-ends
-		if got[i].err != nil {
-			return fmt.Errorf("stream %d: %w", i, got[i].err)
+	for range streams {
+		if o := <-ends; o.err != nil {
+			return fmt.Errorf("stream %d: %w", o.i, o.err)
 		}
 	}
-	for i, o := range got {
-		if o.finish != "tool_calls" {
-			return fmt.Errorf("stream %d finished %q, want tool_calls", i, o.finish)
+	got := [2]*toolStream{streams[0], streams[1]}
+	for i, s := range got {
+		if s.finish != "tool_calls" {
+			return fmt.Errorf("stream %d finished %q, want tool_calls", i, s.finish)
 		}
-		if len(o.calls) == 0 {
+		if len(s.calls) == 0 {
 			return fmt.Errorf("stream %d issued no tool call", i)
 		}
-		for _, c := range o.calls {
+		for _, c := range s.calls {
 			if c.Name != "get_weather" {
 				return fmt.Errorf("stream %d called %q, want get_weather", i, c.Name)
 			}
