@@ -1,7 +1,7 @@
 //! Test driver for the real scheduler. The workload advances only at tick boundaries;
 //! receiver drops exercise the same output-channel failure as a disconnected client.
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const LANES: usize = 2;
@@ -33,7 +33,8 @@ struct Workload<'a> {
     random: u64,
     tick: usize,
     submitted: u64,
-    outstanding: usize,
+    /// Requests sent to the scheduler whose trace has not yet ended (finish, cancel or refuse_ctx).
+    outstanding: BTreeSet<u64>,
     /// The last prompt that fits a lane; a later prompt may extend it, so lanes reuse and copy prefixes.
     last: Vec<u32>,
     /// One request per walk is too long for a lane's context, so the context refusal is always exercised.
@@ -76,7 +77,7 @@ impl Workload<'_> {
         };
         let (out, rx) = channel();
         self.clients.insert(job, (rx, slot));
-        self.outstanding += 1;
+        self.outstanding.insert(job);
         self.metrics.lock().unwrap().queued += 1;
         self.jobs.as_ref().unwrap().send(Job {
             seq: job, queued_at: Instant::now(), toks,
@@ -86,11 +87,18 @@ impl Workload<'_> {
 }
 
 impl Trace for Workload<'_> {
-    fn boundary(&mut self) {
+    fn boundary(&mut self, idle: bool) {
         self.tick += 1;
+        // Requests reach the scheduler only from this thread, so at a boundary none is in flight on the
+        // channel: an idle scheduler holds nothing, and every request sent must already have ended its trace.
+        // Checked here, before the scheduler would block waiting for work, so a lost terminal event fails
+        // the test instead of hanging it.
+        assert!(!idle || self.outstanding.is_empty(),
+                "tick {}: the scheduler is idle but requests {:?} never reached a terminal trace event", self.tick, self.outstanding);
+        assert!(idle || !self.outstanding.is_empty(), "tick {}: the scheduler holds work after every request ended", self.tick);
         assert!(self.tick < 512, "scheduler did not drain the seeded workload");
         self.clients.retain(|_, (rx, _)| !rx.try_iter().any(|ev| matches!(ev, Ev::Done { .. } | Ev::Err(_))));
-        if self.submitted == REQUESTS && self.outstanding == 0 {
+        if self.submitted == REQUESTS && self.outstanding.is_empty() {
             self.jobs.take();
             return;
         }
@@ -100,7 +108,7 @@ impl Trace for Workload<'_> {
             self.clients.remove(&job);
             self.events.push(json!({"event":"disconnect","job":job}));
         }
-        let arrivals = if self.tick == 1 { LANES + QUEUE + 1 } else if self.outstanding == 0 {
+        let arrivals = if self.tick == 1 { LANES + QUEUE + 1 } else if self.outstanding.is_empty() {
             // An idle scheduler blocks until a real request arrives.
             1
         } else {
@@ -114,7 +122,7 @@ impl Trace for Workload<'_> {
         self.events.push(json!({"event":"admit","job":job,"lane":adm.dst,"cached":adm.prefix,"source":source,"from":adm.src}));
     }
     fn refuse_ctx(&mut self, job: u64) {
-        self.outstanding -= 1;
+        assert!(self.outstanding.remove(&job), "request {job} ended twice or was never sent");
         self.events.push(json!({"event":"refuse_ctx","job":job}));
     }
     fn step(&mut self, mode: &str, spans: impl Iterator<Item = (u64,usize,usize,usize)>) {
@@ -125,7 +133,7 @@ impl Trace for Workload<'_> {
     }
     fn step_finished(&mut self) { self.events.push(json!({"event":"finish_step"})); }
     fn terminal(&mut self, job: u64, lane: usize, reason: &str, generated: usize) {
-        self.outstanding -= 1;
+        assert!(self.outstanding.remove(&job), "request {job} ended twice or was never sent");
         if reason == "cancelled" {
             self.events.push(json!({"event":"cancel","job":job,"lane":lane,"generated":generated}));
         } else {
@@ -139,7 +147,7 @@ fn walk(seed: u64) -> Vec<Value> {
     let metrics = Mutex::new(Counters::new(Instant::now()));
     let (sender, receiver) = channel();
     let mut workload = Workload {
-        random:seed, tick:0, submitted:0, outstanding:0, last:vec![], oversized:false, jobs:Some(sender),
+        random:seed, tick:0, submitted:0, outstanding:BTreeSet::new(), last:vec![], oversized:false, jobs:Some(sender),
         clients:BTreeMap::new(), inflight:&inflight, metrics:&metrics,
         events:vec![json!({"event":"config","version":SCHEMA_VERSION,"seed":seed,"lanes":LANES,"queue":QUEUE,"chunk":CHUNK,"context":CONTEXT})],
     };

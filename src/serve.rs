@@ -460,7 +460,9 @@ fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, 
 /// Observations from the production decision loop. The live server uses the
 /// zero-sized observer; only the seeded test driver materializes trace rows.
 trait Trace {
-    fn boundary(&mut self) {}
+    /// The top of each scheduler iteration. `idle` is true when no lane holds a request and the queue is
+    /// empty: the scheduler is about to block until a new request arrives.
+    fn boundary(&mut self, _idle: bool) {}
     /// A request leaves the queue for lane `adm.dst`; `adm.src` and `adm.prefix` say where its cached prefix
     /// comes from (the lane's own kept prompt, a copy from another lane, or nothing).
     fn admit(&mut self, _job: u64, _adm: Admission) {}
@@ -481,7 +483,7 @@ fn run_scheduler<E: SchedulerEngine, T: Trace>(
     let mut queue: VecDeque<Job> = VecDeque::new();
     let mut last_was_prefill = false;
     loop {
-        trace.boundary();
+        trace.boundary(queue.is_empty() && lanes.iter().all(|l| l.job.is_none()));
         // take new requests: block only when there is nothing to do
         let busy = lanes.iter().any(|l| l.job.is_some());
         if !busy && queue.is_empty() { match rx.recv() { Ok(j) => queue.push_back(j), Err(_) => return } }
