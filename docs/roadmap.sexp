@@ -161,7 +161,7 @@
   (:id "t-l3-model-layout" :type :task :title "BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses" :state :done :evidence ("main f676b09 (PR 9): specs/BlockLayout.tla, specs/SpanPins.tla, specs/RESULTS.md") :note "PR 9 merged into main, not layer2; scripts/check-tla.sh runs specs/run_tlc.zsh in CI once main's specs/ reach layer2. Offsets are checked as high-limb preservation and table indexing, not general 64-bit carry.")
   (:id "t-l3-blocks" :type :task :title "Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers" :state :todo)
   (:id "t-l3-table" :type :task :title "Attention reads keys through a per-lane block table of 64-bit offsets" :state :todo)
-  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :todo)
+  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :doing :note "Aurora: src/prefix.rs (PrefixTree behind the PrefixMatch trait, exact-token validation, digest only narrows) and specs/PrefixTree.tla with a shallow-seek reversed witness; PR against layer3 open, built behind its own trait until Johnny's block interface (PR 49) lands as v2")
   (:id "t-l3-start" :type :task :title "Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads" :state :todo)
   (:id "t-l3-tail" :type :task :title "Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse" :state :todo)
   (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :todo)
