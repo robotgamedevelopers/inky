@@ -38,3 +38,18 @@ Inspected counterexamples:
 These runs establish only the bounds and abstractions in [README.md](README.md).
 They do not establish engine trace conformance, general integer-overflow safety,
 allocator-policy independence, or scheduler liveness.
+
+## Grouped layout
+
+On mini-m5, the CI entry point `scripts/check-tla.sh` ran the grouped traversal
+with the pinned v1.8.0 tools jar and one TLC worker. The three-slot run covers
+62 initial snapshots and the four-slot run covers 136. Both exhaust the graph
+with deadlock checking enabled. Times include JVM startup.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| GroupedLayout3 | 483 | 389 | 0.310 | PASS |
+| GroupedLayout4 | 1,241 | 1,025 | 0.346 | PASS |
+| LocalMatch | 879 | 791 | 0.364 | VisitedKeys violated |
+| DonorWindow | 322 | 289 | 0.334 | VisitedKeys violated |
+| TilePartial | 319 | 285 | 0.305 | OrderedPartials violated |

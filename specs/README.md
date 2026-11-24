@@ -92,3 +92,30 @@ also selects the worst alignment). Healthy configurations enable every invariant
 | `SpanPins17` | `Covered` | At offset 63, a 512-token span reads logical blocks 0 through 24; pinning 0 through 16 leaves eight blocks unpinned. |
 
 Results and timings from mini-m5 are recorded in [RESULTS.md](RESULTS.md).
+
+## Grouped tile traversal
+
+`GroupedLayout` checks the layout part of [the shared-prefix model gate](../docs/SHARED-PREFIX.md#gates-in-landing-order)
+for a single attention pass over two pinned lane tables. It enumerates all
+positive row lengths and complete shared-prefix lengths that fit in three or
+four physical slots. Each block holds two keys and each split holds four keys.
+A shared block occupies one slot across both rows; after divergence, each row
+needs a separate slot for each block, including its tail.
+
+For each tile, TLC explores staging the distinct physical slots in either order.
+A staged slot serves the rows that reference it. Each row applies its own causal
+end and either full attention or a three-key sliding window. At completion TLC
+compares the sequence of key positions, physical identities and split indices
+with an independent scalar enumeration. It also compares the sequence of
+emitted partials, including the last key of each visible split. A split can
+start on a shared tile and finish on a private tile.
+
+| Witness | Invariant | What changes |
+| --- | --- | --- |
+| `LocalMatch` | `VisitedKeys` | Two complete blocks have the same local tokens after their parents diverged. Row 2 reads row 1's slot. |
+| `DonorWindow` | `VisitedKeys` | Row 2 applies row 1's window start and visits the wrong keys. |
+| `TilePartial` | `OrderedPartials` | Emitting at the first tile end produces an extra partial inside a split. |
+
+The ordered keys represent logical position and mask membership. SIMD lane
+assignment, floating-point operations and Metal execution require the kernel's
+bitwise tests. Block allocation and lifetime are checked in their own models.

@@ -51,3 +51,8 @@ check SpanTooSmall BlockLayout SpanPinned
 check StartReleased BlockLayout StartRetained
 check SpanPins512 SpanPins
 check SpanPins17 SpanPins Covered
+check GroupedLayout3 GroupedLayout
+check GroupedLayout4 GroupedLayout
+check LocalMatch GroupedLayout VisitedKeys
+check DonorWindow GroupedLayout VisitedKeys
+check TilePartial GroupedLayout OrderedPartials
