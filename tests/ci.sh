@@ -3,8 +3,9 @@
 # $INKY_REF (default ~/inky-ci/ref; tests/make-reference.sh writes them).
 #  1. agreement with llama.cpp: every checked position's argmax agrees and the worst KL is at most 0.01, on the decode
 #     path (a short prompt) and the prefill path (a 2394-token prompt).
-#  2. batch invariance (inky binv), lane independence (inky lanes), steps over spans (inky spans) and decode steps over
-#     lanes (inky dbatch): every lane identical to itself alone; decode steps also agree with llama.cpp.
+#  2. batch invariance (inky binv), lane independence (inky lanes), steps over spans (inky spans), decode steps over
+#     lanes (inky dbatch) and the cross-lane prefix copy (inky xcopy): every lane identical to itself alone; decode
+#     steps also agree with llama.cpp. The sabotaged spans and xcopy runs are required to fail.
 #  3. tests/golden.sh is byte-identical to tests/golden-<chip>.txt: the logits did not change. A change that changes them
 #     on purpose updates that file in the same commit and says why.
 set -e
@@ -37,6 +38,12 @@ agree "decode steps, short prompt vs llama.cpp " "INK_DEC=1" short
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
 INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
+# negative control: the sabotaged spans run (one span bound to the wrong lane's state) must report SPANS NOT INVARIANT
+# (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other failure does not count
+if INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1 | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else echo "FAIL: spans sabotage not detected"; fail=1; fi
+$B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
+# negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
+if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
 chip=$(sysctl -n machdep.cpu.brand_string | sed 's/Apple //; s/ /-/g' | tr A-Z a-z)
 if [ -f tests/golden-$chip.txt ]; then

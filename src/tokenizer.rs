@@ -205,3 +205,32 @@ impl Tokenizer {
         out
     }
 }
+
+#[cfg(test)]
+impl Tokenizer {
+    /// A tiny tokenizer for tests that render without a GGUF: the serve specials and an EOS are
+    /// single tokens, every printable ASCII character is its own token, and there are no merges,
+    /// so plain text encodes one token per character. Newlines and non-ASCII bytes fall back to
+    /// `?`; test strings stay plain ASCII.
+    pub(crate) fn for_test() -> Tokenizer {
+        let special_strs = ["<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>",
+            "<|content_text|>", "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>",
+            "<|end_message|>", "<|content_model_end_sampling|>", "<|eos|>"];
+        let mut id_to_tok: Vec<String> = special_strs.iter().map(|s| s.to_string()).collect();
+        let mut tok_type: Vec<i64> = vec![3; special_strs.len()];
+        for b in 32u8..127 { id_to_tok.push((b as char).to_string()); tok_type.push(0); }
+        let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
+        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        let fallback = *tok_to_id.get("?").unwrap();
+        let mut byte_to_id = [0u32; 256];
+        for b in 0..256usize {
+            byte_to_id[b] = if (32..127).contains(&b) { *tok_to_id.get(&(b as u8 as char).to_string()).unwrap() } else { fallback };
+        }
+        let mut uni_to_byte = HashMap::new();
+        for b in 32u8..127 { uni_to_byte.insert(b as char, b); }
+        let eos = (special_strs.len() - 1) as u32;
+        Tokenizer { id_to_tok, tok_type, tok_to_id, merges: HashMap::new(), specials, byte_to_id, uni_to_byte, eos }
+    }
+}

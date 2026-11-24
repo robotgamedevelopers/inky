@@ -2,7 +2,7 @@
 
 Status: design, 2026-11-22. Nothing here is built. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
 
-One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from the erisinky engine (GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
+One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
 
 ## What is measured (M5 Max, 128 GB, 2026-11-22)
 
@@ -96,9 +96,9 @@ Tried and reverted: decode-step experts with the decode path's f32 dot products 
 ## Decisions
 
 1. **One process, one copy of the weights.** Separate processes cannot share weight reads.
-2. **One kind of step, one computation per token.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token, a prefilling lane up to a chunk. The projections, router, experts and controllers run once over every span's tokens; attention and the convolutions run per span. Every span, whatever its length, goes through the same kernels, so a token's numbers depend neither on what else shares its step nor on how its own lane's work was chunked (`inky spans`, `inky binv`). That second property is what decision 4 rests on: a cached token was computed in one chunking and a cold run computes it in another. So the single-stream decode path, whose fused attention gives different bits, is never used for a lane; a faster attention for decode spans must give the same bits as the prefill path (Follow-ons).
+2. **One kind of step, two arithmetics.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token, a prefilling lane up to a chunk. The projections, router, experts and controllers run once over every span's tokens; attention and the convolutions run per span. The two kinds of span do not share an arithmetic: a prefill row's attention is the batched path's, a decode step's attention is the decode path's fused split-K kernel, and the same token comes out with different bits from each. Each arithmetic is batch-invariant on its own — a token's numbers depend neither on what else shares its step nor, for a prefill row, on how its own lane's work was chunked (`inky spans` for prefill rows, `inky dbatch` for decode steps, `inky binv` for prefill splits) — but neither invariance crosses from one arithmetic to the other. So the decode path is used for a lane, as its decode step; it just never stands in for a prefill row. One attention kernel for every span would merge the two arithmetics (Follow-ons); until then both stand, and decision 4 is what makes that safe.
 3. **The server is stateless; the cache is a tree of blocks.** A request is a token list, matched against a prefix tree of sealed cache blocks. A lane lives for one request: it starts at the deepest start point the tree holds for its tokens, and when the request ends its blocks stay in the tree. There are no sessions. A shared prefix, a resumed conversation, a harness side request and a rollback are all the same case.
-4. **The cache never changes an answer.** A request's output is a function of the request and its seed; the cache only changes how fast it comes. This rests on batch invariance and on start points being exact. The seed is the request's own (its `seed`, or a hash of the request), never arrival order.
+4. **The cache never changes an answer.** A request's output is a function of the request and its seed; the cache only changes how fast it comes. That is well-defined because the boundary between the two arithmetics is the end of the prompt, which the request itself fixes: the prompt is prefilled and the reply is decoded, whatever the cache held, so the same request always splits at the same place. Only what the prefill wrote is reused across a card's turns: the kept prompt and the convolution state at its end. Cache written while decoding a reply is never read as history; the next turn prefills the reply again exactly as the client rendered it (decision 5), over it. The seed is the request's own (its `seed`, or a hash of the rendered tokens and the sampling settings), never arrival order.
 5. **Earlier turns are rendered exactly as the client sends them.** A client that drops the reasoning of earlier turns gets them rendered without it, as the chat template does. The tokens a lane generated are therefore reused only up to where its turn began; the turn itself is prefilled again with the next request (its visible text and tool calls: short). No map from visible text back to generated tokens exists.
 6. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
 7. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
@@ -147,6 +147,22 @@ Liveness: every admitted lane finishes or is cancelled; every queued request is 
 **BlockLayout.** The pool and table arithmetic at capacity 3 or 4: slot reuse with generation counters, the window's sliding over the block list, the table's indexing with 64-bit offsets. One reversed witness per bug class: a reused slot read through a stale entry; a window off by one block; a span of 512 tokens pinning 17 window blocks instead of 25; a start point whose window blocks were released.
 
 The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
+
+## Inky mode: memory in, memory out
+
+The Mac goes in and out of inky mode. Starting inky gives the GPU the memory it needs; stopping inky gives it back.
+
+- **A one-time install, by the owner:** `sudo inky tune-memory` installs a small root LaunchDaemon. It does two things only: raise the GPU's wired-memory limit (`iogpu.wired_limit_mb`) and put it back. It accepts no other setting and runs nothing else. `sudo inky tune-memory --undo` removes it.
+- **Entering:** inky connects to the helper over a Unix socket only the owner's user can open. The helper records the limit it finds and raises it to a value sized from the Mac's memory (118000 MB on 128 GB, leaving about 13 GB for macOS).
+- **Leaving:** when inky's connection closes, the helper restores exactly the limit it found. A clean exit, a crash, `kill -9` or a sleep all close the connection, so the memory is always given back. With several inky processes, the limit is held while any is connected.
+- **In the sprint,** nova-worker drives it: it starts inky when it brings local lanes up, and stops it when it stops serving them, so the laptop goes into inky mode for sprint work and out of it afterwards.
+- **Inside inky mode,** inky asks Metal for the recommended working set, subtracts the weights, scratch and a margin, and sizes lanes and admission from that. Nobody passes a memory budget by hand. Without the helper, inky runs inside the default limit and says, once, what installing it would give.
+
+## Tunings
+
+A tuning is one machine's settings, in a file under `tunings/`, matched by chip and memory: the GPU wired-memory limit in inky mode, the margin kept free of lane caches, and in time the kernel choices that suit that GPU. inky picks the tuning that matches the machine it runs on; a machine without one runs on defaults derived from its memory. Tunings are how inky reaches other machines: anyone with a Mac it does not know yet can measure, write a tuning and contribute it back.
+
+inky is tuned 100% for the first one, `m5-max-128gb`: the Apple M5 Max MacBook Pro with 128 GB. The next are an M3 Ultra Mac Studio with 512 GB and, when there is one, an M5 Ultra Mac Studio.
 
 ## Layers, bottom up
 
