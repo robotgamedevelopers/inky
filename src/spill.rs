@@ -2026,9 +2026,15 @@ mod tests {
                 .join("target")
                 .join("spill-tests");
             fs::create_dir_all(&base).expect("create target/spill-tests");
+            #[cfg(unix)]
+            let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
             let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!("{label}-{}-{nonce}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create scratch test dir");
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 scratch test dir");
             Self { path }
         }
 
