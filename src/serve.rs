@@ -735,6 +735,19 @@ fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
     format!("context full: {prompt} prompt tokens and {max} to generate, {ctx} per lane")
 }
 
+/// The reply budget of a `/v1/messages` request, adjusted to the lane: when
+/// prompt + budget overruns the context but the prompt itself fits with one
+/// token and the scheduler's two reserved tokens to spare, the budget clamps
+/// to what fits (Claude Code asks for 32,000 against a window it believes is
+/// 1M, so refusing here would kill every long card). When the prompt itself
+/// does not fit, the error is Anthropic's own over-long text, word for word,
+/// so the client's reactive compaction recognizes it.
+fn clamped_messages_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, String> {
+    if !context_over(prompt, max, ctx) { return Ok(max); }
+    if prompt.saturating_add(3) <= ctx { return Ok(ctx - prompt - 2); }
+    Err(format!("prompt is too long: {prompt} tokens > {ctx} maximum"))
+}
+
 /// releases a request's in-flight count however the request ends
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
@@ -858,7 +871,7 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
     if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
-    if context_over(prompt_len, max, cx.ctx) { return anthropic_error(s, 400, "invalid_request_error", &context_full_message(prompt_len, max, cx.ctx)); }
+    let max = match clamped_messages_max(prompt_len, max, cx.ctx) { Ok(m) => m, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
     // the seed is the request's own: a hash of what decides the output, as on the chat path
     let seed = {
         let mut h = 0xcbf29ce484222325u64;
@@ -1395,6 +1408,34 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit()), "the nonce is hex: {n}");
     }
 
+    #[test] fn over_cap_messages_clamp_the_budget_or_read_as_too_long() {
+        // Rowan's live case: 108,582 prompt tokens + max_tokens 32,000 in a
+        // 131,072 context must clamp, not die; a prompt past the context
+        // must be Anthropic's over-long error, word for word.
+        assert_eq!(clamped_messages_max(100, 32_000, 131_072), Ok(32_000), "what fits is untouched");
+        assert_eq!(clamped_messages_max(108_582, 32_000, 131_072), Ok(22_488), "131072 - 108582 - the two reserved tokens");
+        assert_eq!(clamped_messages_max(61, 32, 64), Ok(1), "one token and the reserve exactly fit");
+        assert_eq!(clamped_messages_max(62, 32, 64), Err("prompt is too long: 62 tokens > 64 maximum".to_string()));
+        assert_eq!(clamped_messages_max(200, 8, 64), Err("prompt is too long: 200 tokens > 64 maximum".to_string()));
+        // the handler really sends the clamped budget to the scheduler
+        let tk0 = Tokenizer::for_test();
+        let (jtx, jrx) = channel::<Job>();
+        let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
+                       max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       inflight: Default::default(), limit: 4, conns: Default::default() });
+        let req = json!({"model": "m", "max_tokens": 63, "messages": [{"role": "user", "content": "x".repeat(8)}]});
+        let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
+        let want = clamped_messages_max(prompt, 63, 64).unwrap();
+        assert!(want < 63, "the test prompt must actually overrun with max_tokens 63 (prompt {prompt})");
+        let (cx2, req2) = (cx.clone(), req.clone());
+        let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
+        let job = jrx.recv().unwrap();
+        assert_eq!(job.max, want, "the job carries the clamped budget, not the refused 63");
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop" }).unwrap();
+        let out = String::from_utf8(worker.join().unwrap()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "a clamped request is served, not refused: {}", &out[..out.len().min(80)]);
+    }
+
     #[test] fn over_cap_streaming_requests_are_refused_at_the_call_sites() {
         // the actual handlers, not just the context_over helper: a streamed over-cap
         // request gets a clean HTTP 400 before any SSE header, on both routes. The
@@ -1410,7 +1451,8 @@ mod tests {
             "messages": [{"role": "user", "content": long}]}), &mut out).unwrap();
         let a = String::from_utf8(out).unwrap();
         assert!(a.starts_with("HTTP/1.1 400"), "messages over-cap must be an HTTP 400, got: {}", &a[..a.len().min(80)]);
-        assert!(a.contains("invalid_request_error") && a.contains("context full"), "messages over-cap body: {a}");
+        assert!(a.contains("invalid_request_error") && a.contains("prompt is too long:") && a.contains("tokens > 64 maximum"),
+            "a prompt that itself does not fit must read as Anthropic's over-long error, so Claude Code compacts: {a}");
         assert!(!a.contains("text/event-stream"), "no SSE headers may precede the refusal: {a}");
         let mut out: Vec<u8> = Vec::new();
         chat(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
