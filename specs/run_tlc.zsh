@@ -9,9 +9,18 @@ output=${TLC_OUTPUT:-$PWD/tlc-results}
 mkdir -p "$output"
 output=${output:A}
 [[ -r "$jar" ]] || { print -u2 "Missing TLC jar: $jar"; exit 1; }
+# TLC_ONLY=<modules> runs only the checks of those modules; TLC_EXCEPT=<modules> runs every other check (comma lists).
+# scripts/check-tla.sh splits its layout part this way into parallel CI jobs. A selection that runs nothing, or names
+# a module with no check, fails.
+only=${TLC_ONLY:-} except=${TLC_EXCEPT:-} ran=0
+typeset -A seen
 
 check() {
     local name=$1 module=$2 expected=${3:-} kind=${4:-invariant} log="$output/$1.log"
+    if [[ -n $only && ",$only," != *",$module,"* ]] || [[ -n $except && ",$except," == *",$module,"* ]]; then
+        return 0
+    fi
+    ran=$(( ran + 1 )); seen[$module]=1
     local started=$EPOCHREALTIME elapsed rc
     if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC -noGenerateSpecTE \
         -workers 1 -metadir "$output/$name-states" \
@@ -83,3 +92,7 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+(( ran > 0 )) || { print -u2 "run_tlc.zsh: no check selected (TLC_ONLY=$only TLC_EXCEPT=$except)"; exit 1; }
+for m in ${(s:,:)only}; do
+    [[ -n ${seen[$m]:-} ]] || { print -u2 "run_tlc.zsh: TLC_ONLY names $m, which has no check"; exit 1; }
+done

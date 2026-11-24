@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [memmode, layout, traces]
+        part: [memmode, blocks, grouped, traces]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

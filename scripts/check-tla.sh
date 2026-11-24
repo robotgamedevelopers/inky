@@ -1,20 +1,21 @@
 #!/bin/sh
 # Check every available inky TLA+ model and its reversed witnesses.
-# Usage: scripts/check-tla.sh [all|memmode|layout|scheduler|traces]. all (the default; the nightly workflow) runs every
-# part, except that the CacheScheduler models run only with TLA_NIGHTLY=1. The pull-request workflow runs memmode,
-# layout and traces as parallel jobs; the CacheScheduler models (scheduler, which requires TLA_NIGHTLY=1) are
-# exhaustive and slow, so they run in the nightly workflow.
+# Usage: scripts/check-tla.sh [all|memmode|layout|blocks|grouped|scheduler|traces]. all (the default) runs every
+# part, except that the CacheScheduler models run only with TLA_NIGHTLY=1. layout is blocks + grouped: grouped is
+# the GroupedLayout and PoisonGate checks of specs/run_tlc.zsh, blocks is every other check there, so a new model
+# lands in blocks. The pull-request workflow runs memmode, blocks, grouped and traces as parallel jobs; the
+# CacheScheduler models (scheduler, which requires TLA_NIGHTLY=1) are exhaustive and slow, so they run nightly.
 set -eu
 
 section=${1:-all}
 case $section in
-    all|memmode|layout|scheduler|traces) ;;
-    *) echo "usage: scripts/check-tla.sh [all|memmode|layout|scheduler|traces]" >&2; exit 2 ;;
+    all|memmode|layout|blocks|grouped|scheduler|traces) ;;
+    *) echo "usage: scripts/check-tla.sh [all|memmode|layout|blocks|grouped|scheduler|traces]" >&2; exit 2 ;;
 esac
 want() { [ "$section" = all ] || [ "$section" = "$1" ]; }
 # A part named on its own must have something to check; an empty pass is a failure.
 case $section in
-    layout) [ -f "$(dirname -- "$0")/../specs/BlockLayout.tla" ] || { echo 'layout: specs/BlockLayout.tla missing' >&2; exit 1; } ;;
+    layout|blocks|grouped) [ -f "$(dirname -- "$0")/../specs/BlockLayout.tla" ] || { echo 'layout: specs/BlockLayout.tla missing' >&2; exit 1; } ;;
     scheduler)
         [ -f "$(dirname -- "$0")/../specs/CacheScheduler.tla" ] || { echo 'scheduler: specs/CacheScheduler.tla missing' >&2; exit 1; }
         # The scheduler part exists to run the CacheScheduler models; without TLA_NIGHTLY=1 it would check nothing.
@@ -95,9 +96,15 @@ check_memmode NoRollback RefusedRollbackSafe
 fi
 
 # The layer 3 models land separately. A model without its runner is an error.
-if want layout && [ -f "$root/specs/BlockLayout.tla" ]; then
+grouped_modules=GroupedLayout,PoisonGate
+case $section in
+    blocks) layout_sel="TLC_EXCEPT=$grouped_modules" ;;
+    grouped) layout_sel="TLC_ONLY=$grouped_modules" ;;
+    *) layout_sel= ;;
+esac
+if { want layout || [ "$section" = blocks ] || [ "$section" = grouped ]; } && [ -f "$root/specs/BlockLayout.tla" ]; then
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
-    TLC_OUTPUT=$work/block-layout zsh "$root/specs/run_tlc.zsh" || {
+    env $layout_sel TLC_OUTPUT=$work/block-layout zsh "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
     }
