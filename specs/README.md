@@ -25,7 +25,7 @@ counterexamples, in the output directory. For an individual run, from `specs/`:
   -workers 1 -config BlockLayout3.cfg BlockLayout.tla
 ```
 
-`InBlock` is the order inside one slot: `[pass][K|V][head][position][HD]`, 2 passes, 3 heads, 4 positions, `HD = 2`. The action stores an address. `Ordered` compares that address to an independent formula. `Inside` says one row stays inside the slot. `InBlock` uses `kvb = 2` and `InBlockKv8` uses `kvb = 1`. `InBlockMajor` stores `index * (stride / B)` and must violate `Ordered`. `NoCollision` is checked on that config too. `TraceOk` is four engine-sized addresses, the same numbers `key_row` asserts.
+`InBlock` is the order inside one slot: `[pass][K|V][head][position][HD]`, 2 passes, 3 heads, 4 positions, `HD = 2`. The action inlines the address. `Ordered` compares it to `Formula`, which the action does not call. `Inside` says one row stays inside the slot. `NoCollision` quantifies over `AddrOf`, including the position-major arm. `InBlock` uses `kvb = 2` and `InBlockKv8` uses `kvb = 1`. `InBlockMajor` must violate `Ordered`. `InBlockTrace` walks the 48 addresses `key_row_at` emits at these bounds, at `kvb` 2 and at `kvb` 1.
 
 ## Bounds and vocabulary
 

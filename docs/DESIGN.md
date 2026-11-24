@@ -148,7 +148,7 @@ Liveness: every admitted lane finishes or is cancelled; every queued request is 
 
 **BlockLayout.** The pool and table arithmetic at capacity 3 or 4: slot reuse with generation counters, the window's sliding over the block list, the table's indexing with 64-bit offsets. One reversed witness per bug class: a reused slot read through a stale entry; a window off by one block; a span of 512 tokens pinning 17 window blocks instead of 25; a start point whose window blocks were released.
 
-**InBlock.** The bytes inside one slot, at 3 heads and 4 positions: `[pass][K|V][head][position][HD]`, with the element width a constant (`kvb` 2, and again at 1). The action stores an address. `Ordered` compares it to an independent formula. `Inside` says the row stays in the slot. The reversed witness is the position-major step `index * (stride / B)`, and it violates `Ordered`. `NoCollision` is checked on that witness too. A four-address trace, including bytes 256 and 163840, is the same numbers `key_row` asserts.
+**InBlock.** The bytes inside one slot, at 3 heads and 4 positions: `[pass][K|V][head][position][HD]`, with the element width a constant (`kvb` 2, and again at 1). The action stores an address by inlining the arithmetic. `Ordered` compares it to a formula the action does not call. `Inside` says the row stays in the slot. `NoCollision` is over the address the bug stores, so the position-major step collides. `InBlockTrace` is the behaviour `key_row_at` emits at those bounds.
 
 The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
 

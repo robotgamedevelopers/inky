@@ -21,15 +21,18 @@ TLC traversal order.
 Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
 and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
 
-`InBlock` on mini-m5, 2026-11-24T03:19Z, TLC 2.19, one worker, 1 GiB heap. Three configs only, not the full runner. TLC printed the wall time as 00s. The machine clock on the log lines is 2026-11-23 22:19.
+`InBlock` on mini-m5, 2026-11-24T03:44Z, by `run_tlc.zsh`: TLC 2.19 (revision `5a47802`), Eclipse Adoptium 21.0.12.1, one worker, a 4 GiB maximum heap (the log reports 3641MB). Wall seconds include JVM startup. The machine clock on the log lines is 2026-11-23 22:44.
 
-| Run | Generated states | Distinct states | Result |
-| --- | ---: | ---: | --- |
-| InBlock | 2,257 | 48 | PASS |
-| InBlockKv8 | 2,257 | 48 | PASS |
-| InBlockMajor | 2 | 2 | Ordered violated |
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| InBlock | 2,257 | 48 | 0.834 | PASS |
+| InBlockKv8 | 2,257 | 48 | 0.823 | PASS |
+| InBlockMajor | 2 | 2 | 0.656 | Ordered violated |
+| InBlockMajorCollide | — | — | 0.660 | NoCollision violated by the initial state |
+| InBlockTrace | 49 | 48 | 0.709 | PASS |
+| InBlockTraceKv8 | 49 | 48 | 0.673 | PASS |
 
-InBlockMajor state 2 is pass 1, K, head 0, position 0, address 0. The position-major step is `index * (stride / B)`, which is 0 at position 0, so the pass change does not move the address. `Inside`, `NoCollision`, and `TraceOk` hold on that config. The earlier head-term witness is retired.
+InBlockMajor state 2 is `p = 1`, `k = 0`, `h = 0`, `i = 0`, `addr = 0`. The position-major step is `index * (stride / B)`, which is 0 at position 0, so the pass change does not move the address. `Ordered` compares that address to `Formula`, which the action does not call. `Inside` holds on that state. `NoCollision` is checked on its own config and fails while TLC is still computing the initial state, because every index-0 coordinate stores address 0. That log has one `Error:` line and no state count. The earlier head-term witness is retired.
 
 Inspected counterexamples:
 

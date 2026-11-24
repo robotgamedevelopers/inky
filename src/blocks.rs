@@ -47,9 +47,9 @@ impl BlockKind {
     }
 
     /// Bytes in one slot at this element width. `kvb` is 2 for fp16 and 1 for `--kv8`.
-    /// Zero is refused. At 2 this is `FULL_STRIDE` or `WINDOW_STRIDE`.
+    /// Any other width is refused. At 2 this is `FULL_STRIDE` or `WINDOW_STRIDE`.
     pub fn stride_bytes(self, kvb: u32) -> Result<u64, BlockError> {
-        if kvb == 0 { return Err(BlockError::Width); }
+        if kvb != 1 && kvb != 2 { return Err(BlockError::Width); }
         let passes = self.passes() as u64;
         passes.checked_mul(2)
             .and_then(|v| v.checked_mul(NKV as u64))
@@ -153,7 +153,7 @@ fn mul_offset(index: u64, stride: u64) -> Result<u64, BlockError> {
 }
 
 /// Byte offset of a slot in its kind's pool at element width `kvb`.
-/// Refuses a product that does not fit in `u64`, and a `kvb` of 0.
+/// Refuses a product that does not fit in `u64`, and a `kvb` other than 1 or 2.
 pub fn byte_offset(kind: BlockKind, slot: Slot, kvb: u32) -> Result<u64, BlockError> {
     mul_offset(u64::from(slot.pool_index().get()), kind.stride_bytes(kvb)?)
 }
@@ -163,16 +163,22 @@ pub fn byte_offset(kind: BlockKind, slot: Slot, kvb: u32) -> Result<u64, BlockEr
 /// so one head's 64 keys are contiguous. `base` is the slot's `byte_offset`.
 /// A pass, head or position outside the block is `OutOfRange`.
 pub fn key_row(base: u64, kind: BlockKind, kvb: u32, pass: u32, kv: Kv, head: u32, index: u32) -> Result<u64, BlockError> {
-    if kvb == 0 { return Err(BlockError::Width); }
-    if pass >= kind.passes() as u32 || head >= NKV as u32 || index >= BLOCK as u32 {
+    key_row_at(base, kind.passes() as u32, NKV as u32, BLOCK as u32, HD as u32, kvb, pass, kv.index(), head, index)
+}
+
+/// `key_row` at explicit bounds. The engine calls it with `NKV`, `BLOCK` and `HD`.
+/// The InBlock trace calls it at the spec's bounds (2 passes, 3 heads, 4 positions, `HD` 2).
+pub fn key_row_at(base: u64, passes: u32, heads: u32, block: u32, hd: u32, kvb: u32, pass: u32, plane: u32, head: u32, index: u32) -> Result<u64, BlockError> {
+    if kvb != 1 && kvb != 2 { return Err(BlockError::Width); }
+    if pass >= passes || head >= heads || index >= block {
         return Err(BlockError::OutOfRange);
     }
-    let row = (HD as u64).checked_mul(u64::from(kvb)).ok_or(BlockError::Overflow)?;
-    let head_step = (BLOCK as u64).checked_mul(row).ok_or(BlockError::Overflow)?;
-    let plane = (NKV as u64).checked_mul(head_step).ok_or(BlockError::Overflow)?;
-    let pass_step = plane.checked_mul(2).ok_or(BlockError::Overflow)?;
+    let row = u64::from(hd).checked_mul(u64::from(kvb)).ok_or(BlockError::Overflow)?;
+    let head_step = u64::from(block).checked_mul(row).ok_or(BlockError::Overflow)?;
+    let kv_plane = u64::from(heads).checked_mul(head_step).ok_or(BlockError::Overflow)?;
+    let pass_step = kv_plane.checked_mul(2).ok_or(BlockError::Overflow)?;
     let within = u64::from(pass).checked_mul(pass_step).ok_or(BlockError::Overflow)?
-        .checked_add(u64::from(kv.index()).checked_mul(plane).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?
+        .checked_add(u64::from(plane).checked_mul(kv_plane).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?
         .checked_add(u64::from(head).checked_mul(head_step).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?
         .checked_add(u64::from(index).checked_mul(row).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?;
     base.checked_add(within).ok_or(BlockError::Overflow)
@@ -400,10 +406,11 @@ impl BlockTable {
 
     /// Write one entry. The stored offset is `byte_offset` at the pool's `kvb`.
     /// Generation 0, on the argument or the record, is `NotTaken` and takes no
-    /// reference. Any other mismatch is `Stale` and takes no reference. A match
-    /// drops the reference of the entry already in the cell, if there is one,
-    /// then takes one reference via `add_ref`. An empty pool is `NoSlots`.
-    /// This does not bump the generation and does not allocate a buffer.
+    /// reference. Any other mismatch is `Stale` and takes no reference.
+    /// An entry already in the cell drops its reference only when that entry's
+    /// generation is still the slot's generation. Every check finishes before
+    /// any reference changes. An empty pool is `NoSlots`. This does not bump
+    /// the generation and does not allocate a buffer.
     pub fn fill(&mut self, pool: &mut BlockPool, block: BlockIndex, slot: Slot, generation: u32) -> Result<(), BlockError> {
         if pool.len() == 0 { return Err(BlockError::NoSlots); }
         let record_gen = pool.record(slot)?.generation();
@@ -413,10 +420,23 @@ impl BlockTable {
         let offset = byte_offset(pool.kind(), slot, kvb)?;
         let i = table_index(pool.kind(), block, self.blocks_per_kind)? as usize;
         let prev = self.entries.get(i).copied().flatten();
-        if let Some(prev) = prev {
-            pool.record_mut(prev.slot())?.drop_ref()?;
+        let drop_prev = match prev {
+            Some(prev) => pool.record(prev.slot())?.generation() == prev.generation(),
+            None => false,
+        };
+        let same = drop_prev && prev.map(|prev| prev.slot()) == Some(slot);
+        if drop_prev {
+            let held = prev.ok_or(BlockError::NoEntry)?;
+            if pool.record(held.slot())?.refs() == 0 { return Err(BlockError::Refs); }
         }
-        pool.record_mut(slot)?.add_ref()?;
+        if !same && pool.record(slot)?.refs() == u32::MAX { return Err(BlockError::Overflow); }
+        if drop_prev && !same {
+            let held = prev.ok_or(BlockError::NoEntry)?;
+            pool.record_mut(held.slot())?.drop_ref()?;
+        }
+        if !same {
+            pool.record_mut(slot)?.add_ref()?;
+        }
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
         *cell = Some(BlockEntry::new(slot, generation, offset, pool.kind(), kvb));
         Ok(())
@@ -436,6 +456,7 @@ impl BlockTable {
         if entry.kvb() != pool.kvb() { return Err(BlockError::Width); }
         let record = pool.record(entry.slot())?;
         if record.generation() != entry.generation() { return Err(BlockError::Stale); }
+        if record.refs() == 0 { return Err(BlockError::Refs); }
         let index = u32::try_from(pos % BLOCK).map_err(|_| BlockError::Overflow)?;
         if record.sealed() && record.length() != BLOCK as u32 { return Err(BlockError::Length); }
         if index >= record.length() { return Err(BlockError::Length); }
@@ -490,9 +511,8 @@ mod tests {
         assert_eq!(narrow.kvb(), 1);
         assert_eq!(narrow.offset(Slot::new(1).unwrap()).unwrap(), 0);
         assert_eq!(BlockPool::with_kvb(BlockKind::Window, 1, 0).err(), Some(BlockError::Width));
-        // Slot 2 at kvb 2 and slot 3 at kvb 1 are the same byte. One pool has one kvb.
-        assert_eq!(byte_offset(BlockKind::Window, Slot::new(2).unwrap(), 2).unwrap(), WINDOW_STRIDE);
-        assert_eq!(byte_offset(BlockKind::Window, Slot::new(3).unwrap(), 1).unwrap(), WINDOW_STRIDE);
+        assert_eq!(byte_offset(BlockKind::Window, Slot::new(1).unwrap(), 3), Err(BlockError::Width));
+        assert_eq!(BlockPool::with_kvb(BlockKind::Window, 1, 3).err(), Some(BlockError::Width));
         let pools = BlockPools::stub();
         assert_eq!(pools.window.len(), 0);
         assert_eq!(pools.full.kind(), BlockKind::Full);
@@ -625,7 +645,8 @@ mod tests {
         assert_eq!(full.record(slot).unwrap().refs(), 1);
         t.fill(&mut full, BlockIndex::new(0), slot, 2).unwrap();
         assert_eq!(t.read_key(&full, 0).unwrap().generation(), 2);
-        assert_eq!(full.record(slot).unwrap().refs(), 1);
+        // The stale entry's generation does not match, so its reference is not dropped.
+        assert_eq!(full.record(slot).unwrap().refs(), 2);
         assert_eq!(full.kvb(), 2);
     }
 
@@ -639,7 +660,7 @@ mod tests {
         assert_eq!(old_step, 163840);
         assert_eq!(key_row(base, BlockKind::Window, 2, 0, Kv::Value, 2, 0).unwrap(), old_step);
         assert_eq!(key_row(base, BlockKind::Window, 2, 0, Kv::Key, 0, 1).unwrap(), (HD as u64) * 2);
-        // InBlock Trace. specs/InBlock.tla checks these four addresses.
+        // Engine-sized addresses. The small-bounds behaviour is the InBlock trace.
         assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 0, 0).unwrap(), 0);
         assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 0, 1).unwrap(), 256);
         assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 1, 0).unwrap(), 16_384);
@@ -649,12 +670,8 @@ mod tests {
         assert_eq!(key_row(base, BlockKind::Full, 2, 0, Kv::Key, 0, 0).unwrap(), 0);
         // kv8 is one byte per element, so the same head step is half.
         assert_eq!(key_row(base, BlockKind::Full, 1, 0, Kv::Key, 1, 0).unwrap(), head / 2);
-        // pass 1, V, head 3, position 7, kv8.
-        let row = HD as u64;
-        let head_step = BLOCK as u64 * row;
-        let plane = NKV as u64 * head_step;
-        let at = 1 * 2 * plane + 1 * plane + 3 * head_step + 7 * row;
-        assert_eq!(key_row(0, BlockKind::Window, 1, 1, Kv::Value, 3, 7).unwrap(), at);
+        // pass 1, V, head 3, position 7, kv8. The number is not built from key_row's terms.
+        assert_eq!(key_row(0, BlockKind::Window, 1, 1, Kv::Value, 3, 7).unwrap(), 222_080);
         assert_eq!(key_row(0, BlockKind::Window, 2, 40, Kv::Key, 0, 0), Err(BlockError::OutOfRange));
         assert_eq!(key_row(0, BlockKind::Full, 2, 8, Kv::Key, 0, 0), Err(BlockError::OutOfRange));
         assert_eq!(key_row(0, BlockKind::Full, 2, 0, Kv::Key, NKV as u32, 0), Err(BlockError::OutOfRange));
@@ -758,5 +775,78 @@ mod tests {
         let mut last = SlotRecord::at_generation(BlockKind::Full, u32::MAX);
         assert_eq!(last.reissue(), Err(BlockError::Generation));
         assert_eq!(last.generation(), u32::MAX);
+    }
+
+    #[test]
+    fn a_fill_does_not_drop_a_reissued_slot() {
+        let mut pool = BlockPool::new(BlockKind::Full, 4);
+        let mut lane1 = BlockTable::new(1).unwrap();
+        let mut lane2 = BlockTable::new(1).unwrap();
+        let a = Slot::new(1).unwrap();
+        let b = Slot::new(2).unwrap();
+        take(&mut pool, a);
+        lane1.fill(&mut pool, BlockIndex::new(0), a, 1).unwrap();
+        pool.record_mut(a).unwrap().drop_ref().unwrap();
+        pool.record_mut(a).unwrap().reissue().unwrap();
+        lane2.fill(&mut pool, BlockIndex::new(0), a, 2).unwrap();
+        assert_eq!(pool.record(a).unwrap().refs(), 1);
+        take(&mut pool, b);
+        lane1.fill(&mut pool, BlockIndex::new(0), b, 1).unwrap();
+        assert_eq!(pool.record(a).unwrap().refs(), 1);
+        assert_eq!(pool.record(b).unwrap().refs(), 1);
+    }
+
+    #[test]
+    fn a_fill_refuses_before_it_changes_a_reference() {
+        let mut pool = BlockPool::new(BlockKind::Full, 4);
+        let mut t = BlockTable::new(1).unwrap();
+        let a = Slot::new(1).unwrap();
+        let b = Slot::new(2).unwrap();
+        take(&mut pool, a);
+        take(&mut pool, b);
+        t.fill(&mut pool, BlockIndex::new(0), a, 1).unwrap();
+        pool.record_mut(b).unwrap().refs = u32::MAX;
+        assert_eq!(t.fill(&mut pool, BlockIndex::new(0), b, 1), Err(BlockError::Overflow));
+        assert_eq!(pool.record(a).unwrap().refs(), 1);
+        assert_eq!(t.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap().slot(), a);
+    }
+
+    #[test]
+    fn a_read_refuses_a_slot_nothing_references() {
+        let mut pool = BlockPool::new(BlockKind::Full, 2);
+        let mut t = BlockTable::new(1).unwrap();
+        let slot = Slot::new(1).unwrap();
+        take(&mut pool, slot);
+        t.fill(&mut pool, BlockIndex::new(0), slot, 1).unwrap();
+        written(&mut pool, slot, 1);
+        pool.record_mut(slot).unwrap().drop_ref().unwrap();
+        assert_eq!(t.read_key(&pool, 0), Err(BlockError::Refs));
+    }
+
+    fn trace_rows(text: &str, name: &str) -> Vec<(u32, u32, u32, u32, u64)> {
+        let start = text.find(&format!("{name} == <<")).expect(name);
+        let rest = &text[start..];
+        let end = rest.find("\n>>").expect("trace end");
+        let mut rows = Vec::new();
+        for line in rest[..end].lines() {
+            let line = line.trim().trim_end_matches(',');
+            if !line.starts_with("<<") { continue; }
+            let inner = line.trim_start_matches("<<").trim_end_matches(">>");
+            let nums: Vec<u64> = inner.split(',').map(|s| s.trim().parse().unwrap()).collect();
+            rows.push((nums[0] as u32, nums[1] as u32, nums[2] as u32, nums[3] as u32, nums[4]));
+        }
+        rows
+    }
+
+    #[test]
+    fn key_row_at_matches_the_inblock_trace() {
+        let text = include_str!("../specs/InBlockTrace.tla");
+        for (kvb, name) in [(2, "Trace2"), (1, "Trace1")] {
+            let rows = trace_rows(text, name);
+            assert_eq!(rows.len(), 48);
+            for (p, k, h, i, addr) in rows {
+                assert_eq!(key_row_at(0, 2, 3, 4, 2, kvb, p, k, h, i).unwrap(), addr);
+            }
+        }
     }
 }
