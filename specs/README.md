@@ -207,3 +207,22 @@ request too long for a lane, which ends in `refuse_ctx`. A constant winning
 token means normal generation ends at the requested length. Model output and GPU
 execution have separate tests. A TLC replay against
 CacheScheduler is a separate verification step.
+
+## Poisoned-slot gate
+
+`PoisonGate` models the slot arithmetic of layer 3's output gate
+(`src/poolgate.rs`, `inky poolgate`): before each step every slot of a kind's
+pool that no stepping lane references is poisoned, the poisoned slots a live
+lane references are saved first and restored after the step, and free slots
+stay poisoned until the pool zeroes them on reuse. One pool, 3 or 4 slots, two
+or three lanes that take, share and release slots between steps, one write per
+slot. The code runs the plan once per kind; the kinds share no slots.
+
+- `NoFalsePoison`: no slot a stepping lane reads holds poison.
+- `Coverage`: every slot the step must not read holds poison.
+- `LiveIntact`: between steps every referenced slot holds what its lanes wrote.
+
+Reversed witnesses (`Bug`): `unguarded` (the first stepping lane is not
+protected; the same switch as `INK_POOLGATE_SABOTAGE`), `nosave` and
+`ownedonly`. The unit tests in `src/poolgate.rs` check `poison_plan` against
+the same three properties on every two-lane, three-slot table assignment.

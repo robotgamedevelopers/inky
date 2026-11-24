@@ -20,3 +20,13 @@ jobs:
         env:
           TLA_NIGHTLY: '1'
         run: scripts/check-tla.sh
+  # The long GPU gates that do not fit the pull request budget (tests/nightly.sh).
+  # No time limit beyond GitHub's default: a slow nightly is not a failure.
+  m5:
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cargo build --release
+      - name: long GPU gates
+        run: tests/nightly.sh
