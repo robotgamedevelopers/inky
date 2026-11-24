@@ -25,6 +25,8 @@ pub const LOOP_START: usize = 6;
 pub const LOOP_END: usize = 18;
 pub const N_PASS: usize = 3;
 pub const N_SLOT: usize = N_PHYS + (N_PASS - 1) * (LOOP_END - LOOP_START);
+const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
+const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
 /// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
@@ -99,10 +101,10 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
+    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -457,6 +459,10 @@ pub struct Engine {
     verify_keep: RefCell<Option<VerifyKeep>>,
     /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
     verify_record: Cell<bool>,
+    /// Layer 3 pools, one per kind. One contiguous GPU slab per kind, sized by `kvb`,
+    /// splitting into at most four slabs at `maxBufferLength`. Attention does not read them yet. The table lives on the lane.
+    /// `RefCell` because a step mutates the pool through `&Engine`.
+    block_pool: std::cell::RefCell<crate::blocks::BlockPools>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
     pub gpu: Gpu,
     pub g: Gguf,
@@ -474,6 +480,12 @@ pub struct Lane {
     pub toks: Buf,
     tier: Option<Tier>,
     pub prune: RefCell<Option<Prune>>,
+    /// `RefCell` because a step mutates the table through `&Lane`.
+    block_table: std::cell::RefCell<crate::blocks::BlockTable>,
+    /// True when this lane reads/writes K/V through `Engine::block_pool` and `bt_*_gpu`.
+    use_blocks: Cell<bool>,
+    bt_win_gpu: RefCell<Option<Buf>>,
+    bt_full_gpu: RefCell<Option<Buf>>,
 }
 
 /// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
@@ -533,7 +545,63 @@ impl Lane {
             cs: gpu.buffer(N_SLOT * NCH * 3 * 4),
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
             tier, prune: RefCell::new(None),
+            block_table: std::cell::RefCell::new(crate::blocks::BlockTable::empty()),
+            use_blocks: Cell::new(false),
+            bt_win_gpu: RefCell::new(None),
+            bt_full_gpu: RefCell::new(None),
         }
+    }
+
+    /// A Layer 3 block-addressed lane: no contiguous Layer 2 KV cache buffers; K/V lives in
+    /// `Engine::block_pool` and is addressed via 64-bit offsets in `bt_win_gpu`/`bt_full_gpu`.
+    pub fn new_blocked(eng: &Engine, max_pos: usize) -> Lane {
+        let gpu = &eng.gpu;
+        let blocks = max_pos.div_ceil(crate::blocks::BLOCK).max(1);
+        let blocks_u32 = u32::try_from(blocks).expect("block count fits u32");
+        let cs = gpu.buffer(N_SLOT * NCH * 3 * 4);
+        unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, cs.length()); }
+        let bt_win = gpu.buffer(blocks * 8);
+        let bt_full = gpu.buffer(blocks * 8);
+        unsafe {
+            std::ptr::write_bytes(bt_win.contents().as_ptr() as *mut u8, 0, bt_win.length());
+            std::ptr::write_bytes(bt_full.contents().as_ptr() as *mut u8, 0, bt_full.length());
+        }
+        Lane {
+            kv_swa: RefCell::new(gpu.buffer(16)),
+            kv_full: RefCell::new(gpu.buffer(16)),
+            swa_cap: Cell::new(0), full_cap: Cell::new(0),
+            cs,
+            toks: gpu.buffer((eng.max_ctx + 8) * 4),
+            tier: None, prune: RefCell::new(None),
+            block_table: RefCell::new(crate::blocks::BlockTable::new(blocks_u32).expect("block table")),
+            use_blocks: Cell::new(true),
+            bt_win_gpu: RefCell::new(Some(bt_win)),
+            bt_full_gpu: RefCell::new(Some(bt_full)),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_blocked(&self) -> bool { self.use_blocks.get() }
+
+    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
+    /// Interior mutability: callers borrow through the `RefCell`.
+    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
+    pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
+
+    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
+    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
+    /// is `NoSlots`. Does not allocate a GPU buffer.
+    #[allow(dead_code)]
+    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
+        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
+    }
+
+    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
+    /// The slot base comes from the lane table. The width is the pool's `kvb`.
+    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
+    #[allow(dead_code)]
+    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
+        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
     }
 }
 
@@ -544,6 +612,11 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    /// Both block pools. One GPU slab per kind, sized at load to `kvb` and the initial cache block.
+    /// Interior mutability: callers borrow through the `RefCell`.
+    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
+
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
     pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
     /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
@@ -569,6 +642,12 @@ impl Engine {
             for r in 0..rows { unsafe { std::ptr::copy_nonoverlapping(sp.add(r * sc * HD * self.kvb), dp.add(r * dc * HD * self.kvb), nk * HD * self.kvb); } }
         }
         unsafe { std::ptr::copy_nonoverlapping(src.cs.contents().as_ptr() as *const u8, dst.cs.contents().as_ptr() as *mut u8, src.cs.length()); }
+    }
+    /// dev, the poisoned-pool gate (src/poolgate.rs): CPU views of a layer-2 lane's cache: its window buffer and
+    /// its full buffer. Valid until the lane's next `reserve`; nothing may be in flight on the GPU.
+    pub fn lane_regions(&self, lane: &Lane) -> [(*mut u8, usize); 2] {
+        let r = |b: &Buf| (b.contents().as_ptr() as *mut u8, b.length());
+        [r(&lane.kv_swa.borrow()), r(&lane.kv_full.borrow())]
     }
     /// GPU memory the device has allocated (bytes) and the working set it recommends
     pub fn gpu_mem(&self) -> (usize, usize) {
@@ -822,6 +901,8 @@ impl Engine {
         let ctr = gpu.buffer(4096 * 4);
         eprintln!("[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len() as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
+        // KV_CAP0 positions is one block. Further slots come from `BlockPool::grow`.
+        let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
         let eng = Engine {
             eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
@@ -834,6 +915,7 @@ impl Engine {
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
             verify_keep: RefCell::new(None), verify_record: Cell::new(false),
+            block_pool,
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -1278,6 +1360,56 @@ impl Engine {
     /// bind a lane's cache (sliding-window buffer), convolution rows and tokens
     fn bind_lane(&self, e: &Enc, lane: &Lane) {
         e.buf(&lane.kv_swa.borrow(), 0, 3); e.buf(&lane.cs, 0, 4); e.buf(&lane.toks, 0, 6);
+    }
+    /// Bind the 1..=4 GPU slab buffers of `kind` (`Window` if `swa`, else `Full`) at buffer slots 3, 10, 11, 12.
+    fn bind_pool_slabs(&self, e: &Enc, swa: bool) {
+        let pools = self.block_pool.borrow();
+        let pool = if swa { &pools.window } else { &pools.full };
+        let slabs = pool.gpu_slabs();
+        assert!(!slabs.is_empty(), "Layer 3 block pool ({}) has no GPU slabs", if swa { "window" } else { "full" });
+        e.buf(slabs[0], 0, 3);
+        e.buf(slabs.get(1).copied().unwrap_or(slabs[0]), 0, 10);
+        e.buf(slabs.get(2).copied().unwrap_or(slabs[0]), 0, 11);
+        e.buf(slabs.get(3).copied().unwrap_or(slabs[0]), 0, 12);
+    }
+    /// Bind a blocked lane's 64-bit GPU block table (`Window` if `swa`, else `Full`) at buffer slot 8.
+    fn bind_lane_bt(e: &Enc, lane: &Lane, swa: bool) {
+        let bt = if swa { lane.bt_win_gpu.borrow() } else { lane.bt_full_gpu.borrow() };
+        e.buf(bt.as_ref().expect("blocked lane missing GPU block table"), 0, 8);
+    }
+    /// Validate every block needed by span `[p0, p0 + t)` and upload the lane's 64-bit block tables to GPU memory.
+    pub fn sync_lane_block_table(&self, lane: &Lane, p0: usize, t: usize) {
+        use crate::blocks::{BlockIndex, BlockKind, BLOCK as KV_BLOCK};
+        assert!(lane.use_blocks.get(), "sync_lane_block_table called on a Layer 2 lane");
+        let table = lane.block_table.borrow();
+        let pools = self.block_pool.borrow();
+        let n_blk = table.blocks_per_kind() as usize;
+        assert!(t >= 1 && p0 + t <= n_blk * KV_BLOCK, "Layer 3 span [{p0}, {}) exceeds block table ({} blocks)", p0 + t, n_blk);
+        let hi_blk = (p0 + t - 1) / KV_BLOCK;
+        let lo_win_blk = p0.saturating_sub(EXT - 1) / KV_BLOCK;
+        for (kind, lo, bt_cell) in [
+            (BlockKind::Full, 0usize, &lane.bt_full_gpu),
+            (BlockKind::Window, lo_win_blk, &lane.bt_win_gpu),
+        ] {
+            let pool = pools.of(kind);
+            let bt_guard = bt_cell.borrow();
+            let bt_buf = bt_guard.as_ref().expect("blocked lane missing GPU block table");
+            let dst = unsafe { std::slice::from_raw_parts_mut(bt_buf.contents().as_ptr() as *mut u64, n_blk) };
+            for b in 0..n_blk {
+                let bi = BlockIndex::new(b as u32);
+                match table.get(kind, bi).expect("block index in range") {
+                    Some(entry) => {
+                        dst[b] = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
+                            panic!("Layer 3 {kind:?} block {b} entry invalid for slot {} gen {}: {err}", entry.slot().get(), entry.generation())
+                        });
+                    }
+                    None => {
+                        assert!(!(b >= lo && b <= hi_blk), "Layer 3 span [{p0}, {}) missing required {kind:?} block {b}", p0 + t);
+                        dst[b] = 0;
+                    }
+                }
+            }
+        }
     }
     /// bind the engine's buffers: weights, parameters, scratch arenas, counters
     fn bind_eng(&self, e: &Enc) {
@@ -1811,7 +1943,13 @@ impl Engine {
     fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>) {
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
         let t: usize = spans.iter().map(|s| s.t).sum();
-        for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
+        let blocked = spans[0].lane.use_blocks.get();
+        assert!(spans.iter().all(|s| s.lane.use_blocks.get() == blocked), "cannot mix Layer 2 and Layer 3 lanes in one step");
+        if blocked {
+            for sp in spans { self.sync_lane_block_table(sp.lane, sp.p0, sp.t); }
+        } else {
+            for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
+        }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
         assert!(!dec || (self.hgemm && spans.len() <= self.decode_span_limit()), "a decode step needs the fp16 path and room for f32 queries");
         assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
@@ -1829,8 +1967,8 @@ impl Engine {
         let e = Enc::new(cb);
         self.bind_eng(&e);
         self.bind_lane(&e, spans[0].lane);
-        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step does not use it)
-        if !dec {
+        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step or Layer 3 block path does not use it)
+        if !dec && !blocked {
             let bz = self.ba.get();
             let zr = [bz.sk, bz.perm - bz.sk];
             e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
@@ -2006,18 +2144,28 @@ impl Engine {
         // the next span: every dispatch ends with a barrier), and the ring (exactly one window) only receives the last window
         // of keys. Full layers address their cache directly.
         let scap = (EXT + b.cap + 2 * KGUARD) as u32;
+        let blocked = spans[0].lane.use_blocks.get();
+        let pass_idx = self.slot_kind[slot].1 as u32;
         if dec {
             // a decode step: each lane's token through the decode path's fused attention (K/V conv from the lane's state,
             // cache write, split-K attention over the lane's cache, combine + output gate), into qp as f32 rows. The lanes'
             // attention dispatches are independent (own cache, state, rows and split partials): no barrier between them.
             let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
+            if blocked { self.bind_pool_slabs(e, l.swa); }
             for (si, sp) in spans.iter().enumerate() {
                 let run = self.on(sp.lane);
                 let (pos, r0) = (sp.p0, row0[si]);
-                self.bind_lane(e, sp.lane);
-                let (kb, vb, kcap) = run.kv_slot(slot);
                 let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
                 let ar = self.ar;
+                let (kb, vb, kcap) = if blocked {
+                    e.buf(&sp.lane.cs, 0, 4); e.buf(&sp.lane.toks, 0, 6);
+                    Self::bind_lane_bt(e, sp.lane, l.swa);
+                    (pass_idx, 0, 0)
+                } else {
+                    self.bind_lane(e, sp.lane);
+                    run.bind_kv(e, l.swa);
+                    run.kv_slot(slot)
+                };
                 let base = AttnArgs {
                     pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
                     q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
@@ -2027,14 +2175,13 @@ impl Engine {
                     ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
                     ..Default::default()
                 };
-                run.bind_kv(e, l.swa);
                 let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
                 let kps = Run::split_kps(nkeys);
                 let nsplit = nkeys.div_ceil(kps);
                 let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                     pad: self.sep_comb as u32, ..base };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
-                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                self.go_nb(e, C_ATTN, if blocked { "k_attn_blk" } else { "k_attn" }, &aa, (nsplit, NKV, 1), 128);
                 combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
             }
             e.barrier();
@@ -2045,6 +2192,7 @@ impl Engine {
             self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
             e.barrier();
         }
+        if !dec && blocked { self.bind_pool_slabs(e, l.swa); }
         for (si, sp) in spans.iter().enumerate() {
         if dec { break; }
         let run = self.on(sp.lane);
@@ -2055,6 +2203,46 @@ impl Engine {
         let (n, nn_) = (t - ts, (t - ts) as u32);
         let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
         e.buf(&sp.lane.cs, 0, 4);
+        let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
+        let qpd = if hatt { NH * HD / 2 } else { NH * HD };
+        if blocked {
+            Self::bind_lane_bt(e, sp.lane, l.swa);
+            let ka = KvPrepArgs {
+                t: tt, p0: p0 as u32, ring: 0, cap: 0, k_base: pass_idx, v_base: 0, cs_off: cs_slot, q_off: rs(b.q, qd),
+                k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
+                kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
+                qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
+                log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0: 0,
+            };
+            self.go(e, C_KVPREP, "k_kvprep_b_blk", &ka, (t, NKV, 1), 128);
+            if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
+                assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
+                let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
+                e.buf(qc, 0, 3);
+                let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
+                self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
+                let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
+                self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
+                self.bind_pool_slabs(e, l.swa);
+            }
+            let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+            self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+            let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+            self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+            let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap: 0, k_base: pass_idx, v_base: 0,
+                                 window: if l.swa { EXT as u32 } else { 0 }, qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), sink_off: rs(b.sink, NH), gate_off: rs(b.gate, gd),
+                                 out_off: rs(b.attn_g, NH * HD), relbias_w: l.rel_bias, ghalf: 0, kpos0: 0, pad: 0 };
+            if hatt {
+                let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: shs(b.qp, NH * HD / 2), rp_off: shs(b.rp, NH * NREL), sink_off: shs(b.sink, NH),
+                                     gate_off: shs(b.gate, gd), out_off: shs(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
+                self.go(e, C_ATTN, "k_attn_h_blk", &ah, (n.div_ceil(32), NH, 1), 256);
+            }
+            else if self.tensor { self.go(e, C_ATTN, "k_attn_bt_blk", &aa, (t.div_ceil(32), NH, 1), 256); }
+            else { self.go(e, C_ATTN, "k_attn_b_blk", &aa, (t.div_ceil(8), NKV, 1), 128); }
+            continue;
+        }
         let (kb, vb, kcap) = run.kv_slot(slot);
         let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
         let kcopy = |n: usize, pos0: usize, to_ring: u32| {
@@ -2064,8 +2252,6 @@ impl Engine {
             e.buf(&self.act.borrow(), 0, 3);
         };
         if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
-        let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
-        let qpd = if hatt { NH * HD / 2 } else { NH * HD };
         let ka = KvPrepArgs {
             t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qd),
             k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
@@ -2246,7 +2432,9 @@ impl<'a> Run<'a> {
         self.bind_eng(e);
         e.buf(&self.lane.kv_swa.borrow(), 0, 3); e.buf(&self.lane.cs, 0, 4); e.buf(&self.lane.toks, 0, 6);
     }
-    /// (k_base, v_base, cap) of a slot's K/V inside its buffer (offsets in cache elements: fp16, or bytes with --kv8)
+    /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
+    /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
+    /// table. A block-cache key address is `Lane::attn_key_offset`, a `u64` from the table.
     fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
         let (swa, i) = self.slot_kind[slot];
         let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };

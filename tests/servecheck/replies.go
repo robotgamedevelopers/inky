@@ -301,6 +301,7 @@ func (g *gate) defaultSeed() error {
 }
 
 func (g *gate) replies() {
+	g.run("concurrent identical tool calls", g.concurrentToolCalls)
 	g.run("overlapping seeded replies", g.seededReplies)
 	g.run("follow-up cached prompt length", g.followupCache)
 	g.run("unseeded replies across repeats, key order, and streaming", g.defaultSeed)

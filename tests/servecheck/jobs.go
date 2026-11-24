@@ -209,6 +209,7 @@ func (g *gate) cancelJobs() {
 		}
 		return nil
 	})
+	g.run("disconnect in mid-thinking frees a lane", g.thinkingDisconnect)
 }
 
 func (g *gate) cancelBuffered(prefill bool) error {

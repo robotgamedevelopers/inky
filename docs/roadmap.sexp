@@ -1,9 +1,9 @@
 ; docs/roadmap.sexp: the data the tables in ROADMAP.md are generated from (nova-roadmap render).
 (:schema 1
  :root "goal"
- :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
  :nodes
- ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
      ("eval-cards" "Four real cards at once through inky serve, each landing the merged fix")
@@ -161,7 +161,7 @@
   (:id "t-l3-model-layout" :type :task :title "BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses" :state :done :evidence ("main f676b09 (PR 9): specs/BlockLayout.tla, specs/SpanPins.tla, specs/RESULTS.md") :note "PR 9 merged into main, not layer2; scripts/check-tla.sh runs specs/run_tlc.zsh in CI once main's specs/ reach layer2. Offsets are checked as high-limb preservation and table indexing, not general 64-bit carry.")
   (:id "t-l3-blocks" :type :task :title "Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers" :state :todo)
   (:id "t-l3-table" :type :task :title "Attention reads keys through a per-lane block table of 64-bit offsets" :state :todo)
-  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :todo)
+  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :doing :note "Aurora: src/prefix.rs on Johnny's landed PR 49 types (EntryTree over BlockEntry, LiveTree refs and generation-checks over SlotRecords) and specs/PrefixTree.tla token-level model with seven reversed witnesses; PR 50 against layer3 open, Rowan's re-read items being closed")
   (:id "t-l3-start" :type :task :title "Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads" :state :todo)
   (:id "t-l3-tail" :type :task :title "Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse" :state :todo)
   (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :todo)
@@ -242,7 +242,7 @@
   (:id "t-l6-disconnect" :type :task :title "A client that disconnects cancels its lane" :state :done :evidence ("src/serve.rs: a failed send cancels the lane"))
   (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :done :evidence ("src/serve.rs: /health, --bind, --key-env"))
   (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max (four cards at once)"))
-  (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :doing :note "Partly: PR 24's tests/servecheck checks overlapping seeded replies and that a disconnect frees its lane in prefill and decode, at effort none; identical tool calls from concurrent cards and disconnects in mid-thinking are not covered, and tests/serve.sh runs by hand, not in CI")
+  (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :done :evidence ("tests/servecheck/concurrent.go: concurrent identical tool calls; thinkingDisconnect (disconnect on the first reasoning_content delta, canary starts, lane freed early)" "tests/serve.sh on mini-m5 2026-11-24: PASS concurrent identical tool calls, PASS disconnect in mid-thinking frees a lane, whole serve gate green"))
   (:id "t-l6-gate-memd-traces" :type :task :title "Gate: memd traces are behaviours of MemMode.tla, checked in CI" :state :done :evidence ("scripts/check-memmode-traces.sh, scripts/memmode-traces.rs, specs/memmode/TraceCheck.tla (PR 23)" "scripts/check-tla.sh in the CI cpu job (PR 26)"))
   (:id "layer-7" :type :roadmap :title "Layer 6: the lane-count sweep"
    :rows (
@@ -355,6 +355,15 @@
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
   (:id "t-later-upstream" :type :task :title "General fixes sent upstream to inkling" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")
-  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test (pull request 17, not yet on layer2).")
+  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test.")
   (:id "t-later-aggregate" :type :task :title "Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N. The drafts share one prompt through cross-lane prompt-prefix reuse (pull request 22).")
-  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")))
+  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")
+  (:id "provider" :type :roadmap :title "Provider"
+   :rows (
+     ("provider-flash-plus" "inky as a flash+ provider")
+   )
+   :columns (("done" "done"))
+   :cells (
+     ("provider-flash-plus" "done" "t-provider-flash-plus")
+   ))
+  (:id "t-provider-flash-plus" :type :task :title "inky as a flash+ provider" :state :todo :note "Gate: a mixed batch of real flash and flash+ cards through inky on the MacBook, land rate, context length per card, and tool round trips, compared with the flash and pro providers. Glenn named the tier flash+ on 2026-11-23: at least halfway between flash and pro.")))
