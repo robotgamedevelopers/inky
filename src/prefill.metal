@@ -410,6 +410,24 @@ kernel void k_state_upd(device float * A [[buffer(2)]], device float * CS [[buff
     h[0] = v[0]; h[1] = v[1]; h[2] = v[2];
 }
 
+// ---- per-position conv state for a verify span. Same rule as k_state_upd, for every prefix length m = 1..T,
+// written into a side image that has cs's layout. Does not write CS. There is no second forward.
+struct StateKeepArgs { uint x_off, ldx, cs_off, nch, T, snap_off, stride, pad; };
+kernel void k_state_keep(device float * A [[buffer(2)]], device const float * CS [[buffer(4)]], device float * SNAP [[buffer(9)]],
+                         constant StateKeepArgs & a [[buffer(5)]],
+                         uint tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const uint c = tg * 256 + tid;
+    if (c >= a.nch) return;
+    device const float * h = CS + a.cs_off + c * 3;
+    for (uint m = 1; m <= a.T; m++) {
+        device float * o = SNAP + a.snap_off + (m - 1) * a.stride + a.cs_off + c * 3;
+        for (int j = 0; j < 3; j++) {
+            const int s = int(m) + j;
+            o[j] = s >= 3 ? A[a.x_off + (s - 3) * a.ldx + c] : h[s];
+        }
+    }
+}
+
 // ---- K/V row copies between a sliding-window ring (KV, cap keys per group) and the linear prefill scratch (in the arena A).
 // The persistent cache of a sliding-window layer holds exactly its window; a prefill batch attends through a scratch copy
 // [window history | batch keys] and afterwards leaves the last window of keys in the ring. grid (n, NKV), 32 threads.

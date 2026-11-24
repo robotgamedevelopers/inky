@@ -268,6 +268,139 @@ fn check(o: &Opts) {
     }
 }
 
+/// dev, per-row logits gate. One lane, a forced token sequence, no drafter. Run `encode_spans` of t=1 through
+/// position p, then a verify span that starts at the already-cached position p-1 with length 1+k. Each vocabulary
+/// row must match the same positions run as `encode_spans` of t=1, one position at a time. `INK_K` (default 3) and
+/// `INK_P` (default 5) choose the span. Exits 1 on a mismatch.
+fn rows(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(p >= 1, "INK_P is the frontier after the cached position");
+    let ntok = p + k;
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    // forced synthetic ids, inside the embedding table. Not a drafter.
+    let toks: Vec<u32> = (0..ntok).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+    let fresh = || {
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.reserve(ntok + 1, false);
+        run.set_tokens(0, &toks);
+        lane
+    };
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let lane_r = fresh();
+    let mut expect: Vec<Vec<f32>> = Vec::with_capacity(1 + k);
+    for pos in 0..ntok {
+        step1(&lane_r, pos, true);
+        if pos + 1 >= p { expect.push(eng.logits().to_vec()); }
+    }
+    let lane = fresh();
+    let run = eng.on(&lane);
+    for pos in 0..p - 1 { step1(&lane, pos, false); }
+    let cs = run.get_cs();
+    step1(&lane, p - 1, false);
+    run.set_cs(&cs);
+    let cb = eng.gpu.cmd();
+    eng.encode_verify(&cb, &[Span { lane: &lane, p0: p - 1, t: 1 + k }], k);
+    cb.commit();
+    cb.waitUntilCompleted();
+    let mut ok = true;
+    for r in 0..1 + k {
+        let got = eng.span_logits(r);
+        let same = got == expect[r].as_slice();
+        ok &= same;
+        println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
+    }
+    println!("{}", if ok { "per-row logits match encode_spans of t=1" } else { "PER-ROW LOGITS DIFFER" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, rollback gate. One lane, synthetic draft tokens, no drafter. Two forced rejects of a verify span:
+/// one in the middle of the draft, one at the last draft position. After rollback, `lane_hash` (cs and both
+/// K/V buffers) matches `encode_spans` of t=1 stopped at the accepted length, and again after the correction
+/// token is encoded as its own step. A match of the logits at the reject position is printed and is not the gate.
+/// `INK_K` (default 3) and `INK_P` (default 5) choose the span. Exits 1 unless both rejects match.
+fn rollback(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(k >= 3 && p >= 1, "INK_K >= 3 so the middle draft and the last draft differ; INK_P >= 1");
+    let p0 = p - 1;
+    let t = 1 + k;
+    let ntok = p0 + t;
+    let one = engine::Engine::cs_image_bytes();
+    println!("cs image {one} bytes ({:.2} MiB). The span holds 1+k of these, transient, not one per context token.", one as f64 / 1048576.0);
+    println!("k=3: {} bytes ({:.2} MiB per lane). k=7: {} bytes ({:.2} MiB per lane).", one * 4, (one * 4) as f64 / 1048576.0, one * 8, (one * 8) as f64 / 1048576.0);
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    let true_tok = |i: usize| ((i * 17 + 3) % 1000) as u32;
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let mut ok = true;
+    for (name, n_keep) in [("middle", (k + 1) / 2), ("last", k)] {
+        let reject_at = p0 + n_keep;
+        assert!(n_keep >= 1 && n_keep < t && reject_at < ntok);
+        let draft_tok = |i: usize| if i >= reject_at { ((i * 17 + 9) % 1000) as u32 } else { true_tok(i) };
+        assert_ne!(draft_tok(reject_at), true_tok(reject_at), "the rejected token is not the correction");
+        let fresh = || {
+            let lane = Lane::new(&eng);
+            let run = eng.on(&lane);
+            run.reserve(ntok + 1, false);
+            lane
+        };
+        let lane_r = fresh();
+        eng.on(&lane_r).set_tokens(0, &(0..=reject_at).map(true_tok).collect::<Vec<_>>());
+        let mut ref_logits = Vec::new();
+        let mut hash_pref = 0u64;
+        for pos in 0..=reject_at {
+            step1(&lane_r, pos, pos + 1 == reject_at);
+            if pos + 1 == reject_at {
+                ref_logits = eng.logits().to_vec();
+                hash_pref = eng.lane_hash(&lane_r);
+            }
+        }
+        let hash_ref = eng.lane_hash(&lane_r);
+        let lane = fresh();
+        let run = eng.on(&lane);
+        run.set_tokens(0, &(0..ntok).map(draft_tok).collect::<Vec<_>>());
+        for pos in 0..p0 { step1(&lane, pos, false); }
+        let cs = run.get_cs();
+        step1(&lane, p0, false);
+        run.set_cs(&cs);
+        let cb = eng.gpu.cmd();
+        eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let logits_same = eng.span_logits(n_keep - 1) == ref_logits.as_slice();
+        eng.rollback_verify(&lane, 0, n_keep);
+        let pref_ok = eng.lane_hash(&lane) == hash_pref;
+        run.set_tokens(reject_at, &[true_tok(reject_at)]);
+        step1(&lane, reject_at, false);
+        let corr_ok = eng.lane_hash(&lane) == hash_ref;
+        ok &= pref_ok && corr_ok;
+        println!("case {name} n_keep {n_keep} reject-row logits {} prefix lane_hash {} correction lane_hash {}",
+            if logits_same { "same" } else { "DIFFERENT" },
+            if pref_ok { "same" } else { "DIFFERENT" },
+            if corr_ok { "same" } else { "DIFFERENT" });
+        if logits_same && !(pref_ok && corr_ok) {
+            println!("case {name}: reject-row logits match and lane_hash does not; logits alone do not pass");
+        }
+    }
+    println!("{}", if ok { "rollback lane_hash matches encode_spans of t=1" } else { "ROLLBACK LANE_HASH DIFFERS" });
+    if !ok { std::process::exit(1); }
+}
+
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
 fn binv(o: &Opts) {
@@ -438,6 +571,66 @@ fn spans(o: &Opts) {
         ok &= bad.is_empty();
     }
     println!("{}", if ok { "spans invariant: every lane, in every batch, gives exactly what it gives alone" } else { "SPANS NOT INVARIANT" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
+/// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
+/// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
+/// same logits at every shared boundary and decode step, and the same cache and convolution rows at the end,
+/// with the scratch poisoned before every step. Two tails share the one head. The copy must not move the
+/// source. INK_XCOPY_SABOTAGE=1 is the reversed witness: it copies one head token too few while the tail
+/// still starts at the head's end, and the gate must then fail (tests/ci.sh requires that failure).
+fn xcopy(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(2);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let (head, tail, ndec) = (384usize, 256usize, 8usize);
+    assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
+    let mut rot = base.clone(); rot.rotate_left(997);
+    let stream = |which: usize| -> Vec<u32> { let mut v: Vec<u32> = base[..head].to_vec(); v.extend_from_slice(if which == 0 { &base[head..head + tail + ndec] } else { &rot[head..head + tail + ndec] }); v };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let sabotage = std::env::var("INK_XCOPY_SABOTAGE").is_ok();
+    let step = |lane: &Lane, p0: usize, t: usize, dec: bool| -> u64 {
+        eng.poison_scratch();
+        let cb = eng.gpu.cmd();
+        if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
+        cb.commit(); cb.waitUntilCompleted();
+        fnv(if dec { eng.span_logits(0) } else { eng.logits() })
+    };
+    let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
+        let mut hs = Vec::new(); let mut p = from;
+        for &t in chunks { hs.push((p + t, step(lane, p, t, false))); p += t; }
+        let mut ds = Vec::new();
+        if decode { for q in 0..ndec { ds.push(step(lane, head + tail + q, 1, true)); } }
+        (hs, ds)
+    };
+    // cold: head and tail prefilled on one lane, split at 101, 384 and 640
+    let cold = |which: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(which));
+                                let out = run_stream(&l, &[101, 283, 256], 0, true); (l, out) };
+    // the source: the shared head alone, split at 101 and 384; its state at the head's end is kept
+    let src = Lane::new(&eng);
+    { let r = eng.on(&src); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(0)[..head]); run_stream(&src, &[101, 283], 0, false); }
+    let cs_head = eng.on(&src).get_cs();
+    let src_before = eng.lane_hash(&src);
+    let mut ok = true;
+    for which in 0..2 {
+        let (cl, (chs, cds)) = cold(which);
+        let l = Lane::new(&eng); let r = eng.on(&l);
+        r.reset(); r.reserve(head + tail + ndec + 1, false);
+        eng.copy_lane_prefix(&src, &l, if sabotage { head - 1 } else { head });
+        r.set_cs(&cs_head); r.set_tokens(0, &stream(which));
+        let (hs, ds) = run_stream(&l, &[63, 193], head, true);
+        let at = |v: &[(usize, u64)], p: usize| v.iter().find(|(q, _)| *q == p).map(|(_, h)| *h);
+        let same = at(&hs, head + tail) == at(&chs, head + tail) && ds == cds && eng.lane_hash(&l) == eng.lane_hash(&cl);
+        println!("tail {}: copied head {} + tail {} {} cold (logits at {}, decode steps, final state)", which, head, tail, if same { "matches" } else { "DIFFERS from" }, head + tail);
+        ok &= same;
+    }
+    if eng.lane_hash(&src) != src_before { println!("the copy moved the source lane"); ok = false; }
+    if sabotage { println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head); }
+    println!("{}", if ok { "xcopy lossless: two tails from one copied head match cold prefill bit for bit" } else { "XCOPY NOT LOSSLESS" });
     if !ok { std::process::exit(1); }
 }
 
@@ -842,9 +1035,12 @@ fn main() {
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
+        "rows" => rows(&o),
+        "rollback" => rollback(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
+        "xcopy" => xcopy(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "maxctx" => maxctx(&o),
