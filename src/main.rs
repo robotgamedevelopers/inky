@@ -60,6 +60,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --lanes N         active inference lanes (default 16)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
+  --thinking-budget N
+                    hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -86,7 +88,7 @@ fn default_model() -> String {
 fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
-        max_tokens: 16384, key: None, queue: 64,
+        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -113,6 +115,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
                 o.key = Some(key);
             }
             "--queue" => o.queue = parse_usize(flag, value()?)?,
+            "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }

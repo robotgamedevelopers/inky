@@ -12,6 +12,9 @@ pub const T_Q8_0: u32 = 8;
 pub const T_Q4_K: u32 = 12;
 pub const T_Q6_K: u32 = 14;
 pub const T_BF16: u32 = 30;
+/// Native expert weight formats (chadlyb/erisinky): NVFP4 and MXFP8 blocks of 32 weights
+pub const T_NV4: u32 = 200;
+pub const T_MX8: u32 = 201;
 
 /// (bytes per block, elements per block)
 fn type_block(t: u32) -> Option<(usize, usize)> {
@@ -24,6 +27,8 @@ fn type_block(t: u32) -> Option<(usize, usize)> {
         12 => (144, 256),
         13 => (176, 256),
         14 => (210, 256),
+        200 => (18, 32),
+        201 => (34, 32),
         _ => return None,
     })
 }
@@ -369,5 +374,18 @@ mod tests {
         for end in [1, 16, 24, 50, file.len() - 1] {
             assert_eq!(parse_tables(&file[..end]).unwrap_err().kind(), ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn native_nv4_and_mx8_block_geometry() {
+        let nv4 = Tensor::from_decl("gu", vec![2304, 2304, 128], T_NV4, 0).unwrap();
+        assert_eq!(nv4.row_bytes, 2304 / 32 * 18);
+        assert_eq!(nv4.nbytes, nv4.row_bytes * 2304 * 128);
+        assert!(Tensor::from_decl("bad_nv4", vec![30], T_NV4, 0).is_err());
+
+        let mx8 = Tensor::from_decl("dn", vec![1152, 2304, 128], T_MX8, 0).unwrap();
+        assert_eq!(mx8.row_bytes, 1152 / 32 * 34);
+        assert_eq!(mx8.nbytes, mx8.row_bytes * 2304 * 128);
+        assert!(Tensor::from_decl("bad_mx8", vec![33], T_MX8, 0).is_err());
     }
 }

@@ -433,4 +433,32 @@ impl Tokenizer {
         let eos = (special_strs.len() - 1) as u32;
         Tokenizer { id_to_tok, tok_type, tok_to_id, merges: HashMap::new(), max_bpe_token_bytes: 1, specials, byte_to_id, uni_to_byte, eos }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_byte_test() -> Tokenizer {
+        let special_strs = ["<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>",
+            "<|content_text|>", "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>",
+            "<|end_message|>", "<|content_model_end_sampling|>", "<|eos|>"];
+        let mut id_to_tok: Vec<String> = special_strs.iter().map(|s| s.to_string()).collect();
+        let mut tok_type: Vec<i64> = vec![3; special_strs.len()];
+        let mut byte_to_id = [0u32; 256];
+        let mut uni_to_byte = HashMap::new();
+        let mut n = 0u32;
+        for b in 0..256u32 {
+            let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+            let cp = if keep { b } else { n += 1; 255 + n };
+            let ch = char::from_u32(cp).unwrap();
+            let id = id_to_tok.len() as u32;
+            id_to_tok.push(ch.to_string());
+            tok_type.push(0);
+            byte_to_id[b as usize] = id;
+            uni_to_byte.insert(ch, b as u8);
+        }
+        let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
+        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        let eos = (special_strs.len() - 1) as u32;
+        Tokenizer { id_to_tok, tok_type, tok_to_id, merges: HashMap::new(), max_bpe_token_bytes: 1, specials, byte_to_id, uni_to_byte, eos }
+    }
 }

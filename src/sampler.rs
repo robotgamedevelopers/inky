@@ -10,11 +10,17 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// `top_k == 0` disables top-k truncation (full-vocab sampling with monotonic `atanh` logit cut).
     pub fn new(temp: f32, top_k: usize, top_p: f32, softcap: f32, seed: u64) -> Sampler {
-        Sampler { temp, top_k: top_k.max(1), top_p, softcap, state: seed ^ 0x9E37_79B9_7F4A_7C15, cand: Vec::with_capacity(256) }
+        Sampler { temp, top_k, top_p, softcap, state: seed ^ 0x9E37_79B9_7F4A_7C15, cand: Vec::with_capacity(256) }
     }
 
     pub fn greedy(&self) -> bool { self.temp <= 0.0 }
+
+    /// Whether this sampler can use GPU Gumbel-max sampling (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky).
+    pub fn uses_gpu_gumbel(&self) -> bool {
+        self.top_k == 0 && self.top_p >= 1.0 && self.temp.is_finite() && self.temp >= 0.0
+    }
 
     fn next_f32(&mut self) -> f32 {
         // splitmix64
@@ -37,32 +43,63 @@ impl Sampler {
 
     /// Sample one model row, or fail the request before consuming an RNG draw.
     pub fn sample_next(&mut self, logits: &[f32]) -> Result<u32, &'static str> {
-        let Some(&first) = logits.first() else { return Err("model returned no logits") };
+        self.sample_next_with_ban(logits, None)
+    }
+
+    /// Sample one model row with an optional banned token ID (used for hard thinking-budget close),
+    /// using a monotonic `atanh` raw-logit cutoff (chadlyb/erisinky) to skip `tanh`/`exp` on tokens
+    /// more than 30 nats below the maximum.
+    pub fn sample_next_with_ban(&mut self, logits: &[f32], ban: Option<u32>) -> Result<u32, &'static str> {
+        if logits.is_empty() { return Err("model returned no logits"); }
         if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
+        let mut best: Option<(f32, u32)> = None;
+        for (i, &x) in logits.iter().enumerate() {
+            if !x.is_finite() { return Err("model returned non-finite logits"); }
+            if Some(i as u32) == ban { continue; }
+            if best.is_none_or(|(b, _)| x > b) { best = Some((x, i as u32)); }
+        }
+        let Some((best_val, best_tok)) = best else { return Err("no sampling candidates") };
         if self.greedy() || self.temp < 1e-5 {
-            let (mut best, mut token) = (first, 0);
-            for (i, &x) in logits.iter().enumerate() {
-                if !x.is_finite() { return Err("model returned non-finite logits"); }
-                if x > best { best = x; token = i as u32; }
-            }
-            return Ok(token);
+            return Ok(best_tok);
         }
         if !self.softcap.is_finite() || !self.top_p.is_finite() {
             return Err("invalid sampling parameters");
         }
-        // top-k on raw logits (softcap is monotonic, so the order is the same)
-        let k = self.top_k.min(logits.len());
-        select_top_k(logits, k, &mut self.cand)?;
-        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0));
         let c = self.softcap;
         let t = self.temp;
         let capped = |x: f32| if c > 0.0 { c * (x / c).tanh() } else { x };
-        let max = capped(self.cand[0].0);
-        let scaled_max = max / t;
+        let max_cap = capped(best_val);
+        let scaled_max = max_cap / t;
+        // Monotonic raw-logit cutoff: tokens >30 nats below max carry < e^-30 (< f32::EPSILON) weight.
+        let raw_cut = if scaled_max.is_finite() {
+            let y = t * (scaled_max - 30.0);
+            let rc = if c <= 0.0 {
+                y
+            } else if y <= -c {
+                f32::NEG_INFINITY
+            } else {
+                c * (y / c).atanh()
+            };
+            if rc.is_finite() { rc - 1e-3 * rc.abs() - 1e-3 } else { f32::NEG_INFINITY }
+        } else {
+            f32::NEG_INFINITY
+        };
+        self.cand.clear();
+        for (i, &x) in logits.iter().enumerate() {
+            if Some(i as u32) != ban && x >= raw_cut {
+                self.cand.push((x, i as u32));
+            }
+        }
+        if self.cand.is_empty() {
+            self.cand.push((best_val, best_tok));
+        }
+        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        if self.top_k > 0 && self.cand.len() > self.top_k {
+            self.cand.truncate(self.top_k);
+        }
         let mut p: Vec<f32> = self.cand.iter().map(|&(x, _)| {
             let x = capped(x);
-            // Preserve the usual rounding, and center before division when tiny temperatures overflow it.
-            let centered = if scaled_max.is_finite() { x / t - scaled_max } else { (x - max) / t };
+            let centered = if scaled_max.is_finite() { x / t - scaled_max } else { (x - max_cap) / t };
             centered.exp()
         }).collect();
         let sum: f32 = p.iter().sum();
@@ -146,7 +183,7 @@ impl Sampler {
     /// p and q on the union of the two top-k sets, after softcap-after-top-k, `/temp`, and top-p.
     /// A token the other side alone kept is present with a zero. Neither side is renormalized for that zero.
     fn masses(&self, target: &[f32], draft: &[f32]) -> Vec<Mass> {
-        let k = self.top_k;
+        let k = if self.top_k == 0 { target.len().max(draft.len()) } else { self.top_k };
         let mut target_kept = Vec::new();
         let mut draft_kept = Vec::new();
         select_top_k(target, k.min(target.len()), &mut target_kept).expect("invalid target sampling row");
@@ -439,5 +476,29 @@ mod tests {
         assert_eq!(repeated, out, "the same request seed repeats the first round");
         assert_ne!(second, repeated, "the next round continues; it is not a reseed");
         assert_ne!(continued.state, after_first);
+    }
+
+    #[test]
+    fn atanh_cutoff_and_ban_mask_preserve_distribution_and_support_full_vocab() {
+        // Full-vocab (top_k = 0, top_p = 1.0) with softcap and deep tail logits
+        let mut logits = vec![-100.0f32; 2048];
+        logits[5] = 10.0;
+        logits[42] = 9.5;
+        logits[99] = 9.0;
+        let mut s = Sampler::new(1.0, 0, 1.0, 20.0, 12345);
+        assert!(s.uses_gpu_gumbel());
+        assert!(!Sampler::new(1.0, 64, 0.95, 20.0, 12345).uses_gpu_gumbel());
+
+        // Banning the top logit (5) must never emit token 5 in greedy or stochastic mode.
+        let mut greedy = Sampler::new(0.0, 0, 1.0, 20.0, 1);
+        assert_eq!(greedy.sample_next_with_ban(&logits, None), Ok(5));
+        assert_eq!(greedy.sample_next_with_ban(&logits, Some(5)), Ok(42));
+        for _ in 0..200 {
+            let tok = s.sample_next_with_ban(&logits, Some(5)).unwrap();
+            assert_ne!(tok, 5, "banned token must never be sampled");
+            assert!(matches!(tok, 42 | 99), "atanh cutoff drops -100 tail cleanly, got {tok}");
+        }
+        // Banning the only candidate fails cleanly.
+        assert!(greedy.sample_next_with_ban(&[1.0], Some(0)).is_err());
     }
 }
