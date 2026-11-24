@@ -120,7 +120,20 @@ func (r apiObservation) expect(code int) error {
 	return nil
 }
 
-func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
+func verifyModelsList(models []struct{ ID string }) error {
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		seen[m.ID] = true
+	}
+	for _, want := range []string{"inkling-2-mini", "inky/inkling-2-mini"} {
+		if !seen[want] {
+			return fmt.Errorf("/v1/models missing required model id %q (got %+v)", want, models)
+		}
+	}
+	return nil
+}
+
+func (g *gate) observeHeaders(path string, headers map[string]string, body []byte) (apiObservation, error) {
 	var result apiObservation
 	method := http.MethodGet
 	if body != nil {
@@ -130,8 +143,8 @@ func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
 	if err != nil {
 		return result, err
 	}
-	if auth != "" {
-		req.Header["authorization"] = []string{auth}
+	for k, v := range headers {
+		req.Header[k] = []string{v}
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -145,6 +158,14 @@ func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
 	result.code = resp.StatusCode
 	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result)
 	return result, err
+}
+
+func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
+	headers := map[string]string{}
+	if auth != "" {
+		headers["authorization"] = auth
+	}
+	return g.observeHeaders(path, headers, body)
 }
 
 func (g *gate) checkHealth(path string, sabotage bool) error {
@@ -189,8 +210,26 @@ func (g *gate) validation(expectedLanes int) {
 		if err := r.expect(200); err != nil {
 			return err
 		}
-		if len(r.Models) == 0 {
-			return fmt.Errorf("authorized model list is empty")
+		if err := verifyModelsList(r.Models); err != nil {
+			return err
+		}
+		// x-api-key authentication works identically to Bearer and rejects invalid keys with 401.
+		badKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key + "-wrong"}, nil)
+		if err != nil {
+			return err
+		}
+		if err := badKey.expect(401); err != nil {
+			return fmt.Errorf("bad x-api-key: %w", err)
+		}
+		goodKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key}, nil)
+		if err != nil {
+			return err
+		}
+		if err := goodKey.expect(200); err != nil {
+			return fmt.Errorf("good x-api-key: %w", err)
+		}
+		if err := verifyModelsList(goodKey.Models); err != nil {
+			return err
 		}
 		return g.checkHealth("/health", g.sabotage == "health-status")
 	})

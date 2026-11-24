@@ -76,7 +76,7 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 |---|---|---|
 | `-m PATH` | LM Studio path above | Model GGUF |
 | `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
-| `--key-env NAME` | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
+| `--key-env NAME` (`--api-key-env NAME`) | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allows a non-loopback listen address without a key. |
 | `--lanes N` | 16 | Concurrent requests |
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
@@ -88,7 +88,9 @@ An unkeyed server binds only to loopback by default. A non-loopback address requ
 
 An extending request can reuse a lane's previous prompt while its sliding-window history is still in the cache. Decode writes that overwrite that history discard the saved prompt. At prefill completion, another lane can copy the cache and the prompt-end convolution state and prefill only the suffix. `inky xcopy` checks that this copy is bit-identical to cold prefill. Partial overlaps start cold because the convolution state is saved only at the prompt's end.
 
-`GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
+`GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini` and `inky/inkling-2-mini`. `POST /v1/messages` supports streaming, thinking effort mapping, and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, `stream_options.include_usage: true`, model `inkling-2-mini` or `inky/inkling-2-mini`, and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
+
+Each completed request logs its queue wait (`queue_ms`), prefill time (`prefill_ms`), decode time (`decode_ms`), and occupied lanes at admission (`lanes_busy_start`), records them in `--record-dir` JSONL entries, and exposes them on non-streaming responses via `X-Inky-Queue-Ms`, `X-Inky-Prefill-Ms`, and `X-Inky-Decode-Ms`. Once a minute, including idle periods, the server logs a time-weighted utilization summary (`lanes_busy_avg`, `input_tok_s`, `output_tok_s`, `queue_depth`).
 
 The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. Up to four requests can translate and tokenize prompts concurrently, including `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
 
