@@ -89,7 +89,7 @@ DropBlock(s) == SubSeq(s, 1, Len(s) - BlockLen)
 
 BlockAt(s, k) == SubSeq(s, (k - 1) * BlockLen + 1, k * BlockLen)
 
-WinLive(s) == winSlotOf[s] = 0 \/ winGenOf[s] = poolGen[winSlotOf[s]]
+WinLive(s) == IF winSlotOf[s] = 0 THEN TRUE ELSE winGenOf[s] = poolGen[winSlotOf[s]]
 
 \* Every block-boundary prefix of s is sealed at its slots' current
 \* generations. The empty prefix needs nothing and is always live.
