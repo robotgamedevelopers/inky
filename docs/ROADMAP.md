@@ -160,9 +160,9 @@ The endpoint a coding-agent harness talks to.
 | A client that disconnects cancels its lane | ✅ |
 | A health endpoint, and binding to loopback or a private network only | ✅ |
 | Gate: the tracer card and a recorded replay set land through it | ✅ |
-| Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ❌ |
+| Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ✅ |
 | Gate: memd traces are behaviours of MemMode.tla, checked in CI | ✅ |
-| complete | 88% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
