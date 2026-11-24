@@ -34,11 +34,23 @@ Post(row) == Matches(sealed', starts', slotOf', genOf', poolGen', refs', result'
 StepOp(row) ==
     CASE row.op = "seal" -> Seal(row.s, row.slot)
       [] row.op = "seal-stale" -> UNCHANGED vars
+      [] row.op = "seal-dup" -> Dedup(row.s)
+      [] row.op = "seal-twin" -> ReSeal(row.s, row.slot)
       [] row.op = "retain" -> Retain(row.s)
       [] row.op = "release" -> Release(row.s)
       [] row.op = "reuse" -> Reuse(row.slot)
       [] row.op = "remove" -> Evict(row.s)
       [] row.op = "seek" -> Seek
+
+\* The pool's books, read from the records at every row: the refs the
+\* pool holds on a slot are exactly the live blocks sealed onto it.
+\* The model's own refs are per block; this binds the pool's counts,
+\* so a dropped ref (or a leaked one) has nowhere to hide.
+PoolBooks ==
+    LET row == Trace[step] IN
+        \A slot \in Slots :
+            row.poolRefs[slot] =
+                Cardinality({s \in sealed \ {<<>>} : slotOf[s] = slot})
 
 TInit ==
     /\ Init

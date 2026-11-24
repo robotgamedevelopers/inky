@@ -581,6 +581,9 @@ mod tests {
             })
         }
         fn refs(&mut self, slot: Slot, kind: BlockKind) -> u32 { self.record(slot, kind).refs() }
+        fn pool_refs(&self, slot: Slot, kind: BlockKind) -> u32 {
+            self.map.get(&Self::key(slot, kind)).map(|r| r.refs()).unwrap_or(0)
+        }
         fn reuse(&mut self, slot: Slot, kind: BlockKind) { self.record(slot, kind).bump_generation().unwrap(); }
     }
 
@@ -728,8 +731,11 @@ mod tests {
     /// the records' so the model starts at 0), every operation's
     /// resulting state emitted as one row of `PrefixTreeTraceData.tla`.
     /// TLC then checks the emitted states are behaviours of
-    /// `specs/PrefixTree.tla`. Ignored by default; `specs/run_tlc.zsh`
-    /// runs it before the trace check.
+    /// `specs/PrefixTree.tla`. The walk opens with a steered pass over
+    /// the model's request — held starts on the path, a stale root, a
+    /// stale-twin reinsert — then wanders, seeks included, so a broken
+    /// seek writes a row the model cannot step to. Ignored by default;
+    /// `specs/run_tlc.zsh` runs it before the trace check.
     #[test]
     #[ignore = "trace dump; run by specs/run_tlc.zsh"]
     fn prefix_trace_dump() {
@@ -757,23 +763,73 @@ mod tests {
                 gen_of.insert(seq.clone(), e.generation() as i64 - 1);
                 refs.insert(seq, 1);
             }
+            // the pool's own counts, read from the records: PoolBooks
+            // in PrefixTreeTrace binds them to the sealed blocks
+            let pool_refs = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]",
+                live.records.pool_refs(Slot::new(1).unwrap(), BlockKind::Full),
+                live.records.pool_refs(Slot::new(2).unwrap(), BlockKind::Full),
+                live.records.pool_refs(Slot::new(3).unwrap(), BlockKind::Full));
             let g = |sl: u32| live.records.generation(Slot::new(sl).unwrap(), BlockKind::Full).unwrap() - 1;
             let pool = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", g(1), g(2), g(3));
             format!(
                 "[op |-> \"{op}\", s |-> {}, slot |-> {slot}, sealed |-> {{{}}}, starts |-> {}, \
-                 slotOf |-> {}, genOf |-> {}, poolGen |-> {}, refs |-> {}, result |-> {}, sought |-> {}]",
+                 slotOf |-> {}, genOf |-> {}, poolGen |-> {}, refs |-> {}, poolRefs |-> {}, result |-> {}, sought |-> {}]",
                 tla_seq(s), sealed.join(", "), tla_fn(&starts), tla_fn(&slot_of_m),
-                tla_fn(&gen_of), pool, tla_fn(&refs), tla_seq(result),
+                tla_fn(&gen_of), pool, tla_fn(&refs), pool_refs, tla_seq(result),
                 if sought { "TRUE" } else { "FALSE" })
         };
+        let req_abstract: Vec<u32> = vec![1, 2, 1, 2];
+        let req: Vec<u32> = [enc([1, 2]), enc([1, 2])].concat();
 
         rows.push(snapshot(&live, &seq_of, "init", &[], 0, &[], false));
+
+        // --- the steered pass over the model's request ---
+        let root = live.insert(None, 0, &enc([1, 2]), entry(1, 1, BlockKind::Full)).unwrap();
+        seq_of.insert(root, vec![1, 2]);
+        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 1, &[], false));
+        let child = live.insert(Some(root), BLOCK, &enc([1, 2]), entry(2, 1, BlockKind::Full)).unwrap();
+        seq_of.insert(child, req_abstract.clone());
+        rows.push(snapshot(&live, &seq_of, "seal", &req_abstract, 2, &[], false));
+        live.retain_start(root).unwrap();
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
+        live.retain_start(child).unwrap();
+        rows.push(snapshot(&live, &seq_of, "retain", &req_abstract, 0, &[], false));
+        let m = live.deepest_start(&req).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        assert!(live.release_start(child));
+        rows.push(snapshot(&live, &seq_of, "release", &req_abstract, 0, &[], false));
+        let m = live.deepest_start(&req).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        live.records.reuse(Slot::new(1).unwrap(), BlockKind::Full); // the root's slot moves on: the root is stale
+        rows.push(snapshot(&live, &seq_of, "reuse", &[], 1, &[], false));
+        let m = live.deepest_start(&req).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        // the stale twin, reinserted fresh on another slot
+        let root2 = live.insert(None, 0, &enc([1, 2]), entry(3, 1, BlockKind::Full)).unwrap();
+        seq_of.insert(root2, vec![1, 2]);
+        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 3, &[], false));
+        live.retain_start(root2).unwrap();
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // root2 is stale now, still sealed
+        rows.push(snapshot(&live, &seq_of, "reuse", &[], 3, &[], false));
+        let root3 = live.insert(None, 0, &enc([1, 2]), entry(2, 1, BlockKind::Full)).unwrap();
+        assert_ne!(root3, root2, "the fresh block replaces the stale twin");
+        seq_of.retain(|id, _| *id != root2);
+        seq_of.insert(root3, vec![1, 2]);
+        rows.push(snapshot(&live, &seq_of, "seal-twin", &[1, 2], 2, &[], false));
+        live.retain_start(root3).unwrap();
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
+        let m = live.deepest_start(&req).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+
+        // --- the wander: every operation, seeks included ---
         let mut mutating = 0;
         let mut attempts = 0;
-        while mutating < 44 && attempts < 400 {
+        while mutating < 40 && attempts < 500 {
             attempts += 1;
             let live_ids: Vec<SealedId> = live.tree.entries().into_iter().map(|(id, _)| id).collect();
-            match pick(6) {
+            seq_of.retain(|id, _| live_ids.contains(id));
+            match pick(8) {
                 0 => { // seal a fresh block under a live parent (or the root)
                     let parents: Vec<Option<SealedId>> = std::iter::once(None)
                         .chain(live_ids.iter().filter(|id| seq_of[id].len() == 2).map(|id| Some(*id)))
@@ -827,33 +883,52 @@ mod tests {
                     live.records.reuse(Slot::new(slot).unwrap(), BlockKind::Full);
                     rows.push(snapshot(&live, &seq_of, "reuse", &[], slot, &[], false));
                 }
+                5 => { // insert a block that is already in the tree
+                    if live_ids.is_empty() { continue; }
+                    let id = live_ids[pick(live_ids.len())];
+                    let seq = seq_of[&id].clone();
+                    let twin = live.handle(id).unwrap();
+                    let (parent, pos) = if seq.len() == 2 { (None, 0) } else {
+                        let pid = *seq_of.iter().find(|(_, s)| **s == seq[..2]).unwrap().0;
+                        (Some(pid), BLOCK)
+                    };
+                    let block = [seq[seq.len() - 2], seq[seq.len() - 1]];
+                    if live.records.generation(twin.slot(), twin.kind()) == Some(twin.generation()) {
+                        // the twin is live: a dedup, the tree keeps its entry
+                        let got = live.insert(parent, pos, &enc(block),
+                            entry(twin.slot().get(), twin.generation(), BlockKind::Full)).unwrap();
+                        assert_eq!(got, id, "the dedup returns the block already in the tree");
+                        rows.push(snapshot(&live, &seq_of, "seal-dup", &seq, twin.slot().get(), &[], false));
+                    } else {
+                        // the twin is stale: evicted, the fresh entry sealed in its place
+                        let slot = 1 + pick(3) as u32;
+                        let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
+                        let fresh = live.insert(parent, pos, &enc(block),
+                            entry(slot, gen, BlockKind::Full)).unwrap();
+                        assert_ne!(fresh, id, "the fresh block replaces the stale twin");
+                        seq_of.retain(|k, _| *k != id);
+                        seq_of.insert(fresh, seq.clone());
+                        rows.push(snapshot(&live, &seq_of, "seal-twin", &seq, slot, &[], false));
+                    }
+                }
+                6 => { // seek the model's request, wherever the walk is
+                    let m = live.deepest_start(&req).unwrap();
+                    rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+                }
                 _ => { // remove a block and everything below it
                     if live_ids.is_empty() { continue; }
                     let id = live_ids[pick(live_ids.len())];
                     let seq = seq_of[&id].clone();
                     live.remove(id).unwrap();
-                    let live_now: Vec<SealedId> = live.tree.entries().into_iter().map(|(i, _)| i).collect();
-                    seq_of.retain(|k, _| live_now.contains(k));
                     rows.push(snapshot(&live, &seq_of, "remove", &seq, 0, &[], false));
                 }
             }
             mutating += 1;
         }
-        assert_eq!(mutating, 44, "the walk took its mutating steps");
-        // the model's fixed request, then the same seek again: the
-        // second result proves the evictions settled
-        let req: Vec<u32> = [enc([1, 2]), enc([1, 2])].concat();
-        for _ in 0..2 {
-            let m = live.deepest_start(&req).unwrap();
-            let result: Vec<u32> = [1, 2, 1, 2][..m.at / BLOCK * 2].to_vec();
-            rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &result, true));
-        }
-        // the pool's books, checked in Rust: one ref per live block
-        for slot in 1..=3u32 {
-            let want = live.tree.entries().iter().filter(|(_, e)| e.slot().get() == slot).count() as u32;
-            assert_eq!(live.records.refs(Slot::new(slot).unwrap(), BlockKind::Full), want,
-                "one ref per live block on slot {slot} at the end of the walk");
-        }
+        assert_eq!(mutating, 40, "the walk took its wandering steps");
+        let m = live.deepest_start(&req).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+
         let body = format!(
             "------------------------- MODULE PrefixTreeTraceData -------------------------\n\
              \\* Generated by prefix::tests::prefix_trace_dump (specs/run_tlc.zsh runs it).\n\
@@ -862,6 +937,7 @@ mod tests {
             rows.join(",\n"));
         std::fs::write(&out, body).unwrap();
     }
+
 
     #[test]
     fn entry_handles_come_back_as_johnnys_entries() {

@@ -17,9 +17,10 @@
 \* the one ref the tree holds per sealed block. starts counts the
 \* holders of a start point (a lane head and a prompt end are two).
 \*
-\* The tree stops changing once a seek has run (~sought on every
-\* mutating action): the checked property is about one seek against
-\* the tree as the caller sees it at call time, as in the code.
+\* A mutation after a seek consumes that seek's result (sought and
+\* result reset): the checked properties speak about the tree as the
+\* caller sees it at the moment of a seek, and the code's tree keeps
+\* changing after one, as does the model's.
 \*
 \* Bug values are the reversed witnesses, one per config:
 \*   "shallow"      Seek returns the shallowest live start (DeepestStart)
@@ -119,7 +120,9 @@ Seal(s, slot) ==
     /\ slotOf' = [slotOf EXCEPT ![s] = slot]
     /\ genOf' = [genOf EXCEPT ![s] = poolGen[slot]]
     /\ refs' = [refs EXCEPT ![s] = 1]
-    /\ UNCHANGED <<starts, poolGen, result, sought>>
+    /\ UNCHANGED <<starts, poolGen>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 \* The stale-insert bug, expressible only as its own action: an insert
 \* arrives claiming a generation its slot has moved past, and is
@@ -143,20 +146,56 @@ SealClaimed(s, slot, gen) ==
     /\ slotOf' = [slotOf EXCEPT ![s] = slot]
     /\ genOf' = [genOf EXCEPT ![s] = gen]
     /\ refs' = [refs EXCEPT ![s] = 1]
-    /\ UNCHANGED <<starts, poolGen, result, sought>>
+    /\ UNCHANGED <<starts, poolGen>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
+
+\* Inserting a block that is already in the tree, exactly: the code
+\* returns the block it has and takes no second ref. The tree keeps
+\* its own entry, whichever slot the caller named.
+Dedup(s) ==
+    /\ s \in sealed \ {<<>>}
+    /\ UNCHANGED <<sealed, starts, slotOf, genOf, poolGen, refs>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
+
+\* Inserting a fresh entry for a block whose twin in the tree is
+\* stale: the code evicts the twin (its ref dropped, everything
+\* below it gone, its start holds released) and seals the fresh
+\* entry in its place, so the name moves to the entry's slot at
+\* that slot's current generation, holding exactly one ref.
+ReSeal(s, slot) ==
+    /\ s \in sealed \ {<<>>}
+    /\ genOf[s] # poolGen[slotOf[s]]
+    /\ slot \in Slots
+    /\ sealed' = {u \in sealed : ~IsPrefix(s, u)} \cup {s}
+    /\ starts' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE starts[x]]
+    /\ slotOf' = [x \in BlockSeqs |->
+            IF x = s THEN slot ELSE IF IsPrefix(s, x) THEN 0 ELSE slotOf[x]]
+    /\ genOf' = [x \in BlockSeqs |->
+            IF x = s THEN poolGen[slot] ELSE IF IsPrefix(s, x) THEN 0 ELSE genOf[x]]
+    /\ refs' = [x \in BlockSeqs |->
+            IF IsPrefix(s, x) /\ x # s THEN 0 ELSE refs[x]]
+    /\ UNCHANGED <<poolGen>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 Retain(s) ==
     /\ ~sought
     /\ s \in sealed \ {<<>>}
     /\ starts[s] < MaxHolders
     /\ starts' = [starts EXCEPT ![s] = starts[s] + 1]
-    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs, result, sought>>
+    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 Release(s) ==
     /\ ~sought
     /\ starts[s] > 0
     /\ starts' = [starts EXCEPT ![s] = starts[s] - 1]
-    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs, result, sought>>
+    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 \* The pool reuses a slot only once the tree holds no ref on it:
 \* the generation moves, and any block still naming the slot at the
@@ -170,7 +209,9 @@ Reuse(slot) ==
     /\ Bug \in {"stale", "leak", "reuse-held", "evict"}
         \/ \A s \in sealed : slotOf[s] = slot => refs[s] = 0
     /\ poolGen' = [poolGen EXCEPT ![slot] = poolGen[slot] + 1]
-    /\ UNCHANGED <<sealed, starts, slotOf, genOf, refs, result, sought>>
+    /\ UNCHANGED <<sealed, starts, slotOf, genOf, refs>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 \* Removal takes a block and everything below it out of the tree and
 \* drops their refs and start holds.
@@ -182,7 +223,9 @@ Evict(s) ==
     /\ refs' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE refs[x]]
     /\ slotOf' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE slotOf[x]]
     /\ genOf' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE genOf[x]]
-    /\ UNCHANGED <<poolGen, result, sought>>
+    /\ UNCHANGED <<poolGen>>
+    /\ sought' = FALSE
+    /\ result' = <<>>
 
 FirstTokenMatch(p, r) ==
     /\ Len(p) <= Len(r)
@@ -230,6 +273,8 @@ Seek ==
 Next ==
     \/ \E s \in BlockSeqs, slot \in Slots : Seal(s, slot)
     \/ \E s \in BlockSeqs, slot \in Slots, gen \in 0..MaxGen : SealClaimed(s, slot, gen)
+    \/ \E s \in BlockSeqs : Dedup(s)
+    \/ \E s \in BlockSeqs, slot \in Slots : ReSeal(s, slot)
     \/ \E s \in BlockSeqs : Retain(s) \/ Release(s) \/ Evict(s)
     \/ \E slot \in Slots : Reuse(slot)
     \/ Seek
