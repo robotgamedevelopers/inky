@@ -103,16 +103,16 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 
 | feature | done |
 |---|:---:|
-| CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness | ❌ |
+| CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness | ✅ |
 | BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses | ✅ |
-| Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers | ❌ |
-| Attention reads keys through a per-lane block table of 64-bit offsets | ❌ |
-| A request matches the deepest start point in a prefix tree of sealed blocks | ❌ |
-| Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads | ❌ |
-| Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ❌ |
-| Gate: the engine's traces are behaviours of both models, checked in CI | ❌ |
-| Gate: outputs identical to layer 2 with poisoned pool slots | ❌ |
-| complete | 11% |
+| Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers | ✅ |
+| Attention reads keys through a per-lane block table of 64-bit offsets | ✅ |
+| A request matches the deepest start point in a prefix tree of sealed blocks | ✅ |
+| Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads | ✅ |
+| Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ✅ |
+| Gate: the engine's traces are behaviours of both models, checked in CI | ✅ |
+| Gate: outputs identical to layer 2 with poisoned pool slots | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -126,20 +126,20 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 
 | feature | done |
 |---|:---:|
-| Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled | ❌ |
-| Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget | ❌ |
-| No Ready, Restoring or Queued lane is passed over more than W ticks | ❌ |
-| Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ❌ |
-| The memory budget read from Metal's recommended working set at start, never passed by hand | ❌ |
+| Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled | ✅ |
+| Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget | ✅ |
+| No Ready, Restoring or Queued lane is passed over more than W ticks | ✅ |
+| Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ✅ |
+| The memory budget read from Metal's recommended working set at start, never passed by hand | ✅ |
 | Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ✅ |
-| Cancel in a step waits for the step's GPU work and disk I/O | ❌ |
-| Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ❌ |
-| Restoring reserves the whole working set atomically before reading | ❌ |
-| Gate: scheduler traces are behaviours of the model, checked in CI | ❌ |
-| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ❌ |
-| Gate: kill -9 in mid-write loses cache and never correctness | ❌ |
-| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ❌ |
-| complete | 7% |
+| Cancel in a step waits for the step's GPU work and disk I/O | ✅ |
+| Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ✅ |
+| Restoring reserves the whole working set atomically before reading | ✅ |
+| Gate: scheduler traces are behaviours of the model, checked in CI | ✅ |
+| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ✅ |
+| Gate: kill -9 in mid-write loses cache and never correctness | ✅ |
+| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -176,11 +176,11 @@ Measure the curve and pick the lane count where adding lanes stops paying.
 
 | feature | done |
 |---|:---:|
-| Real card traffic recorded as a replay set | ❌ |
-| Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ❌ |
-| Each candidate machine measured: memory bandwidth, single-stream decode, prefill | ❌ |
-| The knee chosen and written down as the default lane count | ❌ |
-| complete | 0% |
+| Real card traffic recorded as a replay set | ✅ |
+| Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ✅ |
+| Each candidate machine measured: memory bandwidth, single-stream decode, prefill | ✅ |
+| The knee chosen and written down as the default lane count | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -194,10 +194,10 @@ Real work arrives from a fleet of agents.
 
 | feature | done |
 |---|:---:|
-| A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling | ❌ |
-| Harness and tools run on other machines and reach the endpoint over a private network | ❌ |
+| A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling | ✅ |
+| Harness and tools run on other machines and reach the endpoint over a private network | ✅ |
 | Gate: a real low-priority card lands from the fleet | ❌ |
-| complete | 0% |
+| complete | 66% |
 
 [Source data](roadmap.sexp)
 
@@ -212,8 +212,8 @@ Run it for days.
 | feature | done |
 |---|:---:|
 | Days under real load with no growth in blocks, memory or disk | ❌ |
-| Kills, a full disk and client disconnect storms leave the server correct | ❌ |
-| complete | 0% |
+| Kills, a full disk and client disconnect storms leave the server correct | ✅ |
+| complete | 50% |
 
 [Source data](roadmap.sexp)
 

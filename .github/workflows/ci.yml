@@ -50,6 +50,9 @@ jobs:
       - name: inkconvert tests
         working-directory: tools/inkconvert
         run: go test -race ./...
+      - name: fleetcheck tests
+        working-directory: tests
+        run: go vet ./fleetcheck/... && go test -race ./fleetcheck/...
       - name: replay sweep tests
         working-directory: tools/replay
         run: go vet ./... && go test -race ./...

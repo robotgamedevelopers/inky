@@ -2070,6 +2070,25 @@ fn count_tokens<W: Write + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io:
     }
 }
 
+/// Returns true if `ip` is loopback or belongs to a private / Tailscale (RFC 6598) network.
+pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (a == 100 && (b & 0b1100_0000) == 64) // RFC 6598 CGNAT / Tailscale 100.64.0.0/10
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || (seg0 & 0xfe00) == 0xfc00 // RFC 4193 ULA (fc00::/7, incl. Tailscale fd7a:115c:a1e0::/48)
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
@@ -2120,7 +2139,7 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
-        preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2132,9 +2151,13 @@ pub fn serve(o: ServeOpts) {
     // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
     let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
     let addr = l.local_addr().expect("bound address");
-    let auth = if o.key.is_some() { "a key required" }
-               else if addr.ip().to_canonical().is_loopback() { "no key (loopback)" }
-               else { "no key (non-loopback explicitly enabled)" };
+    let auth = if o.key.is_some() {
+        if is_private_ip(addr.ip()) { "a key required (private/loopback)" } else { "a key required" }
+    } else if addr.ip().to_canonical().is_loopback() {
+        "no key (loopback)"
+    } else {
+        "no key (non-loopback explicitly enabled)"
+    };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     if effective_lanes < o.lanes {
         eprintln!(
@@ -3791,5 +3814,41 @@ mod tests {
         assert_eq!(body["record_rotations"], 0);
         drop(cx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn is_private_ip_covers_tailscale_cgnat_and_rfc1918() {
+        for addr in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.50",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.117.59.68",
+            "100.65.89.96",
+            "100.127.255.254",
+            "::1",
+            "::ffff:100.117.59.68",
+            "fd7a:115c:a1e0::1",
+            "fe80::1",
+        ] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(is_private_ip(ip), "{addr} should be classified as private/Tailscale");
+        }
+        for addr in [
+            "0.0.0.0",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.0",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.0.2.1",
+            "::",
+            "2001:4860:4860::8888",
+        ] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(!is_private_ip(ip), "{addr} should not be classified as private");
+        }
     }
 }

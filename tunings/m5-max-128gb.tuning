@@ -6,3 +6,5 @@ memory_gb = 128
 wired_limit_mb = 118000
 # kept free of lane caches inside Metal's working set (GiB)
 lane_margin_gib = 4
+# default lane count chosen from the Layer 6 replay sweep knee (max_ttft_p95_ms <= 20s)
+default_lanes = 64

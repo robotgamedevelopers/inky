@@ -60,6 +60,8 @@ options:
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
   --raw             do not apply the chat template; print special tokens";
 
+const DEFAULT_SERVE_LANES: usize = 64;
+
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
@@ -70,7 +72,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
                     alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
-  --lanes N         active inference lanes (default 16)
+  --lanes N         active inference lanes (default 64)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
@@ -118,7 +120,7 @@ fn default_model() -> String {
 
 fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
@@ -223,6 +225,7 @@ mod cli_tests {
 
     #[test]
     fn serve_checks_the_addresses_it_will_bind() {
+        assert_eq!(serve_args(&[]).unwrap().lanes, 64);
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
         assert_eq!(serve_args(&[]).unwrap().record_max_bytes, record::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
@@ -237,7 +240,7 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
-        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0"] {
+        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0", "100.117.59.68:18096"] {
             let args = ["--bind", bind];
             assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"));
             let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
@@ -250,6 +253,7 @@ mod cli_tests {
             assert_eq!(unkeyed.bind, keyed.bind);
             assert!(unkeyed.key.is_none());
         }
+        assert!(serve::is_private_ip("100.117.59.68".parse().unwrap()));
     }
 }
 
@@ -1643,8 +1647,8 @@ fn enter_inky_mode() {
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
     match memd::enter(&sock) {
-        Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
-        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
+        Some(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
+        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
     }
 }
 
