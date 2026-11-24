@@ -55,6 +55,9 @@ pub trait PoisonPool {
     fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)>;
     /// The slot's bytes, CPU-visible. None for a slot that has no memory now (a layer-2 lane that ended).
     fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)>;
+    /// True when `slot` below `slot_count` legitimately has no memory now (a layer-2 lane that ended). Any other slot
+    /// with no memory is a bug in the pool and the gate fails on it, naming the slot.
+    fn absent_ok(&self, _kind: BlockKind, _slot: Slot) -> bool { false }
 }
 
 /// The candidate is a path with a pool.
@@ -135,18 +138,31 @@ pub fn plans(pool: &dyn PoisonPool, tables: &[Vec<(BlockKind, Slot)>], stepping:
     }).collect()
 }
 
-/// Apply the plans: save, then poison. Returns the saved bytes, for `restore`.
-fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> Vec<(BlockKind, Slot, Vec<u8>)> {
+/// What `apply` did: slots saved, slots poisoned, and planned slots skipped because they legitimately have no memory.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Applied { pub saved: usize, pub poisoned: usize, pub absent: usize }
+
+/// Apply the plans: save, then poison. Returns the saved bytes, for `restore`, and what was actually done. A planned
+/// slot with no memory is counted as absent when the pool says it may be (`absent_ok`) and panics, naming the slot,
+/// otherwise; a slot is never skipped without being counted. A slot to save is a live lane's, so it is never absent.
+fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> (Vec<(BlockKind, Slot, Vec<u8>)>, Applied) {
     let mut saved = Vec::new();
+    let mut n = Applied::default();
     for (kind, plan) in plans {
         for &i in &plan.save {
-            if let Some((p, n)) = pool.slot_bytes(*kind, slot_at(i)) { saved.push((*kind, slot_at(i), unsafe { std::slice::from_raw_parts(p, n) }.to_vec())); }
+            let (p, len) = pool.slot_bytes(*kind, slot_at(i)).unwrap_or_else(|| panic!("poolgate: {kind:?} slot {} (pool index {i}) of {} is referenced by a live lane and has no memory", i + 1, pool.slot_count(*kind)));
+            saved.push((*kind, slot_at(i), unsafe { std::slice::from_raw_parts(p, len) }.to_vec()));
+            n.saved += 1;
         }
         for &i in &plan.poison {
-            if let Some((p, n)) = pool.slot_bytes(*kind, slot_at(i)) { poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, n) }); }
+            match pool.slot_bytes(*kind, slot_at(i)) {
+                Some((p, len)) => { poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, len) }); n.poisoned += 1; }
+                None if pool.absent_ok(*kind, slot_at(i)) => n.absent += 1,
+                None => panic!("poolgate: {kind:?} slot {} (pool index {i}) of {} has no memory and is not marked absent (an ended lane)", i + 1, pool.slot_count(*kind)),
+            }
         }
     }
-    saved
+    (saved, n)
 }
 
 fn restore(pool: &dyn PoisonPool, saved: Vec<(BlockKind, Slot, Vec<u8>)>) {
@@ -209,7 +225,7 @@ pub fn reference(path: &dyn StepPath, w: &Workload) -> Vec<Record> {
 }
 
 /// What the poisoned run saw.
-pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub sabotaged: bool }
+pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub absent: usize, pub sabotaged: bool }
 
 /// The lanes together through `cand`, with the pool poisoned before every step. Lane i starts i % 3 rounds late; a
 /// round is a prefill step of every prefilling lane, then a decode step of every decoding lane. `sabotage` drops the
@@ -220,7 +236,7 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
     let mut lane: Vec<Option<LaneId>> = vec![None; n];
     let mut next = vec![0usize; n];
     let mut rec = vec![Record::default(); n];
-    let (mut steps, mut poisoned, mut saved_n, mut sabotaged) = (0, 0, 0, false);
+    let (mut steps, mut poisoned, mut saved_n, mut absent, mut sabotaged) = (0, 0, 0, 0, false);
     let mut round = 0;
     while next.iter().any(|&k| k < work.len()) {
         for i in 0..n { if lane[i].is_none() && next[i] == 0 && round >= i % 3 { lane[i] = Some(cand.new_lane(&w.prompts[i], w.len() + 1)); } }
@@ -233,8 +249,8 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             let unguard = sabotage && !sabotaged && work[next[who[0]]].0 > 0;
             if unguard { sabotaged = true; println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0); }
             let ps = plans(cand, &tables, &stepping, !unguard);
-            for (_, p) in &ps { poisoned += p.poison.len(); saved_n += p.save.len(); }
-            let saved = apply(cand, &ps);
+            let (saved, done) = apply(cand, &ps);
+            poisoned += done.poisoned; saved_n += done.saved; absent += done.absent;
             if dec { cand.decode(&who.iter().map(|&i| (lane[i].unwrap(), work[next[i]].0)).collect::<Vec<_>>()); }
             else { cand.prefill(&who.iter().map(|&i| { let (p0, t, _) = work[next[i]]; (lane[i].unwrap(), p0, t) }).collect::<Vec<_>>()); }
             restore(cand, saved);
@@ -250,19 +266,22 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
         for i in 0..n { if next[i] == work.len() { if let Some(l) = lane[i].take() { cand.end_lane(l); } } }
         round += 1;
     }
-    Report { records: rec, steps, poisoned, saved: saved_n, sabotaged }
+    Report { records: rec, steps, poisoned, saved: saved_n, absent, sabotaged }
 }
 
 /// The reference against the poisoned candidate: Ok(lines) when every lane matches at every step, Err(lines) naming
 /// the first difference of each lane that differs.
 pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>> {
+    if got.records.len() != want.len() {
+        return Err(vec![format!("lane count mismatch: candidate returned {} lanes, reference has {}", got.records.len(), want.len())]);
+    }
     let mut bad = Vec::new();
     for (i, (a, b)) in want.iter().zip(&got.records).enumerate() {
         if let Some(s) = a.steps.iter().zip(&b.steps).position(|(x, y)| x != y) { bad.push(format!("lane {i}: logits differ from step {s}")); }
         else if a.steps.len() != b.steps.len() { bad.push(format!("lane {i}: {} steps, reference {}", b.steps.len(), a.steps.len())); }
         else if a.tokens != b.tokens { bad.push(format!("lane {i}: tokens differ")); }
     }
-    if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored): every step's logits and every token identical", want.len(), got.steps, got.poisoned, got.saved)]) } else { Err(bad) }
+    if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored, {} planned slots of ended lanes absent): every step's logits and every token identical", want.len(), got.steps, got.poisoned, got.saved, got.absent)]) } else { Err(bad) }
 }
 
 /// Layer 2's path: each lane owns its own cache buffers. As a pool, lane k's window cache is window slot k + 1 and its
@@ -274,6 +293,9 @@ impl<'a> Layer2<'a> {
         eng.ensure_batch(eng.chunk);
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
+    }
+    pub fn candidate_label(&self) -> &'static str {
+        "Layer2 self-check (BlockPools candidate not yet wired)"
     }
     fn run<R>(&self, f: impl FnOnce(&[Option<Lane>]) -> R) -> R { f(&self.lanes.borrow()) }
 }
@@ -315,6 +337,7 @@ impl PoisonPool for Layer2<'_> {
         let i = slot.pool_index().get() as usize;
         self.run(|v| v[i].as_ref().map(|l| self.eng.lane_regions(l)[if kind == BlockKind::Window { 0 } else { 1 }]))
     }
+    fn absent_ok(&self, _: BlockKind, slot: Slot) -> bool { self.run(|v| v[slot.pool_index().get() as usize].is_none()) }
 }
 
 #[cfg(test)]
@@ -381,15 +404,19 @@ mod tests {
 
     /// A pool on the heap with a fake path, to check `apply` and `restore` round trip without a GPU.
     /// Both pools on the heap (window slots then full slots), to check `apply` and `restore` without a GPU.
-    struct Heap { win: RefCell<Vec<Vec<u8>>>, full: RefCell<Vec<Vec<u8>>>, tables: Vec<Vec<(BlockKind, Slot)>> }
+    struct Heap { win: RefCell<Vec<Vec<u8>>>, full: RefCell<Vec<Vec<u8>>>, tables: Vec<Vec<(BlockKind, Slot)>>,
+        /// (kind, pool index) with no memory now, and those of them that are legitimately absent (an ended lane)
+        gone: Vec<(BlockKind, usize)>, ended: Vec<(BlockKind, usize)> }
     impl PoisonPool for Heap {
         fn slot_count(&self, k: BlockKind) -> usize { if k == BlockKind::Window { self.win.borrow().len() } else { self.full.borrow().len() } }
         fn lane_slots(&self, l: LaneId) -> Vec<(BlockKind, Slot)> { self.tables[l].clone() }
         fn slot_bytes(&self, k: BlockKind, s: Slot) -> Option<(*mut u8, usize)> {
+            if self.gone.contains(&(k, s.pool_index().get() as usize)) { return None; }
             let mut v = if k == BlockKind::Window { self.win.borrow_mut() } else { self.full.borrow_mut() };
             let x = &mut v[s.pool_index().get() as usize];
             Some((x.as_mut_ptr(), x.len()))
         }
+        fn absent_ok(&self, k: BlockKind, s: Slot) -> bool { self.ended.contains(&(k, s.pool_index().get() as usize)) }
     }
     fn nan(v: &[u8]) -> bool { f32::from_bits(u32::from_ne_bytes(v[0..4].try_into().unwrap())).is_nan() }
     fn sl(n: u32) -> Slot { Slot::new(n).unwrap() }
@@ -399,11 +426,12 @@ mod tests {
         use BlockKind::*;
         // lane 0: window 1, full 1. lane 1: window 2 and 3, full 1 (shared). window 4 and full 2 are free.
         let h = Heap { win: RefCell::new((0..4u8).map(|i| vec![i; 8]).collect()), full: RefCell::new((10..12u8).map(|i| vec![i; 8]).collect()),
-                       tables: vec![vec![(Window, sl(1)), (Full, sl(1))], vec![(Window, sl(2)), (Window, sl(3)), (Full, sl(1))]] };
+                       tables: vec![vec![(Window, sl(1)), (Full, sl(1))], vec![(Window, sl(2)), (Window, sl(3)), (Full, sl(1))]], gone: vec![], ended: vec![] };
         let tables: Vec<_> = (0..2).map(|l| h.lane_slots(l)).collect();
         let ps = plans(&h, &tables, &[0], true);
         assert_eq!(ps, vec![(Window, Plan { poison: vec![1, 2, 3], save: vec![1, 2] }), (Full, Plan { poison: vec![1], save: vec![] })]);
-        let saved = apply(&h, &ps);
+        let (saved, done) = apply(&h, &ps);
+        assert_eq!(done, Applied { saved: 2, poisoned: 4, absent: 0 });
         assert_eq!(h.win.borrow()[0], vec![0; 8]);
         assert_eq!(h.full.borrow()[0], vec![10; 8]);
         for s in 1..4 { assert!(nan(&h.win.borrow()[s])); }
@@ -413,6 +441,43 @@ mod tests {
         assert_eq!(h.win.borrow()[2], vec![2; 8]);
         // free slots stay poisoned: the pool zeroes a slot when it hands it out
         assert!(nan(&h.win.borrow()[3]) && nan(&h.full.borrow()[1]));
+    }
+
+    fn heap_with_gone(gone: Vec<(BlockKind, usize)>, ended: Vec<(BlockKind, usize)>) -> Heap {
+        Heap { win: RefCell::new(vec![vec![1; 8]; 3]), full: RefCell::new(vec![vec![2; 8]; 1]),
+               tables: vec![vec![(BlockKind::Window, sl(1))]], gone, ended }
+    }
+
+    #[test]
+    fn apply_counts_an_ended_lanes_absent_slot_and_poisons_the_rest() {
+        // window pool index 2 has no memory and is marked absent: counted as absent, not as poisoned
+        let h = heap_with_gone(vec![(BlockKind::Window, 2)], vec![(BlockKind::Window, 2)]);
+        let ps = plans(&h, &[h.lane_slots(0)], &[0], true);
+        let (_, done) = apply(&h, &ps);
+        // planned: window poison [1, 2], full poison [0]; one of the three is absent, so two applied
+        assert_eq!(ps.iter().map(|(_, p)| p.poison.len()).sum::<usize>(), 3);
+        assert_eq!(done, Applied { saved: 0, poisoned: 2, absent: 1 });
+    }
+
+    #[test]
+    #[should_panic(expected = "Window slot 3 (pool index 2) of 3 has no memory and is not marked absent")]
+    fn apply_fails_loudly_on_a_slot_with_no_memory_that_is_not_marked_absent() {
+        // the skip this replaces: a slot below slot_count with no memory and no ended lane was passed over uncounted
+        let h = heap_with_gone(vec![(BlockKind::Window, 2)], vec![]);
+        let ps = plans(&h, &[h.lane_slots(0)], &[0], true);
+        apply(&h, &ps);
+    }
+
+    #[test]
+    #[should_panic(expected = "referenced by a live lane and has no memory")]
+    fn apply_fails_loudly_on_a_live_lanes_slot_with_no_memory() {
+        // lane 0 references window slot 1 and is not stepping; its slot is to be saved, and is gone (even if marked ended)
+        let h = Heap { win: RefCell::new(vec![vec![1; 8]; 2]), full: RefCell::new(vec![vec![2; 8]; 1]),
+                       tables: vec![vec![(BlockKind::Window, sl(1))], vec![(BlockKind::Window, sl(2))]],
+                       gone: vec![(BlockKind::Window, 0)], ended: vec![(BlockKind::Window, 0)] };
+        let tables: Vec<_> = (0..2).map(|l| h.lane_slots(l)).collect();
+        let ps = plans(&h, &tables, &[1], true);
+        apply(&h, &ps);
     }
 
     #[test]
@@ -436,5 +501,19 @@ mod tests {
         let half = crate::blocks::FULL_STRIDE as usize / 2;
         assert_eq!(slot_region(base, 4 * half, &narrow, sl(2)).map(|r| r.1), Some(half));
         assert!(half < crate::blocks::FULL_STRIDE as usize);
+    }
+
+    #[test]
+    fn compare_rejects_short_or_extra_candidate_record_lists() {
+        let r0 = Record { steps: vec![1, 2], tokens: vec![10] };
+        let r1 = Record { steps: vec![3, 4], tokens: vec![20] };
+        let want = vec![r0.clone(), r1.clone()];
+        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        let err = compare(&want, &short).unwrap_err();
+        assert!(err[0].contains("lane count mismatch"), "short candidate must fail compare: {err:?}");
+        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        assert!(compare(&want, &extra).is_err(), "extra candidate lanes must fail compare");
+        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        assert!(compare(&want, &exact).is_ok());
     }
 }

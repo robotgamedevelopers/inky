@@ -13,6 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: long GPU gates
         run: tests/nightly.sh
