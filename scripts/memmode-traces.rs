@@ -58,7 +58,7 @@ fn main() {
             if !alive {
                 op="restart"; f.confirmed_set.set(true);
                 if f.disk.get().is_some(){restarts+=1;}
-                m=production::restart(&f.path,|v|f.set(v),|v|f.keep(v));
+                m=production::restore_on_startup(&f.path,|v|f.set(v),|v|f.keep(v)).expect("valid simulated saved limit");
                 f.confirmed_set.set(false); alive=true;
                 // An obligation comes from the persisted record and observed restore result,
                 // independently of whether production remembered to seed Mode.saved.

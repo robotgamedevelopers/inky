@@ -1,6 +1,6 @@
 [package]
 name = "inky-engine"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A hand-fused Metal inference engine for Thinking Machines' Inkling 2 Mini, for Apple Silicon M5 Macs (Metal 4)"
 license = "GPL-3.0-or-later"
@@ -8,7 +8,7 @@ repository = "https://github.com/robotgamedevelopers/inky"
 readme = "README.md"
 keywords = ["inference", "metal", "llm", "gguf", "apple-silicon"]
 categories = ["command-line-utilities", "science"]
-# what a crates.io build needs: the sources, the Metal shaders, the tunings, and the TLA+ specs they embed
+# what a crates.io build needs: the sources, the Metal shaders, the tunings they embed, and the TLA+ specs
 include = ["/src/**", "/tunings/**", "/specs/**", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md"]
 
 [[bin]]

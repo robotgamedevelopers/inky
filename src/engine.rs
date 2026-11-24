@@ -2,8 +2,9 @@
 
 use crate::gguf::*;
 use crate::metal::*;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLDevice};
 use std::cell::{Cell, RefCell};
+use std::io;
 use std::os::unix::fs::FileExt;
 
 pub const E: usize = 2304;
@@ -15,6 +16,9 @@ pub const EXT: usize = 1024;
 pub const NEXP: usize = 128;
 pub const TOPK: usize = 8;
 pub const FF: usize = 1152;
+const N_VOCAB_PAD: usize = 201_024;
+const CONV_TAPS: usize = 4;
+const CTRL_RANK: usize = 64;
 pub const NCH: usize = 2 * NKV * HD + 2 * E; // conv-state channels per slot
 pub const N_PHYS: usize = 24;
 pub const LOOP_START: usize = 6;
@@ -27,6 +31,19 @@ pub const KPS_CHUNK: usize = 32;
 const KGUARD: usize = 64;
 /// most spans one step can carry (each has a logits row in the batch arena)
 pub const MAX_SPANS: usize = 128;
+const MAX_PREFILL_CHUNK: usize = 4096;
+
+fn configured_prefill_chunk(value: Result<String, std::env::VarError>, context: usize) -> Result<usize, &'static str> {
+    let chunk = match value {
+        Err(std::env::VarError::NotPresent) => Some(MAX_PREFILL_CHUNK),
+        Ok(value) => value.parse::<usize>().ok(),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    };
+    chunk.filter(|&n| (32..=MAX_PREFILL_CHUNK).contains(&n) && n % 32 == 0)
+        .map(|n| n.min(context))
+        .ok_or("INK_CHUNK must be a multiple of 32 between 32 and 4096")
+}
+
 /// process-wide default for `Engine::load`: keep only part of the (exact, fp16) K/V cache in memory while generating and
 /// stream the older part from a temporary file on every token (`--kv-disk`)
 pub static KV_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -83,7 +100,7 @@ const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
     "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
-    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
+    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
     "k_topk", "k_norm",
     "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
@@ -139,7 +156,8 @@ struct MoeArgs {
     act_off: u32, wscale: f32, beta: f32, lbeta: f32,
     dn_lo: u32, dn_hi: u32, dn_expert_bytes: u32, dn_row_bytes: u32,
     dn_type: u32, out_off: u32, res_off: i32, cs_off: u32,
-    convw_off: u32, pad: [u32; 3],
+    convw_off: u32, gu_type: u32, gu_gs_lo: u32, gu_gs_hi: u32,
+    dn_gs_lo: u32, dn_gs_hi: u32, pad0: u32, pad1: u32,
 }
 
 // ---- prefill arg structs (mirror prefill.metal)
@@ -155,6 +173,7 @@ struct GemmHArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [HSeg; 10] }
 struct MoeGemmHArgs {
     w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, xh_off: u32,
     tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, aw_off: u32, beta: f32, lbeta: f32,
+    gs_lo: u32, gs_hi: u32, pad0: u32, pad1: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CtrlBJob { u_off: u32, m_off: u32, g_off: u32, f_off: u32, out_off: u32, norm_w: u32, h_off: i32, nof32: u32 }
@@ -170,7 +189,7 @@ struct GemmArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [GSeg; 10] }
 struct MoeGemmArgs {
     w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, x_off: u32,
     gather: u32, perm_off: u32, tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, pad: u32,
-    beta: f32, lbeta: f32, pad2: [f32; 2],
+    beta: f32, lbeta: f32, gs_lo: u32, gs_hi: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct TopkBArgs { logits_off: u32, bias_off: u32, sel_off: u32, t: u32, wscale: f32, pad: [u32; 3] }
@@ -256,15 +275,59 @@ impl BArena {
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, pad: [u32; 3] }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
 
 // ----------------------------------------------------------------------------- weights
 #[derive(Clone, Copy, Default, Debug)]
-pub struct QW { pub off: u64, pub row_bytes: u32, pub ty: u32, pub rows: u32, pub k: u32, pub expert_bytes: u64 }
+pub struct QW { pub off: u64, pub row_bytes: u32, pub ty: u32, pub rows: u32, pub k: u32, pub expert_bytes: u64, pub gs: u64 }
 
-fn qw(g: &Gguf, name: &str) -> QW {
-    let t = g.tensor(name);
-    let rb = t.row_bytes();
-    QW { off: t.file_off, row_bytes: rb as u32, ty: t.ty, rows: t.ne[1] as u32, k: t.ne[0] as u32, expert_bytes: rb * t.ne[1] }
+fn qw(g: &Gguf, name: &str, shape: &[usize], types: &[u32]) -> io::Result<QW> {
+    let t = g.tensor(name, shape, types)?;
+    let rb = t.row_bytes;
+    // All callers pass the target model's fixed geometry. The shaders use 32-bit strides.
+    let expert_bytes = u32::try_from(rb * t.ne[1])
+        .map_err(|_| invalid_model(format_args!("tensor {name} exceeds the GPU stride limit")))?;
+    let gs = if t.ty == T_NV4 {
+        let gname = name.replace(".weight", ".gscale");
+        g.tensor(&gname, &[NEXP], &[T_F32])?.file_off as u64
+    } else {
+        0
+    };
+    Ok(QW {
+        off: t.file_off as u64,
+        row_bytes: rb as u32,
+        ty: t.ty,
+        rows: t.ne[1] as u32,
+        k: t.ne[0] as u32,
+        expert_bytes: u64::from(expert_bytes),
+        gs,
+    })
+}
+
+fn validate_vocab(g: &Gguf, unpadded: u64, padded: usize) -> io::Result<usize> {
+    let token_count = match g.kv.get("tokenizer.ggml.tokens") {
+        Some(Value::AS(tokens)) => tokens.len(),
+        _ => return Err(invalid_model("missing GGUF tokenizer tokens")),
+    };
+    let type_count = match g.kv.get("tokenizer.ggml.token_type") {
+        Some(Value::AI(types)) => types.len(),
+        _ => return Err(invalid_model("missing GGUF tokenizer token types")),
+    };
+    let eos = g.uint("tokenizer.ggml.eos_token_id")?;
+    check_vocab_lengths(unpadded, padded, token_count, type_count, eos)
+}
+
+fn check_vocab_lengths(unpadded: u64, padded: usize, tokens: usize, types: usize, eos: u64) -> io::Result<usize> {
+    if unpadded == 0 || unpadded > padded as u64 || unpadded != tokens as u64 || tokens != types {
+        return Err(invalid_model(format_args!(
+            "vocabulary length {unpadded} must fit {padded} rows and match the tokenizer's {tokens} tokens and {types} token types",
+        )));
+    }
+    if eos >= unpadded {
+        return Err(invalid_model(format_args!("EOS token ID {eos} is outside the vocabulary")));
+    }
+    Ok(tokens)
 }
 
 pub struct Layer {
@@ -285,26 +348,24 @@ pub struct LoopW { pub msg_query: u32, pub down: [u32; 4], pub gain: [u32; 4], p
 struct Pb { data: Vec<u8> }
 impl Pb {
     fn align(&mut self) { while self.data.len() % 256 != 0 { self.data.push(0); } }
-    fn f32(&mut self, g: &Gguf, name: &str) -> u32 {
+    fn f32(&mut self, g: &Gguf, name: &str, shape: &[usize]) -> io::Result<u32> {
+        let t = g.tensor(name, shape, &[T_F32])?;
         self.align();
         let off = self.data.len() as u32;
-        let t = g.tensor(name);
-        assert_eq!(t.ty, T_F32, "{name}");
         self.data.extend_from_slice(g.bytes(t));
-        off
+        Ok(off)
     }
     /// F32 -> BF16 (round to nearest even). Lossless for this model's bf16-origin matrices.
-    fn bf16(&mut self, g: &Gguf, name: &str) -> u32 {
+    fn bf16(&mut self, g: &Gguf, name: &str, shape: &[usize]) -> io::Result<u32> {
+        let t = g.tensor(name, shape, &[T_F32])?;
         self.align();
         let off = self.data.len() as u32;
-        let t = g.tensor(name);
-        assert_eq!(t.ty, T_F32, "{name}");
         for c in g.bytes(t).chunks_exact(4) {
             let u = u32::from_le_bytes(c.try_into().unwrap());
             let r = u.wrapping_add(0x7FFF + ((u >> 16) & 1)) >> 16;
             self.data.extend_from_slice(&(r as u16).to_le_bytes());
         }
-        off
+        Ok(off)
     }
 }
 
@@ -366,9 +427,9 @@ impl VecAlloc {
 }
 
 pub struct Engine {
-    pub g: Gguf,
-    pub gpu: Gpu,
-    w: Buf, pub pb: Buf, ctr: Buf,
+    // Drop all Metal buffers (including the no-copy weights buffer `w`) before `gpu` and `g` (which unmaps the file).
+    w: Buf,
+    pub pb: Buf, ctr: Buf,
     /// activations: the small decode arena, followed by the batch (prefill) arena while a prefill needs one
     act: std::cell::RefCell<Buf>,
     /// per slot: (is sliding-window, index among the slots of its kind)
@@ -399,6 +460,9 @@ pub struct Engine {
     /// Layer 3 pools, one per kind. Not allocated yet. The table lives on the lane.
     /// `RefCell` because a step mutates the pool through `&Engine`.
     block_pool: std::cell::RefCell<crate::blocks::BlockPools>,
+    // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
+    pub gpu: Gpu,
+    pub g: Gguf,
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
@@ -542,10 +606,52 @@ impl Engine {
         let off = b.lg as usize + i * self.vocab_pad();
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
+    /// GPU Gumbel-max sampling for a batch span's logits row (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky):
+    /// transforms logits in-place with softcap + Gumbel noise (and optional `ban_tok` mask) and writes the drawn
+    /// token ID into `lane.toks[out_index]`.
+    pub fn encode_gumbel_span(&self, cb: &CmdBuf, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+        let b = self.ba.get();
+        assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
+        assert!(out_index * 4 < lane.toks.length(), "encode_gumbel_span: out_index {out_index} out of bounds");
+        let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
+        let sa = SampArgs {
+            logits_off,
+            n: self.n_vocab as u32,
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            pos: pos as u32,
+            ban_tok: ban_tok.unwrap_or(u32::MAX),
+            temp,
+            softcap: self.softcap,
+        };
+        let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
+        let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
+        let e = Enc::new(cb);
+        self.bind_eng(&e);
+        self.bind_lane(&e, lane);
+        self.go(&e, C_ARGMAX, "k_gumbel", &sa, (self.n_vocab.div_ceil(256), 1, 1), 256);
+        self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+        self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+        e.end();
+    }
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
     /// offset of residual vector `i` of the decode path at the current base
     fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) as u32 }
+    fn decode_span_limit(&self) -> usize { MAX_SPANS.min(self.chunk).min(self.ba.get().cap / 2) }
+
+    /// The server builds a batch from every ready decoding lane. Check the eventual batch size and GPU path
+    /// after the prefill arena is allocated and the device's fp16 layout has been probed.
+    pub fn check_serve_decode(&self, lanes: usize) -> Result<(), String> {
+        if !self.hgemm { return Err("serve needs the fp16 tensor path for batched decode, which is unavailable".into()); }
+        if !self.sep_comb { return Err("serve needs separate split attention combines; unset INK_FUSE_COMB".into()); }
+        let limit = self.decode_span_limit();
+        if lanes > limit {
+            return Err(format!("--lanes {lanes} exceeds the decode batch capacity of {limit} for the selected context and prefill chunk"));
+        }
+        Ok(())
+    }
+
     /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, after everything else in the activation
     /// buffer. Call after `ensure_batch` (a later batch arena may overlap it). Nothing may be in flight on the GPU.
     pub fn ensure_dbatch(&self, n: usize) {
@@ -565,100 +671,138 @@ impl Engine {
     }
     /// the engine working on `lane`
     pub fn on<'a>(&'a self, lane: &'a Lane) -> Run<'a> { Run { eng: self, lane } }
-    pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
+    pub fn load(path: &str, max_ctx: usize) -> Engine {
+        let chunk = configured_prefill_chunk(std::env::var("INK_CHUNK"), max_ctx).unwrap_or_else(|err| {
+            eprintln!("[inky] {err}");
+            std::process::exit(2);
+        });
+        Self::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), chunk)
+            .unwrap_or_else(|err| {
+                eprintln!("[inky] could not load {path}: {err}");
+                std::process::exit(1);
+            })
+    }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
-    pub fn load_with(path: &str, max_ctx: usize, kv8: bool) -> Engine {
+    fn load_with(path: &str, max_ctx: usize, kv8: bool, chunk: usize) -> io::Result<Engine> {
         let t0 = std::time::Instant::now();
-        let g = Gguf::open(path).expect("open gguf");
-        let arch = match &g.kv["general.architecture"] { Value::S(s) => s.clone(), _ => String::new() };
-        assert_eq!(arch, "inkling2_loop", "unsupported architecture {arch}");
+        let g = Gguf::open(path)?;
+        if !matches!(g.kv.get("general.architecture"), Some(Value::S(s)) if s == "inkling2_loop") {
+            return Err(invalid_model("expected inkling2_loop architecture"));
+        }
         let a = |k: &str| format!("inkling2_loop.{k}");
-        assert_eq!(g.u(&a("embedding_length")) as usize, E);
-        assert_eq!(g.u(&a("block_count")) as usize, N_PHYS);
-        assert_eq!(g.u(&a("expert_count")) as usize, NEXP);
-        assert_eq!(g.u(&a("expert_used_count")) as usize, TOPK);
-        assert_eq!(g.u(&a("loop.start")) as usize, LOOP_START);
-        assert_eq!(g.u(&a("loop.end")) as usize, LOOP_END);
-        assert_eq!(g.u(&a("loop.count")) as usize, N_PASS);
-        assert_eq!(g.u(&a("attn_res.block_size")) as usize, BLOCK);
-        assert_eq!(g.u(&a("attention.sliding_window")) as usize, EXT);
-        assert_eq!(g.u(&a("attention.relative_extent")) as usize, EXT);
-        let swa_pat = match &g.kv[&a("attention.sliding_window_pattern")] { Value::AB(v) => v.clone(), _ => panic!("swa pattern") };
+        for (name, expected) in [
+            ("embedding_length", E), ("block_count", N_PHYS), ("expert_count", NEXP),
+            ("expert_used_count", TOPK), ("loop.start", LOOP_START), ("loop.end", LOOP_END),
+            ("loop.count", N_PASS), ("attn_res.block_size", BLOCK), ("attention.sliding_window", EXT),
+            ("attention.relative_extent", EXT), ("vocab_size", N_VOCAB_PAD),
+        ] {
+            let value = g.uint(&a(name))?;
+            if value != expected as u64 {
+                return Err(invalid_model(format_args!("{} is {value}, expected {expected}", a(name))));
+            }
+        }
+        let swa_pat = match g.kv.get(&a("attention.sliding_window_pattern")) {
+            Some(Value::AB(v)) if v.len() == N_PHYS
+                && v.iter().copied().eq((0..N_PHYS).map(|i| (i + 1) % BLOCK != 0)) => v,
+            _ => return Err(invalid_model("unexpected sliding-window attention pattern")),
+        };
+
+        let n_vocab = validate_vocab(&g, g.uint(&a("vocab_size_unpadded"))?, N_VOCAB_PAD)?;
+        let embed_shape = [E, N_VOCAB_PAD];
+        let tok_embd = qw(&g, "token_embd.weight", &embed_shape, &[T_Q4_K, T_Q8_0])?;
+        let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K, T_Q8_0])?;
+
+        let eps = g.f(&a("attention.layer_norm_rms_epsilon"))?;
+        let log_alpha = g.f(&a("attention.log_scale_alpha"))?;
+        let log_floor = g.f(&a("attention.log_scale_floor"))?;
+        let situ_beta = g.f(&a("activation.situ_beta"))?;
+        let situ_lbeta = g.f(&a("activation.situ_linear_beta"))?;
+        let wscale = g.f(&a("expert_weights_scale"))?;
+        let softcap = g.f(&a("final_logit_softcapping"))?;
 
         let mut pb = Pb { data: Vec::new() };
         let mut layers = Vec::new();
-        for i in 0..N_PHYS {
+        for (i, &swa) in swa_pat.iter().enumerate() {
             let n = |s: &str| format!("blk.{i}.{s}");
-            let swa = swa_pat[i];
-            let opt_f32 = |pb: &mut Pb, s: &str| -> i32 { if g.opt(&n(s)).is_some() { pb.f32(&g, &n(s)) as i32 } else { -1 } };
-            let attn_norm = opt_f32(&mut pb, "attn_norm.weight");
-            let q_inp_norm = opt_f32(&mut pb, "attn_q_inp_norm.weight");
-            let k_inp_norm = opt_f32(&mut pb, "attn_k_inp_norm.weight");
-            let v_inp_norm = opt_f32(&mut pb, "attn_v_inp_norm.weight");
-            let attn_res_query = opt_f32(&mut pb, "attn_res_query.weight");
-            let n_attn_q = g.opt(&n("attn_res_query.weight")).map(|t| if t.ne.len() > 1 { t.ne[1] as u32 } else { 1 }).unwrap_or(0);
-            let layer = Layer {
+            let (attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q, kconvp, vconvp) =
+                if swa {
+                    let query = n("attn_res_query.weight");
+                    let res_query = match g.opt(&query) {
+                        Some(t) => {
+                            let shape: &[usize] = if t.ne.len() == 2 { &[E, 1] } else { &[E] };
+                            pb.f32(&g, &query, shape)? as i32
+                        }
+                        None => -1,
+                    };
+                    (pb.f32(&g, &n("attn_norm.weight"), &[E])? as i32, -1, -1, -1, res_query, 1, None, None)
+                } else {
+                    (
+                        -1,
+                        pb.f32(&g, &n("attn_q_inp_norm.weight"), &[E])? as i32,
+                        pb.f32(&g, &n("attn_k_inp_norm.weight"), &[E])? as i32,
+                        pb.f32(&g, &n("attn_v_inp_norm.weight"), &[E])? as i32,
+                        pb.f32(&g, &n("attn_res_query.weight"), &[E, 3])? as i32,
+                        3,
+                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                    )
+                };
+            layers.push(Layer {
                 swa,
-                wq: qw(&g, &n("attn_q.weight")), wgate: qw(&g, &n("attn_gate.weight")), wk: qw(&g, &n("attn_k.weight")),
-                wv: qw(&g, &n("attn_v.weight")), wo: qw(&g, &n("attn_output.weight")), wrel: qw(&g, &n("attn_rel.weight")),
-                wsink: qw(&g, &n("attn_sink_proj.weight")),
-                kconvp: g.opt(&n("attn_k_conv_proj.weight")).map(|_| qw(&g, &n("attn_k_conv_proj.weight"))),
-                vconvp: g.opt(&n("attn_v_conv_proj.weight")).map(|_| qw(&g, &n("attn_v_conv_proj.weight"))),
+                wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
+                wgate: qw(&g, &n("attn_gate.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
+                wk: qw(&g, &n("attn_k.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q8_0])?,
+                wv: qw(&g, &n("attn_v.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q6_K, T_Q8_0])?,
+                wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K, T_Q8_0])?,
+                wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K, T_Q8_0])?,
+                wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K, T_Q8_0])?,
+                kconvp, vconvp,
                 attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q,
-                ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight")),
-                ffn_norm: pb.f32(&g, &n("ffn_norm.weight")),
-                q_clip: pb.f32(&g, &n("attn_q_clip.weight")),
-                rel_clip: pb.f32(&g, &n("attn_rel_clip.weight")),
-                rel_bias: pb.f32(&g, &n("attn_rel_bias.weight")),
-                k_conv: pb.f32(&g, &n("attn_k_conv.weight")),
-                v_conv: pb.f32(&g, &n("attn_v_conv.weight")),
-                attn_post_conv: pb.f32(&g, &n("attn_post_conv.weight")),
-                ffn_post_conv: pb.f32(&g, &n("ffn_post_conv.weight")),
-                router: pb.bf16(&g, &n("ffn_gate_inp.weight")),
-                exp_bias: pb.f32(&g, &n("exp_probs_b.bias")),
-                gu: qw(&g, &n("ffn_gate_up_exps.weight")),
-                dn: qw(&g, &n("ffn_down_exps.weight")),
-            };
-            assert!(layer.swa == (layer.attn_norm >= 0));
-            assert_eq!(layer.gu.ty, T_Q4_K);
-            assert!(layer.dn.ty == T_Q8_0 || layer.dn.ty == T_Q5_0, "down type {}", type_name(layer.dn.ty));
-            for w in [&layer.wq, &layer.wgate, &layer.wk, &layer.wo, &layer.wrel, &layer.wsink] { assert_eq!(w.ty, T_Q4_K); }
-            assert!(layer.wv.ty == T_Q4_K || layer.wv.ty == T_Q6_K);
-            layers.push(layer);
+                ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight"), &[E])?,
+                ffn_norm: pb.f32(&g, &n("ffn_norm.weight"), &[E])?,
+                q_clip: pb.f32(&g, &n("attn_q_clip.weight"), &[HD, NH])?,
+                rel_clip: pb.f32(&g, &n("attn_rel_clip.weight"), &[NREL, NH])?,
+                rel_bias: pb.f32(&g, &n("attn_rel_bias.weight"), &[NREL, EXT])?,
+                k_conv: pb.f32(&g, &n("attn_k_conv.weight"), &[CONV_TAPS, NKV * HD])?,
+                v_conv: pb.f32(&g, &n("attn_v_conv.weight"), &[CONV_TAPS, NKV * HD])?,
+                attn_post_conv: pb.f32(&g, &n("attn_post_conv.weight"), &[CONV_TAPS, E])?,
+                ffn_post_conv: pb.f32(&g, &n("ffn_post_conv.weight"), &[CONV_TAPS, E])?,
+                router: pb.bf16(&g, &n("ffn_gate_inp.weight"), &[E, NEXP])?,
+                exp_bias: pb.f32(&g, &n("exp_probs_b.bias"), &[NEXP])?,
+                gu: qw(&g, &n("ffn_gate_up_exps.weight"), &[E, 2 * FF, NEXP], &[T_Q4_K, T_Q8_0, T_NV4, T_MX8])?,
+                dn: qw(&g, &n("ffn_down_exps.weight"), &[FF, E, NEXP], &[T_Q8_0, T_Q5_0, T_NV4, T_MX8])?,
+            });
         }
         let mut loops = Vec::new();
         for i in LOOP_START..LOOP_END {
             let n = |s: &str| format!("blk.{i}.{s}");
-            let names = ["q", "k", "v", "ffn"];
-            let mut lw = LoopW { msg_query: pb.f32(&g, &n("loop_msg_query.weight")), down: [0; 4], gain: [0; 4], forget: [0; 4] };
-            for c in 0..4 {
-                lw.down[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_down.weight", names[c])));
-                lw.gain[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_gain.weight", names[c])));
-                lw.forget[c] = pb.bf16(&g, &n(&format!("loop_{}_ctrl_forget.weight", names[c])));
+            let mut lw = LoopW {
+                msg_query: pb.f32(&g, &n("loop_msg_query.weight"), &[E, 4])?,
+                down: [0; 4], gain: [0; 4], forget: [0; 4],
+            };
+            for (c, name) in ["q", "k", "v", "ffn"].into_iter().enumerate() {
+                lw.down[c] = pb.bf16(&g, &n(&format!("loop_{name}_ctrl_down.weight")), &[2 * E, CTRL_RANK])?;
+                lw.gain[c] = pb.bf16(&g, &n(&format!("loop_{name}_ctrl_gain.weight")), &[CTRL_RANK, E])?;
+                lw.forget[c] = pb.bf16(&g, &n(&format!("loop_{name}_ctrl_forget.weight")), &[CTRL_RANK, E])?;
             }
             loops.push(lw);
         }
-        let tok_norm = pb.f32(&g, "token_embd_norm.weight");
-        let output_norm = pb.f32(&g, "output_norm.weight");
-        let output_res_query = pb.f32(&g, "output_res_query.weight");
-        let tok_embd = qw(&g, "token_embd.weight");
-        let output = qw(&g, "output.weight");
-        assert_eq!(tok_embd.ty, T_Q4_K);
-        assert_eq!(output.ty, T_Q6_K);
-        let n_vocab = g.u(&a("vocab_size_unpadded")) as usize;
-        let n_vocab_pad = output.rows as usize;
+        let tok_norm = pb.f32(&g, "token_embd_norm.weight", &[E])?;
+        let output_norm = pb.f32(&g, "output_norm.weight", &[E])?;
+        let output_res_query = pb.f32(&g, "output_res_query.weight", &[E])?;
 
         let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("kernels.metal"), include_str!("prefill.metal"), include_str!("bench_kernels.metal"));
         let kvb = if kv8 { 1 } else { 2 };
         let gpu = Gpu::new(&src, KERNELS);
-        let w = gpu.buffer_nocopy(g.map, g.map_len);
+        if g.map_len() > gpu.dev.maxBufferLength() {
+            return Err(invalid_model("GGUF exceeds the Metal buffer size limit"));
+        }
+        let w = gpu.buffer_nocopy(g.ptr(), g.map_len());
         pb.data.extend(std::iter::repeat(0u8).take(128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
         let pbuf = gpu.buffer_with(&pb.data);
 
         let max_split = MAX_SPLIT;
-        let ar = Arena::new(max_split, n_vocab_pad);
-        let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).min(max_ctx);
-        assert!(chunk % 32 == 0 && chunk <= 4096);
+        let ar = Arena::new(max_split, N_VOCAB_PAD);
         assert!(max_ctx % 64 == 0, "context size must be a multiple of 64");
         // the batch arena is allocated when a prefill needs it and released when generation starts
         let act = gpu.buffer(ar.total as usize * 4);
@@ -673,15 +817,9 @@ impl Engine {
         assert!(n_full * 2 * NKV * max_ctx * HD < u32::MAX as usize, "KV cache too large for 32-bit offsets");
         let ctr = gpu.buffer(4096 * 4);
         eprintln!("[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
-            path.rsplit('/').next().unwrap_or(path), g.file_len as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
+            path.rsplit('/').next().unwrap_or(path), g.file_len() as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
         let eng = Engine {
-            eps: g.f(&a("attention.layer_norm_rms_epsilon")) as f32,
-            log_alpha: g.f(&a("attention.log_scale_alpha")) as f32,
-            log_floor: g.f(&a("attention.log_scale_floor")) as f32,
-            situ_beta: g.f(&a("activation.situ_beta")) as f32,
-            situ_lbeta: g.f(&a("activation.situ_linear_beta")) as f32,
-            wscale: g.f(&a("expert_weights_scale")) as f32,
-            softcap: g.f(&a("final_logit_softcapping")) as f32,
+            eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
             slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
             ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
@@ -703,7 +841,7 @@ impl Engine {
             eng.hgemm = false;
         }
         if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
-        eng
+        Ok(eng)
     }
 
     /// Allocate (or enlarge) the batch arena for a prefill of `t` tokens. Nothing may be in flight on the GPU.
@@ -850,7 +988,8 @@ impl Engine {
                     let dn = &self.layers[l].dn;
                     let ma = MoeArgs { sel_off: ar.logits + 100000 + ((l * 4 + it) as u32 % 32) * 16, act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
                                        dn_lo: dn.off as u32, dn_hi: (dn.off >> 32) as u32, dn_expert_bytes: dn.expert_bytes as u32,
-                                       dn_row_bytes: dn.row_bytes, dn_type: dn.ty, ..Default::default() };
+                                       dn_row_bytes: dn.row_bytes, dn_type: dn.ty,
+                                       dn_gs_lo: dn.gs as u32, dn_gs_hi: (dn.gs >> 32) as u32, ..Default::default() };
                     sels.push(ma.sel_off);
                     e.pso(&self.gpu.pso(name));
                     e.bytes(&ma, 5);
@@ -884,14 +1023,14 @@ impl Engine {
         let cb = self.gpu.cmd();
         let e = Enc::new(&cb); self.bind_eng(&e);
         e.pso(&self.gpu.pso("k_touch"));
-        while off < self.g.file_len {
-            let n = chunk.min(self.g.file_len - off) / 16;
+        while off < self.g.file_len() {
+            let n = chunk.min(self.g.file_len() - off) / 16;
             let ta = TouchArgs { lo: off as u32, hi: (off >> 32) as u32, n16: n as u32, pad: 0 };
             e.bytes(&ta, 5); e.dispatch((4096, 1, 1), 256);
             off += chunk;
         }
         e.end(); cb.commit(); cb.waitUntilCompleted();
-        eprintln!("[inky] warmed {:.1} GiB of weights in {:.0?}", self.g.file_len as f64 / (1u64 << 30) as f64, t0.elapsed());
+        eprintln!("[inky] warmed {:.1} GiB of weights in {:.0?}", self.g.file_len() as f64 / (1u64 << 30) as f64, t0.elapsed());
     }
 
     /// raw GPU read bandwidth over the mapped weights
@@ -932,8 +1071,10 @@ impl Engine {
                     let ld = &self.layers[l];
                     let ma = MoeArgs { sel_off: sel, x_off: Arena::vec(1), act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
                         gu_lo: ld.gu.off as u32, gu_hi: (ld.gu.off >> 32) as u32, gu_expert_bytes: ld.gu.expert_bytes as u32, gu_row_bytes: ld.gu.row_bytes,
+                        gu_type: ld.gu.ty, gu_gs_lo: ld.gu.gs as u32, gu_gs_hi: (ld.gu.gs >> 32) as u32,
                         dn_lo: ld.dn.off as u32, dn_hi: (ld.dn.off >> 32) as u32, dn_expert_bytes: ld.dn.expert_bytes as u32, dn_row_bytes: ld.dn.row_bytes,
-                        dn_type: ld.dn.ty, beta: 4.0, lbeta: 25.0, cs_off: 0, convw_off: ld.ffn_post_conv, ..Default::default() };
+                        dn_type: ld.dn.ty, dn_gs_lo: ld.dn.gs as u32, dn_gs_hi: (ld.dn.gs >> 32) as u32,
+                        beta: 4.0, lbeta: 25.0, cs_off: 0, convw_off: ld.ffn_post_conv, ..Default::default() };
                     e.pso(&self.gpu.pso(which));
                     e.bytes(&ma, 5);
                     e.dispatch((grid.0, grid.1, 1), tgs);
@@ -1009,10 +1150,12 @@ impl Engine {
                             w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                             wtype: l.gu.ty, nrows: (2 * FF) as u32, k: E as u32, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                             out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
                         } } else { MoeGemmHArgs {
                             w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                             wtype: l.dn.ty, nrows: E as u32, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                             out_off: b.yd, ldo: E as u32, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
+                            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
                         } };
                         e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
                         e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + which * 4 * NTC + c * 4) * 4, *tg);
@@ -1517,7 +1660,8 @@ impl Engine {
                 act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
                 dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
                 dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                convw_off: l.ffn_post_conv, pad: [0; 3],
+                convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
+                dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
             };
             self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
             self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
@@ -1666,7 +1810,7 @@ impl Engine {
         let t: usize = spans.iter().map(|s| s.t).sum();
         for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
-        assert!(!dec || (self.hgemm && 2 * spans.len() <= self.ba.get().cap), "a decode step needs the fp16 path and room for f32 queries");
+        assert!(!dec || (self.hgemm && spans.len() <= self.decode_span_limit()), "a decode step needs the fp16 path and room for f32 queries");
         assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
                 "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
@@ -2020,7 +2164,8 @@ impl Engine {
         let gu = MoeGemmArgs {
             w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
             wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, x_off: x, gather: 1, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta, pad2: [0.0; 2],
+            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta,
+            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32,
         };
         let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
         if self.hgemm {
@@ -2035,6 +2180,7 @@ impl Engine {
                         w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                         wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                         out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                        gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
                     };
                     e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
@@ -2047,6 +2193,7 @@ impl Engine {
                         w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                         wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                         out_off: b.yd, ldo: es, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
+                        gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
                     };
                     e.pso(&self.gpu.pso(name)); e.bytes(&d, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
@@ -2058,7 +2205,8 @@ impl Engine {
         let dn = MoeGemmArgs {
             w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
             wtype: l.dn.ty, nrows: es, k: FF as u32, x_off: b.act, gather: 0, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0, pad2: [0.0; 2],
+            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0,
+            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32,
         };
         self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
         }
@@ -2690,8 +2838,16 @@ impl<'a> Run<'a> {
     }
 
     pub fn set_tokens(&self, start: usize, toks: &[u32]) {
-        let p = self.lane.toks.contents().as_ptr() as *mut i32;
-        for (i, &t) in toks.iter().enumerate() { unsafe { *p.add(start + i) = t as i32; } }
+        self.try_set_tokens(start, toks).unwrap_or_else(|err| panic!("{err}"));
+    }
+    pub fn try_set_tokens(&self, start: usize, toks: &[u32]) -> Result<(), String> {
+        let capacity = self.max_ctx.min(self.lane.toks.length() / size_of::<u32>());
+        // The embedding kernel reads signed token IDs.
+        let limit = self.n_vocab.min(self.tok_embd.rows as usize).min(i32::MAX as usize + 1);
+        validate_token_write(start, toks, capacity, limit)?;
+        let p = self.lane.toks.contents().as_ptr().cast::<u32>();
+        unsafe { std::ptr::copy_nonoverlapping(toks.as_ptr(), p.add(start), toks.len()); }
+        Ok(())
     }
     pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.lane.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
     /// Encode one full decode step for token at `pos` (input token read from toks[pos]).
@@ -2892,7 +3048,8 @@ impl<'a> Run<'a> {
             act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
             dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
             dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-            convw_off: l.ffn_post_conv, pad: [0; 3],
+            convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
+            dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
         };
         // ---- experts
         self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
@@ -2908,17 +3065,91 @@ impl<'a> Run<'a> {
     }
 }
 
+fn validate_token_write(start: usize, toks: &[u32], capacity: usize, limit: usize) -> Result<(), String> {
+    if start > capacity || toks.len() > capacity - start {
+        return Err(format!("cannot write {} tokens at position {start} in a {capacity}-token context", toks.len()));
+    }
+    if let Some((i, &id)) = toks.iter().enumerate().find(|&(_, &id)| id as usize >= limit) {
+        return Err(format!("token {id} at position {} is outside the embedding vocabulary (0..{limit})", start + i));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_chunk_requires_a_supported_positive_size() {
+        assert_eq!(configured_prefill_chunk(Err(std::env::VarError::NotPresent), 16384), Ok(4096));
+        assert_eq!(configured_prefill_chunk(Ok("4096".into()), 128), Ok(128));
+        assert_eq!(configured_prefill_chunk(Ok("32".into()), 128), Ok(32));
+        assert_eq!(configured_prefill_chunk(Ok("96".into()), 128), Ok(96));
+        for bad in ["0", "1", "19", "4097", "4128", "-32", "invalid", ""] {
+            assert!(configured_prefill_chunk(Ok(bad.into()), 128).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn token_writes_validate_the_whole_range_and_vocabulary() {
+        assert!(validate_token_write(0, &[0, 1, 2, 3], 4, 4).is_ok());
+        assert!(validate_token_write(3, &[3], 4, 4).is_ok());
+        assert!(validate_token_write(4, &[], 4, 4).is_ok());
+        assert!(validate_token_write(0, &[0; 5], 4, 4).is_err());
+        assert!(validate_token_write(usize::MAX, &[0], 4, 4).is_err());
+        assert!(validate_token_write(2, &[0, 4], 4, 4).is_err());
+        assert!(validate_token_write(0, &[u32::MAX], 4, 4).is_err());
+    }
+
+    #[test]
+    fn vocabulary_must_fit_the_logits_rows_and_match_the_tokenizer() {
+        assert_eq!(check_vocab_lengths(200_058, N_VOCAB_PAD, 200_058, 200_058, 200_006).unwrap(), 200_058);
+        assert!(check_vocab_lengths(32, 31, 32, 32, 0).is_err());
+        assert!(check_vocab_lengths(0, 32, 0, 0, 0).is_err());
+        assert!(check_vocab_lengths(31, 32, 32, 32, 0).is_err());
+        assert!(check_vocab_lengths(32, 32, 32, 31, 0).is_err());
+        assert!(check_vocab_lengths(32, 32, 32, 32, 32).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Metal 4"]
+    fn router_handles_nonfinite_scores() {
+        let src = format!("{}\n{}", include_str!("kernels.metal"), include_str!("prefill.metal"));
+        let gpu = Gpu::new(&src, &["k_topk_b"]);
+        let bias = gpu.buffer(NEXP * 4);
+        let act = gpu.buffer((NEXP + 2 * TOPK) * 4);
+        unsafe {
+            let bias = std::slice::from_raw_parts_mut(bias.contents().as_ptr().cast::<f32>(), NEXP);
+            let scores = std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>(), NEXP);
+            bias.fill(0.0);
+            scores.fill(f32::NAN);
+        }
+
+        let args = [0, 0, NEXP as u32, 1, 1.0f32.to_bits(), 0, 0, 0];
+        let cb = gpu.cmd();
+        let e = Enc::new(&cb);
+        e.buf(&bias, 0, 1);
+        e.buf(&act, 0, 2);
+        e.bytes(&args, 5);
+        e.pso(&gpu.pso("k_topk_b"));
+        e.dispatch((1, 1, 1), 32);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert!(cb.error().is_none());
+        let out = unsafe {
+            std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(NEXP), 2 * TOPK)
+        };
+        for (i, &id) in out[..TOPK].iter().enumerate() { assert_eq!(id, i as f32); }
+        assert_eq!(out[TOPK..], [0.0; TOPK]);
+    }
 
     /// Chunk 4096 keeps `min(t, MAX_SPANS)` vocabulary rows. A verify span of k=3 needs 4 of them.
     /// Growing `lg` to one row per token would be 32× those rows; this layout does not.
     /// fp16 path, fp16 K/V, vocab pad 201024 (`output.weight` rows of Inkling-2-Mini).
     #[test]
     fn chunk_4096_batch_arena_is_unchanged_for_verify_rows() {
-        let vocab_pad = 201024usize;
-        let b = BArena::new(0, 4096, true, 2, vocab_pad);
+        let b = BArena::new(0, 4096, true, 2, N_VOCAB_PAD);
         assert_eq!(b.lg_rows, 128);
         assert_eq!(b.cap, 4096);
         let bytes = b.end as usize * 4;
@@ -2935,5 +3166,13 @@ mod tests {
         assert_eq!(one * 4, 15_335_424);
         assert_eq!(one * 8, 30_670_848);
         assert_eq!(Engine::cs_image_bytes(), one);
+    }
+
+    #[test]
+    fn shader_arg_structs_match_metal_abi_sizes() {
+        assert_eq!(std::mem::size_of::<MoeArgs>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
     }
 }

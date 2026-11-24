@@ -132,15 +132,34 @@ func sameReply(a, b replySample) bool {
 }
 
 func (g *gate) seededReplies() error {
-	const body = `{"messages":[{"role":"user","content":"Write the integers 1 through 10000 in order, separated by commas. Do not summarize."}],"max_tokens":64,"seed":1729,"temperature":0.8,"stream":true}`
+	// Two distinct prompts and seeds overlap on separate lanes so any cross-lane mix-up fails immediately.
+	bodies := [2]string{
+		`{"messages":[{"role":"user","content":"Write the integers 1 through 10000 in order, separated by commas. Do not summarize."}],"max_tokens":64,"seed":1729,"temperature":0.8,"stream":true}`,
+		`{"messages":[{"role":"user","content":"Write the lowercase English alphabet repeated 200 times, separated by spaces. Do not summarize."}],"max_tokens":64,"seed":2029,"temperature":0.8,"stream":true}`,
+	}
+	var refs [2]replySample
+	for i, body := range bodies {
+		r, err := g.sampleReply(body, true, nil)
+		if err != nil {
+			return fmt.Errorf("reference prompt %d: %w", i, err)
+		}
+		refs[i] = r
+	}
+	if sameReply(refs[0], refs[1]) {
+		return fmt.Errorf("distinct seeded reference prompts produced identical replies")
+	}
 	type outcome struct {
+		idx    int
 		sample replySample
 		err    error
 	}
 	first := make(chan string, 2)
 	ends := make(chan outcome, 2)
-	for i := 0; i < 2; i++ {
-		go func() { r, e := g.sampleReply(body, true, func(id string) { first <- id }); ends <- outcome{r, e} }()
+	for i, body := range bodies {
+		go func(idx int, reqBody string) {
+			r, e := g.sampleReply(reqBody, true, func(id string) { first <- id })
+			ends <- outcome{idx, r, e}
+		}(i, body)
 	}
 	ids := make(map[string]bool)
 	for len(ids) < 2 {
@@ -166,37 +185,44 @@ func (g *gate) seededReplies() error {
 			return fmt.Errorf("%s already finished before both first deltas", id)
 		}
 	}
-	a, b := <-ends, <-ends
-	if a.err != nil {
-		return a.err
+	var got [2]replySample
+	for i := 0; i < 2; i++ {
+		o := <-ends
+		if o.err != nil {
+			return o.err
+		}
+		got[o.idx] = o.sample
 	}
-	if b.err != nil {
-		return b.err
+	for i := 0; i < 2; i++ {
+		if !sameReply(got[i], refs[i]) {
+			return fmt.Errorf("overlapping seeded reply %d differs from its solo reference", i)
+		}
 	}
-	if !sameReply(a.sample, b.sample) {
-		return fmt.Errorf("overlapping seeded replies differ")
+	if sameReply(got[0], got[1]) {
+		return fmt.Errorf("overlapping distinct prompts collapsed to the same reply")
 	}
-	b.sample.message.Content += "changed"
-	if sameReply(a.sample, b.sample) {
+	got[1].message.Content += "changed"
+	if sameReply(got[1], refs[1]) {
 		return fmt.Errorf("accepted a changed seeded reply")
 	}
 	return nil
 }
 
+func (g *gate) requestReply(messages []replyMessage, limit int) (replySample, error) {
+	body, err := json.Marshal(map[string]any{"messages": messages, "max_tokens": limit, "seed": 1729, "temperature": 0.8})
+	if err != nil {
+		return replySample{}, err
+	}
+	return g.sampleReply(string(body), false, nil)
+}
+
 func (g *gate) followupCache() error {
 	user := replyMessage{Role: "user", Content: "What is two plus two? Give just the number."}
-	request := func(messages []replyMessage, limit int) (replySample, error) {
-		body, err := json.Marshal(map[string]any{"messages": messages, "max_tokens": limit, "seed": 1729, "temperature": 0.8})
-		if err != nil {
-			return replySample{}, err
-		}
-		return g.sampleReply(string(body), false, nil)
-	}
-	first, err := request([]replyMessage{user}, 64)
+	first, err := g.requestReply([]replyMessage{user}, 64)
 	if err != nil {
 		return err
 	}
-	next, err := request([]replyMessage{user, first.message, {Role: "user", Content: "Add one to that number."}}, 12)
+	next, err := g.requestReply([]replyMessage{user, first.message, {Role: "user", Content: "Add one to that number."}}, 12)
 	if err != nil {
 		return err
 	}
@@ -212,6 +238,34 @@ func (g *gate) followupCache() error {
 	}
 	if matches(0) {
 		return fmt.Errorf("accepted zero cached tokens")
+	}
+	return nil
+}
+
+// Run on the one-lane server so the follow-up reuses the same physical ring.
+func (g *gate) overwrittenWindow() error {
+	head := replyMessage{Role: "user", Content: strings.Repeat(" apple", 1040) + " Write a detailed recipe using apples, with five steps."}
+	followup := []replyMessage{head, {Role: "user", Content: "Include the time for each step."}}
+	cold, err := g.requestReply(followup, 32)
+	if err != nil {
+		return err
+	}
+	base, err := g.requestReply([]replyMessage{head}, 32)
+	if err != nil {
+		return err
+	}
+	if base.usage.Prompt < 1024 || base.usage.Generated < 3 {
+		return fmt.Errorf("fixture did not overwrite retained window rows: %+v", base.usage)
+	}
+	next, err := g.requestReply(followup, 32)
+	if err != nil {
+		return err
+	}
+	if cached := next.usage.Details.Cached; cached == nil || *cached != 0 {
+		return fmt.Errorf("follow-up reused an overwritten prompt window")
+	}
+	if !sameReply(cold, next) {
+		return fmt.Errorf("follow-up differs from cold generation")
 	}
 	return nil
 }
