@@ -13,7 +13,7 @@ output=${output:A}
 check() {
     local name=$1 module=$2 expected=${3:-} kind=${4:-invariant} log="$output/$1.log"
     local started=$EPOCHREALTIME elapsed rc
-    if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC \
+    if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC -noGenerateSpecTE \
         -workers 1 -metadir "$output/$name-states" \
         -config "$root/$name.cfg" "$root/$module.tla" >"$log" 2>&1; then
         rc=0
@@ -69,3 +69,7 @@ check DonorWindow GroupedLayout VisitedKeys
 check TilePartial GroupedLayout OrderedPartials
 check Restage GroupedLayout StagedOnce
 check StalledTraversal GroupedLayout TraversalCompletes temporal
+check AdvanceUnfair GroupedLayout TraversalCompletes temporal
+# Negative control: the redundant-load mutant must keep both output invariants,
+# so only StagedOnce can see it. Restage above proves the same mutant is live.
+check RestageOutputs GroupedLayout
