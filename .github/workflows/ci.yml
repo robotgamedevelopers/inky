@@ -43,10 +43,13 @@ jobs:
         run: scripts/check-tla.sh ${{ matrix.part }}
   # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
   # Pull requests from forks never run here (the repository also requires approval for outside contributors).
+  # Only pushes to main and pull requests into main run here: the two M5 runners are the bottleneck, so a pull
+  # request into a stream branch (layer3, rowan/stella-cover, rowan/land-*) runs unit and tla only, and the stream's
+  # own pull request into main runs the M5 gates once for the whole batch.
   # Both jobs build the `ci` profile (release without fat LTO, incremental), which rebuilds in about a second on a
   # runner's warm target/; the nightly workflow runs every gate on the true release profile.
   m5-gpu:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
@@ -58,7 +61,7 @@ jobs:
           INKY_BIN: ./target/ci/inky
         run: tests/ci.sh pr
   m5-serve:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'push' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
