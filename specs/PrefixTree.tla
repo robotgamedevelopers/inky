@@ -55,8 +55,14 @@ Init ==
     /\ result = <<>>
     /\ sought = FALSE
 
+\* The checked property is about one seek against the tree as the caller
+\* sees it at call time, so the tree stops changing once a seek has run:
+\* a start retained afterwards cannot make an earlier result stale. In
+\* the code each deepest_start call likewise sees one fixed tree.
+
 \* A block is published only sealed and only onto a sealed parent.
 Seal(s) ==
+    /\ ~sought
     /\ s \in AllSeqs
     /\ Len(s) >= 1
     /\ Len(s) <= MaxDepth
@@ -66,12 +72,14 @@ Seal(s) ==
     /\ UNCHANGED <<starts, result, sought>>
 
 Retain(s) ==
+    /\ ~sought
     /\ s \in sealed \ {<<>>}
     /\ s \notin starts
     /\ starts' = starts \cup {s}
     /\ UNCHANGED <<sealed, result, sought>>
 
 Release(s) ==
+    /\ ~sought
     /\ s \in starts
     /\ starts' = starts \ {s}
     /\ UNCHANGED <<sealed, result, sought>>
