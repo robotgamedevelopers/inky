@@ -21,6 +21,20 @@ TLC traversal order.
 Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
 and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
 
+`InBlock` on mini-m5, 2026-11-24T05:03Z, by `run_tlc.zsh`: TLC 2.19 (revision `5a47802`), Eclipse Adoptium 21.0.12.1, one worker, a 4 GiB maximum heap (the log reports 3641MB). Wall seconds include JVM startup. The machine clock on the log lines is 2026-11-24 00:03. The action walks the 48 coordinates in order and records each stored address, so the healthy runs are one path of 48 states.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| InBlock | 49 | 48 | 0.717 | PASS |
+| InBlockKv8 | 49 | 48 | 0.712 | PASS |
+| InBlockMajor | 2 | 2 | 0.685 | Ordered violated |
+| InBlockMajorCollide | 5 | 5 | 0.684 | NoCollision violated |
+| InBlockAddrCol | 5 | 5 | 0.658 | NoCollision violated |
+| InBlockTrace | 49 | 48 | 0.669 | PASS |
+| InBlockTraceKv8 | 49 | 48 | 0.695 | PASS |
+
+InBlockMajor state 2 is `p = 0`, `k = 0`, `h = 0`, `i = 1`, `addr = 48`, `seen = <<0, 48>>`. The position-major step is `index * (stride / B)`, which is 48 there, and `Formula` is 4. `Ordered` compares the stored address to `Formula`, which the action does not call. InBlockMajorCollide state 5 is `p = 0`, `k = 0`, `h = 1`, `i = 0`, `addr = 0`, `seen = <<0, 48, 96, 144, 0>>`. InBlockAddrCol drops the head term and reaches the same coordinate with `seen = <<0, 4, 8, 12, 0>>`. Both are reached states, each log has two `Error:` lines, and `NoCollision` reads `seen`. The trace files were regenerated from `key_row_at` before this run. The earlier head-term witness is retired.
+
 Inspected counterexamples:
 
 - **StaleEntry, state 10:** lane `a` is done with window table entry

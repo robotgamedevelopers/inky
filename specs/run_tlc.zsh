@@ -22,11 +22,20 @@ check() {
     fi
     elapsed=$(( EPOCHREALTIME - started ))
     local ok=true
-    grep -Eq "^[0-9,]+ states generated, [0-9,]+ distinct states found" "$log" || ok=false
+    # An initial-state violation stops before TLC prints a state count.
+    if [[ $kind != initial ]]; then
+        grep -Eq "^[0-9,]+ states generated, [0-9,]+ distinct states found" "$log" || ok=false
+    fi
     grep -q "^Finished in " "$log" || ok=false
     if [[ -n "$expected" ]]; then
         [[ $rc -ne 0 ]] || ok=false
-        [[ $(grep -c "^Error: " "$log" || true) = 2 ]] || ok=false
+        # An initial-state violation is one Error line. A reached state adds
+        # "The behavior up to this point is:" so the count is two.
+        local want_errors=2
+        if [[ $kind = initial ]]; then
+            want_errors=1
+        fi
+        [[ $(grep -c "^Error: " "$log" || true) = $want_errors ]] || ok=false
         if [[ $kind = temporal ]]; then
             # Older TLC reports an unnamed temporal violation. The witness
             # config must name precisely the requested property in that case.
@@ -36,11 +45,15 @@ check() {
             fi
             grep -Fxq "Error: The following behavior constitutes a counter-example:" "$log" || ok=false
             grep -Eq '^State [0-9]+: Stuttering$' "$log" || ok=false
+        elif [[ $kind = initial ]]; then
+            grep -Fxq "Error: Invariant $expected is violated by the initial state:" "$log" || ok=false
         else
             grep -Fxq "Error: Invariant $expected is violated." "$log" || ok=false
             grep -Fxq "Error: The behavior up to this point is:" "$log" || ok=false
         fi
-        grep -q "^State 2:" "$log" || ok=false
+        if [[ $kind != initial ]]; then
+            grep -q "^State 2:" "$log" || ok=false
+        fi
     else
         [[ $rc -eq 0 ]] || ok=false
         if grep -q "^Error:" "$log"; then ok=false; fi
@@ -50,7 +63,12 @@ check() {
         print -u2 "Unexpected result for $name (exit $rc); inspect $log"
         exit 1
     fi
-    local counts=$(awk "/^[0-9,]+ states generated, [0-9,]+ distinct states found/ { print \$1 \" | \" \$4 }" "$log")
+    local counts
+    if [[ $kind = initial ]]; then
+        counts="- | -"
+    else
+        counts=$(awk "/^[0-9,]+ states generated, [0-9,]+ distinct states found/ { print \$1 \" | \" \$4 }" "$log")
+    fi
     printf "%s | %s | %.3f | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}"
 }
 print "run | generated | distinct | wall seconds | result"
@@ -74,3 +92,10 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+check InBlock InBlock
+check InBlockKv8 InBlock
+check InBlockMajor InBlock Ordered
+check InBlockMajorCollide InBlock NoCollision
+check InBlockAddrCol InBlock NoCollision
+check InBlockTrace InBlockTrace
+check InBlockTraceKv8 InBlockTrace

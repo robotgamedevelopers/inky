@@ -25,6 +25,8 @@ counterexamples, in the output directory. For an individual run, from `specs/`:
   -workers 1 -config BlockLayout3.cfg BlockLayout.tla
 ```
 
+`InBlock` is the order inside one slot: `[pass][K|V][head][position][HD]`, 2 passes, 3 heads, 4 positions, `HD = 2`. The action walks the coordinates in that order and inlines the address, then appends it to `seen`. `Ordered` compares the stored address to `Formula`, which the action does not call. `Inside` says one row stays inside the slot. `NoCollision` says the addresses in `seen` are unique. `InBlock` uses `kvb = 2` and `InBlockKv8` uses `kvb = 1`. `InBlockMajor` must violate `Ordered`. `InBlockMajorCollide` and `InBlockAddrCol` must violate `NoCollision` on a reached state. `InBlockTraceData` is written by `inky inblock-trace` from `key_row_at`, and `InBlockTrace` checks that behaviour at `kvb` 2 and at `kvb` 1.
+
 ## Bounds and vocabulary
 
 `BlockLayout` has two lanes, **3 or 4 slots total**, blocks of

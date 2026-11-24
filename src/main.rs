@@ -1288,6 +1288,14 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
         Some("memd") => { memd::daemon(&raw[2..]); return; }
+        Some("inblock-trace") => {
+            let path = raw.get(2).map(|s| s.as_str()).unwrap_or("specs/InBlockTraceData.tla");
+            if let Err(e) = blocks::write_inblock_trace(path) {
+                eprintln!("inblock-trace: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("tune-memory") => { memd::install(&raw[2..]); return; }
         Some("serve") => {
             let args = &raw[2..];

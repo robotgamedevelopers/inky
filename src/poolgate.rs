@@ -14,13 +14,13 @@
 //!    `Lane::block_table`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, kind, slot)` over that kind's GPU buffer. `Layer2` implements it with lane k's window
+//!    `slot_region(base, len, pool, slot)` over that kind's GPU buffer, at the pool's width. `Layer2` implements it with lane k's window
 //!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
-use crate::blocks::{byte_offset, BlockIndex, BlockKind, BlockTable, Slot};
+use crate::blocks::{BlockIndex, BlockKind, BlockTable, Slot};
 use crate::engine::{Engine, Lane, Span};
 use objc2_metal::MTLCommandBuffer;
 use std::cell::RefCell;
@@ -78,14 +78,15 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     v
 }
 
-/// The bytes of `slot` in a kind's pool buffer at `base` of `len` bytes: `kind.stride()` bytes at `byte_offset`.
+/// The bytes of `slot` in `pool`'s buffer at `base` of `len` bytes, at the pool's element width.
 /// None when the slot does not fit in the buffer.
 #[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
-pub fn slot_region(base: *mut u8, len: usize, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
-    let off = byte_offset(kind, slot).ok()?;
-    let end = off.checked_add(kind.stride())?;
+pub fn slot_region(base: *mut u8, len: usize, pool: &crate::blocks::BlockPool, slot: Slot) -> Option<(*mut u8, usize)> {
+    let stride = pool.kind().stride_bytes(pool.kvb()).ok()?;
+    let off = pool.offset(slot).ok()?;
+    let end = off.checked_add(stride)?;
     if end > len as u64 { return None; }
-    Some((unsafe { base.add(off as usize) }, kind.stride() as usize))
+    Some((unsafe { base.add(off as usize) }, stride as usize))
 }
 
 /// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
@@ -487,12 +488,19 @@ mod tests {
 
     #[test]
     fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
+        use crate::blocks::BlockPool;
         let base = 0x1000 as *mut u8;
         let len = 2 * crate::blocks::FULL_STRIDE as usize;
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3)), None);
-        assert_eq!(slot_region(base, len, BlockKind::Window, sl(1)), None);
+        let full = BlockPool::new(BlockKind::Full, 4);
+        let narrow = BlockPool::with_kvb(BlockKind::Full, 4, 1).unwrap();
+        let window = BlockPool::new(BlockKind::Window, 4);
+        assert_eq!(slot_region(base, len, &full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
+        assert_eq!(slot_region(base, len, &full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
+        assert_eq!(slot_region(base, len, &full, sl(3)), None);
+        assert_eq!(slot_region(base, len, &window, sl(1)), None);
+        let half = crate::blocks::FULL_STRIDE as usize / 2;
+        assert_eq!(slot_region(base, 4 * half, &narrow, sl(2)).map(|r| r.1), Some(half));
+        assert!(half < crate::blocks::FULL_STRIDE as usize);
     }
 
     #[test]
