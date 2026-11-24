@@ -514,7 +514,7 @@ kernel void k_kvprep_b(device const uchar * PB [[buffer(1)]], device float * A [
     if (tid < 48) A[a.rp_off + t * (NH * NREL) + (g * 3 + tid / 16) * NREL + tid % 16] = r * clamp(REL_CLIP / (sqrt(rn) + 1e-6f), 0.0f, 1.0f) * tau;
     const float kf = clamp(QK_CLIP / (sqrt(tot[3]) + 1e-6f), 0.0f, 1.0f), vf = rsqrt(tot[4] / HD + 1e-6f);
     const float k = kv[0] * kf, v = kv[1] * vf;
-    const uint idx = (uint) ((int) pos - a.kpos0);
+    const uint idx = a.ring ? pos % a.cap : (uint) ((int) pos - a.kpos0);
 #ifdef KV8
     const uint ck = kv_code(max(max(red[0][5], red[1][5]), max(red[2][5], red[3][5])) * kf);
     const uint cv = kv_code(max(max(red[0][6], red[1][6]), max(red[2][6], red[3][6])) * vf);

@@ -22,9 +22,34 @@ pub const LOOP_END: usize = 18;
 pub const N_PASS: usize = 3;
 pub const N_SLOT: usize = N_PHYS + (N_PASS - 1) * (LOOP_END - LOOP_START);
 pub const BLOCK: usize = 6;
-pub const KPS_CHUNK: usize = 32;
-/// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
-const KGUARD: usize = 64;
+// Cache positions determine the reduction grid; neither the visible key count,
+// lane reservation, batch size nor chunk boundaries enter the calculation.
+fn fixed_split_width(swa: bool) -> usize { if swa { 64 } else { 256 } }
+
+fn fixed_split_count(first: usize, end: usize, width: usize) -> usize {
+    if first == end { 0 } else { (end - 1) / width + 1 - first / width }
+}
+
+// At least 256 slots so short prefill rows can share the arena. A second
+// clipped partial is needed when the experimental pruning path divides a row.
+fn split_scratch_slots(max_ctx: usize) -> usize {
+    (max_ctx.div_ceil(fixed_split_width(false)) + 1).max(256)
+}
+
+/// The partials layout of one tensor-path attention span ending at `end`: the split stride `nsplit`
+/// each row reserves, and how many rows fit in the arena of `split_scratch_slots(max_ctx)` slots per
+/// head. Row `r`, head `h`, split `s` of a batch lives in slot `(r * NH + h) * nsplit + s`, and the
+/// combine reads `fixed_split_count(first, row_end, kps)` of them. Once the window slides
+/// (`end > EXT`) a row's first visible split is clipped, and a window of EXT keys can then touch one
+/// more split than EXT / kps: that edge split is the `+ 1`. Modelled with its arithmetic in
+/// specs/SplitArena.tla (SplitEdgeDropped and SplitRowsUnbounded are the witnesses without each guard).
+fn fixed_attn_batch(swa: bool, end: usize, max_ctx: usize) -> (usize, usize) {
+    let kps = fixed_split_width(swa);
+    let nsplit = if swa && end > EXT { (EXT - 1).div_ceil(kps) + 1 } else { fixed_split_count(0, end, kps) };
+    let rows = split_scratch_slots(max_ctx) / nsplit;
+    assert!(rows >= 1, "a span of {end} positions needs {nsplit} split slots; the arena has {}", split_scratch_slots(max_ctx));
+    (nsplit, rows)
+}
 /// most spans one step can carry (each has a logits row in the batch arena)
 pub const MAX_SPANS: usize = 128;
 /// process-wide default for `Engine::load`: keep only part of the (exact, fp16) K/V cache in memory while generating and
@@ -51,13 +76,48 @@ struct Tier {
     stg: RefCell<Buf>, half: Cell<usize>, pending: RefCell<[Option<CmdBuf>; 2]>,
     /// this step's file reads in execution order, and the round (staging half fill) that is loaded
     plan: RefCell<Vec<Chunk>>, execs: RefCell<Vec<ExecPlan>>, loaded: Cell<usize>,
-    pub read_bytes: Cell<u64>, pub read_time: Cell<std::time::Duration>, unaligned: Cell<bool>,
+    pub read_bytes: Cell<u64>, pub read_time: Cell<std::time::Duration>,
 }
 #[derive(Clone, Copy)]
 struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: usize, off: usize, sp0: usize, ns: usize, kps: usize }
 /// how one layer execution's keys are divided: file chunks cover the splits before `b`, the hot ring the `ns` splits from `sp0`
 #[derive(Clone, Copy)]
 struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize }
+
+/// Pack consecutive layer reads into alternating staging halves without splitting an attention partial.
+struct TierPlanner {
+    half_recs: usize,
+    room: usize,
+    round: usize,
+    chunks: Vec<Chunk>,
+    layers: Vec<ExecPlan>,
+}
+impl TierPlanner {
+    fn new(half_recs: usize) -> Self {
+        Self { half_recs, room: half_recs, round: 0, chunks: Vec::new(), layers: Vec::new() }
+    }
+
+    fn layer(&mut self, kind: usize, i: usize, visible: std::ops::Range<usize>, oldest_hot: usize, kps: usize) {
+        let first = visible.start;
+        let lo = oldest_hot.max(first);
+        let b = if lo == first { first } else { lo.next_multiple_of(kps) };
+        debug_assert!(b < visible.end && self.half_recs >= kps);
+        let (mut c, mut sp) = (first, 0);
+        while c < b {
+            let next_end = (c / kps + 1) * kps;
+            if next_end - c > self.room { self.round += 1; self.room = self.half_recs; }
+            let end = ((c + self.room) / kps * kps).min(b);
+            let ns = fixed_split_count(c, end, kps);
+            self.chunks.push(Chunk { exec: self.layers.len(), kind, i, c0: c, c1: end, round: self.round,
+                                     off: (self.half_recs - self.room) * REC, sp0: sp, ns, kps });
+            self.room -= end - c;
+            c = end;
+            sp += ns;
+        }
+        let nsplit = fixed_split_count(first, visible.end, kps);
+        self.layers.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp });
+    }
+}
 
 /// the encoder a decode step is being written to; with the disk tier a step spans several command buffers
 pub struct Cx { e: Enc, cb: Option<CmdBuf> }
@@ -69,7 +129,7 @@ const KV_CAP0: usize = 64;
 /// MoE tile classes of the fp16 prefill path: (kernel, max tokens per tile, threads per threadgroup)
 pub const NTC: usize = 2;
 const MOE_CLS: [(&str, usize, usize); NTC] = [("k_moe_sg8", 128, 256), ("k_moe_sg4", 64, 128)];
-pub const MAX_SPLIT: usize = 256;
+
 
 /// kernel classes, for skip-mask profiling
 pub const CLS_NAMES: &[&str] = &["embed", "mix_attn", "qkv", "attn", "combine", "wo", "mix_ffn", "router", "moe_gu", "moe_down",
@@ -82,10 +142,10 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
+    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine", "k_attn_fixed_b", "k_attn_fixed_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_kvcopy", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -192,9 +252,14 @@ struct KvPrepArgs {
     k_off: u32, v_off: u32, r_off: u32, kdyn_off: i32, vdyn_off: i32, qp_off: u32, rp_off: u32, qhalf: u32,
     kconv_w: u32, vconv_w: u32, qclip_w: u32, relclip_w: u32, log_alpha: f32, log_floor: f32, is_full: u32, kpos0: i32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct AttnBArgs { t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, window: u32, qp_off: u32,
-                   rp_off: u32, sink_off: u32, gate_off: u32, out_off: u32, relbias_w: u32, ghalf: u32, kpos0: i32, pad: u32 }
+// One span of consecutive queries. nsplit is a scratch stride; every row
+// intersects its own causal interval with the absolute split grid.
+#[repr(C)] #[derive(Clone, Copy)]
+struct PreparedAttnArgs {
+    pos0: u32, window: u32, cap: u32, idx0: i32, k_base: u32, v_base: u32, q_off: u32, r_off: u32,
+    sink_off: u32, gate_off: u32, out_off: u32, relbias_w: u32, part_off: u32, kps: u32, nsplit: u32,
+    half_io: u32, ring: u32,
+}
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_off: u32, sv_off: u32, scap: u32, kpos0: i32, to_ring: u32, pad: [u32; 2] }
 
@@ -243,7 +308,7 @@ impl BArena {
         b.tl = [take((t * TOPK / 128 + NEXP + 1) * 4), take((NEXP + 1) * 4)];
         b.ind = take(64); b.aw = take(t * TOPK); b.fh = take(t * E / 2);
         // sliding-window K/V scratch of the batch: [guard | window history | batch keys | guard] per group, half
-        b.sk = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4); b.sv = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
+        b.sk = take(NKV * (EXT + t) * HD * kvb / 4); b.sv = take(NKV * (EXT + t) * HD * kvb / 4);
         // Not `t` rows. At chunk 4096 that would be 32× this buffer (128 rows today). A verify span reuses them.
         b.lg_rows = t.min(MAX_SPANS) as u32;
         b.lg = take(b.lg_rows as usize * vocab_pad);
@@ -465,7 +530,7 @@ impl Lane {
                         min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
                         stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
                         plan: RefCell::new(Vec::new()), execs: RefCell::new(Vec::new()), loaded: Cell::new(usize::MAX),
-                        read_bytes: Cell::new(0), read_time: Cell::new(Default::default()), unaligned: Cell::new(false) })
+                        read_bytes: Cell::new(0), read_time: Cell::new(Default::default()) })
         } else { None };
         Lane {
             kv_swa: RefCell::new(gpu.buffer(n_swa * 2 * NKV * cap0 * HD * eng.kvb)),
@@ -646,10 +711,9 @@ impl Engine {
         let kvb = if kv8 { 1 } else { 2 };
         let gpu = Gpu::new(&src, KERNELS);
         let w = gpu.buffer_nocopy(g.map, g.map_len);
-        pb.data.extend(std::iter::repeat(0u8).take(128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
         let pbuf = gpu.buffer_with(&pb.data);
 
-        let max_split = MAX_SPLIT;
+        let max_split = split_scratch_slots(max_ctx);
         let ar = Arena::new(max_split, n_vocab_pad);
         let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).min(max_ctx);
         assert!(chunk % 32 == 0 && chunk <= 4096);
@@ -1447,8 +1511,8 @@ impl Engine {
             };
             run.bind_kv(e, l.swa);
             let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-            let kps = Run::split_kps(nkeys);
-            let nsplit = nkeys.div_ceil(kps);
+            let kps = fixed_split_width(l.swa);
+            let nsplit = fixed_split_count(pos + 1 - nkeys, pos + 1, kps);
             let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                 pad: self.sep_comb as u32, ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
@@ -1646,11 +1710,8 @@ impl Engine {
         e.buf(&buf, 0, 9);
         self.go(e, cls, "k_state_keep", &sk, grid, 256);
     }
-    /// Encode one decode step: one token for each lane in `spans` (every span has t = 1). Row-wise work runs through the
-    /// batched tensor path as in `encode_spans`; each lane's attention is the decode path's fused kernel (K/V conv, cache
-    /// write, split-K attention over its own cache). A decode step's arithmetic is its own: a token's numbers depend
-    /// neither on the other lanes in the step nor on how many there are, but differ from a prefill row's, so cache
-    /// blocks written by decode steps are never shared (docs/DESIGN.md).
+    /// One tensor decode token per lane. Attention uses the same fixed cache
+    /// splits and K/V precision as a prefill span, including the current key.
     pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
         assert!(spans.iter().all(|s| s.t == 1));
         self.encode_spans_x(cb, spans, logits, argmax, true, None);
@@ -1660,9 +1721,7 @@ impl Engine {
         let t: usize = spans.iter().map(|s| s.t).sum();
         for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
-        assert!(!dec || (self.hgemm && 2 * spans.len() <= self.ba.get().cap), "a decode step needs the fp16 path and room for f32 queries");
-        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
-                "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
+        assert!(!dec || self.hgemm, "decode steps need the fp16 tensor path");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         if let Some(k) = verify_k {
             assert!(!dec && !argmax, "verify is not a decode step, and argmax would overwrite toks[p0 + t]");
@@ -1676,13 +1735,6 @@ impl Engine {
         let e = Enc::new(cb);
         self.bind_eng(&e);
         self.bind_lane(&e, spans[0].lane);
-        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step does not use it)
-        if !dec {
-            let bz = self.ba.get();
-            let zr = [bz.sk, bz.perm - bz.sk];
-            e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
-            e.barrier();
-        }
         let b = self.ba.get();
         for (si, sp) in spans.iter().enumerate() {
             let r0 = (row0[si] * E) as u32;
@@ -1702,7 +1754,7 @@ impl Engine {
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
         if verify_k.is_some() { self.verify_record.set(true); }
-        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
@@ -1710,10 +1762,10 @@ impl Engine {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
+            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -1729,8 +1781,7 @@ impl Engine {
                     let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + row).collect();
                     st.push(b.vec(cur) + row);
                     let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
-                    self.mix(&e, C_OMIX, &[j]);
-                    self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                    self.span_row_logits(&e, j, lg);
                 }
             }
         } else if logits && dec {
@@ -1762,8 +1813,7 @@ impl Engine {
                 let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + last).collect();
                 st.push(b.vec(cur) + last);
                 let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
-                self.mix(&e, C_OMIX, &[j]);
-                self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                self.span_row_logits(&e, j, lg);
                 if argmax {
                     let nparts = 128u32;
                     let am = ArgmaxArgs { logits_off: lg, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + sp.t) as u32, pad: [0; 3] };
@@ -1776,8 +1826,21 @@ impl Engine {
         e.end();
     }
 
+    fn span_row_logits(&self, e: &Enc, mut job: MixJob, logits: u32) {
+        if self.hgemm {
+            let half = self.ba.get().xh[0];
+            job.hout[0] = half as i32;
+            job.nof32 = 1;
+            self.mix_t(e, C_OMIX, &[job], 1);
+            self.gemm_h(e, C_LMHEAD, &[Engine::hseg(&self.output, half, logits)], 1);
+        } else {
+            self.mix(e, C_OMIX, &[job]);
+            self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, self.ar.fout, logits)]);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
                msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
         let l = &self.layers[ip];
         let b = self.ba.get();
@@ -1786,8 +1849,8 @@ impl Engine {
         let cs_slot = (slot * NCH * 3) as u32;
         let tt = t as u32;
         let es = E as u32;
-        let hatt = self.hgemm;      // fp16 path: k_attn_h, half q / gate, router on the fp16 FFN input
-        let (qgh, rth) = (hatt, hatt);
+        let hatt = self.hgemm;      // fp16 path: packed q and gate, router on the fp16 FFN input
+        let rth = hatt;
         // the query side (queries, attention, output projection, FFN) covers rows [ts, t); the key side always all rows
         assert!(ts == 0 || (ctl.is_none() && hatt));
         let n = t - ts;
@@ -1835,7 +1898,7 @@ impl Engine {
             let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
                               Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
             // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
-            if hatt && qgh && !dec { hq[0].hout = 1; hq[1].hout = 1; }     // a decode step keeps them f32 for k_attn
+            hq[0].hout = 1; hq[1].hout = 1;
             let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
             if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
             if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
@@ -1852,107 +1915,77 @@ impl Engine {
         // Sliding-window layers: a span attends through a linear scratch [window history | span keys] in the arena (reused by
         // the next span: every dispatch ends with a barrier), and the ring (exactly one window) only receives the last window
         // of keys. Full layers address their cache directly.
-        let scap = (EXT + b.cap + 2 * KGUARD) as u32;
-        if dec {
-            // a decode step: each lane's token through the decode path's fused attention (K/V conv from the lane's state,
-            // cache write, split-K attention over the lane's cache, combine + output gate), into qp as f32 rows. The lanes'
-            // attention dispatches are independent (own cache, state, rows and split partials): no barrier between them.
-            let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
-            for (si, sp) in spans.iter().enumerate() {
-                let run = self.on(sp.lane);
-                let (pos, r0) = (sp.p0, row0[si]);
-                self.bind_lane(e, sp.lane);
-                let (kb, vb, kcap) = run.kv_slot(slot);
-                let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
-                let ar = self.ar;
-                let base = AttnArgs {
-                    pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
-                    q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
-                    r_off: b.rel + (r0 * NH * NREL) as u32, sink_off: b.sink + (r0 * NH) as u32,
-                    kdyn_off: if l.swa { -1 } else { (b.kdyn + (r0 * 32) as u32) as i32 }, vdyn_off: if l.swa { -1 } else { (b.vdyn + (r0 * 32) as u32) as i32 },
-                    part_off: self.dstart.get() + si as u32 * ar.total + ar.part, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
-                    ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
-                    ..Default::default()
-                };
-                run.bind_kv(e, l.swa);
-                let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-                let kps = Run::split_kps(nkeys);
-                let nsplit = nkeys.div_ceil(kps);
-                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                    pad: self.sep_comb as u32, ..base };
-                assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
-                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
-                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
-            }
-            e.barrier();
-            for ca in &combs { self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128); }
-            e.barrier();
-            e.buf(&self.act.borrow(), 0, 3);
-            // f32 attention outputs -> the half rows the output projection reads
-            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
-            e.barrier();
-        }
+        let scap = (EXT + b.cap) as u32;
         for (si, sp) in spans.iter().enumerate() {
-        if dec { break; }
-        let run = self.on(sp.lane);
-        let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
-        let tt = t as u32;
-        // a row-major region shifted to this span's first row
-        let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
-        let (n, nn_) = (t - ts, (t - ts) as u32);
-        let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
-        e.buf(&sp.lane.cs, 0, 4);
-        let (kb, vb, kcap) = run.kv_slot(slot);
-        let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
-        let kcopy = |n: usize, pos0: usize, to_ring: u32| {
-            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
-            e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
-            self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
-            e.buf(&self.act.borrow(), 0, 3);
-        };
-        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
-        let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
-        let qpd = if hatt { NH * HD / 2 } else { NH * HD };
-        let ka = KvPrepArgs {
-            t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qd),
-            k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
-            kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
-            qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
-            log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0,
-        };
-        self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
-        if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
-            assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
-            let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
-            e.buf(qc, 0, 3);
-            let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
-            let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
-            e.buf(&sp.lane.kv_full.borrow(), 0, 3);
-        }
-        if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
-        let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        // ---- attention (causal, query-tiled)
-        let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv,
-                             window: if l.swa { EXT as u32 } else { 0 }, qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), sink_off: rs(b.sink, NH), gate_off: rs(b.gate, gd),
-                             out_off: rs(b.attn_g, NH * HD), relbias_w: l.rel_bias, ghalf: 0, kpos0, pad: 0 };
-        if hatt {
-            let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: shs(b.qp, NH * HD / 2), rp_off: shs(b.rp, NH * NREL), sink_off: shs(b.sink, NH),
-                                 gate_off: shs(b.gate, gd), out_off: shs(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
-            self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
-        }
-        else if self.tensor { self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256); }
-        else { self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128); }
+            let run = self.on(sp.lane);
+            let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
+            let tt = t as u32;
+            // a row-major region shifted to this span's first row
+            let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
+            let ring = l.swa && t == 1;
+            e.buf(&sp.lane.cs, 0, 4);
+            let (kb, vb, kcap) = run.kv_slot(slot);
+            let (pk, pv, cap, kpos0) = if l.swa && !ring { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - EXT as i32) } else { (kb, vb, kcap, 0) };
+            let kcopy = |n: usize, pos0: usize, to_ring: u32| {
+                let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
+                e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
+                self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
+                e.buf(&self.act.borrow(), 0, 3);
+            };
+            if l.swa && !ring {
+                if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); }
+                e.buf(&self.act.borrow(), 0, 3);
+            } else {
+                run.bind_kv(e, l.swa);
+            }
+            let qstride = if hatt { NH * HD / 2 } else { NH * HD };
+            let ka = KvPrepArgs {
+                t: tt, p0: p0 as u32, ring: ring as u32, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qstride),
+                k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
+                kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
+                qp_off: rs(b.qp, qstride), rp_off: rs(b.rp, NH * NREL), qhalf: if hatt { 3 } else { 0 }, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
+                log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0,
+            };
+            self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
+            if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
+                assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
+                let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
+                e.buf(qc, 0, 3);
+                let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
+                self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
+                let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
+                self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
+                e.buf(&sp.lane.kv_full.borrow(), 0, 3);
+            }
+            if l.swa && !ring { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
+            let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+            self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+            let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+            self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+            // Batch as many query rows as fit in the fixed partials arena
+            // (fixed_attn_batch; the layout is modelled in specs/SplitArena.tla).
+            let kps = fixed_split_width(l.swa);
+            let (nsplit, batch_rows) = fixed_attn_batch(l.swa, p0 + t, self.max_ctx);
+            let out = if hatt { b.agh } else { b.attn_g };
+            for start in (ts..t).step_by(batch_rows) {
+                let n = (t - start).min(batch_rows);
+                let off = |base: u32, stride: usize| base + ((r0 + start) * stride) as u32;
+                let args = PreparedAttnArgs {
+                    pos0: (p0 + start) as u32, window: if l.swa { EXT as u32 } else { 0 },
+                    cap, idx0: kpos0, k_base: pk, v_base: pv, q_off: off(b.qp, qstride),
+                    r_off: off(b.rp, NH * NREL), sink_off: off(b.sink, NH),
+                    gate_off: off(b.gate, qstride), out_off: off(out, qstride), relbias_w: l.rel_bias,
+                    part_off: self.ar.part, kps: kps as u32, nsplit: nsplit as u32,
+                    half_io: hatt as u32, ring: ring as u32,
+                };
+                self.go(e, C_ATTN, "k_attn_fixed_b", &args, (nsplit, NKV, n), 128);
+                self.go(e, C_COMB, "k_attn_fixed_combine", &args, (NH, n, 1), 128);
+            }
         }
         // ---- output projection + post-conv (+ residual)
         if self.hgemm {
-            if !hatt { self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None); e.barrier(); }
             self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
         } else {
             self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
@@ -2142,9 +2175,9 @@ impl<'a> Run<'a> {
         let cb = self.gpu.cmd();
         let e = Enc::new(&cb);
         self.bind(&e);
-        // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
+        // one trivial dispatch per buffer (a window-history copy of key 0 into the prefill scratch) makes the driver wire them
         let b = self.ba.get();
-        let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
+        let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap) as u32,
                              kpos0: 0, to_ring: 0, pad: [0; 2] };
         e.pso(&self.gpu.pso("k_kvcopy")); e.bytes(&a, 5);
         self.bind_kv(&e, true); e.dispatch((1, 1, 1), 32);
@@ -2179,22 +2212,27 @@ impl<'a> Run<'a> {
     /// hot ring sizes (positions) and staging bytes for a context of `n` positions: together at most half of what the
     /// cache would take in memory
     fn tier_targets(&self, n: usize) -> (usize, usize, usize) {
-        // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
-        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
+        // Keep one whole split plus the 32 positions that may still be in flight.
+        // This gives the file and ring an overlapping absolute split boundary.
+        let min_hot = |swa| fixed_split_width(swa) + 32;
+        let min_staging = 2 * fixed_split_width(false) * REC;
+        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return (h.max(min_hot(true)).min(EXT), h.max(min_hot(false)), (2 << 20).max(min_staging));
+        }
         let c = self.kv_exact_bytes(n);
-        // staging: two halves, each at least one split of the longest attention (see `step`)
-        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
+        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(min_staging);
         let hot = (c / 2).saturating_sub(s);
-        ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
+        let full = (n * hot / c / 64 * 64).max(min_hot(false));
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let full_bytes = (N_SLOT - n_swa) * full * REC;
+        let swa_budget = hot.saturating_sub(full_bytes) / (n_swa * REC);
+        let swa = (n.min(EXT) * hot / c).min(swa_budget) / 64 * 64;
+        (swa.max(min_hot(true)).min(EXT), full, s)
     }
     fn tier_foff(&self, kind: usize, i: usize, p: usize) -> u64 {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
     }
-    fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
-    /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
-    /// the same keys in the same order)
-    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
     /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
     /// file is a ring of one window)
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
@@ -2277,11 +2315,10 @@ impl<'a> Run<'a> {
         for (kind, h) in [(0usize, hs), (1usize, hf)] {
             let (buf, capc, nsl) = self.kind_bufs(kind);
             let old_cap = capc.get();
-            let h = h.min(n);
-            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n - h.min(n));
+            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n.saturating_sub(h));
             let idx_old = |p: usize| if kind == 0 { p % old_cap } else { p };
             // the file runs one split ahead of the hot ring's start, so a split boundary always lies where both have the keys
-            let cold = (lo + Self::split_kps(n + 1 - first) + 64).min(n);
+            let cold = (lo + fixed_split_width(kind == 0) + 64).min(n);
             self.tier_write(kind, first.max(t.filed[kind].get()), cold, idx_old);
             t.filed[kind].set(cold.max(t.filed[kind].get()));
             let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
@@ -2384,7 +2421,7 @@ impl<'a> Run<'a> {
             let need = (pos + 1).saturating_sub(cap);
             let lo = t.lo[kind].get().max(need);
             let done = pos.saturating_sub(32);
-            let want = (lo + Self::split_kps(if kind == 0 { (pos + 1).min(EXT) } else { pos + 1 })).min(done).max(need);
+            let want = (lo + fixed_split_width(kind == 0)).min(done).max(need);
             if t.cold[kind].get() < want {
                 let upto = (want + 15).min(done).max(want);
                 self.tier_write(kind, t.cold[kind].get().max(t.filed[kind].get()), upto, |p| p % cap);
@@ -2394,53 +2431,24 @@ impl<'a> Run<'a> {
             t.lo[kind].set(lo);
         }
         // Plan this step's file reads: per layer execution the splits older than its hot ring, packed into staging halves.
-        // The layer's keys are divided into splits exactly as without the tier (same kps from the window start); the file
+        // The layer's keys are divided into splits exactly as without the tier (same absolute grid); the file
         // supplies whole splits up to a boundary b that the hot ring also reaches, so every split sums the same keys in the
         // same order as the in-memory path and the results are bit-identical.
         let half_recs = t.stg.borrow().length() / 2 / REC;
-        let (mut plan, mut execs) = (Vec::new(), Vec::new());
-        let (mut round, mut room) = (0usize, half_recs);
+        let mut planner = TierPlanner::new(half_recs);
         let mut order: Vec<usize> = (0..LOOP_START).collect();
         for pass in 0..N_PASS { for ip in LOOP_START..LOOP_END { order.push(slot_of(pass, ip)); } }
         order.extend(LOOP_END..N_PHYS);
-        for (exec, &slot) in order.iter().enumerate() {
+        for slot in order {
             let (swa, i) = self.slot_kind[slot];
             let kind = if swa { 0 } else { 1 };
             let w0 = if swa { (pos + 1).saturating_sub(EXT) } else { 0 };
-            let lo = t.lo[kind].get().max(w0);
-            let nk = pos + 1 - w0;
-            let kps = Self::split_kps(nk);
-            let b = w0 + (lo - w0).div_ceil(kps) * kps;
-            if b <= pos && b <= t.cold[kind].get().max(w0) && kps <= half_recs {
-                let (mut c, mut sp) = (w0, 0usize);
-                while c < b {
-                    if room < kps { round += 1; room = half_recs; }
-                    let ns = (room / kps).min((b - c) / kps);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + ns * kps, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
-                    c += ns * kps; sp += ns; room -= ns * kps;
-                }
-                let nsplit = nk.div_ceil(kps);
-                execs.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp });
-            } else {
-                // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
-                // keys, summed in a different grouping
-                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inky] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
-                let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
-                let (mut c, mut sp) = (w0, 0usize);
-                while c < lo {
-                    if room < (lo - c).min(64) { round += 1; room = half_recs; }
-                    let n = room.min(lo - c);
-                    let (kps, ns) = spl(n);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
-                    c += n; sp += ns; room -= n;
-                }
-                let (kps, ns) = spl(pos + 1 - lo);
-                assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
-                execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns });
-            }
+            let kps = fixed_split_width(swa);
+            planner.layer(kind, i, w0..pos + 1, t.lo[kind].get(), kps);
+            debug_assert!(planner.layers.last().unwrap().b <= t.cold[kind].get().max(w0));
         }
-        *t.execs.borrow_mut() = execs;
-        *t.plan.borrow_mut() = plan;
+        *t.execs.borrow_mut() = planner.layers;
+        *t.plan.borrow_mut() = planner.chunks;
         t.loaded.set(usize::MAX);
         let mut cx = Cx { e: Enc::new(&cb), cb: Some(cb) };
         self.encode_step_cx(&mut cx, pos, logits, argmax);
@@ -2819,18 +2827,22 @@ impl<'a> Run<'a> {
         } else if let (false, Some(pr)) = (l.swa, self.lane.prune.borrow().as_ref()) {
             // dev: far keys from the selection, recent keys from the cache
             let fi = self.slot_kind[slot].1;
-            let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
             let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
-            let ((k1, n1), (k2, n2)) = (if nb > 0 { spl(nb) } else { (32, 0) }, spl(pos + 1 - pr.r0));
+            // The experimental packed bag and the recent range use separate partials
+            // even when their boundary falls in the same absolute split.
+            let kps = fixed_split_width(false);
+            let n1 = fixed_split_count(0, nb, kps);
+            let n2 = fixed_split_count(pr.r0, pos + 1, kps);
+            debug_assert!(n1 + n2 <= split_scratch_slots(self.max_ctx));
             if nb > 0 {
                 let kb2 = (fi * 2 * NKV * pr.rows * HD) as u32;
                 let a = AttnArgs { nkeys: nb as u32, first_pos: 0, ring: 0, cap: pr.rows as u32, k_base: kb2, v_base: kb2 + (NKV * pr.rows * HD) as u32,
-                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1,
+                                   gstr: (pr.rows * HD) as u32, kps: kps as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1,
                                    lastbias: if pr.use_sum { pr.lastbias } else { 0.0 }, ..base };
                 e.buf(&pr.bag, 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
             }
-            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1, ..base };
+            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: kps as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1, ..base };
             self.bind_kv(e, false);
             self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
             nsplit = n1 + n2;
@@ -2838,8 +2850,8 @@ impl<'a> Run<'a> {
             // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
             self.bind_kv(e, l.swa);
             let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-            let kps = Self::split_kps(nkeys);
-            nsplit = nkeys.div_ceil(kps);
+            let kps = fixed_split_width(l.swa);
+            nsplit = fixed_split_count(pos + 1 - nkeys, pos + 1, kps);
             let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                 pad: self.sep_comb as u32, ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
@@ -2906,6 +2918,43 @@ impl<'a> Run<'a> {
 mod tests {
     use super::*;
 
+    /// The production arithmetic of specs/SplitArena.tla: every row of a span ending at `end` has at most
+    /// `nsplit` visible splits, and a batch of `rows` rows of `nsplit` slots fits the arena. The reversed
+    /// half: without the edge split some window row needs one slot more than it reserves.
+    #[test]
+    fn fixed_attn_batch_fits_every_row_in_the_arena() {
+        for max_ctx in [256, 4096, 16384, 131072] {
+            let slots = split_scratch_slots(max_ctx);
+            for swa in [true, false] {
+                let kps = fixed_split_width(swa);
+                let (mut widest, mut short_by_edge) = (0, false);
+                for end in 1..=max_ctx {
+                    let first = if swa { end.saturating_sub(EXT) } else { 0 };
+                    widest = widest.max(fixed_split_count(first, end, kps));
+                    let (nsplit, rows) = fixed_attn_batch(swa, end, max_ctx);
+                    assert!(widest <= nsplit, "swa {swa} end {end}: a row needs {widest} splits, {nsplit} reserved");
+                    assert!(rows * nsplit <= slots, "swa {swa} end {end}: {rows} rows of {nsplit} exceed {slots} slots");
+                    if swa && end > EXT { short_by_edge |= widest > (EXT - 1).div_ceil(kps); }
+                }
+                assert_eq!(short_by_edge, swa && max_ctx > EXT, "the edge split is needed exactly when the window slides");
+            }
+        }
+    }
+
+    #[test]
+    fn tier_packs_whole_absolute_splits_across_staging_halves() {
+        // [61,64) is the clipped first split. Its three records leave too
+        // little room for the following 64-record split, so staging flips.
+        let mut planner = TierPlanner::new(64);
+        planner.layer(0, 2, 61..251, 65, 64);
+        planner.layer(1, 4, 0..190, 1, 64);
+        planner.layer(0, 3, 100..121, 99, 64);
+        let chunks: Vec<_> = planner.chunks.iter().map(|c| (c.exec, c.c0, c.c1, c.sp0, c.ns, c.round, c.off)).collect();
+        assert_eq!(chunks, [(0, 61, 64, 0, 1, 0, 0), (0, 64, 128, 1, 1, 1, 0), (1, 0, 64, 0, 1, 2, 0)]);
+        let hot: Vec<_> = planner.layers.iter().map(|l| (l.b, l.sp0, l.ns, l.nsplit)).collect();
+        assert_eq!(hot, [(128, 2, 2, 4), (64, 1, 2, 3), (100, 0, 1, 1)]);
+    }
+
     /// Chunk 4096 keeps `min(t, MAX_SPANS)` vocabulary rows. A verify span of k=3 needs 4 of them.
     /// Growing `lg` to one row per token would be 32× those rows; this layout does not.
     /// fp16 path, fp16 K/V, vocab pad 201024 (`output.weight` rows of Inkling-2-Mini).
@@ -2916,7 +2965,7 @@ mod tests {
         assert_eq!(b.lg_rows, 128);
         assert_eq!(b.cap, 4096);
         let bytes = b.end as usize * 4;
-        assert_eq!(bytes, 1_791_665_152);
+        assert_eq!(bytes, 1_791_140_864);
         assert!(4 <= b.lg_rows as usize, "k=3 is 4 rows and must fit the existing lg");
         assert!(b.lg_rows as usize * 32 == 4096);
     }

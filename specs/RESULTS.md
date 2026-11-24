@@ -56,7 +56,88 @@ with deadlock checking enabled. Times include JVM startup.
 | Restage | 149 | 149 | 0.335 | StagedOnce violated |
 | StalledTraversal | 195 | 195 | 0.397 | TraversalCompletes violated |
 
-As a separate negative-control check, the redundant-load mutant passed both
-output invariants across all 2,887 distinct states when `StagedOnce` was
-omitted. A test copy with a three-key split and a two-key tile was rejected by
-the divisibility assumption before exploring any states.
+A test copy with a three-key split and a two-key tile was rejected by the
+divisibility assumption before exploring any states.
+
+### Fairness witness and negative control in CI
+
+Run on the `hetzner1` bench (AMD Ryzen 7 PRO 8700GE), 2026-11-24 01:58 UTC, through
+`specs/run_tlc.zsh` with the pinned v1.8.0 tools jar (TLC reports
+2026.11.19, rev `bc1b506`), OpenJDK 21.0.12.1, one TLC worker. Times include JVM
+startup. The whole `run_tlc.zsh` list, all 17 runs, took 27.0 seconds.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| GroupedLayout3 | 579 | 485 | 1.157 | PASS |
+| GroupedLayout4 | 1,553 | 1,329 | 1.676 | PASS |
+| StalledTraversal | 195 | 195 | 1.098 | TraversalCompletes violated |
+| AdvanceUnfair | 579 | 485 | 1.144 | TraversalCompletes violated |
+| RestageOutputs | 18,231 | 13,611 | 1.592 | PASS (expected) |
+
+`StalledTraversal` disables Advance, so the stalled state has no successor and
+weak fairness holds trivially. It cannot tell whether the spec has fairness at
+all. It stays because it is the witness for a lost enabling condition, which no
+fairness can repair.
+
+`AdvanceUnfair` keeps every action and keeps deadlock checking on, so TLC confirms
+that a step exists in every reachable state. Weak fairness covers staging only.
+Its counterexample, inspected: lengths `<<1, 1>>`, nothing shared, no window, one
+tile. State 3 has staged both private slots, so `loaded = Requests` and
+`tile = 0 < TileCount = 1`: Advance is enabled. State 4 stutters forever.
+
+Deleting `WF_vars(FairWork)` from `Spec` in a scratch copy made the healthy
+`GroupedLayout3` run fail with `TraversalCompletes` violated (485 distinct states,
+stuttering at state 4). The healthy runs check the property, so CI catches that
+deletion.
+
+`RestageOutputs` is the negative control that was run by hand before. It runs the
+redundant-load mutant against `VisitedKeys` and `OrderedPartials` only, at four
+slots, and the runner requires a clean exhaustive pass. `Restage` in the same list
+shows that the mutant is live. At three slots the same configuration covers
+2,887 distinct states, the count of the earlier hand run.
+
+Runner checks, by scratch copies: with `RestageOutputs` set to the `localMatch`
+mutant, and with `AdvanceUnfair` set to `Bug = "none"`, `run_tlc.zsh` stopped
+with "Unexpected result" for that run.
+
+### Time budget of the CI TLA step
+
+`scripts/check-tla.sh` on hetzner1, 2026-11-24, with every runner: 355 seconds.
+The CacheScheduler runner took about 305 of them; its DecodePriority run alone
+took 177 seconds (2,210,338 states). On the hosted macOS runner the same step
+took 4 min 58 s for pull request #43. That breaks the two-minute budget, so
+pull request CI no longer runs the CacheScheduler runner. The nightly workflow
+`.github/workflows/nightly.yml` runs everything with `TLA_NIGHTLY=1`. No
+configuration, bound or check was changed. The pull request tier (MemMode, the
+production traces, and all 17 `run_tlc.zsh` runs of that date) took 49.5 seconds on hetzner1; the list now has 22 runs.
+
+## Fixed-split partials arena
+
+On mini-m5, 2026-11-23, `specs/run_tlc.zsh` with one TLC worker. The healthy
+runs exhaust the graph and check `Finishes`. The SplitArena6 row was run later on hetzner1, 2026-11-24, in the full `run_tlc.zsh` list (its neighbours there: SplitArena3 1.427 s, SplitArena4 1.931 s). Times include JVM startup.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| SplitArena3 | 1,006 | 766 | 0.952 | PASS |
+| SplitArena4 | 1,046 | 806 | 0.977 | PASS |
+| SplitArena6 (hetzner1) | 1,046 | 806 | 1.846 | PASS |
+| SplitEdgeDropped | 375 | 375 | 0.713 | CombineReadsOwn violated |
+| SplitRowsUnbounded | 251 | 251 | 0.681 | WritesInArena violated |
+
+Inspected counterexamples:
+
+- **SplitEdgeDropped, state 2:** window layer, span `p0=0, t=5`, rows from 4.
+  The row ends at 5 and its window starts at 1, so it needs splits 0, 1 and 2;
+  two are reserved. The arena holds `0 :> (4,0,0)`, `1 :> (4,0,1)`,
+  `2 :> (4,1,0)`, and head 0's third read is slot 2.
+- **SplitRowsUnbounded, state 2:** full layer, span `p0=0, t=5`, `nsplit=2`,
+  four rows in one batch. Row 3, head 1 writes slot 14; the arena ends at 8.
+
+`SplitArena6` (arena floor 6, so two rows per batch where a window span has three
+reserved splits) reaches the case floors 3 and 4 never do: a batch of two or more
+rows on a window layer whose span passes the window. Checked by a scratch invariant
+that forbids that case: it holds at floor 4 (no error) and is violated by the
+initial state at floor 6. Its state count equals floor 4's by coincidence of the
+reachable batch starts; the case is the point, not the count. The PR-tier TLA step
+(`scripts/check-tla.sh`, all runners but CacheScheduler) took 54.5 seconds on
+hetzner1, inside the two-minute budget.

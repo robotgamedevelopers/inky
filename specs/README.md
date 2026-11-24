@@ -120,9 +120,19 @@ the physical slot and tile of every load. Each pair must occur once, and the
 completed trace must cover every pair expected by the private rows.
 
 Under weak fairness of the enabled traversal action, each snapshot must finish.
-The liveness witness blocks the first advance after its tile's loads finish.
-That configuration turns off TLC's earlier deadlock diagnostic so the checker
-reports the infinite stutter that violates traversal completion.
+Two liveness witnesses fail in different ways. `StalledTraversal` blocks the
+first advance after its tile's loads finish, so no step is possible. That
+configuration turns off TLC's earlier deadlock diagnostic so the checker
+reports the infinite stutter that violates traversal completion. It shows that
+the property catches a lost enabling condition that no fairness can repair.
+`AdvanceUnfair` keeps every step and deadlock checking, and narrows weak
+fairness to staging alone. TLC then finds a behavior that stutters forever
+while Advance is enabled. It shows that completion depends on fairness of the
+advance step.
+
+The negative control `RestageOutputs` runs the redundant-load mutant against
+both output invariants only. It must pass. Only `StagedOnce` can see that
+mutant, and `Restage` shows that the same mutant violates it.
 
 | Witness | Checked property | What changes |
 | --- | --- | --- |
@@ -131,10 +141,35 @@ reports the infinite stutter that violates traversal completion.
 | `TilePartial` | `OrderedPartials` | Emitting at the first tile end produces an extra partial inside a split. |
 | `Restage` | `StagedOnce` | A physical slot is loaded twice. The row's visited keys and emitted partials stay unchanged. |
 | `StalledTraversal` | `TraversalCompletes` | Both rows can finish their loads, yet the traversal stays on tile zero forever. |
+| `AdvanceUnfair` | `TraversalCompletes` | Weak fairness covers staging only. Advance stays enabled and is never taken. |
 
 The ordered keys represent logical position and mask membership. SIMD lane
 assignment, floating-point operations and Metal execution require the kernel's
 bitwise tests. Block allocation and lifetime are checked in their own models.
+
+## Fixed-split partials arena
+
+`SplitArena` models the layout of the private tensor path's attention partials
+(`fixed_split_count`, `split_scratch_slots` and `fixed_attn_batch` in
+`src/engine.rs`; `k_attn_fixed_b` and `k_attn_fixed_combine` in
+`src/kernels.metal`) with the same arithmetic at a small scale: window splits of
+2 keys (64 in production), full splits of 4 (256), a window of 4 (1024), a
+context limit of 8, two heads, and an arena floor of 3, 4 or 6 slots per head (256).
+Every span `(p0, t)` of either layer kind, with every tail-trim start, runs its
+query rows in batches. Each batch writes slot `(row * NH + head) * nsplit + split`
+for every dispatched split whose first key lies before the row's end, then the
+combine reads the row's visible splits from the same slots. Invariants: the
+batch size is positive, no write lands past the arena, one dispatch never writes
+a slot twice, and every partial the combine reads is its own row's, head's and
+absolute split's from this batch. `Finishes` checks that every span completes.
+
+| Witness | Checked property | What changes |
+| --- | --- | --- |
+| `SplitEdgeDropped` | `CombineReadsOwn` | The reservation drops the window's edge split. A row ending at 5 sees keys 1..4, which touch three 2-key splits, but only two are reserved; head 0's third read is head 1's first split. In production, a row ending at 1025 needs 17 splits against 16. |
+| `SplitRowsUnbounded` | `WritesInArena` | The batch takes the arena's slot count in rows without dividing by `nsplit`. Four full-attention rows with two reserved splits write slot 14 of an 8-slot arena. |
+
+The unit test `fixed_attn_batch_fits_every_row_in_the_arena` checks the same
+two guards with the production constants at context limits up to 131072.
 
 ## Serve scheduler traces
 
@@ -147,7 +182,7 @@ INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl \
   cargo test --locked serve::scheduler_trace::dump -- --ignored --exact
 ```
 
-The first JSON line records the schema version, seed, lane count, queue limit,
+The first JSON line records the schema version (currently 2), seed, lane count, queue limit,
 prefill chunk budget and context. Each subsequent line records one event in
 execution order. Request IDs (`job`) identify arrivals through termination.
 Lane indices and token positions start at zero.
@@ -155,7 +190,8 @@ Lane indices and token positions start at zero.
 | Event | Observation |
 | --- | --- |
 | `arrive`, `refuse429` | The client submits a request with prompt length and generation limit. A refusal is the outcome of the same atomic capacity claim used by both HTTP handlers. |
-| `admit` | The scheduler assigns a request to a free lane and records its cached prefix length. |
+| `admit` | The scheduler assigns a request to a free lane (`lane`) and records its cached prefix length (`cached`) and where that prefix comes from: `source` is `cold` (nothing cached, `cached` is 0), `own` (the lane's own kept prompt) or `copy` (copied from the busy lane `from`, whose prefill has just finished). `from` equals `lane` unless `source` is `copy`. |
+| `refuse_ctx` | The request reached a free lane but its prompt plus generation limit plus two reserved tokens exceeds one lane's context. The scheduler refuses it; this ends the request. |
 | `build_step` | The scheduler submits a prefill or decode batch. Each span names its lane, request, starting position and token count. |
 | `finish_step` | The submitted batch has completed. This is the engine fence for that step. |
 | `disconnect`, `cancel` | The simulated client drops its receiver; the scheduler observes delivery failure and releases the lane. These can occur on different ticks. |
@@ -165,7 +201,9 @@ The fake supplies cache state and logits at the engine boundary. The production
 scheduler still chooses lanes and builds batches, samples tokens, sends events
 and observes disconnects. The trace covers the current serving decisions.
 The default test repeats 33 seeds with two lanes and one queued request and
-checks that the trace drains. These workloads use cold prompts and a constant
-winning token, so normal generation ends at the requested length. Cache hits,
-model output and GPU execution have separate tests. A TLC replay against
+checks that the trace drains. Some prompts extend the previous prompt, so the
+seeds cover cold, own-lane and cross-lane admissions; each walk also submits one
+request too long for a lane, which ends in `refuse_ctx`. A constant winning
+token means normal generation ends at the requested length. Model output and GPU
+execution have separate tests. A TLC replay against
 CacheScheduler is a separate verification step.
