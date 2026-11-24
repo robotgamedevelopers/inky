@@ -95,6 +95,7 @@ check PoisonOwnedOnly PoisonGate Coverage
 check InBlock InBlock
 check InBlockKv8 InBlock
 check InBlockMajor InBlock Ordered
-check InBlockMajorCollide InBlock NoCollision initial
+check InBlockMajorCollide InBlock NoCollision
+check InBlockAddrCol InBlock NoCollision
 check InBlockTrace InBlockTrace
 check InBlockTraceKv8 InBlockTrace
