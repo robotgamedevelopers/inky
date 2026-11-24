@@ -3,7 +3,11 @@
 //! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
 //! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
 //! prompt's end; a request whose tokens extend that prompt continues the lane from there, so a card's next turn prefills
-//! only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5).
+//! only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
+//! may also start a different lane: when the lane holding the longest matching prompt is busy, its prefill-written
+//! prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the suffix is
+//! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
+//! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
 use crate::engine::{Engine, Lane, Span};
 use crate::sampler::Sampler;
@@ -15,7 +19,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Instant;
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize,
                       /// a request must carry this key, as `x-api-key` or `Authorization: Bearer <this>` (from the environment variable --key-env names)
@@ -394,13 +397,63 @@ struct Job { toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: 
 enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String) }
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
-struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, used: Instant, job: Option<Active> }
+/// `tick` is the scheduler's logical clock (not wall time): a smaller tick was freed longer ago.
+struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
 struct Active { job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize, sampler: Sampler, pending: Option<u32> }
+
+/// Tokens two token lists share at their start.
+fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
+
+/// How much of `request` a lane's kept prompt can supply: the prompt's whole length when the lane holds the
+/// convolution state at that prompt's end and the prompt is a strict prefix of the request, else nothing. A
+/// partial overlap supplies nothing (the state exists only at the prompt's end), and an equal prompt supplies
+/// nothing either, so the suffix to prefill is never empty — the own-lane rule, unchanged.
+fn reusable_prefix(prompt: &[u32], has_state: bool, request: &[u32]) -> usize {
+    let n = shared_prefix(prompt, request);
+    if has_state && n == prompt.len() && n < request.len() { n } else { 0 }
+}
+
+/// One lane as admission sees it, in logical time (the unit tests drive this with synthetic ticks: no wall
+/// clock, no sockets, no GPU).
+#[derive(Clone, Copy)]
+struct LaneCand { prefix: usize, free: bool, copyable: bool, tick: u64 }
+
+/// Where a request starts: lane `dst` runs it, starting from `prefix` tokens supplied by lane `src`.
+/// `src == dst` is the lane's own kept prompt (or a cold start when `prefix` is 0); `src != dst` is a copy.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Admission { dst: usize, src: usize, prefix: usize }
+
+/// Pick the lane for a request and where its prefix comes from. A free lane's own kept prompt comes first
+/// (longest, then least recently freed, as before); only a strictly longer prompt held by a busy but copyable
+/// lane is copied, into the least recently freed lane. A busy lane is never the destination.
+fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
+    let own = cands.iter().enumerate().filter(|(_, c)| c.free)
+        .max_by_key(|(_, c)| (c.prefix, std::cmp::Reverse(c.tick)));
+    let (dst, own_prefix) = match own { Some((i, c)) => (i, c.prefix), None => return None };
+    let src = cands.iter().enumerate().filter(|(_, c)| c.copyable && c.prefix > own_prefix)
+        .max_by_key(|(_, c)| (c.prefix, c.tick));
+    match src {
+        Some((s, c)) if s != dst => {
+            let lru = cands.iter().enumerate().filter(|(_, c)| c.free).min_by_key(|(_, c)| c.tick).unwrap().0;
+            Some(Admission { dst: lru, src: s, prefix: c.prefix })
+        }
+        _ => Some(Admission { dst, src: dst, prefix: own_prefix }),
+    }
+}
+
+/// Copy `src`'s first `n` prefill-written positions into `dst` (the two lanes of one `lanes` slice).
+fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usize) {
+    assert!(src != dst && n > 0);
+    let (s, d) = if src < dst { let (a, b) = lanes.split_at_mut(dst); (&a[src], &mut b[0]) }
+                 else { let (a, b) = lanes.split_at_mut(src); (&b[0], &mut a[dst]) };
+    eng.copy_lane_prefix(&s.lane, &d.lane, n);
+}
 
 fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>) {
-    let mut lanes: Vec<LaneS> = (0..nlanes).map(|_| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, used: Instant::now(), job: None }).collect();
+    let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
+    let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut last_was_prefill = false;
@@ -409,21 +462,43 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         let busy = lanes.iter().any(|l| l.job.is_some());
         if !busy && queue.is_empty() { match rx.recv() { Ok(j) => queue.push_back(j), Err(_) => return } }
         loop { match rx.try_recv() { Ok(j) => queue.push_back(j), Err(TryRecvError::Empty) => break, Err(TryRecvError::Disconnected) => return } }
-        // admit: a free lane whose last prompt is the longest prefix of the request, else the least recently used free lane
+        // admit: a free lane whose kept prompt is the longest prefix of the request, else the least recently freed
+        // lane — started, when a busy lane holds a strictly longer prompt it may still copy, from that lane's
+        // prefill-written prefix and its kept convolution state. A busy lane may be a source only in the moment
+        // its prefill has finished and no decode step has written cache yet (`n_past == pf_end`): after that its
+        // sliding-window ring holds decode-written keys over prompt positions, and a lane whose cache left memory
+        // for the disk tier cannot supply its prefix either. The source lane is only read, never mutated.
         while let Some(j) = queue.front() {
-            let best = lanes.iter().enumerate().filter(|(_, l)| l.job.is_none())
-                .max_by_key(|(_, l)| (if l.cs_at_prompt.is_some() && l.prompt.len() < j.toks.len() && j.toks.starts_with(&l.prompt) { l.prompt.len() } else { 0 }, std::cmp::Reverse(l.used)));
-            let Some((i, _)) = best else { break };
+            let cands: Vec<LaneCand> = lanes.iter().map(|l| LaneCand {
+                prefix: reusable_prefix(&l.prompt, l.cs_at_prompt.is_some(), &j.toks),
+                free: l.job.is_none(),
+                copyable: match &l.job { Some(a) => a.n_past == a.pf_end && !eng.on(&l.lane).tier_on(), None => false },
+                tick: l.tick,
+            }).collect();
+            let Some(adm) = choose_lane(&cands) else { break };
             let j = queue.pop_front().unwrap();
             if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx { let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx))); continue; }
-            let l = &mut lanes[i];
-            let run = eng.on(&l.lane);
-            let reuse = l.cs_at_prompt.is_some() && l.prompt.len() < j.toks.len() && j.toks.starts_with(&l.prompt);
-            let start = if reuse { l.prompt.len() } else { 0 };
-            if reuse { run.set_cs(l.cs_at_prompt.as_ref().unwrap()); } else { run.reset(); }
+            let i = adm.dst;
+            let start = adm.prefix;
+            if start > 0 && adm.src == i {
+                eng.on(&lanes[i].lane).set_cs(lanes[i].cs_at_prompt.as_ref().unwrap());
+            } else if start > 0 {
+                // cross-lane: forget the destination, make room, copy the source's prefill-written prefix,
+                // then put back the source's kept convolution state (its own state at that prompt's end)
+                let cs = lanes[adm.src].cs_at_prompt.clone().unwrap();
+                let run = eng.on(&lanes[i].lane);
+                run.reset();
+                run.reserve(j.toks.len() + j.max + 2, true);
+                copy_prefix(eng, &mut lanes, adm.src, i, start);
+                eng.on(&lanes[i].lane).set_cs(&cs);
+            } else {
+                eng.on(&lanes[i].lane).reset();
+            }
+            let run = eng.on(&lanes[i].lane);
             run.reserve(j.toks.len() + j.max + 2, true);
             run.set_tokens(0, &j.toks);
             let sampler = Sampler::new(j.temp, 64, j.top_p, eng.softcap, j.seed);
+            let l = &mut lanes[i];
             l.prompt.clear(); l.cs_at_prompt = None;
             l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, pending: None, job: j });
         }
@@ -459,7 +534,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 } else if a.job.out.send(Ev::Alive).is_err() {
                     // the client went away during its prefill: free the lane now
                     eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed", a.n_past, a.pf_end);
-                    l.job = None; l.used = Instant::now();
+                    l.job = None; l.tick = tick_seq; tick_seq += 1;
                 }
             }
         } else if !need_dec.is_empty() {
@@ -490,7 +565,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             if let Some(r) = reason {
                 if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
                 let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
-                l.job = None; l.used = Instant::now();
+                l.job = None; l.tick = tick_seq; tick_seq += 1;
             }
         }
     }
@@ -1365,6 +1440,43 @@ mod tests {
         assert!(check_serve_shape(1, 1).is_err(), "a one-token context has no budget inside it");
         assert_eq!(check_serve_shape(4096, 4095), Ok(()));
         assert_eq!(check_serve_shape(2, 1), Ok(()));
+    }
+    #[test] fn a_kept_prompt_supplies_its_whole_length_only_as_a_strict_prefix() {
+        let p: Vec<u32> = (0..100).collect();
+        let ext: Vec<u32> = (0..150).collect();
+        assert_eq!(reusable_prefix(&p, true, &ext), 100, "a strict prefix with its state supplies every token");
+        assert_eq!(reusable_prefix(&p, true, &p), 0, "an equal prompt supplies nothing: the suffix is never empty");
+        assert_eq!(reusable_prefix(&ext, true, &p), 0, "a request shorter than the prompt supplies nothing");
+        assert_eq!(reusable_prefix(&p, false, &ext), 0, "no convolution state at the prompt's end, no reuse");
+        assert_eq!(reusable_prefix(&[], true, &ext), 0, "an empty prompt supplies nothing");
+        assert_eq!(reusable_prefix(&p, true, &[]), 0, "an empty request takes nothing");
+        // a shared head that diverges inside the prompt: the overlap is real, the state is at the wrong end
+        let mut div = ext.clone(); div[60] = 9999;
+        assert_eq!(shared_prefix(&p, &div), 60, "the two lists share a 60-token head");
+        assert_eq!(reusable_prefix(&p, true, &div), 0, "a partial overlap supplies nothing: its state is at token 100, not 60");
+        let mut at_end = ext.clone(); at_end[100] = 9999;
+        assert_eq!(reusable_prefix(&p, true, &at_end), 100, "diverging at the first suffix token still reuses the whole prompt");
+    }
+    #[test] fn lane_choice_prefers_the_own_prompt_then_a_longer_copyable_busy_one() {
+        let cand = |prefix: usize, free: bool, copyable: bool, tick: u64| LaneCand { prefix, free, copyable, tick };
+        // own lane first: a free lane's own prompt beats an equally long busy one, with no copy
+        let c = [cand(100, true, false, 5), cand(100, false, true, 9), cand(0, true, false, 1)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 0, src: 0, prefix: 100 }), "the own prompt wins a tie");
+        // cross-lane: a strictly longer busy prompt is copied into the least recently freed lane
+        let c = [cand(10, true, false, 5), cand(500, false, true, 9), cand(0, true, false, 1)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 2, src: 1, prefix: 500 }), "the longer busy prompt is the source, the stalest free lane the destination");
+        // a busy lane that may not be copied (already decoding, or tiered) is excluded as a source
+        let c = [cand(10, true, false, 5), cand(500, false, false, 9), cand(0, true, false, 1)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 0, src: 0, prefix: 10 }), "an uncopyable busy lane leaves the own prompt in place");
+        // a busy lane is never the destination, and no free lane means no admission
+        let c = [cand(500, false, true, 9), cand(0, true, false, 1)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 1, src: 0, prefix: 500 }), "the one free lane receives the copy");
+        assert_eq!(choose_lane(&[cand(500, false, true, 9)]), None, "every lane busy: the request waits");
+        // cold start and ties: the least recently freed lane, as before
+        let c = [cand(0, true, false, 5), cand(0, true, false, 1), cand(0, false, false, 9)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 1, src: 1, prefix: 0 }), "no prefix anywhere: least recently freed");
+        let c = [cand(50, true, false, 5), cand(50, true, false, 1)];
+        assert_eq!(choose_lane(&c), Some(Admission { dst: 1, src: 1, prefix: 50 }), "equal own prompts: least recently freed, as before");
     }
     #[test] fn peek_results_decide_whether_the_peer_is_gone() {
         use std::io::{Error, ErrorKind};

@@ -47,6 +47,8 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `--effort E` | `medium` | Default model thinking effort |
 | `-n MAX` | 16384 | Default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
+Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. That kept prompt may also start another lane: when the lane holding it is busy, a free lane copies its prefill-written prefix and the prompt-end convolution state and prefills only the suffix (`inky xcopy` gates that the copy is bit-identical to a cold prefill; a partial overlap with a kept prompt still starts cold, because the state exists only at a prompt's end).
+
 `GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `http://127.0.0.1:8096/v1` as their base URL, with model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 
 ### Route Claude Code through nova-sprint
