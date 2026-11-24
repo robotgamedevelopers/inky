@@ -271,6 +271,9 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
 /// The reference against the poisoned candidate: Ok(lines) when every lane matches at every step, Err(lines) naming
 /// the first difference of each lane that differs.
 pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>> {
+    if got.records.len() != want.len() {
+        return Err(vec![format!("lane count mismatch: candidate returned {} lanes, reference has {}", got.records.len(), want.len())]);
+    }
     let mut bad = Vec::new();
     for (i, (a, b)) in want.iter().zip(&got.records).enumerate() {
         if let Some(s) = a.steps.iter().zip(&b.steps).position(|(x, y)| x != y) { bad.push(format!("lane {i}: logits differ from step {s}")); }
@@ -289,6 +292,9 @@ impl<'a> Layer2<'a> {
         eng.ensure_batch(eng.chunk);
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
+    }
+    pub fn candidate_label(&self) -> &'static str {
+        "Layer2 self-check (BlockPools candidate not yet wired)"
     }
     fn run<R>(&self, f: impl FnOnce(&[Option<Lane>]) -> R) -> R { f(&self.lanes.borrow()) }
 }
@@ -487,5 +493,19 @@ mod tests {
         assert_eq!(slot_region(base, len, BlockKind::Full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
         assert_eq!(slot_region(base, len, BlockKind::Full, sl(3)), None);
         assert_eq!(slot_region(base, len, BlockKind::Window, sl(1)), None);
+    }
+
+    #[test]
+    fn compare_rejects_short_or_extra_candidate_record_lists() {
+        let r0 = Record { steps: vec![1, 2], tokens: vec![10] };
+        let r1 = Record { steps: vec![3, 4], tokens: vec![20] };
+        let want = vec![r0.clone(), r1.clone()];
+        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        let err = compare(&want, &short).unwrap_err();
+        assert!(err[0].contains("lane count mismatch"), "short candidate must fail compare: {err:?}");
+        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        assert!(compare(&want, &extra).is_err(), "extra candidate lanes must fail compare");
+        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        assert!(compare(&want, &exact).is_ok());
     }
 }

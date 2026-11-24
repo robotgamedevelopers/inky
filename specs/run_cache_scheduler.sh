@@ -108,6 +108,7 @@ check_run() {
 echo "run | generated | distinct | wall seconds | result"
 check_run CacheScheduler CacheScheduler pass
 check_run CacheSchedulerQueue CacheScheduler pass
+check_run CacheSchedulerQueue2 CacheScheduler pass
 check_run CacheSchedulerTwoPrefixes CacheScheduler pass
 check_run CacheSchedulerMaxPos8 CacheScheduler pass
 check_run CacheSchedulerDecodePriority CacheScheduler pass

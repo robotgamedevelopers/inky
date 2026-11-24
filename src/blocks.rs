@@ -158,6 +158,9 @@ impl SlotRecord {
 
     pub fn bump_generation(&mut self) -> Result<(), BlockError> {
         self.generation = next_generation(self.generation)?;
+        self.length = 0;
+        self.sealed = false;
+        self.refs = 0;
         Ok(())
     }
 
@@ -353,5 +356,25 @@ mod tests {
         assert_eq!(entry.offset(), 0);
         assert_eq!(entry.generation(), 1);
         assert_eq!(entry.slot().get(), 1);
+    }
+
+    #[test]
+    fn bump_generation_resets_stale_length_sealed_and_refs() {
+        let mut slot = SlotRecord::fresh(BlockKind::Full);
+        slot.bump_generation().unwrap();
+        slot.set_length(64).unwrap();
+        slot.seal();
+        slot.add_ref().unwrap();
+        slot.add_ref().unwrap();
+        assert_eq!((slot.generation(), slot.length(), slot.sealed(), slot.refs()), (1, 64, true, 2));
+        slot.bump_generation().unwrap();
+        assert_eq!((slot.generation(), slot.length(), slot.sealed(), slot.refs()), (2, 0, false, 0));
+        // When generation cannot advance past u32::MAX, state stays untouched and returns Err(Generation)
+        let mut max_slot = SlotRecord::at_generation(BlockKind::Window, u32::MAX);
+        max_slot.set_length(32).unwrap();
+        max_slot.seal();
+        max_slot.add_ref().unwrap();
+        assert_eq!(max_slot.bump_generation(), Err(BlockError::Generation));
+        assert_eq!((max_slot.generation(), max_slot.length(), max_slot.sealed(), max_slot.refs()), (u32::MAX, 32, true, 1));
     }
 }

@@ -594,11 +594,13 @@ fn poolgate(o: &Opts) {
     let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
     // the candidate: the block cache plugs in here, as a `StepPath + PoisonPool` over the same engine
     let cand = poolgate::Layer2::new(&eng, n);
+    let label = cand.candidate_label();
+    println!("poolgate candidate: {label}");
     let got = poolgate::poisoned(&cand, &w, sabotage);
     if sabotage && !got.sabotaged { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
     match poolgate::compare(&want, &got) {
-        Ok(lines) => { for l in lines { println!("{l}"); } println!("pool gate identical: poisoned slots, every lane gives exactly layer 2's outputs"); }
-        Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS"); std::process::exit(1); }
+        Ok(lines) => { for l in lines { println!("{l}"); } println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs"); }
+        Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
     }
 }
 
