@@ -109,4 +109,35 @@ took 4 min 58 s for pull request #43. That breaks the two-minute budget, so
 pull request CI no longer runs the CacheScheduler runner. The nightly workflow
 `.github/workflows/nightly.yml` runs everything with `TLA_NIGHTLY=1`. No
 configuration, bound or check was changed. The pull request tier (MemMode, the
-production traces, and all 17 `run_tlc.zsh` runs) took 49.5 seconds on hetzner1.
+production traces, and all 17 `run_tlc.zsh` runs of that date) took 49.5 seconds on hetzner1; the list now has 22 runs.
+
+## Fixed-split partials arena
+
+On mini-m5, 2026-11-23, `specs/run_tlc.zsh` with one TLC worker. The healthy
+runs exhaust the graph and check `Finishes`. The SplitArena6 row was run later on hetzner1, 2026-11-24, in the full `run_tlc.zsh` list (its neighbours there: SplitArena3 1.427 s, SplitArena4 1.931 s). Times include JVM startup.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| SplitArena3 | 1,006 | 766 | 0.952 | PASS |
+| SplitArena4 | 1,046 | 806 | 0.977 | PASS |
+| SplitArena6 (hetzner1) | 1,046 | 806 | 1.846 | PASS |
+| SplitEdgeDropped | 375 | 375 | 0.713 | CombineReadsOwn violated |
+| SplitRowsUnbounded | 251 | 251 | 0.681 | WritesInArena violated |
+
+Inspected counterexamples:
+
+- **SplitEdgeDropped, state 2:** window layer, span `p0=0, t=5`, rows from 4.
+  The row ends at 5 and its window starts at 1, so it needs splits 0, 1 and 2;
+  two are reserved. The arena holds `0 :> (4,0,0)`, `1 :> (4,0,1)`,
+  `2 :> (4,1,0)`, and head 0's third read is slot 2.
+- **SplitRowsUnbounded, state 2:** full layer, span `p0=0, t=5`, `nsplit=2`,
+  four rows in one batch. Row 3, head 1 writes slot 14; the arena ends at 8.
+
+`SplitArena6` (arena floor 6, so two rows per batch where a window span has three
+reserved splits) reaches the case floors 3 and 4 never do: a batch of two or more
+rows on a window layer whose span passes the window. Checked by a scratch invariant
+that forbids that case: it holds at floor 4 (no error) and is violated by the
+initial state at floor 6. Its state count equals floor 4's by coincidence of the
+reachable batch starts; the case is the point, not the count. The PR-tier TLA step
+(`scripts/check-tla.sh`, all runners but CacheScheduler) took 54.5 seconds on
+hetzner1, inside the two-minute budget.

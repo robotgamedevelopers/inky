@@ -8,3 +8,4 @@
 /tools/ref_logits
 .DS_Store
 specs/**/states/
+specs/*_TTrace_*

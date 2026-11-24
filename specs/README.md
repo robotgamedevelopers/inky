@@ -147,6 +147,30 @@ The ordered keys represent logical position and mask membership. SIMD lane
 assignment, floating-point operations and Metal execution require the kernel's
 bitwise tests. Block allocation and lifetime are checked in their own models.
 
+## Fixed-split partials arena
+
+`SplitArena` models the layout of the private tensor path's attention partials
+(`fixed_split_count`, `split_scratch_slots` and `fixed_attn_batch` in
+`src/engine.rs`; `k_attn_fixed_b` and `k_attn_fixed_combine` in
+`src/kernels.metal`) with the same arithmetic at a small scale: window splits of
+2 keys (64 in production), full splits of 4 (256), a window of 4 (1024), a
+context limit of 8, two heads, and an arena floor of 3, 4 or 6 slots per head (256).
+Every span `(p0, t)` of either layer kind, with every tail-trim start, runs its
+query rows in batches. Each batch writes slot `(row * NH + head) * nsplit + split`
+for every dispatched split whose first key lies before the row's end, then the
+combine reads the row's visible splits from the same slots. Invariants: the
+batch size is positive, no write lands past the arena, one dispatch never writes
+a slot twice, and every partial the combine reads is its own row's, head's and
+absolute split's from this batch. `Finishes` checks that every span completes.
+
+| Witness | Checked property | What changes |
+| --- | --- | --- |
+| `SplitEdgeDropped` | `CombineReadsOwn` | The reservation drops the window's edge split. A row ending at 5 sees keys 1..4, which touch three 2-key splits, but only two are reserved; head 0's third read is head 1's first split. In production, a row ending at 1025 needs 17 splits against 16. |
+| `SplitRowsUnbounded` | `WritesInArena` | The batch takes the arena's slot count in rows without dividing by `nsplit`. Four full-attention rows with two reserved splits write slot 14 of an 8-slot arena. |
+
+The unit test `fixed_attn_batch_fits_every_row_in_the_arena` checks the same
+two guards with the production constants at context limits up to 131072.
+
 ## Serve scheduler traces
 
 On a Mac with the Rust toolchain, write one deterministic trace from the serve
