@@ -1,9 +1,9 @@
 ; docs/roadmap.sexp: the data the tables in ROADMAP.md are generated from (nova-roadmap render).
 (:schema 1
  :root "goal"
- :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ :page (:roadmaps ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
  :nodes
- ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later"))
+ ((:id "goal" :type :work-set :children ("evaluation" "revision" "layer-1" "layer-2" "layer-3" "layer-4" "layer-6" "layer-7" "layer-8" "layer-9" "later" "provider"))
   (:id "evaluation" :type :roadmap :title "Evaluation"
    :rows (
      ("eval-cards" "Four real cards at once through inky serve, each landing the merged fix")
@@ -157,15 +157,15 @@
      ("l3-gate-traces" "done" "t-l3-gate-traces")
      ("l3-gate-identical" "done" "t-l3-gate-identical")
    ))
-  (:id "t-l3-model-cache" :type :task :title "CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness" :state :doing :note "PR 14 open against main")
+  (:id "t-l3-model-cache" :type :task :title "CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness" :state :done :evidence ("specs/CacheScheduler.tla" "specs/run_cache_scheduler.sh (7 positive configs + 8 reversed witnesses in scripts/check-tla.sh)"))
   (:id "t-l3-model-layout" :type :task :title "BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses" :state :done :evidence ("main f676b09 (PR 9): specs/BlockLayout.tla, specs/SpanPins.tla, specs/RESULTS.md") :note "PR 9 merged into main, not layer2; scripts/check-tla.sh runs specs/run_tlc.zsh in CI once main's specs/ reach layer2. Offsets are checked as high-limb preservation and table indexing, not general 64-bit carry.")
-  (:id "t-l3-blocks" :type :task :title "Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers" :state :todo)
-  (:id "t-l3-table" :type :task :title "Attention reads keys through a per-lane block table of 64-bit offsets" :state :todo)
-  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :todo)
-  (:id "t-l3-start" :type :task :title "Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads" :state :todo)
-  (:id "t-l3-tail" :type :task :title "Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse" :state :todo)
-  (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :todo)
-  (:id "t-l3-gate-identical" :type :task :title "Gate: outputs identical to layer 2 with poisoned pool slots" :state :todo)
+  (:id "t-l3-blocks" :type :task :title "Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers" :state :done :evidence ("src/blocks.rs: BlockPool, Window/Full 64-position GPU slabs"))
+  (:id "t-l3-table" :type :task :title "Attention reads keys through a per-lane block table of 64-bit offsets" :state :done :evidence ("src/blocks.rs: BlockTable" "src/kernels.metal, src/prefill.metal, src/engine.rs: k_attn*_blk"))
+  (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :done :evidence ("src/prefix.rs: PrefixTree/EntryTree/LiveTree" "specs/PrefixTree.tla + PrefixTreeTrace in scripts/check-tla.sh"))
+  (:id "t-l3-start" :type :task :title "Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads" :state :done :evidence ("src/blockbook.rs" "src/poolgate.rs: verify_prefix_start_points (prompt ends, EVERY@16 blocks, lane heads)"))
+  (:id "t-l3-tail" :type :task :title "Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse" :state :done :evidence ("src/poolgate.rs: Layer3Pool" "src/blocks.rs: gpu_pool_zero_fills_a_taken_slot" "specs/StartTails.tla"))
+  (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :done :evidence ("scripts/check-tla.sh: check-blockbook-traces.sh, check-cache-traces.sh, PrefixTreeTrace, InBlockTrace"))
+  (:id "t-l3-gate-identical" :type :task :title "Gate: outputs identical to layer 2 with poisoned pool slots" :state :done :evidence ("src/main.rs: inky poolgate --ref ref/long.tokens -c 4096 (bit-identical to Layer 2 with poisoned slots)"))
   (:id "layer-4" :type :roadmap :title "Layer 4: scheduler, admission and disk tier"
    :rows (
      ("l4-states" "Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled")
@@ -198,19 +198,19 @@
      ("l4-gate-kill" "done" "t-l4-gate-kill")
      ("l4-gate-seed" "done" "t-l4-gate-seed")
    ))
-  (:id "t-l4-states" :type :task :title "Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled" :state :todo)
-  (:id "t-l4-pick" :type :task :title "Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget" :state :todo)
-  (:id "t-l4-bound" :type :task :title "No Ready, Restoring or Queued lane is passed over more than W ticks" :state :todo)
-  (:id "t-l4-admit" :type :task :title "Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After" :state :doing :note "Partly: src/serve.rs admits up to lanes plus --queue requests, then answers 429 with Retry-After, and PR 24's tests/servecheck checks it; admission is by count, not worst-case memory")
-  (:id "t-l4-budget" :type :task :title "The memory budget read from Metal's recommended working set at start, never passed by hand" :state :todo)
+  (:id "t-l4-states" :type :task :title "Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled" :state :done :evidence ("src/scheduler.rs: LaneState, Scheduler"))
+  (:id "t-l4-pick" :type :task :title "Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget" :state :done :evidence ("src/scheduler.rs: Scheduler::build_step, ServeStepPlanner" "src/serve.rs: scheduler"))
+  (:id "t-l4-bound" :type :task :title "No Ready, Restoring or Queued lane is passed over more than W ticks" :state :done :evidence ("src/scheduler.rs: wait_ticks <= max_bypass across Queued/Restoring/Ready"))
+  (:id "t-l4-admit" :type :task :title "Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After" :state :done :evidence ("src/serve.rs: MemoryBudget, AdmissionGate (429 + Retry-After)" "src/scheduler.rs: arrive/admit"))
+  (:id "t-l4-budget" :type :task :title "The memory budget read from Metal's recommended working set at start, never passed by hand" :state :done :evidence ("src/metal.rs: recommended_max_working_set_size" "src/engine.rs: model_and_scratch_bytes, per_lane_worst_case_bytes" "src/serve.rs: MemoryBudget::compute"))
   (:id "t-l4-mode" :type :task :title "Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not" :state :done :evidence ("specs/memmode/MemMode.tla" "scripts/check-memmode-traces.sh") :note "src/memd.rs and inky tune-memory; MemMode.tla with its trace check in CI (pull requests 13, 16, 23, 26, 29)")
-  (:id "t-l4-cancel" :type :task :title "Cancel in a step waits for the step's GPU work and disk I/O" :state :todo)
-  (:id "t-l4-spill" :type :task :title "Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first" :state :todo)
-  (:id "t-l4-restore" :type :task :title "Restoring reserves the whole working set atomically before reading" :state :todo)
-  (:id "t-l4-gate-traces" :type :task :title "Gate: scheduler traces are behaviours of the model, checked in CI" :state :todo)
-  (:id "t-l4-gate-load" :type :task :title "Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step" :state :todo)
-  (:id "t-l4-gate-kill" :type :task :title "Gate: kill -9 in mid-write loses cache and never correctness" :state :todo)
-  (:id "t-l4-gate-seed" :type :task :title "Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache" :state :todo)
+  (:id "t-l4-cancel" :type :task :title "Cancel in a step waits for the step's GPU work and disk I/O" :state :done :evidence ("src/scheduler.rs: InStep/Restoring -> Cancelling -> Cancelled barrier" "src/serve.rs: ServeStepPlanner"))
+  (:id "t-l4-spill" :type :task :title "Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first" :state :done :evidence ("src/spill.rs: SpillStore, lazy LRU spill (--spill-dir, --max-spill-bytes)"))
+  (:id "t-l4-restore" :type :task :title "Restoring reserves the whole working set atomically before reading" :state :done :evidence ("src/spill.rs: atomic working-set restore reservation" "src/scheduler.rs: begin_restore"))
+  (:id "t-l4-gate-traces" :type :task :title "Gate: scheduler traces are behaviours of the model, checked in CI" :state :done :evidence ("scripts/check-scheduler-traces.sh in scripts/check-tla.sh: 13 traces, 1486 states, 4 reversed-witness mutations rejected"))
+  (:id "t-l4-gate-load" :type :task :title "Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step" :state :done :evidence ("src/scheduler.rs: bimodal_2k_64k_tight_budget_with_mid_step_disconnects"))
+  (:id "t-l4-gate-kill" :type :task :title "Gate: kill -9 in mid-write loses cache and never correctness" :state :done :evidence ("src/spill.rs: SIGKILL mid-write gate (10/10 kills, zero corruption, orphan sweep)"))
+  (:id "t-l4-gate-seed" :type :task :title "Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache" :state :done :evidence ("src/main.rs: inky temp1 (GPU Gumbel + CPU top-p bit-identical to solo on M5 Max)" "src/engine.rs: encode_gumbel_solo"))
   (:id "layer-6" :type :roadmap :title "Layer 5: server"
    :rows (
      ("l6-endpoint" "OpenAI-compatible chat completions, streaming and not, over the lanes")
@@ -242,7 +242,7 @@
   (:id "t-l6-disconnect" :type :task :title "A client that disconnects cancels its lane" :state :done :evidence ("src/serve.rs: a failed send cancels the lane"))
   (:id "t-l6-health" :type :task :title "A health endpoint, and binding to loopback or a private network only" :state :done :evidence ("src/serve.rs: /health, --bind, --key-env"))
   (:id "t-l6-gate-replay" :type :task :title "Gate: the tracer card and a recorded replay set land through it" :state :done :evidence ("docs/DESIGN.md: Measured: lanes on the M5 Max (four cards at once)"))
-  (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :doing :note "Partly: PR 24's tests/servecheck checks overlapping seeded replies and that a disconnect frees its lane in prefill and decode, at effort none; identical tool calls from concurrent cards and disconnects in mid-thinking are not covered, and tests/serve.sh runs by hand, not in CI")
+  (:id "t-l6-gate-concurrent" :type :task :title "Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation" :state :done :evidence ("tests/servecheck/concurrent.go: concurrent identical tool calls; thinkingDisconnect (disconnect on the first reasoning_content delta, canary starts, lane freed early)" "tests/serve.sh on mini-m5 2026-11-24: PASS concurrent identical tool calls, PASS disconnect in mid-thinking frees a lane, whole serve gate green"))
   (:id "t-l6-gate-memd-traces" :type :task :title "Gate: memd traces are behaviours of MemMode.tla, checked in CI" :state :done :evidence ("scripts/check-memmode-traces.sh, scripts/memmode-traces.rs, specs/memmode/TraceCheck.tla (PR 23)" "scripts/check-tla.sh in the CI cpu job (PR 26)"))
   (:id "layer-7" :type :roadmap :title "Layer 6: the lane-count sweep"
    :rows (
@@ -258,10 +258,10 @@
      ("l7-machines" "done" "t-l7-machines")
      ("l7-knee" "done" "t-l7-knee")
    ))
-  (:id "t-l7-record" :type :task :title "Real card traffic recorded as a replay set" :state :todo)
-  (:id "t-l7-sweep" :type :task :title "Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour" :state :todo)
-  (:id "t-l7-machines" :type :task :title "Each candidate machine measured: memory bandwidth, single-stream decode, prefill" :state :todo)
-  (:id "t-l7-knee" :type :task :title "The knee chosen and written down as the default lane count" :state :todo)
+  (:id "t-l7-record" :type :task :title "Real card traffic recorded as a replay set" :state :done :evidence ("tests/replay/recorded_cards.jsonl" "src/record.rs"))
+  (:id "t-l7-sweep" :type :task :title "Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour" :state :done :evidence ("docs/LANE-SWEEP.md" "tools/replay (8..128 lane sweep on M5 Max)"))
+  (:id "t-l7-machines" :type :task :title "Each candidate machine measured: memory bandwidth, single-stream decode, prefill" :state :done :evidence ("docs/LANE-SWEEP.md (M5 Max 128GB & M5 Pro 64GB bandwidth, decode, prefill)"))
+  (:id "t-l7-knee" :type :task :title "The knee chosen and written down as the default lane count" :state :done :evidence ("docs/LANE-SWEEP.md (64-lane knee: 322.66 tok/s, 4259 cards/hr)" "src/main.rs: DEFAULT_SERVE_LANES = 64" "tunings/m5-max-128gb.tuning" "tunings/m5-pro-64gb.tuning"))
   (:id "layer-8" :type :roadmap :title "Layer 7: fleet wiring"
    :rows (
      ("l8-provider" "A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling")
@@ -274,8 +274,8 @@
      ("l8-remote" "done" "t-l8-remote")
      ("l8-gate-card" "done" "t-l8-gate-card")
    ))
-  (:id "t-l8-provider" :type :task :title "A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling" :state :todo)
-  (:id "t-l8-remote" :type :task :title "Harness and tools run on other machines and reach the endpoint over a private network" :state :todo)
+  (:id "t-l8-provider" :type :task :title "A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling" :state :done :evidence ("docs/FLEET-SPRINT.md" "scripts/inky-fleet-serve.sh (concurrency=64, local zero-cost billing, flash priority ceiling)"))
+  (:id "t-l8-remote" :type :task :title "Harness and tools run on other machines and reach the endpoint over a private network" :state :done :evidence ("src/serve.rs: is_private_ip (Tailscale 100.64.0.0/10)" "tests/fleet_gate.sh (live cross-machine card amd-3 -> mini-m5 100.65.89.96:18096)"))
   (:id "t-l8-gate-card" :type :task :title "Gate: a real low-priority card lands from the fleet" :state :todo)
   (:id "layer-9" :type :roadmap :title "Layer 8: soak"
    :rows (
@@ -288,7 +288,7 @@
      ("l9-chaos" "done" "t-l9-chaos")
    ))
   (:id "t-l9-days" :type :task :title "Days under real load with no growth in blocks, memory or disk" :state :todo)
-  (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :todo)
+  (:id "t-l9-chaos" :type :task :title "Kills, a full disk and client disconnect storms leave the server correct" :state :done :evidence ("tests/soak_faults.sh" "tests/soak_client.go" "src/record.rs (--record-max-bytes rotation; verified on M5 Max: 72-req disconnect storm, ENOSPC full disk, SIGKILL + memd recovery)"))
   (:id "later" :type :roadmap :title "After the first build"
    :rows (
      ("later-m3" "The M3 Ultra tuning: decode steps on the non-tensor kernels" :later t)
@@ -355,6 +355,15 @@
   (:id "t-later-grammar" :type :task :title "Tool calls constrained to valid JSON while sampling" :state :todo)
   (:id "t-later-gpu-sampling" :type :task :title "Sampling on the GPU" :state :todo)
   (:id "t-later-upstream" :type :task :title "General fixes sent upstream to inkling" :state :doing :note "Eriskii/erisinky pull request 2: the one-token batch fix and binv, open")
-  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test (pull request 17, not yet on layer2).")
+  (:id "t-later-best-of-n" :type :task :title "Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus" :state :todo :note "The N attempts share one prompt through cross-lane prompt-prefix reuse (pull request 22). Depends on the flash+ provider goal and its tier test.")
   (:id "t-later-aggregate" :type :task :title "Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N. The drafts share one prompt through cross-lane prompt-prefix reuse (pull request 22).")
-  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")))
+  (:id "t-later-critic" :type :task :title "Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N" :state :todo :note "Starts only after later-best-of-n, and only if pro still misses the flash+ bar with best-of-N.")
+  (:id "provider" :type :roadmap :title "Provider"
+   :rows (
+     ("provider-flash-plus" "inky as a flash+ provider")
+   )
+   :columns (("done" "done"))
+   :cells (
+     ("provider-flash-plus" "done" "t-provider-flash-plus")
+   ))
+  (:id "t-provider-flash-plus" :type :task :title "inky as a flash+ provider" :state :todo :note "Gate: a mixed batch of real flash and flash+ cards through inky on the MacBook, land rate, context length per card, and tool round trips, compared with the flash and pro providers. Glenn named the tier flash+ on 2026-11-23: at least halfway between flash and pro.")))

@@ -1,9 +1,12 @@
 //! Tunings: one machine's settings, matched by chip and memory. Each is a file in tunings/ (compiled in); contributors
 //! add theirs. A machine with no tuning runs on defaults derived from its memory.
 
-pub struct Tuning { pub name: String, pub chip: String, pub memory_gb: u64, pub wired_limit_mb: u64, pub lane_margin_gib: f64 }
+pub struct Tuning { pub name: String, pub chip: String, pub memory_gb: u64, pub wired_limit_mb: u64, pub lane_margin_gib: f64, pub default_lanes: usize }
 
-const FILES: &[&str] = &[include_str!("../tunings/m5-max-128gb.tuning")];
+const FILES: &[&str] = &[
+    include_str!("../tunings/m5-max-128gb.tuning"),
+    include_str!("../tunings/m5-pro-64gb.tuning"),
+];
 
 /// Parse a tuning file: `key = value` lines, `#` comments. Refuses a file missing a key.
 pub fn parse(text: &str) -> Result<Tuning, String> {
@@ -16,8 +19,12 @@ pub fn parse(text: &str) -> Result<Tuning, String> {
     }
     let get = |k: &str| kv.get(k).cloned().ok_or(format!("missing {k}"));
     let num = |k: &str| get(k)?.parse::<f64>().map_err(|e| format!("{k}: {e}"));
+    let default_lanes = match kv.get("default_lanes") {
+        Some(v) => v.parse::<usize>().map_err(|e| format!("default_lanes: {e}"))?,
+        None => 64,
+    };
     Ok(Tuning { name: get("name")?, chip: get("chip")?, memory_gb: num("memory_gb")? as u64, wired_limit_mb: num("wired_limit_mb")? as u64,
-                lane_margin_gib: num("lane_margin_gib")? })
+                lane_margin_gib: num("lane_margin_gib")?, default_lanes })
 }
 
 /// The tuning for a machine with this chip and memory, or the defaults for its memory.
@@ -29,7 +36,7 @@ pub fn select(chip: &str, memory_bytes: u64) -> Tuning {
     }
     // defaults: leave max(8 GB, 10%) for macOS
     let mb = memory_bytes / (1 << 20);
-    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb - (mb / 10).max(8192), lane_margin_gib: 4.0 }
+    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb - (mb / 10).max(8192), lane_margin_gib: 4.0, default_lanes: 64 }
 }
 
 /// This machine's chip name and memory, from sysctl.
@@ -63,7 +70,9 @@ mod tests {
     #[test] fn every_tuning_parses() { for f in FILES { parse(f).unwrap(); } }
     #[test] fn selects_the_macbook_pro() {
         let t = select("Apple M5 Max", 128 << 30);
-        assert_eq!((t.name.as_str(), t.wired_limit_mb), ("m5-max-128gb", 118000));
+        assert_eq!((t.name.as_str(), t.wired_limit_mb, t.default_lanes), ("m5-max-128gb", 118000, 64));
+        let p = select("Apple M5 Pro", 64 << 30);
+        assert_eq!((p.name.as_str(), p.wired_limit_mb, p.default_lanes), ("m5-pro-64gb", 57344, 32));
     }
     #[test] fn defaults_leave_room_for_macos() {
         let t = select("Apple M9", 64 << 30);

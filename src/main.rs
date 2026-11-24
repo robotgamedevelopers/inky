@@ -1,11 +1,21 @@
+mod blocks;
+mod cache_scheduler;
+mod cache_trace;
+#[allow(dead_code)]
+mod blockbook;
 mod engine;
 mod gguf;
+#[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
+mod prefix;
 mod metal;
 mod sampler;
+mod scheduler;
 mod session;
 mod memd;
+mod poolgate;
 mod record;
 mod serve;
+mod spill;
 mod tuning;
 mod tokenizer;
 mod unicode_tables;
@@ -50,20 +60,29 @@ options:
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
   --raw             do not apply the chat template; print special tokens";
 
+const DEFAULT_SERVE_LANES: usize = 64;
+
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
   -c, --ctx N       context per lane (default 65536, maximum 262080, rounded up to a multiple of 64)
   --bind ADDR       listen address (default 127.0.0.1:8090)
   --key-env NAME    use a nonempty key from the named environment variable
+  --api-key-env NAME
+                    alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
-  --lanes N         active inference lanes (default 16)
+  --lanes N         active inference lanes (default 64)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
+  --record-max-bytes N
+                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
+  --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
+  --max-spill-bytes N
+                    maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -73,6 +92,18 @@ fn cli_error(error: String) -> ! {
 
 fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
     value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
+}
+
+fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
+    value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
+}
+
+fn parse_u64_positive(flag: &str, value: &str) -> Result<u64, String> {
+    let v: u64 = value.parse().map_err(|_| format!("{flag} requires a positive integer"))?;
+    if v == 0 {
+        return Err(format!("{flag} must be greater than 0"));
+    }
+    Ok(v)
 }
 
 fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
@@ -89,8 +120,10 @@ fn default_model() -> String {
 
 fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
+        record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
+        spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -105,20 +138,23 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--lanes" => o.lanes = parse_usize(flag, value()?)?,
             "--effort" => o.effort = value()?.into(),
             "-n" => o.max_tokens = parse_usize(flag, value()?)?,
-            "--key-env" => {
+            "--key-env" | "--api-key-env" => {
                 let name = value()?;
                 let key = read_key(name).map_err(|error| match error {
-                    std::env::VarError::NotPresent => format!("--key-env {name}: variable is not set"),
-                    std::env::VarError::NotUnicode(_) => format!("--key-env {name}: variable must contain valid UTF-8"),
+                    std::env::VarError::NotPresent => format!("{flag} {name}: variable is not set"),
+                    std::env::VarError::NotUnicode(_) => format!("{flag} {name}: variable must contain valid UTF-8"),
                 })?;
                 if key.is_empty() || key.trim() != key || key.bytes().any(|b| b.is_ascii_control()) {
-                    return Err(format!("--key-env {name} must contain a nonempty HTTP header value without surrounding whitespace or control characters"));
+                    return Err(format!("{flag} {name} must contain a nonempty HTTP header value without surrounding whitespace or control characters"));
                 }
                 o.key = Some(key);
             }
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
             "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
+            "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
+            "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
+            "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -165,8 +201,18 @@ mod cli_tests {
             (&["--key-env", "EMPTY"], "nonempty HTTP header"),
             (&["--key-env", "BLANK", "--allow-unauthenticated-non-loopback"], "nonempty HTTP header"),
             (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
+            (&["--api-key-env"], "missing value for --api-key-env"),
+            (&["--api-key-env", "ABSENT"], "--api-key-env ABSENT"),
+            (&["--api-key-env", "EMPTY"], "nonempty HTTP header"),
+            (&["--api-key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
             (&["--record-dir"], "missing value for --record-dir"),
+            (&["--record-max-bytes"], "missing value for --record-max-bytes"),
+            (&["--record-max-bytes", "0"], "--record-max-bytes must be greater than 0"),
+            (&["--record-max-bytes", "abc"], "--record-max-bytes requires a positive integer"),
+            (&["--spill-dir"], "missing value for --spill-dir"),
+            (&["--max-spill-bytes"], "missing value for --max-spill-bytes"),
+            (&["--max-spill-bytes", "bad"], "--max-spill-bytes requires a nonnegative integer"),
             (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
             (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
             (&["--typo"], "unknown serve option --typo"),
@@ -179,21 +225,35 @@ mod cli_tests {
 
     #[test]
     fn serve_checks_the_addresses_it_will_bind() {
+        assert_eq!(serve_args(&[]).unwrap().lanes, 64);
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
+        assert_eq!(serve_args(&[]).unwrap().record_max_bytes, record::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
+        assert_eq!(serve_args(&["--record-max-bytes", "4096"]).unwrap().record_max_bytes, 4096);
+        assert_eq!(serve_args(&[]).unwrap().spill_dir, None);
+        assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
+        let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576"]).unwrap();
+        assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
+        assert_eq!(spilled.max_spill_bytes, 1_048_576);
+        assert_eq!(serve_args(&[]).unwrap().effort, "medium");
+        assert_eq!(serve_args(&["--effort", "high"]).unwrap().effort, "high");
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
-        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0"] {
+        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0", "100.117.59.68:18096"] {
             let args = ["--bind", bind];
             assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"));
             let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
             assert_eq!(keyed.bind, [bind.parse::<std::net::SocketAddr>().unwrap()]);
             assert_eq!(keyed.key.as_deref(), Some("configured-key"));
+            let api_keyed = serve_args(&["--bind", bind, "--api-key-env", "PRESENT"]).unwrap();
+            assert_eq!(api_keyed.bind, keyed.bind);
+            assert_eq!(api_keyed.key.as_deref(), Some("configured-key"));
             let unkeyed = serve_args(&["--bind", bind, "--allow-unauthenticated-non-loopback"]).unwrap();
             assert_eq!(unkeyed.bind, keyed.bind);
             assert!(unkeyed.key.is_none());
         }
+        assert!(serve::is_private_ip("100.117.59.68".parse().unwrap()));
     }
 }
 
@@ -831,6 +891,47 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, layer 3's output gate (src/poolgate.rs): lanes run together with every pool slot outside the step poisoned must
+/// give exactly the logits and greedy tokens of layer 2's path, each lane alone. Today the candidate is layer 2 itself,
+/// over each lane's own buffers; the block cache replaces it in `cand` below. INK_POOLGATE_LANES (default 3),
+/// INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position block boundary) and
+/// INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a long one.
+/// INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are poisoned, and the gate must then fail.
+fn poolgate(o: &Opts) {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+    let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
+    let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
+    let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
+    let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
+    let eng = Engine::load(&o.model, o.ctx);
+    let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
+    // the candidate: real Layer 3 BlockPool + BlockTable + PrefixTree over the same engine
+    let cand = poolgate::Layer3Pool::new(&eng, n);
+    let label = cand.candidate_label();
+    println!("poolgate candidate: {label}");
+    let got = poolgate::poisoned(&cand, &w, sabotage);
+    let st = cand.stats();
+    cand.shutdown();
+    if sabotage && !got.sabotaged { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
+    match poolgate::compare(&want, &got) {
+        Ok(lines) => {
+            for l in lines { println!("{l}"); }
+            println!("layer 3 stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, tails_dropped={}",
+                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.tails_dropped);
+            if !sabotage {
+                match poolgate::verify_prefix_start_points(&eng, &base, o.ctx) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); std::process::exit(1); }
+                }
+            }
+            println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs");
+        }
+        Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
+    }
+}
+
 /// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
 /// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
 /// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
@@ -889,6 +990,297 @@ fn xcopy(o: &Opts) {
     if sabotage { println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head); }
     println!("{}", if ok { "xcopy lossless: two tails from one copied head match cold prefill bit for bit" } else { "XCOPY NOT LOSSLESS" });
     if !ok { std::process::exit(1); }
+}
+
+/// dev, Layer 4 gate (`docs/ROADMAP.md:141`): temperature = 1.0 with fixed seeds gives bit-identical
+/// sampled token sequences with prefix caching + multi-lane scheduler batching vs uncached solo execution,
+/// across both GPU Gumbel-max (`top_p = 1.0, top_k = 0`) and CPU top-p (`top_p = 0.95`) sampling paths.
+/// `INK_TEMP1_SABOTAGE=1` is the negative control and must fail with `TEMP1 NOT EQUIVALENT`.
+fn temp1(o: &Opts) {
+    use engine::Span;
+    use scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(4);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    let (head, tail, ndec) = (384usize, 192usize, 24usize);
+    assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
+    let sabotage = std::env::var("INK_TEMP1_SABOTAGE").is_ok();
+
+    let mut rot1 = base.clone();
+    rot1.rotate_left(997);
+    let mut rot2 = base.clone();
+    rot2.rotate_left(1999);
+    // Prompts 0 & 1 share the 384-token prefix `head`; prompt 2 is an independent cold stream.
+    let prompts: Vec<Vec<u32>> = vec![
+        base[..head + tail].to_vec(),
+        {
+            let mut v = base[..head].to_vec();
+            v.extend_from_slice(&rot1[head..head + tail]);
+            v
+        },
+        rot2[..head + tail].to_vec(),
+    ];
+    let seeds = [0x1111_2222_3333_4444u64, 0xCAFE_BABE_DEAD_BEEFu64];
+    let modes: [(&str, f32); 2] = [("gpu-gumbel (temp=1.0, top_p=1.0)", 1.0), ("cpu-sampler (temp=1.0, top_p=0.95)", 0.95)];
+    let mut ok = true;
+
+    for &(mode_name, top_p) in &modes {
+        for &seed in &seeds {
+            // 1. Uncached solo reference for each prompt (fresh lane, spans.len() == 1, poisoned scratch).
+            let mut solo_seqs: Vec<Vec<u32>> = Vec::with_capacity(prompts.len());
+            for (idx, prompt) in prompts.iter().enumerate() {
+                let req_seed = seed.wrapping_add((idx as u64) * 0x9E37_79B9);
+                let l = Lane::new(&eng);
+                let r = eng.on(&l);
+                r.reset();
+                r.reserve(prompt.len() + ndec + 2, false);
+                r.set_tokens(0, prompt);
+                let mut sampler = Sampler::new(1.0, 0, top_p, eng.softcap, req_seed);
+                let mut pos = 0usize;
+                for &chunk in &[128usize, 256, 192] {
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans(&cb, &[Span { lane: &l, p0: pos, t: chunk }], pos + chunk == prompt.len(), false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    pos += chunk;
+                }
+                let first_tok = if sampler.uses_gpu_gumbel() {
+                    let gcb = eng.gpu.cmd();
+                    eng.encode_gumbel_solo(&gcb, &l, pos, req_seed, pos, 1.0, None);
+                    gcb.commit();
+                    gcb.waitUntilCompleted();
+                    r.token_at(pos)
+                } else {
+                    sampler.sample_next(eng.logits()).expect("solo prefill sample")
+                };
+                let mut toks = vec![first_tok];
+                while toks.len() < ndec {
+                    let cur = *toks.last().unwrap();
+                    r.set_tokens(pos, &[cur]);
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_decode(&cb, &[Span { lane: &l, p0: pos, t: 1 }], true, false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    let next_pos = pos + 1;
+                    let tok = if sampler.uses_gpu_gumbel() {
+                        let gcb = eng.gpu.cmd();
+                        eng.encode_gumbel_span(&gcb, 0, &l, next_pos, req_seed, next_pos, 1.0, None);
+                        gcb.commit();
+                        gcb.waitUntilCompleted();
+                        r.token_at(next_pos)
+                    } else {
+                        sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
+                    };
+                    pos = next_pos;
+                    toks.push(tok);
+                }
+                solo_seqs.push(toks);
+            }
+
+            // 2. Prefix-cached + multi-lane scheduler-batched execution via ServeStepPlanner.
+            let src = Lane::new(&eng);
+            {
+                let r = eng.on(&src);
+                r.reset();
+                r.reserve(head + tail + ndec + 2, false);
+                r.set_tokens(0, &prompts[0][..head]);
+                let mut p = 0;
+                for &c in &[128usize, 256] {
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t: c }], false, false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    p += c;
+                }
+            }
+            let cs_head = eng.on(&src).get_cs();
+
+            struct ReqState {
+                lane: Lane,
+                n_past: usize,
+                pf_end: usize,
+                seed: u64,
+                sampler: Sampler,
+                toks: Vec<u32>,
+            }
+            let mut reqs: Vec<ReqState> = prompts
+                .iter()
+                .enumerate()
+                .map(|(idx, prompt)| {
+                    let req_seed = seed.wrapping_add((idx as u64) * 0x9E37_79B9);
+                    let l = Lane::new(&eng);
+                    let r = eng.on(&l);
+                    r.reset();
+                    r.reserve(prompt.len() + ndec + 2, false);
+                    let start = if idx < 2 {
+                        let copy_len = if sabotage && idx == 1 { head - 1 } else { head };
+                        eng.copy_lane_prefix(&src, &l, copy_len);
+                        r.set_cs(&cs_head);
+                        head
+                    } else {
+                        0
+                    };
+                    r.set_tokens(0, prompt);
+                    ReqState {
+                        lane: l,
+                        n_past: start,
+                        pf_end: prompt.len(),
+                        seed: req_seed,
+                        sampler: Sampler::new(1.0, 0, top_p, eng.softcap, req_seed),
+                        toks: Vec::with_capacity(ndec),
+                    }
+                })
+                .collect();
+
+            let mut planner = ServeStepPlanner::new(reqs.len(), 2);
+            for i in 0..reqs.len() {
+                planner.on_admit(i);
+            }
+
+            while reqs.iter().any(|r| r.toks.len() < ndec) {
+                let inputs: Vec<ServeLaneInput> = reqs
+                    .iter()
+                    .map(|r| ServeLaneInput {
+                        runnable: r.toks.len() < ndec,
+                        n_past: r.n_past,
+                        pf_end: r.pf_end,
+                        has_pending_decode: !r.toks.is_empty() && r.n_past < r.pf_end + r.toks.len(),
+                    })
+                    .collect();
+                let plan = planner
+                    .plan_and_begin_step(&inputs, 256, 64)
+                    .expect("temp1 scheduler must make progress");
+                match plan {
+                    ServeStepPlan::Prefill(sp_list) => {
+                        let spans: Vec<Span> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t })
+                            .collect();
+                        let many = spans.len() > 1;
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_spans(&cb, &spans, true, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        let mut gpu_pf = Vec::new();
+                        for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
+                            reqs[i].n_past = p0 + t;
+                            if reqs[i].n_past == reqs[i].pf_end {
+                                if reqs[i].sampler.uses_gpu_gumbel() {
+                                    gpu_pf.push((k, i));
+                                } else {
+                                    let lg = if many { eng.span_logits(k) } else { eng.logits() };
+                                    let tok = reqs[i].sampler.sample_next(lg).expect("batched pf sample");
+                                    reqs[i].toks.push(tok);
+                                }
+                            }
+                        }
+                        if !gpu_pf.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_pf {
+                                let p = reqs[i].n_past;
+                                if many {
+                                    eng.encode_gumbel_span(&gcb, k, &reqs[i].lane, p, reqs[i].seed, p, 1.0, None);
+                                } else {
+                                    eng.encode_gumbel_solo(&gcb, &reqs[i].lane, p, reqs[i].seed, p, 1.0, None);
+                                }
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                            for &(_, i) in &gpu_pf {
+                                let p = reqs[i].n_past;
+                                let tok = eng.on(&reqs[i].lane).token_at(p);
+                                reqs[i].toks.push(tok);
+                            }
+                        }
+                    }
+                    ServeStepPlan::Decode(dec_lanes) => {
+                        for &i in &dec_lanes {
+                            let tok = *reqs[i].toks.last().unwrap();
+                            eng.on(&reqs[i].lane).set_tokens(reqs[i].n_past, &[tok]);
+                        }
+                        let spans: Vec<Span> = dec_lanes
+                            .iter()
+                            .map(|&i| Span { lane: &reqs[i].lane, p0: reqs[i].n_past, t: 1 })
+                            .collect();
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_decode(&cb, &spans, true, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        let gpu_dec: Vec<(usize, usize)> = dec_lanes
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &i)| reqs[i].sampler.uses_gpu_gumbel())
+                            .map(|(k, &i)| (k, i))
+                            .collect();
+                        if !gpu_dec.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_dec {
+                                let next_pos = reqs[i].n_past + 1;
+                                eng.encode_gumbel_span(&gcb, k, &reqs[i].lane, next_pos, reqs[i].seed, next_pos, 1.0, None);
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                        }
+                        for (k, &i) in dec_lanes.iter().enumerate() {
+                            reqs[i].n_past += 1;
+                            let tok = if reqs[i].sampler.uses_gpu_gumbel() {
+                                eng.on(&reqs[i].lane).token_at(reqs[i].n_past)
+                            } else {
+                                reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
+                            };
+                            reqs[i].toks.push(tok);
+                        }
+                    }
+                }
+                let _ = planner.complete_step();
+            }
+
+            let mut seed_ok = true;
+            for (i, (solo, req)) in solo_seqs.iter().zip(&reqs).enumerate() {
+                if solo != &req.toks {
+                    let first_diff = solo.iter().zip(&req.toks).position(|(a, b)| a != b);
+                    println!(
+                        "{mode_name} seed=0x{seed:016x} req {i}: DIFFERS at token {:?} (solo={:?} vs cached={:?})",
+                        first_diff,
+                        first_diff.map(|k| solo[k]),
+                        first_diff.map(|k| req.toks[k])
+                    );
+                    seed_ok = false;
+                }
+            }
+            if seed_ok {
+                println!(
+                    "{mode_name} seed=0x{seed:016x}: 3 lanes x {ndec} tokens (2 prefix-cached + 1 cold) IDENTICAL to uncached solo"
+                );
+            }
+            ok &= seed_ok;
+        }
+    }
+    if sabotage {
+        println!("INK_TEMP1_SABOTAGE: copied {} of {} head tokens on lane 1", head - 1, head);
+    }
+    println!(
+        "{}",
+        if ok {
+            "temp1 equivalent: temperature=1.0 fixed-seed cached+scheduled outputs match uncached solo bit for bit (GPU Gumbel + CPU top-p)"
+        } else {
+            "TEMP1 NOT EQUIVALENT"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev, layer 2's performance gate: decode steps over N lanes at a given context. Each context is prefilled once (the
@@ -1255,8 +1647,8 @@ fn enter_inky_mode() {
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
     match memd::enter(&sock) {
-        Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
-        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
+        Some(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
+        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
     }
 }
 
@@ -1264,6 +1656,14 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
         Some("memd") => { memd::daemon(&raw[2..]); return; }
+        Some("inblock-trace") => {
+            let path = raw.get(2).map(|s| s.as_str()).unwrap_or("specs/InBlockTraceData.tla");
+            if let Err(e) = blocks::write_inblock_trace(path) {
+                eprintln!("inblock-trace: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Some("tune-memory") => { memd::install(&raw[2..]); return; }
         Some("serve") => {
             let args = &raw[2..];
@@ -1300,6 +1700,8 @@ fn main() {
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
+        "poolgate" => poolgate(&o),
+        "temp1" => temp1(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "maxctx" => maxctx(&o),

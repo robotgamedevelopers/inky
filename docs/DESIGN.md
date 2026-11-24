@@ -109,8 +109,10 @@ Tried and reverted: decode-step experts with the decode path's f32 dot products 
 
 A block holds the cache for 64 consecutive positions. Two kinds, because the model has two kinds of attention:
 
-- **window block**: the 40 sliding-window layer passes, 10 MiB.
-- **full block**: the 8 full-attention layer passes, 2 MiB.
+- **window block**: the 40 sliding-window layer passes, 10 MiB at fp16.
+- **full block**: the 8 full-attention layer passes, 2 MiB at fp16.
+
+**Inside a block.** The bytes are `[pass][K|V][head][position in the block][HD]`, each element `kvb` bytes: 2 for the fp16 cache, 1 for `--kv8`. A head's 64 keys are contiguous. At `kvb = 2` those sizes are the 10 MiB and 2 MiB above; at `kvb = 1` each block is half that. The address takes the pass, K or V, and the head. It is not the slot base plus the position times `stride / 64`. That step is position-major across every pass, K, V and head, and for window slot 1 at position 1 it lands on pass 0, V, head 2, position 0.
 
 A block is written by exactly one lane, then sealed, then never written again. Sharing is a reference count; because blocks are append-only there is no copy-on-write. The cache for position p depends only on tokens 0..p, so two requests with the same first N tokens share the same blocks exactly.
 
@@ -146,6 +148,8 @@ Lane states: `Queued -> Admitted -> Restoring -> Ready <-> InStep -> Finished`, 
 Liveness: every admitted lane finishes or is cancelled; every queued request is admitted or refused.
 
 **BlockLayout.** The pool and table arithmetic at capacity 3 or 4: slot reuse with generation counters, the window's sliding over the block list, the table's indexing with 64-bit offsets. One reversed witness per bug class: a reused slot read through a stale entry; a window off by one block; a span of 512 tokens pinning 17 window blocks instead of 25; a start point whose window blocks were released.
+
+**InBlock.** The bytes inside one slot, at 3 heads and 4 positions: `[pass][K|V][head][position][HD]`, with the element width a constant (`kvb` 2, and again at 1). The action walks those coordinates and stores an address by inlining the arithmetic, then records that address. `Ordered` compares it to a formula the action does not call. `Inside` says the row stays in the slot. `NoCollision` says the recorded addresses are unique. `InBlockTrace` is the behaviour `inky inblock-trace` writes from `key_row_at` at those bounds, and CI regenerates it before TLC.
 
 The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
 
