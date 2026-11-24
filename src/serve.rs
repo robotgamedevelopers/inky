@@ -9,10 +9,11 @@
 //! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
-use crate::engine::{Engine, Lane, Span};
+use crate::engine::Engine;
+mod backend;
+use backend::SchedulerEngine;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
-use objc2_metal::MTLCommandBuffer;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,6 +21,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+mod scheduler_trace;
 mod timing;
 use timing::{Counters, RequestTiming};
 
@@ -401,7 +404,7 @@ enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reas
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
 /// `tick` is the scheduler's logical clock (not wall time): a smaller tick was freed longer ago.
-struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
+struct LaneS<L> { lane: L, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
 struct Active {
     job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
     timing: RequestTiming, sampler: Sampler,
@@ -452,23 +455,29 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
     }
 }
 
-/// Copy `src`'s first `n` prefill-written positions into `dst` (the two lanes of one `lanes` slice).
-fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usize) {
-    assert!(src != dst && n > 0);
-    let (s, d) = if src < dst { let (a, b) = lanes.split_at_mut(dst); (&a[src], &mut b[0]) }
-                 else { let (a, b) = lanes.split_at_mut(src); (&b[0], &mut a[dst]) };
-    eng.copy_lane_prefix(&s.lane, &d.lane, n);
-}
-
 fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
 
-fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>, metrics: &Mutex<Counters>) {
-    let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
+/// Observations from the production decision loop. The live server uses the
+/// zero-sized observer; only the seeded test driver materializes trace rows.
+trait Trace {
+    fn boundary(&mut self) {}
+    fn admit(&mut self, _job: u64, _lane: usize, _cached: usize) {}
+    fn step(&mut self, _mode: &str, _spans: impl Iterator<Item = (u64, usize, usize, usize)>) {}
+    fn step_finished(&mut self) {}
+    fn terminal(&mut self, _job: u64, _lane: usize, _reason: &str, _generated: usize) {}
+}
+
+impl Trace for () {}
+
+fn run_scheduler<E: SchedulerEngine, T: Trace>(
+    eng: &E, stop: [u32; 2], nlanes: usize, rx: Receiver<Job>, metrics: &Mutex<Counters>, trace: &mut T,
+) {
+    let mut lanes: Vec<LaneS<E::Lane>> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: eng.new_lane(), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
-    let stop = [tk.eos, sp.end_sampling];
     let mut last_was_prefill = false;
     loop {
+        trace.boundary();
         // take new requests: block only when there is nothing to do
         let busy = lanes.iter().any(|l| l.job.is_some());
         if !busy && queue.is_empty() { match rx.recv() { Ok(j) => queue.push_back(j), Err(_) => return } }
@@ -483,39 +492,24 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let cands: Vec<LaneCand> = lanes.iter().map(|l| LaneCand {
                 prefix: reusable_prefix(&l.prompt, l.cs_at_prompt.is_some(), &j.toks),
                 free: l.job.is_none(),
-                copyable: match &l.job { Some(a) => a.n_past == a.pf_end && !eng.on(&l.lane).tier_on(), None => false },
+                copyable: match &l.job { Some(a) => a.n_past == a.pf_end && !eng.tier_on(&l.lane), None => false },
                 tick: l.tick,
             }).collect();
             let Some(adm) = choose_lane(&cands) else { break };
             let j = queue.pop_front().unwrap();
-            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx {
+            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx() {
                 metrics.lock().unwrap().queued -= 1;
-                let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx)));
+                let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx())));
                 continue;
             }
             let timing = metrics.lock().unwrap().admit(Instant::now(), j.queued_at);
             let i = adm.dst;
             let start = adm.prefix;
-            if start > 0 && adm.src == i {
-                eng.on(&lanes[i].lane).set_cs(lanes[i].cs_at_prompt.as_ref().unwrap());
-            } else if start > 0 {
-                // cross-lane: forget the destination, make room, copy the source's prefill-written prefix,
-                // then put back the source's kept convolution state (its own state at that prompt's end)
-                let cs = lanes[adm.src].cs_at_prompt.clone().unwrap();
-                let run = eng.on(&lanes[i].lane);
-                run.reset();
-                run.reserve(j.toks.len() + j.max + 2, true);
-                copy_prefix(eng, &mut lanes, adm.src, i, start);
-                eng.on(&lanes[i].lane).set_cs(&cs);
-            } else {
-                eng.on(&lanes[i].lane).reset();
-            }
-            let run = eng.on(&lanes[i].lane);
-            run.reserve(j.toks.len() + j.max + 2, true);
-            run.set_tokens(0, &j.toks);
-            let sampler = Sampler::new(j.temp, 64, j.top_p, eng.softcap, j.seed);
+            trace.admit(j.seq, i, start);
+            eng.prepare(&lanes, adm, &j);
+            let sampler = Sampler::new(j.temp, 64, j.top_p, eng.softcap(), j.seed);
             // once per request, not per round and not per emitted token
-            let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap, j.seed);
+            let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap(), j.seed);
             let l = &mut lanes[i];
             l.prompt.clear(); l.cs_at_prompt = None;
             l.job = Some(Active { timing, pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
@@ -525,7 +519,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         let need_dec: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past >= a.pf_end && a.pending.is_some())).collect();
         if !need_pf.is_empty() && (need_dec.is_empty() || !last_was_prefill) {
             last_was_prefill = true;
-            let mut budget = eng.chunk;
+            let mut budget = eng.chunk();
             let mut sp_list: Vec<(usize, usize, usize)> = Vec::new();      // (lane, p0, t)
             for &i in &need_pf {
                 if budget == 0 { break; }
@@ -535,12 +529,11 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 let t = if a.n_past + t < a.pf_end && t > 64 { t - (a.n_past + t) % 64 } else { t };
                 sp_list.push((i, a.n_past, t)); budget -= t;
             }
-            let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
-            let began = Instant::now();
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
-            let elapsed = began.elapsed();
+            trace.step("prefill", sp_list.iter().map(|&(i, p0, t)| (lanes[i].job.as_ref().unwrap().job.seq, i, p0, t)));
+            let elapsed = eng.prefill(&lanes, &sp_list);
+            trace.step_finished();
             metrics.lock().unwrap().input += sp_list.iter().map(|&(_, _, t)| t).sum::<usize>();
-            let many = spans.len() > 1;
+            let many = sp_list.len() > 1;
             for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
                 let l = &mut lanes[i];
                 let a = l.job.as_mut().unwrap();
@@ -548,12 +541,13 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 a.n_past = p0 + t;
                 if a.n_past == a.pf_end {
                     // the prompt is in: keep its state for the next turn, then sample the first token
-                    l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
+                    l.cs_at_prompt = Some(eng.save_state(&l.lane));
                     l.prompt = a.job.toks.clone();
-                    let lg = if many { eng.span_logits(k) } else { eng.logits() };
+                    let lg = eng.result_logits(many.then_some(k));
                     let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
                     a.pending = Some(tok);
                 } else if a.job.out.send(Ev::Alive).is_err() {
+                    trace.terminal(a.job.seq, i, "cancelled", a.gen);
                     // the client went away during its prefill: free the lane now
                     eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed #{} {}", a.n_past, a.pf_end, a.job.seq, a.timing);
                     metrics.lock().unwrap().release(Instant::now());
@@ -562,23 +556,23 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             }
         } else if !need_dec.is_empty() {
             last_was_prefill = false;
-            // feed each lane's pending token at its position
-            for &i in &need_dec { let a = lanes[i].job.as_ref().unwrap(); eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]); }
-            let spans: Vec<Span> = need_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-            let began = Instant::now();
-            let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
-            let elapsed = began.elapsed();
+            trace.step("decode", need_dec.iter().map(|&i| {
+                let a = lanes[i].job.as_ref().unwrap();
+                (a.job.seq, i, a.n_past, 1)
+            }));
+            let elapsed = eng.decode(&lanes, &need_dec);
+            trace.step_finished();
             for (k, &i) in need_dec.iter().enumerate() {
                 let a = lanes[i].job.as_mut().unwrap();
                 a.timing.generation.add(1, elapsed);
                 a.n_past += 1;
-                let lg = eng.span_logits(k);
+                let lg = eng.result_logits(Some(k));
                 a.pending = Some(if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) });
             }
         }
         // emit the tokens just sampled; finish lanes that stopped or whose client went away
         let mut outputs = 0;
-        for l in lanes.iter_mut() {
+        for (i, l) in lanes.iter_mut().enumerate() {
             let Some(a) = l.job.as_mut() else { continue };
             let Some(tok) = a.pending else { continue };
             if a.n_past < a.pf_end { continue; }
@@ -589,8 +583,9 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             a.gen += 1;
             outputs += 1;
             let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
-                         else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
+                         else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx() { Some("length") } else { None };
             if let Some(r) = reason {
+                trace.terminal(a.job.seq, i, r, a.gen);
                 if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed #{} {}", a.gen, a.job.seq, a.timing); }
                 let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r, timing: a.timing.to_string() });
                 metrics.lock().unwrap().release(Instant::now());
@@ -759,6 +754,12 @@ fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
 
+/// Claim one running-or-queued request at arrival, shared by both wire protocols.
+fn try_slot(count: &std::sync::atomic::AtomicUsize, limit: usize) -> Option<InFlight<'_>> {
+    use std::sync::atomic::Ordering::SeqCst;
+    count.fetch_update(SeqCst, SeqCst, |n| if n < limit { Some(n + 1) } else { None }).ok().map(|_| InFlight(count))
+}
+
 fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
     cx.metrics.lock().unwrap().queued += 1;
     cx.jobs.send(job).map_err(|_| { cx.metrics.lock().unwrap().queued -= 1; })
@@ -787,11 +788,10 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     });
     let job = Job { seq, queued_at: Instant::now(), toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
     // admission: one atomic count of requests in flight; beyond the limit, refuse now rather than hold the client
-    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
+    let Some(_inflight) = try_slot(&cx.inflight, cx.limit) else {
         write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"error": {"message": "inky is busy: every lane is taken and the queue is full"}}))?;
         return s.flush();
-    }
-    let _inflight = InFlight(&cx.inflight);
+    };
     if enqueue(cx, job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
@@ -891,11 +891,10 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
         h
     };
     let job = Job { seq, queued_at: Instant::now(), toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
-    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
+    let Some(_inflight) = try_slot(&cx.inflight, cx.limit) else {
         write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"type": "error", "error": {"type": "rate_limit_error", "message": "inky is busy: every lane is taken and the queue is full"}}))?;
         return s.flush();
-    }
-    let _inflight = InFlight(&cx.inflight);
+    };
     if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
@@ -1061,7 +1060,7 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
-    scheduler(&eng, &tk, sp, o.lanes, jrx, &metrics);
+    run_scheduler(&eng, [tk.eos, sp.end_sampling], o.lanes, jrx, &metrics, &mut ());
 }
 
 #[cfg(test)]
