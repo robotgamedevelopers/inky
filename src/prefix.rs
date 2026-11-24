@@ -19,13 +19,18 @@
 //! handles are the pool's and Johnny's interface's business, not this
 //! file's: the matcher is behind the `PrefixMatch` trait so the scheduler
 //! never names the concrete tree, and the block handle is the caller's
-//! type. Nothing here hashes for the pool; it only matches tokens the
-//! caller supplies.
+//! type — `BlockEntry` from `crate::blocks` when the caller installs a
+//! match into a lane table. Nothing here hashes for the pool; it only
+//! matches tokens the caller supplies. The sealed flag on a pool's
+//! `SlotRecord` and the sealed flag on a tree block are the same fact
+//! seen from two sides; the caller seals in both places, this file
+//! cannot seal for the pool.
 
 use std::collections::HashMap;
 
-/// Positions in one sealed block. Johnny's `blocks::BLOCK` when PR 49 v2 lands.
-pub const BLOCK: usize = 64;
+/// Positions in one sealed block: Johnny's constant, re-exported so this
+/// file and `crate::blocks` can never disagree about a block's size.
+pub use crate::blocks::BLOCK;
 
 /// One sealed block in the tree. Ids are assigned by the tree and never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -53,9 +58,15 @@ pub struct StartMatch<B> {
     pub blocks: Vec<B>,
 }
 
+/// The tree whose handles are Johnny's table entries: what a caller gets
+/// back from a match and installs, kind by kind, through `BlockTable::get`'s
+/// counterpart writes. The matcher never constructs an entry; it carries
+/// the caller's.
+pub type EntryTree = PrefixTree<crate::blocks::BlockEntry>;
+
 /// What the scheduler asks of a prefix matcher. The concrete tree in this
 /// file is one implementation; the trait is the seam Rowan asked for while
-/// the block interface (PR 49) is revised.
+/// the block interface (PR 49) was revised.
 pub trait PrefixMatch<B> {
     /// The deepest retained start point whose blocks are an exact prefix
     /// of `tokens`. Never past the last completely matched block, and
@@ -274,6 +285,27 @@ mod tests {
         let a = t.insert(None, 0, &block(1), 10).unwrap();
         assert_eq!(t.insert(Some(a), 0, &block(2), 20), Err(InsertError::WrongPosition { expected: 64, got: 0 }));
         assert!(!t.retain_start(SealedId(7)));
+    }
+
+    #[test]
+    fn entry_handles_come_back_as_johnnys_entries() {
+        use crate::blocks::{BlockEntry, BlockKind, Slot};
+        // the caller seals a block in its pool and hands the tree the
+        // entry for it; a match returns those entries, readable through
+        // Johnny's getters, in root-to-start order
+        let full = BlockEntry::new(Slot::new(3).unwrap(), 1, 4096, BlockKind::Full);
+        let win = BlockEntry::new(Slot::new(5).unwrap(), 2, 8192, BlockKind::Window);
+        let mut t: EntryTree = PrefixTree::new();
+        let a = t.insert(None, 0, &block(1), full).unwrap();
+        let b = t.insert(Some(a), BLOCK, &block(2), win).unwrap();
+        t.retain_start(b);
+        let m = t.deepest_start(&[block(1), block(2), block(3)].concat());
+        assert_eq!(m.at, 2 * BLOCK);
+        assert_eq!(m.blocks, vec![full, win]);
+        assert_eq!(m.blocks[0].kind(), BlockKind::Full);
+        assert_eq!(m.blocks[0].offset(), 4096);
+        assert_eq!(m.blocks[0].slot().get(), 3);
+        assert_eq!(m.blocks[1].generation(), 2);
     }
 
     #[test]
