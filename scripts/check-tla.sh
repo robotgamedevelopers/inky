@@ -152,3 +152,5 @@ bash "$root/scripts/check-memmode-traces.sh"
 bash "$root/scripts/check-blockbook-traces.sh"
 [ -f "$root/scripts/check-cache-traces.sh" ] || { echo 'cache trace checker missing' >&2; exit 1; }
 bash "$root/scripts/check-cache-traces.sh"
+[ -f "$root/scripts/check-scheduler-traces.sh" ] || { echo 'scheduler trace checker missing' >&2; exit 1; }
+bash "$root/scripts/check-scheduler-traces.sh"

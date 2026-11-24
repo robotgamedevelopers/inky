@@ -689,14 +689,8 @@ impl Engine {
         let off = b.lg as usize + i * self.vocab_pad();
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
-    /// GPU Gumbel-max sampling for a batch span's logits row (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky):
-    /// transforms logits in-place with softcap + Gumbel noise (and optional `ban_tok` mask) and writes the drawn
-    /// token ID into `lane.toks[out_index]`.
-    pub fn encode_gumbel_span(&self, cb: &CmdBuf, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
-        let b = self.ba.get();
-        assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
-        assert!(out_index * 4 < lane.toks.length(), "encode_gumbel_span: out_index {out_index} out of bounds");
-        let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
+    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+        assert!(out_index * 4 < lane.toks.length(), "encode_gumbel: out_index {out_index} out of bounds");
         let sa = SampArgs {
             logits_off,
             n: self.n_vocab as u32,
@@ -716,6 +710,21 @@ impl Engine {
         self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
         self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
         e.end();
+    }
+    /// GPU Gumbel-max sampling for a batch span's logits row (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky):
+    /// transforms logits in-place with softcap + Gumbel noise (and optional `ban_tok` mask) and writes the drawn
+    /// token ID into `lane.toks[out_index]`.
+    pub fn encode_gumbel_span(&self, cb: &CmdBuf, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+        let b = self.ba.get();
+        assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
+        let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
+        self.encode_gumbel_at(cb, logits_off, lane, out_index, seed, pos, temp, ban_tok);
+    }
+    /// GPU Gumbel-max sampling for a single-span prefill whose logits live in `ar.logits`.
+    /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
+    /// the exact same RNG/sampling kernel for bit-identical `temperature = 1.0` equivalence.
+    pub fn encode_gumbel_solo(&self, cb: &CmdBuf, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+        self.encode_gumbel_at(cb, self.ar.logits, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
