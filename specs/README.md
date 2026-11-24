@@ -136,6 +136,62 @@ The ordered keys represent logical position and mask membership. SIMD lane
 assignment, floating-point operations and Metal execution require the kernel's
 bitwise tests. Block allocation and lifetime are checked in their own models.
 
+## Start points and unsealed tails
+
+`StartTails` checks the bookkeeping in `src/blockbook.rs`: which blocks a start
+point holds, when start points are kept and dropped, what attention may read of a
+tail, and zeroing on reuse. As in `src/blocks.rs`, each kind has its own pool of
+1-based slots, and a slot record holds a generation, a length and a sealed flag.
+Reference counts are derived from the tables, never stored. The step in flight and
+its pins stay in `BlockLayout`; tiers, budgets and the scheduler stay in
+`CacheScheduler`. Its start-point record (state, full blocks, window blocks of a
+boundary) is the same record as `CacheScheduler.startPoints`.
+
+- A **start point** at boundary `n` holds the recurrent state at `n`, every full
+  block before `n` and the window blocks of `History(n)`, each as a reference on
+  its slot. Pruning the lane's window drops only the lane's reference.
+- A **step** writes its positions through the lane's table, seals what it filled,
+  prunes the window to `History`, and, when it ends a prefill on a block boundary,
+  keeps a start point. The point's reasons are `head`, `prompt` at the prompt's
+  last block boundary, and `every` at every `Every`-th block (16 in production).
+  A lane has one head: the previous head loses that reason first, and a point left
+  without one is dropped. `Finish` drops the head reason, so prompt and every
+  points outlive the request. Decode never keeps a point (decision 4).
+- **Tails** are allocated a block at a time, full and window together, each in
+  the lowest usable slot of its pool, at the next generation, zeroed. Neither is
+  taken unless both can be. A tail is referenced by its lane alone, is never in a
+  start point, and is free once its lane finishes. Attention reads block `b` of a
+  lane at `n` only up to `Seen(n, b)`.
+
+Bounds: two lanes, **two slots per kind** in CI (four in all) and three per kind
+nightly, blocks and windows of 2 positions, maximum position 4, spans up to 2,
+start points every 2 blocks, one start-point id (a new head can reuse its
+predecessor's id) and 2 generations per slot.
+
+| Configuration | Expected failure | Counterexample |
+| --- | --- | --- |
+| `UnheldWindow` | `StartRetained` | A start point holds only its full blocks. Lane 1 keeps a prompt point at 2 and finishes; lane 0 takes window slot 1 at generation 2 while the point still holds generation 1. |
+| `PrunedUnderStart` | `StartRetained` | Pruning releases a window slot outright. Lane 1 keeps a prompt point at 2, steps to 4 and prunes window block 0; lane 0 takes that slot at generation 2 under the live point. |
+| `TailOverread` | `ReadsWritten` | Attention reads one position past the lane: block 0 just allocated at position 0, read length 1, written length 0. |
+| `ReuseNotZeroed` | `TailPrivateZero` | Lane 0 writes position 0 and finishes; the next request takes the same slot at generation 2 with length 0 and position 0 still set. |
+
+**Binding the code.** `scripts/check-blockbook-traces.sh` compiles
+`scripts/blockbook-traces.rs` with the production `src/blocks.rs` and
+`src/blockbook.rs` (rustc only, no Cargo or Metal). Twenty deterministic random
+walks of 90 operations drive three lanes over five slots per kind, with a fake GPU
+side that writes through the lane's table, zeroes on `zero` and records kept
+states. Each call is one recorded state. `StartTailsTrace` replays them: the first
+state must be `Init` and each call must be a `StartTails` step or change nothing
+(`Conforms`), with every model invariant, plus `RefsMatch` (each slot record's
+count equals its lane and start-point referrers), `ReadsMatch` (each read the
+code reports equals `Visible`) and `StatesMatch` (each kept state belongs to a
+live point). The walks must reach every witnessed case (a resumed lane, a reused
+slot, a window pruned under a live point, a partial tail read, a retired point,
+a finished tail, prompt and every points, a full pool) or the check fails. Six
+one-line mutations of `src/blockbook.rs` must each be rejected by TLC:
+`unheld-window` and `pruned-under-start` (a), `overread` (b), `no-zero` (c),
+`kept-tail` and `every-off`.
+
 ## Serve scheduler traces
 
 On a Mac with the Rust toolchain, write one deterministic trace from the serve

@@ -176,6 +176,17 @@ impl SlotRecord {
         self.refs = self.refs.checked_sub(1).ok_or(BlockError::Refs)?;
         Ok(())
     }
+
+    /// Hand an unreferenced slot out again: the next generation, nothing written,
+    /// unsealed. Its payload must be zeroed before the new owner's step (blockbook.rs).
+    /// Refused while anything still references the slot.
+    pub fn reissue(&mut self) -> Result<(), BlockError> {
+        if self.refs != 0 { return Err(BlockError::Refs); }
+        self.bump_generation()?;
+        self.length = 0;
+        self.sealed = false;
+        Ok(())
+    }
 }
 
 /// One table entry. The kind is on the entry, not implied by a packed index alone.
@@ -220,6 +231,30 @@ impl BlockPool {
         let _ = self.record(slot)?;
         byte_offset(self.kind, slot)
     }
+
+    pub fn record_mut(&mut self, slot: Slot) -> Result<&mut SlotRecord, BlockError> {
+        let i = slot.pool_index().get() as usize;
+        self.slots.get_mut(i).ok_or(BlockError::OutOfRange)
+    }
+
+    /// The lowest slot nothing references whose generation can still advance.
+    pub fn lowest_free(&self) -> Option<Slot> {
+        let i = self.slots.iter().position(|r| r.refs == 0 && r.generation < u32::MAX)?;
+        Slot::new(u32::try_from(i + 1).ok()?).ok()
+    }
+}
+
+impl BlockPools {
+    /// Both pools with `n_slots` each.
+    pub fn new(n_slots: usize) -> BlockPools {
+        BlockPools { window: BlockPool::new(BlockKind::Window, n_slots), full: BlockPool::new(BlockKind::Full, n_slots) }
+    }
+    pub fn of(&self, kind: BlockKind) -> &BlockPool {
+        match kind { BlockKind::Window => &self.window, BlockKind::Full => &self.full }
+    }
+    pub fn of_mut(&mut self, kind: BlockKind) -> &mut BlockPool {
+        match kind { BlockKind::Window => &mut self.window, BlockKind::Full => &mut self.full }
+    }
 }
 
 /// Both pools. One per kind, so their offsets are not in one address space.
@@ -255,6 +290,23 @@ impl BlockTable {
     pub fn get(&self, kind: BlockKind, block: BlockIndex) -> Result<Option<BlockEntry>, BlockError> {
         let i = table_index(kind, block, self.blocks_per_kind)? as usize;
         Ok(self.entries.get(i).copied().flatten())
+    }
+
+    pub fn blocks_per_kind(&self) -> u32 { self.blocks_per_kind }
+
+    /// Set or clear the entry for `(kind, block)`. An entry of the other kind is refused.
+    pub fn set(&mut self, kind: BlockKind, block: BlockIndex, entry: Option<BlockEntry>) -> Result<(), BlockError> {
+        if entry.is_some_and(|e| e.kind() != kind) { return Err(BlockError::OutOfRange); }
+        let i = table_index(kind, block, self.blocks_per_kind)? as usize;
+        let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
+        *cell = entry;
+        Ok(())
+    }
+
+    /// Every present entry with its block, full before window within a block,
+    /// blocks ascending.
+    pub fn entries(&self) -> impl Iterator<Item = (BlockIndex, BlockEntry)> + '_ {
+        self.entries.iter().enumerate().filter_map(|(i, e)| e.map(|e| (BlockIndex::new((i / 2) as u32), e)))
     }
 }
 
@@ -352,5 +404,41 @@ mod tests {
         assert_eq!(entry.offset(), 0);
         assert_eq!(entry.generation(), 1);
         assert_eq!(entry.slot().get(), 1);
+    }
+
+    #[test]
+    fn reissue_waits_for_the_last_reference_and_resets_the_slot() {
+        let mut r = SlotRecord::fresh(BlockKind::Window);
+        r.reissue().unwrap();
+        r.set_length(64).unwrap();
+        r.seal();
+        r.add_ref().unwrap();
+        assert_eq!(r.reissue(), Err(BlockError::Refs));
+        assert_eq!((r.generation(), r.length(), r.sealed()), (1, 64, true));
+        r.drop_ref().unwrap();
+        r.reissue().unwrap();
+        assert_eq!((r.generation(), r.length(), r.sealed(), r.refs()), (2, 0, false, 0));
+        let mut last = SlotRecord::at_generation(BlockKind::Full, u32::MAX);
+        assert_eq!(last.reissue(), Err(BlockError::Generation));
+    }
+
+    #[test]
+    fn lowest_free_skips_referenced_and_exhausted_slots_and_set_checks_kind() {
+        let mut pools = BlockPools::new(3);
+        let one = Slot::new(1).unwrap();
+        pools.of_mut(BlockKind::Full).record_mut(one).unwrap().add_ref().unwrap();
+        pools.full.slots[1] = SlotRecord::at_generation(BlockKind::Full, u32::MAX);
+        assert_eq!(pools.of(BlockKind::Full).lowest_free(), Some(Slot::new(3).unwrap()));
+        assert_eq!(pools.of(BlockKind::Window).lowest_free(), Some(one));
+        assert_eq!(BlockPool::new(BlockKind::Full, 0).lowest_free(), None);
+        let mut t = BlockTable::new(2).unwrap();
+        let e = BlockEntry::new(one, 1, 0, BlockKind::Full);
+        assert_eq!(t.set(BlockKind::Window, BlockIndex::new(0), Some(e)), Err(BlockError::OutOfRange));
+        assert_eq!(t.set(BlockKind::Full, BlockIndex::new(2), Some(e)), Err(BlockError::OutOfRange));
+        t.set(BlockKind::Full, BlockIndex::new(1), Some(e)).unwrap();
+        assert_eq!(t.entries().map(|(b, e)| (b.get(), e.kind())).collect::<Vec<_>>(), vec![(1, BlockKind::Full)]);
+        t.set(BlockKind::Full, BlockIndex::new(1), None).unwrap();
+        assert_eq!(t.entries().count(), 0);
+        assert_eq!(t.blocks_per_kind(), 2);
     }
 }

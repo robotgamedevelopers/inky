@@ -1,4 +1,6 @@
 mod blocks;
+#[allow(dead_code)]
+mod blockbook;
 mod engine;
 mod gguf;
 mod metal;

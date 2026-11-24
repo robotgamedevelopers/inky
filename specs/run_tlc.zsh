@@ -69,3 +69,12 @@ check DonorWindow GroupedLayout VisitedKeys
 check TilePartial GroupedLayout OrderedPartials
 check Restage GroupedLayout StagedOnce
 check StalledTraversal GroupedLayout TraversalCompletes temporal
+check StartTails2 StartTails
+check UnheldWindow StartTails StartRetained
+check PrunedUnderStart StartTails StartRetained
+check TailOverread StartTails ReadsWritten
+check ReuseNotZeroed StartTails TailPrivateZero
+# Three slots per kind takes about a minute on one worker: nightly, not per push.
+if [[ -n ${TLC_NIGHTLY:-} ]]; then
+    check StartTails3 StartTails
+fi
