@@ -194,8 +194,10 @@ TreeClosed ==
 \* Only sealed blocks are ever held as start points.
 StartsSealed == \A s \in BlockSeqs : starts[s] > 0 => s \in sealed
 
-\* The tree holds exactly one ref per sealed block, and none for the rest.
-RefsHeld == \A s \in BlockSeqs : refs[s] = (IF s \in sealed THEN 1 ELSE 0)
+\* The tree holds exactly one ref per sealed block, and none for the
+\* rest. Position 0 is in `sealed` as the root of every chain and is
+\* not a block: it holds no ref.
+RefsHeld == \A s \in BlockSeqs : refs[s] = (IF s \in sealed \ {<<>>} THEN 1 ELSE 0)
 
 \* The result is a held start point (or position 0).
 ResultIsStart == sought => result \in Held \cup {<<>>}
