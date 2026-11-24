@@ -9,14 +9,17 @@ TLC traversal order.
 
 | Run | Generated states | Distinct states | Wall seconds | Result |
 | --- | ---: | ---: | ---: | --- |
-| BlockLayout3 | 13,049 | 6,668 | 1.299 | PASS |
-| BlockLayout4 | 144,089 | 64,418 | 5.013 | PASS |
-| StaleEntry | 985 | 703 | 1.096 | GenerationMatches violated |
-| WindowOffByOne | 18,393 | 10,576 | 1.765 | WindowCovered violated |
-| SpanTooSmall | 124 | 85 | 0.916 | SpanPinned violated |
-| StartReleased | 2,284 | 1,629 | 1.072 | StartRetained violated |
-| SpanPins512 | 66 | 65 | 0.825 | PASS |
-| SpanPins17 | 2 | 2 | 0.755 | Covered violated |
+| BlockLayout3 | 2,879 | 1,612 | 0.661 | PASS |
+| BlockLayout4 | 30,908 | 15,182 | 1.730 | PASS |
+| BlockLayoutHigh | 30,908 | 15,182 | 1.709 | PASS |
+| BlockLayoutKv8 | 2,879 | 1,612 | 0.551 | PASS |
+| StaleEntry | 423 | 248 | 0.444 | GenerationMatches violated |
+| WindowOffByOne | 4,955 | 2,552 | 0.721 | WindowCovered violated |
+| SpanTooSmall | 116 | 67 | 0.381 | SpanPinned violated |
+| StartReleased | 795 | 492 | 0.482 | StartRetained violated |
+| Truncate32 | 8 | 8 | 0.368 | Address64 violated |
+| SpanPins512 | 66 | 65 | 0.300 | PASS |
+| SpanPins17 | 2 | 2 | 0.271 | Covered violated |
 
 Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
 and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
@@ -141,3 +144,16 @@ Inspected counterexamples, each checked against `poison_plan` by hand:
   poisoned, not saved, and still poison after the restore.
 - **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
   the next step leaves the free slot 1 unpoisoned.
+
+## BlockLayout and CacheScheduler trace conformance
+
+`scripts/check-cache-traces.sh` (CI, CPU-only via `rustc` + pinned `tla2tools.jar` v1.8.0):
+replays 16 seeded walks per configuration (`bl_base0`, `bl_high_fp16` above 4 GiB at `kvb=2`,
+`bl_high_kv8` above 4 GiB at `kvb=1`, and `cs` at `MaxQueue=2`) into generated `TraceData.tla` /
+`TraceCheck.tla` bundles (`395` distinct states per `BlockLayout` bundle with `max_gen=2`,
+start-point steps and dual-slot coverage; `2,445` distinct states for `CacheScheduler` covering
+`admit_bypass=91`, `step_bypass=20`, `cancel=18`, `refuse429=331`) and checks all four bundles
+plus seven single-line production mutations (`trunc-real-byte-offset`, `off1-byte-offset`,
+`reissue-gen-reset`, `stale-finish`, `admit-wait-dropped`, `step-bypass-dropped`,
+`priv-tail-dirty`) in parallel, requiring every mutation to fail inside TLC with an invariant or
+action counterexample.

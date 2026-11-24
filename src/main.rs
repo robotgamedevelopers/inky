@@ -1,4 +1,6 @@
 mod blocks;
+mod cache_scheduler;
+mod cache_trace;
 #[allow(dead_code)]
 mod blockbook;
 mod engine;

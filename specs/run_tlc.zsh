@@ -74,10 +74,13 @@ check() {
 print "run | generated | distinct | wall seconds | result"
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
+check BlockLayoutHigh BlockLayout
+check BlockLayoutKv8 BlockLayout
 check StaleEntry BlockLayout GenerationMatches
 check WindowOffByOne BlockLayout WindowCovered
 check SpanTooSmall BlockLayout SpanPinned
 check StartReleased BlockLayout StartRetained
+check Truncate32 BlockLayout Address64
 check SpanPins512 SpanPins
 check SpanPins17 SpanPins Covered
 check GroupedLayout3 GroupedLayout

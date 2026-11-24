@@ -30,9 +30,13 @@ run_trace() {
 check_mutant() {
     local name=$1 old=$2 new=$3 dir=$work/$1 src status
     mkdir "$dir"
-    src=$(<"$original")
-    [[ $(grep -cF -- "$old" "$original") = 1 ]] || { echo "ERROR: $name target is not one line of src/blockbook.rs" >&2; return 1; }
-    printf '%s\n' "${src/"$old"/"$new"}" > "$dir/blockbook.rs"
+    python3 -c 'import pathlib, sys
+orig, dst, old, new = sys.argv[1:5]
+s = pathlib.Path(orig).read_text()
+if s.count(old) != 1:
+    sys.exit(1)
+pathlib.Path(dst).write_text(s.replace(old, new, 1))
+' "$original" "$dir/blockbook.rs" "$old" "$new" || { echo "ERROR: $name target is not one line of src/blockbook.rs" >&2; return 1; }
     if cmp -s "$dir/blockbook.rs" "$original"; then echo "ERROR: $name changed nothing" >&2; return 1; fi
     if run_trace "$dir"; then echo "ERROR: $name passed trace checking" >&2; return 1; else status=$?; fi
     if [[ $status != 12 && $status != 13 ]] || ! grep -Eq 'Action property .* is violated|Temporal properties were violated|Invariant .* is violated' "$dir/tlc.log"; then
