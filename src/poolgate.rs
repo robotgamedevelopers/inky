@@ -4,26 +4,31 @@
 //! The reference is layer 2's path, each lane alone, nothing poisoned. The candidate runs the same lanes together in
 //! steps, as serve does (one step of prefill spans, then one decode step), and before each step every pool slot that no
 //! lane in that step references is overwritten with poison: NaN and fp16-max words. Slots that a live lane outside the
-//! step owns are saved first and put back after the step, so the poison reaches everything the step should not read
-//! and destroys nothing a later step needs. Every step's logits and every greedy token must be bit-identical to the
-//! reference.
+//! step references are saved first and put back after the step, so the poison reaches everything the step should not
+//! read and destroys nothing a later step needs. Free slots stay poisoned: the pool must zero a slot when it hands it
+//! out. Every step's logits and every greedy token must be bit-identical to the reference.
 //!
-//! What plugs in where:
-//!  - `StepPath` is a way to run lanes: create, step prefill spans, step decode spans, read logits, end. `Layer2` is
-//!    today's per-lane caches; the block cache implements it as the candidate.
-//!  - `PoisonPool` is the pool as the gate sees it: how many slots, which slots a lane's block table references, and
-//!    each slot's bytes. The block cache implements it over its pool of GPU buffers. `Layer2` implements it over each
-//!    lane's own buffers (three slots per lane), so the gate runs today and checks lane isolation with the other lanes'
+//! What plugs in where (src/blocks.rs types):
+//!  - `StepPath`: create a lane, step prefill spans, step decode spans, read logits, end a lane. `Layer2` is today's
+//!    per-lane caches; the block cache implements it as the candidate, over `Engine::block_pool` and
+//!    `Lane::block_table`.
+//!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
+//!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
+//!    `slot_region(base, len, kind, slot)` over that kind's GPU buffer. `Layer2` implements it with lane k's window
+//!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
-//!  - `run` takes the reference and the candidate; `gate` in main.rs today passes `Layer2` as both.
+//!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
 //!
-//! The slot arithmetic (`poison_plan`) is modelled in specs/PoisonGate.tla.
+//! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
+use crate::blocks::{byte_offset, BlockIndex, BlockKind, BlockTable, Slot};
 use crate::engine::{Engine, Lane, Span};
 use objc2_metal::MTLCommandBuffer;
 use std::cell::RefCell;
 
 /// A lane's handle, chosen by the path that made it.
 pub type LaneId = usize;
+
+pub const KINDS: [BlockKind; 2] = [BlockKind::Window, BlockKind::Full];
 
 /// A way to run lanes through steps. Logits are read after the step that wrote them, before the next one.
 pub trait StepPath {
@@ -41,41 +46,66 @@ pub trait StepPath {
     fn end_lane(&self, lane: LaneId);
 }
 
-/// The pool, as the poison gate sees it. Slots are numbered 0..slot_count(); a pool whose own slot numbers start at 1
-/// maps slot s to s - 1. Nothing is in flight on the GPU while the gate calls these.
+/// Both pools, as the poison gate sees them. Nothing is in flight on the GPU while the gate calls these.
 pub trait PoisonPool {
-    fn slot_count(&self) -> usize;
-    /// Every slot the lane's block table references now: sealed shared blocks, window blocks, its unsealed tail.
-    fn lane_slots(&self, lane: LaneId) -> Vec<usize>;
+    /// Slots in `kind`'s pool: 1..=slot_count(kind).
+    fn slot_count(&self, kind: BlockKind) -> usize;
+    /// Every slot the lane's block table references now, of both kinds: sealed shared blocks, window blocks, its
+    /// unsealed tail. Duplicates are allowed.
+    fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)>;
     /// The slot's bytes, CPU-visible. None for a slot that has no memory now (a layer-2 lane that ended).
-    fn slot_bytes(&self, slot: usize) -> Option<(*mut u8, usize)>;
+    fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)>;
 }
 
 /// The candidate is a path with a pool.
 pub trait Candidate: StepPath + PoisonPool {}
 impl<T: StepPath + PoisonPool> Candidate for T {}
 
-/// What to do to the pool before one step.
+/// Every (kind, slot) a block table holds an entry for. Walks each kind's rows until the table says out of range.
+#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no table
+pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
+    let mut v = Vec::new();
+    for kind in KINDS {
+        let mut b = 0u32;
+        while let Ok(e) = t.get(kind, BlockIndex::new(b)) {
+            if let Some(e) = e { assert_eq!(e.kind(), kind, "table row of kind {kind:?} holds a {:?} entry", e.kind()); v.push((kind, e.slot())); }
+            b += 1;
+        }
+    }
+    v
+}
+
+/// The bytes of `slot` in a kind's pool buffer at `base` of `len` bytes: `kind.stride()` bytes at `byte_offset`.
+/// None when the slot does not fit in the buffer.
+#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
+pub fn slot_region(base: *mut u8, len: usize, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
+    let off = byte_offset(kind, slot).ok()?;
+    let end = off.checked_add(kind.stride())?;
+    if end > len as u64 { return None; }
+    Some((unsafe { base.add(off as usize) }, kind.stride() as usize))
+}
+
+/// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// slots to overwrite with poison, ascending
+    /// pool indices to overwrite with poison, ascending
     pub poison: Vec<usize>,
-    /// the poisoned slots a live lane owns: saved before the poison, put back after the step, ascending
+    /// the poisoned indices a live lane references: saved before the poison, put back after the step, ascending
     pub save: Vec<usize>,
 }
 
-/// Which slots to poison and which to save, for one step. `tables[i]` is live lane i's slots; `stepping` lists the
-/// live lanes in the step. A slot is protected when any stepping lane references it (shared slots included); every
-/// other slot is poisoned, free or not; a poisoned slot some live lane references is saved. `guard = false` is the
-/// reversed witness: it drops the protection of the first stepping lane, so that lane reads poison and the gate must
-/// fail (specs/PoisonGate.tla, Bug = "unguarded").
+/// Which slots of one kind's pool to poison and which to save, for one step. `tables[i]` is live lane i's pool indices
+/// of that kind; `stepping` lists the live lanes in the step. A slot is protected when any stepping lane references it
+/// (shared slots included); every other slot is poisoned, free or not; a poisoned slot some live lane references is
+/// saved. `guard = false` is the reversed witness: it drops the protection of the first stepping lane, so that lane
+/// reads poison and the gate must fail (specs/PoisonGate.tla, Bug = "unguarded").
 pub fn poison_plan(n_slots: usize, tables: &[Vec<usize>], stepping: &[usize], guard: bool) -> Plan {
     let mut protect = vec![false; n_slots];
     let mut owned = vec![false; n_slots];
     for (i, t) in tables.iter().enumerate() {
         let steps = stepping.contains(&i) && (guard || Some(&i) != stepping.first());
         for &s in t {
-            assert!(s < n_slots, "lane {i} references slot {s} of a pool of {n_slots}");
+            assert!(s < n_slots, "lane {i} references pool index {s} of a pool of {n_slots}");
             owned[s] = true;
             if steps { protect[s] = true; }
         }
@@ -94,25 +124,38 @@ pub fn poison_bytes(b: &mut [u8]) {
     for x in &mut b[tail..] { *x = 0x7f; }
 }
 
-/// Apply a plan: save, then poison. Returns the saved bytes, for `restore`.
-fn apply(pool: &dyn PoisonPool, plan: &Plan) -> Vec<(usize, Vec<u8>)> {
-    let mut saved = Vec::with_capacity(plan.save.len());
-    for &s in &plan.save {
-        if let Some((p, n)) = pool.slot_bytes(s) { saved.push((s, unsafe { std::slice::from_raw_parts(p, n) }.to_vec())); }
-    }
-    for &s in &plan.poison {
-        if let Some((p, n)) = pool.slot_bytes(s) { poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, n) }); }
+fn slot_at(i: usize) -> Slot { Slot::new(u32::try_from(i + 1).expect("pool index fits a slot")).unwrap() }
+
+/// Both kinds' plans for one step. `tables[i]` is live lane i's (kind, slot) list.
+pub fn plans(pool: &dyn PoisonPool, tables: &[Vec<(BlockKind, Slot)>], stepping: &[usize], guard: bool) -> Vec<(BlockKind, Plan)> {
+    KINDS.iter().map(|&kind| {
+        let per: Vec<Vec<usize>> = tables.iter().map(|t| t.iter().filter(|(k, _)| *k == kind).map(|(_, s)| s.pool_index().get() as usize).collect()).collect();
+        (kind, poison_plan(pool.slot_count(kind), &per, stepping, guard))
+    }).collect()
+}
+
+/// Apply the plans: save, then poison. Returns the saved bytes, for `restore`.
+fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> Vec<(BlockKind, Slot, Vec<u8>)> {
+    let mut saved = Vec::new();
+    for (kind, plan) in plans {
+        for &i in &plan.save {
+            if let Some((p, n)) = pool.slot_bytes(*kind, slot_at(i)) { saved.push((*kind, slot_at(i), unsafe { std::slice::from_raw_parts(p, n) }.to_vec())); }
+        }
+        for &i in &plan.poison {
+            if let Some((p, n)) = pool.slot_bytes(*kind, slot_at(i)) { poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, n) }); }
+        }
     }
     saved
 }
 
-fn restore(pool: &dyn PoisonPool, saved: Vec<(usize, Vec<u8>)>) {
-    for (s, v) in saved {
-        let (p, n) = pool.slot_bytes(s).expect("a saved slot lost its memory during the step");
-        assert_eq!(n, v.len(), "slot {s} changed size during the step");
+fn restore(pool: &dyn PoisonPool, saved: Vec<(BlockKind, Slot, Vec<u8>)>) {
+    for (kind, s, v) in saved {
+        let (p, n) = pool.slot_bytes(kind, s).expect("a saved slot lost its memory during the step");
+        assert_eq!(n, v.len(), "{kind:?} slot {} changed size during the step", s.get());
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), p, n); }
     }
 }
+
 
 /// The lanes to run: each a prompt, prefilled in `chunks`, then `decode` greedy steps.
 pub struct Workload { pub prompts: Vec<Vec<u32>>, pub chunks: Vec<usize>, pub decode: usize }
@@ -184,13 +227,13 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             let who: Vec<usize> = (0..n).filter(|&i| lane[i].is_some() && next[i] < work.len() && work[next[i]].2 == dec).collect();
             if who.is_empty() { continue; }
             let live: Vec<usize> = (0..n).filter(|&i| lane[i].is_some()).collect();
-            let tables: Vec<Vec<usize>> = live.iter().map(|&i| cand.lane_slots(lane[i].unwrap())).collect();
+            let tables: Vec<Vec<(BlockKind, Slot)>> = live.iter().map(|&i| cand.lane_slots(lane[i].unwrap())).collect();
             let stepping: Vec<usize> = who.iter().map(|i| live.iter().position(|j| j == i).unwrap()).collect();
             let unguard = sabotage && !sabotaged && work[next[who[0]]].0 > 0;
             if unguard { sabotaged = true; println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0); }
-            let plan = poison_plan(cand.slot_count(), &tables, &stepping, !unguard);
-            poisoned += plan.poison.len(); saved_n += plan.save.len();
-            let saved = apply(cand, &plan);
+            let ps = plans(cand, &tables, &stepping, !unguard);
+            for (_, p) in &ps { poisoned += p.poison.len(); saved_n += p.save.len(); }
+            let saved = apply(cand, &ps);
             if dec { cand.decode(&who.iter().map(|&i| (lane[i].unwrap(), work[next[i]].0)).collect::<Vec<_>>()); }
             else { cand.prefill(&who.iter().map(|&i| { let (p0, t, _) = work[next[i]]; (lane[i].unwrap(), p0, t) }).collect::<Vec<_>>()); }
             restore(cand, saved);
@@ -221,8 +264,8 @@ pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>
     if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored): every step's logits and every token identical", want.len(), got.steps, got.poisoned, got.saved)]) } else { Err(bad) }
 }
 
-/// Layer 2's path: each lane owns its own cache buffers and convolution rows. As a pool, lane k owns slots 3k (window
-/// cache), 3k + 1 (full cache) and 3k + 2 (convolution rows); an ended lane's slots have no memory.
+/// Layer 2's path: each lane owns its own cache buffers. As a pool, lane k's window cache is window slot k + 1 and its
+/// full cache is full slot k + 1; an ended lane's slots have no memory.
 pub struct Layer2<'a> { eng: &'a Engine, lanes: RefCell<Vec<Option<Lane>>>, rows: std::cell::Cell<(usize, bool)> }
 
 impl<'a> Layer2<'a> {
@@ -265,10 +308,11 @@ impl StepPath for Layer2<'_> {
 }
 
 impl PoisonPool for Layer2<'_> {
-    fn slot_count(&self) -> usize { 3 * self.lanes.borrow().len() }
-    fn lane_slots(&self, lane: LaneId) -> Vec<usize> { vec![3 * lane, 3 * lane + 1, 3 * lane + 2] }
-    fn slot_bytes(&self, slot: usize) -> Option<(*mut u8, usize)> {
-        self.run(|v| v[slot / 3].as_ref().map(|l| self.eng.lane_regions(l)[slot % 3]))
+    fn slot_count(&self, _: BlockKind) -> usize { self.lanes.borrow().len() }
+    fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> { KINDS.iter().map(|&k| (k, slot_at(lane))).collect() }
+    fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
+        let i = slot.pool_index().get() as usize;
+        self.run(|v| v[i].as_ref().map(|l| self.eng.lane_regions(l)[if kind == BlockKind::Window { 0 } else { 1 }]))
     }
 }
 
@@ -335,24 +379,54 @@ mod tests {
     }
 
     /// A pool on the heap with a fake path, to check `apply` and `restore` round trip without a GPU.
-    struct Heap { slots: RefCell<Vec<Vec<u8>>>, tables: Vec<Vec<usize>> }
+    /// Both pools on the heap (window slots then full slots), to check `apply` and `restore` without a GPU.
+    struct Heap { win: RefCell<Vec<Vec<u8>>>, full: RefCell<Vec<Vec<u8>>>, tables: Vec<Vec<(BlockKind, Slot)>> }
     impl PoisonPool for Heap {
-        fn slot_count(&self) -> usize { self.slots.borrow().len() }
-        fn lane_slots(&self, l: LaneId) -> Vec<usize> { self.tables[l].clone() }
-        fn slot_bytes(&self, s: usize) -> Option<(*mut u8, usize)> { let mut v = self.slots.borrow_mut(); Some((v[s].as_mut_ptr(), v[s].len())) }
+        fn slot_count(&self, k: BlockKind) -> usize { if k == BlockKind::Window { self.win.borrow().len() } else { self.full.borrow().len() } }
+        fn lane_slots(&self, l: LaneId) -> Vec<(BlockKind, Slot)> { self.tables[l].clone() }
+        fn slot_bytes(&self, k: BlockKind, s: Slot) -> Option<(*mut u8, usize)> {
+            let mut v = if k == BlockKind::Window { self.win.borrow_mut() } else { self.full.borrow_mut() };
+            let x = &mut v[s.pool_index().get() as usize];
+            Some((x.as_mut_ptr(), x.len()))
+        }
+    }
+    fn nan(v: &[u8]) -> bool { f32::from_bits(u32::from_ne_bytes(v[0..4].try_into().unwrap())).is_nan() }
+    fn sl(n: u32) -> Slot { Slot::new(n).unwrap() }
+
+    #[test]
+    fn apply_poisons_and_restore_puts_back_only_referenced_slots() {
+        use BlockKind::*;
+        // lane 0: window 1, full 1. lane 1: window 2 and 3, full 1 (shared). window 4 and full 2 are free.
+        let h = Heap { win: RefCell::new((0..4u8).map(|i| vec![i; 8]).collect()), full: RefCell::new((10..12u8).map(|i| vec![i; 8]).collect()),
+                       tables: vec![vec![(Window, sl(1)), (Full, sl(1))], vec![(Window, sl(2)), (Window, sl(3)), (Full, sl(1))]] };
+        let tables: Vec<_> = (0..2).map(|l| h.lane_slots(l)).collect();
+        let ps = plans(&h, &tables, &[0], true);
+        assert_eq!(ps, vec![(Window, Plan { poison: vec![1, 2, 3], save: vec![1, 2] }), (Full, Plan { poison: vec![1], save: vec![] })]);
+        let saved = apply(&h, &ps);
+        assert_eq!(h.win.borrow()[0], vec![0; 8]);
+        assert_eq!(h.full.borrow()[0], vec![10; 8]);
+        for s in 1..4 { assert!(nan(&h.win.borrow()[s])); }
+        assert!(nan(&h.full.borrow()[1]));
+        restore(&h, saved);
+        assert_eq!(h.win.borrow()[1], vec![1; 8]);
+        assert_eq!(h.win.borrow()[2], vec![2; 8]);
+        // free slots stay poisoned: the pool zeroes a slot when it hands it out
+        assert!(nan(&h.win.borrow()[3]) && nan(&h.full.borrow()[1]));
     }
 
     #[test]
-    fn apply_poisons_and_restore_puts_back_only_owned_slots() {
-        let h = Heap { slots: RefCell::new((0..4u8).map(|i| vec![i; 8]).collect()), tables: vec![vec![0], vec![1, 2]] };
-        let plan = poison_plan(4, &h.tables, &[0], true);
-        let saved = apply(&h, &plan);
-        assert_eq!(h.slots.borrow()[0], vec![0; 8]);
-        for s in 1..4 { assert!(f32::from_bits(u32::from_ne_bytes(h.slots.borrow()[s][0..4].try_into().unwrap())).is_nan()); }
-        restore(&h, saved);
-        assert_eq!(h.slots.borrow()[1], vec![1; 8]);
-        assert_eq!(h.slots.borrow()[2], vec![2; 8]);
-        // slot 3 is free: it stays poisoned, and the pool zeroes it when it hands it out
-        assert!(f32::from_bits(u32::from_ne_bytes(h.slots.borrow()[3][0..4].try_into().unwrap())).is_nan());
+    fn table_slots_reads_every_entry_of_both_kinds() {
+        assert_eq!(table_slots(&BlockTable::new(4).unwrap()), vec![]);
+        assert_eq!(table_slots(&BlockTable::empty()), vec![]);
+    }
+
+    #[test]
+    fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
+        let base = 0x1000 as *mut u8;
+        let len = 2 * crate::blocks::FULL_STRIDE as usize;
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3)), None);
+        assert_eq!(slot_region(base, len, BlockKind::Window, sl(1)), None);
     }
 }
