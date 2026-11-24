@@ -3,7 +3,7 @@
 # M5 Mac after `cargo build --release`. Each line is one gate; every one runs, and any failure fails the night.
 #  - inky poolgate, long: 17 lanes, prompts of 618 tokens in chunks of 1 to 256 (across many 64-position blocks), 64
 #    greedy decode steps, every pool slot outside the step poisoned; must give layer 2's outputs bit for bit
-#    (about 140 s on an M5 Pro).
+#    (measured 194 s wall, 3:14, on an M5 Pro, 2026-11-23).
 set -e
 cd "${0:A:h}/.."
 B=./target/release/inky
