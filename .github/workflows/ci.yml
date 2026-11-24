@@ -50,6 +50,9 @@ jobs:
       - name: inkconvert tests
         working-directory: tools/inkconvert
         run: go test -race ./...
+      - name: replay sweep tests
+        working-directory: tools/replay
+        run: go vet ./... && go test -race ./...
   m5:
     # A self-hosted M5 Mac: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
     # Pull requests from forks never run here (the repository also requires approval for outside contributors).

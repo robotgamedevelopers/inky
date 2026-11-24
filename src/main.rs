@@ -4,6 +4,7 @@ mod metal;
 mod sampler;
 mod session;
 mod memd;
+mod record;
 mod serve;
 mod tuning;
 mod tokenizer;
@@ -62,6 +63,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
+  --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -88,7 +90,7 @@ fn default_model() -> String {
 fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
-        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0,
+        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -116,6 +118,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             }
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
+            "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -163,6 +166,7 @@ mod cli_tests {
             (&["--key-env", "BLANK", "--allow-unauthenticated-non-loopback"], "nonempty HTTP header"),
             (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
+            (&["--record-dir"], "missing value for --record-dir"),
             (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
             (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
             (&["--typo"], "unknown serve option --typo"),
@@ -175,6 +179,8 @@ mod cli_tests {
 
     #[test]
     fn serve_checks_the_addresses_it_will_bind() {
+        assert_eq!(serve_args(&[]).unwrap().record_dir, None);
+        assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
