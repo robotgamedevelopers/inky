@@ -1454,6 +1454,24 @@ mod tests {
         assert!(!c.contains("text/event-stream"), "no SSE headers may precede the refusal: {c}");
     }
 
+    #[test] fn disconnected_scheduler_leaves_no_phantom_queue_entry() {
+        let tk = Tokenizer::for_test();
+        let (jobs, receiver) = channel();
+        let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), sp: test_sp(&tk), tk: Arc::new(tk),
+                       jobs, effort: "medium".into(), max_tokens: 8, seq: Default::default(), nonce: "test".into(),
+                       key: None, ctx: 2048, inflight: Default::default(), limit: 1, conns: Default::default() };
+        drop(receiver);
+        let request = json!({"model":"m", "max_tokens":8, "messages":[{"role":"user","content":"hi"}]});
+        let mut out = Vec::new();
+        messages(&cx, &request, &mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 503"));
+        assert_eq!(cx.metrics.lock().unwrap().queued, 0);
+        out.clear();
+        chat(&cx, &request, &mut out).unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 503"));
+        assert_eq!(cx.metrics.lock().unwrap().queued, 0);
+    }
+
     #[test] fn serve_header_policy() {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
