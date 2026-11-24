@@ -43,12 +43,13 @@
 
 EXTENDS Integers, Sequences, FiniteSets
 
-CONSTANTS Alphabet, BlockLen, MaxBlocks, Slots, MaxGen, MaxHolders, Bug
+CONSTANTS Alphabet, BlockLen, MaxBlocks, Slots, MaxGen, MaxHolders, MaxSealed, Bug
 
 ASSUME /\ BlockLen \in Nat \ {0}
        /\ MaxBlocks \in Nat \ {0}
        /\ MaxGen \in Nat
        /\ MaxHolders \in Nat \ {0}
+       /\ MaxSealed \in Nat
 
 \* Two blocks of two tokens; must satisfy Len(Req) = MaxBlocks * BlockLen.
 Req == <<1, 2, 1, 2>>
@@ -197,6 +198,10 @@ Next ==
     \/ \E s \in BlockSeqs : Retain(s) \/ Release(s) \/ Evict(s)
     \/ \E slot \in Slots : Reuse(slot)
     \/ Seek
+
+\* A state bound for the small configs: the per-PR depth-2 check keeps
+\* every rule but only explores trees of at most MaxSealed blocks.
+SealedBound == Cardinality(sealed) <= MaxSealed
 
 Spec == Init /\ [][Next]_vars
 
