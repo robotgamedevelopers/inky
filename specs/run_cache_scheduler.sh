@@ -23,10 +23,18 @@ fi
 
 output=${TLC_OUTPUT:-"$PWD/tlc-cache-scheduler-results"}
 workers=${TLC_WORKERS:-8}
-mkdir -p "$output"
-output=$(CDPATH= cd -- "$output" && pwd)
-
-[ -r "$jar" ] || { echo "Missing TLC jar: $jar" >&2; exit 1; }
+# --list prints the run names and runs nothing (scripts/check-tla-tiers.sh reads it).
+list=0
+case ${1:-} in
+    '') ;;
+    --list) list=1 ;;
+    *) echo "usage: run_cache_scheduler.sh [--list]" >&2; exit 2 ;;
+esac
+if [ "$list" = 0 ]; then
+    mkdir -p "$output"
+    output=$(CDPATH= cd -- "$output" && pwd)
+    [ -r "$jar" ] || { echo "Missing TLC jar: $jar" >&2; exit 1; }
+fi
 
 now_ms() {
     if date +%s%3N 2>/dev/null | grep -Eq '^[0-9]+$'; then
@@ -37,6 +45,7 @@ now_ms() {
 }
 
 check_run() {
+    [ "$list" = 0 ] || { echo "$1"; return 0; }
     name=$1
     module=$2
     kind=${3:-pass}
@@ -105,7 +114,7 @@ check_run() {
     printf "%s | %s | %s | %s\n" "$name" "$counts" "$elapsed_s" "$label"
 }
 
-echo "run | generated | distinct | wall seconds | result"
+[ "$list" = 1 ] || echo "run | generated | distinct | wall seconds | result"
 check_run CacheScheduler CacheScheduler pass
 check_run CacheSchedulerQueue CacheScheduler pass
 check_run CacheSchedulerTwoPrefixes CacheScheduler pass

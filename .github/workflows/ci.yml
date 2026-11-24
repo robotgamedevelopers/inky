@@ -42,12 +42,24 @@ jobs:
         part: [memmode, blocks, grouped, traces]
     steps:
       - uses: actions/checkout@v4
+      # Every TLA check and trace mutant must sit in exactly one tier (this file or nightly.yml); the self-test
+      # plants a dropped check, a dropped mutant, an unwired trace script and a doubled part, and needs each red.
+      - name: TLA tier coverage
+        if: matrix.part == 'memmode'
+        run: |
+          scripts/check-tla-tiers.sh
+          scripts/check-tla-tiers.sh --self-test
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
+      # The pinned tla2tools.jar, kept across runs; check-tla.sh still checks its SHA-256 every time.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/inky-tla
+          key: tla2tools-fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
       - name: TLA ${{ matrix.part }}
-        run: scripts/check-tla.sh ${{ matrix.part }}
+        run: TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh ${{ matrix.part }}
   # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
   # Pull requests from forks never run here (the repository also requires approval for outside contributors).
   # Every same-repository pull request runs both, stream bases included: each takes about 40 s.
