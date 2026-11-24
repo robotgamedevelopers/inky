@@ -107,11 +107,13 @@ mutant no-evict \
     '.filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))' \
     '.filter(|(_, _h)| false)' \
     'Deadlock reached'
-mutant shallowest \
-    'if n.starts > 0 {
-                best = StartMatch' \
-    'if best.at == 0 && n.starts > 0 {
-                best = StartMatch' \
+# (the shallowest-start plant is gone: at the LiveTree boundary the
+# suffix clamp makes a shallowest return indistinguishable from the
+# clamped deepest one, so the plant now targets the clamp itself;
+# the model-level shallowest bug remains the PrefixTreeShallow witness)
+mutant full-match \
+    '!tokens.is_empty() && m.at == tokens.len()' \
+    'false && m.at == tokens.len()' \
     'Deadlock reached'
 mutant ref-leak \
     'self.records.drop_ref(e.slot(), e.kind(), e.generation())' \
