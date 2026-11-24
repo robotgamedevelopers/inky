@@ -60,6 +60,8 @@ check PrefixTreeStale PrefixTree ResultLive
 check PrefixTreeFirstToken PrefixTree MatchExact
 check PrefixTreeAnyParent PrefixTree ResultIsStart
 check PrefixTreePartial PrefixTree StartOnBoundary
+check PrefixTreeLeak PrefixTree RefsSettledAfterSeek
+check PrefixTreeReuseHeld PrefixTree HeldNeverStale
 if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
 check PrefixTree PrefixTree
 fi

@@ -27,6 +27,17 @@
 \*   "first-token" a block matches on its first token only (MatchExact)
 \*   "any-parent"  blocks match anywhere, not on one chain (ResultIsStart)
 \*   "partial"     the result may end mid-block (StartOnBoundary)
+\*   "leak"        Seek evicts stale blocks but drops no refs
+\*                 (RefsSettledAfterSeek)
+\*   "reuse-held"  a slot is reused while the tree holds its ref
+\*                 (HeldNeverStale)
+\*
+\* A seek also evicts: every stale sealed block (sealed at an older
+\* generation of its slot) leaves the tree with its subtree, its
+\* start holds released and its ref dropped — the model's version of
+\* LiveTree evicting on a match and re-seeking. The code evicts only
+\* the stale block on the matched path; evicting every stale block
+\* here is stronger and the checked properties hold under both.
 \* The request being matched is fixed in the module because a TLC
 \* config file assigns only literals and cannot write a sequence.
 
@@ -118,11 +129,15 @@ Release(s) ==
     /\ starts' = [starts EXCEPT ![s] = starts[s] - 1]
     /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs, result, sought>>
 
-\* The pool drops a slot's last ref and reuses it: the generation
-\* moves and every block sealed at the old one is stale.
+\* The pool reuses a slot only once the tree holds no ref on it:
+\* the generation moves, and any block still naming the slot at the
+\* old generation would be stale. Three witness configs lift that
+\* guard (stale, leak, reuse-held) so staleness can arise at all.
 Reuse(slot) ==
     /\ ~sought
     /\ poolGen[slot] < MaxGen
+    /\ Bug \in {"stale", "leak", "reuse-held"}
+        \/ \A s \in sealed : slotOf[s] = slot => refs[s] = 0
     /\ poolGen' = [poolGen EXCEPT ![slot] = poolGen[slot] + 1]
     /\ UNCHANGED <<sealed, starts, slotOf, genOf, refs, result, sought>>
 
@@ -164,10 +179,18 @@ SeekResult ==
             IN  IF Len(d) < Len(Req) THEN SubSeq(Req, 1, Len(d) + 1) ELSE d
       [] OTHER -> DeepestLive(Req)
 
+\* Stale blocks and everything below them: what a seek evicts.
+StaleSet == {s \in sealed : Len(s) > 0 /\ genOf[s] # poolGen[slotOf[s]]}
+Evicted == {t \in sealed : \E s \in StaleSet : IsPrefix(s, t)}
+
 Seek ==
     /\ result' = SeekResult
     /\ sought' = TRUE
-    /\ UNCHANGED <<sealed, starts, slotOf, genOf, poolGen, refs>>
+    /\ sealed' = sealed \ Evicted
+    /\ starts' = [x \in BlockSeqs |-> IF x \in Evicted THEN 0 ELSE starts[x]]
+    /\ refs' = [x \in BlockSeqs |->
+           IF Bug = "leak" \/ x \notin Evicted THEN refs[x] ELSE 0]
+    /\ UNCHANGED <<slotOf, genOf, poolGen>>
 
 Next ==
     \/ \E s \in BlockSeqs, slot \in Slots : Seal(s, slot)
@@ -194,10 +217,20 @@ TreeClosed ==
 \* Only sealed blocks are ever held as start points.
 StartsSealed == \A s \in BlockSeqs : starts[s] > 0 => s \in sealed
 
-\* The tree holds exactly one ref per sealed block, and none for the
-\* rest. Position 0 is in `sealed` as the root of every chain and is
-\* not a block: it holds no ref.
-RefsHeld == \A s \in BlockSeqs : refs[s] = (IF s \in sealed \ {<<>>} THEN 1 ELSE 0)
+\* A ref is only ever held on a sealed block.
+RefsOnSealed == \A s \in BlockSeqs : refs[s] = 1 => s \in sealed \ {<<>>}
+
+\* After a seek the books are exact: one ref per sealed block, none
+\* for anything evicted. The "leak" witness breaks exactly this.
+RefsSettledAfterSeek ==
+    sought => \A s \in BlockSeqs :
+        refs[s] = (IF s \in sealed \ {<<>>} THEN 1 ELSE 0)
+
+\* A block the tree holds a ref on is never stale: its slot has not
+\* been reused under it. The "reuse-held" witness breaks exactly this.
+HeldNeverStale ==
+    \A s \in sealed \ {<<>>} :
+        refs[s] = 1 => genOf[s] = poolGen[slotOf[s]]
 
 \* The result is a held start point (or position 0).
 ResultIsStart == sought => result \in Held \cup {<<>>}

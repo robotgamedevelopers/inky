@@ -181,12 +181,21 @@ impl<B: Copy> PrefixTree<B> {
     /// Keep the end of this block as a start point for one more holder.
     /// Start points are counted: two holders are normal (a lane head and
     /// a prompt end), and the point survives until the last release.
-    /// Returns false when the id names no block in this tree.
-    pub fn retain_start(&mut self, id: SealedId) -> bool {
+    /// `Ok(false)` when the id names no block in this tree; the count is
+    /// checked, like Johnny's slot-record mutators, never saturated.
+    pub fn retain_start(&mut self, id: SealedId) -> Result<bool, BlockError> {
         match self.node_mut(id) {
-            Some(n) => { n.starts = n.starts.saturating_add(1); true }
-            None => false,
+            Some(n) => {
+                n.starts = n.starts.checked_add(1).ok_or(BlockError::Overflow)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
+    }
+
+    /// The caller's handle on a block in this tree, if it is here.
+    pub fn handle(&self, id: SealedId) -> Option<B> {
+        self.node(id).map(|n| n.handle)
     }
 
     /// Drop one holder of a start point. Returns false when the id names
@@ -318,23 +327,33 @@ impl<R: SlotRecords> LiveTree<R> {
     }
 
     /// Add one sealed block, taking its slot's ref. A block already in
-    /// the tree (a racing publisher) takes no second ref.
+    /// the tree (a racing publisher) takes no second ref — unless the
+    /// twin in the tree is stale: its slot has moved on, so the twin is
+    /// evicted (its ref dropped) and the fresh block takes its place.
+    /// A refused insert rolls its ref back; if the rollback itself
+    /// refuses, that pool error is the one returned.
     pub fn insert(&mut self, parent: Option<SealedId>, pos: usize, tokens: &[u32], entry: BlockEntry) -> Result<SealedId, LiveError> {
         if tokens.len() == BLOCK {
-            if let Some(id) = self.tree.find(parent, pos, tokens) { return Ok(id); }
+            if let Some(id) = self.tree.find(parent, pos, tokens) {
+                let twin = self.tree.handle(id).expect("a found block has a handle");
+                if self.records.generation(twin.slot(), twin.kind()) == Some(twin.generation()) {
+                    return Ok(id);
+                }
+                self.remove(id)?; // the stale twin: evict it, then insert fresh below
+            }
         }
         self.records.add_ref(entry.slot(), entry.kind())?;
         match self.tree.insert(parent, pos, tokens, entry) {
             Ok(id) => Ok(id),
-            Err(e) => {
-                let _ = self.records.drop_ref(entry.slot(), entry.kind());
-                Err(e.into())
-            }
+            Err(e) => match self.records.drop_ref(entry.slot(), entry.kind()) {
+                Ok(()) => Err(e.into()),
+                Err(pool) => Err(pool.into()),
+            },
         }
     }
 
     /// Keep or drop one holder of a start point (see `PrefixTree`).
-    pub fn retain_start(&mut self, id: SealedId) -> bool { self.tree.retain_start(id) }
+    pub fn retain_start(&mut self, id: SealedId) -> Result<bool, BlockError> { self.tree.retain_start(id) }
     pub fn release_start(&mut self, id: SealedId) -> bool { self.tree.release_start(id) }
 
     /// Remove a block and everything below it, dropping their refs.
@@ -353,16 +372,18 @@ impl<R: SlotRecords> LiveTree<R> {
     }
 
     /// The deepest start point whose blocks are all still the slots and
-    /// generations the tree sealed them at.
-    pub fn deepest_start(&mut self, tokens: &[u32]) -> StartMatch<BlockEntry> {
+    /// generations the tree sealed them at. A stale block on the path is
+    /// evicted through `remove`, so its ref is dropped, never leaked;
+    /// a pool error from that eviction is returned, not swallowed.
+    pub fn deepest_start(&mut self, tokens: &[u32]) -> Result<StartMatch<BlockEntry>, LiveError> {
         loop {
             let m = self.tree.deepest_start(tokens);
             let stale = m.blocks.iter().zip(&m.ids).find(|(e, _)| {
                 self.records.generation(e.slot(), e.kind()) != Some(e.generation())
             }).map(|(_, &id)| id);
             match stale {
-                None => return m,
-                Some(id) => { self.tree.remove(id); }
+                None => return Ok(m),
+                Some(id) => { self.remove(id)?; }
             }
         }
     }
@@ -393,8 +414,8 @@ mod tests {
     #[test]
     fn the_deepest_retained_start_point_wins() {
         let (mut t, ids) = tree3();
-        t.retain_start(ids[0]);
-        t.retain_start(ids[2]);
+        t.retain_start(ids[0]).unwrap();
+        t.retain_start(ids[2]).unwrap();
         let toks = [block(1), block(2), block(3), block(9)].concat();
         let m = t.deepest_start(&toks);
         assert_eq!(m.at, 3 * BLOCK);
@@ -408,8 +429,8 @@ mod tests {
         // Rowan's failing case: a lane head and a prompt end both hold
         // the same point; one release must not unmatch it.
         let (mut t, ids) = tree3();
-        t.retain_start(ids[2]);
-        t.retain_start(ids[2]);
+        t.retain_start(ids[2]).unwrap();
+        t.retain_start(ids[2]).unwrap();
         assert_eq!(t.start_holders(ids[2]), 2);
         let toks = [block(1), block(2), block(3)].concat();
         assert!(t.release_start(ids[2]), "the lane head lets go");
@@ -422,13 +443,13 @@ mod tests {
     #[test]
     fn a_block_that_differs_anywhere_stops_the_match() {
         let (mut t, ids) = tree3();
-        t.retain_start(ids[2]);
+        t.retain_start(ids[2]).unwrap();
         let mut second = block(2);
         second[63] ^= 1;
         let toks = [block(1), second, block(3)].concat();
         assert_eq!(t.deepest_start(&toks).at, 0, "the second block differs, so even the third block's start point is unreachable");
         let (mut t2, ids2) = tree3();
-        t2.retain_start(ids2[1]);
+        t2.retain_start(ids2[1]).unwrap();
         assert_eq!(t2.deepest_start(&[block(1), block(7)].concat()).at, 0);
     }
 
@@ -440,8 +461,8 @@ mod tests {
         let a2 = t.insert(Some(a), BLOCK, &block(2), 20).unwrap();
         let x2 = t.insert(Some(x), BLOCK, &block(2), 60).unwrap();
         assert_ne!(a2, x2);
-        t.retain_start(a2);
-        t.retain_start(x2);
+        t.retain_start(a2).unwrap();
+        t.retain_start(x2).unwrap();
         assert_eq!(t.deepest_start(&[block(5), block(2)].concat()).blocks, vec![50, 60],
             "the match follows the parent chain, never the local tokens alone");
         assert_eq!(t.deepest_start(&[block(1), block(2)].concat()).blocks, vec![10, 20]);
@@ -464,7 +485,7 @@ mod tests {
         assert_eq!(t.insert(None, BLOCK, &block(1), 10), Err(InsertError::WrongPosition { expected: 0, got: BLOCK }));
         assert_eq!(t.insert(Some(foreign), BLOCK, &block(1), 10), Err(InsertError::ForeignId),
             "an id from another tree names nothing here, even at an existing index");
-        assert!(!t.retain_start(foreign));
+        assert_eq!(t.retain_start(foreign), Ok(false), "a foreign id is no block here");
         assert!(t.remove(foreign).is_empty());
         let a = t.insert(None, 0, &block(1), 10).unwrap();
         assert_eq!(t.insert(Some(a), 0, &block(2), 20), Err(InsertError::WrongPosition { expected: BLOCK, got: 0 }));
@@ -476,7 +497,7 @@ mod tests {
     #[test]
     fn remove_shrinks_the_tree_and_returns_handles() {
         let (mut t, ids) = tree3();
-        t.retain_start(ids[2]);
+        t.retain_start(ids[2]).unwrap();
         let toks = [block(1), block(2), block(3)].concat();
         assert_eq!(t.remove(ids[1]), vec![20, 30], "the block and everything below it, root-first");
         assert_eq!(t.deepest_start(&toks).at, 0);
@@ -484,7 +505,7 @@ mod tests {
         // the same tokens publish again as new blocks; no stale digest entry answers
         let b = t.insert(Some(ids[0]), BLOCK, &block(2), 21).unwrap();
         assert_ne!(b, ids[1], "ids are never reused");
-        t.retain_start(b);
+        t.retain_start(b).unwrap();
         assert_eq!(t.deepest_start(&toks).blocks, vec![10, 21]);
     }
 
@@ -498,7 +519,7 @@ mod tests {
             ids.push(id);
             parent = Some(id);
         }
-        t.retain_start(ids[15]); // a 16th-block-boundary start point, position 1024
+        t.retain_start(ids[15]).unwrap(); // a 16th-block-boundary start point, position 1024
         let mut toks: Vec<u32> = (1..=17u32).flat_map(block).collect();
         assert_eq!(t.deepest_start(&toks).at, 16 * BLOCK);
         toks.truncate(16 * BLOCK + 63);
@@ -515,7 +536,13 @@ mod tests {
     impl FakeRecords {
         fn key(slot: Slot, kind: BlockKind) -> (u32, bool) { (slot.get(), kind == BlockKind::Full) }
         fn record(&mut self, slot: Slot, kind: BlockKind) -> &mut SlotRecord {
-            self.map.entry(Self::key(slot, kind)).or_insert_with(|| SlotRecord::fresh(kind))
+            // a record starts at generation 1 when the slot is first
+            // taken: generation 0 is "never taken" (blocks.rs)
+            self.map.entry(Self::key(slot, kind)).or_insert_with(|| {
+                let mut r = SlotRecord::fresh(kind);
+                r.bump_generation().unwrap();
+                r
+            })
         }
         fn refs(&mut self, slot: Slot, kind: BlockKind) -> u32 { self.record(slot, kind).refs() }
         fn reuse(&mut self, slot: Slot, kind: BlockKind) { self.record(slot, kind).bump_generation().unwrap(); }
@@ -535,36 +562,56 @@ mod tests {
 
     #[test]
     fn a_reused_slots_stale_entry_is_a_miss_never_a_match() {
-        // Rowan's failing case: insert A at (slot 3, gen 0); the pool
-        // reuses slot 3 at gen 1 for other tokens; A's tokens must miss.
+        // Rowan's failing case: insert A at (slot 3, gen 1); the pool
+        // reuses slot 3 at gen 2 for other tokens; A's tokens must miss,
+        // and the eviction must drop both blocks' refs, not leak them.
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 0, BlockKind::Full)).unwrap();
-        let b = live.insert(Some(a), BLOCK, &block(2), entry(4, 0, BlockKind::Full)).unwrap();
-        live.retain_start(b);
+        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
+        let b = live.insert(Some(a), BLOCK, &block(2), entry(4, 1, BlockKind::Full)).unwrap();
+        live.retain_start(b).unwrap();
         let toks = [block(1), block(2)].concat();
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "insert took a ref");
-        assert_eq!(live.deepest_start(&toks).at, 2 * BLOCK);
-        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // slot 3 is generation 1 now
-        let m = live.deepest_start(&toks);
-        assert_eq!(m.at, 0, "the gen-0 entry for a gen-1 slot is stale: a miss, not a match");
-        assert_eq!(live.deepest_start(&toks).at, 0, "and it was evicted, not rechecked forever");
+        assert_eq!(live.deepest_start(&toks).unwrap().at, 2 * BLOCK);
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // slot 3 is generation 2 now
+        let m = live.deepest_start(&toks).unwrap();
+        assert_eq!(m.at, 0, "the gen-1 entry for a gen-2 slot is stale: a miss, not a match");
+        assert_eq!(live.deepest_start(&toks).unwrap().at, 0, "and it was evicted, not rechecked forever");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "the evicted root's ref was dropped");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "the evicted child's ref was dropped too (Rowan's leak)");
         // a fresh block at the slot's new generation matches again
-        let a2 = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
-        live.retain_start(a2);
-        assert_eq!(live.deepest_start(&block(1)).blocks, vec![entry(3, 1, BlockKind::Full)]);
+        let a2 = live.insert(None, 0, &block(1), entry(3, 2, BlockKind::Full)).unwrap();
+        live.retain_start(a2).unwrap();
+        assert_eq!(live.deepest_start(&block(1)).unwrap().blocks, vec![entry(3, 2, BlockKind::Full)]);
+    }
+
+    #[test]
+    fn a_fresh_block_is_never_lost_to_its_stale_twin() {
+        // the stale twin is still in the tree when the fresh block is
+        // sealed at the slot's new generation: the dedupe must evict
+        // the twin (dropping its ref) and keep the fresh block
+        let mut live = LiveTree::new(FakeRecords::default());
+        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // gen 2; the gen-1 twin is stale
+        let a2 = live.insert(None, 0, &block(1), entry(3, 2, BlockKind::Full)).unwrap();
+        assert_ne!(a2, a, "the fresh block is a new block, not the stale twin");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "twin's ref dropped, fresh ref held");
+        live.retain_start(a2).unwrap();
+        assert_eq!(live.deepest_start(&block(1)).unwrap().blocks, vec![entry(3, 2, BlockKind::Full)],
+            "and the fresh block survives the next seek");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1);
     }
 
     #[test]
     fn live_inserts_and_removes_balance_their_refs() {
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 0, BlockKind::Full)).unwrap();
-        assert_eq!(live.insert(None, 0, &block(1), entry(3, 0, BlockKind::Full)), Ok(a), "a racing publisher dedupes");
+        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
+        assert_eq!(live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)), Ok(a), "a racing publisher dedupes");
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "and takes no second ref");
         // a refused insert rolls its ref back
-        assert!(live.insert(Some(a), 0, &block(2), entry(4, 0, BlockKind::Full)).is_err());
+        assert!(live.insert(Some(a), 0, &block(2), entry(4, 1, BlockKind::Full)).is_err());
         assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0);
         let gone = live.remove(a).unwrap();
-        assert_eq!(gone, vec![entry(3, 0, BlockKind::Full)]);
+        assert_eq!(gone, vec![entry(3, 1, BlockKind::Full)]);
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "removal dropped the ref");
     }
 
@@ -575,7 +622,7 @@ mod tests {
         let mut t: EntryTree = PrefixTree::new();
         let a = t.insert(None, 0, &block(1), full).unwrap();
         let b = t.insert(Some(a), BLOCK, &block(2), win).unwrap();
-        t.retain_start(b);
+        t.retain_start(b).unwrap();
         let m = t.deepest_start(&[block(1), block(2), block(3)].concat());
         assert_eq!(m.at, 2 * BLOCK);
         assert_eq!(m.blocks, vec![full, win]);
