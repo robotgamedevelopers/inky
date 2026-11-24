@@ -15,30 +15,35 @@ EXTENDS PrefixTree, PrefixTreeTraceData
 VARIABLE step
 tvars == <<vars, step>>
 
-Matches(sv, tv, ov, gv, pv, rv, qv, hv, row) ==
+Matches(sv, tv, ov, gv, wv, wg, pv, rv, qv, hv, row) ==
     /\ sv = row.sealed
     /\ tv = row.starts
     /\ ov = row.slotOf
     /\ gv = row.genOf
+    /\ wv = row.winSlotOf
+    /\ wg = row.winGenOf
     /\ pv = row.poolGen
     /\ rv = row.refs
     /\ qv = row.result
     /\ hv = row.sought
+    /\ row.bad = FALSE
 
-Now(row) == Matches(sealed, starts, slotOf, genOf, poolGen, refs, result, sought, row)
-Post(row) == Matches(sealed', starts', slotOf', genOf', poolGen', refs', result', sought', row)
+Now(row) == Matches(sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, refs, result, sought, row)
+Post(row) == Matches(sealed', starts', slotOf', genOf', winSlotOf', winGenOf', poolGen', refs', result', sought', row)
 
 \* A refused stale insert is no model step at all: the code left the
 \* state untouched, and the correct model (Bug = "evict", so
 \* SealClaimed is disabled) has no action that could take it.
 StepOp(row) ==
-    CASE row.op = "seal" -> Seal(row.s, row.slot)
+    CASE row.op = "seal" -> Seal(row.s, row.slot, row.wslot)
       [] row.op = "seal-stale" ->
-            /\ UNCHANGED <<sealed, starts, slotOf, genOf, poolGen, refs>>
+            /\ UNCHANGED <<sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, refs, badInsert>>
             /\ sought' = FALSE
             /\ result' = <<>>
       [] row.op = "seal-dup" -> Dedup(row.s)
-      [] row.op = "seal-twin" -> ReSeal(row.s, row.slot)
+      [] row.op = "seal-twin" -> ReSeal(row.s, row.slot, row.wslot)
+      [] row.op = "pin" -> Pin(row.s)
+      [] row.op = "unpin" -> Unpin(row.s)
       [] row.op = "retain" -> Retain(row.s)
       [] row.op = "release" -> Release(row.s)
       [] row.op = "reuse" -> Reuse(row.slot)
@@ -53,7 +58,8 @@ PoolBooks ==
     LET row == Trace[step] IN
         \A slot \in Slots :
             row.poolRefs[slot] =
-                Cardinality({s \in sealed \ {<<>>} : slotOf[s] = slot})
+                Cardinality({s \in sealed \ {<<>>} : refs[s] = 1 /\ slotOf[s] = slot})
+                + Cardinality({s \in sealed \ {<<>>} : refs[s] = 1 /\ winSlotOf[s] = slot})
 
 TInit ==
     /\ Init

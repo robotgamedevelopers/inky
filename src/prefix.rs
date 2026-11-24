@@ -18,10 +18,11 @@
 //!
 //! A `BlockEntry` names a pool slot at a generation, and a slot is reused:
 //! the entry alone goes stale. `LiveTree` is the matcher over Johnny's
-//! slot records — it takes a ref on every block it inserts, refuses an
-//! entry whose generation its slot has moved past, evicts every stale
-//! block on a seek before matching, and drops the refs of everything it
-//! removes. The plain `PrefixTree` below it knows nothing of pools.
+//! slot records — cached blocks sit at zero pool refs until a lane
+//! pins them, it refuses an entry whose generation its slot has moved
+//! past, evicts every stale block on a seek before matching, and drops
+//! pinned refs generation-checked so a reused slot's new owner is
+//! never corrupted. The plain `PrefixTree` below it knows nothing of pools.
 //!
 //! Modelled by `specs/PrefixTree.tla`; this code is bound to that model
 //! by the trace check in `specs/run_tlc.zsh` (`PrefixTreeTrace`): a
@@ -87,7 +88,27 @@ pub struct StartMatch<B> {
 /// The tree whose handles are Johnny's table entries: what a caller gets
 /// back from a match and installs, kind by kind. The matcher never
 /// constructs an entry; it carries the caller's.
-pub type EntryTree = PrefixTree<BlockEntry>;
+/// The two pool entries one sealed block carries at a start point:
+/// its `Full` entry and, where the block has one, its `Window` entry
+/// (BlockLayout.tla's two kinds for one block). The tree matches on
+/// tokens; both entries ride on the node so a start point can be
+/// installed without a second lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockHandles {
+    full: BlockEntry,
+    window: Option<BlockEntry>,
+}
+
+impl BlockHandles {
+    pub fn new(full: BlockEntry, window: Option<BlockEntry>) -> BlockHandles { BlockHandles { full, window } }
+    pub fn full(self) -> BlockEntry { self.full }
+    pub fn window(self) -> Option<BlockEntry> { self.window }
+    fn entries(self) -> impl Iterator<Item = BlockEntry> {
+        std::iter::once(self.full).chain(self.window)
+    }
+}
+
+pub type EntryTree = PrefixTree<BlockHandles>;
 
 /// What the scheduler asks of a prefix matcher. The concrete tree in this
 /// file is one implementation; the trait is the seam Rowan asked for while
@@ -106,6 +127,7 @@ struct Node<B> {
     tokens: Box<[u32]>,
     handle: B,
     starts: u32,
+    pins: u32,
     children: Vec<SealedId>,
 }
 
@@ -168,7 +190,7 @@ impl<B: Copy> PrefixTree<B> {
             }
         }
         let id = SealedId { tree: self.tree, index: self.nodes.len() as u32 };
-        self.nodes.push(Some(Node { parent, pos, digest: d, tokens: tokens.into(), handle, starts: 0, children: Vec::new() }));
+        self.nodes.push(Some(Node { parent, pos, digest: d, tokens: tokens.into(), handle, starts: 0, pins: 0, children: Vec::new() }));
         match parent {
             None => self.roots.push(id),
             Some(p) => self.node_mut(p).expect("the parent was just checked").children.push(id),
@@ -227,11 +249,41 @@ impl<B: Copy> PrefixTree<B> {
         self.node(id).map(|n| n.starts).unwrap_or(0)
     }
 
+    /// How many pins hold this block. Pins are counted here; the pool
+    /// ref behind them is the live tree's business (one ref per block,
+    /// taken at the first pin).
+    pub fn pin_count(&self, id: SealedId) -> u32 {
+        self.node(id).map(|n| n.pins).unwrap_or(0)
+    }
+
+    /// Add one pin. `Ok(false)` when the id names no block here.
+    pub fn pin(&mut self, id: SealedId) -> Result<bool, BlockError> {
+        match self.node_mut(id) {
+            Some(n) => { n.pins = n.pins.checked_add(1).ok_or(BlockError::Overflow)?; Ok(true) }
+            None => Ok(false),
+        }
+    }
+
+    /// Drop one pin. Returns false when the id names no block here or
+    /// the block had no pin left.
+    pub fn unpin(&mut self, id: SealedId) -> bool {
+        match self.node_mut(id) {
+            Some(n) if n.pins > 0 => { n.pins -= 1; true }
+            _ => false,
+        }
+    }
+
     /// Remove this block and everything below it; the tree shrinks, and
     /// the removed handles come back root-first so the caller can drop
     /// whatever the blocks held. Ids are never reused. Returns an empty
     /// vec when the id names no block in this tree.
     pub fn remove(&mut self, id: SealedId) -> Vec<B> {
+        self.remove_with_pins(id).into_iter().map(|(h, _)| h).collect()
+    }
+
+    /// `remove`, with each removed block's pin count beside its handle,
+    /// root-first: the caller drops one pool ref per pinned block.
+    pub fn remove_with_pins(&mut self, id: SealedId) -> Vec<(B, u32)> {
         let Some(node) = self.node(id) else { return Vec::new() };
         let parent = node.parent;
         // collect the subtree before touching anything
@@ -253,7 +305,7 @@ impl<B: Copy> PrefixTree<B> {
                 bucket.retain(|&b| b != g);
                 if bucket.is_empty() { self.by_digest.remove(&n.digest); }
             }
-            handles.push(n.handle);
+            handles.push((n.handle, n.pins));
         }
         handles
     }
@@ -300,10 +352,13 @@ impl<B: Copy> PrefixMatch<B> for PrefixTree<B> {
 /// worker owns the records; this seam is only the three operations the
 /// tree performs on them, so the tree never names the pool type.
 pub trait SlotRecords {
-    /// Take one more ref on a slot (the record's own `add_ref`).
-    fn add_ref(&mut self, slot: Slot, kind: BlockKind) -> Result<(), BlockError>;
-    /// Drop one ref (the record's own `drop_ref`).
-    fn drop_ref(&mut self, slot: Slot, kind: BlockKind) -> Result<(), BlockError>;
+    /// Take one more ref on a slot, for an entry at `generation`. The
+    /// record must refuse when it is no longer at that generation:
+    /// a generation-blind ref would pin (or, on drop, corrupt) the
+    /// slot's new owner after a reuse.
+    fn add_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError>;
+    /// Drop one ref, under the same generation check as `add_ref`.
+    fn drop_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError>;
     /// The generation the slot is at now, or `None` when it is not live.
     fn generation(&self, slot: Slot, kind: BlockKind) -> Option<u32>;
 }
@@ -319,6 +374,9 @@ pub enum LiveError {
     /// that is not live): the entry is stale on arrival, so nothing was
     /// inserted and no ref was taken.
     StaleEntry { slot: Slot, claimed: u32, current: Option<u32> },
+    /// A handles pair whose entries are not one `Full` and at most one
+    /// `Window` entry.
+    WrongKind { expected: BlockKind, got: BlockKind },
 }
 
 impl From<InsertError> for LiveError {
@@ -329,12 +387,17 @@ impl From<BlockError> for LiveError {
     fn from(e: BlockError) -> LiveError { LiveError::Pool(e) }
 }
 
-/// The prefix matcher over live pool slots. Every block it holds has one
-/// ref on its slot record; every match is checked against the records'
-/// current generations, because a slot is reused and its old entry is
-/// stale. An insert naming a generation the slot has moved past is
-/// refused on arrival, and a seek evicts every stale block (each with
-/// everything below it) before matching, as the model's `Seek` does.
+/// The prefix matcher over live pool slots. A cached block sits at
+/// zero pool refs: it is evictable, and lookup validates it by
+/// generation instead of by holding it. A lane pins a block it is
+/// actively stepping from; the first pin takes one generation-checked
+/// ref on each of the block's entries, and the last unpin drops them
+/// the same checked way, so a slot reused in between never has its
+/// new owner's refcount corrupted. A seek evicts every stale block
+/// (each with everything below it) before matching, as the model's
+/// `Seek` does, and never returns the whole prompt: the final token
+/// must remain for prefill, so an exact full match steps back one
+/// block.
 pub struct LiveTree<R> {
     tree: EntryTree,
     records: R,
@@ -345,75 +408,144 @@ impl<R: SlotRecords> LiveTree<R> {
         LiveTree { tree: PrefixTree::new(), records }
     }
 
-    /// Add one sealed block, taking its slot's ref. The entry must name
-    /// its slot's current generation: a stale entry (or one naming a
-    /// slot that is not live) is refused before any ref is taken, even
-    /// when its tokens are already in the tree. A block already in the
-    /// tree (a racing publisher) takes no second ref — unless the twin
-    /// in the tree is stale: its slot has moved on, so the twin is
-    /// evicted (its ref dropped) and the fresh block takes its place.
-    /// The returned id's handle may be another publisher's entry;
-    /// `handle` shows the entry the tree actually holds. A refused
-    /// insert rolls its ref back; if the rollback itself refuses, that
-    /// pool error is the one returned.
-    pub fn insert(&mut self, parent: Option<SealedId>, pos: usize, tokens: &[u32], entry: BlockEntry) -> Result<SealedId, LiveError> {
-        match self.records.generation(entry.slot(), entry.kind()) {
-            Some(g) if g == entry.generation() => {}
-            current => return Err(LiveError::StaleEntry { slot: entry.slot(), claimed: entry.generation(), current }),
+    fn check_current(&self, e: BlockEntry) -> Result<(), LiveError> {
+        match self.records.generation(e.slot(), e.kind()) {
+            Some(g) if g == e.generation() => Ok(()),
+            current => Err(LiveError::StaleEntry { slot: e.slot(), claimed: e.generation(), current }),
         }
+    }
+
+    fn handles_current(&self, h: BlockHandles) -> Result<(), LiveError> {
+        for e in h.entries() { self.check_current(e)?; }
+        Ok(())
+    }
+
+    /// Drop the ref behind one entry, only while the record is still
+    /// at the entry's generation. A slot reused since the entry was
+    /// sealed has a new owner (and, on Emma's poolgate, its refcount
+    /// was reset at the reuse): dropping then would corrupt it, so a
+    /// generation mismatch skips the drop, never forces it.
+    fn drop_ref_if_current(&mut self, e: BlockEntry) -> Result<(), LiveError> {
+        if self.records.generation(e.slot(), e.kind()) == Some(e.generation()) {
+            self.records.drop_ref(e.slot(), e.kind(), e.generation())?;
+        }
+        Ok(())
+    }
+
+    fn drop_pinned(&mut self, h: BlockHandles) -> Result<(), LiveError> {
+        for e in h.entries() { self.drop_ref_if_current(e)?; }
+        Ok(())
+    }
+
+    /// Add one sealed block. The block is cached at zero pool refs:
+    /// no ref is taken here. Both entries must name their slots'
+    /// current generations (a stale entry, or one naming a slot that
+    /// is not live, is refused before anything is inserted, even when
+    /// its tokens are already in the tree), and the pair must be one
+    /// `Full` entry plus at most one `Window` entry. A block already
+    /// in the tree (a racing publisher) returns the canonical block —
+    /// unless the twin in the tree is stale: its slot has moved on, so
+    /// the twin is evicted (its pinned refs dropped, checked) and the
+    /// fresh block takes its place, also unpinned. The returned id's
+    /// handles may be another publisher's entries; `handle` shows the
+    /// pair the tree actually holds.
+    pub fn insert(&mut self, parent: Option<SealedId>, pos: usize, tokens: &[u32], handles: BlockHandles) -> Result<SealedId, LiveError> {
+        if handles.full.kind() != BlockKind::Full {
+            return Err(LiveError::WrongKind { expected: BlockKind::Full, got: handles.full.kind() });
+        }
+        if let Some(w) = handles.window {
+            if w.kind() != BlockKind::Window {
+                return Err(LiveError::WrongKind { expected: BlockKind::Window, got: w.kind() });
+            }
+        }
+        self.handles_current(handles)?;
         if tokens.len() == BLOCK {
             if let Some(id) = self.tree.find(parent, pos, tokens) {
-                let twin = self.tree.handle(id).expect("a found block has a handle");
-                if self.records.generation(twin.slot(), twin.kind()) == Some(twin.generation()) {
-                    return Ok(id);
-                }
+                let twin = self.tree.handle(id).expect("a found block has handles");
+                if self.handles_current(twin).is_ok() { return Ok(id); }
                 self.remove(id)?; // the stale twin: evict it, then insert fresh below
             }
         }
-        self.records.add_ref(entry.slot(), entry.kind())?;
-        match self.tree.insert(parent, pos, tokens, entry) {
-            Ok(id) => Ok(id),
-            Err(e) => match self.records.drop_ref(entry.slot(), entry.kind()) {
-                Ok(()) => Err(e.into()),
-                Err(pool) => Err(pool.into()),
-            },
-        }
+        Ok(self.tree.insert(parent, pos, tokens, handles)?)
     }
+
+    /// Pin a block for an active lane or step. The first pin takes one
+    /// generation-checked ref on each of the block's entries; further
+    /// pins only count. A stale block cannot be pinned. `Ok(false)`
+    /// when the id names no block here.
+    pub fn pin(&mut self, id: SealedId) -> Result<bool, LiveError> {
+        let Some(handles) = self.tree.handle(id) else { return Ok(false) };
+        self.handles_current(handles)?;
+        if self.tree.pin_count(id) == 0 {
+            let mut taken: Vec<BlockEntry> = Vec::new();
+            for e in handles.entries() {
+                match self.records.add_ref(e.slot(), e.kind(), e.generation()) {
+                    Ok(()) => taken.push(e),
+                    Err(err) => {
+                        for t in taken { let _ = self.drop_ref_if_current(t); }
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+        self.tree.pin(id)?;
+        Ok(true)
+    }
+
+    /// Drop one pin. At the last pin the entries' refs are dropped,
+    /// generation-checked: a slot reused while pinned keeps its new
+    /// owner's refcount untouched. `Ok(false)` when the id names no
+    /// block here or the block had no pin left.
+    pub fn unpin(&mut self, id: SealedId) -> Result<bool, LiveError> {
+        let Some(handles) = self.tree.handle(id) else { return Ok(false) };
+        if self.tree.pin_count(id) == 0 { return Ok(false); }
+        if self.tree.pin_count(id) == 1 { self.drop_pinned(handles)?; }
+        Ok(self.tree.unpin(id))
+    }
+
+    /// How many pins hold this block.
+    pub fn pin_count(&self, id: SealedId) -> u32 { self.tree.pin_count(id) }
 
     /// Keep or drop one holder of a start point (see `PrefixTree`).
     pub fn retain_start(&mut self, id: SealedId) -> Result<bool, BlockError> { self.tree.retain_start(id) }
     pub fn release_start(&mut self, id: SealedId) -> bool { self.tree.release_start(id) }
 
-    /// The entry the tree holds on a block, if it is here. After a
+    /// The handles the tree holds on a block, if it is here. After a
     /// racing publisher's `Ok(id)`, this is how the caller tells whose
-    /// entry the tree kept.
-    pub fn handle(&self, id: SealedId) -> Option<BlockEntry> { self.tree.handle(id) }
+    /// entries the tree kept.
+    pub fn handle(&self, id: SealedId) -> Option<BlockHandles> { self.tree.handle(id) }
 
-    /// Remove a block and everything below it, dropping their refs.
-    pub fn remove(&mut self, id: SealedId) -> Result<Vec<BlockEntry>, LiveError> {
-        let handles = self.tree.remove(id);
+    /// Remove a block and everything below it. Pinned blocks among
+    /// them drop their refs generation-checked (see
+    /// `drop_ref_if_current`); idle blocks held no ref to drop.
+    pub fn remove(&mut self, id: SealedId) -> Result<Vec<BlockHandles>, LiveError> {
+        let removed = self.tree.remove_with_pins(id);
         let mut first_err = None;
-        for h in &handles {
-            if let Err(e) = self.records.drop_ref(h.slot(), h.kind()) {
-                if first_err.is_none() { first_err = Some(e); }
+        for (h, pins) in &removed {
+            if *pins > 0 {
+                if let Err(e) = self.drop_pinned(*h) {
+                    if first_err.is_none() { first_err = Some(e); }
+                }
             }
         }
+        let handles: Vec<BlockHandles> = removed.into_iter().map(|(h, _)| h).collect();
         match first_err {
             None => Ok(handles),
-            Some(e) => Err(e.into()),
+            Some(e) => Err(e),
         }
     }
 
-    /// The deepest start point whose blocks are all still the slots and
-    /// generations the tree sealed them at. A seek first evicts every
-    /// stale block in the tree — not only those on the matched path, as
-    /// the model's `Seek` does — each through `remove`, so refs are
-    /// dropped, never leaked; a pool error from an eviction is
-    /// returned, not swallowed. The eviction scan is linear in the
-    /// tree's blocks, which bounds what a seek may cost.
-    pub fn deepest_start(&mut self, tokens: &[u32]) -> Result<StartMatch<BlockEntry>, LiveError> {
+    /// The deepest start point whose blocks are all still the slots
+    /// and generations the tree sealed them at. A seek first evicts
+    /// every stale block in the tree — not only those on the matched
+    /// path, as the model's `Seek` does — so a later lookup never
+    /// meets it; a pool error from an eviction is returned, not
+    /// swallowed. The result never covers the whole prompt when the
+    /// prompt is non-empty: an exact full match steps back one block,
+    /// leaving at least the final token to prefill.
+    pub fn deepest_start(&mut self, tokens: &[u32]) -> Result<StartMatch<BlockHandles>, LiveError> {
         let stale: Vec<SealedId> = self.tree.entries().into_iter()
-            .filter(|(_, e)| self.records.generation(e.slot(), e.kind()) != Some(e.generation()))
+            .filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))
             .map(|(id, _)| id)
             .collect();
         for id in stale {
@@ -421,7 +553,13 @@ impl<R: SlotRecords> LiveTree<R> {
             // it again removes nothing and drops no second ref
             self.remove(id)?;
         }
-        Ok(self.tree.deepest_start(tokens))
+        let m = self.tree.deepest_start(tokens);
+        if !tokens.is_empty() && m.at == tokens.len() {
+            // exact full-prompt match: step back one block so the
+            // suffix to prefill is never empty
+            return Ok(self.tree.deepest_start(&tokens[..tokens.len() - BLOCK]));
+        }
+        Ok(m)
     }
 }
 
@@ -588,8 +726,14 @@ mod tests {
     }
 
     impl SlotRecords for FakeRecords {
-        fn add_ref(&mut self, slot: Slot, kind: BlockKind) -> Result<(), BlockError> { self.record(slot, kind).add_ref() }
-        fn drop_ref(&mut self, slot: Slot, kind: BlockKind) -> Result<(), BlockError> { self.record(slot, kind).drop_ref() }
+        fn add_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError> {
+            if self.generation(slot, kind) != Some(generation) { return Err(BlockError::Generation); }
+            self.record(slot, kind).add_ref()
+        }
+        fn drop_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError> {
+            if self.generation(slot, kind) != Some(generation) { return Err(BlockError::Generation); }
+            self.record(slot, kind).drop_ref()
+        }
         fn generation(&self, slot: Slot, kind: BlockKind) -> Option<u32> {
             // an untouched slot reads as generation 1, the generation
             // `record` takes it at (fresh 0 bumped once on first use)
@@ -601,43 +745,60 @@ mod tests {
         BlockEntry::new(Slot::new(slot).unwrap(), generation, 4096, kind)
     }
 
+    fn handles(slot: u32, generation: u32) -> BlockHandles {
+        BlockHandles::new(entry(slot, generation, BlockKind::Full), None)
+    }
+
+    fn handles_win(slot: u32, generation: u32, wslot: u32, wgen: u32) -> BlockHandles {
+        BlockHandles::new(entry(slot, generation, BlockKind::Full), Some(entry(wslot, wgen, BlockKind::Window)))
+    }
+
     #[test]
     fn a_reused_slots_stale_entry_is_a_miss_never_a_match() {
         // Rowan's failing case: insert A at (slot 3, gen 1); the pool
         // reuses slot 3 at gen 2 for other tokens; A's tokens must miss,
-        // and the eviction must drop both blocks' refs, not leak them.
+        // and pinned refs must settle, not leak.
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
-        let b = live.insert(Some(a), BLOCK, &block(2), entry(4, 1, BlockKind::Full)).unwrap();
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
+        let b = live.insert(Some(a), BLOCK, &block(2), handles(4, 1)).unwrap();
         live.retain_start(b).unwrap();
         let toks = [block(1), block(2)].concat();
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "insert took a ref");
-        assert_eq!(live.deepest_start(&toks).unwrap().at, 2 * BLOCK);
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "a cached block sits at zero refs");
+        live.pin(a).unwrap();
+        live.pin(b).unwrap();
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "the first pin took the ref");
+        live.retain_start(a).unwrap();
+        assert_eq!(live.deepest_start(&toks).unwrap().at, BLOCK, "exact full match steps back one block");
         live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // slot 3 is generation 2 now
         let m = live.deepest_start(&toks).unwrap();
         assert_eq!(m.at, 0, "the gen-1 entry for a gen-2 slot is stale: a miss, not a match");
         assert_eq!(live.deepest_start(&toks).unwrap().at, 0, "and it was evicted, not rechecked forever");
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "the evicted root's ref was dropped");
-        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "the evicted child's ref was dropped too (Rowan's leak)");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "no ref leaks on the reused slot");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "the evicted child's pinned ref was dropped too");
         // a fresh block at the slot's new generation matches again
-        let a2 = live.insert(None, 0, &block(1), entry(3, 2, BlockKind::Full)).unwrap();
+        let a2 = live.insert(None, 0, &block(1), handles(3, 2)).unwrap();
         live.retain_start(a2).unwrap();
-        assert_eq!(live.deepest_start(&block(1)).unwrap().blocks, vec![entry(3, 2, BlockKind::Full)]);
+        assert_eq!(live.deepest_start(&block(1)).unwrap().at, 0, "one block is the whole prompt: the suffix is never empty");
+        assert_eq!(live.deepest_start(&[block(1), block(9)].concat()).unwrap().blocks, vec![handles(3, 2)]);
     }
 
     #[test]
     fn a_fresh_block_is_never_lost_to_its_stale_twin() {
         // the stale twin is still in the tree when the fresh block is
         // sealed at the slot's new generation: the dedupe must evict
-        // the twin (dropping its ref) and keep the fresh block
+        // the twin and keep the fresh block, unpinned like any cache entry
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
+        live.pin(a).unwrap();
         live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // gen 2; the gen-1 twin is stale
-        let a2 = live.insert(None, 0, &block(1), entry(3, 2, BlockKind::Full)).unwrap();
+        let a2 = live.insert(None, 0, &block(1), handles(3, 2)).unwrap();
         assert_ne!(a2, a, "the fresh block is a new block, not the stale twin");
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "twin's ref dropped, fresh ref held");
+        assert_eq!(live.pin_count(a2), 0, "the fresh block starts unpinned");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0,
+            "the twin's pin died with its generation; no blind drop touched the new owner");
+        live.pin(a2).unwrap();
         live.retain_start(a2).unwrap();
-        assert_eq!(live.deepest_start(&block(1)).unwrap().blocks, vec![entry(3, 2, BlockKind::Full)],
+        assert_eq!(live.deepest_start(&[block(1), block(9)].concat()).unwrap().blocks, vec![handles(3, 2)],
             "and the fresh block survives the next seek");
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1);
     }
@@ -648,49 +809,91 @@ mod tests {
         // generation-1 entry must not be accepted — for new tokens or
         // for tokens already in the tree — and must take no ref
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
         live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // slot 3 is generation 2 now
         let stale = LiveError::StaleEntry { slot: Slot::new(3).unwrap(), claimed: 1, current: Some(2) };
-        assert_eq!(live.insert(None, 0, &block(9), entry(3, 1, BlockKind::Full)), Err(stale.clone()),
+        assert_eq!(live.insert(None, 0, &block(9), handles(3, 1)), Err(stale.clone()),
             "a gen-1 entry for a gen-2 slot is refused, not inserted");
-        assert_eq!(live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)), Err(stale),
+        assert_eq!(live.insert(None, 0, &block(1), handles(3, 1)), Err(stale),
             "the same refusal when the tokens are already in the tree");
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "no ref was taken by either refusal");
-        assert_eq!(live.handle(a), Some(entry(3, 1, BlockKind::Full)), "the tree is unchanged");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "no ref was taken by either refusal");
+        assert_eq!(live.handle(a), Some(handles(3, 1)), "the tree is unchanged");
         // a fresh entry at the current generation still lands
-        assert!(live.insert(None, 0, &block(9), entry(3, 2, BlockKind::Full)).is_ok());
+        assert!(live.insert(None, 0, &block(9), handles(3, 2)).is_ok());
     }
 
     #[test]
     fn a_seek_evicts_stale_blocks_off_the_matched_path() {
-        // the model's Seek evicts every stale block; the code now does
-        // the same, so a stale block the request never touches is gone
-        // (with its ref) after any seek, not only after a matching one
+        // the model's Seek evicts every stale block; the code does the
+        // same, so a stale block the request never touches is gone
+        // after any seek, not only after a matching one
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
-        let off = live.insert(None, 0, &block(7), entry(4, 1, BlockKind::Full)).unwrap();
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
+        let off = live.insert(None, 0, &block(7), handles(4, 1)).unwrap();
         live.retain_start(a).unwrap();
-        live.retain_start(off).unwrap();
+        live.pin(off).unwrap();
         live.records.reuse(Slot::new(4).unwrap(), BlockKind::Full); // slot 4 at gen 2: `off` is stale
-        let m = live.deepest_start(&block(1)).unwrap();
+        let m = live.deepest_start(&[block(1), block(9)].concat()).unwrap();
         assert_eq!(m.at, BLOCK, "the live path still matches");
         assert_eq!(live.handle(off), None, "the stale off-path block was evicted by the seek");
-        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "and its ref was dropped");
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "the live block keeps its ref");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "and no ref is left on the reused slot");
+    }
+
+    #[test]
+    fn pins_take_and_drop_one_ref_per_block() {
+        let mut live = LiveTree::new(FakeRecords::default());
+        let a = live.insert(None, 0, &block(1), handles_win(3, 1, 4, 1)).unwrap();
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "idle: no Full ref");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Window), 0, "idle: no Window ref");
+        live.pin(a).unwrap();
+        live.pin(a).unwrap();
+        assert_eq!(live.pin_count(a), 2);
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "two pins, one Full ref");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Window), 1, "two pins, one Window ref");
+        assert_eq!(live.handle(a).unwrap().window(), Some(entry(4, 1, BlockKind::Window)), "both entries ride on the node");
+        live.unpin(a).unwrap();
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "a pin remains");
+        live.unpin(a).unwrap();
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "the last unpin dropped the Full ref");
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Window), 0, "and the Window ref");
+        assert_eq!(live.unpin(a), Ok(false), "no pin left to drop");
+        // removing a pinned block drops its refs; removing an idle one drops none
+        live.pin(a).unwrap();
+        let gone = live.remove(a).unwrap();
+        assert_eq!(gone, vec![handles_win(3, 1, 4, 1)]);
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0);
+    }
+
+    #[test]
+    fn a_reused_slots_new_owner_keeps_its_refcount() {
+        // the generation-checked drop: a block pinned at gen 1, its
+        // slot reused to gen 2 and re-owned; evicting the stale block
+        // must not drop the new owner's ref
+        let mut live = LiveTree::new(FakeRecords::default());
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
+        live.pin(a).unwrap();
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // gen 2; Emma's poolgate resets refs there
+        live.records.add_ref(Slot::new(3).unwrap(), BlockKind::Full, 2).unwrap(); // the new owner's ref
+        live.remove(a).unwrap();
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1,
+            "the stale block's eviction skipped the drop: the new owner's ref stands");
+        // and a generation-blind checked drop at the old generation refuses outright
+        assert_eq!(live.records.drop_ref(Slot::new(3).unwrap(), BlockKind::Full, 1), Err(BlockError::Generation));
     }
 
     #[test]
     fn live_inserts_and_removes_balance_their_refs() {
         let mut live = LiveTree::new(FakeRecords::default());
-        let a = live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)).unwrap();
-        assert_eq!(live.insert(None, 0, &block(1), entry(3, 1, BlockKind::Full)), Ok(a), "a racing publisher dedupes");
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "and takes no second ref");
-        // a refused insert rolls its ref back
-        assert!(live.insert(Some(a), 0, &block(2), entry(4, 1, BlockKind::Full)).is_err());
+        let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
+        assert_eq!(live.insert(None, 0, &block(1), handles(3, 1)), Ok(a), "a racing publisher dedupes");
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "and still takes no ref");
+        // a refused insert takes no ref either
+        assert!(live.insert(Some(a), 0, &block(2), handles(4, 1)).is_err());
         assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0);
+        live.pin(a).unwrap();
         let gone = live.remove(a).unwrap();
-        assert_eq!(gone, vec![entry(3, 1, BlockKind::Full)]);
-        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "removal dropped the ref");
+        assert_eq!(gone, vec![handles(3, 1)]);
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "removal dropped the pinned ref");
     }
 
     /// One abstract block of the model (two tokens over {1, 2}) as a
@@ -732,7 +935,7 @@ mod tests {
     /// resulting state emitted as one row of `PrefixTreeTraceData.tla`.
     /// TLC then checks the emitted states are behaviours of
     /// `specs/PrefixTree.tla`. The walk opens with a steered pass over
-    /// the model's request — held starts on the path, a stale root, a
+    /// the model's request — held starts, pins, a stale root, a
     /// stale-twin reinsert — then wanders, seeks included, so a broken
     /// seek writes a row the model cannot step to. Ignored by default;
     /// `specs/run_tlc.zsh` runs it before the trace check.
@@ -751,76 +954,98 @@ mod tests {
         };
 
         let snapshot = |live: &LiveTree<FakeRecords>, seq_of: &HashMap<SealedId, Vec<u32>>,
-                        op: &str, s: &[u32], slot: u32, result: &[u32], sought: bool| -> String {
+                        op: &str, s: &[u32], slot: u32, wslot: u32, result: &[u32], sought: bool| -> String {
             let mut sealed: Vec<String> = vec![tla_seq(&[])];
-            let (mut starts, mut slot_of_m, mut gen_of, mut refs) =
-                (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
-            for (id, e) in live.tree.entries() {
+            let (mut starts, mut slot_of_m, mut gen_of, mut win_slot, mut win_gen, mut refs) =
+                (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+            for (id, h) in live.tree.entries() {
                 let seq = seq_of[&id].clone();
                 sealed.push(tla_seq(&seq));
                 starts.insert(seq.clone(), live.tree.start_holders(id) as i64);
-                slot_of_m.insert(seq.clone(), e.slot().get() as i64);
-                gen_of.insert(seq.clone(), e.generation() as i64 - 1);
-                refs.insert(seq, 1);
+                slot_of_m.insert(seq.clone(), h.full().slot().get() as i64);
+                gen_of.insert(seq.clone(), h.full().generation() as i64 - 1);
+                if let Some(w) = h.window() {
+                    win_slot.insert(seq.clone(), w.slot().get() as i64);
+                    win_gen.insert(seq.clone(), w.generation() as i64 - 1);
+                }
+                if live.pin_count(id) > 0 { refs.insert(seq, 1); }
             }
-            // the pool's own counts, read from the records: PoolBooks
-            // in PrefixTreeTrace binds them to the sealed blocks
-            let pool_refs = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]",
-                live.records.pool_refs(Slot::new(1).unwrap(), BlockKind::Full),
-                live.records.pool_refs(Slot::new(2).unwrap(), BlockKind::Full),
-                live.records.pool_refs(Slot::new(3).unwrap(), BlockKind::Full));
+            // the pool's own counts, read from the records (both kinds
+            // summed per slot): PoolBooks in PrefixTreeTrace binds them
+            // to the pinned blocks and their entries
+            let pr = |sl: u32| live.records.pool_refs(Slot::new(sl).unwrap(), BlockKind::Full)
+                + live.records.pool_refs(Slot::new(sl).unwrap(), BlockKind::Window);
+            let pool_refs = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", pr(1), pr(2), pr(3));
             let g = |sl: u32| live.records.generation(Slot::new(sl).unwrap(), BlockKind::Full).unwrap() - 1;
             let pool = format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", g(1), g(2), g(3));
             format!(
-                "[op |-> \"{op}\", s |-> {}, slot |-> {slot}, sealed |-> {{{}}}, starts |-> {}, \
-                 slotOf |-> {}, genOf |-> {}, poolGen |-> {}, refs |-> {}, poolRefs |-> {}, result |-> {}, sought |-> {}]",
+                "[op |-> \"{op}\", s |-> {}, slot |-> {slot}, wslot |-> {wslot}, sealed |-> {{{}}}, starts |-> {}, \
+                 slotOf |-> {}, genOf |-> {}, winSlotOf |-> {}, winGenOf |-> {}, poolGen |-> {}, refs |-> {}, poolRefs |-> {}, result |-> {}, sought |-> {}, bad |-> FALSE]",
                 tla_seq(s), sealed.join(", "), tla_fn(&starts), tla_fn(&slot_of_m),
-                tla_fn(&gen_of), pool, tla_fn(&refs), pool_refs, tla_seq(result),
+                tla_fn(&gen_of), tla_fn(&win_slot), tla_fn(&win_gen), pool, tla_fn(&refs), pool_refs, tla_seq(result),
                 if sought { "TRUE" } else { "FALSE" })
         };
         let req_abstract: Vec<u32> = vec![1, 2, 1, 2];
         let req: Vec<u32> = [enc([1, 2]), enc([1, 2])].concat();
+        // a handles pair on two distinct slots, at their current generations
+        let pair = |live: &LiveTree<FakeRecords>, slot: u32, wslot: u32| -> BlockHandles {
+            let fg = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
+            let wg = live.records.generation(Slot::new(wslot).unwrap(), BlockKind::Window).unwrap();
+            handles_win(slot, fg, wslot, wg)
+        };
 
-        rows.push(snapshot(&live, &seq_of, "init", &[], 0, &[], false));
+        rows.push(snapshot(&live, &seq_of, "init", &[], 0, 0, &[], false));
 
         // --- the steered pass over the model's request ---
-        let root = live.insert(None, 0, &enc([1, 2]), entry(1, 1, BlockKind::Full)).unwrap();
+        let root = live.insert(None, 0, &enc([1, 2]), pair(&live, 1, 3)).unwrap();
         seq_of.insert(root, vec![1, 2]);
-        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 1, &[], false));
-        let child = live.insert(Some(root), BLOCK, &enc([1, 2]), entry(2, 1, BlockKind::Full)).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 1, 3, &[], false));
+        let child = live.insert(Some(root), BLOCK, &enc([1, 2]), pair(&live, 2, 1)).unwrap();
         seq_of.insert(child, req_abstract.clone());
-        rows.push(snapshot(&live, &seq_of, "seal", &req_abstract, 2, &[], false));
+        rows.push(snapshot(&live, &seq_of, "seal", &req_abstract, 2, 1, &[], false));
         live.retain_start(root).unwrap();
-        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, 0, &[], false));
         live.retain_start(child).unwrap();
-        rows.push(snapshot(&live, &seq_of, "retain", &req_abstract, 0, &[], false));
+        rows.push(snapshot(&live, &seq_of, "retain", &req_abstract, 0, 0, &[], false));
+        live.pin(root).unwrap();
+        rows.push(snapshot(&live, &seq_of, "pin", &[1, 2], 0, 0, &[], false));
+        live.pin(child).unwrap();
+        rows.push(snapshot(&live, &seq_of, "pin", &req_abstract, 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
-        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
         assert!(live.release_start(child));
-        rows.push(snapshot(&live, &seq_of, "release", &req_abstract, 0, &[], false));
+        rows.push(snapshot(&live, &seq_of, "release", &req_abstract, 0, 0, &[], false));
+        live.unpin(child).unwrap();
+        rows.push(snapshot(&live, &seq_of, "unpin", &req_abstract, 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
-        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
-        live.records.reuse(Slot::new(1).unwrap(), BlockKind::Full); // the root's slot moves on: the root is stale
-        rows.push(snapshot(&live, &seq_of, "reuse", &[], 1, &[], false));
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
+        // the root's slots move on: the root (and the child below it) is stale
+        live.records.reuse(Slot::new(1).unwrap(), BlockKind::Full);
+        live.records.reuse(Slot::new(1).unwrap(), BlockKind::Window);
+        rows.push(snapshot(&live, &seq_of, "reuse", &[], 1, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
-        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
-        // the stale twin, reinserted fresh on another slot
-        let root2 = live.insert(None, 0, &enc([1, 2]), entry(3, 1, BlockKind::Full)).unwrap();
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
+        // the stale twin, reinserted fresh on other slots
+        let root2 = live.insert(None, 0, &enc([1, 2]), pair(&live, 3, 2)).unwrap();
         seq_of.insert(root2, vec![1, 2]);
-        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 3, &[], false));
+        rows.push(snapshot(&live, &seq_of, "seal", &[1, 2], 3, 2, &[], false));
         live.retain_start(root2).unwrap();
-        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
-        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // root2 is stale now, still sealed
-        rows.push(snapshot(&live, &seq_of, "reuse", &[], 3, &[], false));
-        let root3 = live.insert(None, 0, &enc([1, 2]), entry(2, 1, BlockKind::Full)).unwrap();
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, 0, &[], false));
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full);
+        live.records.reuse(Slot::new(3).unwrap(), BlockKind::Window);
+        rows.push(snapshot(&live, &seq_of, "reuse", &[], 3, 0, &[], false));
+        let fresh = pair(&live, 2, 1);
+        let root3 = live.insert(None, 0, &enc([1, 2]), fresh).unwrap();
         assert_ne!(root3, root2, "the fresh block replaces the stale twin");
         seq_of.retain(|id, _| *id != root2);
         seq_of.insert(root3, vec![1, 2]);
-        rows.push(snapshot(&live, &seq_of, "seal-twin", &[1, 2], 2, &[], false));
+        rows.push(snapshot(&live, &seq_of, "seal-twin", &[1, 2], 2, 1, &[], false));
         live.retain_start(root3).unwrap();
-        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, &[], false));
+        rows.push(snapshot(&live, &seq_of, "retain", &[1, 2], 0, 0, &[], false));
+        live.pin(root3).unwrap();
+        rows.push(snapshot(&live, &seq_of, "pin", &[1, 2], 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
-        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
 
         // --- the wander: every operation, seeks included ---
         let mut mutating = 0;
@@ -829,7 +1054,7 @@ mod tests {
             attempts += 1;
             let live_ids: Vec<SealedId> = live.tree.entries().into_iter().map(|(id, _)| id).collect();
             seq_of.retain(|id, _| live_ids.contains(id));
-            match pick(8) {
+            match pick(10) {
                 0 => { // seal a fresh block under a live parent (or the root)
                     let parents: Vec<Option<SealedId>> = std::iter::once(None)
                         .chain(live_ids.iter().filter(|id| seq_of[id].len() == 2).map(|id| Some(*id)))
@@ -841,22 +1066,22 @@ mod tests {
                     seq.extend(block);
                     if seq_of.values().any(|s| *s == seq) { continue; }
                     let slot = 1 + pick(3) as u32;
-                    let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
+                    let wslot = 1 + (slot + pick(2) as u32) % 3;
                     let id = live.insert(parent, base.len() / 2 * BLOCK, &enc(block),
-                        entry(slot, gen, BlockKind::Full)).expect("a fresh seal at the current generation");
+                        pair(&live, slot, wslot)).expect("a fresh seal at the current generations");
                     seq_of.insert(id, seq.clone());
-                    rows.push(snapshot(&live, &seq_of, "seal", &seq, slot, &[], false));
+                    rows.push(snapshot(&live, &seq_of, "seal", &seq, slot, wslot, &[], false));
                 }
                 1 => { // a stale insert, refused: the state must not move
                     let slot = 1 + pick(3) as u32;
                     let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
                     if gen < 2 { continue; }
                     let block = [1 + pick(2) as u32, 1 + pick(2) as u32];
-                    let got = live.insert(None, 0, &enc(block), entry(slot, gen - 1, BlockKind::Full));
+                    let got = live.insert(None, 0, &enc(block), handles(slot, gen - 1));
                     assert_eq!(got, Err(LiveError::StaleEntry {
                         slot: Slot::new(slot).unwrap(), claimed: gen - 1, current: Some(gen) }),
                         "the walk's stale insert is refused");
-                    rows.push(snapshot(&live, &seq_of, "seal-stale", &block.to_vec(), slot, &[], false));
+                    rows.push(snapshot(&live, &seq_of, "seal-stale", &block.to_vec(), slot, 0, &[], false));
                 }
                 2 => { // retain a start point (at most two holders each)
                     let held: Vec<SealedId> = live_ids.iter().copied()
@@ -865,7 +1090,7 @@ mod tests {
                     let id = held[pick(held.len())];
                     live.retain_start(id).unwrap();
                     let seq = seq_of[&id].clone();
-                    rows.push(snapshot(&live, &seq_of, "retain", &seq, 0, &[], false));
+                    rows.push(snapshot(&live, &seq_of, "retain", &seq, 0, 0, &[], false));
                 }
                 3 => { // release a held start point
                     let held: Vec<SealedId> = live_ids.iter().copied()
@@ -874,14 +1099,15 @@ mod tests {
                     let id = held[pick(held.len())];
                     assert!(live.release_start(id));
                     let seq = seq_of[&id].clone();
-                    rows.push(snapshot(&live, &seq_of, "release", &seq, 0, &[], false));
+                    rows.push(snapshot(&live, &seq_of, "release", &seq, 0, 0, &[], false));
                 }
-                4 => { // reuse a slot (abstract generation at most 2)
+                4 => { // reuse a slot, both kinds together (abstract generation at most 2)
                     let slot = 1 + pick(3) as u32;
                     let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
                     if gen >= 3 { continue; }
                     live.records.reuse(Slot::new(slot).unwrap(), BlockKind::Full);
-                    rows.push(snapshot(&live, &seq_of, "reuse", &[], slot, &[], false));
+                    live.records.reuse(Slot::new(slot).unwrap(), BlockKind::Window);
+                    rows.push(snapshot(&live, &seq_of, "reuse", &[], slot, 0, &[], false));
                 }
                 5 => { // insert a block that is already in the tree
                     if live_ids.is_empty() { continue; }
@@ -893,41 +1119,58 @@ mod tests {
                         (Some(pid), BLOCK)
                     };
                     let block = [seq[seq.len() - 2], seq[seq.len() - 1]];
-                    if live.records.generation(twin.slot(), twin.kind()) == Some(twin.generation()) {
-                        // the twin is live: a dedup, the tree keeps its entry
-                        let got = live.insert(parent, pos, &enc(block),
-                            entry(twin.slot().get(), twin.generation(), BlockKind::Full)).unwrap();
+                    let current = |e: BlockEntry| live.records.generation(e.slot(), e.kind()) == Some(e.generation());
+                    if current(twin.full()) && twin.window().map(current).unwrap_or(true) {
+                        // the twin is live: a dedup, the tree keeps its entries
+                        let got = live.insert(parent, pos, &enc(block), twin).unwrap();
                         assert_eq!(got, id, "the dedup returns the block already in the tree");
-                        rows.push(snapshot(&live, &seq_of, "seal-dup", &seq, twin.slot().get(), &[], false));
+                        rows.push(snapshot(&live, &seq_of, "seal-dup", &seq, twin.full().slot().get(), twin.window().map(|w| w.slot().get()).unwrap_or(0), &[], false));
                     } else {
-                        // the twin is stale: evicted, the fresh entry sealed in its place
+                        // the twin is stale: evicted, the fresh entries sealed in its place
                         let slot = 1 + pick(3) as u32;
-                        let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
-                        let fresh = live.insert(parent, pos, &enc(block),
-                            entry(slot, gen, BlockKind::Full)).unwrap();
+                        let wslot = 1 + (slot + pick(2) as u32) % 3;
+                        let fresh = live.insert(parent, pos, &enc(block), pair(&live, slot, wslot)).unwrap();
                         assert_ne!(fresh, id, "the fresh block replaces the stale twin");
                         seq_of.retain(|k, _| *k != id);
                         seq_of.insert(fresh, seq.clone());
-                        rows.push(snapshot(&live, &seq_of, "seal-twin", &seq, slot, &[], false));
+                        rows.push(snapshot(&live, &seq_of, "seal-twin", &seq, slot, wslot, &[], false));
                     }
                 }
                 6 => { // seek the model's request, wherever the walk is
                     let m = live.deepest_start(&req).unwrap();
-                    rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+                    rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
+                }
+                7 => { // pin a live, unpinned block
+                    let cand: Vec<SealedId> = live_ids.iter().copied()
+                        .filter(|id| live.pin_count(*id) == 0).collect();
+                    if cand.is_empty() { continue; }
+                    let id = cand[pick(cand.len())];
+                    if live.pin(id).is_err() { continue; } // stale: not pinnable, no row
+                    let seq = seq_of[&id].clone();
+                    rows.push(snapshot(&live, &seq_of, "pin", &seq, 0, 0, &[], false));
+                }
+                8 => { // unpin a pinned block
+                    let cand: Vec<SealedId> = live_ids.iter().copied()
+                        .filter(|id| live.pin_count(*id) > 0).collect();
+                    if cand.is_empty() { continue; }
+                    let id = cand[pick(cand.len())];
+                    live.unpin(id).unwrap();
+                    let seq = seq_of[&id].clone();
+                    rows.push(snapshot(&live, &seq_of, "unpin", &seq, 0, 0, &[], false));
                 }
                 _ => { // remove a block and everything below it
                     if live_ids.is_empty() { continue; }
                     let id = live_ids[pick(live_ids.len())];
                     let seq = seq_of[&id].clone();
                     live.remove(id).unwrap();
-                    rows.push(snapshot(&live, &seq_of, "remove", &seq, 0, &[], false));
+                    rows.push(snapshot(&live, &seq_of, "remove", &seq, 0, 0, &[], false));
                 }
             }
             mutating += 1;
         }
         assert_eq!(mutating, 40, "the walk took its wandering steps");
         let m = live.deepest_start(&req).unwrap();
-        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, &req_abstract[..m.at / BLOCK * 2], true));
+        rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
 
         let body = format!(
             "------------------------- MODULE PrefixTreeTraceData -------------------------\n\
@@ -943,16 +1186,21 @@ mod tests {
     fn entry_handles_come_back_as_johnnys_entries() {
         let full = BlockEntry::new(Slot::new(3).unwrap(), 1, 4096, BlockKind::Full);
         let win = BlockEntry::new(Slot::new(5).unwrap(), 2, 8192, BlockKind::Window);
+        let full2 = BlockEntry::new(Slot::new(4).unwrap(), 1, 4096, BlockKind::Full);
+        let ha = BlockHandles::new(full, Some(win));
+        let hb = BlockHandles::new(full2, None);
         let mut t: EntryTree = PrefixTree::new();
-        let a = t.insert(None, 0, &block(1), full).unwrap();
-        let b = t.insert(Some(a), BLOCK, &block(2), win).unwrap();
+        let a = t.insert(None, 0, &block(1), ha).unwrap();
+        let b = t.insert(Some(a), BLOCK, &block(2), hb).unwrap();
         t.retain_start(b).unwrap();
         let m = t.deepest_start(&[block(1), block(2), block(3)].concat());
         assert_eq!(m.at, 2 * BLOCK);
-        assert_eq!(m.blocks, vec![full, win]);
-        assert_eq!(m.blocks[0].kind(), BlockKind::Full);
-        assert_eq!(m.blocks[0].offset(), 4096);
-        assert_eq!(m.blocks[0].slot().get(), 3);
-        assert_eq!(m.blocks[1].generation(), 2);
+        assert_eq!(m.blocks, vec![ha, hb]);
+        assert_eq!(m.blocks[0].full().kind(), BlockKind::Full);
+        assert_eq!(m.blocks[0].full().offset(), 4096);
+        assert_eq!(m.blocks[0].full().slot().get(), 3);
+        assert_eq!(m.blocks[0].window(), Some(win), "the Window entry rides on the same node");
+        assert_eq!(m.blocks[0].window().unwrap().generation(), 2);
+        assert_eq!(m.blocks[1].window(), None);
     }
 }

@@ -63,7 +63,7 @@ check PrefixTreeAnyParent PrefixTree ResultIsStart
 check PrefixTreePartial PrefixTree StartOnBoundary
 check PrefixTreeLeak PrefixTree RefsSettledAfterSeek
 check PrefixTreeReuseHeld PrefixTree HeldNeverStale
-check PrefixTreeStaleInsert PrefixTree HeldNeverStale
+check PrefixTreeStaleInsert PrefixTree NoBadInsert
 # The trace binding: regenerate the walk trace from the code under
 # test, then check every emitted state is a behaviour of the spec.
 (cd "$root/.." && INKY_PREFIX_TRACE_OUT="$root/PrefixTreeTraceData.tla" \
@@ -104,8 +104,8 @@ mutant() {
     printf "mutant-%s | red as required (%s)\n" "$name" "$expected"
 }
 mutant no-evict \
-    '.filter(|(_, e)| self.records.generation(e.slot(), e.kind()) != Some(e.generation()))' \
-    '.filter(|(_, _e)| false)' \
+    '.filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))' \
+    '.filter(|(_, _h)| false)' \
     'Deadlock reached'
 mutant shallowest \
     'if n.starts > 0 {
@@ -114,7 +114,7 @@ mutant shallowest \
                 best = StartMatch' \
     'Deadlock reached'
 mutant ref-leak \
-    'self.records.drop_ref(h.slot(), h.kind())' \
+    'self.records.drop_ref(e.slot(), e.kind(), e.generation())' \
     'Ok::<(), BlockError>(())' \
     'Invariant PoolBooks is violated'
 if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
