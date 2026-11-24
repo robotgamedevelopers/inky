@@ -440,8 +440,13 @@ fn binv(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
-/// Compare the same target row through tensor prefill and tensor decode. Start each comparison
-/// from identical cache and convolution state so a previous decode cannot affect a later test.
+/// Compare the same target row through tensor prefill and tensor decode. Every checked end gets its own
+/// span of CROSSPATH_SPAN rows ending at that end (fewer only when the end is shorter), started from one
+/// base lane that never takes part in a comparison: the prefill lane runs the whole span as one multi-row
+/// prefill, the decode lane prefills all but its last row and decodes that row. A one-row prefill would take
+/// the decode path's ring write (`ring = l.swa && t == 1` in engine.rs) and compare decode with itself, so
+/// every span has at least two rows, and a span ending just past a split boundary crosses it.
+const CROSSPATH_SPAN: usize = 17;
 fn crosspath(o: &Opts) {
     use engine::Span;
 
@@ -451,15 +456,17 @@ fn crosspath(o: &Opts) {
         "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049".into()
     }).split(',').map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts")).collect();
     let len = *ends.last().unwrap();
-    assert!(ends[0] > 0 && ends.windows(2).all(|p| p[0] < p[1]),
-            "INK_COMPARE_ENDS must list increasing positive token counts");
+    assert!(ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
+            "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)");
     assert!(len <= toks.len() && len <= o.ctx, "crosspath fixture or context is too short");
 
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
+    assert!(CROSSPATH_SPAN <= eng.chunk, "a crosspath span must fit one prefill chunk");
+    let base = Lane::new(&eng);
     let prefill = Lane::new(&eng);
     let decode = Lane::new(&eng);
-    for lane in [&prefill, &decode] {
+    for lane in [&base, &prefill, &decode] {
         let run = eng.on(lane);
         run.reserve(len, false);
         run.set_tokens(0, &toks[..len]);
@@ -471,21 +478,21 @@ fn crosspath(o: &Opts) {
         cb.commit();
         cb.waitUntilCompleted();
     };
+    // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
     let mut cursor = 0;
     let mut ok = true;
     for end in ends {
-        // Include several preceding rows in the prefill wherever the chosen positions allow it.
-        let start = cursor.max(end.saturating_sub(17.min(eng.chunk)));
+        let start = end.saturating_sub(CROSSPATH_SPAN);
+        let target = end - 1;
+        assert!(start >= cursor && target - start >= 1, "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows");
         while cursor < start {
             let count = (start - cursor).min(eng.chunk);
-            run_prefill(&prefill, cursor, count, false);
+            run_prefill(&base, cursor, count, false);
             cursor += count;
         }
-        eng.copy_lane(&prefill, &decode);
-        let target = end - 1;
-        if start < target {
-            run_prefill(&decode, start, target - start, false);
-        }
+        eng.copy_lane(&base, &prefill);
+        eng.copy_lane(&base, &decode);
+        run_prefill(&decode, start, target - start, false);
         run_prefill(&prefill, start, end - start, true);
         let expected = eng.logits().to_vec();
         let cb = eng.gpu.cmd();
@@ -498,17 +505,16 @@ fn crosspath(o: &Opts) {
         });
         let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&decode);
         if let Some(i) = first_bad {
-            println!("after {end} tokens: logit {i} differs (prefill {:08x}, decode {:08x})",
+            println!("after {end} tokens: logit {i} differs (prefill {:08x}, decode {:08x}), prefill span [{start}, {end})",
                      expected[i].to_bits(), actual[i].to_bits());
         }
         if !state_equal {
-            println!("after {end} tokens: cache or convolution state differs");
+            println!("after {end} tokens: cache or convolution state differs, prefill span [{start}, {end})");
         }
         if first_bad.is_none() && state_equal {
-            println!("after {end} tokens: exact, prefill span {}", end - start);
+            println!("after {end} tokens: exact, prefill span [{start}, {end}) of {} rows", end - start);
         }
         ok &= first_bad.is_none() && state_equal;
-        cursor = end;
     }
     if !ok {
         println!("CROSSPATH MISMATCH");
