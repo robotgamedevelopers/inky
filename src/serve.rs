@@ -31,7 +31,11 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// default hard cap on thinking tokens before forcing `<|end_message|>` (`0` = unlimited)
                       pub thinking_budget: usize,
                       /// optional directory for opt-in JSONL card traffic recording (`--record-dir`)
-                      pub record_dir: Option<std::path::PathBuf> }
+                      pub record_dir: Option<std::path::PathBuf>,
+                      /// optional directory for Layer 4 lazy LRU SSD block spill (`--spill-dir`)
+                      pub spill_dir: Option<std::path::PathBuf>,
+                      /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
+                      pub max_spill_bytes: u64 }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -1939,6 +1943,23 @@ pub fn serve(o: ServeOpts) {
     let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::new(d.clone())));
+    if let Some(spill_dir) = &o.spill_dir {
+        match crate::spill::SpillStore::open(spill_dir, o.max_spill_bytes) {
+            Ok(store) => {
+                let swept = store.stats().orphans_swept;
+                eprintln!(
+                    "[serve] spill dir {} ready (budget {:.2} GiB, swept {} orphan tmp file(s))",
+                    store.dir().display(),
+                    o.max_spill_bytes as f64 / (1u64 << 30) as f64,
+                    swept,
+                );
+            }
+            Err(e) => {
+                eprintln!("cannot prepare --spill-dir {}: {e}", spill_dir.display());
+                std::process::exit(2);
+            }
+        }
+    }
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),

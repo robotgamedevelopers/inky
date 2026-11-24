@@ -15,6 +15,7 @@ mod memd;
 mod poolgate;
 mod record;
 mod serve;
+mod spill;
 mod tuning;
 mod tokenizer;
 mod unicode_tables;
@@ -73,6 +74,9 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
+  --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
+  --max-spill-bytes N
+                    maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -81,6 +85,10 @@ fn cli_error(error: String) -> ! {
 }
 
 fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
+    value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
+}
+
+fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
     value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
 }
 
@@ -100,6 +108,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
+        spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -128,6 +137,8 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
             "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
+            "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
+            "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -176,6 +187,9 @@ mod cli_tests {
             (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
             (&["--record-dir"], "missing value for --record-dir"),
+            (&["--spill-dir"], "missing value for --spill-dir"),
+            (&["--max-spill-bytes"], "missing value for --max-spill-bytes"),
+            (&["--max-spill-bytes", "bad"], "--max-spill-bytes requires a nonnegative integer"),
             (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
             (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
             (&["--typo"], "unknown serve option --typo"),
@@ -190,6 +204,11 @@ mod cli_tests {
     fn serve_checks_the_addresses_it_will_bind() {
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
         assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
+        assert_eq!(serve_args(&[]).unwrap().spill_dir, None);
+        assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
+        let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576"]).unwrap();
+        assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
+        assert_eq!(spilled.max_spill_bytes, 1_048_576);
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
