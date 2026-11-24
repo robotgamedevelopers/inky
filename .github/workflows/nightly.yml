@@ -1,0 +1,22 @@
+name: nightly
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  # The heavy TLA runs that do not fit the two-minute pull request budget.
+  # No time limit beyond GitHub's default: a slow nightly is not a failure.
+  tla:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: all TLA models, witnesses and production traces
+        env:
+          TLA_NIGHTLY: '1'
+        run: scripts/check-tla.sh

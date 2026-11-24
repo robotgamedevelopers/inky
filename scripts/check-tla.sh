@@ -80,12 +80,27 @@ if [ -f "$root/specs/BlockLayout.tla" ]; then
         exit 1
     }
 fi
+# The CacheScheduler runner takes more than two minutes (its DecodePriority run
+# alone took 159 s on hetzner1, and the whole cpu TLA step 4 min 58 s on the
+# hosted runner, 2026-11-24). Pull request CI therefore leaves it to the nightly
+# workflow, which sets TLA_NIGHTLY=1. The runner must still exist.
 if [ -f "$root/specs/CacheScheduler.tla" ]; then
     [ -f "$root/specs/run_cache_scheduler.sh" ] || { echo 'CacheScheduler runner missing' >&2; exit 1; }
-    TLC_OUTPUT=$work/cache-scheduler sh "$root/specs/run_cache_scheduler.sh" || {
-        find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
-        exit 1
-    }
+    case "${TLA_NIGHTLY:-0}" in
+        1)
+            TLC_OUTPUT=$work/cache-scheduler sh "$root/specs/run_cache_scheduler.sh" || {
+                find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
+                exit 1
+            }
+            ;;
+        0)
+            echo 'CacheScheduler: not run here; nightly only (.github/workflows/nightly.yml)'
+            ;;
+        *)
+            echo "TLA_NIGHTLY must be 0 or 1, not $TLA_NIGHTLY" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # Required since PR #23: a missing checker must fail this gate.

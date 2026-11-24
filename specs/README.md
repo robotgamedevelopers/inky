@@ -120,9 +120,19 @@ the physical slot and tile of every load. Each pair must occur once, and the
 completed trace must cover every pair expected by the private rows.
 
 Under weak fairness of the enabled traversal action, each snapshot must finish.
-The liveness witness blocks the first advance after its tile's loads finish.
-That configuration turns off TLC's earlier deadlock diagnostic so the checker
-reports the infinite stutter that violates traversal completion.
+Two liveness witnesses fail in different ways. `StalledTraversal` blocks the
+first advance after its tile's loads finish, so no step is possible. That
+configuration turns off TLC's earlier deadlock diagnostic so the checker
+reports the infinite stutter that violates traversal completion. It shows that
+the property catches a lost enabling condition that no fairness can repair.
+`AdvanceUnfair` keeps every step and deadlock checking, and narrows weak
+fairness to staging alone. TLC then finds a behavior that stutters forever
+while Advance is enabled. It shows that completion depends on fairness of the
+advance step.
+
+The negative control `RestageOutputs` runs the redundant-load mutant against
+both output invariants only. It must pass. Only `StagedOnce` can see that
+mutant, and `Restage` shows that the same mutant violates it.
 
 | Witness | Checked property | What changes |
 | --- | --- | --- |
@@ -131,6 +141,7 @@ reports the infinite stutter that violates traversal completion.
 | `TilePartial` | `OrderedPartials` | Emitting at the first tile end produces an extra partial inside a split. |
 | `Restage` | `StagedOnce` | A physical slot is loaded twice. The row's visited keys and emitted partials stay unchanged. |
 | `StalledTraversal` | `TraversalCompletes` | Both rows can finish their loads, yet the traversal stays on tile zero forever. |
+| `AdvanceUnfair` | `TraversalCompletes` | Weak fairness covers staging only. Advance stays enabled and is never taken. |
 
 The ordered keys represent logical position and mask membership. SIMD lane
 assignment, floating-point operations and Metal execution require the kernel's
