@@ -1,12 +1,16 @@
-# CacheScheduler model and TLC results
+# CacheScheduler model, PerKindBlockLayout, and Layer 3 trace-conformance gate
 
 Read against the **Blocks**, **Scheduler**, and **Models** sections of
-[docs/DESIGN.md](../docs/DESIGN.md), alongside `specs/BlockLayout.tla` (PR #9).
-Where `BlockLayout` models physical pool slot reuse, generation counters, and
-64-bit table offsets at capacity 3 or 4, `CacheScheduler` models the coupled
+[docs/DESIGN.md](../docs/DESIGN.md), alongside `specs/BlockLayout.tla` (PR #9)
+and `specs/PerKindBlockLayout.tla`. Where `PerKindBlockLayout` models separate
+`full` (`2 MiB` stride) and `window` (`10 MiB` stride) physical pools starting at
+byte offset `0` (`src/blocks.rs`), 1-based slot reuse, non-wrapping generations,
+and 64-bit byte offsets up to `>= 4 GiB`, `CacheScheduler` models the coupled
 cache-tier, start-point, step-fence, admission, restore-reservation, lazy
 cold-block SSD writeback, and starvation/liveness contract across blocks and
-lanes.
+lanes, and `ServeScheduler` models the live `src/serve.rs` +
+`src/serve/scheduler_trace.rs` HTTP/batch scheduler loop (`INKY_SCHED_TRACE_OUT`,
+schema versions 1 and 2).
 
 Run on a **Linux bench**, never the engine's MacBook. With Java and
 [tla2tools.jar](https://github.com/tlaplus/tlaplus/releases) installed:
@@ -22,13 +26,13 @@ or `~/sdk/tla/tla2tools.jar`), checks every positive configuration to exhaustion
 and requires each reversed witness to fail on its intended invariant, action
 property, or temporal property.
 
-## Shared vocabulary and mapping to `BlockLayout`
+## Shared vocabulary and mapping to `BlockLayout` / `PerKindBlockLayout`
 
 - **Block kinds (`Kinds == {"full", "window"}`)**: `BlockSize` corresponds to
   `B` in `BlockLayout` (64 positions in production, 2 here) and `WindowSize`
   corresponds to `W` in `BlockLayout` (1024 positions in production, 2 here).
   The logical range operators `Ceil`, `SpanBound`, `Window`, `History`,
-  `SpanWindow`, and `Full` are identical between both specs.
+  `SpanWindow`, and `Full` are identical across all three specs.
 - **Sealed tree blocks vs unsealed tails**: `TreeIds` hold sealed, immutable
   prefix-tree blocks (`<<"tree", prefix, kind, idx>>`) across tiers `"memory"`,
   `"disk"`, and `"both"` (`"none"` when absent or dropped). `PrivIds` hold a
@@ -134,23 +138,13 @@ and step-completion actions (with client `Arrive`, `Cancel`, `SlideWindow`, and
   `ActionNoQueuedRefusal`, every accepted `"Queued"` or admitted request reaches
   `Cancelled` or `Finished`).
 
-Bounded scope: these runs check small instances (`BlockSize = 2`,
-`WindowSize = 2`, `MaxPos \in {2, 4, 8}`, `StepTokenBudget = 2`, `2` or `3`
-reusable lane slots, `1` or `2` prefixes, `MemBudget \in {2, 4, 7, 10}`,
-`DiskBudget \in {2, 3, 4}`). Cold victim selection abstracts LRU to
-nondeterministic `\E` choice; slot reuse generations and 64-bit byte offsets
-belong to `BlockLayout.tla`; engine trace conformance belongs to the Layer 3/4 CI
-gates.
-
 ## Bench receipts (`b1`)
 
 Validated on Linux bench `b1` (16-core x86\_64), 2026-11-24, with pinned TLA+
 `v1.8.0` (`tla2tools.jar` SHA-256 `fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713`),
 Eclipse Temurin OpenJDK 21.0.12.1, `-Xmx8g`, `-XX:+UseParallelGC`
 (`TLC_WORKERS=8` wall times below, `31.993 s` total across all 14 runs; also
-verified 14/14 at CI's `TLC_WORKERS=2` in `58.934 s` total, and
-`CacheSchedulerDecodePriority` additionally verified under full `Spec`
-`LiveRequestResolves` over all `102,327` distinct states in `39 s`):
+verified 14/14 at CI's `TLC_WORKERS=2` in `58.934 s` total):
 
 | Run | Bounds (`Lanes`, `Prefixes`, `MaxPos`, `StepTokenBudget`, `Mem`/`Disk`, `MaxQueue`, `W`) | Generated | Distinct | Wall seconds | Result |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -169,48 +163,78 @@ verified 14/14 at CI's `TLC_WORKERS=2` in `58.934 s` total, and
 | `DeferredTied429` | `{a,b,c}`, `{p1}`, `4` (`{2,4}`), `2`, `4`/`3`, `1`, `1`, `Bug="deferred_tied_429"` | 667 | 351 | 0.632 | `ActionNoQueuedRefusal` violated |
 | `EagerHotWriteback` | `{a,b}`, `{p1}`, `4` (`{2,4}`), `2`, `10`/`2`, `1`, `1`, `Bug="eager_hot_writeback"` | 1,146 | 475 | 0.681 | `ActionLazyColdWriteback` violated |
 
-Runner negative controls: both `TLC_JAVA=/usr/bin/true` (exit 0 with empty log)
-and `TLC_JAVA=/usr/bin/false` (exit 1) were rejected by `specs/run_cache_scheduler.sh`.
+## CI tiers (`pr` vs `nightly-only` vs `full`)
 
-## Inspected reversed-witness counterexamples
+`specs/run_cache_scheduler.sh` accepts `[full|pr|nightly-only]` (or `CACHE_SCHEDULER_TIER`):
 
-- **`CancelInStep` (`StepBlocksInMemoryAndOwned`, state 5)**: lane `a` enters
-  `InStep` (`stepActive = TRUE`, `gpuDone = FALSE`) with
-  `stepPins = {<<"priv", a, "full">>, <<"priv", a, "window">>}`; bypassing
-  `Cancelling` sends `a` straight to `Cancelled` and clears its block table
-  while the GPU step is still in flight.
-- **`RestoreSplitBudget` (`LiveRequestResolves`, stuttering)**: cold
-  start points `<<p1, 2>>` and `<<p2, 2>>` each hold 2 blocks on disk under
-  `MemBudget = 2`. Without atomic working-set reservation in `BeginRestore`,
-  lanes `a` (`p1`) and `b` (`p2`) both enter `Restoring`, restore one block each
-  into `"memory"` (`MemUsed = 2 = MemBudget`), and stutter forever in
-  `laneState = (a :> "Restoring" @@ b :> "Restoring")`.
-- **`BoundaryWindowDropped` (`LaneHistoryCovered`, state 13)**: lane `a` steps
-  to boundary `pos = 2` and seals `<<p1, 2>>`, then finishes. Without start-point
-  retention on `History(2)`, `DropUnreferenced` evicts `<<"tree", p1, "window", 0>>`
-  while `<<"tree", p1, "full", 0>>` stays kept; `BeginRestore(b)` then matches
-  boundary `pos = 2` with its required window block missing (`tier = "none"`).
-- **`UnprunedWindow` (`BudgetsAndReservations`, state 15)**: with `W = B = 2`,
-  `RequestLengths = {8}`, and `MemBudget = 7`, lane `a` reserves `WorstCaseBlocks(8) = 7`
-  blocks. Without pruning `laneWin` to `History(npos)` at `FinishStep` fence
-  completion, three two-token prefill steps (`0 -> 2 -> 4 -> 6`) without an
-  optional `SlideWindow` retain window blocks `0, 1, 2` alongside full blocks
-  `0, 1, 2`, giving `CurrentWorkingSet(a) = 8 > 7 = reservation[a]`.
-- **`DecodeStalledByPrefill` (`ActionDecodePriority`, state 12)**: with
-  `MemBudget = 10`, `StepTokenBudget = 2`, and three equally aged Ready lanes
-  (`waitTicks = 0` on `a, b, c`) holding mixed decode (`target = 2`) and prefill
-  (`target = 4`) phases, checking only `waitTicks[p] < maxW` allows a non-leader
-  prefill span tied at `maxW` to take a token in `stepLanes` while a Ready
-  decoder that fits in memory is left out.
-- **`QueuedBypassedByStep` (`BypassBoundHolds`, state 10)**: at `W = 1`
-  (`MaxBypass = 1`) and `MemBudget = 10`, Ready lane `a` and admissible `Queued`
-  lane `b` (`CanFitAdmit(b) = TRUE`) reach `BuildStep` #1 (`waitTicks[b] = 1`);
-  guarding only `SteppableReady \ chosen` in `BuildStep` allows `a` to take a
-  second consecutive `BuildStep` while `b` remains queued (`waitTicks[b] = 2 > 1`).
-- **`DeferredTied429` (`ActionNoQueuedRefusal`, state 6)**: deferring capacity
-  refusal past `Arrive` lets overflow requests enter `"Queued"` (`Cardinality(QueuedLanes) > MaxQueue`)
-  and subsequently transitions a `"Queued"` request to `"Refused"` via `Refuse429`.
-- **`EagerHotWriteback` (`ActionLazyColdWriteback`, state 9)**: eagerly starting
-  `stepIO` on pinned hot blocks in `BuildStep` writes `<<"tree", p1, "full", 0>>`
-  while `MemUsed = 2 < MemBudget = 10` (`~MemPressure`) and while lane `a`
-  actively references the block (`LaneReferrers # {}`).
+```sh
+# Pull-request tier: 3 positive models + all 8 witnesses in bounded parallel batches
+sh specs/run_cache_scheduler.sh pr
+
+# Nightly-only tier: the 3 large positive state sweeps
+TLC_WORKERS=2 sh specs/run_cache_scheduler.sh nightly-only
+
+# Full suite (default): all 14 configurations
+TLC_WORKERS=2 sh specs/run_cache_scheduler.sh full
+```
+
+## Layer 3 + Serve trace-conformance CI gate (`scripts/check-layer3-traces.sh`)
+
+`scripts/check-layer3-traces.sh` compiles the real production Rust code and
+checks both standalone `PerKindBlockLayout.tla` and live emitted JSONL traces in
+parallel (`7.28 s` wall on `hetzner1`, `9.04 s` wall on `mini-m5`, pinned TLA+
+`v1.8.0`):
+
+```sh
+# Compile real src/blocks.rs + src/serve.rs emitters, check PerKindBlockLayout,
+# replay live traces, and run all 13 negative controls (~7.3 s on hetzner1)
+bash scripts/check-layer3-traces.sh
+
+# Also replay external cargo-test trace dumps (auto-detects serve_scheduler,
+# per_kind_block_layout, shared_block_layout, and cache_scheduler):
+INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl \
+  cargo test --locked serve::scheduler_trace::dump -- --ignored --exact
+bash scripts/check-layer3-traces.sh --scheduler-trace /tmp/serve-seed-1.jsonl
+```
+
+Key guarantees:
+
+- **Bound to real production Rust emitters (zero hand-written per-kind fixtures)**:
+  - Compiles `scripts/blocklayout-traces.rs` directly against `src/blocks.rs`
+    (`byte_offset`, `SlotRecord`, `BlockEntry`, `BlockPools`, `BlockTable`,
+    `table_index`, `block_length`) and emits live NDJSON traces at both
+    `slot_base = 0` and `slot_base = 2048` (`>= 4 GiB` offsets in both `full`
+    and `window` pools).
+  - Splices and compiles the production `run_scheduler`, `choose_lane`,
+    `reusable_prefix`, `try_slot`, `InFlight`, and `scheduler_trace::walk`
+    directly from `src/serve.rs` + `src/serve/scheduler_trace.rs` (`rustc --edition=2021`,
+    verified byte-for-byte identical to `cargo test --locked serve::scheduler_trace::dump -- --ignored --exact`
+    on `mini-m5`), replaying seeds `1`, `2`, and `u64::MAX` against
+    `specs/ServeScheduler.tla` (both schema v1 and v2).
+  - Automatically compiles and replays `src/cache_scheduler.rs` +
+    `src/cache_trace.rs` (`walk_block_layout` and `walk_cache_scheduler`, PR #62)
+    whenever present (`9.96 s` wall for all 24 checks on `hetzner1`).
+- **Fail-closed converter with zero slot remapping and zero Python offset checks**:
+  - Unknown events (e.g. `{"event":"bogus_op_xyz"}`) and empty traces always
+    hard-fail (`exit 2`).
+  - Raw `slot`, `generation`, and 64-bit `offset` limbs `(hi, mib, sub)` pass
+    straight into `PerKindBlockLayoutTraceCheck.tla` with zero remapping; lowest
+    free slot selection (`Alloc`), generation matching (`GenerationMatches`),
+    and 64-bit per-kind stride offsets (`Address64`) are checked strictly inside
+    TLC.
+- **13 built-in negative controls (all built from real code / real emitted traces,
+  zero deadlock-only passes)**:
+  - Converter hard-failures (`exit 2`): `neg-unknown-event-serve`,
+    `neg-unknown-event-block`, `neg-empty-trace`.
+  - Standalone `PerKindBlockLayout` reversed witnesses (`exit 12`):
+    `witness-PerKindWrongStride` (`Invariant Address64`),
+    `witness-PerKindTrunc32` (`Invariant Address64`),
+    `witness-PerKindStaleEntry` (`Invariant GenerationMatches`).
+  - Live Rust source mutations & real-trace mutations (`exit 12` / `exit 13`):
+    `neg-rust-blocks-trunc32` (`src/blocks.rs` 32-bit truncation -> `Invariant Address64`, `exit 12`),
+    `neg-rust-blocks-wrong-stride` (`src/blocks.rs` window stride -> `Invariant Address64`, `exit 12`),
+    `neg-real-block-nonlowest-slot` (moving window block `1` to `slot = 5` while slots `2..4` are free -> `Action property Conforms`, `exit 13`),
+    `neg-real-block-stale-gen` (`Invariant GenerationMatches`, `exit 12`),
+    `neg-real-serve-over-inflight` (`Invariant InFlightBounded`, `exit 12`),
+    `neg-real-serve-over-chunk` (`Invariant StepBudgetAndModeValid`, `exit 12`),
+    `neg-rust-serve-no-alternation` (`src/serve.rs` removing `!last_was_prefill` -> `Action property Conforms`, `exit 13`).
