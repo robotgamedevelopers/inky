@@ -111,8 +111,12 @@ check_run CacheSchedulerQueue CacheScheduler pass
 check_run CacheSchedulerTwoPrefixes CacheScheduler pass
 check_run CacheSchedulerMaxPos8 CacheScheduler pass
 check_run CacheSchedulerDecodePriority CacheScheduler pass
+check_run CacheSchedulerQueuedBypass CacheScheduler pass
 check_run CancelInStep CacheScheduler invariant StepBlocksInMemoryAndOwned
 check_run RestoreSplitBudget CacheScheduler temporal 'a :> "Restoring" @@ b :> "Restoring"'
 check_run BoundaryWindowDropped CacheScheduler invariant LaneHistoryCovered
 check_run UnprunedWindow CacheScheduler invariant BudgetsAndReservations
 check_run DecodeStalledByPrefill CacheScheduler action ActionDecodePriority
+check_run QueuedBypassedByStep CacheScheduler invariant BypassBoundHolds
+check_run DeferredTied429 CacheScheduler action ActionNoQueuedRefusal
+check_run EagerHotWriteback CacheScheduler action ActionLazyColdWriteback
