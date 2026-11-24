@@ -1,6 +1,8 @@
 mod blocks;
 mod engine;
 mod gguf;
+#[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
+mod prefix;
 mod metal;
 mod sampler;
 mod session;
