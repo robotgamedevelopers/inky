@@ -322,6 +322,85 @@ fn rows(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, rollback gate. One lane, synthetic draft tokens, no drafter. Two forced rejects of a verify span:
+/// one in the middle of the draft, one at the last draft position. After rollback, `lane_hash` (cs and both
+/// K/V buffers) matches `encode_spans` of t=1 stopped at the accepted length, and again after the correction
+/// token is encoded as its own step. A match of the logits at the reject position is printed and is not the gate.
+/// `INK_K` (default 3) and `INK_P` (default 5) choose the span. Exits 1 unless both rejects match.
+fn rollback(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(k >= 3 && p >= 1, "INK_K >= 3 so the middle draft and the last draft differ; INK_P >= 1");
+    let p0 = p - 1;
+    let t = 1 + k;
+    let ntok = p0 + t;
+    let one = engine::Engine::cs_image_bytes();
+    println!("cs image {one} bytes ({:.2} MiB). The span holds 1+k of these, transient, not one per context token.", one as f64 / 1048576.0);
+    println!("k=3: {} bytes ({:.2} MiB per lane). k=7: {} bytes ({:.2} MiB per lane).", one * 4, (one * 4) as f64 / 1048576.0, one * 8, (one * 8) as f64 / 1048576.0);
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    let true_tok = |i: usize| ((i * 17 + 3) % 1000) as u32;
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let mut ok = true;
+    for (name, n_keep) in [("middle", (k + 1) / 2), ("last", k)] {
+        let reject_at = p0 + n_keep;
+        assert!(n_keep >= 1 && n_keep < t && reject_at < ntok);
+        let draft_tok = |i: usize| if i >= reject_at { ((i * 17 + 9) % 1000) as u32 } else { true_tok(i) };
+        assert_ne!(draft_tok(reject_at), true_tok(reject_at), "the rejected token is not the correction");
+        let fresh = || {
+            let lane = Lane::new(&eng);
+            let run = eng.on(&lane);
+            run.reserve(ntok + 1, false);
+            lane
+        };
+        let lane_r = fresh();
+        eng.on(&lane_r).set_tokens(0, &(0..=reject_at).map(true_tok).collect::<Vec<_>>());
+        let mut ref_logits = Vec::new();
+        let mut hash_pref = 0u64;
+        for pos in 0..=reject_at {
+            step1(&lane_r, pos, pos + 1 == reject_at);
+            if pos + 1 == reject_at {
+                ref_logits = eng.logits().to_vec();
+                hash_pref = eng.lane_hash(&lane_r);
+            }
+        }
+        let hash_ref = eng.lane_hash(&lane_r);
+        let lane = fresh();
+        let run = eng.on(&lane);
+        run.set_tokens(0, &(0..ntok).map(draft_tok).collect::<Vec<_>>());
+        for pos in 0..p0 { step1(&lane, pos, false); }
+        let cs = run.get_cs();
+        step1(&lane, p0, false);
+        run.set_cs(&cs);
+        let cb = eng.gpu.cmd();
+        eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let logits_same = eng.span_logits(n_keep - 1) == ref_logits.as_slice();
+        eng.rollback_verify(&lane, 0, n_keep);
+        let pref_ok = eng.lane_hash(&lane) == hash_pref;
+        run.set_tokens(reject_at, &[true_tok(reject_at)]);
+        step1(&lane, reject_at, false);
+        let corr_ok = eng.lane_hash(&lane) == hash_ref;
+        ok &= pref_ok && corr_ok;
+        println!("case {name} n_keep {n_keep} reject-row logits {} prefix lane_hash {} correction lane_hash {}",
+            if logits_same { "same" } else { "DIFFERENT" },
+            if pref_ok { "same" } else { "DIFFERENT" },
+            if corr_ok { "same" } else { "DIFFERENT" });
+        if logits_same && !(pref_ok && corr_ok) {
+            println!("case {name}: reject-row logits match and lane_hash does not; logits alone do not pass");
+        }
+    }
+    println!("{}", if ok { "rollback lane_hash matches encode_spans of t=1" } else { "ROLLBACK LANE_HASH DIFFERS" });
+    if !ok { std::process::exit(1); }
+}
+
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
 fn binv(o: &Opts) {
@@ -897,6 +976,7 @@ fn main() {
     match cmd.as_str() {
         "check" => check(&o),
         "rows" => rows(&o),
+        "rollback" => rollback(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
