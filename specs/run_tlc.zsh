@@ -76,4 +76,4 @@ check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
 check InBlock InBlock
 check InBlockKv8 InBlock
-check InBlockNoHead InBlock HeadTerm
+check InBlockMajor InBlock Ordered

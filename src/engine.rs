@@ -486,19 +486,19 @@ impl Lane {
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
 
     /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
-    /// at `kvb` (`self` is not used for the width: the caller passes the engine's `kvb`).
-    /// The generation must match the pool record. An empty pool is `NoSlots`.
-    /// Does not allocate a GPU buffer.
+    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
+    /// is `NoSlots`. Does not allocate a GPU buffer.
     #[allow(dead_code)]
-    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32, kvb: u32) -> Result<(), crate::blocks::BlockError> {
-        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation, kvb)
+    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
+        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
     }
 
     /// Byte offset of one key row at `pos` for this pass, K or V, and head.
-    /// The slot base comes from the lane table. Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
+    /// The slot base comes from the lane table. The width is the pool's `kvb`.
+    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
     #[allow(dead_code)]
-    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, kvb: u32, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
-        self.block_table.borrow().read_key(pools.of(kind), pos, kvb)?.row(pass, kv, head)
+    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
+        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
     }
 }
 

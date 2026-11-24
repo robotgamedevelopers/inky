@@ -90,7 +90,9 @@ pub enum BlockError {
     NoEntry,
     /// The entry's generation is not the pool record's generation.
     Stale,
-    /// `kvb` is 0, or a read asked for a different element width than `fill` stored.
+    /// Generation 0, on the argument or on the record. The slot has never been taken.
+    NotTaken,
+    /// `kvb` is 0, or a read asked for a different element width than the pool stores.
     Width,
 }
 
@@ -106,6 +108,7 @@ impl fmt::Display for BlockError {
             BlockError::NoSlots => write!(f, "pool has no slots"),
             BlockError::NoEntry => write!(f, "block table has no entry"),
             BlockError::Stale => write!(f, "block generation does not match the pool"),
+            BlockError::NotTaken => write!(f, "block slot has not been taken"),
             BlockError::Width => write!(f, "block element width does not match"),
         }
     }
@@ -247,6 +250,18 @@ impl SlotRecord {
         self.refs = self.refs.checked_sub(1).ok_or(BlockError::Refs)?;
         Ok(())
     }
+
+    /// Take the slot again once nothing holds it. A live reference is `Refs`.
+    /// Otherwise the generation bumps, the length goes to 0, and the seal clears.
+    /// `bump_generation` itself still succeeds while a reference is held: that is
+    /// how a slot is reused under a live entry, and the table then sees `Stale`.
+    pub fn reissue(&mut self) -> Result<(), BlockError> {
+        if self.refs != 0 { return Err(BlockError::Refs); }
+        self.bump_generation()?;
+        self.length = 0;
+        self.sealed = false;
+        Ok(())
+    }
 }
 
 /// One table entry. The kind is on the entry, not implied by a packed index alone.
@@ -302,14 +317,26 @@ impl KeyAddr {
 #[derive(Clone, Debug)]
 pub struct BlockPool {
     kind: BlockKind,
+    /// Element width for every slot in this pool. 2 is fp16, 1 is `--kv8`.
+    kvb: u32,
     slots: Vec<SlotRecord>,
 }
 
 impl BlockPool {
+    /// A pool at fp16 (`kvb` 2).
     pub fn new(kind: BlockKind, n_slots: usize) -> BlockPool {
-        BlockPool { kind, slots: vec![SlotRecord::fresh(kind); n_slots] }
+        BlockPool::with_kvb(kind, n_slots, 2).expect("kvb 2 fits in a slot stride")
     }
+
+    /// One element width for the whole pool. `kvb` 0 is `Width`. The stride must fit.
+    pub fn with_kvb(kind: BlockKind, n_slots: usize, kvb: u32) -> Result<BlockPool, BlockError> {
+        if kvb == 0 { return Err(BlockError::Width); }
+        let _ = kind.stride_bytes(kvb)?;
+        Ok(BlockPool { kind, kvb, slots: vec![SlotRecord::fresh(kind); n_slots] })
+    }
+
     pub fn kind(&self) -> BlockKind { self.kind }
+    pub fn kvb(&self) -> u32 { self.kvb }
     pub fn len(&self) -> usize { self.slots.len() }
 
     pub fn record(&self, slot: Slot) -> Result<&SlotRecord, BlockError> {
@@ -322,9 +349,9 @@ impl BlockPool {
         self.slots.get_mut(i).ok_or(BlockError::OutOfRange)
     }
 
-    pub fn offset(&self, slot: Slot, kvb: u32) -> Result<u64, BlockError> {
+    pub fn offset(&self, slot: Slot) -> Result<u64, BlockError> {
         let _ = self.record(slot)?;
-        byte_offset(self.kind, slot, kvb)
+        byte_offset(self.kind, slot, self.kvb)
     }
 }
 
@@ -371,17 +398,24 @@ impl BlockTable {
         Ok(self.entries.get(i).copied().flatten())
     }
 
-    /// Write one entry. The stored offset is `byte_offset(pool.kind(), slot, kvb)`.
-    /// The generation must be the pool record's generation; a mismatch is `Stale`
-    /// and takes no reference. A match takes one reference via `add_ref`.
-    /// An empty pool is `NoSlots`. This does not bump the generation and does not
-    /// allocate a buffer.
-    pub fn fill(&mut self, pool: &mut BlockPool, block: BlockIndex, slot: Slot, generation: u32, kvb: u32) -> Result<(), BlockError> {
+    /// Write one entry. The stored offset is `byte_offset` at the pool's `kvb`.
+    /// Generation 0, on the argument or the record, is `NotTaken` and takes no
+    /// reference. Any other mismatch is `Stale` and takes no reference. A match
+    /// drops the reference of the entry already in the cell, if there is one,
+    /// then takes one reference via `add_ref`. An empty pool is `NoSlots`.
+    /// This does not bump the generation and does not allocate a buffer.
+    pub fn fill(&mut self, pool: &mut BlockPool, block: BlockIndex, slot: Slot, generation: u32) -> Result<(), BlockError> {
         if pool.len() == 0 { return Err(BlockError::NoSlots); }
-        if kvb == 0 { return Err(BlockError::Width); }
-        if pool.record(slot)?.generation() != generation { return Err(BlockError::Stale); }
+        let record_gen = pool.record(slot)?.generation();
+        if generation == 0 || record_gen == 0 { return Err(BlockError::NotTaken); }
+        if record_gen != generation { return Err(BlockError::Stale); }
+        let kvb = pool.kvb();
         let offset = byte_offset(pool.kind(), slot, kvb)?;
         let i = table_index(pool.kind(), block, self.blocks_per_kind)? as usize;
+        let prev = self.entries.get(i).copied().flatten();
+        if let Some(prev) = prev {
+            pool.record_mut(prev.slot())?.drop_ref()?;
+        }
         pool.record_mut(slot)?.add_ref()?;
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
         *cell = Some(BlockEntry::new(slot, generation, offset, pool.kind(), kvb));
@@ -391,17 +425,21 @@ impl BlockTable {
     /// The block at stream position `pos`. Block `pos / 64` is looked up in this table.
     /// The `u64` is that entry's slot base. A pool with no slots is `NoSlots`.
     /// A hole inside the table is `NoEntry`. An index past the table is `OutOfRange`.
-    /// A generation that is not the pool record's is `Stale`. A `kvb` other than the
-    /// one `fill` stored is `Width`.
-    pub fn read_key(&self, pool: &BlockPool, pos: usize, kvb: u32) -> Result<KeyAddr, BlockError> {
+    /// A generation that is not the pool record's is `Stale`. An entry stored at a
+    /// different `kvb` than the pool is `Width`. A position at or past the written
+    /// length is `Length`. A sealed record whose length is not the whole block is
+    /// `Length` for every position.
+    pub fn read_key(&self, pool: &BlockPool, pos: usize) -> Result<KeyAddr, BlockError> {
         if pool.len() == 0 { return Err(BlockError::NoSlots); }
         let block = BlockIndex::of_pos(pos)?;
         let entry = self.get(pool.kind(), block)?.ok_or(BlockError::NoEntry)?;
+        if entry.kvb() != pool.kvb() { return Err(BlockError::Width); }
         let record = pool.record(entry.slot())?;
         if record.generation() != entry.generation() { return Err(BlockError::Stale); }
-        if kvb == 0 || kvb != entry.kvb() { return Err(BlockError::Width); }
         let index = u32::try_from(pos % BLOCK).map_err(|_| BlockError::Overflow)?;
-        Ok(KeyAddr { offset: entry.offset(), index, slot: entry.slot(), generation: entry.generation(), kind: entry.kind(), kvb })
+        if record.sealed() && record.length() != BLOCK as u32 { return Err(BlockError::Length); }
+        if index >= record.length() { return Err(BlockError::Length); }
+        Ok(KeyAddr { offset: entry.offset(), index, slot: entry.slot(), generation: entry.generation(), kind: entry.kind(), kvb: entry.kvb() })
     }
 }
 
@@ -445,9 +483,16 @@ mod tests {
         let one = BlockPool::new(BlockKind::Full, 1);
         assert_eq!(one.kind(), BlockKind::Full);
         assert_eq!(one.len(), 1);
-        assert_eq!(one.offset(Slot::new(1).unwrap(), 2).unwrap(), 0);
-        assert_eq!(one.offset(Slot::new(1).unwrap(), 1).unwrap(), 0);
-        assert_eq!(one.offset(Slot::new(2).unwrap(), 2), Err(BlockError::OutOfRange));
+        assert_eq!(one.kvb(), 2);
+        assert_eq!(one.offset(Slot::new(1).unwrap()).unwrap(), 0);
+        assert_eq!(one.offset(Slot::new(2).unwrap()), Err(BlockError::OutOfRange));
+        let narrow = BlockPool::with_kvb(BlockKind::Full, 1, 1).unwrap();
+        assert_eq!(narrow.kvb(), 1);
+        assert_eq!(narrow.offset(Slot::new(1).unwrap()).unwrap(), 0);
+        assert_eq!(BlockPool::with_kvb(BlockKind::Window, 1, 0).err(), Some(BlockError::Width));
+        // Slot 2 at kvb 2 and slot 3 at kvb 1 are the same byte. One pool has one kvb.
+        assert_eq!(byte_offset(BlockKind::Window, Slot::new(2).unwrap(), 2).unwrap(), WINDOW_STRIDE);
+        assert_eq!(byte_offset(BlockKind::Window, Slot::new(3).unwrap(), 1).unwrap(), WINDOW_STRIDE);
         let pools = BlockPools::stub();
         assert_eq!(pools.window.len(), 0);
         assert_eq!(pools.full.kind(), BlockKind::Full);
@@ -512,6 +557,13 @@ mod tests {
         pool.record_mut(slot).unwrap().bump_generation().unwrap();
     }
 
+    fn written(pool: &mut BlockPool, slot: Slot, n: u32) {
+        pool.record_mut(slot).unwrap().set_length(n).unwrap();
+        if n == BLOCK as u32 {
+            pool.record_mut(slot).unwrap().seal();
+        }
+    }
+
     #[test]
     fn fill_stores_byte_offset_and_a_key_read_uses_the_table() {
         let mut full = BlockPool::new(BlockKind::Full, 4);
@@ -520,10 +572,12 @@ mod tests {
         let slot = Slot::new(3).unwrap();
         take(&mut full, slot);
         take(&mut window, slot);
-        assert_eq!(t.fill(&mut full, BlockIndex::new(0), slot, 4, 2), Err(BlockError::Stale));
+        assert_eq!(t.fill(&mut full, BlockIndex::new(0), slot, 4), Err(BlockError::Stale));
         assert_eq!(full.record(slot).unwrap().refs(), 0);
-        t.fill(&mut full, BlockIndex::new(0), slot, 1, 2).unwrap();
-        t.fill(&mut window, BlockIndex::new(0), slot, 1, 2).unwrap();
+        t.fill(&mut full, BlockIndex::new(0), slot, 1).unwrap();
+        t.fill(&mut window, BlockIndex::new(0), slot, 1).unwrap();
+        written(&mut full, slot, 64);
+        written(&mut window, slot, 64);
         let stored = t.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap();
         assert_eq!(stored.offset(), byte_offset(BlockKind::Full, slot, 2).unwrap());
         assert_eq!(stored.offset(), 2 * FULL_STRIDE);
@@ -531,24 +585,25 @@ mod tests {
         assert_eq!(stored.kvb(), 2);
         assert_eq!(full.record(slot).unwrap().generation(), 1);
         assert_eq!(full.record(slot).unwrap().refs(), 1);
-        let key = t.read_key(&full, 0, 2).unwrap();
+        let key = t.read_key(&full, 0).unwrap();
         assert_eq!(key.offset(), stored.offset());
         assert_eq!(key.index(), 0);
         assert_eq!(key.slot(), slot);
         assert_eq!(key.generation(), 1);
         assert_eq!(key.kind(), BlockKind::Full);
         assert_eq!(key.row(0, Kv::Key, 0).unwrap(), stored.offset());
-        let at63 = t.read_key(&full, 63, 2).unwrap();
+        let at63 = t.read_key(&full, 63).unwrap();
         assert_eq!(at63.offset(), stored.offset());
         assert_eq!(at63.index(), 63);
         assert_eq!(at63.row(0, Kv::Key, 0).unwrap(), stored.offset() + 63 * (HD as u64) * 2);
-        let win = t.read_key(&window, 1, 2).unwrap();
+        let win = t.read_key(&window, 1).unwrap();
         assert_eq!(win.offset(), byte_offset(BlockKind::Window, slot, 2).unwrap());
         assert_eq!(win.offset(), 2 * WINDOW_STRIDE);
         assert_eq!(win.row(0, Kv::Key, 0).unwrap(), win.offset() + (HD as u64) * 2);
         take(&mut full, Slot::new(1).unwrap());
-        t.fill(&mut full, BlockIndex::new(1), Slot::new(1).unwrap(), 1, 2).unwrap();
-        let next = t.read_key(&full, 64, 2).unwrap();
+        t.fill(&mut full, BlockIndex::new(1), Slot::new(1).unwrap(), 1).unwrap();
+        written(&mut full, Slot::new(1).unwrap(), 64);
+        let next = t.read_key(&full, 64).unwrap();
         assert_eq!(next.offset(), byte_offset(BlockKind::Full, Slot::new(1).unwrap(), 2).unwrap());
         assert_eq!(next.index(), 0);
         assert_eq!(next.row(0, Kv::Key, 0).unwrap(), 0);
@@ -560,17 +615,18 @@ mod tests {
         let mut t = BlockTable::new(4).unwrap();
         let slot = Slot::new(3).unwrap();
         take(&mut full, slot);
-        t.fill(&mut full, BlockIndex::new(0), slot, 1, 2).unwrap();
-        assert_eq!(t.read_key(&full, 0, 2).unwrap().generation(), 1);
+        t.fill(&mut full, BlockIndex::new(0), slot, 1).unwrap();
+        written(&mut full, slot, 1);
+        assert_eq!(t.read_key(&full, 0).unwrap().generation(), 1);
         take(&mut full, slot);
         assert_eq!(full.record(slot).unwrap().generation(), 2);
-        assert_eq!(t.read_key(&full, 0, 2), Err(BlockError::Stale));
-        assert_eq!(t.fill(&mut full, BlockIndex::new(0), slot, 1, 2), Err(BlockError::Stale));
+        assert_eq!(t.read_key(&full, 0), Err(BlockError::Stale));
+        assert_eq!(t.fill(&mut full, BlockIndex::new(0), slot, 1), Err(BlockError::Stale));
         assert_eq!(full.record(slot).unwrap().refs(), 1);
-        t.fill(&mut full, BlockIndex::new(0), slot, 2, 2).unwrap();
-        assert_eq!(t.read_key(&full, 0, 2).unwrap().generation(), 2);
-        assert_eq!(full.record(slot).unwrap().refs(), 2);
-        assert_eq!(t.read_key(&full, 0, 1), Err(BlockError::Width));
+        t.fill(&mut full, BlockIndex::new(0), slot, 2).unwrap();
+        assert_eq!(t.read_key(&full, 0).unwrap().generation(), 2);
+        assert_eq!(full.record(slot).unwrap().refs(), 1);
+        assert_eq!(full.kvb(), 2);
     }
 
     #[test]
@@ -583,6 +639,11 @@ mod tests {
         assert_eq!(old_step, 163840);
         assert_eq!(key_row(base, BlockKind::Window, 2, 0, Kv::Value, 2, 0).unwrap(), old_step);
         assert_eq!(key_row(base, BlockKind::Window, 2, 0, Kv::Key, 0, 1).unwrap(), (HD as u64) * 2);
+        // InBlock Trace. specs/InBlock.tla checks these four addresses.
+        assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 0, 0).unwrap(), 0);
+        assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 0, 1).unwrap(), 256);
+        assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Key, 1, 0).unwrap(), 16_384);
+        assert_eq!(key_row(0, BlockKind::Window, 2, 0, Kv::Value, 2, 0).unwrap(), 163_840);
         let head = (BLOCK as u64) * (HD as u64) * 2;
         assert_eq!(key_row(base, BlockKind::Full, 2, 0, Kv::Key, 1, 0).unwrap(), head);
         assert_eq!(key_row(base, BlockKind::Full, 2, 0, Kv::Key, 0, 0).unwrap(), 0);
@@ -604,23 +665,23 @@ mod tests {
     fn an_empty_pool_has_no_slots() {
         let mut pools = BlockPools::stub();
         let mut t = BlockTable::new(2).unwrap();
-        let err = t.fill(pools.of_mut(BlockKind::Window), BlockIndex::new(0), Slot::new(1).unwrap(), 1, 2).unwrap_err();
+        let err = t.fill(pools.of_mut(BlockKind::Window), BlockIndex::new(0), Slot::new(1).unwrap(), 1).unwrap_err();
         assert_eq!(err, BlockError::NoSlots);
         assert_eq!(err.to_string(), "pool has no slots");
-        let err = t.read_key(pools.of(BlockKind::Full), 0, 2).unwrap_err();
+        let err = t.read_key(pools.of(BlockKind::Full), 0).unwrap_err();
         assert_eq!(err, BlockError::NoSlots);
         assert_eq!(err.to_string(), "pool has no slots");
         assert_eq!(pools.full.len(), 0);
         assert_eq!(t.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), None);
         let one = BlockPool::new(BlockKind::Full, 1);
         let mut one = one;
-        assert_eq!(t.fill(&mut one, BlockIndex::new(0), Slot::new(2).unwrap(), 1, 2), Err(BlockError::OutOfRange));
+        assert_eq!(t.fill(&mut one, BlockIndex::new(0), Slot::new(2).unwrap(), 1), Err(BlockError::OutOfRange));
         let empty_table = BlockTable::empty();
-        assert_eq!(empty_table.read_key(&one, 0, 2), Err(BlockError::OutOfRange));
+        assert_eq!(empty_table.read_key(&one, 0), Err(BlockError::OutOfRange));
         let sized = BlockPool::new(BlockKind::Window, 2);
         let bare = BlockTable::new(4).unwrap();
-        assert_eq!(bare.read_key(&sized, 0, 2), Err(BlockError::NoEntry));
-        assert_eq!(bare.read_key(&sized, 4 * BLOCK, 2), Err(BlockError::OutOfRange));
+        assert_eq!(bare.read_key(&sized, 0), Err(BlockError::NoEntry));
+        assert_eq!(bare.read_key(&sized, 4 * BLOCK), Err(BlockError::OutOfRange));
     }
 
     #[test]
@@ -630,11 +691,72 @@ mod tests {
         let mut pool = BlockPool::new(BlockKind::Window, (index + 1) as usize);
         take(&mut pool, slot);
         let mut t = BlockTable::new(1).unwrap();
-        t.fill(&mut pool, BlockIndex::new(0), slot, 1, 2).unwrap();
-        let key = t.read_key(&pool, 0, 2).unwrap();
+        t.fill(&mut pool, BlockIndex::new(0), slot, 1).unwrap();
+        written(&mut pool, slot, 1);
+        let key = t.read_key(&pool, 0).unwrap();
         let off = key.row(0, Kv::Key, 0).unwrap();
         assert_eq!(off, byte_offset(BlockKind::Window, slot, 2).unwrap());
         assert!(off > u64::from(u32::MAX));
         assert!(u32::try_from(off).is_err());
+    }
+
+    #[test]
+    fn overwriting_an_entry_drops_the_previous_reference() {
+        let mut pool = BlockPool::new(BlockKind::Full, 4);
+        let mut t = BlockTable::new(1).unwrap();
+        let a = Slot::new(1).unwrap();
+        let b = Slot::new(2).unwrap();
+        take(&mut pool, a);
+        take(&mut pool, b);
+        t.fill(&mut pool, BlockIndex::new(0), a, 1).unwrap();
+        assert_eq!(pool.record(a).unwrap().refs(), 1);
+        t.fill(&mut pool, BlockIndex::new(0), b, 1).unwrap();
+        assert_eq!(pool.record(a).unwrap().refs(), 0);
+        assert_eq!(pool.record(b).unwrap().refs(), 1);
+        t.fill(&mut pool, BlockIndex::new(0), b, 1).unwrap();
+        assert_eq!(pool.record(b).unwrap().refs(), 1);
+    }
+
+    #[test]
+    fn a_fresh_slot_is_not_taken() {
+        let mut pool = BlockPool::new(BlockKind::Full, 2);
+        let mut t = BlockTable::new(1).unwrap();
+        let slot = Slot::new(1).unwrap();
+        assert_eq!(t.fill(&mut pool, BlockIndex::new(0), slot, 0), Err(BlockError::NotTaken));
+        assert_eq!(pool.record(slot).unwrap().refs(), 0);
+        assert_eq!(t.fill(&mut pool, BlockIndex::new(0), slot, 1), Err(BlockError::NotTaken));
+        assert_eq!(pool.record(slot).unwrap().refs(), 0);
+    }
+
+    #[test]
+    fn a_read_stops_at_the_written_length() {
+        let mut pool = BlockPool::new(BlockKind::Window, 2);
+        let mut t = BlockTable::new(1).unwrap();
+        let slot = Slot::new(1).unwrap();
+        take(&mut pool, slot);
+        t.fill(&mut pool, BlockIndex::new(0), slot, 1).unwrap();
+        assert_eq!(t.read_key(&pool, 0), Err(BlockError::Length));
+        written(&mut pool, slot, 3);
+        assert_eq!(t.read_key(&pool, 2).unwrap().index(), 2);
+        assert_eq!(t.read_key(&pool, 40), Err(BlockError::Length));
+        pool.record_mut(slot).unwrap().seal();
+        assert_eq!(t.read_key(&pool, 2), Err(BlockError::Length));
+    }
+
+    #[test]
+    fn reissue_waits_for_the_last_reference_and_resets_the_slot() {
+        let mut r = SlotRecord::fresh(BlockKind::Window);
+        r.reissue().unwrap();
+        r.set_length(64).unwrap();
+        r.seal();
+        r.add_ref().unwrap();
+        assert_eq!(r.reissue(), Err(BlockError::Refs));
+        assert_eq!((r.generation(), r.length(), r.sealed()), (1, 64, true));
+        r.drop_ref().unwrap();
+        r.reissue().unwrap();
+        assert_eq!((r.generation(), r.length(), r.sealed(), r.refs()), (2, 0, false, 0));
+        let mut last = SlotRecord::at_generation(BlockKind::Full, u32::MAX);
+        assert_eq!(last.reissue(), Err(BlockError::Generation));
+        assert_eq!(last.generation(), u32::MAX);
     }
 }

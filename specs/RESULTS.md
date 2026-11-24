@@ -21,15 +21,15 @@ TLC traversal order.
 Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
 and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
 
-`InBlock` on mini-m5, 2026-11-24T02:55Z, same jar and Java, one worker, 1 GiB heap. Three configs only, not the full runner. TLC printed the wall time as 00s.
+`InBlock` on mini-m5, 2026-11-24T03:19Z, TLC 2.19, one worker, 1 GiB heap. Three configs only, not the full runner. TLC printed the wall time as 00s. The machine clock on the log lines is 2026-11-23 22:19.
 
 | Run | Generated states | Distinct states | Result |
 | --- | ---: | ---: | --- |
 | InBlock | 2,257 | 48 | PASS |
 | InBlockKv8 | 2,257 | 48 | PASS |
-| InBlockNoHead | 5 | 5 | HeadTerm violated |
+| InBlockMajor | 2 | 2 | Ordered violated |
 
-InBlockNoHead state 2 is pass 0, K, head 1, position 0. Head 0 at that pass still matched, so the missing head term is the step that failed.
+InBlockMajor state 2 is pass 1, K, head 0, position 0, address 0. The position-major step is `index * (stride / B)`, which is 0 at position 0, so the pass change does not move the address. `Inside`, `NoCollision`, and `TraceOk` hold on that config. The earlier head-term witness is retired.
 
 Inspected counterexamples:
 
