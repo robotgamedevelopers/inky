@@ -29,7 +29,9 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// requests waiting beyond this many are refused with 429
                       pub queue: usize,
                       /// default hard cap on thinking tokens before forcing `<|end_message|>` (`0` = unlimited)
-                      pub thinking_budget: usize }
+                      pub thinking_budget: usize,
+                      /// optional directory for opt-in JSONL card traffic recording (`--record-dir`)
+                      pub record_dir: Option<std::path::PathBuf> }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -960,7 +962,7 @@ fn respond<W: Write + ?Sized>(s: &mut W, code: u16, body: &str) -> std::io::Resu
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, chunked: bool }
+struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1011,7 +1013,7 @@ fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<Stri
 fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, chunked: false };
+    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, card_id: None, chunked: false };
     for _ in 0..128 {
         let l = read_bounded_line(r, 16384)?;
         if l == "\r\n" || l == "\n" { return Ok(h); }
@@ -1023,6 +1025,7 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
                 if let Some((scheme, tok)) = v.split_once(' ') { if scheme.eq_ignore_ascii_case("bearer") { h.auth = Some(tok.trim().to_string()); } }
             }
             if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
+            if k.eq_ignore_ascii_case("x-inky-card-id") { h.card_id = crate::record::sanitize_card_id(Some(v)); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
@@ -1160,7 +1163,9 @@ struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String
              /// Lanes currently occupied by an active job in the scheduler.
              active_lanes: Arc<AtomicUsize>,
              /// connection threads alive; at most MAX_CONNS
-             conns: Arc<AtomicUsize> }
+             conns: Arc<AtomicUsize>,
+             /// opt-in non-blocking JSONL card traffic recorder
+             recorder: Option<Arc<crate::record::Recorder>> }
 const MAX_CONNS: usize = 512;
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1249,9 +1254,54 @@ fn clamped_messages_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, 
     Err(format!("prompt is too long: {prompt} tokens > {ctx} maximum"))
 }
 
+fn record_turn_outcome(
+    cx: &Ctx,
+    turn: Option<(String, u64)>,
+    endpoint: &str,
+    req: &Value,
+    req_start: Instant,
+    first_tok: Option<Instant>,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    finish_reason: &str,
+    status_code: u16,
+) {
+    let (Some(rec), Some((card_id, turn_index))) = (&cx.recorder, turn) else { return };
+    let total_ms = req_start.elapsed().as_millis() as u64;
+    let ttft_ms = first_tok
+        .map(|t| t.saturating_duration_since(req_start).as_millis() as u64)
+        .unwrap_or(total_ms);
+    rec.record(crate::record::RecordEntry {
+        schema_version: crate::record::SCHEMA_VERSION,
+        recorded_at_ms: crate::record::now_ms(),
+        card_id,
+        turn_index,
+        endpoint: endpoint.to_string(),
+        request: req.clone(),
+        response: crate::record::ResponseMetrics {
+            prompt_tokens,
+            completion_tokens,
+            ttft_ms,
+            total_ms,
+            finish_reason: finish_reason.to_string(),
+            status_code,
+        },
+    });
+}
+
 fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
+    chat_with_card(cx, req, None, s)
+}
+
+fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
+    let req_start = Instant::now();
+    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
+    let mut first_tok: Option<Instant> = None;
     // every client-controlled number is checked here, never in the scheduler
-    let mut bad = |m: String| respond(s, 400, &json!({"error": {"message": m}}).to_string());
+    let mut bad = |m: String| {
+        record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, "invalid_request", 400);
+        respond(s, 400, &json!({"error": {"message": m}}).to_string())
+    };
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -1282,7 +1332,10 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
     let (permit, preprocess) = match cx.admit_for_render() {
         Ok(permits) => permits,
-        Err(e) => return overloaded(s, json!({"error": {"message": e}})),
+        Err(e) => {
+            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, "overloaded", 429);
+            return overloaded(s, json!({"error": {"message": e}}));
+        }
     };
     let prompt_limit = cx.ctx.saturating_sub(max.saturating_add(2));
     let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit);
@@ -1306,7 +1359,10 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     });
     let (tx, rx) = job_events();
     let job = Job { toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, out: tx, _permit: permit };
-    if cx.jobs.send(job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
+    if cx.jobs.send(job).is_err() {
+        record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, "unavailable", 503);
+        return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
+    }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
     let model = req["model"].as_str().unwrap_or("inkling-2-mini").to_string();
@@ -1323,14 +1379,29 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
         // request fails and frees its lane (prefill steps send Alive, decode steps a token)
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if s.client_gone() {
+                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), "cancelled", 499);
+                    return Ok(());
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ev::Failed("the request was dropped".into()),
         };
         match ev {
-            Ev::Alive => { if s.client_gone() { return Ok(()); } }
+            Ev::Alive => {
+                if s.client_gone() {
+                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), "cancelled", 499);
+                    return Ok(());
+                }
+            }
             Ev::Tok(t) => {
+                if first_tok.is_none() { first_tok = Some(Instant::now()); }
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() { return Ok(()); }
+                if gen.len() % 16 == 0 && s.client_gone() {
+                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), "cancelled", 499);
+                    return Ok(());
+                }
                 if !stream { continue; }
                 if t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
                     let text = take_stream_text(&mut pend, true);
@@ -1358,6 +1429,7 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
             Ev::Done { prompt, cached, gen: ng, reason } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
+                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, prompt, ng, finish, 200);
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
@@ -1380,6 +1452,7 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
             }
             Ev::Err(ref message) | Ev::Failed(ref message) => {
                 let (code, kind) = if matches!(ev, Ev::Err(_)) { (400, "invalid_request_error") } else { (500, "server_error") };
+                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), kind, code);
                 let error = json!({"error": {"type": kind, "message": message}});
                 if stream {
                     write!(s, "data: {error}\n\n")?;
@@ -1405,11 +1478,21 @@ fn render_messages(cx: &Ctx, req: &Value, limit: usize) -> Result<Vec<u32>, Rend
 }
 
 fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
+    messages_with_card(cx, req, None, s)
+}
+
+fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
+    let req_start = Instant::now();
+    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
+    let mut first_tok: Option<Instant> = None;
+    let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
+        record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, reason, code);
+    };
     // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
     let max = match req["max_tokens"].as_u64() {
-        Some(0) => return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"),
+        Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"),
+        None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
@@ -1426,11 +1509,11 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
         }
         _ => cx.thinking_budget,
     };
-    if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render() {
         Ok(permits) => permits,
-        Err(e) => return anthropic_overloaded(s, e),
+        Err(e) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, e); }
     };
     let rendered = render_messages(cx, req, cx.ctx);
     drop(preprocess);
@@ -1463,7 +1546,7 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
     };
     let (tx, rx) = job_events();
     let job = Job { toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, out: tx, _permit: permit };
-    if cx.jobs.send(job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    if cx.jobs.send(job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().unwrap_or("inkling-2-mini").to_string();
@@ -1480,24 +1563,27 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if s.client_gone() { return Ok(()); }
+                    if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
                     write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    record_err(first_tok, 500, "api_error", received);
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
                     return s.flush();
                 }
             };
             match ev {
-                Ev::Alive => { if s.client_gone() { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
                 Ev::Tok(t) => {
+                    if first_tok.is_none() { first_tok = Some(Instant::now()); }
                     received += 1;
-                    if received % 16 == 0 && s.client_gone() { return Ok(()); }
+                    if received % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
                     for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
                 }
                 Ev::Done { prompt, cached, gen: ng, reason } => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
+                    record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, stop, 200);
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls}", calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
@@ -1506,11 +1592,13 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
                     return s.flush();
                 }
                 Ev::Err(e) => {
+                    record_err(first_tok, 400, "invalid_request_error", received);
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
                     return s.flush();
                 }
                 Ev::Failed(message) => {
+                    record_err(first_tok, 500, "api_error", received);
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
                     return s.flush();
                 }
@@ -1521,22 +1609,27 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
     loop {
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { return Ok(()); } continue; }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return anthropic_error(s, 500, "api_error", "the request was dropped"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
         };
         match ev {
-            Ev::Alive => { if s.client_gone() { return Ok(()); } }
-            Ev::Tok(t) => { gen.push(t); if gen.len() % 16 == 0 && s.client_gone() { return Ok(()); } }
+            Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } }
+            Ev::Tok(t) => {
+                if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                gen.push(t);
+                if gen.len() % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); }
+            }
             Ev::Done { prompt, cached, gen: ng, reason } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
+                record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, stop, 200);
                 eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
                 return respond(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
                     "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string());
             }
-            Ev::Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e),
-            Ev::Failed(message) => return anthropic_error(s, 500, "api_error", &message),
+            Ev::Err(e) => { record_err(first_tok, 400, "invalid_request_error", gen.len()); return anthropic_error(s, 400, "invalid_request_error", &e); }
+            Ev::Failed(message) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", &message); }
         }
     }
 }
@@ -1570,9 +1663,10 @@ pub fn serve(o: ServeOpts) {
     let (jtx, jrx) = channel::<Job>();
     let admission_limit = o.lanes.saturating_add(o.queue).min(MAX_CONNS);
     let active_lanes = Arc::new(AtomicUsize::new(0));
+    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::new(d.clone())));
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: PermitPool::new(admission_limit),
-        preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: active_lanes.clone(), conns: Default::default() });
+        preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
     // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
     let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
     let addr = l.local_addr().expect("bound address");
@@ -1636,13 +1730,14 @@ pub fn serve(o: ServeOpts) {
                 };
                 drop(r);
                 let _ = s.set_read_timeout(None);
+                let card_id = h.card_id.as_deref();
                 let r = match route {
                     Route::Chat => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => chat(&cx, &v, &mut s),
+                        Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
                         Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
                     },
                     Route::Messages => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => messages(&cx, &v, &mut s),
+                        Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
                         Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
                     },
                     Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
@@ -1676,7 +1771,7 @@ mod tests {
         let cx = Ctx {
             sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(lanes_and_queue), preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(),
+            inflight: PermitPool::new(lanes_and_queue), preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         };
         (cx, rx)
     }
@@ -2198,7 +2293,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default() };
+            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(64), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -2229,7 +2324,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default() };
+            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv().unwrap();
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -2257,7 +2352,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default() };
+                inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv().unwrap();
                 let mut sent = 0usize;
@@ -2298,7 +2393,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default() });
+                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -2320,7 +2415,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default() };
+                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -2342,7 +2437,7 @@ mod tests {
     #[test] fn serve_header_policy() {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
-            len: MAX_BODY + 1, auth: None, api_key: None, chunked: false,
+            len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
         };
         let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
@@ -2355,7 +2450,7 @@ mod tests {
         head.chunked = true;
         head.len = 0;
         assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
-        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), chunked: false };
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false };
         assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
         by_key.api_key = Some("wrong".into());
         assert_eq!(status(&by_key), Err(401));
@@ -2400,7 +2495,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    inflight: PermitPool::new(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default() };
+                    inflight: PermitPool::new(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv().unwrap();
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -2674,5 +2769,72 @@ mod tests {
         drop(p);
         let drained: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(drained, json!({"ok": true, "active_lanes": 0, "inflight": 0}));
+    }
+
+    #[test] fn serve_records_multi_turn_card_traffic_without_auth_headers() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-record-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::new(dir.clone()));
+        let tk = Arc::new(Tokenizer::for_test());
+        let sp = test_sp(&tk);
+        let tok_hi = tk.encode("hi", false)[0];
+        let (jobs, rx) = channel();
+        let cx = Ctx {
+            sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
+            seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
+            inflight: PermitPool::new(4), preprocess: PermitPool::new(2),
+            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+        };
+
+        let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
+        let mut head_reader = BufReader::new(&raw_req[..]);
+        let head = read_head(&mut head_reader).unwrap();
+        assert_eq!(head.card_id.as_deref(), Some("card-multi-7"));
+        assert!(check_headers(&head, "/v1/chat/completions", cx.key.as_deref()).is_ok());
+
+        let worker = std::thread::spawn(move || {
+            for turn in 0..2 {
+                let job = rx.recv().unwrap();
+                let _ = job.out.send(Ev::Tok(sp.c_text));
+                let _ = job.out.send(Ev::Tok(tok_hi));
+                let _ = job.out.send(Ev::Done { prompt: 10 + turn * 5, cached: turn * 10, gen: 2, reason: "stop" });
+            }
+        });
+
+        for turn in 0..2 {
+            let req = json!({
+                "model": "inkling-2-mini",
+                "messages": [{"role": "user", "content": format!("turn {turn}")}],
+                "temperature": 0.5,
+                "max_tokens": 8,
+                "stream": false
+            });
+            let mut out = Vec::new();
+            chat_with_card(&cx, &req, head.card_id.as_deref(), &mut out).unwrap();
+            assert!(String::from_utf8(out).unwrap().starts_with("HTTP/1.1 200"));
+        }
+        worker.join().unwrap();
+        drop(cx);
+        drop(rec);
+
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|p| p.path()))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let content = std::fs::read_to_string(files.pop().unwrap()).unwrap();
+        assert!(!content.contains("secret-bearer-key"));
+        assert!(!content.contains("s=secret"));
+        let entries = crate::record::parse_jsonl(&content).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].card_id, "card-multi-7");
+        assert_eq!(entries[0].turn_index, 0);
+        assert_eq!(entries[1].card_id, "card-multi-7");
+        assert_eq!(entries[1].turn_index, 1);
+        assert_eq!(entries[0].response.status_code, 200);
+        assert_eq!(entries[0].response.completion_tokens, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
