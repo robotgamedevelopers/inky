@@ -395,7 +395,15 @@ enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reas
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
 struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, used: Instant, job: Option<Active> }
-struct Active { job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize, sampler: Sampler, pending: Option<u32> }
+struct Active {
+    job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
+    sampler: Sampler,
+    /// Draft stream, seeded once per request (`seed ^ DRAFT_SEED_MIX`). A verify round advances it.
+    /// Greedy serve does not read it. It is not the stream `sampler.sample` draws emitted tokens from.
+    #[allow(dead_code)]
+    draft_sampler: Sampler,
+    pending: Option<u32>,
+}
 
 fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
 
@@ -424,8 +432,10 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             run.reserve(j.toks.len() + j.max + 2, true);
             run.set_tokens(0, &j.toks);
             let sampler = Sampler::new(j.temp, 64, j.top_p, eng.softcap, j.seed);
+            // once per request, not per round and not per emitted token
+            let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap, j.seed);
             l.prompt.clear(); l.cs_at_prompt = None;
-            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, pending: None, job: j });
+            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
         }
         // a step: prefill when a lane has prompt left (alternating with decode while others generate), else decode
         let need_pf: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past < a.pf_end)).collect();
