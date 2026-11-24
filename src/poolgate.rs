@@ -14,7 +14,7 @@
 //!    `Lane::block_table`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, kind, slot)` over that kind's GPU buffer. `Layer2` implements it with lane k's window
+//!    `slot_region(base, len, kind, slot, kvb)` over that kind's GPU buffer. `Layer2` implements it with lane k's window
 //!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
@@ -75,14 +75,15 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     v
 }
 
-/// The bytes of `slot` in a kind's pool buffer at `base` of `len` bytes: `kind.stride()` bytes at `byte_offset`.
-/// None when the slot does not fit in the buffer.
+/// The bytes of `slot` in a kind's pool buffer at `base` of `len` bytes: one slot at element width `kvb`.
+/// None when the slot does not fit in the buffer, or when `kvb` is 0.
 #[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
-pub fn slot_region(base: *mut u8, len: usize, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
-    let off = byte_offset(kind, slot).ok()?;
-    let end = off.checked_add(kind.stride())?;
+pub fn slot_region(base: *mut u8, len: usize, kind: BlockKind, slot: Slot, kvb: u32) -> Option<(*mut u8, usize)> {
+    let stride = kind.stride_bytes(kvb).ok()?;
+    let off = byte_offset(kind, slot, kvb).ok()?;
+    let end = off.checked_add(stride)?;
     if end > len as u64 { return None; }
-    Some((unsafe { base.add(off as usize) }, kind.stride() as usize))
+    Some((unsafe { base.add(off as usize) }, stride as usize))
 }
 
 /// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
@@ -424,9 +425,11 @@ mod tests {
     fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
         let base = 0x1000 as *mut u8;
         let len = 2 * crate::blocks::FULL_STRIDE as usize;
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3)), None);
-        assert_eq!(slot_region(base, len, BlockKind::Window, sl(1)), None);
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1), 2), Some((base, crate::blocks::FULL_STRIDE as usize)));
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(2), 2).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3), 2), None);
+        assert_eq!(slot_region(base, len, BlockKind::Window, sl(1), 2), None);
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3), 1).map(|r| r.1), Some(crate::blocks::FULL_STRIDE as usize / 2));
+        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1), 0), None);
     }
 }

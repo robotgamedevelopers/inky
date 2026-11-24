@@ -21,6 +21,16 @@ TLC traversal order.
 Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
 and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
 
+`InBlock` on mini-m5, 2026-11-24T02:55Z, same jar and Java, one worker, 1 GiB heap. Three configs only, not the full runner. TLC printed the wall time as 00s.
+
+| Run | Generated states | Distinct states | Result |
+| --- | ---: | ---: | --- |
+| InBlock | 2,257 | 48 | PASS |
+| InBlockKv8 | 2,257 | 48 | PASS |
+| InBlockNoHead | 5 | 5 | HeadTerm violated |
+
+InBlockNoHead state 2 is pass 0, K, head 1, position 0. Head 0 at that pass still matched, so the missing head term is the step that failed.
+
 Inspected counterexamples:
 
 - **StaleEntry, state 10:** lane `a` is done with window table entry

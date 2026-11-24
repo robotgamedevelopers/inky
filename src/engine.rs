@@ -21,6 +21,8 @@ pub const LOOP_START: usize = 6;
 pub const LOOP_END: usize = 18;
 pub const N_PASS: usize = 3;
 pub const N_SLOT: usize = N_PHYS + (N_PASS - 1) * (LOOP_END - LOOP_START);
+const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
+const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
 /// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
@@ -483,18 +485,20 @@ impl Lane {
     #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
 
-    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool.
-    /// An empty pool is `NoSlots`. Does not allocate a GPU buffer.
+    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
+    /// at `kvb` (`self` is not used for the width: the caller passes the engine's `kvb`).
+    /// The generation must match the pool record. An empty pool is `NoSlots`.
+    /// Does not allocate a GPU buffer.
     #[allow(dead_code)]
-    pub fn fill_block(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
-        self.block_table.borrow_mut().fill(pools.of(kind), block, slot, generation)
+    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32, kvb: u32) -> Result<(), crate::blocks::BlockError> {
+        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation, kvb)
     }
 
-    /// Byte offset of the key at `pos`. The table entry's `u64`, plus the position
-    /// inside its block. Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
+    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
+    /// The slot base comes from the lane table. Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
     #[allow(dead_code)]
-    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize) -> Result<u64, crate::blocks::BlockError> {
-        self.block_table.borrow().read_key(pools.of(kind), pos)?.position_offset()
+    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, kvb: u32, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
+        self.block_table.borrow().read_key(pools.of(kind), pos, kvb)?.row(pass, kv, head)
     }
 }
 

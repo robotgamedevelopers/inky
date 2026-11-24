@@ -74,3 +74,6 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+check InBlock InBlock
+check InBlockKv8 InBlock
+check InBlockNoHead InBlock HeadTerm

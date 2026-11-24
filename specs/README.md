@@ -25,6 +25,8 @@ counterexamples, in the output directory. For an individual run, from `specs/`:
   -workers 1 -config BlockLayout3.cfg BlockLayout.tla
 ```
 
+`InBlock` is the order inside one slot: `[pass][K|V][head][position][HD]`, 2 passes, 3 heads, 4 positions, `HD = 2`. `InBlock` uses `kvb = 2` and `InBlockKv8` uses `kvb = 1`. `InBlockNoHead` drops the head term and must violate `HeadTerm`.
+
 ## Bounds and vocabulary
 
 `BlockLayout` has two lanes, **3 or 4 slots total**, blocks of
