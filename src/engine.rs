@@ -396,6 +396,9 @@ pub struct Engine {
     verify_keep: RefCell<Option<VerifyKeep>>,
     /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
     verify_record: Cell<bool>,
+    /// Layer 3 pools, one per kind. Not allocated yet. The table lives on the lane.
+    /// `RefCell` because a step mutates the pool through `&Engine`.
+    block_pool: std::cell::RefCell<crate::blocks::BlockPools>,
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
@@ -410,6 +413,8 @@ pub struct Lane {
     pub toks: Buf,
     tier: Option<Tier>,
     pub prune: RefCell<Option<Prune>>,
+    /// `RefCell` because a step mutates the table through `&Lane`.
+    block_table: std::cell::RefCell<crate::blocks::BlockTable>,
 }
 
 /// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
@@ -469,8 +474,14 @@ impl Lane {
             cs: gpu.buffer(N_SLOT * NCH * 3 * 4),
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
             tier, prune: RefCell::new(None),
+            block_table: std::cell::RefCell::new(crate::blocks::BlockTable::empty()),
         }
     }
+
+    /// The lane's block table. Empty until the table worker fills it.
+    /// Interior mutability: callers borrow through the `RefCell`.
+    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
@@ -480,6 +491,11 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    /// Both block pools. Empty until the pool worker sizes them.
+    /// Interior mutability: callers borrow through the `RefCell`.
+    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
+
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
     pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
     /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
@@ -676,6 +692,7 @@ impl Engine {
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
             verify_keep: RefCell::new(None), verify_record: Cell::new(false),
+            block_pool: std::cell::RefCell::new(crate::blocks::BlockPools::stub()),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
