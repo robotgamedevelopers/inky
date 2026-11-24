@@ -10,61 +10,71 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Every job here must finish in about a minute (Glenn, 2026-11-23: pull request and push CI averages one minute or
+# less). Anything slower runs in .github/workflows/nightly.yml, where it still fails red:
+#   the CacheScheduler TLC models, the release-profile unit tests and clean release build, the slow GPU gates
+#   (binv, lanes, spans and its sabotage, dbatch, golden hashes) and the serve API negative control.
 jobs:
-  # Two jobs:
-  #   cpu: a GitHub-hosted ARM Mac; builds and runs the CPU-only unit tests. Shaders compile at
-  #        runtime, so the build needs no GPU. It reports in minutes without waiting for the M5.
-  #   m5:  the self-hosted M5 Mac; runs GPU gates and loopback API probes against the local model.
-  cpu:
+  # unit: a GitHub-hosted ARM Mac; the CPU-only unit tests in the test profile (overflow checks and debug asserts on).
+  # Shaders compile at runtime, so the build needs no GPU. rust-cache keeps target/ and ~/.cargo keyed on Cargo.lock.
+  unit:
     runs-on: macos-latest
     timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: unit tests
+        run: cargo test --locked --bins
+  # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel.
+  tla:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [memmode, layout, traces]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-      - name: TLA models, witnesses and production traces
-        run: scripts/check-tla.sh
-      - name: build
-        run: cargo build --release
-      - name: unit tests
-        run: cargo test --release --bins
-  m5:
-    # A self-hosted M5 Mac: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
-    # Pull requests from forks never run here (the repository also requires approval for outside contributors).
+      - name: TLA ${{ matrix.part }}
+        run: scripts/check-tla.sh ${{ matrix.part }}
+  # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
+  # Pull requests from forks never run here (the repository also requires approval for outside contributors).
+  # Both jobs build the `ci` profile (release without fat LTO, incremental), which rebuilds in about a second on a
+  # runner's warm target/; the nightly workflow runs every gate on the true release profile.
+  m5-gpu:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: cargo build --release
-      - name: tests
-        run: tests/ci.sh
+        run: cargo build --locked --profile ci
+      - name: GPU gates (pull request set)
+        env:
+          INKY_BIN: ./target/ci/inky
+        run: tests/ci.sh pr
+  m5-serve:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cargo build --locked --profile ci
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.10'
           cache: false
       # servecheck allocates ephemeral loopback ports, bounds requests/server
       # lifetime, and cancels/waits for each child server before removing logs.
+      # serve_header_policy runs in the unit job (cargo test --bins), so this job runs the probes alone.
       - name: serve API probes
         timeout-minutes: 10
         env:
           SERVECHECK_SABOTAGE: ''
-        run: tests/serve.sh
-      - name: serve API negative control
-        timeout-minutes: 10
-        env:
-          SERVECHECK_SABOTAGE: health-status
-        run: |
-          log=$(mktemp)
-          trap 'rm -f "$log"' EXIT
-          if tests/serve.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
-          cat "$log"
-          # Require the deliberate mismatch and completed suite; a crash is not proof.
-          test "$rc" -eq 1
-          grep -Fxq 'FAIL bearer authentication and public health: sabotage health-status: got HTTP 200, want 418' "$log"
-          grep -Fxq 'one or more serve checks failed' "$log"
-          test "$(grep -c '^FAIL ' "$log")" -eq 1
-          echo 'serve health-status sabotage: detected, as required'
+          INKY_SERVE_PROBES_ONLY: '1'
+        run: tests/serve.sh ./target/ci/inky

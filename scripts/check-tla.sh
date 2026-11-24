@@ -1,6 +1,21 @@
 #!/bin/sh
 # Check every available inky TLA+ model and its reversed witnesses.
+# Usage: scripts/check-tla.sh [all|memmode|layout|scheduler|traces]. all (the default; the nightly workflow) runs every
+# part. The pull-request workflow runs memmode, layout and traces as parallel jobs; the CacheScheduler models
+# (scheduler) are exhaustive and slow, so they run in the nightly workflow.
 set -eu
+
+section=${1:-all}
+case $section in
+    all|memmode|layout|scheduler|traces) ;;
+    *) echo "usage: scripts/check-tla.sh [all|memmode|layout|scheduler|traces]" >&2; exit 2 ;;
+esac
+want() { [ "$section" = all ] || [ "$section" = "$1" ]; }
+# A part named on its own must have something to check; an empty pass is a failure.
+case $section in
+    layout) [ -f "$(dirname -- "$0")/../specs/BlockLayout.tla" ] || { echo 'layout: specs/BlockLayout.tla missing' >&2; exit 1; } ;;
+    scheduler) [ -f "$(dirname -- "$0")/../specs/CacheScheduler.tla" ] || { echo 'scheduler: specs/CacheScheduler.tla missing' >&2; exit 1; } ;;
+esac
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 jar_url=https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
@@ -64,6 +79,7 @@ check_memmode() {
     fi
 }
 
+if want memmode; then
 check_memmode MemMode
 check_memmode RestoreDefault RestoredWhenIdle
 check_memmode ReleaseEarly RaisedWhileConnected
@@ -71,16 +87,17 @@ check_memmode NoPersist RestoredWhenIdle
 check_memmode LostSeed SavedIsOwner
 check_memmode StaleSaved RestoredWhenIdle
 check_memmode NoRollback RefusedRollbackSafe
+fi
 
 # The layer 3 models land separately. A model without its runner is an error.
-if [ -f "$root/specs/BlockLayout.tla" ]; then
+if want layout && [ -f "$root/specs/BlockLayout.tla" ]; then
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
     TLC_OUTPUT=$work/block-layout zsh "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
     }
 fi
-if [ -f "$root/specs/CacheScheduler.tla" ]; then
+if want scheduler && [ -f "$root/specs/CacheScheduler.tla" ]; then
     [ -f "$root/specs/run_cache_scheduler.sh" ] || { echo 'CacheScheduler runner missing' >&2; exit 1; }
     TLC_OUTPUT=$work/cache-scheduler sh "$root/specs/run_cache_scheduler.sh" || {
         find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
@@ -89,4 +106,6 @@ if [ -f "$root/specs/CacheScheduler.tla" ]; then
 fi
 
 # Required since PR #23: a missing checker must fail this gate.
-bash "$root/scripts/check-memmode-traces.sh"
+if want traces; then
+    bash "$root/scripts/check-memmode-traces.sh"
+fi
