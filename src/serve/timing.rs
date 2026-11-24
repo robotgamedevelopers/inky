@@ -1,4 +1,5 @@
-//! Scheduler wall time. Each participating lane is charged the duration of its batch.
+//! Scheduler wall time. Each participating lane is charged the duration of its batch. A request's wall time
+//! from arrival to its last token is queue wait, then lane preparation, then its prefill and decode batches.
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -22,14 +23,16 @@ impl Phase {
 pub(super) struct RequestTiming {
     pub(super) queue_wait: Duration,
     pub(super) busy_at_start: usize,
+    /// Readying the lane after admission: reset, reservation, a cross-lane prefix copy, kept state, prompt upload.
+    pub(super) prep: Duration,
     pub(super) prefill: Phase,
     pub(super) generation: Phase,
 }
 
 impl fmt::Display for RequestTiming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "queue_ms={:.1} prefill_ms={:.1} prefill_tok_s={:.1} gen_ms={:.1} gen_tok_s={:.1} lanes_busy_start={}",
-               self.queue_wait.as_secs_f64() * 1000.0,
+        write!(f, "queue_ms={:.1} prep_ms={:.1} prefill_ms={:.1} prefill_tok_s={:.1} gen_ms={:.1} gen_tok_s={:.1} lanes_busy_start={}",
+               self.queue_wait.as_secs_f64() * 1000.0, self.prep.as_secs_f64() * 1000.0,
                self.prefill.elapsed.as_secs_f64() * 1000.0, rate(self.prefill.tokens, self.prefill.elapsed),
                self.generation.elapsed.as_secs_f64() * 1000.0, rate(self.generation.tokens, self.generation.elapsed),
                self.busy_at_start)
@@ -60,7 +63,7 @@ impl Counters {
         self.accrue(now);
         self.queued -= 1;
         self.busy += 1;
-        RequestTiming { queue_wait: now - queued_at, busy_at_start: self.busy,
+        RequestTiming { queue_wait: now - queued_at, busy_at_start: self.busy, prep: Duration::ZERO,
                         prefill: Phase::default(), generation: Phase::default() }
     }
 
@@ -96,9 +99,24 @@ mod tests {
         let mut timing = counters.admit(start + Duration::from_millis(50), start);
         timing.prefill.add(4, Duration::from_millis(25));
         timing.prefill.add(6, Duration::from_millis(75));
-        assert_eq!(timing.to_string(), "queue_ms=50.0 prefill_ms=100.0 prefill_tok_s=100.0 gen_ms=0.0 gen_tok_s=0.0 lanes_busy_start=2");
+        assert_eq!(timing.to_string(), "queue_ms=50.0 prep_ms=0.0 prefill_ms=100.0 prefill_tok_s=100.0 gen_ms=0.0 gen_tok_s=0.0 lanes_busy_start=2");
         timing.generation.add(1, Duration::from_millis(50));
         assert!(timing.to_string().contains("gen_ms=50.0 gen_tok_s=20.0"));
+    }
+
+    #[test]
+    fn lane_preparation_is_its_own_phase() {
+        // Admission at 40 ms, preparation 15 ms, then a 30 ms prefill: preparation is charged to neither the
+        // queue wait (it starts after admission) nor the prefill rate (it moves no prompt tokens).
+        let queued = Instant::now();
+        let mut counters = Counters::new(queued);
+        counters.queued = 1;
+        let mut timing = counters.admit(queued + Duration::from_millis(40), queued);
+        timing.prep = Duration::from_millis(15);
+        timing.prefill.add(6, Duration::from_millis(30));
+        assert_eq!(timing.to_string(), "queue_ms=40.0 prep_ms=15.0 prefill_ms=30.0 prefill_tok_s=200.0 gen_ms=0.0 gen_tok_s=0.0 lanes_busy_start=1");
+        let total = timing.queue_wait + timing.prep + timing.prefill.elapsed;
+        assert_eq!(total, Duration::from_millis(85));
     }
 
     #[test]

@@ -461,7 +461,11 @@ fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, 
 /// zero-sized observer; only the seeded test driver materializes trace rows.
 trait Trace {
     fn boundary(&mut self) {}
-    fn admit(&mut self, _job: u64, _lane: usize, _cached: usize) {}
+    /// A request leaves the queue for lane `adm.dst`; `adm.src` and `adm.prefix` say where its cached prefix
+    /// comes from (the lane's own kept prompt, a copy from another lane, or nothing).
+    fn admit(&mut self, _job: u64, _adm: Admission) {}
+    /// A request reached a free lane but cannot fit in one lane's context: it is refused and ends here.
+    fn refuse_ctx(&mut self, _job: u64) {}
     fn step(&mut self, _mode: &str, _spans: impl Iterator<Item = (u64, usize, usize, usize)>) {}
     fn step_finished(&mut self) {}
     fn terminal(&mut self, _job: u64, _lane: usize, _reason: &str, _generated: usize) {}
@@ -498,15 +502,17 @@ fn run_scheduler<E: SchedulerEngine, T: Trace>(
             let Some(adm) = choose_lane(&cands) else { break };
             let j = queue.pop_front().unwrap();
             if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx() {
+                trace.refuse_ctx(j.seq);
                 metrics.lock().unwrap().queued -= 1;
                 let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx())));
                 continue;
             }
-            let timing = metrics.lock().unwrap().admit(Instant::now(), j.queued_at);
+            // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
+            let mut timing = metrics.lock().unwrap().admit(Instant::now(), j.queued_at);
             let i = adm.dst;
             let start = adm.prefix;
-            trace.admit(j.seq, i, start);
-            eng.prepare(&lanes, adm, &j);
+            trace.admit(j.seq, adm);
+            timing.prep = eng.prepare(&lanes, adm, &j);
             let sampler = Sampler::new(j.temp, 64, j.top_p, eng.softcap(), j.seed);
             // once per request, not per round and not per emitted token
             let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap(), j.seed);
@@ -1452,7 +1458,7 @@ mod tests {
         // the handler really sends the clamped budget to the scheduler
         let tk0 = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
-        let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
+        let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        inflight: Default::default(), limit: 4, conns: Default::default() });
         let req = json!({"model": "m", "max_tokens": 63, "messages": [{"role": "user", "content": "x".repeat(8)}]});
@@ -1463,7 +1469,7 @@ mod tests {
         let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
         let job = jrx.recv().unwrap();
         assert_eq!(job.max, want, "the job carries the clamped budget, not the refused 63");
-        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop" }).unwrap();
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: String::new() }).unwrap();
         let out = String::from_utf8(worker.join().unwrap()).unwrap();
         assert!(out.starts_with("HTTP/1.1 200"), "a clamped request is served, not refused: {}", &out[..out.len().min(80)]);
     }

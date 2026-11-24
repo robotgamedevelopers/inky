@@ -9,6 +9,8 @@ const QUEUE: usize = 1;
 const CHUNK: usize = 2;
 const CONTEXT: usize = 32;
 const REQUESTS: u64 = 32;
+/// Version 2: `admit` carries `source` and `from`; `refuse_ctx` ends a request too long for a lane.
+const SCHEMA_VERSION: u64 = 2;
 
 /// The scheduler still samples, updates positions, and decides when each lane is done.
 /// Only the GPU work is substituted. Token 1 always wins; the two stop tokens are 2, 3.
@@ -20,7 +22,7 @@ impl backend::SchedulerEngine for FakeEngine {
     fn chunk(&self) -> usize { CHUNK }
     fn softcap(&self) -> f32 { 0.0 }
     fn tier_on(&self, _: &()) -> bool { false }
-    fn prepare(&self, _: &[LaneS<()>], _: Admission, _: &Job) {}
+    fn prepare(&self, _: &[LaneS<()>], _: Admission, _: &Job) -> Duration { Duration::ZERO }
     fn prefill(&self, _: &[LaneS<()>], _: &[(usize, usize, usize)]) -> Duration { Duration::ZERO }
     fn decode(&self, _: &[LaneS<()>], _: &[usize]) -> Duration { Duration::ZERO }
     fn save_state(&self, _: &()) -> Vec<u8> { vec![] }
@@ -32,6 +34,10 @@ struct Workload<'a> {
     tick: usize,
     submitted: u64,
     outstanding: usize,
+    /// The last prompt that fits a lane; a later prompt may extend it, so lanes reuse and copy prefixes.
+    last: Vec<u32>,
+    /// One request per walk is too long for a lane's context, so the context refusal is always exercised.
+    oversized: bool,
     jobs: Option<Sender<Job>>,
     clients: BTreeMap<u64, (Receiver<Ev>, InFlight<'a>)>,
     inflight: &'a AtomicUsize,
@@ -48,10 +54,23 @@ impl Workload<'_> {
     fn arrive(&mut self) {
         self.submitted += 1;
         let job = self.submitted;
-        let prompt = 1 + self.pick(7);
+        let slot = try_slot(self.inflight, LANES + QUEUE);
         let max = 2 + self.pick(4);
-        self.events.push(json!({"event":"arrive","job":job,"prompt":prompt,"max":max}));
-        let Some(slot) = try_slot(self.inflight, LANES + QUEUE) else {
+        let toks = if slot.is_some() && !self.oversized && job > (LANES + QUEUE + 1) as u64 {
+            // prompt + max + 2 > CONTEXT: refused at admission, after it reaches a free lane
+            self.oversized = true;
+            vec![job as u32; CONTEXT - 1]
+        } else {
+            let extra = 1 + self.pick(7);
+            let extend = !self.last.is_empty() && self.pick(2) == 0 && self.last.len() + extra + max + 2 <= CONTEXT;
+            // A fresh prompt leads with its own unique token, so it shares nothing with any lane.
+            let mut toks = if extend { self.last.clone() } else { vec![] };
+            toks.extend(vec![job as u32; extra]);
+            self.last = toks.clone();
+            toks
+        };
+        self.events.push(json!({"event":"arrive","job":job,"prompt":toks.len(),"max":max}));
+        let Some(slot) = slot else {
             self.events.push(json!({"event":"refuse429","job":job}));
             return;
         };
@@ -59,9 +78,8 @@ impl Workload<'_> {
         self.clients.insert(job, (rx, slot));
         self.outstanding += 1;
         self.metrics.lock().unwrap().queued += 1;
-        // A unique leading token keeps this bounded scheduling workload cold.
         self.jobs.as_ref().unwrap().send(Job {
-            seq: job, queued_at: Instant::now(), toks: vec![job as u32; prompt],
+            seq: job, queued_at: Instant::now(), toks,
             max, temp: 0.0, top_p: 1.0, seed: self.random, out,
         }).unwrap();
     }
@@ -71,7 +89,7 @@ impl Trace for Workload<'_> {
     fn boundary(&mut self) {
         self.tick += 1;
         assert!(self.tick < 512, "scheduler did not drain the seeded workload");
-        self.clients.retain(|_, (rx, _)| !rx.try_iter().any(|ev| matches!(ev, Ev::Done { .. })));
+        self.clients.retain(|_, (rx, _)| !rx.try_iter().any(|ev| matches!(ev, Ev::Done { .. } | Ev::Err(_))));
         if self.submitted == REQUESTS && self.outstanding == 0 {
             self.jobs.take();
             return;
@@ -91,8 +109,13 @@ impl Trace for Workload<'_> {
         for _ in 0..arrivals.min((REQUESTS - self.submitted) as usize) { self.arrive(); }
     }
 
-    fn admit(&mut self, job: u64, lane: usize, cached: usize) {
-        self.events.push(json!({"event":"admit","job":job,"lane":lane,"cached":cached}));
+    fn admit(&mut self, job: u64, adm: Admission) {
+        let source = if adm.prefix == 0 { "cold" } else if adm.src == adm.dst { "own" } else { "copy" };
+        self.events.push(json!({"event":"admit","job":job,"lane":adm.dst,"cached":adm.prefix,"source":source,"from":adm.src}));
+    }
+    fn refuse_ctx(&mut self, job: u64) {
+        self.outstanding -= 1;
+        self.events.push(json!({"event":"refuse_ctx","job":job}));
     }
     fn step(&mut self, mode: &str, spans: impl Iterator<Item = (u64,usize,usize,usize)>) {
         let spans: Vec<_> = spans.map(|(job,lane,pos,tokens)| json!({
@@ -116,9 +139,9 @@ fn walk(seed: u64) -> Vec<Value> {
     let metrics = Mutex::new(Counters::new(Instant::now()));
     let (sender, receiver) = channel();
     let mut workload = Workload {
-        random:seed, tick:0, submitted:0, outstanding:0, jobs:Some(sender),
+        random:seed, tick:0, submitted:0, outstanding:0, last:vec![], oversized:false, jobs:Some(sender),
         clients:BTreeMap::new(), inflight:&inflight, metrics:&metrics,
-        events:vec![json!({"event":"config","version":1,"seed":seed,"lanes":LANES,"queue":QUEUE,"chunk":CHUNK,"context":CONTEXT})],
+        events:vec![json!({"event":"config","version":SCHEMA_VERSION,"seed":seed,"lanes":LANES,"queue":QUEUE,"chunk":CHUNK,"context":CONTEXT})],
     };
     run_scheduler(&FakeEngine, [2, 3], LANES, receiver, &metrics, &mut workload);
     assert_eq!(inflight.load(Ordering::SeqCst), 0);
@@ -129,11 +152,17 @@ fn walk(seed: u64) -> Vec<Value> {
 #[test]
 fn seeded_decisions_are_repeatable_and_drain() {
     use std::collections::{BTreeSet, HashMap};
+    let mut sources = HashMap::new();
     for seed in (0..32).chain([u64::MAX]) {
         let trace = walk(seed);
         assert_eq!(trace, walk(seed));
+        assert_eq!(trace[0]["version"], SCHEMA_VERSION);
         let mut pending = BTreeSet::new();
+        let mut prompts = HashMap::new();
+        let mut maxes = HashMap::new();
         let mut lanes = [None; LANES];
+        // the prompt length whose state each lane keeps: set when a prefill reaches the prompt's end
+        let mut kept = [None; LANES];
         let mut phases = BTreeSet::new();
         let mut cases = HashMap::new();
         let mut executing = false;
@@ -141,13 +170,40 @@ fn seeded_decisions_are_repeatable_and_drain() {
             let kind = ev["event"].as_str().unwrap();
             *cases.entry(kind).or_insert(0) += 1;
             match kind {
-                "arrive" => assert!(pending.insert(ev["job"].as_u64().unwrap())),
+                "arrive" => {
+                    let job = ev["job"].as_u64().unwrap();
+                    assert!(pending.insert(job));
+                    prompts.insert(job, ev["prompt"].as_u64().unwrap());
+                    maxes.insert(job, ev["max"].as_u64().unwrap());
+                }
                 "refuse429" => assert!(pending.remove(&ev["job"].as_u64().unwrap())),
+                "refuse_ctx" => {
+                    let job = ev["job"].as_u64().unwrap();
+                    assert!(pending.remove(&job));
+                    assert!((prompts[&job] + maxes[&job]) as usize + 2 > CONTEXT);
+                }
                 "admit" => {
                     let job = ev["job"].as_u64().unwrap();
                     assert!(pending.remove(&job));
                     let lane = ev["lane"].as_u64().unwrap() as usize;
-                    assert!(lanes[lane].replace((job, ev["cached"].as_u64().unwrap())).is_none());
+                    let from = ev["from"].as_u64().unwrap() as usize;
+                    let cached = ev["cached"].as_u64().unwrap();
+                    let source = ev["source"].as_str().unwrap();
+                    *sources.entry(source.to_string()).or_insert(0) += 1;
+                    assert!(cached < prompts[&job], "the suffix to prefill is never empty");
+                    match source {
+                        "cold" => assert_eq!((cached, from), (0, lane)),
+                        "own" => assert!(from == lane && kept[lane] == Some(cached)),
+                        "copy" => {
+                            assert!(from != lane && kept[from] == Some(cached));
+                            // the source is busy, its prefill done and no decode step written yet
+                            let (src_job, pos) = lanes[from].unwrap();
+                            assert_eq!((pos, prompts[&src_job]), (cached, cached));
+                        }
+                        other => panic!("unexpected admit source {other}"),
+                    }
+                    kept[lane] = None;
+                    assert!(lanes[lane].replace((job, cached)).is_none());
                 }
                 "build_step" => {
                     assert!(!executing);
@@ -166,6 +222,7 @@ fn seeded_decisions_are_repeatable_and_drain() {
                         if phase == "decode" { assert_eq!(n, 1); }
                         *pos += n;
                         total += n;
+                        if phase == "prefill" && *pos == prompts[&*job] { kept[lane] = Some(*pos); }
                     }
                     assert!(!chosen.is_empty());
                     if phase == "prefill" { assert!(total <= CHUNK as u64); }
@@ -184,7 +241,9 @@ fn seeded_decisions_are_repeatable_and_drain() {
         assert_eq!(phases, BTreeSet::from(["decode", "prefill"]));
         assert_eq!(cases["arrive"], REQUESTS);
         for kind in ["finish", "cancel", "refuse429"] { assert!(cases[kind] > 0); }
+        assert_eq!(cases["refuse_ctx"], 1);
     }
+    for source in ["cold", "own", "copy"] { assert!(sources.get(source).is_some_and(|&n| n > 0), "no {source} admission in any seed"); }
 }
 
 #[test]
