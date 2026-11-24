@@ -248,7 +248,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
         }
     }
     let mut out = json!({"messages": msgs});
-    if let Some(e) = anthropic_effort(req) { out["reasoning_effort"] = json!(e); }
+    if let Some(e) = anthropic_effort(req)? { out["reasoning_effort"] = json!(e); }
     if let Some(tools) = req.get("tools").filter(|t| !t.is_null()) {
         let tools = tools.as_array().ok_or("tools must be an array")?;
         if !tools.is_empty() {
@@ -267,21 +267,40 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
 /// the chat path renders through `effort_num` — or none, when the request
 /// leaves the serve default standing. An explicit effort field wins (top
 /// level, `output_config`, or inside `thinking`); then `thinking` itself:
-/// disabled is none, an enabled budget maps by size (under 4096 low, under
-/// 16384 medium, else high), and adaptive — or no thinking at all — decides
-/// for itself, so it sets nothing.
-fn anthropic_effort(req: &Value) -> Option<String> {
-    let field = |v: &Value| v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    if let Some(e) = req.get("output_config").and_then(|o| o.get("effort")).and_then(field) { return Some(e); }
-    if let Some(e) = req.get("effort").and_then(field) { return Some(e); }
-    let th = req.get("thinking")?;
-    if let Some(e) = th.get("effort").and_then(field) { return Some(e); }
+/// disabled is none, an enabled budget maps by size (1024–4095 low,
+/// 4096–16383 medium, else high), and adaptive — or no thinking at all —
+/// decides for itself, so it sets nothing. Anything malformed refuses
+/// (the caller answers 400): no silent fallback may turn an unknown
+/// effort into 0.9 or drop a budget on the floor.
+fn anthropic_effort(req: &Value) -> Result<Option<String>, String> {
+    // an effort field that is present must be a known level (or a number in
+    // effort_num's range): an unknown string would otherwise reach effort_num
+    // and silently become 0.9, and a non-string would silently vanish
+    let field = |v: &Value| -> Result<String, String> {
+        let s = v.as_str().ok_or("effort must be a string")?.trim();
+        let known = matches!(s, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+            || s.parse::<f64>().is_ok_and(|n| n.is_finite() && (0.0..=0.99).contains(&n));
+        if known { Ok(s.to_string()) } else { Err(format!("unknown effort level {s:?}")) }
+    };
+    if let Some(v) = req.get("output_config").and_then(|o| o.get("effort")).filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    if let Some(v) = req.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    let Some(th) = req.get("thinking").filter(|v| !v.is_null()) else { return Ok(None) };
+    if let Some(v) = th.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
     match th["type"].as_str() {
-        Some("disabled") => Some("none".into()),
-        Some("enabled") => th["budget_tokens"].as_u64().map(|b| match b {
-            0 => "none", 1..=4095 => "low", 4096..=16383 => "medium", _ => "high",
-        }.to_string()),
-        _ => None,
+        Some("disabled") => Ok(Some("none".into())),
+        Some("adaptive") => Ok(None),
+        Some("enabled") => {
+            let b = th.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
+            let b = b.as_u64().ok_or("thinking budget_tokens must be a non-negative integer")?;
+            match b {
+                0 => Ok(Some("none".into())),
+                1..=1023 => Err(format!("thinking budget_tokens {b} is under Anthropic's 1024 minimum")),
+                1024..=4095 => Ok(Some("low".into())),
+                4096..=16383 => Ok(Some("medium".into())),
+                _ => Ok(Some("high".into())),
+            }
+        }
+        t => Err(format!("unknown thinking type {}", t.unwrap_or("none"))),
     }
 }
 
@@ -1214,6 +1233,24 @@ mod tests {
         // an explicit effort field wins over the budget, wherever it sits
         assert_eq!(effort_of(base(json!({"output_config": {"effort": "xhigh"}, "thinking": {"type": "enabled", "budget_tokens": 1024}}))), Some("xhigh".into()));
         assert_eq!(effort_of(base(json!({"effort": "max", "thinking": {"type": "disabled"}}))), Some("max".into()));
+        // budget boundaries, both sides of every cut
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 4095}}))), Some("low".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}))), Some("medium".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 16383}}))), Some("medium".into()));
+        assert_eq!(effort_of(base(json!({"thinking": {"type": "enabled", "budget_tokens": 16384}}))), Some("high".into()));
+        // malformed effort settings refuse (400 at the handler), never a silent fallback
+        let refuses = |r: Value| anthropic_to_openai(&r).is_err();
+        assert!(refuses(base(json!({"effort": "ultra"}))), "an unknown effort level must not become 0.9 in effort_num");
+        assert!(refuses(base(json!({"effort": ""}))), "an empty effort level");
+        assert!(refuses(base(json!({"effort": 5}))), "a non-string effort must not be dropped");
+        assert!(refuses(base(json!({"output_config": {"effort": true}}))), "a non-string output_config effort");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled", "budget_tokens": 1}}))), "a budget under Anthropic's minimum");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled", "budget_tokens": 1023}}))), "1023 is still under the minimum");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled", "budget_tokens": -5}}))), "a negative budget");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled", "budget_tokens": 8192.5}}))), "a fractional budget");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled", "budget_tokens": "8192"}}))), "a string budget");
+        assert!(refuses(base(json!({"thinking": {"type": "enabled"}}))), "enabled without a budget");
+        assert!(refuses(base(json!({"thinking": {"type": "sometimes"}}))), "an unknown thinking type");
         // and it renders to the chat path's effort line, not a second spelling
         let tk = Tokenizer::for_test();
         let sp = test_sp(&tk);
