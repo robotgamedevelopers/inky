@@ -5,6 +5,7 @@ mod metal;
 mod sampler;
 mod session;
 mod memd;
+mod poolgate;
 mod serve;
 mod tuning;
 mod tokenizer;
@@ -575,6 +576,34 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, layer 3's output gate (src/poolgate.rs): lanes run together with every pool slot outside the step poisoned must
+/// give exactly the logits and greedy tokens of layer 2's path, each lane alone. Today the candidate is layer 2 itself,
+/// over each lane's own buffers; the block cache replaces it in `cand` below. INK_POOLGATE_LANES (default 3),
+/// INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position block boundary) and
+/// INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a long one.
+/// INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are poisoned, and the gate must then fail.
+fn poolgate(o: &Opts) {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+    let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
+    let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
+    let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
+    let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
+    let eng = Engine::load(&o.model, o.ctx);
+    let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
+    // the candidate: the block cache plugs in here, as a `StepPath + PoisonPool` over the same engine
+    let cand = poolgate::Layer2::new(&eng, n);
+    let label = cand.candidate_label();
+    println!("poolgate candidate: {label}");
+    let got = poolgate::poisoned(&cand, &w, sabotage);
+    if sabotage && !got.sabotaged { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
+    match poolgate::compare(&want, &got) {
+        Ok(lines) => { for l in lines { println!("{l}"); } println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs"); }
+        Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
+    }
+}
+
 /// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
 /// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
 /// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
@@ -1042,6 +1071,7 @@ fn main() {
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
+        "poolgate" => poolgate(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "maxctx" => maxctx(&o),

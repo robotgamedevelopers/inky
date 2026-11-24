@@ -1,4 +1,5 @@
 //! Layer 3 block cache, the types the rest of the layer builds on.
+#![allow(dead_code)] // the pool, the table and the prefix tree are the callers; cargo check does not compile the unit tests
 //!
 //! A block is 64 positions. A window block is 10 MiB and a full block is 2 MiB
 //! (DESIGN.md). Each kind has its own pool, so an offset is a plain `u64` byte
@@ -655,5 +656,22 @@ mod tests {
             assert_eq!(pool.offset(slot).unwrap(), 0);
         }
         assert_ne!(pools.window.kind().stride(), pools.full.kind().stride());
+    }
+
+    #[test]
+    fn bump_generation_advances_and_leaves_a_live_reference() {
+        let mut slot = SlotRecord::fresh(BlockKind::Full);
+        slot.set_length(64).unwrap();
+        slot.seal();
+        slot.add_ref().unwrap();
+        slot.add_ref().unwrap();
+        slot.bump_generation().unwrap();
+        assert_eq!((slot.generation(), slot.length(), slot.sealed(), slot.refs()), (1, 64, true, 2));
+        let mut max_slot = SlotRecord::at_generation(BlockKind::Window, u32::MAX);
+        max_slot.set_length(32).unwrap();
+        max_slot.seal();
+        max_slot.add_ref().unwrap();
+        assert_eq!(max_slot.bump_generation(), Err(BlockError::Generation));
+        assert_eq!((max_slot.generation(), max_slot.length(), max_slot.sealed(), max_slot.refs()), (u32::MAX, 32, true, 1));
     }
 }
