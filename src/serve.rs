@@ -1452,7 +1452,7 @@ mod tests {
         // the handler really sends the clamped budget to the scheduler
         let tk0 = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
-        let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
+        let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        inflight: Default::default(), limit: 4, conns: Default::default() });
         let req = json!({"model": "m", "max_tokens": 63, "messages": [{"role": "user", "content": "x".repeat(8)}]});
@@ -1463,7 +1463,7 @@ mod tests {
         let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
         let job = jrx.recv().unwrap();
         assert_eq!(job.max, want, "the job carries the clamped budget, not the refused 63");
-        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop" }).unwrap();
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: String::new() }).unwrap();
         let out = String::from_utf8(worker.join().unwrap()).unwrap();
         assert!(out.starts_with("HTTP/1.1 200"), "a clamped request is served, not refused: {}", &out[..out.len().min(80)]);
     }
