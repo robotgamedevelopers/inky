@@ -1,4 +1,8 @@
 mod blocks;
+mod cache_scheduler;
+mod cache_trace;
+#[allow(dead_code)]
+mod blockbook;
 mod engine;
 mod gguf;
 #[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next

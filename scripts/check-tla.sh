@@ -147,3 +147,8 @@ fi
 
 # Required since PR #23: a missing checker must fail this gate.
 bash "$root/scripts/check-memmode-traces.sh"
+# src/blockbook.rs is bound to specs/StartTails.tla; a missing checker must fail this gate.
+[ -f "$root/scripts/check-blockbook-traces.sh" ] || { echo 'blockbook trace checker missing' >&2; exit 1; }
+bash "$root/scripts/check-blockbook-traces.sh"
+[ -f "$root/scripts/check-cache-traces.sh" ] || { echo 'cache trace checker missing' >&2; exit 1; }
+bash "$root/scripts/check-cache-traces.sh"

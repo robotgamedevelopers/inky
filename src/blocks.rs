@@ -678,6 +678,12 @@ impl BlockPool {
         Ok(())
     }
 
+    /// The lowest slot nothing references whose generation can still advance.
+    pub fn lowest_free(&self) -> Option<Slot> {
+        let i = self.slots.iter().position(|r| r.refs == 0 && r.generation < u32::MAX)?;
+        Slot::new(u32::try_from(i + 1).ok()?).ok()
+    }
+
     #[cfg(test)]
     fn force_generation(&mut self, slot: Slot, generation: u32) -> Result<(), BlockError> {
         self.record_mut(slot)?.generation = generation;
@@ -713,6 +719,19 @@ impl BlockPools {
         }
     }
 
+    /// Both pools with `n_slots` each at fp16 (`kvb = 2`).
+    pub fn new(n_slots: usize) -> BlockPools {
+        BlockPools { window: BlockPool::new(BlockKind::Window, n_slots), full: BlockPool::new(BlockKind::Full, n_slots) }
+    }
+
+    /// Both pools with independent capacities at element width `kvb` (`1` or `2`).
+    pub fn with_capacities(full_slots: usize, window_slots: usize, kvb: u32) -> Result<BlockPools, BlockError> {
+        Ok(BlockPools {
+            window: BlockPool::with_kvb(BlockKind::Window, window_slots, kvb)?,
+            full: BlockPool::with_kvb(BlockKind::Full, full_slots, kvb)?,
+        })
+    }
+
     pub fn of(&self, kind: BlockKind) -> &BlockPool {
         match kind { BlockKind::Window => &self.window, BlockKind::Full => &self.full }
     }
@@ -741,6 +760,23 @@ impl BlockTable {
     pub fn get(&self, kind: BlockKind, block: BlockIndex) -> Result<Option<BlockEntry>, BlockError> {
         let i = table_index(kind, block, self.blocks_per_kind)? as usize;
         Ok(self.entries.get(i).copied().flatten())
+    }
+
+    pub fn blocks_per_kind(&self) -> u32 { self.blocks_per_kind }
+
+    /// Set or clear the entry for `(kind, block)`. An entry of the other kind is refused.
+    pub fn set(&mut self, kind: BlockKind, block: BlockIndex, entry: Option<BlockEntry>) -> Result<(), BlockError> {
+        if entry.is_some_and(|e| e.kind() != kind) { return Err(BlockError::OutOfRange); }
+        let i = table_index(kind, block, self.blocks_per_kind)? as usize;
+        let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
+        *cell = entry;
+        Ok(())
+    }
+
+    /// Every present entry with its block, full before window within a block,
+    /// blocks ascending.
+    pub fn entries(&self) -> impl Iterator<Item = (BlockIndex, BlockEntry)> + '_ {
+        self.entries.iter().enumerate().filter_map(|(i, e)| e.map(|e| (BlockIndex::new((i / 2) as u32), e)))
     }
 
     /// Write one entry. The stored offset is `byte_offset` at the pool's `kvb`.
@@ -1390,5 +1426,25 @@ mod tests {
                 assert_eq!(key_row_at(0, 2, 3, 4, 2, kvb, p, k, h, i).unwrap(), addr);
             }
         }
+    }
+
+    #[test]
+    fn lowest_free_skips_referenced_and_exhausted_slots_and_set_checks_kind() {
+        let mut pools = BlockPools::new(3);
+        let one = Slot::new(1).unwrap();
+        pools.of_mut(BlockKind::Full).record_mut(one).unwrap().add_ref().unwrap();
+        pools.full.slots[1] = SlotRecord::at_generation(BlockKind::Full, u32::MAX);
+        assert_eq!(pools.of(BlockKind::Full).lowest_free(), Some(Slot::new(3).unwrap()));
+        assert_eq!(pools.of(BlockKind::Window).lowest_free(), Some(one));
+        assert_eq!(BlockPool::new(BlockKind::Full, 0).lowest_free(), None);
+        let mut t = BlockTable::new(2).unwrap();
+        let e = BlockEntry::new(one, 1, 0, BlockKind::Full, 2);
+        assert_eq!(t.set(BlockKind::Window, BlockIndex::new(0), Some(e)), Err(BlockError::OutOfRange));
+        assert_eq!(t.set(BlockKind::Full, BlockIndex::new(2), Some(e)), Err(BlockError::OutOfRange));
+        t.set(BlockKind::Full, BlockIndex::new(1), Some(e)).unwrap();
+        assert_eq!(t.entries().map(|(b, e)| (b.get(), e.kind())).collect::<Vec<_>>(), vec![(1, BlockKind::Full)]);
+        t.set(BlockKind::Full, BlockIndex::new(1), None).unwrap();
+        assert_eq!(t.entries().count(), 0);
+        assert_eq!(t.blocks_per_kind(), 2);
     }
 }
