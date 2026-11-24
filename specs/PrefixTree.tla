@@ -109,7 +109,6 @@ Init ==
 \* only within the modelled depth. It takes the tree's one ref and
 \* records the slot's generation at seal time.
 Seal(s, slot) ==
-    /\ ~sought
     /\ s \in BlockSeqs
     /\ Len(s) \in {BlockLen, 2 * BlockLen}
     /\ Len(s) <= MaxBlocks * BlockLen
@@ -133,7 +132,6 @@ Seal(s, slot) ==
 \* refuses this insert (LiveTree, StaleEntry); under Bug =
 \* "stale-insert" the model accepts it and HeldNeverStale falls.
 SealClaimed(s, slot, gen) ==
-    /\ ~sought
     /\ Bug = "stale-insert"
     /\ s \in BlockSeqs
     /\ Len(s) \in {BlockLen, 2 * BlockLen}
@@ -181,7 +179,6 @@ ReSeal(s, slot) ==
     /\ result' = <<>>
 
 Retain(s) ==
-    /\ ~sought
     /\ s \in sealed \ {<<>>}
     /\ starts[s] < MaxHolders
     /\ starts' = [starts EXCEPT ![s] = starts[s] + 1]
@@ -190,7 +187,6 @@ Retain(s) ==
     /\ result' = <<>>
 
 Release(s) ==
-    /\ ~sought
     /\ starts[s] > 0
     /\ starts' = [starts EXCEPT ![s] = starts[s] - 1]
     /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs>>
@@ -204,7 +200,6 @@ Release(s) ==
 \* the "evict" config lifts it with a correct Seek so eviction is
 \* exercised in a passing config.
 Reuse(slot) ==
-    /\ ~sought
     /\ poolGen[slot] < MaxGen
     /\ Bug \in {"stale", "leak", "reuse-held", "evict"}
         \/ \A s \in sealed : slotOf[s] = slot => refs[s] = 0
@@ -216,7 +211,6 @@ Reuse(slot) ==
 \* Removal takes a block and everything below it out of the tree and
 \* drops their refs and start holds.
 Evict(s) ==
-    /\ ~sought
     /\ s \in sealed \ {<<>>}
     /\ sealed' = {t \in sealed : ~IsPrefix(s, t)}
     /\ starts' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE starts[x]]
