@@ -1,6 +1,40 @@
 # inky
 
-> The engine's full guide, written by its original author, Eris ([erisinky](https://github.com/Eriskii/erisinky)), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
+> The engine's full guide, written by its original author, Eris, for [inkling](https://github.com/Eriskii/erisinky), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
+
+## Target hardware and tuning
+
+**The target is the Apple M5 Max MacBook Pro with 128 GB of memory**: inky is tuned and measured on it. The next target is an M5 Ultra Mac Studio. inky needs an M5 or later (Metal 4 and the GPU neural accelerators).
+
+**The model runs exactly as published, lossless.** No change to Inkling 2 Mini: no quantization beyond the GGUF's own weights, no 8-bit cache, no key pruning, no int8 activations. The speed comes from two things only: many lanes in one step, which turns many small operations into a few wide ones, and using everything the hardware offers.
+
+**Give the GPU the memory.** macOS lets the GPU wire about 107.5 GiB of a 128 GB Mac by default. More memory is more lanes at long context, so raise the limit:
+
+```sh
+sysctl iogpu.wired_limit_mb                  # 0 = the macOS default
+sudo sysctl iogpu.wired_limit_mb=118000      # about 115 GiB for the GPU, about 13 GB left for macOS
+sudo sysctl iogpu.wired_limit_mb=0           # back to the default
+```
+
+The setting lasts until the next reboot. With it, Metal's recommended working set on the 128 GB MacBook Pro is 115.2 GiB. inky does this itself in inky mode (docs/DESIGN.md). Install the helper once:
+
+```sh
+sudo inky tune-memory           # starting inky now raises the limit; stopping it restores the limit it found
+sudo inky tune-memory --undo    # remove it
+```
+
+The value comes from this machine's tuning (`tunings/`; `m5-max-128gb` sets 118000).
+
+**Memory per lane.** A lane's cache is 160 MiB for the sliding-window layers plus 32 KiB per token of context for the full-attention layers. After the 17.5 GB of weights and a few GB of scratch, about 90 GiB is left for lanes:
+
+| context | cache per lane | lanes in about 90 GiB |
+|---:|---:|---:|
+| 16K | 0.7 GiB | 64 or more |
+| 64K | 2.2 GiB | about 40 |
+| 256K | 8.2 GiB | about 10 |
+| 1M | 32 GiB | 2 |
+
+**Watch for swapping.** Swapping ruins every measurement and slows the whole Mac. Check `vm_stat | grep Swapouts` before and after a run; the count must not grow.
 
 ## Serving: inky as a provider
 
@@ -46,6 +80,8 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
 | `-n MAX` | 16384 | Default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
+
+Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. That kept prompt may also start another lane: when the lane holding it is busy, a free lane copies its prefill-written prefix and the prompt-end convolution state and prefills only the suffix (`inky xcopy` gates that the copy is bit-identical to a cold prefill; a partial overlap with a kept prompt still starts cold, because the state exists only at a prompt's end).
 
 `GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `http://127.0.0.1:8096/v1` as their base URL, with model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 

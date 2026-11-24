@@ -54,12 +54,19 @@ func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
 	return result, err
 }
 
-func (g *gate) checkHealth(path string) error {
+func (g *gate) checkHealth(path string, sabotage bool) error {
 	r, err := g.observe(path, "", nil)
 	if err != nil {
 		return err
 	}
-	if err := r.expect(http.StatusOK); err != nil {
+	expected := http.StatusOK
+	if sabotage {
+		expected = http.StatusTeapot // CI negative control: a healthy server must disagree.
+	}
+	if err := r.expect(expected); err != nil {
+		if sabotage {
+			return fmt.Errorf("sabotage health-status: %w", err)
+		}
 		return err
 	}
 	if !r.OK {
@@ -92,7 +99,7 @@ func (g *gate) validation() {
 		if len(r.Models) == 0 {
 			return fmt.Errorf("authorized model list is empty")
 		}
-		return g.checkHealth("/health")
+		return g.checkHealth("/health", g.sabotage == "health-status")
 	})
 	g.run("sampling bounds and subsequent health", func() error {
 		for _, tc := range []struct{ name, field string }{{"max_tokens", `"max_tokens":18446744073709551615`}, {"temperature", `"temperature":5,"max_tokens":1`}, {"top_p", `"top_p":0,"max_tokens":1`}} {
@@ -111,7 +118,7 @@ func (g *gate) validation() {
 				return fmt.Errorf("accepted incorrect sampling success observation")
 			}
 		}
-		return g.checkHealth("/health")
+		return g.checkHealth("/health", false)
 	})
 	g.run("bearer header casing and trailing-slash health", func() error {
 		r, err := g.observe("/v1/models", "BEARER "+g.key, nil)
@@ -127,6 +134,6 @@ func (g *gate) validation() {
 		if r.expect(401) == nil {
 			return fmt.Errorf("accepted incorrect rejection observation")
 		}
-		return g.checkHealth("/health/")
+		return g.checkHealth("/health/", false)
 	})
 }

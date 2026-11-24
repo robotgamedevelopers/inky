@@ -130,6 +130,8 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | Step building: the longest-waiting lane first, decoding lanes, then prefill spans to the token budget | ❌ |
 | No Ready, Restoring or Queued lane is passed over more than W ticks | ❌ |
 | Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ❌ |
+| The memory budget read from Metal's recommended working set at start, never passed by hand | ❌ |
+| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ✅ |
 | Cancel in a step waits for the step's GPU work and disk I/O | ❌ |
 | Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ❌ |
 | Restoring reserves the whole working set atomically before reading | ❌ |
@@ -137,7 +139,7 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ❌ |
 | Gate: kill -9 in mid-write loses cache and never correctness | ❌ |
 | Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ❌ |
-| complete | 0% |
+| complete | 7% |
 
 [Source data](roadmap.sexp)
 
@@ -244,7 +246,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Smaller weight quantizations, behind the quality replay (later) | ❌ |
 | Tool calls constrained to valid JSON while sampling (later) | ❌ |
 | Sampling on the GPU (later) | ❌ |
-| General fixes sent upstream to erisinky (later) | ❌ |
+| General fixes sent upstream to inkling (later) | ❌ |
 | Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
 | Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
 | Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |

@@ -2,7 +2,7 @@
 
 <img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/1ae045b5-9adc-4590-8746-bd55b8bedad8" />
 
-Fast local inference for **Inkling 2 Mini** on Apple silicon.
+Fast local inference for [**Inkling 2 Mini**](https://thinkingmachines.ai/news/inkling-2-mini/) on Apple silicon.
 
 With **inky**, you can:
 

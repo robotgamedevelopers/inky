@@ -1,5 +1,5 @@
 // xsim: does choosing which lanes decode together, by predicted expert overlap, cut the bytes read per step?
-// Input: erisinky ref/routes dumps (G lines: token, 48 layer passes of top-8 experts).
+// Input: inkling's ref/routes dumps (G lines: token, 48 layer passes of top-8 experts).
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 )
 
 const L, E = 48, 128
-const sharedGB, expertGB = 1.26, (2.986 + 1.66) / 1000 // from erisinky tools/spec_analysis.py
+const sharedGB, expertGB = 1.26, (2.986 + 1.66) / 1000 // from inkling's tools/spec_analysis.py
 
 type tok [L]uint128
 
