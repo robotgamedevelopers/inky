@@ -14,9 +14,13 @@
 
 EXTENDS Integers, Sequences, FiniteSets
 
-CONSTANTS Alphabet, MaxDepth, Req, Bug
+CONSTANTS Alphabet, MaxDepth, Bug
 
-ASSUME MaxDepth \in Nat /\ Len(Req) = MaxDepth
+ASSUME MaxDepth \in Nat
+
+\* The request being matched: MaxDepth blocks, fixed here because a TLC
+\* config file assigns only literals and cannot write a sequence.
+Req == <<1, 2, 1>>
 
 VARIABLES sealed, starts, result, sought
 vars == <<sealed, starts, result, sought>>
