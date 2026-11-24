@@ -20,12 +20,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: the tag matches Cargo.toml and has release notes
+        with:
+          fetch-depth: 0
+      - name: verify tag is on main, matches Cargo.toml, and has release notes
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "tagged commit $(git rev-parse HEAD) is not an ancestor of origin/main" >&2
+            exit 1
+          fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           if [ "${TAG#v}" != "$version" ]; then
             echo "tag $TAG does not match Cargo.toml version $version" >&2
@@ -35,8 +42,10 @@ jobs:
             echo "docs/releases/$TAG.md is missing" >&2
             exit 1
           fi
+      - name: unit tests
+        run: cargo test --locked --release --bins
       - name: build
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: assets and SHA256SUMS
         shell: bash
         env:

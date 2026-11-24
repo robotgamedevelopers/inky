@@ -80,6 +80,7 @@ if [ -f tests/golden-$chip.txt ]; then
     if diff tests/golden-$chip.txt /tmp/inky-golden.$$; then echo "golden: identical to tests/golden-$chip.txt"; else echo "FAIL: golden hashes changed"; fail=1; fi
     rm -f /tmp/inky-golden.$$
 else
-    echo "golden: no tests/golden-$chip.txt for this chip, skipped"
+    echo "FAIL: missing tests/golden-$chip.txt for this chip"
+    fail=1
 fi
 exit $fail

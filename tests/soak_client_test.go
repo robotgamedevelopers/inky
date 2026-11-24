@@ -52,17 +52,25 @@ func TestSoakVerdict(t *testing.T) {
 		name           string
 		workloadStatus int
 		body           string
+		healthBody     string
 		success        bool
 	}{
-		{"success", 200, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true},
-		{"all workload rejected", 400, "bad request", false},
-		{"all 429 zero workload fails", 429, "overloaded", false},
-		{"truncated stream", 200, "data: [DONE]\n\n", false},
-		{"mid-stream error", 200, "data: {\"error\":{\"message\":\"boom\"}}\n\ndata: [DONE]\n\n", false},
+		{"success", 200, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", `{"ok":true,"active_lanes":0,"inflight":0}`, true},
+		{"leaked server lane fails", 200, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", `{"ok":true,"active_lanes":1,"inflight":0}`, false},
+		{"leaked server inflight fails", 200, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", `{"ok":true,"active_lanes":0,"inflight":1}`, false},
+		{"all workload rejected", 400, "bad request", `{"ok":true,"active_lanes":0,"inflight":0}`, false},
+		{"all 429 zero workload fails", 429, "overloaded", `{"ok":true,"active_lanes":0,"inflight":0}`, false},
+		{"truncated stream", 200, "data: [DONE]\n\n", `{"ok":true,"active_lanes":0,"inflight":0}`, false},
+		{"mid-stream error", 200, "data: {\"error\":{\"message\":\"boom\"}}\n\ndata: [DONE]\n\n", `{"ok":true,"active_lanes":0,"inflight":0}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var count atomic.Int64
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprint(w, tc.healthBody)
+					return
+				}
 				count.Add(1)
 				var req chatReq
 				_ = json.NewDecoder(r.Body).Decode(&req)
@@ -75,7 +83,7 @@ func TestSoakVerdict(t *testing.T) {
 			}))
 			defer server.Close()
 			cmd := exec.Command(os.Args[0], "-test.run=^TestSoakVerdict$")
-			cmd.Env = append(os.Environ(), "SOAK_TEST_CHILD=1", "SOAK_TEST_URL="+server.URL, "INKY_SERVE_KEY=test")
+			cmd.Env = append(os.Environ(), "SOAK_TEST_CHILD=1", "SOAK_TEST_URL="+server.URL+"/v1/chat/completions", "INKY_SERVE_KEY=test")
 			out, err := cmd.CombinedOutput()
 			if (err == nil) != tc.success {
 				t.Fatalf("err=%v output=%s", err, out)

@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"sync"
@@ -237,8 +238,6 @@ func main() {
 	cancelRun()
 
 	inflightEnd := tot.inflight.Load()
-	// A concurrent wave checks that lane-count requests can finish after the workload.
-	// Without server lane statistics this cannot prove each lane was occupied.
 	probeOK := 0
 	if inflightEnd == 0 {
 		var probes sync.WaitGroup
@@ -258,6 +257,7 @@ func main() {
 		probes.Wait()
 		probeOK = int(ok.Load())
 	}
+	serverActiveLanes, serverInflight, serverHealthOK := checkHealthDrain(httpClient, healthURL(*url))
 
 	fmt.Printf("seed=%d\n", *seed)
 	fmt.Printf("duration_s=%d\n", *duration)
@@ -280,15 +280,79 @@ func main() {
 	fmt.Printf("timeouts=%d\n", tot.timeouts.Load())
 	fmt.Printf("inflight_end=%d\n", inflightEnd)
 	fmt.Printf("inflight_max=%d\n", tot.inflightMax.Load())
+	fmt.Printf("server_active_lanes_end=%d\n", serverActiveLanes)
+	fmt.Printf("server_inflight_end=%d\n", serverInflight)
+	fmt.Printf("server_health_ok=%d\n", boolInt(serverHealthOK))
 	fmt.Printf("workload_completed=%d\n", tot.completed.Load())
 	fmt.Printf("unexpected_status=%d\n", tot.unexpected.Load())
 	fmt.Printf("stream_errors=%d\n", tot.streamErrors.Load())
 	fmt.Printf("recovery_completed=%d\n", probeOK)
 	fmt.Printf("recovery_requested=%d\n", *lanes)
-	fmt.Println("inflight_source=client_outstanding_no_server_stats_route")
+	fmt.Println("inflight_source=server_health_and_client_outstanding")
 
-	if inflightEnd != 0 || tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 || tot.completed.Load() == 0 || tot.transport.Load() != 0 || tot.timeouts.Load() != 0 || probeOK != *lanes {
+	if inflightEnd != 0 || !serverHealthOK || serverActiveLanes != 0 || serverInflight != 0 || tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 || tot.completed.Load() == 0 || tot.transport.Load() != 0 || tot.timeouts.Load() != 0 || probeOK != *lanes {
 		os.Exit(1)
+	}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func healthURL(chatURL string) string {
+	u, err := neturl.Parse(chatURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return strings.TrimRight(chatURL, "/") + "/health"
+	}
+	u.Path = "/health"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+type healthSnapshot struct {
+	OK          bool `json:"ok"`
+	ActiveLanes *int `json:"active_lanes"`
+	Inflight    *int `json:"inflight"`
+}
+
+func checkHealthDrain(httpClient *http.Client, url string) (activeLanes int, inflight int, ok bool) {
+	deadline := time.Now().Add(2 * time.Second)
+	activeLanes, inflight = -1, -1
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err == nil {
+			req.Close = true
+			resp, doErr := httpClient.Do(req)
+			if doErr == nil {
+				var snap healthSnapshot
+				decErr := json.NewDecoder(resp.Body).Decode(&snap)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK && decErr == nil && snap.OK && snap.ActiveLanes != nil && snap.Inflight != nil {
+					activeLanes = *snap.ActiveLanes
+					inflight = *snap.Inflight
+					ok = true
+					cancel()
+					if activeLanes == 0 && inflight == 0 {
+						return activeLanes, inflight, true
+					}
+				} else {
+					cancel()
+				}
+			} else {
+				cancel()
+			}
+		} else {
+			cancel()
+		}
+		if time.Now().After(deadline) {
+			return activeLanes, inflight, ok
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
