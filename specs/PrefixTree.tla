@@ -22,22 +22,26 @@
 \* the tree as the caller sees it at call time, as in the code.
 \*
 \* Bug values are the reversed witnesses, one per config:
-\*   "shallow"     Seek returns the shallowest live start (DeepestStart)
-\*   "stale"       Seek ignores generations (ResultLive)
-\*   "first-token" a block matches on its first token only (MatchExact)
-\*   "any-parent"  blocks match anywhere, not on one chain (ResultIsStart)
-\*   "partial"     the result may end mid-block (StartOnBoundary)
-\*   "leak"        Seek evicts stale blocks but drops no refs
-\*                 (RefsSettledAfterSeek)
-\*   "reuse-held"  a slot is reused while the tree holds its ref
-\*                 (HeldNeverStale)
+\*   "shallow"      Seek returns the shallowest live start (DeepestStart)
+\*   "stale"        Seek ignores generations (ResultLive)
+\*   "first-token"  a block matches on its first token only (MatchExact)
+\*   "any-parent"   blocks match anywhere, not on one chain (ResultIsStart)
+\*   "partial"      the result may end mid-block (StartOnBoundary)
+\*   "leak"         Seek evicts stale blocks but drops no refs
+\*                  (RefsSettledAfterSeek)
+\*   "reuse-held"   a slot is reused while the tree holds its ref
+\*                  (HeldNeverStale)
+\*   "stale-insert" an insert is accepted at a generation its slot has
+\*                  moved past (HeldNeverStale; SealClaimed below)
+\*   "evict"        not a bug: the Reuse guard is lifted (the pool's
+\*                  bump_generation has no such guard) but Seek stays
+\*                  correct, so a passing config exercises eviction
+\*                  itself (PrefixTreeEvictFast, NoStaleAfterSeek)
 \*
 \* A seek also evicts: every stale sealed block (sealed at an older
 \* generation of its slot) leaves the tree with its subtree, its
-\* start holds released and its ref dropped — the model's version of
-\* LiveTree evicting on a match and re-seeking. The code evicts only
-\* the stale block on the matched path; evicting every stale block
-\* here is stronger and the checked properties hold under both.
+\* start holds released and its ref dropped. The code does the same:
+\* LiveTree's seek evicts every stale block before matching.
 \* The request being matched is fixed in the module because a TLC
 \* config file assigns only literals and cannot write a sequence.
 
@@ -117,6 +121,30 @@ Seal(s, slot) ==
     /\ refs' = [refs EXCEPT ![s] = 1]
     /\ UNCHANGED <<starts, poolGen, result, sought>>
 
+\* The stale-insert bug, expressible only as its own action: an insert
+\* arrives claiming a generation its slot has moved past, and is
+\* accepted anyway — for fresh tokens, or for a block already in the
+\* tree (the stale twin: the name is re-sealed at the claimed, older
+\* generation). Seal cannot write it, because Seal records the slot's
+\* current generation and refuses a block already sealed. The code
+\* refuses this insert (LiveTree, StaleEntry); under Bug =
+\* "stale-insert" the model accepts it and HeldNeverStale falls.
+SealClaimed(s, slot, gen) ==
+    /\ ~sought
+    /\ Bug = "stale-insert"
+    /\ s \in BlockSeqs
+    /\ Len(s) \in {BlockLen, 2 * BlockLen}
+    /\ Len(s) <= MaxBlocks * BlockLen
+    /\ DropBlock(s) \in sealed
+    /\ slot \in Slots
+    /\ gen \in 0..MaxGen
+    /\ gen # poolGen[slot]
+    /\ sealed' = sealed \cup {s}
+    /\ slotOf' = [slotOf EXCEPT ![s] = slot]
+    /\ genOf' = [genOf EXCEPT ![s] = gen]
+    /\ refs' = [refs EXCEPT ![s] = 1]
+    /\ UNCHANGED <<starts, poolGen, result, sought>>
+
 Retain(s) ==
     /\ ~sought
     /\ s \in sealed \ {<<>>}
@@ -133,11 +161,13 @@ Release(s) ==
 \* The pool reuses a slot only once the tree holds no ref on it:
 \* the generation moves, and any block still naming the slot at the
 \* old generation would be stale. Three witness configs lift that
-\* guard (stale, leak, reuse-held) so staleness can arise at all.
+\* guard (stale, leak, reuse-held) so staleness can arise at all, and
+\* the "evict" config lifts it with a correct Seek so eviction is
+\* exercised in a passing config.
 Reuse(slot) ==
     /\ ~sought
     /\ poolGen[slot] < MaxGen
-    /\ Bug \in {"stale", "leak", "reuse-held"}
+    /\ Bug \in {"stale", "leak", "reuse-held", "evict"}
         \/ \A s \in sealed : slotOf[s] = slot => refs[s] = 0
     /\ poolGen' = [poolGen EXCEPT ![slot] = poolGen[slot] + 1]
     /\ UNCHANGED <<sealed, starts, slotOf, genOf, refs, result, sought>>
@@ -199,6 +229,7 @@ Seek ==
 
 Next ==
     \/ \E s \in BlockSeqs, slot \in Slots : Seal(s, slot)
+    \/ \E s \in BlockSeqs, slot \in Slots, gen \in 0..MaxGen : SealClaimed(s, slot, gen)
     \/ \E s \in BlockSeqs : Retain(s) \/ Release(s) \/ Evict(s)
     \/ \E slot \in Slots : Reuse(slot)
     \/ Seek
@@ -248,6 +279,12 @@ RefsSettledAfterSeek ==
 HeldNeverStale ==
     \A s \in sealed \ {<<>>} :
         refs[s] = 1 => genOf[s] = poolGen[slotOf[s]]
+
+\* After a seek no stale block remains sealed: the seek evicted every
+\* one of them, on the matched path or not. In the guarded configs
+\* this is vacuous (nothing can be stale at a seek); the "evict"
+\* config is where it bites.
+NoStaleAfterSeek == sought => StaleSet = {}
 
 \* The result is a held start point (or position 0).
 ResultIsStart == sought => result \in Held \cup {<<>>}

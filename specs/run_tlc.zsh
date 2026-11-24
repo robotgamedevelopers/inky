@@ -55,6 +55,7 @@ check() {
 }
 print "run | generated | distinct | wall seconds | result"
 check PrefixTreeFast PrefixTree
+check PrefixTreeEvictFast PrefixTree
 check PrefixTreeShallow PrefixTree DeepestStart
 check PrefixTreeStale PrefixTree ResultLive
 check PrefixTreeFirstToken PrefixTree MatchExact
@@ -62,6 +63,13 @@ check PrefixTreeAnyParent PrefixTree ResultIsStart
 check PrefixTreePartial PrefixTree StartOnBoundary
 check PrefixTreeLeak PrefixTree RefsSettledAfterSeek
 check PrefixTreeReuseHeld PrefixTree HeldNeverStale
+check PrefixTreeStaleInsert PrefixTree HeldNeverStale
+# The trace binding: regenerate the walk trace from the code under
+# test, then check every emitted state is a behaviour of the spec.
+(cd "$root/.." && INKY_PREFIX_TRACE_OUT="$root/PrefixTreeTraceData.tla" \
+    cargo test --locked prefix::tests::prefix_trace_dump -- --ignored --exact >/dev/null) \
+    || { print -u2 "prefix trace dump failed"; exit 1; }
+check PrefixTreeTrace PrefixTreeTrace
 if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
 check PrefixTree PrefixTree
 fi
