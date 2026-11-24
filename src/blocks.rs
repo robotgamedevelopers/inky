@@ -1,4 +1,5 @@
 //! Layer 3 block cache, the types the rest of the layer builds on.
+#![allow(dead_code)] // the pool, the table and the prefix tree are the callers; cargo check does not compile the unit tests
 //!
 //! The GPU buffers are not allocated here. A key read goes through the per-lane
 //! table (`BlockTable::read_key`): the `u64` stored on the entry, which `fill`
