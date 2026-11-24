@@ -60,3 +60,24 @@ As a separate negative-control check, the redundant-load mutant passed both
 output invariants across all 2,887 distinct states when `StagedOnce` was
 omitted. A test copy with a three-key split and a two-key tile was rejected by
 the divisibility assumption before exploring any states.
+
+## Fixed-split partials arena
+
+On mini-m5, 2026-11-23, `specs/run_tlc.zsh` with one TLC worker. Both healthy
+runs exhaust the graph and check `Finishes`. Times include JVM startup.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| SplitArena3 | 1,006 | 766 | 0.952 | PASS |
+| SplitArena4 | 1,046 | 806 | 0.977 | PASS |
+| SplitEdgeDropped | 375 | 375 | 0.713 | CombineReadsOwn violated |
+| SplitRowsUnbounded | 251 | 251 | 0.681 | WritesInArena violated |
+
+Inspected counterexamples:
+
+- **SplitEdgeDropped, state 2:** window layer, span `p0=0, t=5`, rows from 4.
+  The row ends at 5 and its window starts at 1, so it needs splits 0, 1 and 2;
+  two are reserved. The arena holds `0 :> (4,0,0)`, `1 :> (4,0,1)`,
+  `2 :> (4,1,0)`, and head 0's third read is slot 2.
+- **SplitRowsUnbounded, state 2:** full layer, span `p0=0, t=5`, `nsplit=2`,
+  four rows in one batch. Row 3, head 1 writes slot 14; the arena ends at 8.

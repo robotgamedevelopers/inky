@@ -69,3 +69,7 @@ check DonorWindow GroupedLayout VisitedKeys
 check TilePartial GroupedLayout OrderedPartials
 check Restage GroupedLayout StagedOnce
 check StalledTraversal GroupedLayout TraversalCompletes temporal
+check SplitArena3 SplitArena
+check SplitArena4 SplitArena
+check SplitEdgeDropped SplitArena CombineReadsOwn
+check SplitRowsUnbounded SplitArena WritesInArena

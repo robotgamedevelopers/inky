@@ -35,6 +35,21 @@ fn fixed_split_count(first: usize, end: usize, width: usize) -> usize {
 fn split_scratch_slots(max_ctx: usize) -> usize {
     (max_ctx.div_ceil(fixed_split_width(false)) + 1).max(256)
 }
+
+/// The partials layout of one tensor-path attention span ending at `end`: the split stride `nsplit`
+/// each row reserves, and how many rows fit in the arena of `split_scratch_slots(max_ctx)` slots per
+/// head. Row `r`, head `h`, split `s` of a batch lives in slot `(r * NH + h) * nsplit + s`, and the
+/// combine reads `fixed_split_count(first, row_end, kps)` of them. Once the window slides
+/// (`end > EXT`) a row's first visible split is clipped, and a window of EXT keys can then touch one
+/// more split than EXT / kps: that edge split is the `+ 1`. Modelled with its arithmetic in
+/// specs/SplitArena.tla (SplitEdgeDropped and SplitRowsUnbounded are the witnesses without each guard).
+fn fixed_attn_batch(swa: bool, end: usize, max_ctx: usize) -> (usize, usize) {
+    let kps = fixed_split_width(swa);
+    let nsplit = if swa && end > EXT { (EXT - 1).div_ceil(kps) + 1 } else { fixed_split_count(0, end, kps) };
+    let rows = split_scratch_slots(max_ctx) / nsplit;
+    assert!(rows >= 1, "a span of {end} positions needs {nsplit} split slots; the arena has {}", split_scratch_slots(max_ctx));
+    (nsplit, rows)
+}
 /// most spans one step can carry (each has a logits row in the batch arena)
 pub const MAX_SPANS: usize = 128;
 /// process-wide default for `Engine::load`: keep only part of the (exact, fp16) K/V cache in memory while generating and
@@ -1932,17 +1947,10 @@ impl Engine {
             let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
             self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
             self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-            // Batch as many query rows as fit in the fixed partials arena. The
-            // first visible split may change inside a batch as a sliding window
-            // advances, so reserve one extra split for its partial edges.
+            // Batch as many query rows as fit in the fixed partials arena
+            // (fixed_attn_batch; the layout is modelled in specs/SplitArena.tla).
             let kps = fixed_split_width(l.swa);
-            let end = p0 + t;
-            let nsplit = if l.swa && end > EXT {
-                (EXT - 1).div_ceil(kps) + 1
-            } else {
-                fixed_split_count(0, end, kps)
-            };
-            let batch_rows = split_scratch_slots(self.max_ctx) / nsplit;
+            let (nsplit, batch_rows) = fixed_attn_batch(l.swa, p0 + t, self.max_ctx);
             let out = if hatt { b.agh } else { b.attn_g };
             for start in (ts..t).step_by(batch_rows) {
                 let n = (t - start).min(batch_rows);
@@ -2892,6 +2900,29 @@ impl<'a> Run<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production arithmetic of specs/SplitArena.tla: every row of a span ending at `end` has at most
+    /// `nsplit` visible splits, and a batch of `rows` rows of `nsplit` slots fits the arena. The reversed
+    /// half: without the edge split some window row needs one slot more than it reserves.
+    #[test]
+    fn fixed_attn_batch_fits_every_row_in_the_arena() {
+        for max_ctx in [256, 4096, 16384, 131072] {
+            let slots = split_scratch_slots(max_ctx);
+            for swa in [true, false] {
+                let kps = fixed_split_width(swa);
+                let (mut widest, mut short_by_edge) = (0, false);
+                for end in 1..=max_ctx {
+                    let first = if swa { end.saturating_sub(EXT) } else { 0 };
+                    widest = widest.max(fixed_split_count(first, end, kps));
+                    let (nsplit, rows) = fixed_attn_batch(swa, end, max_ctx);
+                    assert!(widest <= nsplit, "swa {swa} end {end}: a row needs {widest} splits, {nsplit} reserved");
+                    assert!(rows * nsplit <= slots, "swa {swa} end {end}: {rows} rows of {nsplit} exceed {slots} slots");
+                    if swa && end > EXT { short_by_edge |= widest > (EXT - 1).div_ceil(kps); }
+                }
+                assert_eq!(short_by_edge, swa && max_ctx > EXT, "the edge split is needed exactly when the window slides");
+            }
+        }
+    }
 
     #[test]
     fn tier_packs_whole_absolute_splits_across_staging_halves() {
