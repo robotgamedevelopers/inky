@@ -2,25 +2,28 @@
 //! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens) or a
 //! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
 //! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
-//! prompt's end; a request whose tokens extend that prompt continues the lane from there, so a card's next turn prefills
-//! only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
+//! prompt's end while its sliding-window history survives. A request whose tokens extend that prompt continues from
+//! there and prefills only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
 //! may also start a different lane: when the lane holding the longest matching prompt is busy, its prefill-written
 //! prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the suffix is
 //! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
-use crate::engine::{Engine, Lane, Span};
+use crate::engine::{Engine, Lane, Span, EXT};
+use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
-use objc2_metal::MTLCommandBuffer;
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
+use std::time::Duration;
 
-pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize,
+pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAddr>, pub lanes: usize, pub effort: String, pub max_tokens: usize,
                       /// a request must carry this key, as `x-api-key` or `Authorization: Bearer <this>` (from the environment variable --key-env names)
                       pub key: Option<String>,
                       /// requests waiting beyond this many are refused with 429
@@ -43,13 +46,13 @@ fn effort_num(e: &str) -> String {
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
 
-fn content_parts(v: &Value) -> Vec<String> {
+fn content_parts(v: &Value) -> Vec<&str> {
     match v {
-        Value::String(s) => vec![s.clone()],
+        Value::String(s) => vec![s],
         Value::Array(a) => a.iter().filter_map(|p| match p {
-            Value::String(s) => Some(s.clone()),
+            Value::String(s) => Some(s.as_str()),
             Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
-                None | Some("text") | Some("input_text") => Some(o.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                None | Some("text") | Some("input_text") => Some(o.get("text").and_then(|t| t.as_str()).unwrap_or("")),
                 _ => None,
             },
             _ => None,
@@ -58,10 +61,31 @@ fn content_parts(v: &Value) -> Vec<String> {
     }
 }
 
+#[derive(Debug)]
+enum RenderError {
+    Invalid(String),
+    TooLong,
+}
+
+impl From<String> for RenderError {
+    fn from(message: String) -> Self { Self::Invalid(message) }
+}
+
+impl From<&str> for RenderError {
+    fn from(message: &str) -> Self { Self::Invalid(message.into()) }
+}
+
 /// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
 /// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
-fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, String> {
-    let text = |t: &mut Vec<u32>, s: &str| t.extend(tk.encode(s, false));
+fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize) -> Result<Vec<u32>, RenderError> {
+    let text = |t: &mut Vec<u32>, s: &str| {
+        if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
+    };
+    let marks = |t: &mut Vec<u32>, tokens: &[u32]| {
+        if tokens.len() > limit.saturating_sub(t.len()) { return Err(RenderError::TooLong); }
+        t.extend_from_slice(tokens);
+        Ok(())
+    };
     let mut t = Vec::new();
     let msgs = req["messages"].as_array().ok_or("messages missing")?;
     if let Some(tools) = req["tools"].as_array().filter(|a| !a.is_empty()) {
@@ -70,36 +94,61 @@ fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> R
             json!({"description": f.get("description").and_then(|d| d.as_str()).unwrap_or(""), "name": f["name"],
                    "parameters": f.get("parameters").cloned().unwrap_or(json!({})), "type": tool.get("type").and_then(|d| d.as_str()).unwrap_or("function")})
         }).collect();
-        t.push(sp.msg_system); text(&mut t, "tool_declare"); t.push(sp.c_xml); text(&mut t, &Value::Array(specs).to_string()); t.push(sp.end);
+        marks(&mut t, &[sp.msg_system])?;
+        text(&mut t, "tool_declare")?;
+        marks(&mut t, &[sp.c_xml])?;
+        text(&mut t, &Value::Array(specs).to_string())?;
+        marks(&mut t, &[sp.end])?;
     }
     let effort = req.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or(default_effort).to_string();
-    let emit_effort = |t: &mut Vec<u32>| { t.push(sp.msg_system); t.push(sp.c_text); t.extend(tk.encode(&format!("Thinking effort level: {}", effort_num(&effort)), false)); t.push(sp.end); };
+    let emit_effort = |t: &mut Vec<u32>| {
+        marks(t, &[sp.msg_system, sp.c_text])?;
+        text(t, &format!("Thinking effort level: {}", effort_num(&effort)))?;
+        marks(t, &[sp.end])
+    };
     let mut effort_done = false;
     let mut call_names = std::collections::HashMap::new();
     for m in msgs { for tc in m["tool_calls"].as_array().into_iter().flatten() { if let (Some(id), Some(n)) = (tc["id"].as_str(), tc["function"]["name"].as_str()) { call_names.insert(id.to_string(), n.to_string()); } } }
     for m in msgs {
         let role = m["role"].as_str().ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
-        if !effort_done && role != "system" { emit_effort(&mut t); effort_done = true; }
+        if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
         match role {
-            "system" | "user" => { let h = if role == "system" { sp.msg_system } else { sp.msg_user };
-                                   for p in content_parts(&m["content"]) { t.push(h); t.push(sp.c_text); text(&mut t, &p); t.push(sp.end); } }
+            "system" | "user" => {
+                let h = if role == "system" { sp.msg_system } else { sp.msg_user };
+                for p in content_parts(&m["content"]) {
+                    marks(&mut t, &[h, sp.c_text])?;
+                    text(&mut t, p)?;
+                    marks(&mut t, &[sp.end])?;
+                }
+            }
             "tool" => {
                 let name = m["name"].as_str().map(|s| s.to_string()).or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).cloned())).unwrap_or_default();
                 let mut parts = content_parts(&m["content"]);
-                if parts.is_empty() { parts.push(String::new()); }
+                if parts.is_empty() { parts.push(""); }
                 let is_error = m["is_error"].as_bool().unwrap_or(false);
                 for (i, p) in parts.iter().enumerate() {
-                    t.push(sp.msg_tool); text(&mut t, &name); t.push(sp.c_text);
-                    if is_error && i == 0 { text(&mut t, "Error: "); }
-                    text(&mut t, p); t.push(sp.end);
+                    marks(&mut t, &[sp.msg_tool])?;
+                    text(&mut t, &name)?;
+                    marks(&mut t, &[sp.c_text])?;
+                    if is_error && i == 0 { text(&mut t, "Error: ")?; }
+                    text(&mut t, p)?;
+                    marks(&mut t, &[sp.end])?;
                 }
             }
             "assistant" => {
                 let content = content_parts(&m["content"]).join("");
-                if let Some(r) = m["reasoning_content"].as_str().filter(|r| !r.is_empty()) { t.push(sp.msg_model); t.push(sp.c_think); text(&mut t, r); t.push(sp.end); }
+                if let Some(r) = m["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
+                    marks(&mut t, &[sp.msg_model, sp.c_think])?;
+                    text(&mut t, r)?;
+                    marks(&mut t, &[sp.end])?;
+                }
                 let calls: Vec<&Value> = m["tool_calls"].as_array().into_iter().flatten().collect();
-                if !content.is_empty() || calls.is_empty() { t.push(sp.msg_model); t.push(sp.c_text); text(&mut t, &content); t.push(sp.end); }
+                if !content.is_empty() || calls.is_empty() {
+                    marks(&mut t, &[sp.msg_model, sp.c_text])?;
+                    text(&mut t, &content)?;
+                    marks(&mut t, &[sp.end])?;
+                }
                 for tc in calls {
                     let name = tc["function"]["name"].as_str().ok_or("tool call without a name")?;
                     let args: Value = match &tc["function"]["arguments"] {
@@ -107,16 +156,24 @@ fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> R
                         Value::String(s) => serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?,
                         Value::Null => json!({}), v => v.clone(),
                     };
-                    t.push(sp.msg_model); text(&mut t, name); t.push(sp.c_tool);
-                    text(&mut t, &format!("{{\"name\":{},\"args\":{}}}", Value::String(name.into()), args)); t.push(sp.end);
+                    marks(&mut t, &[sp.msg_model])?;
+                    text(&mut t, name)?;
+                    marks(&mut t, &[sp.c_tool])?;
+                    text(&mut t, &format!("{{\"name\":{},\"args\":{}}}", Value::String(name.into()), args))?;
+                    marks(&mut t, &[sp.end])?;
                 }
-                t.push(sp.end_sampling);
+                marks(&mut t, &[sp.end_sampling])?;
             }
-            r => return Err(format!("unknown role {r}")),
+            r => return Err(format!("unknown role {r}").into()),
         }
     }
-    if !effort_done { emit_effort(&mut t); }
+    if !effort_done { emit_effort(&mut t)?; }
     Ok(t)
+}
+
+#[cfg(test)]
+fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, RenderError> {
+    render_limited(tk, sp, req, default_effort, usize::MAX)
 }
 
 /// A generated reply split into thinking, text and tool calls.
@@ -309,6 +366,28 @@ fn streaming_delta_usage(prompt: usize, cached: usize, gen: usize) -> Value { an
 
 fn sse_text(event: &str, data: &Value) -> String { format!("event: {event}\ndata: {data}\n\n") }
 
+/// Decode complete UTF-8 sequences and replace malformed bytes, retaining only an
+/// incomplete trailing sequence until more bytes arrive or the segment ends.
+fn take_stream_text(pend: &mut Vec<u8>, end: bool) -> String {
+    let mut consumed = 0;
+    while consumed < pend.len() {
+        match std::str::from_utf8(&pend[consumed..]) {
+            Ok(_) => { consumed = pend.len(); break; }
+            Err(e) => {
+                consumed += e.valid_up_to();
+                match e.error_len() {
+                    Some(n) => consumed += n,
+                    None if end => { consumed = pend.len(); break; }
+                    None => break,
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&pend[..consumed]).into_owned();
+    pend.drain(..consumed);
+    text
+}
+
 /// A streamed reply as content blocks, fed one generated token at a time. Text streams as it
 /// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
 /// the block must stream on their own. Thinking tokens open no block.
@@ -320,17 +399,19 @@ impl BlockStream {
     }
     fn flush_text(&mut self, out: &mut Vec<String>) {
         if !self.open_text { self.pend.clear(); return; }
-        let valid = match std::str::from_utf8(&self.pend) { Ok(_) => self.pend.len(), Err(e) => e.valid_up_to() };
-        if valid > 0 {
-            let text = String::from_utf8_lossy(&self.pend[..valid]).to_string();
-            self.pend.drain(..valid);
+        let text = take_stream_text(&mut self.pend, false);
+        if !text.is_empty() {
             out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
                 "delta": {"type": "text_delta", "text": text}})));
         }
     }
     fn close_text(&mut self, out: &mut Vec<String>) {
         if self.open_text {
-            self.flush_text(out);
+            let text = take_stream_text(&mut self.pend, true);
+            if !text.is_empty() {
+                out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
+                    "delta": {"type": "text_delta", "text": text}})));
+            }
             out.push(sse_text("content_block_stop", &json!({"type": "content_block_stop", "index": self.text_index})));
             self.open_text = false;
         }
@@ -391,14 +472,106 @@ impl BlockStream {
 
 // ------------------------------------------------------------------------------------------------- scheduler
 
-struct Job { toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: Sender<Ev> }
+struct Job {
+    toks: Vec<u32>,
+    max: usize,
+    temp: f32,
+    top_p: f32,
+    seed: u64,
+    out: JobOutput,
+    // Capacity follows the job through the channel, the scheduler queue and its lane.
+    _permit: Permit,
+}
 /// to a request's connection: a token, a sign of life after each prefill step (a send that fails means the client is gone),
 /// the end, or a refusal
-enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String) }
+enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String), Failed(String) }
+
+const JOB_OUTPUT_EVENTS: usize = 256;
+
+#[derive(Default)]
+struct JobOutputState {
+    queued: AtomicUsize,
+    cancelled: AtomicBool,
+}
+
+struct JobOutput {
+    tx: SyncSender<Ev>,
+    state: Arc<JobOutputState>,
+}
+
+struct JobEvents {
+    rx: Receiver<Ev>,
+    state: Arc<JobOutputState>,
+}
+
+fn job_events() -> (JobOutput, JobEvents) {
+    // One extra slot guarantees delivery of the terminal event even when tokens fill the buffer.
+    let (tx, rx) = sync_channel(JOB_OUTPUT_EVENTS + 1);
+    let state = Arc::new(JobOutputState::default());
+    (JobOutput { tx, state: state.clone() }, JobEvents { rx, state })
+}
+
+impl JobOutput {
+    fn cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    fn backpressured(&self) -> bool {
+        self.state.queued.load(Ordering::Relaxed) >= JOB_OUTPUT_EVENTS
+    }
+
+    fn send(&self, event: Ev) -> Result<(), ()> {
+        if self.cancelled() { return Err(()); }
+        let counts = matches!(event, Ev::Tok(_) | Ev::Alive);
+        if counts {
+            if self.backpressured() { return Err(()); }
+            // Increment before publishing so the receiver never decrements an uncounted event.
+            self.state.queued.fetch_add(1, Ordering::Relaxed);
+        }
+        let result = self.tx.try_send(event).map_err(|_| ());
+        if counts && result.is_err() { self.state.queued.fetch_sub(1, Ordering::Relaxed); }
+        result
+    }
+}
+
+impl JobEvents {
+    fn recv_timeout(&self, timeout: Duration) -> Result<Ev, RecvTimeoutError> {
+        let event = self.rx.recv_timeout(timeout)?;
+        if matches!(event, Ev::Tok(_) | Ev::Alive) {
+            self.state.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(event)
+    }
+}
+
+impl Drop for JobEvents {
+    fn drop(&mut self) {
+        self.state.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn discard_cancelled_jobs(queue: &mut VecDeque<Job>) {
+    queue.retain(|job| !job.out.cancelled());
+}
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
 /// `tick` is the scheduler's logical clock (not wall time): a smaller tick was freed longer ago.
 struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
+impl LaneS {
+    fn invalidate_prompt(&mut self) {
+        self.prompt.clear();
+        self.cs_at_prompt = None;
+    }
+
+    fn fail(&mut self, message: String, tick_seq: &mut u64) {
+        self.invalidate_prompt();
+        let active = self.job.take().expect("failed lane must have an active job");
+        let _ = active.job.out.send(Ev::Failed(message));
+        self.tick = *tick_seq;
+        *tick_seq += 1;
+    }
+}
+
 struct Active {
     job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
     sampler: Sampler,
@@ -407,6 +580,16 @@ struct Active {
     #[allow(dead_code)]
     draft_sampler: Sampler,
     pending: Option<u32>,
+}
+
+impl Active {
+    fn log_cancellation(&self, lane: usize) {
+        if self.n_past < self.pf_end {
+            eprintln!("[serve] lane {lane}: client gone during prefill ({} of {} prompt tokens); lane freed", self.n_past, self.pf_end);
+        } else {
+            eprintln!("[serve] client gone after {} generated tokens; lane freed", self.gen);
+        }
+    }
 }
 
 /// Tokens two token lists share at their start.
@@ -457,7 +640,27 @@ fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usi
     eng.copy_lane_prefix(&s.lane, &d.lane, n);
 }
 
-fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
+/// Prefill loads the saved prompt's last `EXT` rows (or its whole history if shorter).
+/// The first decode row that overlaps this range in the ring is `oldest + EXT`.
+/// Serve reserves the full request budget up front, so a ring smaller than `EXT` cannot wrap.
+fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
+
+fn commit_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
+    cb.commit();
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
+    if let Some(error) = cb.error() {
+        eprintln!("[serve] Metal {stage} failed ({status:?}): {}", error.localizedDescription());
+    } else {
+        eprintln!("[serve] Metal {stage} failed ({status:?})");
+    }
+    Err(format!("Metal {stage} failed"))
+}
+
+fn fail_step(lanes: &mut [LaneS], affected: impl IntoIterator<Item = usize>, error: String, tick_seq: &mut u64) {
+    for i in affected { lanes[i].fail(error.clone(), tick_seq); }
+}
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>) {
     let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
@@ -470,12 +673,20 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         let busy = lanes.iter().any(|l| l.job.is_some());
         if !busy && queue.is_empty() { match rx.recv() { Ok(j) => queue.push_back(j), Err(_) => return } }
         loop { match rx.try_recv() { Ok(j) => queue.push_back(j), Err(TryRecvError::Empty) => break, Err(TryRecvError::Disconnected) => return } }
+        discard_cancelled_jobs(&mut queue);
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            if let Some(a) = lane.job.as_ref().filter(|a| a.job.out.cancelled()) {
+                a.log_cancellation(i);
+                lane.job = None;
+                lane.tick = tick_seq;
+                tick_seq += 1;
+            }
+        }
         // admit: a free lane whose kept prompt is the longest prefix of the request, else the least recently freed
         // lane — started, when a busy lane holds a strictly longer prompt it may still copy, from that lane's
-        // prefill-written prefix and its kept convolution state. A busy lane may be a source only in the moment
-        // its prefill has finished and no decode step has written cache yet (`n_past == pf_end`): after that its
-        // sliding-window ring holds decode-written keys over prompt positions, and a lane whose cache left memory
-        // for the disk tier cannot supply its prefix either. The source lane is only read, never mutated.
+        // prefill-written prefix and its kept convolution state. Busy lanes may supply a copy at prefill completion
+        // while their cache is in memory. A free lane can restore its saved state until enough decode rows were
+        // written to overwrite the prompt's sliding-window history.
         while let Some(j) = queue.front() {
             let cands: Vec<LaneCand> = lanes.iter().map(|l| LaneCand {
                 prefix: reusable_prefix(&l.prompt, l.cs_at_prompt.is_some(), &j.toks),
@@ -485,7 +696,11 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             }).collect();
             let Some(adm) = choose_lane(&cands) else { break };
             let j = queue.pop_front().unwrap();
-            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx { let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx))); continue; }
+            if j.out.cancelled() { continue; }
+            if context_over(j.toks.len(), j.max, eng.max_ctx) {
+                let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, eng.max_ctx)));
+                continue;
+            }
             let i = adm.dst;
             let start = adm.prefix;
             if start > 0 && adm.src == i {
@@ -509,12 +724,15 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // once per request, not per round and not per emitted token
             let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap, j.seed);
             let l = &mut lanes[i];
-            l.prompt.clear(); l.cs_at_prompt = None;
+            l.invalidate_prompt();
             l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
         }
         // a step: prefill when a lane has prompt left (alternating with decode while others generate), else decode
-        let need_pf: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past < a.pf_end)).collect();
-        let need_dec: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past >= a.pf_end && a.pending.is_some())).collect();
+        let runnable = |a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured();
+        let need_pf: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| runnable(a) && a.n_past < a.pf_end)).collect();
+        let need_dec: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| {
+            runnable(a) && a.n_past >= a.pf_end && a.pending.is_some() && a.n_past < a.pf_end + a.gen
+        })).collect();
         if !need_pf.is_empty() && (need_dec.is_empty() || !last_was_prefill) {
             last_was_prefill = true;
             let mut budget = eng.chunk;
@@ -528,22 +746,30 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 sp_list.push((i, a.n_past, t)); budget -= t;
             }
             let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &spans, true, false);
             let many = spans.len() > 1;
+            if let Err(e) = commit_step(&cb, "prefill") {
+                fail_step(&mut lanes, sp_list.iter().map(|&(i, _, _)| i), e, &mut tick_seq);
+                continue;
+            }
             for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
                 let l = &mut lanes[i];
                 let a = l.job.as_mut().unwrap();
                 a.n_past = p0 + t;
                 if a.n_past == a.pf_end {
-                    // the prompt is in: keep its state for the next turn, then sample the first token
-                    l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
-                    l.prompt = a.job.toks.clone();
                     let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                    let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
-                    a.pending = Some(tok);
+                    match a.sampler.sample_next(lg) {
+                        Ok(tok) => {
+                            a.pending = Some(tok);
+                            l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
+                            l.prompt = a.job.toks.clone();
+                        }
+                        Err(e) => l.fail(e.into(), &mut tick_seq),
+                    }
                 } else if a.job.out.send(Ev::Alive).is_err() {
                     // the client went away during its prefill: free the lane now
-                    eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed", a.n_past, a.pf_end);
+                    a.log_cancellation(i);
                     l.job = None; l.tick = tick_seq; tick_seq += 1;
                 }
             }
@@ -552,30 +778,51 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // feed each lane's pending token at its position
             for &i in &need_dec { let a = lanes[i].job.as_ref().unwrap(); eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]); }
             let spans: Vec<Span> = need_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-            let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd();
+            eng.encode_decode(&cb, &spans, true, false);
+            if let Err(e) = commit_step(&cb, "decode") {
+                fail_step(&mut lanes, need_dec, e, &mut tick_seq);
+                continue;
+            }
             for (k, &i) in need_dec.iter().enumerate() {
-                let a = lanes[i].job.as_mut().unwrap();
+                let l = &mut lanes[i];
+                let a = l.job.as_mut().unwrap();
+                let overwritten = decode_overwrites_prompt(a.n_past, a.pf_end);
                 a.n_past += 1;
-                let lg = eng.span_logits(k);
-                a.pending = Some(if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) });
+                match a.sampler.sample_next(eng.span_logits(k)) {
+                    Ok(tok) => a.pending = Some(tok),
+                    Err(e) => l.fail(e.into(), &mut tick_seq),
+                }
+                if overwritten { l.invalidate_prompt(); }
             }
         }
         // emit the tokens just sampled; finish lanes that stopped or whose client went away
-        for l in lanes.iter_mut() {
+        for (i, l) in lanes.iter_mut().enumerate() {
             let Some(a) = l.job.as_mut() else { continue };
             let Some(tok) = a.pending else { continue };
             if a.n_past < a.pf_end { continue; }
             // a token is emitted once, right after it is sampled: then n_past - pf_end == gen
             let fresh = a.n_past == a.pf_end + a.gen;
-            if !fresh { continue; }
+            if !fresh || a.job.out.backpressured() { continue; }
             let gone = a.job.out.send(Ev::Tok(tok)).is_err();
             a.gen += 1;
             let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
                          else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
             if let Some(r) = reason {
-                if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
-                let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+                if gone { a.log_cancellation(i); }
+                if !gone {
+                    let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+                }
                 l.job = None; l.tick = tick_seq; tick_seq += 1;
+            }
+        }
+        // No GPU work can proceed while every live lane's output buffer is full.
+        // Recheck consumption and cancellation shortly, waking sooner for another request.
+        if need_pf.is_empty() && need_dec.is_empty() && lanes.iter().any(|l| l.job.is_some()) {
+            match rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(job) => queue.push_back(job),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -591,15 +838,25 @@ fn respond<W: Write + ?Sized>(s: &mut W, code: u16, body: &str) -> std::io::Resu
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
+const MAX_FRAMING: usize = 64 << 10;
 
-fn read_head(r: &mut BufReader<&TcpStream>) -> std::io::Result<Head> {
+// A partial line at EOF or at the byte limit is never a complete HTTP line.
+fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<String> {
     let mut line = String::new();
-    (&mut *r).take(8192).read_line(&mut line)?;
+    r.take(limit as u64).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete or overlong line"));
+    }
+    Ok(line)
+}
+
+fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
+    let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
     let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, chunked: false };
     for _ in 0..128 {
-        let mut l = String::new();
-        if (&mut *r).take(16384).read_line(&mut l)? == 0 || l == "\r\n" || l == "\n" { return Ok(h); }
+        let l = read_bounded_line(r, 16384)?;
+        if l == "\r\n" || l == "\n" { return Ok(h); }
         if let Some((k, v)) = l.split_once(':') {
             let v = v.trim();
             if k.eq_ignore_ascii_case("content-length") { h.len = v.parse().unwrap_or(usize::MAX); }
@@ -624,26 +881,47 @@ enum BodyError { TooLarge, Malformed(String) }
 fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
     let bad = |m: &str| BodyError::Malformed(m.to_string());
     let mut body = Vec::new();
+    let mut framing = 0usize;
     loop {
-        let mut line = String::new();
-        if r.by_ref().take(8192).read_line(&mut line).map_err(|e| bad(&format!("chunk size: {e}")))? == 0 { return Err(bad("body ended before a chunk size")); }
+        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
+        framing += line.len();
         let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
         let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
         if n == 0 {
-            loop {
-                let mut t = String::new();
-                if r.by_ref().take(16384).read_line(&mut t).map_err(|e| bad(&format!("trailer: {e}")))? == 0 { return Err(bad("body ended inside the trailers")); }
+            for _ in 0..128 {
+                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("trailer: {e}")))?;
+                framing += t.len();
                 if t == "\r\n" || t == "\n" { return Ok(body); }
                 if !t.contains(':') { return Err(bad("bad trailer")); }
             }
+            return Err(bad("too many trailers"));
         }
         if n > max - body.len().min(max) { return Err(BodyError::TooLarge); }
         let at = body.len();
         body.resize(at + n, 0);
         r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
-        let mut eol = String::new();
-        r.read_line(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
-        if eol != "\r\n" && eol != "\n" { return Err(bad("chunk not followed by CRLF")); }
+        let mut eol = [0u8; 1];
+        r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+        let eol_len = if eol[0] == b'\r' {
+            r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+            2
+        } else { 1 };
+        if eol[0] != b'\n' { return Err(bad("chunk not followed by CRLF")); }
+        framing = framing.checked_add(eol_len).filter(|&n| n <= MAX_FRAMING).ok_or_else(|| bad("too much chunk framing"))?;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route { Models, Health, Chat, Messages, CountTokens, NotFound }
+
+fn route(method: &str, path: &str) -> Route {
+    match (method, path) {
+        ("GET", "/v1/models") => Route::Models,
+        ("GET", "/health") => Route::Health,
+        ("POST", "/v1/chat/completions") => Route::Chat,
+        ("POST", "/v1/messages") => Route::Messages,
+        ("POST", "/v1/messages/count_tokens") => Route::CountTokens,
+        _ => Route::NotFound,
     }
 }
 
@@ -717,11 +995,62 @@ impl ClientWrite for Vec<u8> {
 
 struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
-             /// requests admitted and not yet finished (generating, prefilling or queued for a lane); at most `limit`
-             inflight: std::sync::atomic::AtomicUsize, limit: usize,
+             /// Generation requests rendering, queued, prefilling or decoding.
+             inflight: PermitPool,
+             /// Translation and rendering capacity shared with count_tokens.
+             preprocess: PermitPool,
              /// connection threads alive; at most MAX_CONNS
-             conns: Arc<std::sync::atomic::AtomicUsize> }
+             conns: Arc<AtomicUsize> }
 const MAX_CONNS: usize = 512;
+const PREPROCESS_LIMIT: usize = 4;
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const QUEUE_FULL: &str = "inky is busy: the request queue is full";
+const PREPROCESS_BUSY: &str = "inky is busy: all prompt processors are in use";
+
+struct PermitPool {
+    used: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl PermitPool {
+    fn new(limit: usize) -> Self {
+        Self { used: Arc::new(AtomicUsize::new(0)), limit }
+    }
+
+    fn acquire(&self) -> Option<Permit> {
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            (used < self.limit).then(|| used + 1)
+        }).ok()?;
+        Some(Permit(self.used.clone()))
+    }
+}
+
+struct Permit(Arc<AtomicUsize>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Ctx {
+    fn admit_for_render(&self) -> Result<(Permit, Permit), &'static str> {
+        let job = self.inflight.acquire().ok_or(QUEUE_FULL)?;
+        let preprocess = self.preprocess.acquire().ok_or(PREPROCESS_BUSY)?;
+        Ok((job, preprocess))
+    }
+}
+
+fn overloaded<W: Write + ?Sized>(s: &mut W, body: Value) -> std::io::Result<()> {
+    let body = body.to_string();
+    write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    s.flush()
+}
+
+fn anthropic_overloaded<W: Write + ?Sized>(s: &mut W, message: &str) -> std::io::Result<()> {
+    overloaded(s, json!({"type": "error", "error": {"type": "rate_limit_error", "message": message}}))
+}
 
 /// Whether a request can never fit a lane: prompt + generation + the two tokens the
 /// scheduler reserves past the prompt. Checked on the connection thread before any
@@ -748,38 +1077,49 @@ fn clamped_messages_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, 
     Err(format!("prompt is too long: {prompt} tokens > {ctx} maximum"))
 }
 
-/// releases a request's in-flight count however the request ends
-struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
-impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
-
 fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
-    let toks = match render(&cx.tk, &cx.sp, req, &cx.effort) { Ok(t) => t, Err(e) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()) };
-    let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let (tx, rx) = channel();
     // every client-controlled number is checked here, never in the scheduler
     let mut bad = |m: String| respond(s, 400, &json!({"error": {"message": m}}).to_string());
-    let max = match req["max_tokens"].as_u64().or(req["max_completion_tokens"].as_u64()) {
-        Some(v) if v == 0 || v as usize >= cx.ctx => return bad(format!("max_tokens must be between 1 and {}", cx.ctx - 1)),
-        Some(v) => v as usize, None => cx.max_tokens,
-    };
+    let mut budgets = [None, None];
+    for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
+        if let Some(value) = req.get(*name) {
+            match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+                Some(v) if v > 0 && v < cx.ctx => budgets[i] = Some(v),
+                _ => return bad(format!("{name} must be between 1 and {}", cx.ctx - 1)),
+            }
+        }
+    }
+    let max = budgets[0].or(budgets[1]).unwrap_or(cx.max_tokens);
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
     if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
-    if context_over(toks.len(), max, cx.ctx) { return bad(context_full_message(toks.len(), max, cx.ctx)); }
+    let (permit, preprocess) = match cx.admit_for_render() {
+        Ok(permits) => permits,
+        Err(e) => return overloaded(s, json!({"error": {"message": e}})),
+    };
+    let prompt_limit = cx.ctx.saturating_sub(max.saturating_add(2));
+    let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit);
+    drop(preprocess);
+    let toks = match rendered {
+        Ok(t) => t,
+        Err(e) => {
+            drop(permit);
+            return bad(match e {
+                RenderError::Invalid(message) => message,
+                RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and {max} to generate, {} per lane", cx.ctx),
+            });
+        }
+    };
+    let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
     // the seed is the request's own: its `seed`, or a hash of what decides the output (the rendered tokens and sampling)
     let seed = req["seed"].as_u64().unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     });
-    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
-    // admission: one atomic count of requests in flight; beyond the limit, refuse now rather than hold the client
-    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
-        write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"error": {"message": "inky is busy: every lane is taken and the queue is full"}}))?;
-        return s.flush();
-    }
-    let _inflight = InFlight(&cx.inflight);
+    let (tx, rx) = job_events();
+    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx, _permit: permit };
     if cx.jobs.send(job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
@@ -798,24 +1138,30 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { return Ok(()); } continue; }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return respond(s, 500, &json!({"error": {"message": "the request was dropped"}}).to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ev::Failed("the request was dropped".into()),
         };
-        match Ok::<Ev, ()>(ev) {
-            Ok(Ev::Alive) => { if s.client_gone() { return Ok(()); } }
-            Ok(Ev::Tok(t)) => {
+        match ev {
+            Ev::Alive => { if s.client_gone() { return Ok(()); } }
+            Ev::Tok(t) => {
                 gen.push(t);
-                if !stream && gen.len() % 16 == 0 && s.client_gone() { return Ok(()); }
+                if gen.len() % 16 == 0 && s.client_gone() { return Ok(()); }
                 if !stream { continue; }
+                if t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
+                    let text = take_stream_text(&mut pend, true);
+                    if !text.is_empty() && (mode == 1 || mode == 2) {
+                        let key = if mode == 1 { "reasoning_content" } else { "content" };
+                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
+                        s.flush()?;
+                    }
+                }
                 if t == sp.c_think { mode = 1; continue; }
                 if t == sp.c_text { mode = 2; continue; }
                 if t == sp.c_tool { mode = 3; continue; }
                 if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); continue; }
                 if mode == 1 || mode == 2 {
                     pend.extend(cx.tk.decode_bytes(t));
-                    let valid = match std::str::from_utf8(&pend) { Ok(_) => pend.len(), Err(e) => e.valid_up_to() };
-                    if valid > 0 {
-                        let text = String::from_utf8_lossy(&pend[..valid]).to_string();
-                        pend.drain(..valid);
+                    let text = take_stream_text(&mut pend, false);
+                    if !text.is_empty() {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
                         // a failed write drops `rx`: the scheduler sees the client gone and cancels the lane
                         write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
@@ -823,7 +1169,7 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
                     }
                 }
             }
-            Ok(Ev::Done { prompt, cached, gen: ng, reason }) => {
+            Ev::Done { prompt, cached, gen: ng, reason } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
@@ -831,6 +1177,11 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
                 eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
                 if stream {
+                    let text = take_stream_text(&mut pend, true);
+                    if !text.is_empty() && (mode == 1 || mode == 2) {
+                        let key = if mode == 1 { "reasoning_content" } else { "content" };
+                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
+                    }
                     if !calls.is_empty() { write!(s, "data: {}\n\n", chunk(json!({"tool_calls": calls}), Value::Null))?; }
                     let mut last = chunk(json!({}), json!(finish)); last["usage"] = usage;
                     write!(s, "data: {last}\n\ndata: [DONE]\n\n")?;
@@ -841,8 +1192,15 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 return respond(s, 200, &json!({"id": id, "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage}).to_string());
             }
-            Ok(Ev::Err(e)) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()),
-            Err(()) => unreachable!(),
+            Ev::Err(ref message) | Ev::Failed(ref message) => {
+                let (code, kind) = if matches!(ev, Ev::Err(_)) { (400, "invalid_request_error") } else { (500, "server_error") };
+                let error = json!({"error": {"type": kind, "message": message}});
+                if stream {
+                    write!(s, "data: {error}\n\n")?;
+                    return s.flush();
+                }
+                return respond(s, code, &error.to_string());
+            }
         }
     }
 }
@@ -855,35 +1213,57 @@ fn anthropic_error<W: Write + ?Sized>(s: &mut W, code: u16, kind: &str, msg: &st
     respond(s, code, &json!({"type": "error", "error": {"type": kind, "message": msg}}).to_string())
 }
 
+fn render_messages(cx: &Ctx, req: &Value, limit: usize) -> Result<Vec<u32>, RenderError> {
+    let openai = anthropic_to_openai(req)?;
+    render_limited(&cx.tk, &cx.sp, &openai, &cx.effort, limit)
+}
+
 fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
-    let openai = match anthropic_to_openai(req) { Ok(v) => v, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
-    let toks = match render(&cx.tk, &cx.sp, &openai, &cx.effort) { Ok(t) => t, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
-    let prompt_len = toks.len();
-    let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let (tx, rx) = channel();
     // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
     let max = match req["max_tokens"].as_u64() {
-        Some(v) if v == 0 || v as usize >= cx.ctx => return anthropic_error(s, 400, "invalid_request_error", &format!("max_tokens must be between 1 and {}", cx.ctx - 1)),
-        Some(v) => v as usize,
+        Some(0) => return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"),
+        Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
         None => return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"),
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
     if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
     if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
-    let max = match clamped_messages_max(prompt_len, max, cx.ctx) { Ok(m) => m, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
+    let (permit, preprocess) = match cx.admit_for_render() {
+        Ok(permits) => permits,
+        Err(e) => return anthropic_overloaded(s, e),
+    };
+    let rendered = render_messages(cx, req, cx.ctx);
+    drop(preprocess);
+    let toks = match rendered {
+        Ok(t) => t,
+        Err(e) => {
+            drop(permit);
+            let message = match e {
+                RenderError::Invalid(message) => message,
+                // Retain the numeric error format used by clients for reactive compaction.
+                RenderError::TooLong => format!("prompt is too long: {} tokens > {} maximum", cx.ctx.saturating_add(1), cx.ctx),
+            };
+            return anthropic_error(s, 400, "invalid_request_error", &message);
+        }
+    };
+    let prompt_len = toks.len();
+    let max = match clamped_messages_max(prompt_len, max, cx.ctx) {
+        Ok(m) => m,
+        Err(e) => {
+            drop(permit);
+            return anthropic_error(s, 400, "invalid_request_error", &e);
+        }
+    };
+    let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
     // the seed is the request's own: a hash of what decides the output, as on the chat path
     let seed = {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     };
-    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
-    if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
-        write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"type": "error", "error": {"type": "rate_limit_error", "message": "inky is busy: every lane is taken and the queue is full"}}))?;
-        return s.flush();
-    }
-    let _inflight = InFlight(&cx.inflight);
+    let (tx, rx) = job_events();
+    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx, _permit: permit };
     if cx.jobs.send(job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
@@ -896,6 +1276,7 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
             "usage": {"input_tokens": prompt_len, "output_tokens": 0}}})))?;
         s.flush()?;
         let mut bs = BlockStream::new(&cx.nonce, seq);
+        let mut received = 0usize;
         loop {
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
@@ -910,7 +1291,11 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
             };
             match ev {
                 Ev::Alive => { if s.client_gone() { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
-                Ev::Tok(t) => { for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?; }
+                Ev::Tok(t) => {
+                    received += 1;
+                    if received % 16 == 0 && s.client_gone() { return Ok(()); }
+                    for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
+                }
                 Ev::Done { prompt, cached, gen: ng, reason } => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
@@ -924,6 +1309,10 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
                 Ev::Err(e) => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
+                    return s.flush();
+                }
+                Ev::Failed(message) => {
+                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
                     return s.flush();
                 }
             }
@@ -948,16 +1337,20 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string());
             }
             Ev::Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e),
+            Ev::Failed(message) => return anthropic_error(s, 500, "api_error", &message),
         }
     }
 }
 
 /// The would-be prompt's token count; no lane is taken, nothing is generated.
-fn count_tokens(cx: &Ctx, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
-    let openai = match anthropic_to_openai(req) { Ok(v) => v, Err(e) => return anthropic_error(s, 400, "invalid_request_error", &e) };
-    match render(&cx.tk, &cx.sp, &openai, &cx.effort) {
+fn count_tokens<W: Write + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
+    let Some(preprocess) = cx.preprocess.acquire() else { return anthropic_overloaded(s, PREPROCESS_BUSY) };
+    let rendered = render_messages(cx, req, usize::MAX);
+    drop(preprocess);
+    match rendered {
         Ok(t) => respond(s, 200, &json!({"input_tokens": t.len()}).to_string()),
-        Err(e) => anthropic_error(s, 400, "invalid_request_error", &e),
+        Err(RenderError::Invalid(e)) => anthropic_error(s, 400, "invalid_request_error", &e),
+        Err(RenderError::TooLong) => anthropic_error(s, 400, "invalid_request_error", "prompt is too long to count"),
     }
 }
 
@@ -965,6 +1358,9 @@ pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    if let Err(e) = eng.check_serve_decode(o.lanes) { eprintln!("{e}"); std::process::exit(2); }
+    eng.ensure_dbatch(o.lanes);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
@@ -972,17 +1368,22 @@ pub fn serve(o: ServeOpts) {
         c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
-    eng.ensure_batch(eng.chunk);
-    eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
+    let admission_limit = o.lanes.saturating_add(o.queue).min(MAX_CONNS);
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
-                            nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
-    let l = TcpListener::bind(&o.bind).expect("bind");
-    eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", l.local_addr().expect("bound address"), o.lanes, o.ctx, o.effort, o.queue,
-              if o.key.is_some() { "a bearer key required" } else { "no key (loopback use only)" });
+        nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: PermitPool::new(admission_limit),
+        preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() });
+    // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
+    let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
+    let addr = l.local_addr().expect("bound address");
+    let auth = if o.key.is_some() { "a key required" }
+               else if addr.ip().to_canonical().is_loopback() { "no key (loopback)" }
+               else { "no key (non-loopback explicitly enabled)" };
+    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", o.lanes, o.ctx, o.effort, o.queue);
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
+            if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
             let cx = cx.clone();
             if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
                 cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1005,6 +1406,20 @@ pub fn serve(o: ServeOpts) {
                             else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
                     return;
                 }
+                // Routes that do not use a body can answer without waiting for one.
+                let route = route(&method, &path);
+                if matches!(route, Route::Models | Route::Health | Route::NotFound) {
+                    drop(r);
+                    let result = match route {
+                        Route::Models => respond(&mut s, 200, &json!({"object": "list", "data": [{"id": "inkling-2-mini", "object": "model", "owned_by": "inky"}]}).to_string()),
+                        Route::Health => respond(&mut s, 200, &json!({"ok": true}).to_string()),
+                        Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
+                        Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
+                        _ => unreachable!("body routes are handled below"),
+                    };
+                    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+                    return;
+                }
                 // the body is read only now, after the header gate above
                 let body = if h.chunked {
                     match read_chunked(&mut r, MAX_BODY) {
@@ -1019,23 +1434,20 @@ pub fn serve(o: ServeOpts) {
                 };
                 drop(r);
                 let _ = s.set_read_timeout(None);
-                let r = match (method.as_str(), path.as_str()) {
-                    ("GET", "/v1/models") => respond(&mut s, 200, &json!({"object": "list", "data": [{"id": "inkling-2-mini", "object": "model", "owned_by": "inky"}]}).to_string()),
-                    ("GET", "/health") => respond(&mut s, 200, &json!({"ok": true}).to_string()),
-                    ("POST", "/v1/chat/completions") => match serde_json::from_slice::<Value>(&body) {
+                let r = match route {
+                    Route::Chat => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => chat(&cx, &v, &mut s),
                         Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
                     },
-                    ("POST", "/v1/messages") => match serde_json::from_slice::<Value>(&body) {
+                    Route::Messages => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => messages(&cx, &v, &mut s),
                         Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
                     },
-                    ("POST", "/v1/messages/count_tokens") => match serde_json::from_slice::<Value>(&body) {
+                    Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => count_tokens(&cx, &v, &mut s),
                         Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
                     },
-                    _ => if path.starts_with("/v1/messages") { anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")) }
-                         else { respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()) },
+                    _ => unreachable!("bodyless routes were handled above"),
                 };
                 if let Err(e) = r { eprintln!("[serve] client: {e}"); }
             });
@@ -1054,6 +1466,118 @@ mod tests {
             c_xml: special(tk, "<|content_xml|>"), c_tool: special(tk, "<|content_invoke_tool_json|>"), end: special(tk, "<|end_message|>"),
             end_sampling: special(tk, "<|content_model_end_sampling|>"),
         }
+    }
+
+    fn admission_test_ctx(lanes_and_queue: usize) -> (Ctx, Receiver<Job>) {
+        let tk = Arc::new(Tokenizer::for_test());
+        let (jobs, rx) = channel();
+        let cx = Ctx {
+            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8,
+            seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            inflight: PermitPool::new(lanes_and_queue), preprocess: PermitPool::new(1), conns: Default::default(),
+        };
+        (cx, rx)
+    }
+
+    #[test]
+    fn cancelled_queue_entry_keeps_its_permit_until_removed() {
+        struct StalledWriter;
+        impl Write for StalledWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::TimedOut.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for StalledWriter {
+            fn client_gone(&self) -> bool { false }
+        }
+
+        let (cx, jobs) = admission_test_ctx(2);
+        let _active_job = cx.inflight.acquire().unwrap();
+        let req = json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
+        let error = chat(&cx, &req, &mut StalledWriter).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(cx.inflight.acquire().is_none(), "the timed-out job still occupies the channel");
+
+        let mut queue = VecDeque::from([jobs.try_recv().unwrap()]);
+        assert!(queue[0].out.cancelled(), "the failed socket write signals cancellation");
+        let mut response = Vec::new();
+        chat(&cx, &req, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 429"), "the timed-out job still occupies the queue");
+        assert!(jobs.try_recv().is_err());
+
+        discard_cancelled_jobs(&mut queue);
+        assert!(queue.is_empty(), "purging needs no free lane");
+        assert!(cx.inflight.acquire().is_some(), "the permit returns when the scheduler drops the job");
+    }
+
+    #[test]
+    fn output_buffer_resumes_in_order_and_reserves_the_terminal_slot() {
+        let (out, events) = job_events();
+        for number in 0..JOB_OUTPUT_EVENTS {
+            assert!(!out.backpressured());
+            out.send(Ev::Tok(number as u32)).unwrap();
+        }
+        assert!(out.backpressured());
+        assert!(out.send(Ev::Tok(JOB_OUTPUT_EVENTS as u32)).is_err());
+        let (other, other_events) = job_events();
+        other.send(Ev::Alive).unwrap();
+        assert!(matches!(other_events.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
+
+        assert!(matches!(events.recv_timeout(Duration::ZERO), Ok(Ev::Tok(0))));
+        assert!(!out.backpressured(), "consuming a token lets the scheduler resume the lane");
+        out.send(Ev::Tok(JOB_OUTPUT_EVENTS as u32)).unwrap();
+        out.send(Ev::Done { prompt: 1, cached: 0, gen: JOB_OUTPUT_EVENTS + 1, reason: "length" }).unwrap();
+        drop(out);
+
+        for number in 1..=JOB_OUTPUT_EVENTS {
+            assert!(matches!(events.recv_timeout(Duration::ZERO), Ok(Ev::Tok(t)) if t == number as u32));
+        }
+        assert!(matches!(events.recv_timeout(Duration::ZERO), Ok(Ev::Done { reason: "length", .. })));
+        assert!(matches!(events.recv_timeout(Duration::ZERO), Err(RecvTimeoutError::Disconnected)));
+    }
+
+    #[test]
+    fn overload_precedes_rendering_and_count_tokens_shares_the_preprocessing_limit() {
+        let (cx, jobs) = admission_test_ctx(1);
+        let req = json!({"max_tokens": 1, "messages": [{"role": "unsupported", "content": "hi"}]});
+        let generation = cx.inflight.acquire().unwrap();
+        let mut response = Vec::new();
+        chat(&cx, &req, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 429"), "chat refuses overload before rendering the invalid role");
+        response.clear();
+        messages(&cx, &req, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 429"), "Messages refuses overload before translating the invalid role");
+
+        let over_context = json!({"messages": [{"role": "user", "content": "x".repeat(200)}]});
+        let count = render_messages(&cx, &over_context, usize::MAX).unwrap().len();
+        assert!(count > cx.ctx);
+        response.clear();
+        count_tokens(&cx, &over_context, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "counting requires no generation slot");
+        assert!(String::from_utf8(response).unwrap().ends_with(&format!("{{\"input_tokens\":{count}}}")));
+
+        drop(generation);
+        let _preprocess = cx.preprocess.acquire().unwrap();
+        let mut response = Vec::new();
+        count_tokens(&cx, &over_context, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 429"));
+        response.clear();
+        messages(&cx, &req, &mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 429"));
+        assert!(cx.inflight.acquire().is_some(), "failed preprocessing admission returns the generation permit");
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn bounded_render_counts_template_markers_and_text() {
+        let (cx, _) = admission_test_ctx(1);
+        let req = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let expected = render(&cx.tk, &cx.sp, &req, &cx.effort).unwrap();
+        let render_to = |limit| render_limited(&cx.tk, &cx.sp, &req, &cx.effort, limit);
+        assert_eq!(render_to(expected.len()).unwrap(), expected);
+        assert!(matches!(render_to(expected.len() - 1), Err(RenderError::TooLong)), "the final message marker takes one position");
+        assert!(matches!(render_to(2), Err(RenderError::TooLong)), "the effort text must fit as well");
     }
 
     /// a reply token stream, as the scheduler would send it: thinking, text, then a tool call
@@ -1107,6 +1631,43 @@ mod tests {
         assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"0\r\nBadTrailer\r\n\r\n".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "a trailer without a colon");
         assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"5\r\nab".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "a chunk cut short");
         assert!(matches!(read_chunked(&mut BufReader::new(Cursor::new(b"3\r\nabcXX\r\n0\r\n\r\n".to_vec())), MAX_BODY), Err(BodyError::Malformed(_))), "no CRLF after the chunk data");
+    }
+
+    #[test] fn framing_lines_and_trailers_are_bounded() {
+        use std::io::Cursor;
+        let head = |s: Vec<u8>| read_head(&mut Cursor::new(s));
+        assert!(head(b"GET /health HTTP/1.1\r\nHost: local\r\n\r\n".to_vec()).is_ok());
+        assert!(head(b"GET /health HTTP/1.1".to_vec()).is_err());
+        assert!(head(b"GET /health HTTP/1.1\r\nHost: local".to_vec()).is_err());
+        let mut long_head = b"GET /health HTTP/1.1\r\nX: ".to_vec();
+        long_head.extend(vec![b'x'; 16384]);
+        long_head.extend_from_slice(b"\r\n\r\n");
+        assert!(head(long_head).is_err());
+        let chunk = |s: Vec<u8>| read_chunked(&mut Cursor::new(s), 16);
+        assert!(chunk(b"1\r\na\r\n0\r\nX: y\r\n\r\n".to_vec()).is_ok());
+        assert!(chunk(b"1".to_vec()).is_err());
+        assert!(chunk(b"0\r\nX: y".to_vec()).is_err());
+        assert!(chunk(b"1\r\na\r".to_vec()).is_err());
+        let mut long_size = vec![b'0'; 8192];
+        long_size.extend_from_slice(b"\r\n\r\n");
+        assert!(chunk(long_size).is_err());
+        let mut trailers = b"0\r\n".to_vec();
+        for _ in 0..128 { trailers.extend_from_slice(b"X: y\r\n"); }
+        trailers.extend_from_slice(b"\r\n");
+        assert!(chunk(trailers).is_err());
+        let mut framing = Vec::new();
+        for _ in 0..(MAX_FRAMING / 3 + 1) { framing.extend_from_slice(b"1\na\n"); }
+        assert!(matches!(read_chunked(&mut Cursor::new(framing), MAX_FRAMING), Err(BodyError::Malformed(_))));
+    }
+
+    #[test] fn routes_distinguish_body_and_bodyless_handlers() {
+        assert_eq!(route("GET", "/health"), Route::Health);
+        assert_eq!(route("GET", "/v1/models"), Route::Models);
+        assert_eq!(route("POST", "/unknown"), Route::NotFound);
+        assert_eq!(route("POST", "/v1/chat/completions"), Route::Chat);
+        assert_eq!(route("POST", "/v1/messages"), Route::Messages);
+        assert_eq!(route("POST", "/v1/messages/count_tokens"), Route::CountTokens);
+        assert_eq!(route("GET", "/v1/messages"), Route::NotFound);
     }
 
     #[test] fn routes_ignore_query_strings_and_trailing_slashes() {
@@ -1408,6 +1969,119 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit()), "the nonce is hex: {n}");
     }
 
+    #[test] fn stream_utf8_recovers_and_flushes_incomplete_sequences() {
+        let mut pend = vec![0xff, b'h', b'i', 0xe2, 0x82];
+        assert_eq!(take_stream_text(&mut pend, false), "�hi");
+        assert_eq!(pend, vec![0xe2, 0x82]);
+        pend.push(0xac);
+        assert_eq!(take_stream_text(&mut pend, false), "€");
+        pend.extend([0xe2, 0x82]);
+        assert_eq!(take_stream_text(&mut pend, true), "�");
+        assert!(pend.is_empty());
+        let mut bs = BlockStream::new("test", 1);
+        bs.open_text = true;
+        bs.pend = vec![0xff, b'h', b'i', 0xe2];
+        let mut events = Vec::new();
+        bs.flush_text(&mut events);
+        bs.close_text(&mut events);
+        let text: String = events.iter().filter_map(|event| {
+            let v: Value = serde_json::from_str(event.split("\ndata: ").nth(1)?.trim_end()).ok()?;
+            v["delta"]["text"].as_str().map(str::to_owned)
+        }).collect();
+        assert_eq!(text, "�hi�");
+    }
+
+    #[test] fn chat_rejects_each_invalid_budget_before_admission() {
+        let tk = Tokenizer::for_test();
+        let (jtx, jrx) = channel::<Job>();
+        let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
+            max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() };
+        for name in ["max_tokens", "max_completion_tokens"] {
+            for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(64), json!("8")] {
+                let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
+                req[name] = value;
+                let mut out = Vec::new();
+                chat(&cx, &req, &mut out).unwrap();
+                assert!(String::from_utf8(out).unwrap().starts_with("HTTP/1.1 400"), "{name}: {req}");
+                assert!(jrx.try_recv().is_err());
+            }
+        }
+        let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "max_completion_tokens": -1});
+        let mut out = Vec::new();
+        chat(&cx, &req, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().starts_with("HTTP/1.1 400"));
+    }
+
+    #[test] fn messages_stream_polls_even_during_hidden_thinking() {
+        struct Gone { bytes: Vec<u8>, checks: std::cell::Cell<usize> }
+        impl Write for Gone {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.bytes.extend_from_slice(buf); Ok(buf.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for Gone {
+            fn client_gone(&self) -> bool { self.checks.set(self.checks.get() + 1); true }
+        }
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+        let (jtx, jrx) = channel::<Job>();
+        let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
+            max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() };
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv().unwrap();
+            let _ = job.out.send(Ev::Tok(sp.c_think));
+            for _ in 0..50 { if job.out.send(Ev::Tok(sp.c_think)).is_err() { break; } }
+        });
+        let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
+        messages(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+        scheduler.join().unwrap();
+        assert!(out.checks.get() > 0);
+    }
+
+    #[test] fn chat_and_messages_streams_poll_during_silent_tool_json() {
+        struct Gone { bytes: Vec<u8>, checks: std::cell::Cell<usize> }
+        impl Write for Gone {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.bytes.extend_from_slice(buf); Ok(buf.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for Gone {
+            fn client_gone(&self) -> bool { self.checks.set(self.checks.get() + 1); true }
+        }
+        for use_chat in [true, false] {
+            let tk = Tokenizer::for_test();
+            let sp = test_sp(&tk);
+            let payload_tok = tk.encode("a", false)[0];
+            let (jtx, jrx) = channel::<Job>();
+            let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
+                max_tokens: 64, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() };
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().unwrap();
+                let mut sent = 0usize;
+                if job.out.send(Ev::Tok(sp.c_tool)).is_ok() {
+                    sent += 1;
+                    for _ in 0..512 {
+                        if job.out.send(Ev::Tok(payload_tok)).is_err() { break; }
+                        sent += 1;
+                    }
+                }
+                sent
+            });
+            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
+            if use_chat {
+                chat(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+            } else {
+                messages(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+            }
+            drop(cx);
+            let sent = scheduler.join().unwrap();
+            assert!(String::from_utf8_lossy(&out.bytes).starts_with("HTTP/1.1 200"), "use_chat={use_chat} expected 200 stream");
+            assert!(out.checks.get() > 0, "use_chat={use_chat} must poll client_gone during silent tool JSON");
+            assert!(sent < 513, "use_chat={use_chat} must abort stream early on disconnect (sent={sent})");
+        }
+    }
+
     #[test] fn over_cap_messages_clamp_the_budget_or_read_as_too_long() {
         // Rowan's live case: 108,582 prompt tokens + max_tokens 32,000 in a
         // 131,072 context must clamp, not die; a prompt past the context
@@ -1422,10 +2096,10 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: Default::default(), limit: 4, conns: Default::default() });
-        let req = json!({"model": "m", "max_tokens": 63, "messages": [{"role": "user", "content": "x".repeat(8)}]});
+                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() });
+        let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
-        let want = clamped_messages_max(prompt, 63, 64).unwrap();
+        let want = clamped_messages_max(prompt, 64000, 64).unwrap();
         assert!(want < 63, "the test prompt must actually overrun with max_tokens 63 (prompt {prompt})");
         let (cx2, req2) = (cx.clone(), req.clone());
         let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
@@ -1444,7 +2118,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       inflight: Default::default(), limit: 4, conns: Default::default() };
+                       inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -1509,6 +2183,45 @@ mod tests {
         let mut at_end = ext.clone(); at_end[100] = 9999;
         assert_eq!(reusable_prefix(&p, true, &at_end), 100, "diverging at the first suffix token still reuses the whole prompt");
     }
+    #[test] fn decoding_invalidates_only_when_a_write_wraps_into_prefill_history() {
+        assert!(!decode_overwrites_prompt(100, 100));
+        assert!(!decode_overwrites_prompt(EXT - 1, 100));
+        assert!(decode_overwrites_prompt(EXT, 100));
+        assert!(decode_overwrites_prompt(EXT, EXT));
+        assert!(decode_overwrites_prompt(EXT + 40, EXT + 40));
+    }
+
+    #[test] fn inference_failures_reach_both_apis_without_a_success_terminator() {
+        let tk = Arc::new(Tokenizer::for_test());
+        for anthropic in [false, true] {
+            for stream in [false, true] {
+                let (jtx, jrx) = channel::<Job>();
+                let cx = Ctx { tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
+                    max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                    inflight: PermitPool::new(4), preprocess: PermitPool::new(4), conns: Default::default() };
+                let scheduler = std::thread::spawn(move || {
+                    let job = jrx.recv().unwrap();
+                    job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
+                });
+                let req = json!({"max_tokens": 8, "stream": stream, "messages": [{"role": "user", "content": "hi"}]});
+                let mut out = Vec::new();
+                if anthropic { messages(&cx, &req, &mut out).unwrap(); }
+                else { chat(&cx, &req, &mut out).unwrap(); }
+                scheduler.join().unwrap();
+                let response = String::from_utf8(out).unwrap();
+                assert!(response.contains("model returned non-finite logits"));
+                assert!(response.contains(if anthropic { "api_error" } else { "server_error" }));
+                if stream {
+                    assert!(response.starts_with("HTTP/1.1 200"));
+                    assert!(!response.contains(if anthropic { "message_stop" } else { "[DONE]" }));
+                    if anthropic { assert!(response.contains("event: error\n")); }
+                } else {
+                    assert!(response.starts_with("HTTP/1.1 500"));
+                }
+            }
+        }
+    }
+
     #[test] fn lane_choice_prefers_the_own_prompt_then_a_longer_copyable_busy_one() {
         let cand = |prefix: usize, free: bool, copyable: bool, tick: u64| LaneCand { prefix, free, copyable, tick };
         // own lane first: a free lane's own prompt beats an equally long busy one, with no copy

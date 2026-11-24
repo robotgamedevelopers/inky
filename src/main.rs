@@ -14,9 +14,13 @@ use objc2_metal::{MTLBuffer, MTLCommandBuffer};
 use sampler::Sampler;
 use session::{Renderer, Session};
 use std::io::{BufRead, Write};
+use std::net::ToSocketAddrs;
 use tokenizer::Tokenizer;
 
 const DEFAULT_MODEL: &str = "~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf";
+const CONTEXT_ALIGNMENT: usize = 64;
+// Inkling 2 Mini's eight full-attention slots address 16,384 K/V elements per token with u32 offsets.
+const MAX_CONTEXT: usize = ((u32::MAX as usize - 1) / 16_384 / CONTEXT_ALIGNMENT) * CONTEXT_ALIGNMENT;
 
 const USAGE: &str = "inky - a hand-fused Metal inference engine for Thinking Machines Inkling 2 Mini
 
@@ -27,12 +31,13 @@ commands:
   run -p TEXT       one prompt, streamed
   bench             greedy prefill + decode benchmark
   check --ref P     compare logits against a llama.cpp reference dump (tools/ref_logits)
+  serve             OpenAI Chat Completions and Anthropic Messages (see inky serve --help)
 
 options:
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
   -p, --prompt TEXT prompt text (run/bench)      -f FILE  read the prompt from a file
-  -n N              max new tokens (default 2048, bench 128)
-  -c, --ctx N       context length (default 16384)
+  -n N              max new tokens (default 2048, bench 128; 0 skips generation)
+  -c, --ctx N       context length (default 16384, maximum 262080, rounded up to a multiple of 64)
   --effort E        reasoning effort: none|minimal|low|medium|high|xhigh|<0..0.99> (default high)
   --system TEXT     system prompt
   --temp T          temperature (default 1.0; 0 = greedy, fully GPU-pipelined)
@@ -44,6 +49,145 @@ options:
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
   --raw             do not apply the chat template; print special tokens";
 
+const SERVE_USAGE: &str = "usage: inky serve [options]
+
+  -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
+  -c, --ctx N       context per lane (default 65536, maximum 262080, rounded up to a multiple of 64)
+  --bind ADDR       listen address (default 127.0.0.1:8090)
+  --key-env NAME    use a nonempty key from the named environment variable
+  --allow-unauthenticated-non-loopback
+                    explicitly allow a non-loopback bind without a key
+  --lanes N         active inference lanes (default 16)
+  --queue N         waiting requests (default 64)
+  --effort E        default reasoning effort (default medium)
+  -n MAX            positive default Chat Completions reply budget (default 16384)";
+
+fn cli_error(error: String) -> ! {
+    eprintln!("{error}");
+    std::process::exit(2);
+}
+
+fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
+    value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
+}
+
+fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
+    let ctx = parse_usize(flag, value)?;
+    if !(1..=MAX_CONTEXT).contains(&ctx) {
+        return Err(format!("{flag} must be between 1 and {MAX_CONTEXT} tokens"));
+    }
+    Ok(ctx.div_ceil(CONTEXT_ALIGNMENT) * CONTEXT_ALIGNMENT)
+}
+
+fn default_model() -> String {
+    DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
+}
+
+fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
+    let mut o = serve::ServeOpts {
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
+        max_tokens: 16384, key: None, queue: 64,
+    };
+    let mut bind = "127.0.0.1:8090";
+    let mut allow_unauthenticated = false;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(flag) = args.next() {
+        let mut value = || args.next().filter(|value| !value.is_empty() && !value.starts_with("--") && !matches!(*value, "-m" | "-c" | "-n" | "-h"))
+            .ok_or_else(|| format!("missing value for {flag}"));
+        match flag {
+            "-m" | "--model" => o.model = value()?.into(),
+            "-c" | "--ctx" => o.ctx = parse_context(flag, value()?)?,
+            "--bind" => bind = value()?,
+            "--lanes" => o.lanes = parse_usize(flag, value()?)?,
+            "--effort" => o.effort = value()?.into(),
+            "-n" => o.max_tokens = parse_usize(flag, value()?)?,
+            "--key-env" => {
+                let name = value()?;
+                let key = read_key(name).map_err(|error| match error {
+                    std::env::VarError::NotPresent => format!("--key-env {name}: variable is not set"),
+                    std::env::VarError::NotUnicode(_) => format!("--key-env {name}: variable must contain valid UTF-8"),
+                })?;
+                if key.is_empty() || key.trim() != key || key.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(format!("--key-env {name} must contain a nonempty HTTP header value without surrounding whitespace or control characters"));
+                }
+                o.key = Some(key);
+            }
+            "--queue" => o.queue = parse_usize(flag, value()?)?,
+            "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
+            _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
+        }
+    }
+    o.bind = bind.to_socket_addrs().map_err(|e| format!("cannot resolve --bind {bind}: {e}"))?.collect();
+    if o.bind.is_empty() { return Err(format!("--bind {bind} resolved to no addresses")); }
+    if o.key.is_none() && !allow_unauthenticated && o.bind.iter().any(|addr| !addr.ip().to_canonical().is_loopback()) {
+        return Err("a non-loopback --bind requires --key-env or --allow-unauthenticated-non-loopback".into());
+    }
+    Ok(o)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
+        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), |name| match name {
+            "PRESENT" => Ok("configured-key".into()),
+            "EMPTY" => Ok(String::new()),
+            "BLANK" => Ok(" \t".into()),
+            "NONUNICODE" => Err(std::env::VarError::NotUnicode("secret data".into())),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+    }
+
+    #[test]
+    fn cli_context_limit_applies_before_rounding() {
+        assert_eq!(MAX_CONTEXT, 262080);
+        assert_eq!(parse_context("--ctx", "1"), Ok(64));
+        assert_eq!(parse_context("--ctx", "262079"), Ok(MAX_CONTEXT));
+        assert_eq!(parse_context("--ctx", "262080"), Ok(MAX_CONTEXT));
+        for invalid in ["0", "262081", "262144", "1000000", &usize::MAX.to_string(), "text"] {
+            assert!(parse_context("--ctx", invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn serve_rejects_incomplete_or_invalid_arguments() {
+        for (args, message) in [
+            (&["--key-env"][..], "missing value for --key-env"),
+            (&["--key-env", "--lanes", "1"], "missing value for --key-env"),
+            (&["--key-env", "ABSENT"], "--key-env ABSENT"),
+            (&["--key-env", "EMPTY"], "nonempty HTTP header"),
+            (&["--key-env", "BLANK", "--allow-unauthenticated-non-loopback"], "nonempty HTTP header"),
+            (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
+            (&["--bind"], "missing value for --bind"),
+            (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
+            (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
+            (&["--typo"], "unknown serve option --typo"),
+        ] {
+            let err = serve_args(args).err().unwrap();
+            assert!(err.contains(message), "{args:?}: {err}");
+            assert!(!err.contains("secret data"));
+        }
+    }
+
+    #[test]
+    fn serve_checks_the_addresses_it_will_bind() {
+        assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
+        assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
+        assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
+        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0"] {
+            let args = ["--bind", bind];
+            assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"));
+            let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
+            assert_eq!(keyed.bind, [bind.parse::<std::net::SocketAddr>().unwrap()]);
+            assert_eq!(keyed.key.as_deref(), Some("configured-key"));
+            let unkeyed = serve_args(&["--bind", bind, "--allow-unauthenticated-non-loopback"]).unwrap();
+            assert_eq!(unkeyed.bind, keyed.bind);
+            assert!(unkeyed.key.is_none());
+        }
+    }
+}
+
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
@@ -52,8 +196,7 @@ struct Opts {
 fn parse() -> (String, Opts) {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_else(|| "help".into());
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut o = Opts { model: DEFAULT_MODEL.replace('~', &home), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
+    let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
                        temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false };
     while let Some(a) = args.next() {
@@ -62,8 +205,8 @@ fn parse() -> (String, Opts) {
             "-m" | "--model" => o.model = v(),
             "-p" | "--prompt" => o.prompt = v(),
             "-f" | "--file" => o.prompt = std::fs::read_to_string(v()).expect("read prompt file"),
-            "-n" => { o.n = v().parse().unwrap(); o.n_set = true; }
-            "-c" | "--ctx" => o.ctx = v().parse::<usize>().unwrap().div_ceil(64) * 64,
+            "-n" => { o.n = parse_usize(&a, &v()).unwrap_or_else(|e| cli_error(e)); o.n_set = true; }
+            "-c" | "--ctx" => o.ctx = parse_context(&a, &v()).unwrap_or_else(|e| cli_error(e)),
             "--raw" => o.raw = true,
             "--kv8" => engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed),
             "--kv-disk" => engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -105,6 +248,10 @@ fn first_turn(o: &Opts, user: &str) -> String {
 
 fn softcap(x: f32, c: f32) -> f32 { if c > 0.0 { c * (x / c).tanh() } else { x } }
 
+fn token_rate(tokens: usize, elapsed: std::time::Duration) -> f64 {
+    if elapsed.is_zero() { 0.0 } else { tokens as f64 / elapsed.as_secs_f64() }
+}
+
 fn run(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let tk = Tokenizer::load(&eng.g);
@@ -121,7 +268,7 @@ fn run(o: &Opts) {
     r.end(&mut out);
     let s = sess.stats;
     eprintln!("\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
-              s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, s.gen_tokens as f64 / s.gen_time.as_secs_f64(),
+              s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, token_rate(s.gen_tokens, s.gen_time),
               if sampler.greedy() { " (greedy)" } else { "" }, kv_note(sess.run(), sess.n_past), sess.n_past);
 }
 
@@ -134,20 +281,20 @@ fn chat(o: &Opts) {
     let mut out = std::io::stdout();
     eprintln!("[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
               o.effort, if sampler.greedy() { "greedy".to_string() } else { format!("temp {}", o.temp) });
-    let mut turn = 0;
+    let mut has_turn = false;
     loop {
         print!("\n\x1b[1m> \x1b[0m"); out.flush().ok();
         let mut line = String::new();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
         let line = line.trim_end_matches(['\n', '\r']).to_string();
         if line.trim().is_empty() { break; }
-        if line.trim() == "/reset" { sess = Session::with_lane(&eng, &tk, sess.into_lane()); turn = 0; eprintln!("[context cleared]"); continue; }
-        let text = if turn == 0 { first_turn(o, &line) } else { format!("<|message_user|><|content_text|>{line}<|end_message|>") };
-        turn += 1;
+        if line.trim() == "/reset" { sess = Session::with_lane(&eng, &tk, sess.into_lane()); has_turn = false; eprintln!("[context cleared]"); continue; }
+        let text = if has_turn { format!("<|message_user|><|content_text|>{line}<|end_message|>") } else { first_turn(o, &line) };
         let before = sess.stats;
         let toks = tk.encode(&text, true);
         if sess.ctx_left() < toks.len() + 64 { eprintln!("[context full: /reset]"); continue; }
         let first = sess.prefill(&toks);
+        has_turn = true;
         let mut r = Renderer::new(!o.hide_thinking, o.raw);
         let max = o.n.min(sess.ctx_left().saturating_sub(4));
         sess.generate(first, max, &mut sampler, |t| { r.push(&tk, t, &mut out); true });
@@ -155,7 +302,7 @@ fn chat(o: &Opts) {
         let s = sess.stats;
         let (pt, gt) = (s.prompt_tokens - before.prompt_tokens, s.gen_tokens - before.gen_tokens);
         eprintln!("\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
-                  pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(), gt as f64 / (s.gen_time - before.gen_time).as_secs_f64(),
+                  pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(), token_rate(gt, s.gen_time - before.gen_time),
                   sess.n_past, eng.max_ctx, kv_note(sess.run(), sess.n_past));
     }
 }
@@ -169,7 +316,12 @@ fn bench(o: &Opts) {
     let toks = tk.encode(&text, true);
     let mut sampler = Sampler::new(0.0, 1, 1.0, eng.softcap, 0);
     // warm-up pass (pipelines, page mappings)
-    let warm = { let mut s = Session::new(&eng, &tk); let f = s.prefill(&toks[..toks.len().min(64)]); s.generate(f, 8, &mut sampler, |_| true); s.into_lane() };
+    let warm = {
+        let mut s = Session::new(&eng, &tk);
+        let f = s.prefill(&toks[..toks.len().min(64)]);
+        if n > 0 { s.generate(f, 8, &mut sampler, |_| true); }
+        s.into_lane()
+    };
     let mut sess = Session::with_lane(&eng, &tk, warm);     // the warm-up's buffers, already mapped
     sess.run().prepare(toks.len(), toks.len());       // as `run` does: working memory allocated and mapped before the clock starts
     let first = sess.prefill(&toks);
@@ -177,10 +329,10 @@ fn bench(o: &Opts) {
     let s = sess.stats;
     println!("prompt {:5} tok: {:8.1} ms  {:7.1} tok/s | decode {:4} tok: {:8.1} ms  {:6.2} tok/s",
              s.prompt_tokens, s.prompt_time.as_secs_f64() * 1e3, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
-             s.gen_tokens, s.gen_time.as_secs_f64() * 1e3, s.gen_tokens as f64 / s.gen_time.as_secs_f64());
+             s.gen_tokens, s.gen_time.as_secs_f64() * 1e3, token_rate(s.gen_tokens, s.gen_time));
     println!("memory besides the weights: {} at {} tokens | prefill scratch {:.0} MiB while prefilling, {:.1} MiB while generating",
              kv_note(sess.run(), sess.n_past), sess.n_past, s.peak_scratch as f64 / 1048576.0, sess.run().mem().1 as f64 / 1048576.0);
-    if sess.run().tier_on() {
+    if s.gen_tokens > 0 && sess.run().tier_on() {
         let (rb, rt) = sess.run().tier_io();
         println!("K/V file: {:.0} MiB read per token, {:.1} GiB/s, {:.1} ms of each token's {:.1} ms", rb as f64 / 1048576.0 / s.gen_tokens as f64,
                  rb as f64 / 1073741824.0 / rt.as_secs_f64(), rt.as_secs_f64() * 1e3 / s.gen_tokens as f64, s.gen_time.as_secs_f64() * 1e3 / s.gen_tokens as f64);
@@ -194,26 +346,87 @@ fn kv_note(eng: engine::Run, n: usize) -> String {
     else { format!("K/V cache {:.0} MiB", mib(eng.mem().0)) }
 }
 
-fn check(o: &Opts) {
+fn reference_tokens(text: &str, context: usize) -> Result<Vec<u32>, String> {
+    let mut toks = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if i == context {
+            return Err(format!("reference has more than {context} tokens"));
+        }
+        toks.push(line.trim().parse().map_err(|_| format!("invalid token ID at line {}", i + 1))?);
+    }
+    if toks.is_empty() {
+        return Err("reference has no tokens".into());
+    }
+    Ok(toks)
+}
+
+fn reference_logits(raw: &[u8], tokens: usize, vocab: usize) -> Result<Vec<f32>, String> {
+    let row_bytes = vocab * size_of::<f32>();
+    if raw.is_empty() || row_bytes == 0 || raw.len() % row_bytes != 0 || raw.len() / row_bytes > tokens {
+        return Err(format!("expected 1 to {tokens} complete reference logit rows of width {vocab}, got {} bytes", raw.len()));
+    }
+    // Trimmed dumps cover the last positions of the token list.
+    let first_pos = tokens - raw.len() / row_bytes;
+    raw.chunks_exact(size_of::<f32>()).enumerate().map(|(i, bytes)| {
+        let logit = f32::from_le_bytes(bytes.try_into().unwrap());
+        if logit.is_finite() {
+            Ok(logit)
+        } else {
+            Err(format!("non-finite reference logit at position {}, token {}", first_pos + i / vocab, i % vocab))
+        }
+    }).collect()
+}
+
+fn compare_logits(lg: &[f32], r: &[f32]) -> Option<(usize, usize, f32, f32)> {
+    if lg.iter().chain(r).any(|x| !x.is_finite()) {
+        return None;
+    }
+    let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
+    let maxdiff = lg.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    // KL(ref || ours)
+    let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+    let (l1, l2) = (lse(lg), lse(r));
+    let kl: f32 = r.iter().zip(lg).map(|(b, a)| { let pb = (b - l2).exp(); pb * ((b - l2) - (a - l1)) }).sum();
+    if maxdiff.is_finite() && kl.is_finite() {
+        Some((am(lg), am(r), maxdiff, kl))
+    } else {
+        None
+    }
+}
+
+fn check(o: &Opts) -> Result<(), String> {
+    if o.reference.is_empty() {
+        return Err("expected --ref PREFIX".into());
+    }
+    let token_path = format!("{}.tokens", o.reference);
+    let token_text = std::fs::read_to_string(&token_path).map_err(|err| format!("{token_path}: {err}"))?;
+    let toks = reference_tokens(&token_text, o.ctx).map_err(|err| format!("{token_path}: {err}"))?;
+    // INK_PF=N: prefill the first N tokens as one batch, then decode the rest one by one.
+    let pf: usize = match std::env::var("INK_PF") {
+        Ok(v) => v.parse().map_err(|_| format!("invalid INK_PF value {v:?}"))?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(err) => return Err(format!("INK_PF: {err}")),
+    };
+    if pf > toks.len() {
+        return Err(format!("INK_PF={pf} exceeds the {} reference tokens", toks.len()));
+    }
+    let logit_path = format!("{}.logits", o.reference);
+    let raw = std::fs::read(&logit_path).map_err(|err| format!("{logit_path}: {err}"))?;
     let eng = Engine::load(&o.model, o.ctx);
+    let nv = eng.n_vocab;
+    let reflog = reference_logits(&raw, toks.len(), nv).map_err(|err| format!("{logit_path}: {err}"))?;
+    drop(raw);
+    let first_ref = toks.len() - reflog.len() / nv;
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
+    eng.try_set_tokens(0, &toks).map_err(|err| format!("{token_path}: {err}"))?;
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
-    let toks: Vec<u32> = std::fs::read_to_string(format!("{}.tokens", o.reference)).unwrap().lines().map(|l| l.trim().parse().unwrap()).collect();
-    let raw = std::fs::read(format!("{}.logits", o.reference)).unwrap();
-    let nv = eng.n_vocab;
-    let reflog: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    // the dump may hold only the last positions (trimmed references): align it to the end of the token list
-    assert!(reflog.len() % nv == 0 && reflog.len() <= toks.len() * nv);
-    let first_ref = toks.len() - reflog.len() / nv;
     eng.reset();
-    eng.set_tokens(0, &toks);
-    // --pf N: prefill the first N tokens as one batch, then decode the rest one by one
-    let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
     let dec_steps = std::env::var("INK_DEC").is_ok();
     if dec_steps { eng.ensure_dbatch(1); }
     let mut agree = 0;
+    let mut compared = 0;
     let mut worst = 0f32;
     let kv_disk = engine::KV_DISK.load(std::sync::atomic::Ordering::Relaxed);
     let mut bits_hash = 0xcbf29ce484222325u64;       // over the raw bits of every logit of every checked step
@@ -244,27 +457,62 @@ fn check(o: &Opts) {
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
         let raw: &[f32] = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.softcap)).collect();
+        if let Some(token) = raw.iter().position(|x| !x.is_finite()) {
+            return Err(format!("non-finite engine logit at position {pos}, token {token}"));
+        }
         for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.softcap)).collect();
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
-        let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
-        let (a1, a2) = (am(&lg), am(r));
-        let maxdiff = lg.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        // KL(ref || ours)
-        let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
-        let (l1, l2) = (lse(&lg), lse(r));
-        let kl: f32 = r.iter().zip(&lg).map(|(b, a)| { let pb = (b - l2).exp(); pb * ((b - l2) - (a - l1)) }).sum();
+        let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
+            .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
+        compared += 1;
         if a1 == a2 { agree += 1; }
         worst = worst.max(kl);
         println!("pos {pos:3} tok {:6} argmax ours {a1:6} ref {a2:6} {} maxdiff {maxdiff:.4} KL {kl:.6}", toks[pos], if a1 == a2 { "OK " } else { "XX " });
     }
-    println!("argmax agreement {agree}/{} worst KL {worst:.6}", toks.len() - first_ref.max(pf.saturating_sub(1)));
+    println!("argmax agreement {agree}/{compared} worst KL {worst:.9}");
     eprintln!("logit bits hash {bits_hash:016x}");
     if eng.tier_on() {
         let (n, (rb, rt)) = (toks.len(), eng.tier_io());
         eprintln!("disk tier: {:.1} MiB in memory, {:.1} MiB on disk only (all in memory: {:.1} MiB); read {:.0} MiB in {:.0} ms",
                   eng.mem().0 as f64 / 1048576.0, eng.kv_disk_bytes(n) as f64 / 1048576.0, eng.kv_exact_bytes(n) as f64 / 1048576.0, rb as f64 / 1048576.0, rt.as_secs_f64() * 1e3);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn reference_tokens_require_a_nonempty_sequence_that_fits() {
+        assert_eq!(reference_tokens("0\n1\n2\n3\n", 4).unwrap(), vec![0, 1, 2, 3]);
+        assert!(reference_tokens("0\n1\n2\n3\n4\n", 4).is_err());
+        assert!(reference_tokens("", 4).is_err());
+        assert!(reference_tokens("0\n-1\n", 4).is_err());
+    }
+
+    #[test]
+    fn reference_logits_require_whole_finite_rows_and_allow_a_trimmed_tail() {
+        let bytes: Vec<u8> = [1f32, 2.0].into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_eq!(reference_logits(&bytes, 3, 2).unwrap(), vec![1.0, 2.0]);
+        assert!(reference_logits(&[], 3, 2).is_err());
+        assert!(reference_logits(&bytes[..bytes.len() - 1], 3, 2).is_err());
+        assert!(reference_logits(&bytes, 1, 1).is_err());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(reference_logits(&bad.to_le_bytes(), 3, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn comparisons_reject_non_finite_logits_and_metrics() {
+        assert_eq!(compare_logits(&[1.0, 2.0], &[1.0, 2.0]), Some((1, 1, 0.0, 0.0)));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(compare_logits(&[1.0, bad], &[1.0, 2.0]).is_none());
+            assert!(compare_logits(&[1.0, 2.0], &[1.0, bad]).is_none());
+        }
+        assert!(compare_logits(&[f32::MAX, f32::MIN], &[f32::MIN, f32::MAX]).is_none());
     }
 }
 
@@ -993,48 +1241,50 @@ fn vcost(o: &Opts) {
     }
 }
 
+fn enter_inky_mode() {
+    let (chip, mem) = tuning::this_machine();
+    let t = tuning::select(&chip, mem);
+    let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
+    match memd::enter(&sock) {
+        Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
+        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
+    }
+}
+
 fn main() {
-    // inky mode's helper and its install take their own arguments
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
         Some("memd") => { memd::daemon(&raw[2..]); return; }
         Some("tune-memory") => { memd::install(&raw[2..]); return; }
+        Some("serve") => {
+            let args = &raw[2..];
+            if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+                println!("{SERVE_USAGE}");
+                return;
+            }
+            let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
+            enter_inky_mode();
+            serve::serve(options);
+            return;
+        }
+        Some("mode") => {
+            // Hold inky mode for the requested interval, then leave by exiting.
+            enter_inky_mode();
+            let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            return;
+        }
         _ => {}
     }
-    if !matches!(raw.get(1).map(|s| s.as_str()), None | Some("help") | Some("-h") | Some("--help")) {
-        let (chip, mem) = tuning::this_machine();
-        let t = tuning::select(&chip, mem);
-        let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-        match memd::enter(&sock) {
-            Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
-            None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
-        }
-    }
-    // `inky serve [-m MODEL] [-c CTX] [--lanes N] [--bind ADDR] [--effort E] [-n MAX]`: the OpenAI endpoint over lanes
-    if raw.get(1).map(|s| s.as_str()) == Some("serve") {
-        let arg = |k: &str| raw.iter().position(|a| a == k).and_then(|i| raw.get(i + 1)).cloned();
-        let home = std::env::var("HOME").unwrap_or_default();
-        serve::serve(serve::ServeOpts {
-            model: arg("-m").unwrap_or(DEFAULT_MODEL.replace('~', &home)),
-            ctx: arg("-c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(65536).div_ceil(64) * 64,
-            bind: arg("--bind").unwrap_or("127.0.0.1:8090".into()),
-            lanes: arg("--lanes").and_then(|v| v.parse().ok()).unwrap_or(16),
-            effort: arg("--effort").unwrap_or("medium".into()),
-            max_tokens: arg("-n").and_then(|v| v.parse().ok()).unwrap_or(16384),
-            key: arg("--key-env").map(|k| std::env::var(&k).unwrap_or_else(|_| { eprintln!("--key-env {k}: not in the environment"); std::process::exit(2) })),
-            queue: arg("--queue").and_then(|v| v.parse().ok()).unwrap_or(64),
-        });
-        return;
-    }
-    // `inky mode [SECONDS]`: enter inky mode (above) and hold it, then leave by exiting
-    if raw.get(1).map(|s| s.as_str()) == Some("mode") {
-        let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        return;
-    }
     let (cmd, o) = parse();
+    if !matches!(cmd.as_str(), "help" | "-h" | "--help") { enter_inky_mode(); }
     match cmd.as_str() {
-        "check" => check(&o),
+        "check" => {
+            if let Err(err) = check(&o) {
+                eprintln!("check: {err}");
+                std::process::exit(1);
+            }
+        }
         "rows" => rows(&o),
         "rollback" => rollback(&o),
         "binv" => binv(&o),

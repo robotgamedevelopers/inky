@@ -183,20 +183,21 @@ func (g *gate) seededReplies() error {
 	return nil
 }
 
+func (g *gate) requestReply(messages []replyMessage, limit int) (replySample, error) {
+	body, err := json.Marshal(map[string]any{"messages": messages, "max_tokens": limit, "seed": 1729, "temperature": 0.8})
+	if err != nil {
+		return replySample{}, err
+	}
+	return g.sampleReply(string(body), false, nil)
+}
+
 func (g *gate) followupCache() error {
 	user := replyMessage{Role: "user", Content: "What is two plus two? Give just the number."}
-	request := func(messages []replyMessage, limit int) (replySample, error) {
-		body, err := json.Marshal(map[string]any{"messages": messages, "max_tokens": limit, "seed": 1729, "temperature": 0.8})
-		if err != nil {
-			return replySample{}, err
-		}
-		return g.sampleReply(string(body), false, nil)
-	}
-	first, err := request([]replyMessage{user}, 64)
+	first, err := g.requestReply([]replyMessage{user}, 64)
 	if err != nil {
 		return err
 	}
-	next, err := request([]replyMessage{user, first.message, {Role: "user", Content: "Add one to that number."}}, 12)
+	next, err := g.requestReply([]replyMessage{user, first.message, {Role: "user", Content: "Add one to that number."}}, 12)
 	if err != nil {
 		return err
 	}
@@ -212,6 +213,34 @@ func (g *gate) followupCache() error {
 	}
 	if matches(0) {
 		return fmt.Errorf("accepted zero cached tokens")
+	}
+	return nil
+}
+
+// Run on the one-lane server so the follow-up reuses the same physical ring.
+func (g *gate) overwrittenWindow() error {
+	head := replyMessage{Role: "user", Content: strings.Repeat(" apple", 1040) + " Write a detailed recipe using apples, with five steps."}
+	followup := []replyMessage{head, {Role: "user", Content: "Include the time for each step."}}
+	cold, err := g.requestReply(followup, 32)
+	if err != nil {
+		return err
+	}
+	base, err := g.requestReply([]replyMessage{head}, 32)
+	if err != nil {
+		return err
+	}
+	if base.usage.Prompt < 1024 || base.usage.Generated < 3 {
+		return fmt.Errorf("fixture did not overwrite retained window rows: %+v", base.usage)
+	}
+	next, err := g.requestReply(followup, 32)
+	if err != nil {
+		return err
+	}
+	if cached := next.usage.Details.Cached; cached == nil || *cached != 0 {
+		return fmt.Errorf("follow-up reused an overwritten prompt window")
+	}
+	if !sameReply(cold, next) {
+		return fmt.Errorf("follow-up differs from cold generation")
 	}
 	return nil
 }

@@ -14,15 +14,9 @@ source = pathlib.Path(sys.argv[1]).read_text()
 start = source.index('#[derive(Default)]\npub struct Mode')
 end = source.index('\nfn get_limit()', start)
 pathlib.Path(sys.argv[2]).write_text(source[start:end])
-start = source.index('    let mut seed = None;')
-end = source.index('    // the socket lives', start)
-initialization_marker = 'let mode = Arc::new(Mutex::new('
-initialization_start = source.index(initialization_marker, end) + len(initialization_marker)
-initialization_end = source.index('));', initialization_start)
-initialization = source[initialization_start:initialization_end]
-assert initialization.startswith('Mode {'), 'production Mode initialization marker changed'
-startup = 'pub fn restart(saved_path: &str, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Mode {\n' + source[start:end] + '\n' + initialization + '\n}'
-pathlib.Path(sys.argv[2]).with_name('startup.rs').write_text(startup)
+start = source.index('\nfn read_saved(')
+end = source.index('\nfn checked_directory(', start)
+pathlib.Path(sys.argv[2]).with_name('startup.rs').write_text(source[start:end])
 PY
 run_trace() {
     : > "$work/tlc.log"
