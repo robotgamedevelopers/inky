@@ -1013,8 +1013,10 @@ mod tests {
         rows.push(snapshot(&live, &seq_of, "pin", &req_abstract, 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
         rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
-        assert!(live.release_start(child));
-        rows.push(snapshot(&live, &seq_of, "release", &req_abstract, 0, 0, &[], false));
+        // only the child held now: the clamped result is position 0,
+        // where a shallowest-start bug would still answer the child
+        assert!(live.release_start(root));
+        rows.push(snapshot(&live, &seq_of, "release", &[1, 2], 0, 0, &[], false));
         live.unpin(child).unwrap();
         rows.push(snapshot(&live, &seq_of, "unpin", &req_abstract, 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
