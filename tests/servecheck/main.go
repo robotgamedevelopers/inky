@@ -144,7 +144,11 @@ func execute() error {
 	g := gate{key: "local-gate-test", sabotage: sabotage}
 	bin, model := os.Args[1], os.Args[2]
 	g.run("lane limit checked before model load", func() error { return checkLaneRange(ctx, bin, dir) })
-	if err = g.server(ctx, bin, model, dir, 1, func() { g.validation(); g.cancelJobs() }); err != nil {
+	if err = g.server(ctx, bin, model, dir, 1, func() {
+		g.validation()
+		g.cancelJobs()
+		g.run("follow-up after window overwrite matches cold generation", g.overwrittenWindow)
+	}); err != nil {
 		return err
 	}
 	if err = g.server(ctx, bin, model, dir, 2, func() { g.replies(); g.queueJobs() }); err != nil {

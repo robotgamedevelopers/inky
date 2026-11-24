@@ -241,24 +241,24 @@ if [[ -s $client_out ]]; then
     done <"$client_out"
 fi
 
-http_5xx=${rec[http_5xx]:-}
 inflight_end=${rec[inflight_end]:-}
-probe_status=${rec[probe_status]:-}
-http_401=${rec[http_401]:-}
-transport_errors=${rec[transport_errors]:-}
-timeouts=${rec[timeouts]:-}
+server_active_lanes_end=${rec[server_active_lanes_end]:-}
+server_inflight_end=${rec[server_inflight_end]:-}
+server_health_ok=${rec[server_health_ok]:-}
+recovery_completed=${rec[recovery_completed]:-}
+recovery_requested=${rec[recovery_requested]:-}
+workload_completed=${rec[workload_completed]:-}
 
-lane_ok=0
-if [[ $inflight_end == 0 && $probe_status == 200 ]]; then
-    lane_ok=1
+recovery_ok=0
+if [[ $inflight_end == 0 && $server_health_ok == 1 && $server_active_lanes_end == 0 && $server_inflight_end == 0 && $recovery_completed == "$lanes" && $recovery_requested == "$lanes" ]]; then
+    recovery_ok=1
 fi
-five_ok=0
-if [[ -s $client_out && $http_5xx == 0 && $http_401 == 0 && $transport_errors == 0 && $timeouts == 0 ]]; then
-    five_ok=1
+client_ok=0
+if (( client_ec == 0 )); then
+    client_ok=1
 fi
-
-print -r -- "check_lane_leak=$lane_ok inflight_end=${inflight_end:-missing} probe_status=${probe_status:-missing} source=client_outstanding_no_server_stats_route"
-print -r -- "check_no_5xx=$five_ok http_5xx=${http_5xx:-missing} http_401=${http_401:-missing} transport_errors=${transport_errors:-missing} timeouts=${timeouts:-missing}"
+print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} server_active_lanes_end=${server_active_lanes_end:-missing} server_inflight_end=${server_inflight_end:-missing} source=server_health_and_client_outstanding"
+print -r -- "check_client=$client_ok workload_completed=${workload_completed:-missing} client_exit=$client_ec"
 print -r -- "check_wired_limit=$wired_restored before=$wired_before after=${wired_after:-unread}"
 print -r -- "prompt_lengths=short:${rec[prompt_short_bytes]:-64}B medium:${rec[prompt_medium_bytes]:-1024}B long:${rec[prompt_long_bytes]:-4096}B"
 print -r -- "max_tokens=${rec[max_tokens]:-16,64,256}"
@@ -266,7 +266,7 @@ print -r -- "requests=${rec[requests]:-0} http_200=${rec[http_200]:-0} http_429=
 print -r -- "effort_default=$effort_note temperature=0 stream=true"
 
 exit_code=0
-if (( lane_ok == 0 || five_ok == 0 || wired_restored == 0 )); then
+if (( recovery_ok == 0 || client_ok == 0 || wired_restored == 0 )); then
     exit_code=1
     print -r -- "serve_log=$log"
 else

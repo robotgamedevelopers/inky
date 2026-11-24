@@ -1,8 +1,8 @@
 # Lanes: design
 
-Status: design, 2026-11-22. Nothing here is built. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
+Status (2026-11-24): Layers 1–2 (multi-lane Metal engine) and `inky serve` (OpenAI Chat Completions + Anthropic Messages HTTP server, ahead of the block cache) are built and running in CI; Layer 3 (pooled 64-token block tree and start-point restore) is in progress. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
 
-One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
+One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` builds and serves the multi-lane engine (`inky serve`), while the historical branch `tracer-serve` held the initial one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
 
 ## What is measured (M5 Max, 128 GB, 2026-11-22)
 
@@ -85,9 +85,9 @@ Decode steps (`encode_decode`): row-wise work through the tensor path, each lane
 | 16K | 79 | 64 | 389 | 4.9x |
 | 64K | 53 | 27 | 150 | 2.9x |
 | 128K | 33 | 14 | 78 | 2.4x |
-| 256K | 21 | 7 | 40 | 1.9x |
+| ≈256K | 21 | 7 | 40 | 1.9x |
 
-(16K and up from `inky maxctx` on real code, 60 GB for lanes.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to 256K runs at 875 tok/s: 214 s to the first token at 256K.
+(16K and up from `inky maxctx` on real code, 60 GB for lanes. The built-in long checkpoint is 262,000 tokens and the current context limit is 262,080.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to about 256K runs at 875 tok/s: 214 s to the first token at about 256K.
 
 **Four cards at once through `inky serve`** (8 lanes, 131K context per lane), the tracer card four times: all four landed the same two-line fix as the merged change. 208 requests, 10.6 M prompt tokens of which 97% came from the lanes' kept prompts, 314 K prefilled, 53 K generated, largest prompt 97 K.
 
@@ -103,13 +103,16 @@ Tried and reverted: decode-step experts with the decode path's f32 dot products 
 6. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
 7. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
 8. **The Mac only generates tokens.** Harness and tools run on other machines and reach it over a private network.
+9. **Release builds abort on panic (`[profile.release] panic = "abort"`).** Raw-pointer GPU arenas cannot safely continue or unwind after a thread panic in release builds; recoverable parse and input boundaries (such as GGUF loading and CLI validation) return `Result` errors before touching GPU state.
 
 ## Blocks
 
 A block holds the cache for 64 consecutive positions. Two kinds, because the model has two kinds of attention:
 
-- **window block**: the 40 sliding-window layer passes, 10 MiB.
-- **full block**: the 8 full-attention layer passes, 2 MiB.
+- **window block**: the 40 sliding-window layer passes, 10 MiB at fp16.
+- **full block**: the 8 full-attention layer passes, 2 MiB at fp16.
+
+**Inside a block.** The bytes are `[pass][K|V][head][position in the block][HD]`, each element `kvb` bytes: 2 for the fp16 cache, 1 for `--kv8`. A head's 64 keys are contiguous. At `kvb = 2` those sizes are the 10 MiB and 2 MiB above; at `kvb = 1` each block is half that. The address takes the pass, K or V, and the head. It is not the slot base plus the position times `stride / 64`. That step is position-major across every pass, K, V and head, and for window slot 1 at position 1 it lands on pass 0, V, head 2, position 0.
 
 A block is written by exactly one lane, then sealed, then never written again. Sharing is a reference count; because blocks are append-only there is no copy-on-write. The cache for position p depends only on tokens 0..p, so two requests with the same first N tokens share the same blocks exactly.
 
@@ -146,6 +149,8 @@ Liveness: every admitted lane finishes or is cancelled; every queued request is 
 
 **BlockLayout.** The pool and table arithmetic at capacity 3 or 4: slot reuse with generation counters, the window's sliding over the block list, the table's indexing with 64-bit offsets. One reversed witness per bug class: a reused slot read through a stale entry; a window off by one block; a span of 512 tokens pinning 17 window blocks instead of 25; a start point whose window blocks were released.
 
+**InBlock.** The bytes inside one slot, at 3 heads and 4 positions: `[pass][K|V][head][position][HD]`, with the element width a constant (`kvb` 2, and again at 1). The action walks those coordinates and stores an address by inlining the arithmetic, then records that address. `Ordered` compares it to a formula the action does not call. `Inside` says the row stays in the slot. `NoCollision` says the recorded addresses are unique. `InBlockTrace` is the behaviour `inky inblock-trace` writes from `key_row_at` at those bounds, and CI regenerates it before TLC.
+
 The engine's random walk emits traces, and TLC checks in CI that each is a behaviour of the model: that binds the code to the safety properties. Liveness is the model's, checked by TLC.
 
 ## Inky mode: memory in, memory out
@@ -153,6 +158,7 @@ The engine's random walk emits traces, and TLC checks in CI that each is a behav
 The Mac goes in and out of inky mode. Starting inky gives the GPU the memory it needs; stopping inky gives it back.
 
 - **A one-time install, by the owner:** `sudo inky tune-memory` installs a small root LaunchDaemon. It does two things only: raise the GPU's wired-memory limit (`iogpu.wired_limit_mb`) and put it back. It accepts no other setting and runs nothing else. `sudo inky tune-memory --undo` removes it.
+- **Upgrading an existing helper:** run `sudo inky tune-memory` using the upgraded binary, then restart your Inky processes with that binary. The installer retires the old socket in `/var/run/inky`. The upgraded binary uses `/private/var/db/inky/memd.sock`, so the helper and clients need to be upgraded together.
 - **Entering:** inky connects to the helper over a Unix socket only the owner's user can open. The helper records the limit it finds and raises it to a value sized from the Mac's memory (118000 MB on 128 GB, leaving about 13 GB for macOS).
 - **Leaving:** when inky's connection closes, the helper restores exactly the limit it found. A clean exit, a crash, `kill -9` or a sleep all close the connection, so the memory is always given back. With several inky processes, the limit is held while any is connected.
 - **In the sprint,** nova-worker drives it: it starts inky when it brings local lanes up, and stops it when it stops serving them, so the laptop goes into inky mode for sprint work and out of it afterwards.

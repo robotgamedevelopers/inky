@@ -15,28 +15,30 @@ cd "${0:A:h}/.."
 B=./target/release/inky
 REF=${INKY_REF:-$HOME/inky-ci/ref}
 fail=0
-agree() {  # name, env, ref
+agree() {  # name, ref, expected positions, env...
+    local name=$1 ref=$2 expected=$3
+    shift 3
     local out
-    if ! out=$(env "$2" "$B" check --ref "$REF/$3" -c 4096 2>&1); then
+    if ! out=$(env -u INK_PF -u INK_DEC "$@" "$B" check --ref "$REF/$ref" -c 4096 2>&1); then
         print -r -- "$out"
-        echo "FAIL: $1"
+        echo "FAIL: $name"
         fail=1
         return
     fi
-    print -r -- "$out" | awk -v name="$1" '
+    print -r -- "$out" | awk -v name="$name" -v expected="$expected" '
         /^argmax agreement / {
             print name ": " $0
             seen++
             split($3, a, "/")
-            if (NF != 6 || $3 !~ /^[0-9]+\/[0-9]+$/ || a[2]+0 == 0 || a[1]+0 != a[2]+0 ||
+            if (NF != 6 || $3 !~ /^[0-9]+\/[0-9]+$/ || a[1]+0 != expected || a[2]+0 != expected ||
                 $4 != "worst" || $5 != "KL" || $6 !~ /^[0-9]+([.][0-9]+)?$/ || $6+0 > 0.01) bad=1
         }
         END { exit (seen != 1 || bad) }
-    ' || { echo "FAIL: $1"; fail=1; }
+    ' || { echo "FAIL: $name (expected $expected agreeing positions)"; fail=1; }
 }
-agree "decode, short prompt vs llama.cpp " "INK_PF=0" short
-agree "prefill, long prompt vs llama.cpp " "INK_PF=2380" long
-agree "decode steps, short prompt vs llama.cpp " "INK_DEC=1" short
+agree "decode, short prompt vs llama.cpp" short 58
+agree "prefill, long prompt vs llama.cpp" long 24 INK_PF=2380
+agree "decode steps, short prompt vs llama.cpp" short 58 INK_DEC=1
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
 INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
@@ -52,12 +54,40 @@ $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | gre
 pg_out=$(INK_POOLGATE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pg_rc=0 || pg_rc=$?
 if [ "$pg_rc" = 1 ] && printf '%s\n' "$pg_out" | grep -q 'POOL GATE DIFFERS'; then echo "poolgate sabotage: detected, as required"; else echo "FAIL: poolgate sabotage not detected (exit $pg_rc)"; fail=1; fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
+zero_out=$(mktemp)
+if zero_stats=$($B run -c 128 --raw -n 0 -p 'Once upon a time' 2>&1 > "$zero_out") &&
+   [[ ! -s "$zero_out" && "$zero_stats" == *'generated 0 tok @ 0.00 tok/s'* ]]; then
+    echo "zero generation budget: no tokens emitted or counted"
+else
+    print -r -- "$zero_stats"
+    echo "FAIL: zero generation budget"
+    fail=1
+fi
+rm -f "$zero_out"
+
+chat_args=(chat -c 128 -n 1 --greedy --effort xhigh --system 'Answer concisely in Spanish.')
+short='What color is the sky?'
+long=$(printf 'oversized %.0s' {1..256})
+prompt_count() { sed -nE 's/.*\[([0-9]+) prompt tok @.*/\1/p'; }
+if fresh=$(printf '%s\n' "$short" | $B "${chat_args[@]}" 2>&1) &&
+   retried=$(printf '%s\n' "$long" "$short" | $B "${chat_args[@]}" 2>&1) &&
+   [[ "$retried" == *'[context full: /reset]'* ]] &&
+   [[ -n $(print -r -- "$fresh" | prompt_count) &&
+      $(print -r -- "$fresh" | prompt_count) == $(print -r -- "$retried" | prompt_count) ]]; then
+    echo "first chat turn: oversized input preserves the retry's system prompt and effort"
+else
+    print -r -- "$fresh" "$retried"
+    echo "FAIL: first chat turn after oversized input"
+    fail=1
+fi
+
 chip=$(sysctl -n machdep.cpu.brand_string | sed 's/Apple //; s/ /-/g' | tr A-Z a-z)
 if [ -f tests/golden-$chip.txt ]; then
     tests/golden.sh $B > /tmp/inky-golden.$$ 2>&1
     if diff tests/golden-$chip.txt /tmp/inky-golden.$$; then echo "golden: identical to tests/golden-$chip.txt"; else echo "FAIL: golden hashes changed"; fail=1; fi
     rm -f /tmp/inky-golden.$$
 else
-    echo "golden: no tests/golden-$chip.txt for this chip, skipped"
+    echo "FAIL: missing tests/golden-$chip.txt for this chip"
+    fail=1
 fi
 exit $fail

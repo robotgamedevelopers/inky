@@ -14,16 +14,19 @@
 //!    `Lane::block_table`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, kind, slot)` over that kind's GPU buffer. `Layer2` implements it with lane k's window
+//!    `slot_region(base, len, pool, slot)` over that kind's GPU buffer, at the pool's width. `Layer2` implements it with lane k's window
 //!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
-use crate::blocks::{byte_offset, BlockIndex, BlockKind, BlockTable, Slot};
-use crate::engine::{Engine, Lane, Span};
+use crate::blockbook::{EVERY, HEAD, PROMPT};
+use crate::blocks::{BlockEntry, BlockIndex, BlockKind, BlockTable, Slot, BLOCK, WINDOW};
+use crate::engine::{Engine, Lane, Span, EXT};
+use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, SealedId};
 use objc2_metal::MTLCommandBuffer;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 /// A lane's handle, chosen by the path that made it.
 pub type LaneId = usize;
@@ -78,14 +81,15 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     v
 }
 
-/// The bytes of `slot` in a kind's pool buffer at `base` of `len` bytes: `kind.stride()` bytes at `byte_offset`.
+/// The bytes of `slot` in `pool`'s buffer at `base` of `len` bytes, at the pool's element width.
 /// None when the slot does not fit in the buffer.
 #[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
-pub fn slot_region(base: *mut u8, len: usize, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
-    let off = byte_offset(kind, slot).ok()?;
-    let end = off.checked_add(kind.stride())?;
+pub fn slot_region(base: *mut u8, len: usize, pool: &crate::blocks::BlockPool, slot: Slot) -> Option<(*mut u8, usize)> {
+    let stride = pool.kind().stride_bytes(pool.kvb()).ok()?;
+    let off = pool.offset(slot).ok()?;
+    let end = off.checked_add(stride)?;
     if end > len as u64 { return None; }
-    Some((unsafe { base.add(off as usize) }, kind.stride() as usize))
+    Some((unsafe { base.add(off as usize) }, stride as usize))
 }
 
 /// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
@@ -293,6 +297,7 @@ impl<'a> Layer2<'a> {
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
     }
+    #[allow(dead_code)]
     pub fn candidate_label(&self) -> &'static str {
         "Layer2 self-check (BlockPools candidate not yet wired)"
     }
@@ -337,6 +342,641 @@ impl PoisonPool for Layer2<'_> {
         self.run(|v| v[i].as_ref().map(|l| self.eng.lane_regions(l)[if kind == BlockKind::Window { 0 } else { 1 }]))
     }
     fn absent_ok(&self, _: BlockKind, slot: Slot) -> bool { self.run(|v| v[slot.pool_index().get() as usize].is_none()) }
+}
+
+/// Statistics collected during a `Layer3Pool` run (for gate receipts and diagnostics).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct L3Stats {
+    pub slots_taken: usize,
+    pub slots_reused: usize,
+    pub blocks_sealed: usize,
+    pub shared_dedups: usize,
+    pub start_points_saved: usize,
+    pub start_matches: usize,
+    pub window_pruned: usize,
+    pub tails_dropped: usize,
+}
+
+struct RetainedStart {
+    pos: usize,
+    cs: Vec<u8>,
+    reasons: u8,
+    entries: Vec<(BlockKind, BlockIndex, BlockEntry)>,
+}
+
+struct L3Lane {
+    lane: Lane,
+    tokens: Vec<u32>,
+    prompt_len: usize,
+    written: usize,
+    sealed: Vec<SealedId>,
+    head_start: Option<SealedId>,
+}
+
+/// Layer 3 block-cache candidate: contiguous GPU `BlockPools` per kind (`Window`, `Full`),
+/// per-lane 64-bit `BlockTable`, sealed 64-token `PrefixTree` (`EntryTree`), and start points
+/// (recurrent state + full blocks + preceding 1024-token window blocks).
+pub struct Layer3Pool<'a> {
+    eng: &'a Engine,
+    lanes: RefCell<Vec<Option<L3Lane>>>,
+    tree: RefCell<EntryTree>,
+    starts: RefCell<HashMap<SealedId, RetainedStart>>,
+    keep_persistent_starts: bool,
+    rows: Cell<(usize, bool)>,
+    stats: RefCell<L3Stats>,
+}
+
+impl<'a> Layer3Pool<'a> {
+    /// Candidate for `poolgate::poisoned`: every slot not referenced by a live lane is poisoned
+    /// before each step, so finished lanes release all their refs back to the pool for reuse + zeroing.
+    pub fn new(eng: &'a Engine, max_lanes: usize) -> Layer3Pool<'a> {
+        Self::create(eng, max_lanes, false)
+    }
+
+    /// Persistent start-point mode: `PROMPT` and `EVERY` (every 16 blocks) start points outlive
+    /// finished lanes so subsequent requests match the deepest start point in `PrefixTree`.
+    pub fn with_persistent_starts(eng: &'a Engine, max_lanes: usize) -> Layer3Pool<'a> {
+        Self::create(eng, max_lanes, true)
+    }
+
+    fn create(eng: &'a Engine, max_lanes: usize, keep_persistent_starts: bool) -> Layer3Pool<'a> {
+        eng.ensure_batch(eng.chunk);
+        eng.ensure_dbatch(max_lanes);
+        {
+            let mut pools = eng.block_pool().borrow_mut();
+            for kind in KINDS {
+                let pool = pools.of_mut(kind);
+                if pool.len() < 4 {
+                    pool.grow_by(4 - pool.len()).expect("initial Layer 3 pool growth");
+                }
+            }
+        }
+        let p = Layer3Pool {
+            eng,
+            lanes: RefCell::new(Vec::new()),
+            tree: RefCell::new(EntryTree::new()),
+            starts: RefCell::new(HashMap::new()),
+            keep_persistent_starts,
+            rows: Cell::new((0, false)),
+            stats: RefCell::new(L3Stats::default()),
+        };
+        p.poison_free_slots();
+        p
+    }
+
+    #[allow(dead_code)]
+    pub fn candidate_label(&self) -> &'static str {
+        "Layer3 BlockPool + BlockTable + PrefixTree"
+    }
+
+    pub fn stats(&self) -> L3Stats { *self.stats.borrow() }
+
+    /// Overwrite every unreferenced (`refs == 0`) slot in both GPU pools with `POISON`
+    /// so any unzeroed reuse or out-of-bounds read immediately produces NaN logits.
+    pub fn poison_free_slots(&self) -> usize {
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let mut count = 0usize;
+        for kind in KINDS {
+            let pool = pools.of_mut(kind);
+            for i in 0..pool.len() {
+                let slot = slot_at(i);
+                if pool.record(slot).unwrap().refs() == 0 {
+                    poison_bytes(pool.slot_bytes_mut(slot).unwrap());
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Create a lane matched against the deepest live start point in `PrefixTree`.
+    /// Returns `(lane_id, matched_pos)` where `matched_pos < toks.len()` is a multiple of 64 (or 0).
+    pub fn new_lane_matched(&self, toks: &[u32], cap: usize) -> (LaneId, usize) {
+        assert!(!toks.is_empty(), "prompt cannot be empty");
+        let lane = Lane::new_blocked(self.eng, cap.max(toks.len() + 1));
+        self.eng.on(&lane).set_tokens(0, toks);
+        // Clamp to toks.len() - 1 so at least one token remains to prefill and produce prompt-end logits.
+        let search = &toks[..toks.len() - 1];
+        let matched = self.tree.borrow().deepest_start(search);
+        let mut written = 0usize;
+        let mut sealed = Vec::new();
+        if matched.at > 0 {
+            if let Some(sid) = matched.start {
+                let start_opt = self.starts.borrow().get(&sid).map(|s| (s.pos, s.cs.clone(), s.entries.clone()));
+                if let Some((pos, cs, entries)) = start_opt {
+                    assert_eq!(pos, matched.at);
+                    let mut pools = self.eng.block_pool().borrow_mut();
+                    let all_live = entries.iter().all(|&(kind, _, e)| {
+                        pools.of(kind).record(e.slot()).ok().is_some_and(|r| {
+                            r.generation() == e.generation() && r.sealed() && r.refs() > 0
+                        })
+                    });
+                    if all_live {
+                        {
+                            let mut tbl = lane.block_table().borrow_mut();
+                            for &(kind, bi, e) in &entries {
+                                tbl.fill(pools.of_mut(kind), bi, e.slot(), e.generation())
+                                    .expect("install start-point block");
+                            }
+                        }
+                        self.eng.on(&lane).set_cs(&cs);
+                        written = matched.at;
+                        sealed = matched.ids;
+                        self.stats.borrow_mut().start_matches += 1;
+                    }
+                }
+            }
+        }
+        let mut v = self.lanes.borrow_mut();
+        v.push(Some(L3Lane {
+            lane,
+            tokens: toks.to_vec(),
+            prompt_len: toks.len(),
+            written,
+            sealed,
+            head_start: None,
+        }));
+        (v.len() - 1, written)
+    }
+
+    fn take_zeroed_slot(&self, kind: BlockKind) -> (Slot, u32) {
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let pool = pools.of_mut(kind);
+        let slot = match pool.lowest_free() {
+            Some(s) => s,
+            None => {
+                let s = pool.grow().expect("grow Layer 3 block pool");
+                // Pre-poison freshly grown slot before `take` zeroes it so `take` always wipes poison.
+                poison_bytes(pool.slot_bytes_mut(s).expect("fresh slot bytes"));
+                s
+            }
+        };
+        let _ = pool.take(slot).expect("take zeroed slot");
+        let gen = pool.record(slot).unwrap().generation();
+        let mut st = self.stats.borrow_mut();
+        st.slots_taken += 1;
+        if gen > 1 { st.slots_reused += 1; }
+        (slot, gen)
+    }
+
+    fn ensure_span_blocks(&self, l3: &mut L3Lane, p0: usize, t: usize) {
+        let lo_blk = p0 / BLOCK;
+        let hi_blk = (p0 + t - 1) / BLOCK;
+        for b in lo_blk..=hi_blk {
+            let bi = BlockIndex::new(b as u32);
+            for kind in KINDS {
+                let existing = l3.lane.block_table().borrow().get(kind, bi).expect("block in table range");
+                if let Some(entry) = existing {
+                    let pools = self.eng.block_pool().borrow();
+                    let rec = pools.of(kind).record(entry.slot()).expect("existing slot record");
+                    assert_eq!(rec.generation(), entry.generation(), "stale entry in active lane table");
+                    assert!(!rec.sealed(), "attempt to write into sealed {kind:?} block {b}");
+                } else {
+                    let (slot, gen) = self.take_zeroed_slot(kind);
+                    let mut pools = self.eng.block_pool().borrow_mut();
+                    l3.lane.block_table().borrow_mut()
+                        .fill(pools.of_mut(kind), bi, slot, gen)
+                        .expect("fill newly taken slot");
+                }
+            }
+        }
+    }
+
+    fn drop_start_reason(&self, sid: SealedId, reason: u8) {
+        let mut remove_entries = None;
+        {
+            let mut starts = self.starts.borrow_mut();
+            if let Some(st) = starts.get_mut(&sid) {
+                st.reasons &= !reason;
+                if st.reasons == 0 {
+                    remove_entries = starts.remove(&sid).map(|s| s.entries);
+                }
+            }
+        }
+        if let Some(entries) = remove_entries {
+            let _ = self.tree.borrow_mut().release_start(sid);
+            let mut pools = self.eng.block_pool().borrow_mut();
+            for (kind, _, e) in entries {
+                let pool = pools.of_mut(kind);
+                if let Ok(rec) = pool.record(e.slot()) {
+                    if rec.generation() == e.generation() && rec.refs() > 0 {
+                        pool.record_mut(e.slot()).unwrap().drop_ref().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn prune_expired_window(&self, l3: &mut L3Lane, next_pos: usize) {
+        let min_win_blk = next_pos.saturating_sub(EXT - 1) / BLOCK;
+        if min_win_blk == 0 { return; }
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let mut tbl = l3.lane.block_table().borrow_mut();
+        for b in 0..min_win_blk {
+            let bi = BlockIndex::new(b as u32);
+            if tbl.get(BlockKind::Window, bi).expect("window block in range").is_some() {
+                tbl.clear_kind_entry(&mut pools.window, bi).expect("prune expired window block");
+                self.stats.borrow_mut().window_pruned += 1;
+            }
+        }
+    }
+
+    fn finish_prefill_span(&self, l3: &mut L3Lane, p0: usize, t: usize) {
+        let end = p0 + t;
+        l3.written = end;
+        let lo_blk = p0 / BLOCK;
+        let hi_blk = (end - 1) / BLOCK;
+        for b in lo_blk..=hi_blk {
+            let bi = BlockIndex::new(b as u32);
+            let block_len = (end - b * BLOCK).min(BLOCK) as u32;
+            let (full_e, win_e) = {
+                let tbl = l3.lane.block_table().borrow();
+                (
+                    tbl.get(BlockKind::Full, bi).unwrap().expect("full entry"),
+                    tbl.get(BlockKind::Window, bi).unwrap().expect("window entry"),
+                )
+            };
+            {
+                let mut pools = self.eng.block_pool().borrow_mut();
+                for (kind, e) in [(BlockKind::Full, full_e), (BlockKind::Window, win_e)] {
+                    let rec = pools.of_mut(kind).record_mut(e.slot()).unwrap();
+                    rec.set_length(block_len).expect("set block length");
+                    if block_len == BLOCK as u32 { rec.seal(); }
+                }
+            }
+            if block_len == BLOCK as u32 {
+                self.stats.borrow_mut().blocks_sealed += 1;
+                if b == 0 || l3.sealed.len() == b {
+                    let parent = if b == 0 { None } else { l3.sealed.get(b - 1).copied() };
+                    let blk_toks = &l3.tokens[b * BLOCK..(b + 1) * BLOCK];
+                    let handles = BlockHandles::new(full_e, Some(win_e));
+                    let mut id = self.tree.borrow_mut()
+                        .insert(parent, b * BLOCK, blk_toks, handles)
+                        .expect("insert sealed block into PrefixTree");
+                    let canon = self.tree.borrow().handle(id).expect("inserted handle");
+                    let canon_f = canon.full();
+                    let canon_w = canon.window().expect("window handle on sealed block");
+                    if canon_f != full_e || canon_w != win_e {
+                        // Another lane already sealed these exact 64 tokens. Reuse its slots if both
+                        // are still live and referenced (so poolgate either protected or saved them).
+                        let can_share = {
+                            let pools = self.eng.block_pool().borrow();
+                            let ok = |kind: BlockKind, e: BlockEntry| {
+                                pools.of(kind).record(e.slot()).ok().is_some_and(|r| {
+                                    r.generation() == e.generation() && r.sealed() && r.refs() > 0
+                                })
+                            };
+                            ok(BlockKind::Full, canon_f) && ok(BlockKind::Window, canon_w)
+                        };
+                        if can_share {
+                            let mut pools = self.eng.block_pool().borrow_mut();
+                            let mut tbl = l3.lane.block_table().borrow_mut();
+                            tbl.fill(&mut pools.full, bi, canon_f.slot(), canon_f.generation())
+                                .expect("share canonical full block");
+                            tbl.fill(&mut pools.window, bi, canon_w.slot(), canon_w.generation())
+                                .expect("share canonical window block");
+                            self.stats.borrow_mut().shared_dedups += 1;
+                        } else {
+                            // Stale or unreferenced cached node: evict it and publish our live sealed slots.
+                            let _ = self.tree.borrow_mut().remove(id);
+                            id = self.tree.borrow_mut()
+                                .insert(parent, b * BLOCK, blk_toks, handles)
+                                .expect("re-insert fresh sealed block");
+                        }
+                    }
+                    if l3.sealed.len() == b { l3.sealed.push(id); } else { l3.sealed[b] = id; }
+                }
+            }
+        }
+        // Keep start points at prompt end, every 16th block, and lane head (when persistent starts enabled).
+        if self.keep_persistent_starts && end % BLOCK == 0 && l3.sealed.len() == end / BLOCK {
+            let tip = *l3.sealed.last().unwrap();
+            let mut reasons = HEAD;
+            if end == l3.prompt_len { reasons |= PROMPT; }
+            if (end / BLOCK) % 16 == 0 { reasons |= EVERY; }
+            if let Some(old_head) = l3.head_start.take() {
+                if old_head != tip { self.drop_start_reason(old_head, HEAD); }
+            }
+            let exists = self.starts.borrow().contains_key(&tip);
+            if exists {
+                self.starts.borrow_mut().get_mut(&tip).unwrap().reasons |= reasons;
+            } else {
+                let cs = self.eng.on(&l3.lane).get_cs();
+                let tbl = l3.lane.block_table().borrow();
+                let mut entries = Vec::new();
+                for b in 0..(end / BLOCK) {
+                    let bi = BlockIndex::new(b as u32);
+                    let fe = tbl.get(BlockKind::Full, bi).unwrap().expect("start point full block");
+                    entries.push((BlockKind::Full, bi, fe));
+                }
+                let win_lo = end.saturating_sub(WINDOW) / BLOCK;
+                for b in win_lo..(end / BLOCK) {
+                    let bi = BlockIndex::new(b as u32);
+                    let we = tbl.get(BlockKind::Window, bi).unwrap().expect("start point window block");
+                    entries.push((BlockKind::Window, bi, we));
+                }
+                {
+                    let mut pools = self.eng.block_pool().borrow_mut();
+                    for &(kind, _, e) in &entries {
+                        pools.of_mut(kind).record_mut(e.slot()).unwrap().add_ref().expect("retain start point ref");
+                    }
+                }
+                self.tree.borrow_mut().retain_start(tip).expect("retain start in PrefixTree");
+                self.starts.borrow_mut().insert(tip, RetainedStart { pos: end, cs, reasons, entries });
+                self.stats.borrow_mut().start_points_saved += 1;
+            }
+            l3.head_start = Some(tip);
+        }
+        self.prune_expired_window(l3, end);
+    }
+
+    fn finish_decode_span(&self, l3: &mut L3Lane, pos: usize) {
+        let end = pos + 1;
+        l3.written = end;
+        let b = pos / BLOCK;
+        let bi = BlockIndex::new(b as u32);
+        let block_len = (end - b * BLOCK).min(BLOCK) as u32;
+        let tbl = l3.lane.block_table().borrow();
+        let mut pools = self.eng.block_pool().borrow_mut();
+        for kind in KINDS {
+            let e = tbl.get(kind, bi).unwrap().expect("decode block entry");
+            // Decode-written blocks stay private to the lane and are never sealed into PrefixTree.
+            pools.of_mut(kind).record_mut(e.slot()).unwrap().set_length(block_len).expect("set decode length");
+        }
+        drop(tbl);
+        drop(pools);
+        self.prune_expired_window(l3, end);
+    }
+
+    /// Release every remaining lane and retained start point so all pool slots return to `refs == 0`.
+    pub fn shutdown(&self) {
+        let n = self.lanes.borrow().len();
+        for i in 0..n {
+            if self.lanes.borrow()[i].is_some() { self.end_lane(i); }
+        }
+        let sids: Vec<SealedId> = self.starts.borrow().keys().copied().collect();
+        for sid in sids { self.drop_start_reason(sid, PROMPT | EVERY | HEAD); }
+    }
+}
+
+impl Drop for Layer3Pool<'_> {
+    fn drop(&mut self) { self.shutdown(); }
+}
+
+impl StepPath for Layer3Pool<'_> {
+    fn new_lane(&self, toks: &[u32], cap: usize) -> LaneId {
+        let lane = Lane::new_blocked(self.eng, cap.max(toks.len() + 1));
+        self.eng.on(&lane).set_tokens(0, toks);
+        let mut v = self.lanes.borrow_mut();
+        v.push(Some(L3Lane {
+            lane,
+            tokens: toks.to_vec(),
+            prompt_len: toks.len(),
+            written: 0,
+            sealed: Vec::new(),
+            head_start: None,
+        }));
+        v.len() - 1
+    }
+
+    fn set_token(&self, lane: LaneId, pos: usize, tok: u32) {
+        let mut v = self.lanes.borrow_mut();
+        let l3 = v[lane].as_mut().expect("live lane");
+        self.eng.on(&l3.lane).set_tokens(pos, &[tok]);
+        if pos >= l3.tokens.len() { l3.tokens.resize(pos + 1, 0); }
+        l3.tokens[pos] = tok;
+    }
+
+    fn prefill(&self, spans: &[(LaneId, usize, usize)]) {
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, p0, t) in spans {
+                self.ensure_span_blocks(v[l].as_mut().expect("live lane"), p0, t);
+            }
+        }
+        {
+            let v = self.lanes.borrow();
+            let sp: Vec<Span> = spans.iter().map(|&(l, p0, t)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t }).collect();
+            let cb = self.eng.gpu.cmd();
+            self.eng.encode_spans(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, p0, t) in spans {
+                self.finish_prefill_span(v[l].as_mut().expect("live lane"), p0, t);
+            }
+        }
+        self.rows.set((spans.len(), false));
+    }
+
+    fn decode(&self, spans: &[(LaneId, usize)]) {
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, pos) in spans {
+                self.ensure_span_blocks(v[l].as_mut().expect("live lane"), pos, 1);
+            }
+        }
+        {
+            let v = self.lanes.borrow();
+            let sp: Vec<Span> = spans.iter().map(|&(l, p0)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t: 1 }).collect();
+            let cb = self.eng.gpu.cmd();
+            self.eng.encode_decode(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, pos) in spans {
+                self.finish_decode_span(v[l].as_mut().expect("live lane"), pos);
+            }
+        }
+        self.rows.set((spans.len(), true));
+    }
+
+    fn logits(&self, row: usize) -> Vec<f32> {
+        let (n, dec) = self.rows.get();
+        assert!(row < n, "logits row {row} of a step of {n} spans");
+        (if n == 1 && !dec { self.eng.logits() } else { self.eng.span_logits(row) }).to_vec()
+    }
+
+    fn end_lane(&self, lane: LaneId) {
+        let l3 = match self.lanes.borrow_mut()[lane].take() {
+            Some(l) => l,
+            None => return,
+        };
+        if let Some(head) = l3.head_start {
+            self.drop_start_reason(head, HEAD);
+        }
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let unsealed_tails = {
+            let tbl = l3.lane.block_table().borrow();
+            tbl.entries().filter(|(_, e)| {
+                pools.of(e.kind()).record(e.slot()).ok().is_some_and(|r| !r.sealed())
+            }).count()
+        };
+        self.stats.borrow_mut().tails_dropped += unsealed_tails;
+        l3.lane.block_table().borrow_mut().clear_entries(&mut pools).expect("clear lane block table");
+    }
+}
+
+impl PoisonPool for Layer3Pool<'_> {
+    fn slot_count(&self, kind: BlockKind) -> usize {
+        self.eng.block_pool().borrow().of(kind).len()
+    }
+    fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> {
+        let v = self.lanes.borrow();
+        let l3 = v[lane].as_ref().expect("live lane");
+        let slots = table_slots(&l3.lane.block_table().borrow());
+        slots
+    }
+    fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
+        self.eng.block_pool().borrow().of(kind).slot_raw_region(slot)
+    }
+}
+
+/// Verify deepest start-point prefix matching (`PrefixTree`) + recurrent state & window restoration
+/// + sliding-window pruning past 1024 tokens against cold Layer 2, with all free pool slots poisoned.
+pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize) -> Result<String, String> {
+    let run_cold_l2 = |toks: &[u32], ndec: usize| -> Record {
+        let l2 = Layer2::new(eng, 1);
+        let lid = l2.new_lane(toks, toks.len() + ndec + 1);
+        let mut rec = Record::default();
+        let mut p = 0;
+        while p < toks.len() {
+            let c = eng.chunk.min(toks.len() - p);
+            l2.prefill(&[(lid, p, c)]);
+            p += c;
+        }
+        let lg = l2.logits(0);
+        rec.steps.push(fnv(&lg));
+        let mut tok = argmax(&lg);
+        rec.tokens.push(tok);
+        l2.set_token(lid, toks.len(), tok);
+        for d in 0..ndec {
+            let pos = toks.len() + d;
+            l2.decode(&[(lid, pos)]);
+            let lg = l2.logits(0);
+            rec.steps.push(fnv(&lg));
+            tok = argmax(&lg);
+            rec.tokens.push(tok);
+            l2.set_token(lid, pos + 1, tok);
+        }
+        l2.end_lane(lid);
+        rec
+    };
+
+    let run_matched_l3 = |l3: &Layer3Pool, toks: &[u32], expected_match: usize, ndec: usize| -> Result<Record, String> {
+        l3.poison_free_slots();
+        let (lid, matched) = l3.new_lane_matched(toks, toks.len() + ndec + 1);
+        if matched != expected_match {
+            l3.end_lane(lid);
+            return Err(format!("expected prefix start-point match at {expected_match}, got {matched}"));
+        }
+        let mut p = matched;
+        while p < toks.len() {
+            let c = eng.chunk.min(toks.len() - p);
+            l3.prefill(&[(lid, p, c)]);
+            p += c;
+        }
+        let mut rec = Record::default();
+        let lg = l3.logits(0);
+        rec.steps.push(fnv(&lg));
+        let mut tok = argmax(&lg);
+        rec.tokens.push(tok);
+        l3.set_token(lid, toks.len(), tok);
+        for d in 0..ndec {
+            let pos = toks.len() + d;
+            l3.poison_free_slots();
+            l3.decode(&[(lid, pos)]);
+            let lg = l3.logits(0);
+            rec.steps.push(fnv(&lg));
+            tok = argmax(&lg);
+            rec.tokens.push(tok);
+            l3.set_token(lid, pos + 1, tok);
+        }
+        l3.end_lane(lid);
+        Ok(rec)
+    };
+
+    let rot = |k: usize, len: usize| -> Vec<u32> {
+        let mut v = base.to_vec();
+        v.rotate_left(k % base.len());
+        v.truncate(len);
+        v
+    };
+
+    let l3 = Layer3Pool::with_persistent_starts(eng, 2);
+    // 1. Prompt-end start point at 192 tokens (3 full blocks).
+    let head192 = base[..192].to_vec();
+    let (la, m0) = l3.new_lane_matched(&head192, 256);
+    if m0 != 0 { return Err(format!("cold tree matched at {m0}")); }
+    l3.prefill(&[(la, 0, 64)]);
+    l3.prefill(&[(la, 64, 128)]);
+    l3.end_lane(la);
+
+    let mut prompt_b = head192.clone();
+    prompt_b.extend_from_slice(&rot(173, 37));
+    let want_b = run_cold_l2(&prompt_b, 6);
+    let got_b = run_matched_l3(&l3, &prompt_b, 192, 6)?;
+    if want_b != got_b {
+        return Err(format!("prefix-matched 192+37 prompt differs from Layer 2: want {want_b:?} got {got_b:?}"));
+    }
+
+    // 2. Every-16-blocks start point at 1024 AND prompt-end start point at 1152 (past WINDOW=1024).
+    let mut tested_window = false;
+    if ctx >= 1408 && base.len() >= 1408 {
+        tested_window = true;
+        let head1152 = base[..1152].to_vec();
+        let (lc, mc) = l3.new_lane_matched(&head1152, 1280);
+        if mc != 192 {
+            l3.end_lane(lc);
+            return Err(format!("expected 1152 prompt to reuse 192 start point, got {mc}"));
+        }
+        // Step to exact block 16 (1024) so EVERY start point is saved, then to 1152 (PROMPT start point).
+        l3.prefill(&[(lc, 192, 320)]);  // -> 512
+        l3.prefill(&[(lc, 512, 512)]);  // -> 1024 (block 16: EVERY start point!)
+        l3.prefill(&[(lc, 1024, 128)]); // -> 1152 (block 18: PROMPT start point, prunes window 0..2 on lane!)
+        l3.end_lane(lc);
+
+        // Request D diverges after 1024 -> must match the EVERY start point at 1024 (window 0..16 retained!).
+        let mut prompt_d = base[..1024].to_vec();
+        prompt_d.extend_from_slice(&rot(509, 45));
+        let want_d = run_cold_l2(&prompt_d, 4);
+        let got_d = run_matched_l3(&l3, &prompt_d, 1024, 4)?;
+        if want_d != got_d {
+            return Err(format!("EVERY-1024 start-point match differs from Layer 2: want {want_d:?} got {got_d:?}"));
+        }
+
+        // Request E diverges after 1152 -> must match PROMPT start point at 1152 (window 2..18, blocks 0..1 pruned!).
+        let mut prompt_e = base[..1152].to_vec();
+        prompt_e.extend_from_slice(&rot(733, 45));
+        let want_e = run_cold_l2(&prompt_e, 4);
+        let got_e = run_matched_l3(&l3, &prompt_e, 1152, 4)?;
+        if want_e != got_e {
+            return Err(format!("PROMPT-1152 window-pruned start-point match differs from Layer 2: want {want_e:?} got {got_e:?}"));
+        }
+    }
+
+    let st = l3.stats();
+    l3.shutdown();
+    // Verify zero refcount leaks after shutdown.
+    {
+        let pools = eng.block_pool().borrow();
+        for kind in KINDS {
+            let pool = pools.of(kind);
+            for i in 0..pool.len() {
+                let r = pool.record(slot_at(i)).unwrap().refs();
+                if r != 0 { return Err(format!("refcount leak on {kind:?} slot {}: refs={r}", i + 1)); }
+            }
+        }
+    }
+    Ok(format!(
+        "prefix start-point reuse identical to Layer 2 (192{}: matches={}, saved={}, pruned={}, reused={})",
+        if tested_window { ", EVERY@1024, PROMPT@1152" } else { "" },
+        st.start_matches, st.start_points_saved, st.window_pruned, st.slots_reused
+    ))
 }
 
 #[cfg(test)]
@@ -487,12 +1127,19 @@ mod tests {
 
     #[test]
     fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
+        use crate::blocks::BlockPool;
         let base = 0x1000 as *mut u8;
         let len = 2 * crate::blocks::FULL_STRIDE as usize;
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
-        assert_eq!(slot_region(base, len, BlockKind::Full, sl(3)), None);
-        assert_eq!(slot_region(base, len, BlockKind::Window, sl(1)), None);
+        let full = BlockPool::new(BlockKind::Full, 4);
+        let narrow = BlockPool::with_kvb(BlockKind::Full, 4, 1).unwrap();
+        let window = BlockPool::new(BlockKind::Window, 4);
+        assert_eq!(slot_region(base, len, &full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
+        assert_eq!(slot_region(base, len, &full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
+        assert_eq!(slot_region(base, len, &full, sl(3)), None);
+        assert_eq!(slot_region(base, len, &window, sl(1)), None);
+        let half = crate::blocks::FULL_STRIDE as usize / 2;
+        assert_eq!(slot_region(base, 4 * half, &narrow, sl(2)).map(|r| r.1), Some(half));
+        assert!(half < crate::blocks::FULL_STRIDE as usize);
     }
 
     #[test]

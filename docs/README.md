@@ -6,7 +6,7 @@
 
 **The target is the Apple M5 Max MacBook Pro with 128 GB of memory**: inky is tuned and measured on it. The next target is an M5 Ultra Mac Studio. inky needs an M5 or later (Metal 4 and the GPU neural accelerators).
 
-**The model runs exactly as published, lossless.** No change to Inkling 2 Mini: no quantization beyond the GGUF's own weights, no 8-bit cache, no key pruning, no int8 activations. The speed comes from two things only: many lanes in one step, which turns many small operations into a few wide ones, and using everything the hardware offers.
+**The engine adds no further compression to the GGUF.** No quantization beyond the GGUF's own weights (for example, the published `Q4_K_M` weights), no 8-bit cache, no key pruning, no int8 activations. The speed comes from two things only: many lanes in one step, which turns many small operations into a few wide ones, and using everything the hardware offers.
 
 **Give the GPU the memory.** macOS lets the GPU wire about 107.5 GiB of a 128 GB Mac by default. More memory is more lanes at long context, so raise the limit:
 
@@ -31,8 +31,10 @@ The value comes from this machine's tuning (`tunings/`; `m5-max-128gb` sets 1180
 |---:|---:|---:|
 | 16K | 0.7 GiB | 64 or more |
 | 64K | 2.2 GiB | about 40 |
-| 256K | 8.2 GiB | about 10 |
-| 1M | 32 GiB | 2 |
+| 262,080 | 8.2 GiB | about 10 |
+| 1M (capacity projection) | 32 GiB | 2 |
+
+The current GPU addressing limit is 262,080 tokens per lane. Context settings round up to a multiple of 64. Larger contexts, including 262,144 and 1 million tokens, require wider GPU cache offsets.
 
 **Watch for swapping.** Swapping ruins every measurement and slows the whole Mac. Check `vm_stat | grep Swapouts` before and after a run; the count must not grow.
 
@@ -74,16 +76,23 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 |---|---|---|
 | `-m PATH` | LM Studio path above | Model GGUF |
 | `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
-| `--key-env NAME` | unset | Reads the key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
+| `--key-env NAME` | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
+| `--allow-unauthenticated-non-loopback` | off | Explicitly allows a non-loopback listen address without a key. |
 | `--lanes N` | 16 | Concurrent requests |
-| `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens |
+| `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
-| `-n MAX` | 16384 | Default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
+| `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
-Endpoints: `POST /v1/chat/completions`, `GET /v1/models` (model `inkling-2-mini`), `GET /health`. A card's next turn reuses its lane's previous prompt (`usage.prompt_tokens_details.cached_tokens`), so it prefills only what is new. That kept prompt may also start another lane: when the lane holding it is busy, a free lane copies its prefill-written prefix and the prompt-end convolution state and prefills only the suffix (`inky xcopy` gates that the copy is bit-identical to a cold prefill; a partial overlap with a kept prompt still starts cold, because the state exists only at a prompt's end).
+An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.
 
-`GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `http://127.0.0.1:8096/v1` as their base URL, with model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
+An extending request can reuse a lane's previous prompt while its sliding-window history is still in the cache. Decode writes that overwrite that history discard the saved prompt. At prefill completion, another lane can copy the cache and the prompt-end convolution state and prefill only the suffix. `inky xcopy` checks that this copy is bit-identical to cold prefill. Partial overlaps start cold because the convolution state is saved only at the prompt's end.
+
+`GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini`. `POST /v1/messages` supports streaming and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, model `inkling-2-mini` and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
+
+The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. Up to four requests can translate and tokenize prompts concurrently, including `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
+
+Generation prompt rendering stops early once the applicable token limit is exceeded. A prompt token count reported for an early rejection is a lower bound. To get the exact rendered count for a Messages request, use `count_tokens`, which can count past the lane context. A full output buffer pauses its own lane, and a socket write that stalls for five seconds closes the connection and cancels any remaining generation.
 
 Each completed request logs its queue wait (`queue_ms`) and the number of occupied lanes at admission, including its own (`lanes_busy_start`). Prefill and generation times sum the wall time of the engine batches that served the lane. Each participating lane receives the full batch duration. Prefill tokens/s counts newly evaluated prompt tokens. Generation tokens/s counts decode steps; the first output token comes from prefill, so a one-token response has zero decode time and rate.
 
@@ -331,9 +340,7 @@ tools/ref_logits.cpp  llama.cpp reference-logit dumper (validation oracle)
 `inky prof -n POS` / `inky prof_pf -f prompt.txt` attribute GPU time per kernel class (skip-mask method);
 `inky kmoepf -f prompt.txt` times the MoE GEMMs alone on the prompt's real routing, `inky ksg` the tile kernel vs
 threadgroup size and fill, `inky kpeak` / `kmode` the tensor units' ceiling and precision modes, `inky kvdump` dumps the K/V payload, `inky kvscreen` measures how
-concentrated full attention is over its keys, `INK_KVQ=kbits,vbits inky check` simulates a coarser cache; `INK_TIER_MIN=n` / `INK_TIER_HOT=n` make `--kv-disk` start at a smaller context / with tiny rings for tests. `INK_CHUNK=N` caps the prefill batch (default 4096 tokens). If the tensor ops' accumulator layout is not the one the register epilogues expect, the engine
-falls back to a slower tensor path (`INK_NO_HGEMM=1` forces it); `INK_NO_TENSOR=1` uses simdgroup matrices instead of the
-neural accelerators.
+concentrated full attention is over its keys, `INK_KVQ=kbits,vbits inky check` simulates a coarser cache; `INK_TIER_MIN=n` / `INK_TIER_HOT=n` make `--kv-disk` start at a smaller context / with tiny rings for tests. `INK_CHUNK=N` caps the prefill batch. It accepts multiples of 32 from 32 to 4096 and defaults to 4096. If the tensor accumulator layout differs from what the register epilogues expect, the engine falls back to a slower tensor path (`INK_NO_HGEMM=1` forces it). `INK_NO_TENSOR=1` uses simdgroup matrices. Serving requires the fp16 tensor path and enough arena space for its requested lanes. For example, a 128-token context with the default chunk supports up to 64 lanes.
 
 ## Releasing
 

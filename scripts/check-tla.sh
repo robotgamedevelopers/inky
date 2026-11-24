@@ -72,13 +72,68 @@ check_memmode LostSeed SavedIsOwner
 check_memmode StaleSaved RestoredWhenIdle
 check_memmode NoRollback RefusedRollbackSafe
 
+run_tlc_from_zsh_table() {
+    out_dir=$1
+    mkdir -p "$out_dir"
+    awk '
+        /^runs=\(/ { in_runs = 1; next }
+        in_runs && /^\)/ { in_runs = 0; next }
+        in_runs {
+            gsub(/^[ \t]+|[ \t]+$/, "")
+            if ($0 == "" || substr($0, 1, 1) == "#") next
+            gsub(/^"|"$/, "")
+            print
+        }
+    ' "$root/specs/run_tlc.zsh" | while IFS=: read -r spec cfg expected; do
+        [ -n "$spec" ] || continue
+        name=$(basename "$cfg" .cfg)
+        log=$out_dir/$name.log
+        if (cd "$root/specs" && "$java_bin" -Xmx2g -cp "$jar" tlc2.TLC \
+            -noGenerateSpecTE -workers "$TLC_WORKERS" -metadir "$out_dir/$name-states" \
+            -config "$cfg" "$spec") >"$log" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if [ -n "$expected" ]; then
+            if [ "$rc" -eq 0 ] || ! grep -Fq "$expected" "$log"; then
+                cat "$log" >&2
+                echo "BlockLayout $name did not show expected $expected violation (exit $rc)" >&2
+                return 1
+            fi
+            echo "$name: expected $expected violation"
+        else
+            if [ "$rc" -ne 0 ] || grep -q '^Error:' "$log" || \
+                ! grep -Fxq 'Model checking completed. No error has been found.' "$log"; then
+                cat "$log" >&2
+                echo "BlockLayout $name did not pass cleanly (exit $rc)" >&2
+                return 1
+            fi
+            echo "$name: PASS"
+        fi
+    done
+}
+
+# The in-block trace is what key_row_at emits. Regenerate it before TLC,
+# so a change in that function turns the trace check red.
+if [ -f "$root/specs/InBlockTrace.tla" ]; then
+    (cd "$root" && cargo run --quiet --bin inky -- inblock-trace "$root/specs/InBlockTraceData.tla")
+fi
+
 # The layer 3 models land separately. A model without its runner is an error.
 if [ -f "$root/specs/BlockLayout.tla" ]; then
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
-    TLC_OUTPUT=$work/block-layout zsh "$root/specs/run_tlc.zsh" || {
-        find "$work/block-layout" -name '*.log' -exec tail -n 60 {} \; >&2
-        exit 1
-    }
+    if command -v zsh >/dev/null 2>&1; then
+        TLC_OUTPUT=$work/block-layout zsh "$root/specs/run_tlc.zsh" || {
+            find "$work/block-layout" -name '*.log' -exec tail -n 60 {} \; >&2
+            exit 1
+        }
+    else
+        run_tlc_from_zsh_table "$work/block-layout" || {
+            find "$work/block-layout" -name '*.log' -exec tail -n 60 {} \; >&2
+            exit 1
+        }
+    fi
 fi
 if [ -f "$root/specs/CacheScheduler.tla" ]; then
     [ -f "$root/specs/run_cache_scheduler.sh" ] || { echo 'CacheScheduler runner missing' >&2; exit 1; }
@@ -86,7 +141,14 @@ if [ -f "$root/specs/CacheScheduler.tla" ]; then
         find "$work/cache-scheduler" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
     }
+else
+    echo "check-tla: CacheScheduler.tla not present on this branch (layer 3); skipping"
 fi
 
 # Required since PR #23: a missing checker must fail this gate.
 bash "$root/scripts/check-memmode-traces.sh"
+# src/blockbook.rs is bound to specs/StartTails.tla; a missing checker must fail this gate.
+[ -f "$root/scripts/check-blockbook-traces.sh" ] || { echo 'blockbook trace checker missing' >&2; exit 1; }
+bash "$root/scripts/check-blockbook-traces.sh"
+[ -f "$root/scripts/check-cache-traces.sh" ] || { echo 'cache trace checker missing' >&2; exit 1; }
+bash "$root/scripts/check-cache-traces.sh"

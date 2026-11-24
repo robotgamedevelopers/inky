@@ -31,6 +31,23 @@ inline void deq16_q4k(device const uchar * row, uint k0, thread half * out) {
 
 inline void deq16(device const uchar * row, uint wtype, uint k0, thread half * out) {
     if (wtype == 12) { deq16_q4k(row, k0, out); return; }
+    if (wtype == 200) {         // NV4: fp4 * e4m3 scale is exact in half (|w| <= 6 * 448); expert gscale applied later in fp32
+        device const uchar * b = row + (k0 / 32) * 18;
+        const uint hp = (k0 % 32) / 16;
+        const float s = e4m3f(b[hp]) * NV4_K;
+        device const packed_uchar4 * q4 = (device const packed_uchar4 *) (b + 2);
+        thread half4 * o = (thread half4 *) out;
+        for (int i = 0; i < 4; i++) { const uchar4 q = uchar4(q4[i]); o[i] = half4(fp4f4(hp ? q >> 4 : q & 0xF) * s); }
+        return;
+    }
+    if (wtype == 201) {         // MX8: e4m3 * a power of two
+        device const uchar * b = row + (k0 / 32) * 34;
+        const float d = float(*(device const half *) b) * MX8_K;
+        device const packed_uchar4 * q4 = (device const packed_uchar4 *) (b + 2 + (k0 % 32));
+        thread half4 * o = (thread half4 *) out;
+        for (int i = 0; i < 4; i++) o[i] = half4(e4m3f4(uchar4(q4[i])) * d);
+        return;
+    }
     if (wtype == 8) {           // Q8_0: int8 * d. |q| <= 127 is exact in half, so the half product is the correctly rounded w
         device const block_q8_0 * b = (device const block_q8_0 *) row + k0 / 32;
         const half d = b->d;
@@ -170,7 +187,7 @@ struct MoeGemmArgs {
     uint wtype, nrows, K, x_off;
     uint gather, perm_off, tiles_off, ntiles_off;
     uint out_off, ldo, situ, pad;
-    float beta, lbeta, pad2, pad3;
+    float beta, lbeta; uint gs_lo, gs_hi;
 };
 
 kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmArgs & a [[buffer(5)]],
@@ -215,6 +232,11 @@ kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[
     for (int t = 0; t < 4; t++) for (int r = 0; r < 2; r++)
         simdgroup_store(mc[t * 2 + r], sc + (t * 8) * GM_BM + sg * 16 + r * 8, GM_BM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.wtype == 200) {
+        const float g = gscale_at(W, a.gs_lo, a.gs_hi, e);
+        for (uint i = tid; i < GM_BN * GM_BM; i += 128) sc[i] *= g;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (a.situ) {
         for (uint i = tid; i < GM_BN * 32; i += 128) {
             const uint t = i / 32, r = i % 32;
@@ -236,25 +258,7 @@ kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[
 struct TopkBArgs { uint logits_off, bias_off, sel_off, T; float wscale; uint pad0, pad1, pad2; };
 kernel void k_topk_b(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant TopkBArgs & a [[buffer(5)]],
                      uint t [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
-    device const float * lg = A + a.logits_off + t * NEXP;
-    device const float * bias = (device const float *) (PB + a.bias_off);
-    float pr[4], sel[4];
-    for (int i = 0; i < 4; i++) { const int e = lane * 4 + i; pr[i] = sigm(lg[e]); sel[i] = pr[i] + bias[e]; }
-    float wsum = 0, myw = 0; int myid = 0;
-    for (int k = 0; k < TOPK; k++) {
-        float bv = sel[0]; int bi = 0;
-        for (int i = 1; i < 4; i++) if (sel[i] > bv) { bv = sel[i]; bi = i; }
-        const float mv = simd_max(bv);
-        const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
-        const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
-        if (lane == (ushort) k) { myid = win; myw = pw; }
-        wsum += pw;
-    }
-    if (lane < TOPK) {
-        A[a.sel_off + t * 16 + lane] = (float) myid;
-        A[a.sel_off + t * 16 + TOPK + lane] = myw / (wsum + 1e-20f) * a.wscale;
-    }
+    topk_sg(A, PB, a.logits_off + t * NEXP, a.bias_off, a.sel_off + t * 2 * TOPK, a.wscale, lane);
 }
 
 // ---- routing: counting sort of (token, slot) assignments by expert + 32-row tile list. 1 TG x 1024 threads.
@@ -710,6 +714,11 @@ kernel void k_moe_gemm_t(device const uchar * W [[buffer(0)]], device float * A 
     auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(GM_BM, GM_BN));
     cT.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.wtype == 200) {
+        const float g = gscale_at(W, a.gs_lo, a.gs_hi, e);
+        for (uint i = tid; i < GM_BN * GM_BM; i += 128) sc[i] *= g;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (a.situ) {
         for (uint i = tid; i < GM_BN * 32; i += 128) {
             const uint t = i / 32, r = i % 32;
@@ -1217,6 +1226,7 @@ template [[host_name("k_gemm_sg4")]] kernel void k_gemm_sg<4>(device const uchar
 struct MoeGemmHArgs {
     uint w_lo, w_hi, expert_bytes, row_bytes, wtype, nrows, K, xh_off;
     uint tiles_off, ntiles_off, out_off, ldo, situ, aw_off; float beta, lbeta;
+    uint gs_lo, gs_hi, pad0, pad1;
 };
 template <int NSG>
 kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmHArgs & a [[buffer(5)]],
@@ -1251,6 +1261,7 @@ kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[bu
         buf ^= 1;
     }
     if (!on) return;
+    if (a.wtype == 200) { const float g = gscale_at(W, a.gs_lo, a.gs_hi, e); for (short i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] *= g; }
     if (!a.situ) {
         device half * yd = (device half *) (A + a.out_off);
         for (short q = 0; q < 8; ++q) {
@@ -1331,4 +1342,403 @@ kernel void k_layout_sg(device float * A [[buffer(2)]], constant uint & out_off 
         if (cT.is_valid_element(i)) { const auto ix = cT.get_multidimensional_index(i); o[i] = (ix[0] << 16) | ix[1]; } else o[i] = -1;
     }
     o[63] = cT.get_capacity();
+}
+
+// =============================================================================================
+// Layer 3 block-addressed prefill K/V write and causal attention kernels.
+// Identical arithmetic to `k_kvprep_b`, `k_attn_b`, `k_attn_bt`, `k_attn_h`, replacing
+// contiguous cache addressing with 64-bit per-lane block-table lookups (`BT[pos >> 6]`).
+// `a.k_base` carries the pass index within the pool kind (0..40 window, 0..8 full).
+
+kernel void k_kvprep_b_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                           device uchar * KV0 [[buffer(3)]], device float * CS [[buffer(4)]],
+                           constant KvPrepArgs & a [[buffer(5)]], device const ulong * BT [[buffer(8)]],
+                           device uchar * KV1 [[buffer(10)]], device uchar * KV2 [[buffer(11)]], device uchar * KV3 [[buffer(12)]],
+                           uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                           ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4][8];
+    const uint t = tgp.x, g = tgp.y, pos = a.p0 + t;
+    const float tau = a.is_full ? 1.0f + a.log_alpha * log(max(1.0f, float(pos + 1) / a.log_floor)) : 1.0f;
+    device const float * qclip = (device const float *) (PB + a.qclip_w);
+    float q[3];
+    for (int h = 0; h < 3; h++) {
+        const uint H = g * 3 + h, qi = t * (NH * HD) + H * HD + tid;
+        q[h] = ((a.qhalf & 2) ? float(((device const half *) (A + a.q_off))[qi]) : A[a.q_off + qi]) * qclip[H * HD + tid];
+    }
+    const uint c = g * HD + tid;
+    float kv[2];
+    const float scl = a.kdyn_off >= 0 ? (1.0f / 3.0f) : 0.4472135954999579f;
+    for (int which = 0; which < 2; which++) {
+        const uint xo = which == 0 ? a.k_off : a.v_off;
+        device const float * hh = CS + a.cs_off + (which * NKV * HD + c) * 3;
+        device const float * w = (device const float *) (PB + (which == 0 ? a.kconv_w : a.vconv_w)) + c * 4;
+        float x[4];
+        for (int j = 0; j < 4; j++) { const int tt = int(t) - 3 + j; x[j] = tt >= 0 ? A[xo + tt * (NKV * HD) + c] : hh[3 + tt]; }
+        float acc = w[0] * x[0] + w[1] * x[1] + w[2] * x[2] + w[3] * x[3];
+        const int dyn = which == 0 ? a.kdyn_off : a.vdyn_off;
+        if (dyn >= 0) { device const float * tp = A + dyn + t * 32 + g * 4; acc += tp[0] * x[3] + tp[1] * x[2] + tp[2] * x[1] + tp[3] * x[0]; }
+        kv[which] = (x[3] + acc) * scl;
+    }
+    float r = 0;
+    if (tid < 48) {
+        const uint h = tid / 16, i = tid % 16, H = g * 3 + h;
+        r = A[a.r_off + t * (NH * NREL) + H * NREL + i] * ((device const float *) (PB + a.relclip_w))[H * NREL + i];
+    }
+    float rn = r * r;
+    rn += simd_shuffle_xor(rn, 1); rn += simd_shuffle_xor(rn, 2); rn += simd_shuffle_xor(rn, 4); rn += simd_shuffle_xor(rn, 8);
+    {
+        const float s0 = simd_sum(q[0] * q[0]), s1 = simd_sum(q[1] * q[1]), s2 = simd_sum(q[2] * q[2]);
+        const float s3 = simd_sum(kv[0] * kv[0]), s4 = simd_sum(kv[1] * kv[1]);
+        const float s5 = simd_max(fabs(kv[0])), s6 = simd_max(fabs(kv[1]));
+        if (lane == 0) { red[sg][0] = s0; red[sg][1] = s1; red[sg][2] = s2; red[sg][3] = s3; red[sg][4] = s4; red[sg][5] = s5; red[sg][6] = s6; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot[5];
+    for (int i = 0; i < 5; i++) tot[i] = red[0][i] + red[1][i] + red[2][i] + red[3][i];
+    for (int h = 0; h < 3; h++) {
+        const float f = clamp(QK_CLIP / (sqrt(tot[h]) + 1e-6f), 0.0f, 1.0f) * tau * 0.08838834764831845f;
+        if (a.qhalf & 1) ((device half *) (A + a.qp_off))[t * (NH * HD) + (g * 3 + h) * HD + tid] = half(q[h] * f);
+        else A[a.qp_off + t * (NH * HD) + (g * 3 + h) * HD + tid] = q[h] * f;
+    }
+    if (tid < 48) A[a.rp_off + t * (NH * NREL) + (g * 3 + tid / 16) * NREL + tid % 16] = r * clamp(REL_CLIP / (sqrt(rn) + 1e-6f), 0.0f, 1.0f) * tau;
+    const float kf = clamp(QK_CLIP / (sqrt(tot[3]) + 1e-6f), 0.0f, 1.0f), vf = rsqrt(tot[4] / HD + 1e-6f);
+    const float k = kv[0] * kf, v = kv[1] * vf;
+    const uint blk = pos >> 6, ib = pos & KV_BLK_MASK;
+    const ulong koff = ulong(a.k_base) * KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;
+    const ulong voff = koff + KV_PLANE_BYTES;
+    device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
+    device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
+#ifdef KV8
+    const uint ck = kv_code(max(max(red[0][5], red[1][5]), max(red[2][5], red[3][5])) * kf);
+    const uint cv = kv_code(max(max(red[0][6], red[1][6]), max(red[2][6], red[3][6])) * vf);
+    kp[tid] = (kv_t) (int) kv_quant(k, kv_scale(ck), ck, tid);
+    vp[tid] = (kv_t) (int) kv_quant(v, kv_scale(cv), cv, tid);
+#else
+    kp[tid] = half(k);
+    vp[tid] = half(v);
+#endif
+}
+
+kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                         device uchar * KV0 [[buffer(3)]], constant AttnBArgs & a [[buffer(5)]],
+                         device const ulong * BT [[buffer(8)]],
+                         device uchar * KV1 [[buffer(10)]], device uchar * KV2 [[buffer(11)]], device uchar * KV3 [[buffer(12)]],
+                         uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup half qs[AQT * 3][HD];
+    threadgroup half ks[32][HD];
+    threadgroup half vs[32][HD];
+    threadgroup float ss[AQT * 3][33];
+    threadgroup float rs[AQT * 3][NREL];
+    threadgroup float sk[AQT * 3];
+    const uint g = tgp.y, t0 = tgp.x * AQT;
+    const uint nq = min((uint) AQT, a.T - t0);
+    const ulong koff = ulong(a.k_base) * KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;
+    const ulong voff = koff + KV_PLANE_BYTES;
+    for (uint i = tid; i < AQT * 3 * HD; i += 128) {
+        const uint row = i / HD, d = i % HD, tt = row / 3, h = row % 3;
+        qs[row][d] = tt < nq ? half(A[a.qp_off + (t0 + tt) * (NH * HD) + (g * 3 + h) * HD + d]) : half(0);
+    }
+    if (tid < AQT * 3 * 4) {
+        const uint row = tid / 4, part = tid % 4, tt = row / 3, h = row % 3;
+        for (int i = 0; i < 4; i++) rs[row][part * 4 + i] = tt < nq ? A[a.rp_off + (t0 + tt) * (NH * NREL) + (g * 3 + h) * NREL + part * 4 + i] : 0.0f;
+    }
+    if (tid < AQT * 3) { const uint tt = tid / 3, h = tid % 3; sk[tid] = tt < nq ? A[a.sink_off + (t0 + tt) * NH + g * 3 + h] : 0.0f; }
+    device const float * relb = (device const float *) (PB + a.relbias_w);
+    const uint plast = a.p0 + t0 + nq - 1;
+    const uint pfirst = a.p0 + t0;
+    const uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
+    float o[AQT * 3];
+    for (int r = 0; r < AQT * 3; r++) o[r] = 0;
+    float m[AQT * 3], l[AQT * 3];
+    for (int r = 0; r < AQT * 3; r++) { m[r] = 0.0f; l[r] = 1.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kc = kstart; kc <= plast; kc += 32) {
+        const uint nk = min(32u, plast + 1 - kc);
+        for (uint i = tid; i < 32 * HD / 4; i += 128) {
+            const uint j = i / (HD / 4), d4 = i % (HD / 4);
+            const uint p = kc + min(j, nk - 1);
+            device const kv_t * krow = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, p >> 6, koff) + (p & KV_BLK_MASK) * HD;
+            device const kv_t * vrow = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, p >> 6, voff) + (p & KV_BLK_MASK) * HD;
+#ifdef KV8
+            ((threadgroup half4 *) ks[j])[d4] = half4(float4(char4(*(device const packed_char4 *) (krow + d4 * 4))) * kv_vscale(krow));
+            ((threadgroup half4 *) vs[j])[d4] = half4(float4(char4(*(device const packed_char4 *) (vrow + d4 * 4))) * kv_vscale(vrow));
+#else
+            ((threadgroup half4 *) ks[j])[d4] = *(device const half4 *) (krow + d4 * 4);
+            ((threadgroup half4 *) vs[j])[d4] = *(device const half4 *) (vrow + d4 * 4);
+#endif
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < AQT * 3 * 32; i += 128) {
+            const uint row = i / 32, j = i % 32, tt = row / 3;
+            const uint qp = a.p0 + t0 + tt, kp = kc + j;
+            float s = -INFINITY;
+            if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)) {
+                float acc = 0;
+                for (int d4 = 0; d4 < HD / 4; d4++)
+                    acc += dot(float4(((threadgroup const half4 *) qs[row])[d4]), float4(((threadgroup const half4 *) ks[j])[d4]));
+                const uint dist = qp - kp;
+                if (dist < EXT) for (int r = 0; r < NREL; r++) acc += rs[row][r] * relb[dist * NREL + r];
+                s = acc - sk[row];
+            }
+            ss[row][j] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int r = 0; r < AQT * 3; r++) {
+            float mx = m[r];
+            for (uint j = 0; j < nk; j++) mx = max(mx, ss[r][j]);
+            const float f = exp(m[r] - mx);
+            l[r] *= f; o[r] *= f; m[r] = mx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < AQT * 3 * 32; i += 128) { const uint row = i / 32, j = i % 32; ss[row][j] = j < nk ? exp(ss[row][j] - m[row]) : 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int r = 0; r < AQT * 3; r++) {
+            float acc = 0, ls = 0;
+            for (uint j = 0; j < nk; j++) { const float p = ss[r][j]; ls += p; acc += p * float(vs[j][tid]); }
+            l[r] += ls; o[r] += acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int r = 0; r < AQT * 3; r++) {
+        const uint tt = r / 3, h = r % 3;
+        if (tt < nq) {
+            const uint i = (t0 + tt) * (NH * HD) + (g * 3 + h) * HD + tid;
+            A[a.out_off + i] = o[r] / l[r] * sigm(A[a.gate_off + i]);
+        }
+    }
+}
+
+kernel void k_attn_bt_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                          device uchar * KV0 [[buffer(3)]], constant AttnBArgs & a [[buffer(5)]],
+                          device const ulong * BT [[buffer(8)]],
+                          device uchar * KV1 [[buffer(10)]], device uchar * KV2 [[buffer(11)]], device uchar * KV3 [[buffer(12)]],
+                          uint2 tgp [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float region0[FQ * HD];
+    threadgroup half sp[FQ * FCK];
+    threadgroup float sr[FQ];
+    threadgroup float rsh[FQ][NREL];
+    threadgroup float sk[FQ];
+    threadgroup half * sq = (threadgroup half *) region0;
+    threadgroup float * ss = region0 + FQ * HD / 2;
+    const ushort tid = sgitg * 32 + tiisg;
+    const uint h = tgp.y, g = h / 3, t0 = tgp.x * FQ;
+    const uint nq = min((uint) FQ, a.T - t0);
+    const ulong koff = ulong(a.k_base) * KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;
+    const ulong voff = koff + KV_PLANE_BYTES;
+    for (uint i = tid; i < FQ * HD / 4; i += FNSG * 32) {
+        const uint row = i / (HD / 4), d4 = i % (HD / 4);
+        float4 q = 0;
+        if (row < nq) q = *(device const float4 *) (A + a.qp_off + (t0 + row) * (NH * HD) + h * HD + d4 * 4);
+        ((threadgroup half4 *) sq)[i] = half4(q);
+    }
+    for (uint i = tid; i < FQ * NREL; i += FNSG * 32) {
+        const uint row = i / NREL, r = i % NREL;
+        rsh[row][r] = row < nq ? A[a.rp_off + (t0 + row) * (NH * NREL) + h * NREL + r] : 0.0f;
+    }
+    if (tid < FQ) sk[tid] = tid < nq ? A[a.sink_off + (t0 + tid) * NH + h] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tq = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sq, dextents<int32_t, 2>(HD, FQ));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(FCK, FQ));
+    auto tp = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(FCK, FQ));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(FQ, FCK, HD, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+                              execution_simdgroups<FNSG>> mm_qk;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(FQ, HD, FCK, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+                              execution_simdgroups<FNSG>> mm_pv;
+    auto tv0 = tensor((device kv_t *) KV0, dextents<int32_t, 2>(HD, FCK), array<int, 2>({1, HD}));
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] = 0.0f;
+
+    constexpr short NQR = FQ / FNSG;
+    float M[NQR], S[NQR];
+    for (short jj = 0; jj < NQR; jj++) { M[jj] = 0.0f; S[jj] = 2980.9579870417283f; }
+    device const float * relb = (device const float *) (PB + a.relbias_w);
+    const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
+    kstart = kstart / FCK * FCK;
+    for (uint kc = kstart; kc <= plast; kc += FCK) {
+        const uint blk = kc >> 6;
+        device kv_t * kptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff);
+        device kv_t * vptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff);
+        auto tk = tensor(kptr, dextents<int32_t, 2>(HD, FCK), array<int, 2>({1, HD}));
+        mm_qk.run(tq, tk, ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef KV8
+        float ksc[FCK / 32], vsc[FCK / 32];
+        for (short ii = 0; ii < FCK / 32; ii++) { ksc[ii] = kv_vscale(kptr + (ii * 32 + tiisg) * HD); vsc[ii] = kv_vscale(vptr + (ii * 32 + tiisg) * HD); }
+#endif
+        for (short jj = 0; jj < NQR; jj++) {
+            const uint j = jj * FNSG + sgitg;
+            const uint qp = a.p0 + t0 + j;
+            float s[FCK / 32];
+            float m = M[jj];
+            for (short ii = 0; ii < FCK / 32; ii++) {
+                const uint col = ii * 32 + tiisg, kp = kc + col;
+                const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window);
+                float v = -INFINITY;
+                if (valid) {
+#ifdef KV8
+                    v = ss[j * FCK + col] * ksc[ii] - sk[j];
+#else
+                    v = ss[j * FCK + col] - sk[j];
+#endif
+                    const uint dist = qp - kp;
+                    if (dist < EXT) {
+                        device const float4 * b4 = (device const float4 *) (relb + dist * NREL);
+                        threadgroup const float4 * r4 = (threadgroup const float4 *) rsh[j];
+                        v += dot(r4[0], b4[0]) + dot(r4[1], b4[1]) + dot(r4[2], b4[2]) + dot(r4[3], b4[3]);
+                    }
+                }
+                s[ii] = v;
+                m = max(m, v);
+            }
+            m = simd_max(m);
+            const float ms = exp(M[jj] - m);
+            M[jj] = m;
+            float sum = 0;
+            for (short ii = 0; ii < FCK / 32; ii++) {
+                const half p = half(exp(s[ii] - m + 8.0f));
+#ifdef KV8
+                sp[j * FCK + ii * 32 + tiisg] = half(float(p) * vsc[ii]);
+#else
+                sp[j * FCK + ii * 32 + tiisg] = p;
+#endif
+                sum += float(p);
+            }
+            S[jj] = S[jj] * ms + simd_sum(sum);
+            if (tiisg == 0) sr[j] = ms;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+        auto tv = tensor(vptr, dextents<int32_t, 2>(HD, FCK), array<int, 2>({1, HD}));
+        mm_pv.run(tp, tv, co);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (short jj = 0; jj < NQR; jj++) { const uint j = jj * FNSG + sgitg; if (tiisg == 0) sr[j] = 1.0f / S[jj]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+    auto to = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(region0, dextents<int32_t, 2>(HD, FQ));
+    co.store(to);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < FQ * HD; i += FNSG * 32) {
+        const uint row = i / HD, d = i % HD;
+        if (row < nq) {
+            const uint o = (t0 + row) * (NH * HD) + h * HD + d;
+            A[a.out_off + o] = region0[i] * sigm(A[a.gate_off + o]);
+        }
+    }
+}
+
+kernel void k_attn_h_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                         device uchar * KV0 [[buffer(3)]], constant AttnBArgs & a [[buffer(5)]],
+                         device const ulong * BT [[buffer(8)]],
+                         device uchar * KV1 [[buffer(10)]], device uchar * KV2 [[buffer(11)]], device uchar * KV3 [[buffer(12)]],
+                         uint2 tgp [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float ss[AQ * AK];
+    threadgroup float G[AQ * AG];
+    threadgroup half sp[AQ * AK];
+    threadgroup float sr[AQ];
+    const uint h = tgp.y, g = h / 3, t0 = tgp.x * AQ;
+    const uint nq = min((uint) AQ, a.T - t0);
+    const ulong koff = ulong(a.k_base) * KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;
+    const ulong voff = koff + KV_PLANE_BYTES;
+    auto tq = tensor((device half *) (A + a.qp_off) + (ulong) t0 * (NH * HD) + h * HD, dextents<int32_t, 2>(HD, (int) nq), array<int, 2>({1, NH * HD}));
+    auto tr = tensor(A + a.rp_off + t0 * (NH * NREL) + h * NREL, dextents<int32_t, 2>(NREL, (int) nq), array<int, 2>({1, NH * NREL}));
+    auto ts = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(ss, dextents<int32_t, 2>(AK, AQ));
+    auto tg = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(G, dextents<int32_t, 2>(AG, AQ));
+    auto tp = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sp, dextents<int32_t, 2>(AK, AQ));
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, AK, HD, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+                              execution_simdgroups<8>> mm_qk;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, AG, NREL, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+                              execution_simdgroups<8>> mm_g;
+    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(AQ, HD, AK, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+                              execution_simdgroups<8>> mm_pv;
+    auto tv0 = tensor((device kv_t *) KV0, dextents<int32_t, 2>(HD, AK), array<int, 2>({1, HD}));
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+    for (short i = 0; i < 16; ++i) co[i] = 0.0f;
+    ushort cd[4], cr[4];
+    for (short q = 0; q < 4; ++q) { const auto ix = co.get_multidimensional_index(4 * q); cd[q] = ix[0]; cr[q] = ix[1]; }
+    float M[4], S[4];
+    for (short jj = 0; jj < 4; jj++) {
+        const uint j = jj * 8 + sg;
+        M[jj] = j < nq ? A[a.sink_off + (t0 + j) * NH + h] : 0.0f; S[jj] = 2980.9579870417283f;
+    }
+    device const float * relb = (device const float *) (PB + a.relbias_w);
+    const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
+    kstart = kstart / AK * AK;
+    for (uint kc = kstart; kc <= plast; kc += AK) {
+        const uint blk = kc >> 6;
+        device kv_t * kptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff);
+        device kv_t * vptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff);
+        auto tk = tensor(kptr, dextents<int32_t, 2>(HD, AK), array<int, 2>({1, HD}));
+        { auto cs = mm_qk.template get_destination_cooperative_tensor<decltype(tq), decltype(tk), float>(); mm_qk.run(tq, tk, cs); cs.store(ts); }
+        const int D0 = int(pfirst) - int(kc);
+        const int dlo = max(D0 - (AK - 1), 0);
+        const bool bias = dlo < EXT;
+        if (bias) {
+            auto tb = tensor((device float *) relb + dlo * NREL, dextents<int32_t, 2>(NREL, AG), array<int, 2>({1, NREL}));
+            auto cg = mm_g.template get_destination_cooperative_tensor<decltype(tr), decltype(tb), float>(); mm_g.run(tr, tb, cg); cg.store(tg);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool fast = nq == AQ && D0 >= AK - 1 && (a.window == 0 || D0 + AQ - 1 < (int) a.window) && (!bias || D0 + AQ - 1 < EXT);
+        const int gofs = D0 - dlo - int(lane);
+#ifdef KV8
+        const float ks0 = kv_vscale(kptr + lane * HD), ks1 = kv_vscale(kptr + (32 + lane) * HD);
+        const float vs0 = kv_vscale(vptr + lane * HD), vs1 = kv_vscale(vptr + (32 + lane) * HD);
+#endif
+        for (short jj = 0; jj < 4; jj++) {
+            const uint j = jj * 8 + sg;
+#ifdef KV8
+            float s0 = ss[j * AK + lane] * ks0, s1 = ss[j * AK + 32 + lane] * ks1;
+#else
+            float s0 = ss[j * AK + lane], s1 = ss[j * AK + 32 + lane];
+#endif
+            if (fast) {
+                if (bias) { threadgroup const float * gp = G + j * AG + j + gofs; s0 += gp[0]; s1 += gp[-32]; }
+            } else {
+                const int d0 = D0 + int(j) - int(lane), d1 = d0 - 32;
+                if (bias && d0 < EXT) s0 += G[j * AG + clamp(d0 - dlo, 0, AG - 1)];
+                if (bias && d1 < EXT) s1 += G[j * AG + clamp(d1 - dlo, 0, AG - 1)];
+                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window))) s0 = -INFINITY;
+                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window))) s1 = -INFINITY;
+            }
+            const float m = simd_max(max(M[jj], max(s0, s1)));
+            const float ms = exp(M[jj] - m);
+            M[jj] = m;
+            const half p0 = half(exp(s0 - m + 8.0f)), p1 = half(exp(s1 - m + 8.0f));
+#ifdef KV8
+            sp[j * AK + lane] = half(float(p0) * vs0);
+            sp[j * AK + 32 + lane] = half(float(p1) * vs1);
+#else
+            sp[j * AK + lane] = p0;
+            sp[j * AK + 32 + lane] = p1;
+#endif
+            S[jj] = S[jj] * ms + simd_sum(float(p0) + float(p1));
+            if (lane == 0) sr[j] = ms;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const float r0 = sr[cr[0]], r1 = sr[cr[1]], r2 = sr[cr[2]], r3 = sr[cr[3]];
+            co[0] *= r0; co[1] *= r0; co[2] *= r0; co[3] *= r0;
+            co[4] *= r1; co[5] *= r1; co[6] *= r1; co[7] *= r1;
+            co[8] *= r2; co[9] *= r2; co[10] *= r2; co[11] *= r2;
+            co[12] *= r3; co[13] *= r3; co[14] *= r3; co[15] *= r3;
+        }
+        auto tv = tensor(vptr, dextents<int32_t, 2>(HD, AK), array<int, 2>({1, HD}));
+        mm_pv.run(tp, tv, co);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short jj = 0; jj < 4; jj++) { if (lane == 0) sr[jj * 8 + sg] = 1.0f / S[jj]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device half * out = (device half *) (A + a.out_off);
+    for (short q = 0; q < 4; ++q) {
+        const uint row = cr[q];
+        if (row < nq) {
+            const uint o = (t0 + row) * (NH * HD) + h * HD + cd[q];
+            const float4 gt = a.ghalf ? float4(*(device const half4 *) ((device const half *) (A + a.gate_off) + o)) : *(device const float4 *) (A + a.gate_off + o);
+            const float4 v = float4(co[4 * q], co[4 * q + 1], co[4 * q + 2], co[4 * q + 3]) * sr[row] / (1.0f + exp(-gt));
+            *(device half4 *) (out + o) = half4(v);
+        }
+    }
 }
