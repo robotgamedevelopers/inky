@@ -54,8 +54,15 @@ check() {
     printf "%s | %s | %.3f | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}"
 }
 print "run | generated | distinct | wall seconds | result"
-check PrefixTree PrefixTree
+check PrefixTreeFast PrefixTree
 check PrefixTreeShallow PrefixTree DeepestStart
+check PrefixTreeStale PrefixTree ResultLive
+check PrefixTreeFirstToken PrefixTree MatchExact
+check PrefixTreeAnyParent PrefixTree ResultIsStart
+check PrefixTreePartial PrefixTree StartOnBoundary
+if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
+check PrefixTree PrefixTree
+fi
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
 check StaleEntry BlockLayout GenerationMatches

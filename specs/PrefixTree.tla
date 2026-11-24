@@ -1,122 +1,214 @@
 ----------------------------- MODULE PrefixTree -----------------------------
-\* The Layer 3 prefix matcher (src/prefix.rs): a request matches the
-\* deepest retained start point in a tree of sealed blocks.
+\* The Layer 3 prefix matcher (src/prefix.rs, PrefixTree and LiveTree):
+\* a request matches the deepest retained start point in a tree of
+\* sealed blocks.
 \*
-\* One alphabet symbol stands for one whole 64-position block: the code
-\* validates every token of a block and equality is all matching ever
-\* uses, so a block is abstracted to its identity here. A prefix is a
-\* sequence of blocks; position 0 (the empty prefix) is always a start
-\* point and needs no state. `Req` is the request being matched.
+\* Unlike the first version of this model, blocks have token content:
+\* a block is BlockLen tokens over Alphabet, so a block that differs
+\* in its second token is a different block and MatchExact is a real
+\* property, not a construction. A prefix is a token sequence whose
+\* length is a whole number of blocks.
 \*
-\* Bug = "shallow" is the reversed witness: Seek returns the shallowest
-\* matching start point instead of the deepest, and DeepestStart must
-\* fail (specs/PrefixTreeShallow.cfg).
+\* Each sealed block also carries the pool facts the live matcher
+\* checks: the slot it was sealed into and that slot's generation at
+\* seal time (slotOf, genOf), against the slot's current generation
+\* (poolGen). Reuse bumps a slot's generation; a block sealed at an
+\* older generation is stale and must never be returned. refs counts
+\* the one ref the tree holds per sealed block. starts counts the
+\* holders of a start point (a lane head and a prompt end are two).
+\*
+\* The tree stops changing once a seek has run (~sought on every
+\* mutating action): the checked property is about one seek against
+\* the tree as the caller sees it at call time, as in the code.
+\*
+\* Bug values are the reversed witnesses, one per config:
+\*   "shallow"     Seek returns the shallowest live start (DeepestStart)
+\*   "stale"       Seek ignores generations (ResultLive)
+\*   "first-token" a block matches on its first token only (MatchExact)
+\*   "any-parent"  blocks match anywhere, not on one chain (ResultIsStart)
+\*   "partial"     the result may end mid-block (StartOnBoundary)
+\* The request being matched is fixed in the module because a TLC
+\* config file assigns only literals and cannot write a sequence.
 
 EXTENDS Integers, Sequences, FiniteSets
 
-CONSTANTS Alphabet, MaxDepth, Bug
+CONSTANTS Alphabet, BlockLen, MaxBlocks, Slots, MaxGen, MaxHolders, Bug
 
-ASSUME MaxDepth \in Nat
+ASSUME /\ BlockLen \in Nat \ {0}
+       /\ MaxBlocks \in Nat \ {0}
+       /\ MaxGen \in Nat
+       /\ MaxHolders \in Nat \ {0}
 
-\* The request being matched: MaxDepth blocks, fixed here because a TLC
-\* config file assigns only literals and cannot write a sequence.
-Req == <<1, 2, 1>>
+\* Two blocks of two tokens; must satisfy Len(Req) = MaxBlocks * BlockLen.
+Req == <<1, 2, 1, 2>>
 
-VARIABLES sealed, starts, result, sought
-vars == <<sealed, starts, result, sought>>
+VARIABLES sealed, starts, slotOf, genOf, poolGen, refs, result, sought
+vars == <<sealed, starts, slotOf, genOf, poolGen, refs, result, sought>>
 
-AllSeqs ==
-    {<<>>}
-    \cup {<<a>> : a \in Alphabet}
-    \cup {<<a, b>> : a, b \in Alphabet}
-    \cup {<<a, b, c>> : a, b, c \in Alphabet}
+L0 == {<<>>}
+L1 == {<<a>> : a \in Alphabet}
+L2 == {<<a, b>> : a, b \in Alphabet}
+L3 == {<<a, b, c>> : a, b, c \in Alphabet}
+L4 == {<<a, b, c, d>> : a, b, c, d \in Alphabet}
+\* Every token sequence the model can name (results may end mid-block).
+AllTok == L0 \cup L1 \cup L2 \cup L3 \cup L4
+\* Sequences at block boundaries: the only things ever sealed or held.
+BlockSeqs == L0 \cup L2 \cup L4
 
 IsPrefix(p, s) ==
     /\ Len(p) <= Len(s)
     /\ \A i \in 1..Len(p) : p[i] = s[i]
 
-DropLast(s) == SubSeq(s, 1, Len(s) - 1)
+DropBlock(s) == SubSeq(s, 1, Len(s) - BlockLen)
 
-\* The longest retained start point that is a prefix of the request.
-\* Prefixes of one sequence are ordered by length, so this is unique.
-Deepest(r) ==
-    LET matching == {p \in starts \cup {<<>>} : IsPrefix(p, r)}
-    IN  CHOOSE p \in matching :
-            \A q \in matching : Len(q) <= Len(p)
+BlockAt(s, k) == SubSeq(s, (k - 1) * BlockLen + 1, k * BlockLen)
 
-Shallowest(r) ==
-    LET matching == {p \in starts \cup {<<>>} : IsPrefix(p, r)}
-    IN  CHOOSE p \in matching :
-            \A q \in matching : Len(p) <= Len(q)
+\* Every block-boundary prefix of s is sealed at its slot's current
+\* generation. The empty prefix needs nothing and is always live.
+Live(s) ==
+    \A q \in BlockSeqs :
+        (IsPrefix(q, s) /\ Len(q) > 0) =>
+            q \in sealed /\ genOf[q] = poolGen[slotOf[q]]
+
+Held == {s \in BlockSeqs : starts[s] > 0}
+
+Longest(cands, r) ==
+    CHOOSE p \in cands : \A q \in cands : Len(q) <= Len(p)
+
+DeepestLive(r) ==
+    Longest({p \in Held \cup {<<>>} : IsPrefix(p, r) /\ Live(p)}, r)
 
 Init ==
     /\ sealed = {<<>>}
-    /\ starts = {}
+    /\ starts = [s \in BlockSeqs |-> 0]
+    /\ slotOf = [s \in BlockSeqs |-> 0]
+    /\ genOf = [s \in BlockSeqs |-> 0]
+    /\ poolGen = [s \in Slots |-> 0]
+    /\ refs = [s \in BlockSeqs |-> 0]
     /\ result = <<>>
     /\ sought = FALSE
 
-\* The checked property is about one seek against the tree as the caller
-\* sees it at call time, so the tree stops changing once a seek has run:
-\* a start retained afterwards cannot make an earlier result stale. In
-\* the code each deepest_start call likewise sees one fixed tree.
-
-\* A block is published only sealed and only onto a sealed parent.
-Seal(s) ==
+\* A block is published only sealed, only onto a sealed parent, and
+\* only within the modelled depth. It takes the tree's one ref and
+\* records the slot's generation at seal time.
+Seal(s, slot) ==
     /\ ~sought
-    /\ s \in AllSeqs
-    /\ Len(s) >= 1
-    /\ Len(s) <= MaxDepth
-    /\ DropLast(s) \in sealed
+    /\ s \in BlockSeqs
+    /\ Len(s) \in {BlockLen, 2 * BlockLen}
+    /\ Len(s) <= MaxBlocks * BlockLen
+    /\ DropBlock(s) \in sealed
     /\ s \notin sealed
+    /\ slot \in Slots
     /\ sealed' = sealed \cup {s}
-    /\ UNCHANGED <<starts, result, sought>>
+    /\ slotOf' = [slotOf EXCEPT ![s] = slot]
+    /\ genOf' = [genOf EXCEPT ![s] = poolGen[slot]]
+    /\ refs' = [refs EXCEPT ![s] = 1]
+    /\ UNCHANGED <<starts, poolGen, result, sought>>
 
 Retain(s) ==
     /\ ~sought
     /\ s \in sealed \ {<<>>}
-    /\ s \notin starts
-    /\ starts' = starts \cup {s}
-    /\ UNCHANGED <<sealed, result, sought>>
+    /\ starts[s] < MaxHolders
+    /\ starts' = [starts EXCEPT ![s] = starts[s] + 1]
+    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs, result, sought>>
 
 Release(s) ==
     /\ ~sought
-    /\ s \in starts
-    /\ starts' = starts \ {s}
-    /\ UNCHANGED <<sealed, result, sought>>
+    /\ starts[s] > 0
+    /\ starts' = [starts EXCEPT ![s] = starts[s] - 1]
+    /\ UNCHANGED <<sealed, slotOf, genOf, poolGen, refs, result, sought>>
+
+\* The pool drops a slot's last ref and reuses it: the generation
+\* moves and every block sealed at the old one is stale.
+Reuse(slot) ==
+    /\ ~sought
+    /\ poolGen[slot] < MaxGen
+    /\ poolGen' = [poolGen EXCEPT ![slot] = poolGen[slot] + 1]
+    /\ UNCHANGED <<sealed, starts, slotOf, genOf, refs, result, sought>>
+
+\* Removal takes a block and everything below it out of the tree and
+\* drops their refs and start holds.
+Evict(s) ==
+    /\ ~sought
+    /\ s \in sealed \ {<<>>}
+    /\ sealed' = {t \in sealed : ~IsPrefix(s, t)}
+    /\ starts' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE starts[x]]
+    /\ refs' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE refs[x]]
+    /\ UNCHANGED <<slotOf, genOf, poolGen, result, sought>>
+
+FirstTokenMatch(p, r) ==
+    /\ Len(p) <= Len(r)
+    /\ \A k \in 1..(Len(p) \div BlockLen) :
+           p[(k - 1) * BlockLen + 1] = r[(k - 1) * BlockLen + 1]
+
+\* The longest request prefix whose blocks each appear as some sealed
+\* block's last block, anywhere in the tree (the parent chain ignored).
+AnyParentResult ==
+    LET ok(n) == \A k \in 1..(n \div BlockLen) :
+            \E t \in sealed :
+                Len(t) >= BlockLen /\ BlockAt(t, Len(t) \div BlockLen) = BlockAt(Req, k)
+        ns == {n \in {0, BlockLen, 2 * BlockLen} : n <= Len(Req) /\ ok(n)}
+    IN  SubSeq(Req, 1, CHOOSE n \in ns : \A m \in ns : m <= n)
+
+SeekResult ==
+    CASE Bug = "shallow" ->
+            LET c == {p \in Held \cup {<<>>} : IsPrefix(p, Req) /\ Live(p)}
+            IN  CHOOSE p \in c : \A q \in c : Len(p) <= Len(q)
+      [] Bug = "stale" ->
+            Longest({p \in Held \cup {<<>>} : IsPrefix(p, Req)}, Req)
+      [] Bug = "first-token" ->
+            Longest({p \in Held \cup {<<>>} : FirstTokenMatch(p, Req)}, Req)
+      [] Bug = "any-parent" -> AnyParentResult
+      [] Bug = "partial" ->
+            LET d == DeepestLive(Req)
+            IN  IF Len(d) < Len(Req) THEN SubSeq(Req, 1, Len(d) + 1) ELSE d
+      [] OTHER -> DeepestLive(Req)
 
 Seek ==
-    /\ result' = IF Bug = "shallow" THEN Shallowest(Req) ELSE Deepest(Req)
+    /\ result' = SeekResult
     /\ sought' = TRUE
-    /\ UNCHANGED <<sealed, starts>>
+    /\ UNCHANGED <<sealed, starts, slotOf, genOf, poolGen, refs>>
 
 Next ==
-    \/ \E s \in AllSeqs : Seal(s) \/ Retain(s) \/ Release(s)
+    \/ \E s \in BlockSeqs, slot \in Slots : Seal(s, slot)
+    \/ \E s \in BlockSeqs : Retain(s) \/ Release(s) \/ Evict(s)
+    \/ \E slot \in Slots : Reuse(slot)
     \/ Seek
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ sealed \subseteq AllSeqs
-    /\ starts \subseteq AllSeqs
-    /\ result \in AllSeqs
+    /\ sealed \subseteq BlockSeqs
+    /\ starts \in [BlockSeqs -> 0..MaxHolders]
+    /\ slotOf \in [BlockSeqs -> Slots \cup {0}]
+    /\ genOf \in [BlockSeqs -> 0..MaxGen]
+    /\ poolGen \in [Slots -> 0..MaxGen]
+    /\ refs \in [BlockSeqs -> 0..1]
+    /\ result \in AllTok
     /\ sought \in BOOLEAN
 
-\* The tree is prefix-closed: no block without its whole parent chain.
+\* The tree is prefix-closed at block granularity.
 TreeClosed ==
-    \A s \in sealed : Len(s) >= 1 => DropLast(s) \in sealed
+    \A s \in sealed : Len(s) >= BlockLen => DropBlock(s) \in sealed
 
-\* Only sealed blocks are ever retained as start points.
-StartsSealed == starts \subseteq sealed
+\* Only sealed blocks are ever held as start points.
+StartsSealed == \A s \in BlockSeqs : starts[s] > 0 => s \in sealed
 
-\* The result is a retained start point and an exact prefix.
-ResultIsStart == sought => result \in starts \cup {<<>>}
+\* The tree holds exactly one ref per sealed block, and none for the rest.
+RefsHeld == \A s \in BlockSeqs : refs[s] = (IF s \in sealed THEN 1 ELSE 0)
+
+\* The result is a held start point (or position 0).
+ResultIsStart == sought => result \in Held \cup {<<>>}
+
+\* The result is an exact token prefix of the request.
 MatchExact == sought => IsPrefix(result, Req)
 
-\* The result is the deepest such start point. This is the property the
-\* reversed witness (Bug = "shallow") must violate.
-DeepestStart == sought => result = Deepest(Req)
+\* The result never ends in the middle of a block.
+StartOnBoundary == sought => Len(result) = BlockLen * (Len(result) \div BlockLen)
 
-\* No start point is ever deeper than the matched prefix allows: the
-\* result's length never passes the request, block by block.
-NoPartialBlock == sought => Len(result) <= Len(Req)
+\* No block on the returned path is stale or unsealed.
+ResultLive == sought => Live(result)
+
+\* The result is the deepest live held start point.
+DeepestStart == sought => result = DeepestLive(Req)
 =============================================================================
