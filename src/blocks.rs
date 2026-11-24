@@ -17,9 +17,13 @@
 
 use std::fmt;
 
+#[cfg(not(standalone_blocks))]
 use objc2::rc::Retained;
+#[cfg(not(standalone_blocks))]
 use objc2::runtime::ProtocolObject;
+#[cfg(not(standalone_blocks))]
 use objc2::Message;
+#[cfg(not(standalone_blocks))]
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 /// Positions in one block.
@@ -402,6 +406,7 @@ impl KeyAddr {
 #[derive(Clone)]
 enum SlabStorage {
     Host(Vec<u8>),
+    #[cfg(not(standalone_blocks))]
     Gpu(crate::metal::Buf),
 }
 
@@ -418,6 +423,7 @@ pub struct BlockPool {
     slots: Vec<SlotRecord>,
     slabs: Vec<SlabStorage>,
     /// Present when this pool allocates Metal buffers.
+    #[cfg(not(standalone_blocks))]
     device: Option<Retained<ProtocolObject<dyn MTLDevice>>>,
 }
 
@@ -431,6 +437,7 @@ impl Clone for BlockPool {
             slots: self.slots.clone(),
             // A cloned GPU buffer is another retain of the same allocation.
             slabs: self.slabs.clone(),
+            #[cfg(not(standalone_blocks))]
             device: self.device.clone(),
         }
     }
@@ -438,12 +445,16 @@ impl Clone for BlockPool {
 
 impl fmt::Debug for BlockPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(not(standalone_blocks))]
+        let is_gpu = self.device.is_some();
+        #[cfg(standalone_blocks)]
+        let is_gpu = false;
         f.debug_struct("BlockPool")
             .field("kind", &self.kind)
             .field("kvb", &self.kvb)
             .field("len", &self.slots.len())
             .field("slabs", &self.slabs.len())
-            .field("gpu", &self.device.is_some())
+            .field("gpu", &is_gpu)
             .finish()
     }
 }
@@ -451,13 +462,13 @@ impl fmt::Debug for BlockPool {
 impl BlockPool {
     /// Host bytes at fp16 (`kvb` 2), one contiguous slab, zero-filled. No Metal device.
     pub fn new(kind: BlockKind, n_slots: usize) -> BlockPool {
-        Self::open(kind, n_slots, KVB_FP16, u64::MAX, None).expect("host block pool")
+        Self::open_host(kind, n_slots, KVB_FP16, u64::MAX).expect("host block pool")
     }
 
     /// One element width for the whole pool (host storage). `kvb` other than 1 or 2 is `Width`.
     pub fn with_kvb(kind: BlockKind, n_slots: usize, kvb: u32) -> Result<BlockPool, BlockError> {
         let _ = kind.stride_bytes(kvb)?;
-        Self::open(kind, n_slots, kvb, u64::MAX, None)
+        Self::open_host(kind, n_slots, kvb, u64::MAX)
     }
 
     /// Metadata-only pool for high-slot offset/table tests without multi-GiB host allocation.
@@ -469,17 +480,35 @@ impl BlockPool {
             kind, kvb, stride, slots_per_slab,
             slots: vec![SlotRecord::fresh(kind); n_slots],
             slabs: Vec::new(),
+            #[cfg(not(standalone_blocks))]
             device: None,
         })
     }
 
     /// GPU pools for this kind. `kvb` is 1 or 2. One buffer until a slot would pass
     /// the device `maxBufferLength`, then another slab, and never a fifth.
+    #[cfg(not(standalone_blocks))]
     pub fn gpu(dev: &ProtocolObject<dyn MTLDevice>, kind: BlockKind, n_slots: usize, kvb: u32) -> BlockPool {
         let max = dev.maxBufferLength() as u64;
         Self::open(kind, n_slots, kvb, max, Some(dev.retain())).expect("gpu block pool")
     }
 
+    fn open_host(kind: BlockKind, n_slots: usize, kvb: u32, max_slab_bytes: u64) -> Result<BlockPool, BlockError> {
+        #[cfg(not(standalone_blocks))]
+        { Self::open(kind, n_slots, kvb, max_slab_bytes, None) }
+        #[cfg(standalone_blocks)]
+        {
+            let stride = stride_at(kind, kvb)?;
+            let slots_per_slab = slots_in_slab(stride, max_slab_bytes)?;
+            let mut pool = BlockPool {
+                kind, kvb, stride, slots_per_slab, slots: Vec::with_capacity(n_slots), slabs: Vec::new(),
+            };
+            if n_slots > 0 { pool.grow_by(n_slots)?; }
+            Ok(pool)
+        }
+    }
+
+    #[cfg(not(standalone_blocks))]
     fn open(
         kind: BlockKind,
         n_slots: usize,
@@ -492,21 +521,20 @@ impl BlockPool {
         let mut pool = BlockPool {
             kind, kvb, stride, slots_per_slab, slots: Vec::with_capacity(n_slots), slabs: Vec::new(), device,
         };
-        for _ in 0..n_slots { pool.grow()?; }
+        if n_slots > 0 { pool.grow_by(n_slots)?; }
         Ok(pool)
     }
 
     fn allocate_slab(&self, nbytes: u64) -> Result<SlabStorage, BlockError> {
         let n = usize::try_from(nbytes).map_err(|_| BlockError::Overflow)?;
-        match &self.device {
-            None => Ok(SlabStorage::Host(vec![0u8; n])),
-            Some(dev) => {
-                let buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
-                // Reuse fills a slot again. A fresh buffer is zero too, so a read before `take` is finite.
-                unsafe { std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, n); }
-                Ok(SlabStorage::Gpu(buf))
-            }
+        #[cfg(not(standalone_blocks))]
+        if let Some(dev) = &self.device {
+            let buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
+            // Reuse fills a slot again. A fresh buffer is zero too, so a read before `take` is finite.
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, n); }
+            return Ok(SlabStorage::Gpu(buf));
         }
+        Ok(SlabStorage::Host(vec![0u8; n]))
     }
 
     /// Grow the slab that owns `index`, or open the next one. Does not move a slot already placed.
@@ -526,24 +554,28 @@ impl BlockPool {
 
     fn resize_slab(&mut self, slab_i: usize, nbytes: u64) -> Result<(), BlockError> {
         let n = usize::try_from(nbytes).map_err(|_| BlockError::Overflow)?;
+        #[allow(irrefutable_let_patterns)]
         if let SlabStorage::Host(v) = &mut self.slabs[slab_i] {
             if v.len() < n { v.resize(n, 0); }
             return Ok(());
         }
-        let old_len = match &self.slabs[slab_i] {
-            SlabStorage::Gpu(b) => b.length(),
-            SlabStorage::Host(_) => return Ok(()),
-        };
-        if old_len >= n { return Ok(()); }
-        let dev = self.device.as_ref().expect("gpu slab without a device");
-        let new_buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
-        if let SlabStorage::Gpu(old) = &self.slabs[slab_i] {
-            unsafe {
-                std::ptr::copy_nonoverlapping(old.contents().as_ptr() as *const u8, new_buf.contents().as_ptr() as *mut u8, old_len);
-                std::ptr::write_bytes((new_buf.contents().as_ptr() as *mut u8).add(old_len), 0, n - old_len);
+        #[cfg(not(standalone_blocks))]
+        {
+            let old_len = match &self.slabs[slab_i] {
+                SlabStorage::Gpu(b) => b.length(),
+                SlabStorage::Host(_) => return Ok(()),
+            };
+            if old_len >= n { return Ok(()); }
+            let dev = self.device.as_ref().expect("gpu slab without a device");
+            let new_buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
+            if let SlabStorage::Gpu(old) = &self.slabs[slab_i] {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(old.contents().as_ptr() as *const u8, new_buf.contents().as_ptr() as *mut u8, old_len);
+                    std::ptr::write_bytes((new_buf.contents().as_ptr() as *mut u8).add(old_len), 0, n - old_len);
+                }
             }
+            self.slabs[slab_i] = SlabStorage::Gpu(new_buf);
         }
-        self.slabs[slab_i] = SlabStorage::Gpu(new_buf);
         Ok(())
     }
 
@@ -580,10 +612,46 @@ impl BlockPool {
     /// The slab buffer that holds this slot. `None` on a host pool.
     /// Two slots in one slab return the same buffer. Its length is the bytes placed
     /// in that slab, not the stride of one slot.
+    #[cfg(not(standalone_blocks))]
     pub fn gpu_buffer(&self, slot: Slot) -> Result<Option<&crate::metal::Buf>, BlockError> {
         let i = self.index(slot)?;
         let slab = i / self.slots_per_slab;
         Ok(match &self.slabs[slab] { SlabStorage::Gpu(b) => Some(b), SlabStorage::Host(_) => None })
+    }
+
+    /// Every allocated GPU slab buffer in slab order (0..slab_count).
+    #[cfg(not(standalone_blocks))]
+    pub fn gpu_slabs(&self) -> Vec<&crate::metal::Buf> {
+        self.slabs.iter().filter_map(|s| match s { SlabStorage::Gpu(b) => Some(b), SlabStorage::Host(_) => None }).collect()
+    }
+
+    /// 64-bit GPU block-table word for `entry`: `(slab_index << 62) | within_slab_byte_offset`.
+    /// Validates kind, width, generation, and live reference count before returning.
+    /// For single-slab pools (`slab_index == 0`), this equals `entry.offset()`.
+    pub fn gpu_table_entry(&self, entry: BlockEntry) -> Result<u64, BlockError> {
+        if entry.kind() != self.kind { return Err(BlockError::OutOfRange); }
+        if entry.kvb() != self.kvb { return Err(BlockError::Width); }
+        let i = self.index(entry.slot())?;
+        let rec = &self.slots[i];
+        if rec.generation() != entry.generation() { return Err(BlockError::Stale); }
+        if rec.refs() == 0 { return Err(BlockError::Refs); }
+        let (slab, start, _) = self.slot_range(i);
+        if slab >= MAX_SLABS { return Err(BlockError::Slab); }
+        let off = start as u64;
+        if off >= (1u64 << 62) { return Err(BlockError::Overflow); }
+        Ok(((slab as u64) << 62) | off)
+    }
+
+    /// Raw CPU-visible pointer and byte length of `slot` inside its owning slab.
+    /// Valid while nothing is in flight on the GPU and before the slab is resized.
+    pub fn slot_raw_region(&self, slot: Slot) -> Option<(*mut u8, usize)> {
+        let i = self.index(slot).ok()?;
+        let (slab, start, n) = self.slot_range(i);
+        match self.slabs.get(slab)? {
+            SlabStorage::Host(v) => Some((unsafe { (v.as_ptr() as *mut u8).add(start) }, n)),
+            #[cfg(not(standalone_blocks))]
+            SlabStorage::Gpu(b) => Some((unsafe { (b.contents().as_ptr() as *mut u8).add(start) }, n)),
+        }
     }
 
     /// The slot's bytes: one stride inside the owning slab.
@@ -598,6 +666,13 @@ impl BlockPool {
         Ok(self.bytes_of_mut(i))
     }
 
+    /// Explicitly zero-fill one slot's backing storage.
+    pub fn zero_slot(&mut self, slot: Slot) -> Result<(), BlockError> {
+        let i = self.index(slot)?;
+        self.bytes_of_mut(i).fill(0);
+        Ok(())
+    }
+
     fn slot_range(&self, i: usize) -> (usize, usize, usize) {
         let slab = i / self.slots_per_slab;
         let start = (i % self.slots_per_slab) * (self.stride as usize);
@@ -608,6 +683,7 @@ impl BlockPool {
         let (slab, start, n) = self.slot_range(i);
         match &self.slabs[slab] {
             SlabStorage::Host(v) => &v[start..start + n],
+            #[cfg(not(standalone_blocks))]
             SlabStorage::Gpu(b) => unsafe {
                 std::slice::from_raw_parts((b.contents().as_ptr() as *const u8).add(start), n)
             },
@@ -619,6 +695,7 @@ impl BlockPool {
         match &mut self.slabs[slab] {
             SlabStorage::Host(v) => &mut v[start..start + n],
             // Shared storage. The CPU zero-fills and appends; no command buffer reads this yet.
+            #[cfg(not(standalone_blocks))]
             SlabStorage::Gpu(b) => unsafe {
                 std::slice::from_raw_parts_mut((b.contents().as_ptr() as *mut u8).add(start), n)
             },
@@ -634,6 +711,25 @@ impl BlockPool {
         self.ensure_slot(slot.pool_index().get() as usize)?;
         self.slots.push(SlotRecord::fresh(self.kind));
         Ok(slot)
+    }
+
+    /// Append `count` fresh slots in one resize per touched slab, avoiding repeated copies.
+    pub fn grow_by(&mut self, count: usize) -> Result<(), BlockError> {
+        if count == 0 { return Ok(()); }
+        let start = self.slots.len();
+        let end = start.checked_add(count).ok_or(BlockError::Overflow)?;
+        if end > u32::MAX as usize { return Err(BlockError::Overflow); }
+        let last_idx = end - 1;
+        let _ = mul_offset(last_idx as u64, self.stride)?;
+        let mut idx = start;
+        while idx <= last_idx {
+            let slab_i = idx / self.slots_per_slab;
+            let slab_end = ((slab_i + 1).saturating_mul(self.slots_per_slab) - 1).min(last_idx);
+            self.ensure_slot(slab_end)?;
+            idx = slab_end + 1;
+        }
+        self.slots.resize(end, SlotRecord::fresh(self.kind));
+        Ok(())
     }
 
     /// Zero-fill `slot`, clear its seal and length, and bump its generation.
@@ -712,6 +808,7 @@ impl BlockPools {
 
     /// GPU pools. `n_window` and `n_full` are allocated now. `kvb` is 1 or 2 and sizes
     /// both kinds. Zero slots still holds the device and grows through [`BlockPool::grow`].
+    #[cfg(not(standalone_blocks))]
     pub fn gpu(dev: &ProtocolObject<dyn MTLDevice>, n_window: usize, n_full: usize, kvb: u32) -> BlockPools {
         BlockPools {
             window: BlockPool::gpu(dev, BlockKind::Window, n_window, kvb),
@@ -814,6 +911,31 @@ impl BlockTable {
         }
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
         *cell = Some(BlockEntry::new(slot, generation, offset, pool.kind(), kvb));
+        Ok(())
+    }
+
+    /// Clear one `(kind, block)` cell, dropping its pool reference if its generation still matches.
+    pub fn clear_kind_entry(&mut self, pool: &mut BlockPool, block: BlockIndex) -> Result<(), BlockError> {
+        let i = table_index(pool.kind(), block, self.blocks_per_kind)? as usize;
+        if let Some(prev) = self.entries.get(i).copied().flatten() {
+            if pool.record(prev.slot())?.generation() == prev.generation() {
+                pool.record_mut(prev.slot())?.drop_ref()?;
+            }
+            self.entries[i] = None;
+        }
+        Ok(())
+    }
+
+    /// Drop every live reference held by this table and clear every cell to `None`.
+    pub fn clear_entries(&mut self, pools: &mut BlockPools) -> Result<(), BlockError> {
+        for cell in &mut self.entries {
+            if let Some(prev) = cell.take() {
+                let pool = pools.of_mut(prev.kind());
+                if pool.record(prev.slot())?.generation() == prev.generation() {
+                    pool.record_mut(prev.slot())?.drop_ref()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1060,6 +1182,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(standalone_blocks))]
     #[ignore = "needs a Metal device; run on mini-m5"]
     fn gpu_pool_zero_fills_a_taken_slot() {
         use objc2_metal::{MTLBuffer, MTLDevice};

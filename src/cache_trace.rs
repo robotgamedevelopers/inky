@@ -1733,6 +1733,7 @@ pub struct CacheSchedulerState {
     pub blocks: Vec<CacheBlockSnapshot>,
     pub start_points: Vec<StartPointSnapshot>,
     pub lanes: Vec<CacheLaneSnapshot>,
+    pub queue_seq: Vec<String>,
     pub step_active: bool,
     pub step_lanes: Vec<String>,
     pub step_span: BTreeMap<String, u32>,
@@ -1760,6 +1761,10 @@ impl CacheSchedulerState {
         m.insert(
             "lanes".into(),
             JsonVal::Arr(self.lanes.iter().map(CacheLaneSnapshot::to_json_val).collect()),
+        );
+        m.insert(
+            "queue_seq".into(),
+            JsonVal::Arr(self.queue_seq.iter().cloned().map(JsonVal::Str).collect()),
         );
         m.insert("step_active".into(), JsonVal::Bool(self.step_active));
         m.insert(
@@ -2013,10 +2018,19 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             .map(|v| parse_id(v.as_str()?))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let queue_seq = match st_obj.get("queue_seq") {
+            Some(v) => v
+                .as_arr()?
+                .iter()
+                .map(|x| x.as_str().map(str::to_owned))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
         let state = CacheSchedulerState {
             blocks,
             start_points,
             lanes,
+            queue_seq,
             step_active: req_field(st_obj, "step_active")?.as_bool()?,
             step_lanes,
             step_span,
@@ -2260,9 +2274,15 @@ pub fn render_cache_scheduler_tla_bundle(
                 .collect::<Vec<_>>()
                 .join(", ");
             let gd_lit = if st.gpu_done { "TRUE" } else { "FALSE" };
+            let qs_lit = st
+                .queue_seq
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = write!(
                 data,
-                ">>, {sa_lit}, {{{sl_lit}}}, <<{ss_lit}>>, {{{sp_lit}}}, {{{sio_lit}}}, {gd_lit}>>"
+                ">>, {sa_lit}, {{{sl_lit}}}, <<{ss_lit}>>, {{{sp_lit}}}, {{{sio_lit}}}, {gd_lit}, <<{qs_lit}>>>>"
             );
         }
         data.push_str("\n  >>");
@@ -2348,7 +2368,8 @@ Lift(s) == [
   stepSpan    |-> [l \\in Lanes |-> s[14][LaneIdx(l)]],
   stepPins    |-> DecodeBlockSet(s[15]),
   stepIO      |-> DecodeBlockSet(s[16]),
-  gpuDone     |-> s[17]
+  gpuDone     |-> s[17],
+  queueSeq    |-> s[18]
 ]
 
 VARIABLES traceIdx, stepIdx
@@ -2359,7 +2380,8 @@ Matches(st) ==
   /\\ laneTarget = st.laneTarget /\\ lanePos = st.lanePos
   /\\ laneFull = st.laneFull /\\ laneWin = st.laneWin
   /\\ reservation = st.reservation /\\ admitBudget = st.admitBudget
-  /\\ waitTicks = st.waitTicks /\\ stepActive = st.stepActive
+  /\\ waitTicks = st.waitTicks /\\ queueSeq = st.queueSeq
+  /\\ stepActive = st.stepActive
   /\\ stepLanes = st.stepLanes /\\ stepSpan = st.stepSpan
   /\\ stepPins = st.stepPins /\\ stepIO = st.stepIO
   /\\ gpuDone = st.gpuDone
@@ -2379,7 +2401,7 @@ ReplayNext ==
        /\\ laneTarget' = nxt.laneTarget /\\ lanePos' = nxt.lanePos
        /\\ laneFull' = nxt.laneFull /\\ laneWin' = nxt.laneWin
        /\\ reservation' = nxt.reservation /\\ admitBudget' = nxt.admitBudget
-       /\\ waitTicks' = nxt.waitTicks /\\ stepActive' = nxt.stepActive
+       /\\ waitTicks' = nxt.waitTicks /\\ queueSeq' = nxt.queueSeq /\\ stepActive' = nxt.stepActive
        /\\ stepLanes' = nxt.stepLanes /\\ stepSpan' = nxt.stepSpan
        /\\ stepPins' = nxt.stepPins /\\ stepIO' = nxt.stepIO
        /\\ gpuDone' = nxt.gpuDone

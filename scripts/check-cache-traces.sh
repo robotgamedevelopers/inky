@@ -19,7 +19,7 @@ compile_gen() {
     local dir=$1 warn_flag=${2:-}
     cp "$root/src/blockbook.rs" "$root/src/cache_trace.rs" "$dir/"
     cp "$root/scripts/cache-traces.rs" "$dir/main.rs"
-    rustc --edition=2021 $warn_flag -O "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
+    rustc --edition=2021 --cfg standalone_blocks $warn_flag -O "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
         cat "$dir/rustc.log" >&2
         return 1
     }

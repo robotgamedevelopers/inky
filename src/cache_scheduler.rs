@@ -1130,6 +1130,7 @@ pub struct CacheScheduler {
     blocks: BTreeMap<CacheBlockId, SchedBlock>,
     start_points: BTreeMap<(String, u32), SchedStartPoint>,
     lanes: BTreeMap<String, SchedLane>,
+    queue_seq: Vec<String>,
     step_active: bool,
     step_lanes: BTreeSet<String>,
     step_span: BTreeMap<String, u32>,
@@ -1184,6 +1185,7 @@ impl CacheScheduler {
             blocks,
             start_points,
             lanes,
+            queue_seq: Vec::new(),
             step_active: false,
             step_lanes: BTreeSet::new(),
             step_span,
@@ -1387,6 +1389,12 @@ impl CacheScheduler {
         self.admitted_total() + self.worst_case_for(req_len) <= self.cfg.mem_budget
     }
 
+    fn older_queued(&self, a: &str, b: &str) -> bool {
+        let ia = self.queue_seq.iter().position(|x| x == a);
+        let ib = self.queue_seq.iter().position(|x| x == b);
+        matches!((ia, ib), (Some(i), Some(j)) if i < j)
+    }
+
     pub fn can_admit_now(&self, lane: &str) -> bool {
         let Some(l) = self.lanes.get(lane) else {
             return false;
@@ -1396,10 +1404,15 @@ impl CacheScheduler {
         }
         for (qname, q) in &self.lanes {
             if qname != lane && q.state == "Queued" {
-                if self.can_fit_request(q.target) && l.wait_ticks < q.wait_ticks {
+                if self.can_fit_request(q.target)
+                    && !(l.wait_ticks > q.wait_ticks
+                        || (l.wait_ticks == q.wait_ticks && self.older_queued(lane, qname)))
+                {
                     return false;
                 }
-                if q.wait_ticks >= self.cfg.max_bypass && l.wait_ticks < q.wait_ticks {
+                if q.wait_ticks >= self.cfg.max_bypass
+                    && !(self.older_queued(lane, qname) || l.wait_ticks > q.wait_ticks)
+                {
                     return false;
                 }
             }
@@ -1421,7 +1434,7 @@ impl CacheScheduler {
                         || mem_used < self.cfg.mem_budget
                         || has_cold
                 }
-                "Queued" => self.can_fit_request(l.target),
+                "Queued" => self.can_admit_now(name),
                 _ => false,
             };
             if ok {
@@ -1499,6 +1512,7 @@ impl CacheScheduler {
             l.reservation = 0;
             l.admit_budget = 0;
             l.wait_ticks = 0;
+            self.queue_seq.push(lane.into());
             ArriveOutcome::Queued
         } else if can_direct_admit {
             for qn in &queued_names {
@@ -1569,14 +1583,21 @@ impl CacheScheduler {
             return Err(SchedulerError::Precondition("admit precondition not satisfied"));
         }
         let target = self.lanes[lane].target;
-        let my_wait = self.lanes[lane].wait_ticks;
         let wc = self.worst_case_for(target);
         let max_byp = self.cfg.max_bypass;
-        for (qname, q) in &mut self.lanes {
-            if qname != lane && q.state == "Queued" && my_wait <= q.wait_ticks && q.wait_ticks < max_byp {
+        let older: Vec<String> = self
+            .queue_seq
+            .iter()
+            .take_while(|x| x.as_str() != lane)
+            .cloned()
+            .collect();
+        for qname in &older {
+            let q = self.lanes.get_mut(qname).unwrap();
+            if q.state == "Queued" && q.wait_ticks < max_byp {
                 q.wait_ticks += 1; // MUTANT_ANCHOR_ADMIT_BYPASS
             }
         }
+        self.queue_seq.retain(|x| x != lane);
         let l = self.lanes.get_mut(lane).unwrap();
         l.state = "Admitted";
         l.admit_budget = wc;
@@ -2577,6 +2598,7 @@ impl CacheScheduler {
             l.reservation = 0;
             l.admit_budget = 0;
             l.wait_ticks = 0;
+            self.queue_seq.retain(|x| x != lane);
             self.sync_ref_counts();
             "Cancelled"
         };
@@ -2647,6 +2669,7 @@ impl CacheScheduler {
             blocks,
             start_points,
             lanes,
+            queue_seq: self.queue_seq.clone(),
             step_active: self.step_active,
             step_lanes: self.step_lanes.iter().cloned().collect(),
             step_span: self.step_span.clone(),

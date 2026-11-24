@@ -849,14 +849,27 @@ fn poolgate(o: &Opts) {
     let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
     let eng = Engine::load(&o.model, o.ctx);
     let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
-    // the candidate: the block cache plugs in here, as a `StepPath + PoisonPool` over the same engine
-    let cand = poolgate::Layer2::new(&eng, n);
+    // the candidate: real Layer 3 BlockPool + BlockTable + PrefixTree over the same engine
+    let cand = poolgate::Layer3Pool::new(&eng, n);
     let label = cand.candidate_label();
     println!("poolgate candidate: {label}");
     let got = poolgate::poisoned(&cand, &w, sabotage);
+    let st = cand.stats();
+    cand.shutdown();
     if sabotage && !got.sabotaged { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
     match poolgate::compare(&want, &got) {
-        Ok(lines) => { for l in lines { println!("{l}"); } println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs"); }
+        Ok(lines) => {
+            for l in lines { println!("{l}"); }
+            println!("layer 3 stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, tails_dropped={}",
+                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.tails_dropped);
+            if !sabotage {
+                match poolgate::verify_prefix_start_points(&eng, &base, o.ctx) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); std::process::exit(1); }
+                }
+            }
+            println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs");
+        }
         Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
     }
 }

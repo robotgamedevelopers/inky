@@ -722,7 +722,11 @@ mod tests {
         fn pool_refs(&self, slot: Slot, kind: BlockKind) -> u32 {
             self.map.get(&Self::key(slot, kind)).map(|r| r.refs()).unwrap_or(0)
         }
-        fn reuse(&mut self, slot: Slot, kind: BlockKind) { self.record(slot, kind).bump_generation().unwrap(); }
+        fn reuse(&mut self, slot: Slot, kind: BlockKind) {
+            let r = self.record(slot, kind);
+            while r.refs() > 0 { r.drop_ref().unwrap(); }
+            r.reissue().unwrap();
+        }
     }
 
     impl SlotRecords for FakeRecords {
@@ -742,7 +746,7 @@ mod tests {
     }
 
     fn entry(slot: u32, generation: u32, kind: BlockKind) -> BlockEntry {
-        BlockEntry::new(Slot::new(slot).unwrap(), generation, 4096, kind)
+        BlockEntry::new(Slot::new(slot).unwrap(), generation, 4096, kind, 2)
     }
 
     fn handles(slot: u32, generation: u32) -> BlockHandles {
@@ -1194,9 +1198,9 @@ mod tests {
 
     #[test]
     fn entry_handles_come_back_as_johnnys_entries() {
-        let full = BlockEntry::new(Slot::new(3).unwrap(), 1, 4096, BlockKind::Full);
-        let win = BlockEntry::new(Slot::new(5).unwrap(), 2, 8192, BlockKind::Window);
-        let full2 = BlockEntry::new(Slot::new(4).unwrap(), 1, 4096, BlockKind::Full);
+        let full = BlockEntry::new(Slot::new(3).unwrap(), 1, 4096, BlockKind::Full, 2);
+        let win = BlockEntry::new(Slot::new(5).unwrap(), 2, 8192, BlockKind::Window, 2);
+        let full2 = BlockEntry::new(Slot::new(4).unwrap(), 1, 4096, BlockKind::Full, 2);
         let ha = BlockHandles::new(full, Some(win));
         let hb = BlockHandles::new(full2, None);
         let mut t: EntryTree = PrefixTree::new();

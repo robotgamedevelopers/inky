@@ -18,7 +18,7 @@ run_trace() {
     cp "$root"/specs/{StartTails.tla,StartTailsTrace.tla,StartTailsTrace.cfg} "$root/src/blocks.rs" "$dir/"
     cp "$root/scripts/blockbook-traces.rs" "$dir/main.rs"
     : > "$dir/tlc.log"
-    rustc --edition=2021 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
+    rustc --edition=2021 --cfg standalone_blocks "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
     "$dir/generate" > "$dir/StartTailsTraceData.tla" 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
     (cd "$dir" && "${TLC_JAVA:-java}" -Xmx2g -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
         -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
