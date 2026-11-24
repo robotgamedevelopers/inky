@@ -1,6 +1,8 @@
 //! Layer 3 block cache, the types the rest of the layer builds on.
 //!
-//! The GPU buffers and the attention read are not allocated here.
+//! The GPU buffers are not allocated here. A key read goes through the per-lane
+//! table (`BlockTable::read_key`): the `u64` stored on the entry, which `fill`
+//! took from `byte_offset`. It is not a position in the layer-2 contiguous cache.
 //! A block is 64 positions. A window block is 10 MiB and a full block is 2 MiB
 //! (DESIGN.md). Each kind has its own pool, so an offset is a plain `u64` byte
 //! offset in that pool: base 0 plus the 0-based pool index times the stride.
@@ -46,6 +48,10 @@ pub enum BlockError {
     OutOfRange,
     /// A reference count that is already zero cannot be dropped.
     Refs,
+    /// This kind's pool has no slots. A key cannot be read from it.
+    NoSlots,
+    /// The block is inside the table and no entry was filled.
+    NoEntry,
 }
 
 impl fmt::Display for BlockError {
@@ -57,6 +63,8 @@ impl fmt::Display for BlockError {
             BlockError::Length => write!(f, "block length past 64"),
             BlockError::OutOfRange => write!(f, "block index outside the table"),
             BlockError::Refs => write!(f, "block reference count is already zero"),
+            BlockError::NoSlots => write!(f, "pool has no slots"),
+            BlockError::NoEntry => write!(f, "block table has no entry"),
         }
     }
 }
@@ -197,6 +205,34 @@ impl BlockEntry {
     pub fn kind(&self) -> BlockKind { self.kind }
 }
 
+/// Where one key sits, as read from the lane table. `offset` is the entry's `u64`
+/// (from `byte_offset` at fill). `index` is the position inside that 64-key block.
+/// Neither is `pos % cap` in the layer-2 contiguous cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyAddr {
+    offset: u64,
+    index: u32,
+    slot: Slot,
+    generation: u32,
+    kind: BlockKind,
+}
+
+impl KeyAddr {
+    pub fn offset(&self) -> u64 { self.offset }
+    pub fn index(&self) -> u32 { self.index }
+    pub fn slot(&self) -> Slot { self.slot }
+    pub fn generation(&self) -> u32 { self.generation }
+    pub fn kind(&self) -> BlockKind { self.kind }
+
+    /// Byte offset of this position in its kind's pool.
+    /// `entry.offset() + index * (stride / 64)`. The stride is the whole block.
+    pub fn position_offset(&self) -> Result<u64, BlockError> {
+        let step = self.kind.stride().checked_div(BLOCK as u64).ok_or(BlockError::Overflow)?;
+        self.offset.checked_add(u64::from(self.index).checked_mul(step).ok_or(BlockError::Overflow)?)
+            .ok_or(BlockError::Overflow)
+    }
+}
+
 /// One kind's pool. This commit keeps the records and does not allocate GPU buffers.
 #[derive(Clone, Debug)]
 pub struct BlockPool {
@@ -234,6 +270,10 @@ impl BlockPools {
     pub fn stub() -> BlockPools {
         BlockPools { window: BlockPool::new(BlockKind::Window, 0), full: BlockPool::new(BlockKind::Full, 0) }
     }
+
+    pub fn of(&self, kind: BlockKind) -> &BlockPool {
+        match kind { BlockKind::Window => &self.window, BlockKind::Full => &self.full }
+    }
 }
 
 /// One lane's table. A missing entry inside the declared rows is no entry.
@@ -255,6 +295,31 @@ impl BlockTable {
     pub fn get(&self, kind: BlockKind, block: BlockIndex) -> Result<Option<BlockEntry>, BlockError> {
         let i = table_index(kind, block, self.blocks_per_kind)? as usize;
         Ok(self.entries.get(i).copied().flatten())
+    }
+
+    /// Write one entry. The stored offset is `byte_offset(pool.kind(), slot)`.
+    /// An empty pool is `NoSlots`, not a hole and not a layer-2 address.
+    /// This does not bump the slot's generation and does not allocate a buffer.
+    pub fn fill(&mut self, pool: &BlockPool, block: BlockIndex, slot: Slot, generation: u32) -> Result<(), BlockError> {
+        if pool.len() == 0 { return Err(BlockError::NoSlots); }
+        let _ = pool.record(slot)?;
+        let offset = byte_offset(pool.kind(), slot)?;
+        let i = table_index(pool.kind(), block, self.blocks_per_kind)? as usize;
+        let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
+        *cell = Some(BlockEntry::new(slot, generation, offset, pool.kind()));
+        Ok(())
+    }
+
+    /// The key at stream position `pos`. Block `pos / 64` is looked up in this table.
+    /// The `u64` is that entry's offset. A pool with no slots is `NoSlots`.
+    /// A hole inside the table is `NoEntry`. An index past the table is `OutOfRange`.
+    pub fn read_key(&self, pool: &BlockPool, pos: usize) -> Result<KeyAddr, BlockError> {
+        if pool.len() == 0 { return Err(BlockError::NoSlots); }
+        let block = BlockIndex::of_pos(pos)?;
+        let entry = self.get(pool.kind(), block)?.ok_or(BlockError::NoEntry)?;
+        let _ = pool.record(entry.slot())?;
+        let index = u32::try_from(pos % BLOCK).map_err(|_| BlockError::Overflow)?;
+        Ok(KeyAddr { offset: entry.offset(), index, slot: entry.slot(), generation: entry.generation(), kind: entry.kind() })
     }
 }
 
@@ -352,5 +417,79 @@ mod tests {
         assert_eq!(entry.offset(), 0);
         assert_eq!(entry.generation(), 1);
         assert_eq!(entry.slot().get(), 1);
+    }
+
+    #[test]
+    fn fill_stores_byte_offset_and_a_key_read_uses_the_table() {
+        let full = BlockPool::new(BlockKind::Full, 4);
+        let window = BlockPool::new(BlockKind::Window, 4);
+        let mut t = BlockTable::new(4).unwrap();
+        let slot = Slot::new(3).unwrap();
+        t.fill(&full, BlockIndex::new(0), slot, 4).unwrap();
+        t.fill(&window, BlockIndex::new(0), slot, 9).unwrap();
+        let stored = t.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap();
+        assert_eq!(stored.offset(), byte_offset(BlockKind::Full, slot).unwrap());
+        assert_eq!(stored.offset(), 2 * FULL_STRIDE);
+        assert_eq!(stored.generation(), 4);
+        assert_eq!(full.record(slot).unwrap().generation(), 0);
+        let key = t.read_key(&full, 0).unwrap();
+        assert_eq!(key.offset(), stored.offset());
+        assert_eq!(key.index(), 0);
+        assert_eq!(key.slot(), slot);
+        assert_eq!(key.generation(), 4);
+        assert_eq!(key.kind(), BlockKind::Full);
+        assert_eq!(key.position_offset().unwrap(), stored.offset());
+        assert_ne!(key.offset(), 0);
+        let at63 = t.read_key(&full, 63).unwrap();
+        let step = FULL_STRIDE / BLOCK as u64;
+        assert_eq!(at63.offset(), stored.offset());
+        assert_eq!(at63.index(), 63);
+        assert_eq!(at63.position_offset().unwrap(), stored.offset() + 63 * step);
+        assert_ne!(at63.position_offset().unwrap(), 63 * step);
+        let win = t.read_key(&window, 1).unwrap();
+        assert_eq!(win.offset(), byte_offset(BlockKind::Window, slot).unwrap());
+        assert_eq!(win.offset(), 2 * WINDOW_STRIDE);
+        assert_ne!(win.position_offset().unwrap(), key.position_offset().unwrap());
+        t.fill(&full, BlockIndex::new(1), Slot::new(1).unwrap(), 1).unwrap();
+        let next = t.read_key(&full, 64).unwrap();
+        assert_eq!(next.offset(), byte_offset(BlockKind::Full, Slot::new(1).unwrap()).unwrap());
+        assert_eq!(next.index(), 0);
+        assert_ne!(next.position_offset().unwrap(), stored.offset() + FULL_STRIDE);
+    }
+
+    #[test]
+    fn an_empty_pool_has_no_slots() {
+        let pools = BlockPools::stub();
+        let mut t = BlockTable::new(2).unwrap();
+        let err = t.fill(pools.of(BlockKind::Window), BlockIndex::new(0), Slot::new(1).unwrap(), 1).unwrap_err();
+        assert_eq!(err, BlockError::NoSlots);
+        assert_eq!(err.to_string(), "pool has no slots");
+        let err = t.read_key(pools.of(BlockKind::Full), 0).unwrap_err();
+        assert_eq!(err, BlockError::NoSlots);
+        assert_eq!(err.to_string(), "pool has no slots");
+        assert_eq!(pools.full.len(), 0);
+        assert_eq!(t.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), None);
+        let one = BlockPool::new(BlockKind::Full, 1);
+        assert_eq!(t.fill(&one, BlockIndex::new(0), Slot::new(2).unwrap(), 1), Err(BlockError::OutOfRange));
+        let empty_table = BlockTable::empty();
+        assert_eq!(empty_table.read_key(&one, 0), Err(BlockError::OutOfRange));
+        let sized = BlockPool::new(BlockKind::Window, 2);
+        let bare = BlockTable::new(4).unwrap();
+        assert_eq!(bare.read_key(&sized, 0), Err(BlockError::NoEntry));
+        assert_eq!(bare.read_key(&sized, 4 * BLOCK), Err(BlockError::OutOfRange));
+    }
+
+    #[test]
+    fn a_key_offset_is_a_u64_past_the_layer2_base() {
+        let index = u32::MAX / (WINDOW_STRIDE as u32) + 1;
+        let slot = Slot::new(index + 1).unwrap();
+        let pool = BlockPool::new(BlockKind::Window, (index + 1) as usize);
+        let mut t = BlockTable::new(1).unwrap();
+        t.fill(&pool, BlockIndex::new(0), slot, 1).unwrap();
+        let key = t.read_key(&pool, 0).unwrap();
+        let off = key.position_offset().unwrap();
+        assert_eq!(off, byte_offset(BlockKind::Window, slot).unwrap());
+        assert!(off > u64::from(u32::MAX));
+        assert!(u32::try_from(off).is_err());
     }
 }
