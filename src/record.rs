@@ -16,7 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCHEMA_VERSION: u32 = 1;
-const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 const MAX_TRACKED_CARDS: usize = 16_384;
 const MAX_CARD_ID_LEN: usize = 128;
 
@@ -305,6 +306,7 @@ struct Stats {
     written: AtomicUsize,
     dropped: AtomicUsize,
     write_errors: AtomicUsize,
+    rotations: AtomicUsize,
 }
 
 impl Stats {
@@ -313,6 +315,7 @@ impl Stats {
             written: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             write_errors: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
         }
     }
 }
@@ -326,37 +329,39 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    #[allow(dead_code)]
     pub fn new(dir: PathBuf) -> Self {
-        Self::with_capacity(dir, DEFAULT_QUEUE_CAPACITY)
+        Self::with_options(dir, DEFAULT_QUEUE_CAPACITY, DEFAULT_MAX_FILE_BYTES)
     }
 
     #[allow(dead_code)]
     pub fn with_capacity(dir: PathBuf, capacity: usize) -> Self {
+        Self::with_options(dir, capacity, DEFAULT_MAX_FILE_BYTES)
+    }
+
+    pub fn with_options(dir: PathBuf, capacity: usize, max_file_bytes: u64) -> Self {
         let (tx, rx) = sync_channel::<RecordEntry>(capacity.max(1));
         let stats = std::sync::Arc::new(Stats::new());
         let worker_stats = stats.clone();
         let worker = std::thread::spawn(move || {
             let mut dir_ready = false;
-            let mut warned = false;
             while let Ok(entry) = rx.recv() {
                 if !dir_ready {
                     match fs::create_dir_all(&dir) {
                         Ok(()) => dir_ready = true,
                         Err(e) => {
-                            worker_stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                            if !warned {
-                                warned = true;
-                                eprintln!("[record] failed to create {}: {e}", dir.display());
+                            let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n == 1 || n.is_power_of_two() {
+                                eprintln!("[record] failed to create {} (errors={n}): {e}", dir.display());
                             }
                             continue;
                         }
                     }
                 }
-                if let Err(e) = append_entry(&dir, &entry) {
-                    worker_stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                    if !warned {
-                        warned = true;
-                        eprintln!("[record] write failed in {}: {e}", dir.display());
+                if let Err(e) = append_entry(&dir, &entry, max_file_bytes, &worker_stats) {
+                    let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_power_of_two() {
+                        eprintln!("[record] write failed in {} (errors={n}): {e}", dir.display());
                     }
                 } else {
                     worker_stats.written.fetch_add(1, Ordering::Relaxed);
@@ -399,7 +404,6 @@ impl Recorder {
         }
     }
 
-    #[allow(dead_code)]
     pub fn written_count(&self) -> usize {
         self.stats.written.load(Ordering::Relaxed)
     }
@@ -408,9 +412,12 @@ impl Recorder {
         self.stats.dropped.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn write_error_count(&self) -> usize {
         self.stats.write_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn rotation_count(&self) -> usize {
+        self.stats.rotations.load(Ordering::Relaxed)
     }
 }
 
@@ -423,9 +430,80 @@ impl Drop for Recorder {
     }
 }
 
-fn append_entry(dir: &Path, entry: &RecordEntry) -> std::io::Result<()> {
+fn is_card_record_file(name: &str) -> bool {
+    name.starts_with("cards-") && (name.ends_with(".jsonl") || name.ends_with(".jsonl.1"))
+}
+
+fn rotate_and_prune(
+    dir: &Path,
+    filename: &str,
+    path: &Path,
+    needed_bytes: u64,
+    max_file_bytes: u64,
+    stats: &Stats,
+) -> std::io::Result<()> {
+    if max_file_bytes == 0 {
+        return Ok(());
+    }
+    let existing_len = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    let backup_name = format!("{filename}.1");
+    if existing_len > 0 && existing_len.saturating_add(needed_bytes) > max_file_bytes {
+        let backup = dir.join(&backup_name);
+        fs::rename(path, &backup)?;
+        stats.rotations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let max_total = max_file_bytes.saturating_mul(2);
+    let mut total: u64 = 0;
+    let mut older: Vec<(String, PathBuf, u64)> = Vec::new();
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if !is_card_record_file(&name) {
+            continue;
+        }
+        let meta = item.metadata()?;
+        let len = meta.len();
+        total = total.saturating_add(len);
+        if name != filename && name != backup_name {
+            older.push((name, item.path(), len));
+        }
+    }
+    // Older dated files sort chronologically by name (`cards-YYYYMMDD.jsonl*`),
+    // pruning `.1` before `.jsonl` for the same date.
+    older.sort_by(|a, b| {
+        let key = |n: &str| {
+            let is_active = !n.ends_with(".1");
+            (n.trim_end_matches(".1").to_string(), is_active)
+        };
+        key(&a.0).cmp(&key(&b.0))
+    });
+    for (_name, old_path, old_len) in older {
+        if total.saturating_add(needed_bytes) <= max_total {
+            break;
+        }
+        fs::remove_file(&old_path)?;
+        total = total.saturating_sub(old_len);
+    }
+    Ok(())
+}
+
+fn append_entry(
+    dir: &Path,
+    entry: &RecordEntry,
+    max_file_bytes: u64,
+    stats: &Stats,
+) -> std::io::Result<()> {
+    let line = serde_json::to_string(&entry.to_json())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let needed_bytes = (line.len() as u64).saturating_add(1);
     let filename = format!("cards-{}.jsonl", yyyymmdd_utc(entry.recorded_at_ms));
-    let path = dir.join(filename);
+    let path = dir.join(&filename);
+    rotate_and_prune(dir, &filename, &path, needed_bytes, max_file_bytes, stats)?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -439,8 +517,6 @@ fn append_entry(dir: &Path, entry: &RecordEntry) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let line = serde_json::to_string(&entry.to_json())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     writeln!(file, "{line}")?;
     file.flush()
 }
@@ -725,5 +801,113 @@ mod tests {
         assert!(rec.record(mk()));
         assert!(!rec.record(mk()), "full bounded queue must drop non-blockingly");
         assert_eq!(rec.dropped_count(), 1);
+    }
+
+    #[test]
+    fn recorder_rotates_bounded_jsonl_and_prunes_older_days() {
+        let dir = temp_dir("rotate");
+        let _ = fs::remove_dir_all(&dir);
+        let max_bytes = 900u64;
+        let day1 = 1_795_543_200_000u64; // 2026-11-24
+        let day2 = day1 + 86_400_000;
+        let day3 = day2 + 86_400_000;
+        let mk = |ts: u64, turn: u64| RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: ts,
+            card_id: "card-rot".into(),
+            turn_index: turn,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"messages": [{"role": "user", "content": format!("rotation payload turn {turn} with padding text")}]}),
+            response: ResponseMetrics {
+                prompt_tokens: 20,
+                completion_tokens: 10,
+                ttft_ms: 5,
+                total_ms: 25,
+                finish_reason: "stop".into(),
+                status_code: 200,
+            },
+        };
+        let stats = {
+            let rec = Recorder::with_options(dir.clone(), 64, max_bytes);
+            let s = rec.stats.clone();
+            for i in 0..20u64 {
+                assert!(rec.record(mk(day1 + i, i)));
+            }
+            drop(rec);
+            s
+        };
+        assert_eq!(stats.write_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.written.load(Ordering::Relaxed), 20);
+        assert!(stats.rotations.load(Ordering::Relaxed) >= 2, "expected rotations on day 1");
+
+        let active = dir.join("cards-20261124.jsonl");
+        let backup = dir.join("cards-20261124.jsonl.1");
+        assert!(active.exists() && backup.exists(), "must keep active and .1 backup");
+        assert!(!dir.join("cards-20261124.jsonl.2").exists(), "must cap at single .1 backup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&active).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let dir_bytes = || -> u64 {
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.metadata().unwrap().len())
+                .sum()
+        };
+        assert!(dir_bytes() <= max_bytes * 2, "day 1 total bytes {} exceeded cap {}", dir_bytes(), max_bytes * 2);
+
+        // Advance across days and verify older dated files are pruned to stay within 2*max_bytes.
+        {
+            let rec = Recorder::with_options(dir.clone(), 64, max_bytes);
+            for i in 0..8u64 {
+                assert!(rec.record(mk(day2 + i, 100 + i)));
+            }
+            for i in 0..8u64 {
+                assert!(rec.record(mk(day3 + i, 200 + i)));
+            }
+        }
+        assert!(dir_bytes() <= max_bytes * 2, "multi-day total bytes {} exceeded cap {}", dir_bytes(), max_bytes * 2);
+        assert!(!dir.join("cards-20261124.jsonl").exists(), "oldest day should be pruned");
+        assert!(dir.join("cards-20261126.jsonl").exists(), "latest day should remain");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_read_only_dir_counts_write_errors_without_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("ro");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let rec = Recorder::with_options(dir.clone(), 16, DEFAULT_MAX_FILE_BYTES);
+        let stats = rec.stats.clone();
+        for i in 0..4u64 {
+            assert!(rec.record(RecordEntry {
+                schema_version: SCHEMA_VERSION,
+                recorded_at_ms: 1_795_543_200_000 + i,
+                card_id: "card-ro".into(),
+                turn_index: i,
+                endpoint: "/v1/chat/completions".into(),
+                request: json!({"messages": [{"role": "user", "content": "hi"}]}),
+                response: ResponseMetrics {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    ttft_ms: 1,
+                    total_ms: 1,
+                    finish_reason: "stop".into(),
+                    status_code: 200,
+                },
+            }));
+        }
+        drop(rec);
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(stats.written.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.write_errors.load(Ordering::Relaxed), 4);
     }
 }

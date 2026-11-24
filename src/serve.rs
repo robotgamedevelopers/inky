@@ -35,6 +35,8 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       pub thinking_budget: usize,
                       /// optional directory for opt-in JSONL card traffic recording (`--record-dir`)
                       pub record_dir: Option<std::path::PathBuf>,
+                      /// max bytes per cards-YYYYMMDD.jsonl file before rotating to `.1`
+                      pub record_max_bytes: u64,
                       /// optional directory for Layer 4 lazy LRU SSD block spill (`--spill-dir`)
                       pub spill_dir: Option<std::path::PathBuf>,
                       /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
@@ -1553,16 +1555,23 @@ impl PermitPool {
 }
 
 fn health_body(cx: &Ctx) -> String {
-    json!({
-        "ok": true,
-        "active_lanes": cx.active_lanes.load(Ordering::Relaxed),
-        "inflight": cx.admission.inflight(),
-        "recommended_working_set_bytes": cx.budget.recommended_working_set_bytes,
-        "model_bytes": cx.budget.model_bytes,
-        "per_lane_worst_case_bytes": cx.budget.per_lane_worst_case_bytes,
-        "max_admitted_lanes": cx.budget.max_admitted_lanes,
-        "queued_requests": cx.admission.queued(),
-    }).to_string()
+    let mut obj = serde_json::Map::from_iter([
+        ("ok".into(), json!(true)),
+        ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
+        ("inflight".into(), json!(cx.admission.inflight())),
+        ("recommended_working_set_bytes".into(), json!(cx.budget.recommended_working_set_bytes)),
+        ("model_bytes".into(), json!(cx.budget.model_bytes)),
+        ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
+        ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
+        ("queued_requests".into(), json!(cx.admission.queued())),
+    ]);
+    if let Some(rec) = &cx.recorder {
+        obj.insert("record_written".into(), json!(rec.written_count()));
+        obj.insert("record_dropped".into(), json!(rec.dropped_count()));
+        obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
+        obj.insert("record_rotations".into(), json!(rec.rotation_count()));
+    }
+    Value::Object(obj).to_string()
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -2089,7 +2098,7 @@ pub fn serve(o: ServeOpts) {
     let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
-    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::new(d.clone())));
+    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
     if let Some(spill_dir) = &o.spill_dir {
         match crate::spill::SpillStore::open(spill_dir, o.max_spill_bytes) {
             Ok(store) => {
@@ -3764,5 +3773,23 @@ mod tests {
         assert_eq!(delta.1["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(delta.1["usage"]["input_tokens"], prompt_len - 40);
         assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    #[test] fn health_body_reports_recorder_telemetry_when_enabled() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-health-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::with_options(dir.clone(), 16, 4096));
+        let (mut cx, _jrx) = admission_test_ctx_with(2, 1, Duration::from_secs(1), 2);
+        cx.recorder = Some(rec);
+        let body: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["record_written"], 0);
+        assert_eq!(body["record_dropped"], 0);
+        assert_eq!(body["record_write_errors"], 0);
+        assert_eq!(body["record_rotations"], 0);
+        drop(cx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

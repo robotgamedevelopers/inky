@@ -76,6 +76,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
+  --record-max-bytes N
+                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
@@ -94,6 +96,14 @@ fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
     value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
 }
 
+fn parse_u64_positive(flag: &str, value: &str) -> Result<u64, String> {
+    let v: u64 = value.parse().map_err(|_| format!("{flag} requires a positive integer"))?;
+    if v == 0 {
+        return Err(format!("{flag} must be greater than 0"));
+    }
+    Ok(v)
+}
+
 fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
     let ctx = parse_usize(flag, value)?;
     if !(1..=MAX_CONTEXT).contains(&ctx) {
@@ -110,6 +120,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
+        record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
     };
     let mut bind = "127.0.0.1:8090";
@@ -139,6 +150,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
             "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
+            "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
@@ -193,6 +205,9 @@ mod cli_tests {
             (&["--api-key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
             (&["--record-dir"], "missing value for --record-dir"),
+            (&["--record-max-bytes"], "missing value for --record-max-bytes"),
+            (&["--record-max-bytes", "0"], "--record-max-bytes must be greater than 0"),
+            (&["--record-max-bytes", "abc"], "--record-max-bytes requires a positive integer"),
             (&["--spill-dir"], "missing value for --spill-dir"),
             (&["--max-spill-bytes"], "missing value for --max-spill-bytes"),
             (&["--max-spill-bytes", "bad"], "--max-spill-bytes requires a nonnegative integer"),
@@ -209,7 +224,9 @@ mod cli_tests {
     #[test]
     fn serve_checks_the_addresses_it_will_bind() {
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
+        assert_eq!(serve_args(&[]).unwrap().record_max_bytes, record::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
+        assert_eq!(serve_args(&["--record-max-bytes", "4096"]).unwrap().record_max_bytes, 4096);
         assert_eq!(serve_args(&[]).unwrap().spill_dir, None);
         assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
         let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576"]).unwrap();
