@@ -150,7 +150,9 @@ Evict(s) ==
     /\ sealed' = {t \in sealed : ~IsPrefix(s, t)}
     /\ starts' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE starts[x]]
     /\ refs' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE refs[x]]
-    /\ UNCHANGED <<slotOf, genOf, poolGen, result, sought>>
+    /\ slotOf' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE slotOf[x]]
+    /\ genOf' = [x \in BlockSeqs |-> IF IsPrefix(s, x) THEN 0 ELSE genOf[x]]
+    /\ UNCHANGED <<poolGen, result, sought>>
 
 FirstTokenMatch(p, r) ==
     /\ Len(p) <= Len(r)
@@ -191,7 +193,9 @@ Seek ==
     /\ starts' = [x \in BlockSeqs |-> IF x \in Evicted THEN 0 ELSE starts[x]]
     /\ refs' = [x \in BlockSeqs |->
            IF Bug = "leak" \/ x \notin Evicted THEN refs[x] ELSE 0]
-    /\ UNCHANGED <<slotOf, genOf, poolGen>>
+    /\ slotOf' = [x \in BlockSeqs |-> IF x \in Evicted THEN 0 ELSE slotOf[x]]
+    /\ genOf' = [x \in BlockSeqs |-> IF x \in Evicted THEN 0 ELSE genOf[x]]
+    /\ UNCHANGED <<poolGen>>
 
 Next ==
     \/ \E s \in BlockSeqs, slot \in Slots : Seal(s, slot)
