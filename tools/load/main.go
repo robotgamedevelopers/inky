@@ -68,12 +68,19 @@ func main() {
 				Usage struct {
 					CompletionTokens int `json:"completion_tokens"`
 				} `json:"usage"`
+				Timings struct {
+					PredictedPerSecond float64 `json:"predicted_per_second"`
+				} `json:"timings"`
 			}
 			if err := json.Unmarshal(b, &v); err != nil || v.Usage.CompletionTokens == 0 {
 				out[i].err = fmt.Errorf("bad response: %.200s", b)
 				return
 			}
-			out[i] = res{toks: v.Usage.CompletionTokens, rate: float64(v.Usage.CompletionTokens) / elapsed}
+			rate := v.Timings.PredictedPerSecond
+			if rate <= 0 && elapsed > 0 {
+				rate = float64(v.Usage.CompletionTokens) / elapsed
+			}
+			out[i] = res{toks: v.Usage.CompletionTokens, rate: rate}
 		}(i)
 	}
 	wg.Wait()

@@ -1,8 +1,8 @@
 # Lanes: design
 
-Status: design, 2026-11-22. Nothing here is built. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
+Status (2026-11-24): Layers 1–2 (multi-lane Metal engine) and `inky serve` (OpenAI Chat Completions + Anthropic Messages HTTP server, ahead of the block cache) are built and running in CI; Layer 3 (pooled 64-token block tree and start-point restore) is in progress. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
 
-One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` is upstream with its licence, and the branch `tracer-serve` holds the one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
+One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` builds and serves the multi-lane engine (`inky serve`), while the historical branch `tracer-serve` held the initial one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
 
 ## What is measured (M5 Max, 128 GB, 2026-11-22)
 
@@ -103,6 +103,7 @@ Tried and reverted: decode-step experts with the decode path's f32 dot products 
 6. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
 7. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
 8. **The Mac only generates tokens.** Harness and tools run on other machines and reach it over a private network.
+9. **Release builds abort on panic (`[profile.release] panic = "abort"`).** Raw-pointer GPU arenas cannot safely continue or unwind after a thread panic in release builds; recoverable parse and input boundaries (such as GGUF loading and CLI validation) return `Result` errors before touching GPU state.
 
 ## Blocks
 

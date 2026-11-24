@@ -24,6 +24,7 @@ func TestLoadProgram(t *testing.T) {
 		success bool
 	}{
 		{"successful response without timings", 200, `{"usage":{"completion_tokens":10}}`, true},
+		{"server timings preferred when present", 200, `{"usage":{"completion_tokens":10},"timings":{"predicted_per_second":88.5}}`, true},
 		{"http error", 500, `{"usage":{"completion_tokens":10}}`, false},
 		{"missing usage", 200, `{}`, false},
 	} {
@@ -42,6 +43,9 @@ func TestLoadProgram(t *testing.T) {
 			}
 			if tc.success && (!strings.Contains(string(out), "per-request-median=") || strings.Contains(string(out), "per-request-median=0.0")) {
 				t.Fatalf("missing measured rate: %s", out)
+			}
+			if tc.name == "server timings preferred when present" && !strings.Contains(string(out), "per-request-median=88.5") {
+				t.Fatalf("expected server timings rate 88.5, got: %s", out)
 			}
 		})
 	}

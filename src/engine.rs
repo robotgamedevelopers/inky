@@ -416,10 +416,8 @@ impl VecAlloc {
 }
 
 pub struct Engine {
-    // Drop the no-copy Metal buffer before unmapping the file it borrows.
+    // Drop all Metal buffers (including the no-copy weights buffer `w`) before `gpu` and `g` (which unmaps the file).
     w: Buf,
-    pub g: Gguf,
-    pub gpu: Gpu,
     pub pb: Buf, ctr: Buf,
     /// activations: the small decode arena, followed by the batch (prefill) arena while a prefill needs one
     act: std::cell::RefCell<Buf>,
@@ -448,6 +446,9 @@ pub struct Engine {
     verify_keep: RefCell<Option<VerifyKeep>>,
     /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
     verify_record: Cell<bool>,
+    // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
+    pub gpu: Gpu,
+    pub g: Gguf,
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.

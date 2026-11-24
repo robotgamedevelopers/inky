@@ -39,7 +39,7 @@ impl Sampler {
     pub fn sample_next(&mut self, logits: &[f32]) -> Result<u32, &'static str> {
         let Some(&first) = logits.first() else { return Err("model returned no logits") };
         if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
-        if self.greedy() {
+        if self.greedy() || self.temp < 1e-5 {
             let (mut best, mut token) = (first, 0);
             for (i, &x) in logits.iter().enumerate() {
                 if !x.is_finite() { return Err("model returned non-finite logits"); }
@@ -84,23 +84,26 @@ impl Sampler {
         Ok(self.cand[last].1)
     }
 
-    /// One drafted position. Draw from q, accept with min(1, p/q), else draw `norm(max(0, p-q))`.
-    /// Every uniform comes from this sampler. `temp <= 0` does not belong here.
+    /// One drafted position. Given the actual drafted token `draft_tok` drawn from `q`, accept with
+    /// `min(1, p/q)`, else draw `norm(max(0, p-q))`. Every uniform comes from this sampler.
+    /// `temp <= 0` does not belong here.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn reject_one(&mut self, target: &[f32], draft: &[f32]) -> u32 {
-        self.reject_at(target, draft).0
+    pub fn reject_one(&mut self, draft_tok: u32, target: &[f32], draft: &[f32]) -> u32 {
+        self.reject_at(draft_tok, target, draft).0
     }
 
-    /// One verify round on the probabilistic path. `target_rows` is the draft positions plus the
-    /// bonus row. A rejection stops the round. The bonus draw, when every draft is accepted, uses
-    /// this same stream. One call is one round: it is not reseeded per emitted token.
+    /// One verify round on the probabilistic path. `draft_tokens` are the actual drafted tokens
+    /// fed into the target forward pass; `target_rows` is those draft positions plus the bonus row.
+    /// A rejection stops the round. The bonus draw, when every draft is accepted, uses this same
+    /// stream. One call is one round: it is not reseeded per emitted token.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn verify_round(&mut self, target_rows: &[&[f32]], draft_rows: &[&[f32]]) -> Vec<u32> {
+    pub fn verify_round(&mut self, draft_tokens: &[u32], target_rows: &[&[f32]], draft_rows: &[&[f32]]) -> Vec<u32> {
         assert!(self.temp > 0.0, "greedy does not reject");
+        assert_eq!(draft_tokens.len(), draft_rows.len(), "one draft token per draft row");
         assert_eq!(target_rows.len(), draft_rows.len() + 1, "one target row per draft token, plus the bonus");
         let mut out = Vec::with_capacity(target_rows.len());
         for i in 0..draft_rows.len() {
-            let (tok, accepted) = self.reject_at(target_rows[i], draft_rows[i]);
+            let (tok, accepted) = self.reject_at(draft_tokens[i], target_rows[i], draft_rows[i]);
             out.push(tok);
             if !accepted { return out; }
         }
@@ -108,11 +111,10 @@ impl Sampler {
         out
     }
 
-    fn reject_at(&mut self, target: &[f32], draft: &[f32]) -> (u32, bool) {
+    fn reject_at(&mut self, draft_tok: u32, target: &[f32], draft: &[f32]) -> (u32, bool) {
         assert!(self.temp > 0.0, "greedy does not reject");
         let masses = self.masses(target, draft);
-        let q: Vec<(u32, f32)> = masses.iter().filter(|m| m.q > 0.0).map(|m| (m.token, m.q)).collect();
-        let x = self.draw_dist(&q);
+        let x = draft_tok;
         let px = prob_of(&masses, x, true);
         let qx = prob_of(&masses, x, false);
         // p >= q accepts without a draw; the uniform is only the case that can reject
@@ -131,6 +133,7 @@ impl Sampler {
     }
 
     fn draw_dist(&mut self, dist: &[(u32, f32)]) -> u32 {
+        assert!(!dist.is_empty(), "empty sampling distribution");
         let total: f32 = dist.iter().map(|d| d.1).sum();
         let mut r = self.next_f32() * total;
         for &(tok, p) in dist {
@@ -202,9 +205,18 @@ fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<
 fn side_probs(cand: &mut Vec<(f32, u32)>, zeros: &[u32], softcap: f32, temp: f32, top_p: f32) -> Vec<(u32, f32)> {
     if cand.is_empty() { return Vec::new(); }
     cand.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let scaled: Vec<f32> = cand.iter().map(|&(x, _)| (if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x }) / temp).collect();
-    let m = scaled[0];
-    let mut pr: Vec<f32> = scaled.iter().map(|&x| (x - m).exp()).collect();
+    let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
+    let max = capped(cand[0].0);
+    let scaled_max = max / temp;
+    let mut pr: Vec<f32> = cand.iter().map(|&(x, _)| {
+        let x = capped(x);
+        if temp < 1e-5 {
+            if x == max { 1.0 } else { 0.0 }
+        } else {
+            let centered = if scaled_max.is_finite() { x / temp - scaled_max } else { (x - max) / temp };
+            centered.exp()
+        }
+    }).collect();
     let sum: f32 = pr.iter().sum();
     for v in pr.iter_mut() { *v /= sum; }
     let mut rows: Vec<(u32, f32)> = cand.iter().zip(pr).map(|(&(_, tok), p)| (tok, p)).collect();
@@ -343,8 +355,12 @@ mod tests {
 
         let n = 30_000u32;
         let mut counts = vec![0u32; target.len()];
+        let mut draft_rng = Sampler::draft(TEMP, K, TOP_P, SOFTCAP, 0x51E3_0001);
         let mut rng = Sampler::draft(TEMP, K, TOP_P, SOFTCAP, 0x51E3_0003);
-        for _ in 0..n { counts[rng.reject_one(&target, &draft) as usize] += 1; }
+        for _ in 0..n {
+            let x = draft_rng.sample(&draft);
+            counts[rng.reject_one(x, &target, &draft) as usize] += 1;
+        }
         assert!(counts[argmax as usize] > 0, "the residual draw can emit the target argmax");
         assert_eq!(counts[0], 0, "p=0 is not emitted, including a draft token the target dropped");
         assert_eq!(counts[150], 0, "outside the union is not emitted");
@@ -360,6 +376,38 @@ mod tests {
     }
 
     #[test]
+    fn verify_round_evaluates_supplied_draft_tokens_not_cpu_redraw() {
+        let (target, draft) = logits();
+        // Token 0 has p=0, q>0: must ALWAYS reject regardless of RNG and emit from target residual.
+        let mut s1 = Sampler::new(TEMP, K, TOP_P, SOFTCAP, 0x1234);
+        let out = s1.verify_round(&[0, 10], &[&target, &target, &target], &[&draft, &draft]);
+        assert_eq!(out.len(), 1, "rejection on the first drafted token stops the round");
+        assert_ne!(out[0], 0, "p(0)==0 must never be accepted");
+
+        // Identical target & draft: p == q > 0 for drafted tokens 10 and 11, so BOTH exact drafted tokens
+        // are accepted without consuming an acceptance uniform, followed by the bonus sample.
+        let mut s2 = Sampler::new(TEMP, K, TOP_P, SOFTCAP, 0x5678);
+        let out2 = s2.verify_round(&[10, 11], &[&target, &target, &target], &[&target, &target]);
+        assert_eq!(out2.len(), 3);
+        assert_eq!(&out2[..2], &[10, 11], "accepted tokens must be the exact supplied draft_tokens");
+    }
+
+    #[test]
+    fn tiny_temperature_never_panics_in_sample_or_verify_round() {
+        let (target, draft) = logits();
+        for temp in [1e-37_f32, f32::from_bits(1)] {
+            let mut s = Sampler::new(temp, 8, 0.9, SOFTCAP, 7);
+            assert_eq!(s.sample_next(&target), Ok(100));
+            // draft argmax is 0 (where p=0), so verify_round rejects and draws from target argmax (100) without panicking.
+            let out = s.verify_round(&[0], &[&target, &target], &[&draft]);
+            assert_eq!(out, vec![100]);
+            // identical rows accept the argmax draft token and emit the argmax bonus token.
+            let out_same = s.verify_round(&[100], &[&target, &target], &[&target]);
+            assert_eq!(out_same, vec![100, 100]);
+        }
+    }
+
+    #[test]
     fn draft_sampler_mixed_once_per_request_not_reseeded_per_round() {
         let seed = 0xA11C_E5EDu64;
         let mut draft = Sampler::draft(TEMP, K, TOP_P, SOFTCAP, seed);
@@ -370,22 +418,24 @@ mod tests {
 
         let (tg, dr) = logits();
         let target_state = target.state;
-        let _ = draft.reject_one(&tg, &dr);
+        let _ = draft.reject_one(0, &tg, &dr);
         assert_eq!(target.state, target_state, "rejection draws do not advance the emit stream");
 
-        // identical logits: p == q, so the draft is accepted and one round emits the drafts plus the bonus
+        // identical logits: p == q, so the supplied draft tokens are accepted and one round emits the drafts plus the bonus
         let row = tg.clone();
+        let drafted = [100u32, 10];
         let mut round = Sampler::draft(0.7, 8, 1.0, SOFTCAP, seed);
         let before = round.state;
-        let out = round.verify_round(&[&row, &row, &row], &[&row, &row]);
+        let out = round.verify_round(&drafted, &[&row, &row, &row], &[&row, &row]);
         assert_eq!(out.len(), 3, "one round may emit more than one token");
+        assert_eq!(&out[..2], &drafted);
         assert_ne!(round.state, before);
         let mut continued = Sampler::draft(0.7, 8, 1.0, SOFTCAP, seed);
-        let _ = continued.verify_round(&[&row, &row, &row], &[&row, &row]);
+        let _ = continued.verify_round(&drafted, &[&row, &row, &row], &[&row, &row]);
         let after_first = continued.state;
-        let second = continued.verify_round(&[&row, &row, &row], &[&row, &row]);
+        let second = continued.verify_round(&drafted, &[&row, &row, &row], &[&row, &row]);
         let mut reseeded = Sampler::draft(0.7, 8, 1.0, SOFTCAP, seed);
-        let repeated = reseeded.verify_round(&[&row, &row, &row], &[&row, &row]);
+        let repeated = reseeded.verify_round(&drafted, &[&row, &row, &row], &[&row, &row]);
         assert_eq!(repeated, out, "the same request seed repeats the first round");
         assert_ne!(second, repeated, "the next round continues; it is not a reseed");
         assert_ne!(continued.state, after_first);

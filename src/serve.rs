@@ -2039,6 +2039,49 @@ mod tests {
         assert!(out.checks.get() > 0);
     }
 
+    #[test] fn chat_and_messages_streams_poll_during_silent_tool_json() {
+        struct Gone { bytes: Vec<u8>, checks: std::cell::Cell<usize> }
+        impl Write for Gone {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.bytes.extend_from_slice(buf); Ok(buf.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for Gone {
+            fn client_gone(&self) -> bool { self.checks.set(self.checks.get() + 1); true }
+        }
+        for use_chat in [true, false] {
+            let tk = Tokenizer::for_test();
+            let sp = test_sp(&tk);
+            let payload_tok = tk.encode("a", false)[0];
+            let (jtx, jrx) = channel::<Job>();
+            let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
+                max_tokens: 64, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                inflight: PermitPool::new(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), conns: Default::default() };
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().unwrap();
+                let mut sent = 0usize;
+                if job.out.send(Ev::Tok(sp.c_tool)).is_ok() {
+                    sent += 1;
+                    for _ in 0..512 {
+                        if job.out.send(Ev::Tok(payload_tok)).is_err() { break; }
+                        sent += 1;
+                    }
+                }
+                sent
+            });
+            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
+            if use_chat {
+                chat(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+            } else {
+                messages(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+            }
+            drop(cx);
+            let sent = scheduler.join().unwrap();
+            assert!(String::from_utf8_lossy(&out.bytes).starts_with("HTTP/1.1 200"), "use_chat={use_chat} expected 200 stream");
+            assert!(out.checks.get() > 0, "use_chat={use_chat} must poll client_gone during silent tool JSON");
+            assert!(sent < 513, "use_chat={use_chat} must abort stream early on disconnect (sent={sent})");
+        }
+    }
+
     #[test] fn over_cap_messages_clamp_the_budget_or_read_as_too_long() {
         // Rowan's live case: 108,582 prompt tokens + max_tokens 32,000 in a
         // 131,072 context must clamp, not die; a prompt past the context

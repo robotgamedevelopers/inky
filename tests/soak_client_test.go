@@ -56,7 +56,9 @@ func TestSoakVerdict(t *testing.T) {
 	}{
 		{"success", 200, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", true},
 		{"all workload rejected", 400, "bad request", false},
+		{"all 429 zero workload fails", 429, "overloaded", false},
 		{"truncated stream", 200, "data: [DONE]\n\n", false},
+		{"mid-stream error", 200, "data: {\"error\":{\"message\":\"boom\"}}\n\ndata: [DONE]\n\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var count atomic.Int64
@@ -64,7 +66,7 @@ func TestSoakVerdict(t *testing.T) {
 				count.Add(1)
 				var req chatReq
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				if tc.name == "all workload rejected" && req.MaxTokens == 8 {
+				if (tc.name == "all workload rejected" || tc.name == "all 429 zero workload fails") && req.MaxTokens == 8 {
 					fmt.Fprint(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 					return
 				}

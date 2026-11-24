@@ -5,12 +5,13 @@
 //! models the helper.
 
 use std::fs::{self, Metadata, OpenOptions, Permissions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,15 +100,42 @@ fn set_limit(v: u64) -> Result<(), String> {
 }
 
 fn read_saved(path: &str) -> Result<Option<u64>, String> {
+    match read_saved_record(path, None)? {
+        SavedRecord::Absent | SavedRecord::StaleBoot(_, _) => Ok(None),
+        SavedRecord::Current(v) => Ok(Some(v)),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SavedRecord {
+    Absent,
+    StaleBoot(i64, u64),
+    Current(u64),
+}
+
+fn read_saved_record(path: &str, current_boot: Option<i64>) -> Result<SavedRecord, String> {
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.is_file() => {}
         Ok(_) => return Err(format!("the saved limit at {path} is not a regular file")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SavedRecord::Absent),
         Err(e) => return Err(format!("could not inspect the saved limit at {path}: {e}")),
     }
     let value = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read the saved limit at {path}: {e}"))?;
-    value.trim().parse::<u32>().map(|v| Some(u64::from(v)))
+    let trimmed = value.trim();
+    if let Some((boot_str, limit_str)) = trimmed.split_once(':') {
+        let boot = boot_str.parse::<i64>()
+            .map_err(|e| format!("could not parse the saved boot time at {path}: {e}"))?;
+        let limit = limit_str.parse::<u32>()
+            .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))?;
+        if let Some(now_boot) = current_boot {
+            if boot != now_boot {
+                return Ok(SavedRecord::StaleBoot(boot, u64::from(limit)));
+            }
+        }
+        return Ok(SavedRecord::Current(u64::from(limit)));
+    }
+    trimmed.parse::<u32>().map(|v| SavedRecord::Current(u64::from(v)))
         .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))
 }
 
@@ -237,6 +265,88 @@ fn bind_socket(path: &Path, owner: u32, directory_uid: u32, fake: bool) -> Resul
     Ok(listener)
 }
 
+const MAX_MEMD_LINE: usize = 256;
+const MAX_MEMD_CLIENTS: usize = 256;
+
+fn boot_time_sec() -> Option<i64> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<libc::timeval>() && tv.tv_sec > 0).then_some(tv.tv_sec as i64)
+}
+
+fn write_saved_atomic(path: &str, value: u64, boot: Option<i64>) -> Result<(), String> {
+    let tmp = format!("{path}.tmp");
+    let body = match boot {
+        Some(sec) => format!("{sec}:{value}\n"),
+        None => format!("{value}\n"),
+    };
+    (|| -> io::Result<()> {
+        let mut f = OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
+    })()
+    .map_err(|e| format!("could not record the saved limit in {path}: {e}"))
+}
+
+fn restore_on_startup_for_boot(
+    saved_path: &str,
+    current_boot: Option<i64>,
+    set: impl Fn(u64) -> Result<(), String>,
+    keep: impl Fn(Option<u64>) -> Result<(), String>,
+) -> Result<Mode, String> {
+    match read_saved_record(saved_path, current_boot)? {
+        SavedRecord::Absent => Ok(Mode::default()),
+        SavedRecord::StaleBoot(old_boot, old_val) => {
+            eprintln!("[inky memd] ignoring stale saved limit {old_val} from earlier boot {old_boot}");
+            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            Ok(Mode::default())
+        }
+        SavedRecord::Current(_) => restore_on_startup(saved_path, set, keep),
+    }
+}
+
+fn read_bounded_line<R: BufRead>(r: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut line = String::new();
+    let n = r.by_ref().take((max_bytes + 1) as u64).read_line(&mut line)?;
+    if n == 0 { return Ok(None); }
+    if line.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "memd line too long"));
+    }
+    Ok(Some(line))
+}
+
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl ClientGuard {
+    fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut cur = active.load(Ordering::Acquire);
+        loop {
+            if cur >= limit { return None; }
+            match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(active.clone())),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let (mut uid, mut gid) = (0, 0);
     (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
@@ -275,16 +385,17 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let set: Arc<dyn Fn(u64) -> Result<(), String> + Send + Sync> = if fake { Arc::new(move |v| { *fl2.lock().unwrap() = v; eprintln!("[inky memd] (fake) limit = {v}"); Ok(()) }) } else { Arc::new(set_limit) };
     // the saved limit on disk (beside the socket with --fake, so tests need no root)
     let saved_path = if fake { format!("{path}.saved") } else { SAVED.to_string() };
+    let boot_time = boot_time_sec();
     let sp = saved_path.clone();
     let keep: Arc<dyn Fn(Option<u64>) -> Result<(), String> + Send + Sync> = Arc::new(move |v| match v {
-        Some(v) => { let tmp = format!("{sp}.tmp"); std::fs::write(&tmp, v.to_string()).and_then(|_| std::fs::rename(&tmp, &sp)).map_err(|e| format!("could not record the saved limit in {sp}: {e}")) }
+        Some(v) => write_saved_atomic(&sp, v, boot_time),
         None => match std::fs::remove_file(&sp) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(format!("could not forget the saved limit in {sp}: {e}")) },
     });
     // a helper that died while the limit was raised left the limit it found on disk: put it back first (`set`
     // confirms by reading back, so its Ok is the confirmation). If the restore fails, the file is kept and Mode is
     // seeded from it below, so the first connect restores that limit instead of reading the still-raised limit
-    // as the found one and overwriting the file with it.
-    let mode = Arc::new(Mutex::new(restore_on_startup(&saved_path, |v| set(v), |v| keep(v))?));
+    // as the found one and overwriting the file with it. Saved files from an earlier macOS boot are ignored.
+    let mode = Arc::new(Mutex::new(restore_on_startup_for_boot(&saved_path, boot_time, |v| set(v), |v| keep(v))?));
     // SIGTERM (launchctl bootout) and SIGINT: give the memory back, then exit (`set` confirms by reading back,
     // so its Ok is the confirmation; Mode::close keeps its own read-back because its `set` is injected)
     {
@@ -312,25 +423,31 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
         });
     }
     let listener = bind_socket(Path::new(path), owner, uid, fake)?;
+    let active_clients = Arc::new(AtomicUsize::new(0));
     eprintln!("[inky memd] tuning {} ({chip}, {} GB): inky mode raises {LIMIT} to {target}; listening on {path}", tuning.name, tuning.memory_gb);
     for s in listener.incoming() {
         let Ok(s) = s else { continue };
         // The socket owner can change its mode, so also check the kernel-supplied peer UID.
         if !peer_uid(&s).is_some_and(|uid| uid == owner || uid == 0) { continue; }
+        let Some(slot) = ClientGuard::try_acquire(&active_clients, MAX_MEMD_CLIENTS) else {
+            let _ = (&s).write_all(b"err too many clients\n");
+            continue;
+        };
         let (mode, get, set, keep) = (mode.clone(), get.clone(), set.clone(), keep.clone());
         std::thread::spawn(move || {
+            let _slot = slot;
             let mut r = BufReader::new(&s);
-            let mut line = String::new();
-            if r.read_line(&mut line).unwrap_or(0) == 0 || !line.starts_with("enter") { return; }
+            let Ok(Some(line)) = read_bounded_line(&mut r, MAX_MEMD_LINE) else { return; };
+            if !line.starts_with("enter") { return; }
             if let Err(e) = mode.lock().unwrap().connect(target, || get(), |v| set(v), |v| keep(v)) {
                 eprintln!("[inky memd] refused a client: {e}");
                 let _ = (&s).write_all(format!("err {e}\n").as_bytes());
                 return;
             }
             let _ = (&s).write_all(format!("ok {target}\n").as_bytes());
-            // hold until the client's end closes, however it closes
-            let mut sink = String::new();
-            while r.read_line(&mut sink).unwrap_or(0) > 0 { sink.clear(); }
+            // hold until the client's end closes, however it closes, without allocating per byte
+            let mut sink = [0u8; 256];
+            while r.read(&mut sink).unwrap_or(0) > 0 {}
             mode.lock().unwrap().close(|| get(), |v| set(v), |v| keep(v));
         });
     }
@@ -343,8 +460,8 @@ pub fn enter(path: &str) -> Option<u64> {
     let s = UnixStream::connect(path).ok()?;
     if path == SOCKET && peer_uid(&s) != Some(0) { return None; }
     (&s).write_all(format!("enter {}\n", std::process::id()).as_bytes()).ok()?;
-    let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line).ok()?;
+    let mut r = BufReader::new(&s);
+    let line = read_bounded_line(&mut r, MAX_MEMD_LINE).ok()??;
     let v = line.strip_prefix("ok ")?.trim().parse().ok()?;
     Box::leak(Box::new(s));     // held open until the process exits
     Some(v)
@@ -458,10 +575,15 @@ fn uninstall_helper() -> Result<(), String> {
     let dir = socket_directory(path)?;
     check_system_socket_ancestors(dir)?;
     // The stopped helper may have left its recovery record if it could not confirm the restore.
-    // Keep the record and installed files intact until recovery is confirmed here.
-    if let Some(value) = read_saved(SAVED)? {
-        set_limit(value).map_err(|e| format!("restoring {value} failed: {e}; kept {SAVED} and the helper"))?;
-        remove_file_if_present(Path::new(SAVED))?;
+    // Keep the record and installed files intact until recovery is confirmed here; discard stale
+    // records left from an earlier boot.
+    match read_saved_record(SAVED, boot_time_sec())? {
+        SavedRecord::Current(value) => {
+            set_limit(value).map_err(|e| format!("restoring {value} failed: {e}; kept {SAVED} and the helper"))?;
+            remove_file_if_present(Path::new(SAVED))?;
+        }
+        SavedRecord::StaleBoot(_, _) => remove_file_if_present(Path::new(SAVED))?,
+        SavedRecord::Absent => {}
     }
     checked_directory(Path::new("/Library"), 0)?;
     for dir in [Path::new(HELPER_DIR), Path::new(PLIST).parent().unwrap()] {
@@ -515,7 +637,7 @@ fn install_helper() -> Result<(), String> {
     let dir = socket_directory(socket)?;
     check_system_socket_ancestors(dir)?;
     stop_helper()?;
-    read_saved(SAVED)?;
+    read_saved_record(SAVED, boot_time_sec())?;
     retire_legacy_socket(Path::new(OLD_SOCKET_DIR))?;
     prepare_socket_directory(dir, 0, false)?;
     remove_socket(socket)?;
@@ -740,5 +862,62 @@ mod tests {
         m.clients = 1;
         m.close(|| Some(lim.get()), |_| Ok(()), |v| { disk.set(v); Ok(()) });
         assert_eq!((lim.get(), m.saved, disk.get()), (118000, Some(50000), Some(50000)));
+    }
+    #[test]
+    fn bounded_line_and_client_guard_enforce_limits() {
+        let mut ok_reader = io::Cursor::new(b"enter 12345\n".as_slice());
+        assert_eq!(read_bounded_line(&mut ok_reader, MAX_MEMD_LINE).unwrap().as_deref(), Some("enter 12345\n"));
+        assert_eq!(read_bounded_line(&mut ok_reader, MAX_MEMD_LINE).unwrap(), None);
+
+        let oversized = vec![b'x'; MAX_MEMD_LINE + 16];
+        let mut bad_reader = io::Cursor::new(oversized.as_slice());
+        assert_eq!(read_bounded_line(&mut bad_reader, MAX_MEMD_LINE).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let g1 = ClientGuard::try_acquire(&active, 2).unwrap();
+        let g2 = ClientGuard::try_acquire(&active, 2).unwrap();
+        assert!(ClientGuard::try_acquire(&active, 2).is_none());
+        drop(g1);
+        let g3 = ClientGuard::try_acquire(&active, 2).unwrap();
+        drop(g2);
+        drop(g3);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn boot_tagged_saved_limit_ignores_prior_boot_and_syncs_atomically() {
+        let base = std::env::current_dir().unwrap().join(format!("inky-memd-boot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        let path = base.join("saved");
+        let name = path.to_str().unwrap();
+
+        write_saved_atomic(name, 50000, Some(1_700_000_000)).unwrap();
+        assert_eq!(read_saved_record(name, Some(1_700_000_000)), Ok(SavedRecord::Current(50000)));
+        assert_eq!(read_saved_record(name, Some(1_700_009_999)), Ok(SavedRecord::StaleBoot(1_700_000_000, 50000)));
+
+        // Stale boot record is ignored (no set() call) and cleaned up via keep(None).
+        let removed = Cell::new(false);
+        let mode = restore_on_startup_for_boot(
+            name,
+            Some(1_700_009_999),
+            |_| panic!("stale pre-reboot saved limit must not be restored"),
+            |v| { assert_eq!(v, None); removed.set(true); let _ = fs::remove_file(name); Ok(()) },
+        ).unwrap();
+        assert!(removed.get());
+        assert_eq!(mode.saved, None);
+        assert!(!path.exists());
+
+        // Current boot record IS restored.
+        write_saved_atomic(name, 50000, Some(1_700_009_999)).unwrap();
+        let restored = Cell::new(None);
+        let mode2 = restore_on_startup_for_boot(
+            name,
+            Some(1_700_009_999),
+            |v| { restored.set(Some(v)); Ok(()) },
+            |v| { assert_eq!(v, None); fs::remove_file(name).map_err(|e| e.to_string()) },
+        ).unwrap();
+        assert_eq!(restored.get(), Some(50000));
+        assert_eq!(mode2.saved, None);
+        fs::remove_dir_all(&base).unwrap();
     }
 }

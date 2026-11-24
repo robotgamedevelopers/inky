@@ -6,7 +6,7 @@
 
 **The target is the Apple M5 Max MacBook Pro with 128 GB of memory**: inky is tuned and measured on it. The next target is an M5 Ultra Mac Studio. inky needs an M5 or later (Metal 4 and the GPU neural accelerators).
 
-**The model runs exactly as published, lossless.** No change to Inkling 2 Mini: no quantization beyond the GGUF's own weights, no 8-bit cache, no key pruning, no int8 activations. The speed comes from two things only: many lanes in one step, which turns many small operations into a few wide ones, and using everything the hardware offers.
+**The engine adds no further compression to the GGUF.** No quantization beyond the GGUF's own weights (for example, the published `Q4_K_M` weights), no 8-bit cache, no key pruning, no int8 activations. The speed comes from two things only: many lanes in one step, which turns many small operations into a few wide ones, and using everything the hardware offers.
 
 **Give the GPU the memory.** macOS lets the GPU wire about 107.5 GiB of a 128 GB Mac by default. More memory is more lanes at long context, so raise the limit:
 
