@@ -33,7 +33,10 @@ Post(row) == Matches(sealed', starts', slotOf', genOf', poolGen', refs', result'
 \* SealClaimed is disabled) has no action that could take it.
 StepOp(row) ==
     CASE row.op = "seal" -> Seal(row.s, row.slot)
-      [] row.op = "seal-stale" -> UNCHANGED vars
+      [] row.op = "seal-stale" ->
+            /\ UNCHANGED <<sealed, starts, slotOf, genOf, poolGen, refs>>
+            /\ sought' = FALSE
+            /\ result' = <<>>
       [] row.op = "seal-dup" -> Dedup(row.s)
       [] row.op = "seal-twin" -> ReSeal(row.s, row.slot)
       [] row.op = "retain" -> Retain(row.s)
