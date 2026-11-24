@@ -74,3 +74,7 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+check ScratchTail3 ScratchTail
+check ScratchTail4 ScratchTail
+check ScratchTailOneSpan ScratchTail
+check ScratchTailNoZero ScratchTail NoForeignRead

@@ -82,3 +82,23 @@ Inspected counterexamples, each checked against `poison_plan` by hand:
   poisoned, not saved, and still poison after the restore.
 - **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
   the next step leaves the free slot 1 unpoisoned.
+
+## Sliding-window scratch tail
+
+Run on `mini-m5`, 2026-11-24 02:45 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| ScratchTail3 | 469,184 | 435,360 | 3.608 | PASS |
+| ScratchTail4 | 2,359,830 | 2,190,375 | 16.883 | PASS |
+| ScratchTailOneSpan | 832 | 728 | 0.864 | PASS (`notail`, one span) |
+| ScratchTailNoZero | 1,429 | 1,429 | 0.923 | NoForeignRead violated |
+
+Inspected counterexample, checked against `layer_b` by hand:
+
+- **ScratchTailNoZero, state 4:** spans `<<[p0 0, t 2], [p0 0, t 1]>>`; span 1
+  writes rows 0 and 1, span 2 writes row 0 and its tile (AK = 2) reads row 1,
+  span 1's key. On the GPU (`INK_POOLGATE_SABOTAGE`): lane 0 (t 23, NaN after
+  the sabotage) then lane 1 (p0 31, t 1, its tile reaching position 63) in one
+  step; lane 1 read lane 0's NaN keys in rows 1 .. 22 and diverged, then lane 2
+  the same way a step later.

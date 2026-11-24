@@ -207,8 +207,8 @@ pub fn reference(path: &dyn StepPath, w: &Workload) -> Vec<Record> {
     }).collect()
 }
 
-/// What the poisoned run saw.
-pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub sabotaged: bool }
+/// What the poisoned run saw. `sabotaged`: the lane whose own slots were poisoned, if any.
+pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub sabotaged: Option<usize> }
 
 /// The lanes together through `cand`, with the pool poisoned before every step. Lane i starts i % 3 rounds late; a
 /// round is a prefill step of every prefilling lane, then a decode step of every decoding lane. `sabotage` drops the
@@ -219,7 +219,7 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
     let mut lane: Vec<Option<LaneId>> = vec![None; n];
     let mut next = vec![0usize; n];
     let mut rec = vec![Record::default(); n];
-    let (mut steps, mut poisoned, mut saved_n, mut sabotaged) = (0, 0, 0, false);
+    let (mut steps, mut poisoned, mut saved_n, mut sabotaged) = (0, 0, 0, None);
     let mut round = 0;
     while next.iter().any(|&k| k < work.len()) {
         for i in 0..n { if lane[i].is_none() && next[i] == 0 && round >= i % 3 { lane[i] = Some(cand.new_lane(&w.prompts[i], w.len() + 1)); } }
@@ -229,8 +229,8 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             let live: Vec<usize> = (0..n).filter(|&i| lane[i].is_some()).collect();
             let tables: Vec<Vec<(BlockKind, Slot)>> = live.iter().map(|&i| cand.lane_slots(lane[i].unwrap())).collect();
             let stepping: Vec<usize> = who.iter().map(|i| live.iter().position(|j| j == i).unwrap()).collect();
-            let unguard = sabotage && !sabotaged && work[next[who[0]]].0 > 0;
-            if unguard { sabotaged = true; println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0); }
+            let unguard = sabotage && sabotaged.is_none() && work[next[who[0]]].0 > 0;
+            if unguard { sabotaged = Some(who[0]); println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0); }
             let ps = plans(cand, &tables, &stepping, !unguard);
             for (_, p) in &ps { poisoned += p.poison.len(); saved_n += p.save.len(); }
             let saved = apply(cand, &ps);
@@ -250,6 +250,13 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
         round += 1;
     }
     Report { records: rec, steps, poisoned, saved: saved_n, sabotaged }
+}
+
+/// The lanes other than lane poisoned whose records differ from the reference. A sabotaged run poisons one lane's own
+/// slots in one step; lanes share no cache, so every other lane must still match, or something the engine shares across
+/// lanes carried the poison over (the sliding-window scratch tail, src/engine.rs, specs/ScratchTail.tla).
+pub fn leaked(want: &[Record], got: &Report, poisoned: usize) -> Vec<usize> {
+    want.iter().zip(&got.records).enumerate().filter(|&(i, (a, b))| i != poisoned && a != b).map(|(i, _)| i).collect()
 }
 
 /// The reference against the poisoned candidate: Ok(lines) when every lane matches at every step, Err(lines) naming
@@ -363,6 +370,16 @@ mod tests {
         let t = vec![vec![0], vec![1]];
         let p = poison_plan(3, &t, &[1, 0], false);
         assert!(p.poison.contains(&1) && p.save.contains(&1) && !p.poison.contains(&0));
+    }
+
+    #[test]
+    fn leaked_names_every_other_lane_that_differs() {
+        let r = |s: u64| Record { steps: vec![1, s], tokens: vec![7] };
+        let want = vec![r(2), r(3), r(4)];
+        let got = |v: Vec<Record>| Report { records: v, steps: 0, poisoned: 0, saved: 0, sabotaged: Some(0) };
+        assert_eq!(leaked(&want, &got(vec![r(9), r(3), r(4)]), 0), Vec::<usize>::new());
+        assert_eq!(leaked(&want, &got(vec![r(9), r(9), r(4)]), 0), vec![1]);
+        assert_eq!(leaked(&want, &got(vec![r(2), r(3), Record { steps: vec![1, 4], tokens: vec![8] }]), 1), vec![2]);
     }
 
     #[test]

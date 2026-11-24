@@ -188,3 +188,21 @@ Reversed witnesses (`Bug`): `unguarded` (the first stepping lane is not
 protected; the same switch as `INK_POOLGATE_SABOTAGE`), `nosave` and
 `ownedonly`. The unit tests in `src/poolgate.rs` check `poison_plan` against
 the same three properties on every two-lane, three-slot table assignment.
+
+## Sliding-window scratch tail
+
+`ScratchTail` models the row layout of the sliding-window K/V scratch in a
+prefill step of several spans (`src/engine.rs` `layer_b`; `k_zero`,
+`k_kvcopy`, `k_kvprep_b`, `k_attn_h`). `k_zero` clears it once per step; every
+span of every sliding-window layer then copies its window history below row 0,
+writes its keys into rows `0 .. t - 1`, and attends in whole tiles of `AK` key
+positions, which reach past its last key to the next multiple of `AK`. Masked
+keys get a zero weight, and a zero weight does not cancel a NaN or an infinity.
+
+- `NoForeignRead`: every row a span's attention reads is its own or zero.
+- `InBounds`: every row read lies in the scratch (the `KGUARD` sizing).
+
+Reversed witness: `notail` (the code before the tail rows were zeroed): a span
+with a longer `t` leaves its keys in the next span's last tile.
+`ScratchTailOneSpan` runs that same code with one span per step and passes:
+the zeroing is needed only when a step has more than one span.

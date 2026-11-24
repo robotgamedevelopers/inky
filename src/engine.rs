@@ -25,6 +25,8 @@ pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
 /// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
 const KGUARD: usize = 64;
+/// k_attn_h's key tile (AK in prefill.metal): a prefill span's attention reads keys up to the next multiple of this
+const ATT_AK: usize = 64;
 /// most spans one step can carry (each has a logits row in the batch arena)
 pub const MAX_SPANS: usize = 128;
 /// process-wide default for `Engine::load`: keep only part of the (exact, fp16) K/V cache in memory while generating and
@@ -1938,6 +1940,15 @@ impl Engine {
             e.buf(&sp.lane.kv_full.borrow(), 0, 3);
         }
         if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
+        // k_attn_h reads keys in whole tiles of ATT_AK positions, so the span's last tile runs past its last key to the
+        // next multiple of ATT_AK. Those scratch rows are masked with a zero weight, which does not cancel a NaN or an
+        // infinity, and k_zero cleared them only at the start of the step: an earlier span of this layer (or a longer span of the
+        // layer before) may have written another lane's keys there since. Zero them for this span.
+        // (specs/ScratchTail.tla; one span alone never leaves them dirty)
+        if l.swa && spans.len() > 1 {
+            let (end, tail) = (p0 + t, (p0 + t).next_multiple_of(ATT_AK) - (p0 + t));
+            if tail > 0 { kcopy(tail, end, 2); }
+        }
         let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
         self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
         self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
