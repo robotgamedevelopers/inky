@@ -997,7 +997,6 @@ pub fn serve(o: ServeOpts) {
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
     eng.ensure_batch(eng.chunk);
-    eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let reporter = Arc::downgrade(&metrics);
