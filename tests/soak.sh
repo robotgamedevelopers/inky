@@ -242,21 +242,22 @@ if [[ -s $client_out ]]; then
 fi
 
 inflight_end=${rec[inflight_end]:-}
+server_active_lanes_end=${rec[server_active_lanes_end]:-}
+server_inflight_end=${rec[server_inflight_end]:-}
+server_health_ok=${rec[server_health_ok]:-}
 recovery_completed=${rec[recovery_completed]:-}
 recovery_requested=${rec[recovery_requested]:-}
 workload_completed=${rec[workload_completed]:-}
 
-# This wave exercises lane-count concurrent requests, but without a server stats
-# route it cannot prove that each lane was occupied or independently released.
 recovery_ok=0
-if [[ $inflight_end == 0 && $recovery_completed == "$lanes" && $recovery_requested == "$lanes" ]]; then
+if [[ $inflight_end == 0 && $server_health_ok == 1 && $server_active_lanes_end == 0 && $server_inflight_end == 0 && $recovery_completed == "$lanes" && $recovery_requested == "$lanes" ]]; then
     recovery_ok=1
 fi
 client_ok=0
 if (( client_ec == 0 )); then
     client_ok=1
 fi
-print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} source=client_requests_not_server_lane_stats"
+print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} server_active_lanes_end=${server_active_lanes_end:-missing} server_inflight_end=${server_inflight_end:-missing} source=server_health_and_client_outstanding"
 print -r -- "check_client=$client_ok workload_completed=${workload_completed:-missing} client_exit=$client_ec"
 print -r -- "check_wired_limit=$wired_restored before=$wired_before after=${wired_after:-unread}"
 print -r -- "prompt_lengths=short:${rec[prompt_short_bytes]:-64}B medium:${rec[prompt_medium_bytes]:-1024}B long:${rec[prompt_long_bytes]:-4096}B"
