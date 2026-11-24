@@ -32,16 +32,41 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        self.sample_next(logits).expect("model sampling failed")
+    }
+
+    /// Sample one model row, or fail the request before consuming an RNG draw.
+    pub fn sample_next(&mut self, logits: &[f32]) -> Result<u32, &'static str> {
+        let Some(&first) = logits.first() else { return Err("model returned no logits") };
+        if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
+        if self.greedy() {
+            let (mut best, mut token) = (first, 0);
+            for (i, &x) in logits.iter().enumerate() {
+                if !x.is_finite() { return Err("model returned non-finite logits"); }
+                if x > best { best = x; token = i as u32; }
+            }
+            return Ok(token);
+        }
+        if !self.softcap.is_finite() || !self.top_p.is_finite() {
+            return Err("invalid sampling parameters");
+        }
         // top-k on raw logits (softcap is monotonic, so the order is the same)
         let k = self.top_k.min(logits.len());
-        select_top_k(logits, k, &mut self.cand);
-        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0));     // total order: a NaN logit cannot panic the scheduler
+        select_top_k(logits, k, &mut self.cand)?;
+        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0));
         let c = self.softcap;
         let t = self.temp;
-        let scaled: Vec<f32> = self.cand.iter().map(|&(x, _)| (if c > 0.0 { c * (x / c).tanh() } else { x }) / t).collect();
-        let m = scaled[0];
-        let mut p: Vec<f32> = scaled.iter().map(|&x| (x - m).exp()).collect();
+        let capped = |x: f32| if c > 0.0 { c * (x / c).tanh() } else { x };
+        let max = capped(self.cand[0].0);
+        let scaled_max = max / t;
+        let mut p: Vec<f32> = self.cand.iter().map(|&(x, _)| {
+            let x = capped(x);
+            // Preserve the usual rounding, and center before division when tiny temperatures overflow it.
+            let centered = if scaled_max.is_finite() { x / t - scaled_max } else { (x - max) / t };
+            centered.exp()
+        }).collect();
         let sum: f32 = p.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 { return Err("model returned invalid sampling probabilities"); }
         for v in p.iter_mut() { *v /= sum; }
         // top-p cut
         let mut cum = 0.0;
@@ -49,8 +74,14 @@ impl Sampler {
         for (i, &v) in p.iter().enumerate() { cum += v; if cum >= self.top_p { n = i + 1; break; } }
         let total: f32 = p[..n].iter().sum();
         let mut r = self.next_f32() * total;
-        for i in 0..n { r -= p[i]; if r <= 0.0 { return self.cand[i].1; } }
-        self.cand[n - 1].1
+        let mut last = 0;
+        for (i, &mass) in p[..n].iter().enumerate() {
+            if mass == 0.0 { continue; }
+            last = i;
+            r -= mass;
+            if r <= 0.0 { return Ok(self.cand[i].1); }
+        }
+        Ok(self.cand[last].1)
     }
 
     /// One drafted position. Draw from q, accept with min(1, p/q), else draw `norm(max(0, p-q))`.
@@ -115,8 +146,8 @@ impl Sampler {
         let k = self.top_k;
         let mut target_kept = Vec::new();
         let mut draft_kept = Vec::new();
-        select_top_k(target, k.min(target.len()), &mut target_kept);
-        select_top_k(draft, k.min(draft.len()), &mut draft_kept);
+        select_top_k(target, k.min(target.len()), &mut target_kept).expect("invalid target sampling row");
+        select_top_k(draft, k.min(draft.len()), &mut draft_kept).expect("invalid draft sampling row");
         let draft_ids: Vec<u32> = draft_kept.iter().map(|c| c.1).collect();
         let target_ids: Vec<u32> = target_kept.iter().map(|c| c.1).collect();
         // zeros of the other side sit on the support, after this side's own top-k, and do not enter its softmax
@@ -145,20 +176,25 @@ pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
 struct Mass { token: u32, p: f32, q: f32 }
 
-fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) {
+fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<(), &'static str> {
+    if k == 0 { return Err("no sampling candidates"); }
     cand.clear();
-    let mut floor = f32::NEG_INFINITY;
+    let mut floor = 0;
     for (i, &x) in logits.iter().enumerate() {
-        if x <= floor && cand.len() == k { continue; }
+        if !x.is_finite() { return Err("model returned non-finite logits"); }
         if cand.len() < k {
+            let j = cand.len();
             cand.push((x, i as u32));
-            if cand.len() == k { floor = cand.iter().map(|c| c.0).fold(f32::INFINITY, f32::min); }
-        } else {
-            let j = cand.iter().position(|c| c.0 == floor).unwrap();
-            cand[j] = (x, i as u32);
-            floor = cand.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+            if x < cand[floor].0 { floor = j; }
+        } else if x > cand[floor].0 {
+            cand[floor] = (x, i as u32);
+            floor = 0;
+            for j in 1..k {
+                if cand[j].0 < cand[floor].0 { floor = j; }
+            }
         }
     }
+    Ok(())
 }
 
 /// Softcap after the top-k cut, then `/temp`, then the same top-p. `zeros` are the other side's
@@ -206,6 +242,31 @@ mod tests {
     const TEMP: f32 = 1.0;
     const TOP_P: f32 = 0.8;
     const K: usize = 64;
+
+    #[test]
+    fn invalid_logits_fail_in_greedy_and_sampled_modes() {
+        for temp in [0.0, TEMP] {
+            let mut sampler = Sampler::new(temp, 2, TOP_P, SOFTCAP, 1);
+            let before = sampler.state;
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                // The invalid logit can be inside or outside the top-k candidates.
+                assert!(sampler.sample_next(&[bad, 2.0, 1.0]).is_err());
+                assert!(sampler.sample_next(&[2.0, 1.0, bad]).is_err());
+            }
+            assert!(sampler.sample_next(&[]).is_err());
+            assert_eq!(sampler.state, before);
+            assert!(sampler.sample_next(&[2.0, 2.0, 1.0]).is_ok());
+        }
+        let mut greedy = Sampler::new(0.0, 2, TOP_P, SOFTCAP, 1);
+        assert_eq!(greedy.sample_next(&[1.0, 2.0, 2.0]), Ok(1));
+    }
+
+    #[test]
+    fn small_positive_temperature_does_not_overflow_probabilities() {
+        let mut sampler = Sampler::new(f32::from_bits(1), 3, 1.0, 0.0, 1);
+        assert_eq!(sampler.sample_next(&[1.0, f32::MAX, -f32::MAX]), Ok(1));
+        assert_eq!(sampler.sample_next(&[-f32::MAX, -2.0, -1.0]), Ok(2));
+    }
 
     /// Target argmax is token 100, outside the draft's top-64. Token 0 is in the draft's top-64
     /// and outside the target's. Token 150 is in neither.

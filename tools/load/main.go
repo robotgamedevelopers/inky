@@ -1,4 +1,4 @@
-// load: N concurrent chat completions against an OpenAI-compatible endpoint; prints total and per-stream decode rates.
+// load: N concurrent chat completions; rates include prompt processing and response latency.
 package main
 
 import (
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -24,6 +25,10 @@ func main() {
 	predict := flag.Int("predict", 256, "tokens per stream")
 	pad := flag.Int("pad", 0, "repeat a filler paragraph this many times in each prompt (context size)")
 	flag.Parse()
+	if *n < 1 || *predict < 1 || *pad < 0 {
+		fmt.Fprintln(os.Stderr, "n and predict must be positive; pad must be nonnegative")
+		os.Exit(2)
+	}
 	type res struct {
 		toks int
 		rate float64
@@ -42,22 +47,33 @@ func main() {
 			}
 			body, _ := json.Marshal(map[string]any{"model": "inky", "max_tokens": *predict, "temperature": 0.7, "reasoning_effort": "none",
 				"messages": []map[string]string{{"role": "user", "content": p}}})
+			requestStart := time.Now()
 			r, err := http.Post(*url, "application/json", bytes.NewReader(body))
 			if err != nil {
 				out[i].err = err
 				return
 			}
 			defer r.Body.Close()
-			b, _ := io.ReadAll(r.Body)
+			b, err := io.ReadAll(r.Body)
+			elapsed := time.Since(requestStart).Seconds()
+			if err != nil {
+				out[i].err = err
+				return
+			}
+			if r.StatusCode != http.StatusOK {
+				out[i].err = fmt.Errorf("HTTP %d: %.200s", r.StatusCode, b)
+				return
+			}
 			var v struct {
-				Usage   struct{ CompletionTokens int `json:"completion_tokens"` } `json:"usage"`
-				Timings struct{ PredictedPerSecond float64 `json:"predicted_per_second"` } `json:"timings"`
+				Usage struct {
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
 			}
 			if err := json.Unmarshal(b, &v); err != nil || v.Usage.CompletionTokens == 0 {
 				out[i].err = fmt.Errorf("bad response: %.200s", b)
 				return
 			}
-			out[i] = res{toks: v.Usage.CompletionTokens, rate: v.Timings.PredictedPerSecond}
+			out[i] = res{toks: v.Usage.CompletionTokens, rate: float64(v.Usage.CompletionTokens) / elapsed}
 		}(i)
 	}
 	wg.Wait()
@@ -80,5 +96,8 @@ func main() {
 	if len(rates) > 0 {
 		med = rates[len(rates)/2]
 	}
-	fmt.Printf("n=%d tokens=%d wall=%.1fs total=%.0f tok/s per-stream-median=%.1f tok/s errors=%d\n", *n, total, wall, float64(total)/wall, med, errs)
+	fmt.Printf("n=%d tokens=%d wall=%.1fs total=%.0f tok/s per-request-median=%.1f tok/s errors=%d\n", *n, total, wall, float64(total)/wall, med, errs)
+	if errs != 0 {
+		os.Exit(1)
+	}
 }

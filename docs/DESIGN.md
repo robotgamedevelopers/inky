@@ -85,9 +85,9 @@ Decode steps (`encode_decode`): row-wise work through the tensor path, each lane
 | 16K | 79 | 64 | 389 | 4.9x |
 | 64K | 53 | 27 | 150 | 2.9x |
 | 128K | 33 | 14 | 78 | 2.4x |
-| 256K | 21 | 7 | 40 | 1.9x |
+| ≈256K | 21 | 7 | 40 | 1.9x |
 
-(16K and up from `inky maxctx` on real code, 60 GB for lanes.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to 256K runs at 875 tok/s: 214 s to the first token at 256K.
+(16K and up from `inky maxctx` on real code, 60 GB for lanes. The built-in long checkpoint is 262,000 tokens and the current context limit is 262,080.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to about 256K runs at 875 tok/s: 214 s to the first token at about 256K.
 
 **Four cards at once through `inky serve`** (8 lanes, 131K context per lane), the tracer card four times: all four landed the same two-line fix as the merged change. 208 requests, 10.6 M prompt tokens of which 97% came from the lanes' kept prompts, 314 K prefilled, 53 K generated, largest prompt 97 K.
 
@@ -153,6 +153,7 @@ The engine's random walk emits traces, and TLC checks in CI that each is a behav
 The Mac goes in and out of inky mode. Starting inky gives the GPU the memory it needs; stopping inky gives it back.
 
 - **A one-time install, by the owner:** `sudo inky tune-memory` installs a small root LaunchDaemon. It does two things only: raise the GPU's wired-memory limit (`iogpu.wired_limit_mb`) and put it back. It accepts no other setting and runs nothing else. `sudo inky tune-memory --undo` removes it.
+- **Upgrading an existing helper:** run `sudo inky tune-memory` using the upgraded binary, then restart your Inky processes with that binary. The installer retires the old socket in `/var/run/inky`. The upgraded binary uses `/private/var/db/inky/memd.sock`, so the helper and clients need to be upgraded together.
 - **Entering:** inky connects to the helper over a Unix socket only the owner's user can open. The helper records the limit it finds and raises it to a value sized from the Mac's memory (118000 MB on 128 GB, leaving about 13 GB for macOS).
 - **Leaving:** when inky's connection closes, the helper restores exactly the limit it found. A clean exit, a crash, `kill -9` or a sleep all close the connection, so the memory is always given back. With several inky processes, the limit is held while any is connected.
 - **In the sprint,** nova-worker drives it: it starts inky when it brings local lanes up, and stops it when it stops serving them, so the laptop goes into inky mode for sprint work and out of it afterwards.

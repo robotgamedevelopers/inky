@@ -336,13 +336,21 @@ inline void topk_sg(device float * A, device const uchar * PB, uint logits_off, 
     device const float * lg = A + logits_off;
     device const float * bias = (device const float *) (PB + bias_off);
     float pr[4], sel[4];
-    for (int i = 0; i < 4; i++) { const int e = lane * 4 + i; pr[i] = sigm(lg[e]); sel[i] = pr[i] + bias[e]; }
+    for (int i = 0; i < 4; i++) {
+        const int e = lane * 4 + i;
+        const float p = sigm(lg[e]), score = p + bias[e];
+        // Inspect bits because these kernels are compiled with fast math.
+        const bool finite = (as_type<uint>(score) & 0x7f800000u) != 0x7f800000u;
+        pr[i] = finite ? p : 0.0f;
+        sel[i] = finite ? score : as_type<float>(0xff7fffffu);
+    }
     float wsum = 0, myw = 0; int myid = 0;
     for (int k = 0; k < TOPK; k++) {
         float bv = sel[0]; int bi = 0;
         for (int i = 1; i < 4; i++) if (sel[i] > bv) { bv = sel[i]; bi = i; }
         const float mv = simd_max(bv);
-        const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
+        const int candidate = simd_min((bv == mv) ? (int) (lane * 4 + bi) : NEXP);
+        const int win = candidate < NEXP ? candidate : k;
         const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
         if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
         if (lane == (ushort) k) { myid = win; myw = pw; }
@@ -779,25 +787,7 @@ struct MoeArgs {
 
 kernel void k_topk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant MoeArgs & a [[buffer(5)]],
                    ushort lane [[thread_index_in_simdgroup]]) {
-    device const float * lg = A + a.logits_off;
-    device const float * bias = (device const float *) (PB + a.bias_off);
-    float pr[4], sel[4];
-    for (int i = 0; i < 4; i++) { const int e = lane * 4 + i; pr[i] = sigm(lg[e]); sel[i] = pr[i] + bias[e]; }
-    float wsum = 0, myw = 0; int myid = 0;
-    for (int k = 0; k < TOPK; k++) {
-        float bv = sel[0]; int bi = 0;
-        for (int i = 1; i < 4; i++) if (sel[i] > bv) { bv = sel[i]; bi = i; }
-        const float mv = simd_max(bv);
-        const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
-        const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
-        if (lane == (ushort) k) { myid = win; myw = pw; }
-        wsum += pw;
-    }
-    if (lane < TOPK) {
-        A[a.sel_off + lane] = (float) myid;
-        A[a.sel_off + TOPK + lane] = myw / (wsum + 1e-20f) * a.wscale;
-    }
+    topk_sg(A, PB, a.logits_off, a.bias_off, a.sel_off, a.wscale, lane);
 }
 
 // grid: (FF / GU_NSG, TOPK); each simdgroup computes gate row i and up row i of one expert -> SiTU
@@ -909,5 +899,5 @@ kernel void k_argmax2(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[
     }
     const float m = simd_max(best);
     int c = best == m ? idx : 0x7fffffff; c = simd_min(c);
-    if (lane == 0) toks[a.out_index] = c;
+    if (lane == 0) toks[a.out_index] = uint(c) < a.n ? c : 0;
 }

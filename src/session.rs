@@ -80,6 +80,7 @@ impl<'a> Session<'a> {
         let eng = self.eng.on(&self.lane);
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
+        if max == 0 { return 0; }
         let mut tok = if sampler.greedy() { first } else { sampler.sample(eng.logits()) };
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;

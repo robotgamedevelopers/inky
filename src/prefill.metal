@@ -236,25 +236,7 @@ kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[
 struct TopkBArgs { uint logits_off, bias_off, sel_off, T; float wscale; uint pad0, pad1, pad2; };
 kernel void k_topk_b(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], constant TopkBArgs & a [[buffer(5)]],
                      uint t [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
-    device const float * lg = A + a.logits_off + t * NEXP;
-    device const float * bias = (device const float *) (PB + a.bias_off);
-    float pr[4], sel[4];
-    for (int i = 0; i < 4; i++) { const int e = lane * 4 + i; pr[i] = sigm(lg[e]); sel[i] = pr[i] + bias[e]; }
-    float wsum = 0, myw = 0; int myid = 0;
-    for (int k = 0; k < TOPK; k++) {
-        float bv = sel[0]; int bi = 0;
-        for (int i = 1; i < 4; i++) if (sel[i] > bv) { bv = sel[i]; bi = i; }
-        const float mv = simd_max(bv);
-        const int win = simd_min((bv == mv) ? (int) (lane * 4 + bi) : 1 << 20);
-        const float pw = simd_shuffle(pr[win % 4], (ushort) (win / 4));
-        if ((int) (lane * 4 + bi) == win) sel[bi] = -INFINITY;
-        if (lane == (ushort) k) { myid = win; myw = pw; }
-        wsum += pw;
-    }
-    if (lane < TOPK) {
-        A[a.sel_off + t * 16 + lane] = (float) myid;
-        A[a.sel_off + t * 16 + TOPK + lane] = myw / (wsum + 1e-20f) * a.wscale;
-    }
+    topk_sg(A, PB, a.logits_off + t * NEXP, a.bias_off, a.sel_off + t * 2 * TOPK, a.wscale, lane);
 }
 
 // ---- routing: counting sort of (token, slot) assignments by expert + 32-row tile list. 1 TG x 1024 threads.
