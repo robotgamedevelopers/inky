@@ -11,7 +11,7 @@ output=${output:A}
 [[ -r "$jar" ]] || { print -u2 "Missing TLC jar: $jar"; exit 1; }
 
 check() {
-    local name=$1 module=$2 expected=${3:-} log="$output/$1.log"
+    local name=$1 module=$2 expected=${3:-} kind=${4:-invariant} log="$output/$1.log"
     local started=$EPOCHREALTIME elapsed rc
     if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC \
         -workers 1 -metadir "$output/$name-states" \
@@ -27,8 +27,19 @@ check() {
     if [[ -n "$expected" ]]; then
         [[ $rc -ne 0 ]] || ok=false
         [[ $(grep -c "^Error: " "$log" || true) = 2 ]] || ok=false
-        grep -Fxq "Error: Invariant $expected is violated." "$log" || ok=false
-        grep -Fxq "Error: The behavior up to this point is:" "$log" || ok=false
+        if [[ $kind = temporal ]]; then
+            # Older TLC reports an unnamed temporal violation. The witness
+            # config must name precisely the requested property in that case.
+            if ! grep -Fxq "Error: Temporal property $expected was violated." "$log"; then
+                grep -Fxq "Error: Temporal properties were violated." "$log" || ok=false
+                [[ $(awk '/^PROPERTY / {print substr($0,10)}' "$root/$name.cfg") = "$expected" ]] || ok=false
+            fi
+            grep -Fxq "Error: The following behavior constitutes a counter-example:" "$log" || ok=false
+            grep -Eq '^State [0-9]+: Stuttering$' "$log" || ok=false
+        else
+            grep -Fxq "Error: Invariant $expected is violated." "$log" || ok=false
+            grep -Fxq "Error: The behavior up to this point is:" "$log" || ok=false
+        fi
         grep -q "^State 2:" "$log" || ok=false
     else
         [[ $rc -eq 0 ]] || ok=false
@@ -51,3 +62,10 @@ check SpanTooSmall BlockLayout SpanPinned
 check StartReleased BlockLayout StartRetained
 check SpanPins512 SpanPins
 check SpanPins17 SpanPins Covered
+check GroupedLayout3 GroupedLayout
+check GroupedLayout4 GroupedLayout
+check LocalMatch GroupedLayout VisitedKeys
+check DonorWindow GroupedLayout VisitedKeys
+check TilePartial GroupedLayout OrderedPartials
+check Restage GroupedLayout StagedOnce
+check StalledTraversal GroupedLayout TraversalCompletes temporal

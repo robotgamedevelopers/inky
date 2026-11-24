@@ -38,3 +38,25 @@ Inspected counterexamples:
 These runs establish only the bounds and abstractions in [README.md](README.md).
 They do not establish engine trace conformance, general integer-overflow safety,
 allocator-policy independence, or scheduler liveness.
+
+## Grouped layout
+
+On mini-m5, the CI entry point `scripts/check-tla.sh` ran the grouped traversal
+with the pinned v1.8.0 tools jar and one TLC worker. The three-slot run covers
+62 initial snapshots and the four-slot run covers 136. Both exhaust the graph
+with deadlock checking enabled. Times include JVM startup.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| GroupedLayout3 | 579 | 485 | 0.425 | PASS |
+| GroupedLayout4 | 1,553 | 1,329 | 0.509 | PASS |
+| LocalMatch | 1,007 | 981 | 0.392 | VisitedKeys violated |
+| DonorWindow | 361 | 343 | 0.336 | VisitedKeys violated |
+| TilePartial | 357 | 339 | 0.325 | OrderedPartials violated |
+| Restage | 149 | 149 | 0.335 | StagedOnce violated |
+| StalledTraversal | 195 | 195 | 0.397 | TraversalCompletes violated |
+
+As a separate negative-control check, the redundant-load mutant passed both
+output invariants across all 2,887 distinct states when `StagedOnce` was
+omitted. A test copy with a three-key split and a two-key tile was rejected by
+the divisibility assumption before exploring any states.
