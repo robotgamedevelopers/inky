@@ -18,7 +18,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+mod timing;
+use timing::{Counters, RequestTiming};
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: String, pub lanes: usize, pub effort: String, pub max_tokens: usize,
                       /// a request must carry this key, as `x-api-key` or `Authorization: Bearer <this>` (from the environment variable --key-env names)
@@ -391,17 +394,17 @@ impl BlockStream {
 
 // ------------------------------------------------------------------------------------------------- scheduler
 
-struct Job { toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: Sender<Ev> }
+struct Job { seq: u64, queued_at: Instant, toks: Vec<u32>, max: usize, temp: f32, top_p: f32, seed: u64, out: Sender<Ev> }
 /// to a request's connection: a token, a sign of life after each prefill step (a send that fails means the client is gone),
 /// the end, or a refusal
-enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str }, Err(String) }
+enum Ev { Tok(u32), Alive, Done { prompt: usize, cached: usize, gen: usize, reason: &'static str, timing: String }, Err(String) }
 
 /// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
 /// `tick` is the scheduler's logical clock (not wall time): a smaller tick was freed longer ago.
 struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
 struct Active {
     job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
-    sampler: Sampler,
+    timing: RequestTiming, sampler: Sampler,
     /// Draft stream, seeded once per request (`seed ^ DRAFT_SEED_MIX`). A verify round advances it.
     /// Greedy serve does not read it. It is not the stream `sampler.sample` draws emitted tokens from.
     #[allow(dead_code)]
@@ -459,7 +462,7 @@ fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usi
 
 fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
 
-fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>) {
+fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>, metrics: &Mutex<Counters>) {
     let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
@@ -485,7 +488,12 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             }).collect();
             let Some(adm) = choose_lane(&cands) else { break };
             let j = queue.pop_front().unwrap();
-            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx { let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx))); continue; }
+            if j.toks.len().saturating_add(j.max).saturating_add(2) > eng.max_ctx {
+                metrics.lock().unwrap().queued -= 1;
+                let _ = j.out.send(Ev::Err(format!("context full: {} prompt tokens and {} to generate, {} per lane", j.toks.len(), j.max, eng.max_ctx)));
+                continue;
+            }
+            let timing = metrics.lock().unwrap().admit(Instant::now(), j.queued_at);
             let i = adm.dst;
             let start = adm.prefix;
             if start > 0 && adm.src == i {
@@ -510,7 +518,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let draft_sampler = Sampler::draft(j.temp, 64, j.top_p, eng.softcap, j.seed);
             let l = &mut lanes[i];
             l.prompt.clear(); l.cs_at_prompt = None;
-            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
+            l.job = Some(Active { timing, pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, sampler, draft_sampler, pending: None, job: j });
         }
         // a step: prefill when a lane has prompt left (alternating with decode while others generate), else decode
         let need_pf: Vec<usize> = (0..nlanes).filter(|&i| lanes[i].job.as_ref().is_some_and(|a| a.n_past < a.pf_end)).collect();
@@ -528,11 +536,15 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 sp_list.push((i, a.n_past, t)); budget -= t;
             }
             let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
+            let began = Instant::now();
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let elapsed = began.elapsed();
+            metrics.lock().unwrap().input += sp_list.iter().map(|&(_, _, t)| t).sum::<usize>();
             let many = spans.len() > 1;
             for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
                 let l = &mut lanes[i];
                 let a = l.job.as_mut().unwrap();
+                a.timing.prefill.add(t, elapsed);
                 a.n_past = p0 + t;
                 if a.n_past == a.pf_end {
                     // the prompt is in: keep its state for the next turn, then sample the first token
@@ -543,7 +555,8 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     a.pending = Some(tok);
                 } else if a.job.out.send(Ev::Alive).is_err() {
                     // the client went away during its prefill: free the lane now
-                    eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed", a.n_past, a.pf_end);
+                    eprintln!("[serve] lane {i}: client gone during prefill ({} of {} prompt tokens); lane freed #{} {}", a.n_past, a.pf_end, a.job.seq, a.timing);
+                    metrics.lock().unwrap().release(Instant::now());
                     l.job = None; l.tick = tick_seq; tick_seq += 1;
                 }
             }
@@ -552,15 +565,19 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // feed each lane's pending token at its position
             for &i in &need_dec { let a = lanes[i].job.as_ref().unwrap(); eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]); }
             let spans: Vec<Span> = need_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
+            let began = Instant::now();
             let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let elapsed = began.elapsed();
             for (k, &i) in need_dec.iter().enumerate() {
                 let a = lanes[i].job.as_mut().unwrap();
+                a.timing.generation.add(1, elapsed);
                 a.n_past += 1;
                 let lg = eng.span_logits(k);
                 a.pending = Some(if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) });
             }
         }
         // emit the tokens just sampled; finish lanes that stopped or whose client went away
+        let mut outputs = 0;
         for l in lanes.iter_mut() {
             let Some(a) = l.job.as_mut() else { continue };
             let Some(tok) = a.pending else { continue };
@@ -570,14 +587,17 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             if !fresh { continue; }
             let gone = a.job.out.send(Ev::Tok(tok)).is_err();
             a.gen += 1;
+            outputs += 1;
             let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
                          else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
             if let Some(r) = reason {
-                if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
-                let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+                if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed #{} {}", a.gen, a.job.seq, a.timing); }
+                let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r, timing: a.timing.to_string() });
+                metrics.lock().unwrap().release(Instant::now());
                 l.job = None; l.tick = tick_seq; tick_seq += 1;
             }
         }
+        metrics.lock().unwrap().output += outputs;
     }
 }
 
@@ -715,7 +735,7 @@ impl ClientWrite for Vec<u8> {
     fn client_gone(&self) -> bool { false }
 }
 
-struct Ctx { tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
+struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
              /// requests admitted and not yet finished (generating, prefilling or queued for a lane); at most `limit`
              inflight: std::sync::atomic::AtomicUsize, limit: usize,
@@ -739,6 +759,11 @@ fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
 struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for InFlight<'_> { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
 
+fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
+    cx.metrics.lock().unwrap().queued += 1;
+    cx.jobs.send(job).map_err(|_| { cx.metrics.lock().unwrap().queued -= 1; })
+}
+
 fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
     let toks = match render(&cx.tk, &cx.sp, req, &cx.effort) { Ok(t) => t, Err(e) => return respond(s, 400, &json!({"error": {"message": e}}).to_string()) };
     let seq = cx.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -760,14 +785,14 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     });
-    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
+    let job = Job { seq, queued_at: Instant::now(), toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
     // admission: one atomic count of requests in flight; beyond the limit, refuse now rather than hold the client
     if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
         write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"error": {"message": "inky is busy: every lane is taken and the queue is full"}}))?;
         return s.flush();
     }
     let _inflight = InFlight(&cx.inflight);
-    if cx.jobs.send(job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
+    if enqueue(cx, job).is_err() { return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string()); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
     let model = req["model"].as_str().unwrap_or("inkling-2-mini").to_string();
@@ -810,13 +835,13 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
                     }
                 }
             }
-            Ok(Ev::Done { prompt, cached, gen: ng, reason }) => {
+            Ok(Ev::Done { prompt, cached, gen: ng, reason, timing }) => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
-                eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
+                eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}] {timing}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
                 if stream {
                     if !calls.is_empty() { write!(s, "data: {}\n\n", chunk(json!({"tool_calls": calls}), Value::Null))?; }
                     let mut last = chunk(json!({}), json!(finish)); last["usage"] = usage;
@@ -865,13 +890,13 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     };
-    let job = Job { toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
+    let job = Job { seq, queued_at: Instant::now(), toks, max, temp: temp as f32, top_p: top_p as f32, seed, out: tx };
     if cx.inflight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |w| if w < cx.limit { Some(w + 1) } else { None }).is_err() {
         write!(s, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", json!({"type": "error", "error": {"type": "rate_limit_error", "message": "inky is busy: every lane is taken and the queue is full"}}))?;
         return s.flush();
     }
     let _inflight = InFlight(&cx.inflight);
-    if cx.jobs.send(job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().unwrap_or("inkling-2-mini").to_string();
@@ -898,10 +923,10 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
             match ev {
                 Ev::Alive => { if s.client_gone() { return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
                 Ev::Tok(t) => { for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?; }
-                Ev::Done { prompt, cached, gen: ng, reason } => {
+                Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
-                    eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls}", calls = bs.calls);
+                    eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {timing}", calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
                         "usage": streaming_delta_usage(prompt, cached, ng)})))?;
@@ -926,10 +951,10 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
         match ev {
             Ev::Alive => { if s.client_gone() { return Ok(()); } }
             Ev::Tok(t) => { gen.push(t); if gen.len() % 16 == 0 && s.client_gone() { return Ok(()); } }
-            Ev::Done { prompt, cached, gen: ng, reason } => {
+            Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
-                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}]", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
+                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {timing}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","));
                 return respond(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
                     "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string());
@@ -962,7 +987,15 @@ pub fn serve(o: ServeOpts) {
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(o.lanes);
     let (jtx, jrx) = channel::<Job>();
-    let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
+    let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
+    let reporter = Arc::downgrade(&metrics);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let Some(metrics) = reporter.upgrade() else { break };
+        let summary = metrics.lock().unwrap().summarize(Instant::now());
+        eprintln!("{summary}");
+    });
+    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, seq: Default::default(),
                             nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx, inflight: Default::default(), limit: o.lanes + o.queue, conns: Default::default() });
     let l = TcpListener::bind(&o.bind).expect("bind");
     eprintln!("[serve] http://{}/v1: {} lanes, context {} per lane, effort {}, queue {}, {}", l.local_addr().expect("bound address"), o.lanes, o.ctx, o.effort, o.queue,
@@ -1028,7 +1061,7 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
-    scheduler(&eng, &tk, sp, o.lanes, jrx);
+    scheduler(&eng, &tk, sp, o.lanes, jrx, &metrics);
 }
 
 #[cfg(test)]
@@ -1401,7 +1434,7 @@ mod tests {
         // handlers write to an in-memory buffer here: no socket, no timeout.
         let tk0 = Tokenizer::for_test();
         let (jtx, _jrx) = channel::<Job>();
-        let cx = Ctx { tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
+        let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        inflight: Default::default(), limit: 4, conns: Default::default() };
         let long = "x".repeat(200);
