@@ -44,6 +44,8 @@ pub enum BlockError {
     Length,
     /// The block index is outside the table this pool declared.
     OutOfRange,
+    /// A reference count that is already zero cannot be dropped.
+    Refs,
 }
 
 impl fmt::Display for BlockError {
@@ -54,6 +56,7 @@ impl fmt::Display for BlockError {
             BlockError::Generation => write!(f, "block generation would wrap"),
             BlockError::Length => write!(f, "block length past 64"),
             BlockError::OutOfRange => write!(f, "block index outside the table"),
+            BlockError::Refs => write!(f, "block reference count is already zero"),
         }
     }
 }
@@ -129,26 +132,69 @@ pub fn block_length(n: u32) -> Result<u32, BlockError> {
 /// gate share. `generation` 0 is a slot that has never been taken.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SlotRecord {
-    pub generation: u32,
-    pub kind: BlockKind,
-    pub length: u32,
-    pub sealed: bool,
-    pub refs: u32,
+    generation: u32,
+    kind: BlockKind,
+    length: u32,
+    sealed: bool,
+    refs: u32,
 }
 
 impl SlotRecord {
     pub fn fresh(kind: BlockKind) -> SlotRecord {
         SlotRecord { generation: 0, kind, length: 0, sealed: false, refs: 0 }
     }
+
+    #[cfg(test)]
+    fn at_generation(kind: BlockKind, generation: u32) -> SlotRecord {
+        SlotRecord { generation, kind, length: 0, sealed: false, refs: 0 }
+    }
+
+    pub fn generation(&self) -> u32 { self.generation }
+    pub fn kind(&self) -> BlockKind { self.kind }
+    pub fn length(&self) -> u32 { self.length }
+    pub fn sealed(&self) -> bool { self.sealed }
+    pub fn refs(&self) -> u32 { self.refs }
+
+    pub fn bump_generation(&mut self) -> Result<(), BlockError> {
+        self.generation = next_generation(self.generation)?;
+        Ok(())
+    }
+
+    pub fn set_length(&mut self, n: u32) -> Result<(), BlockError> {
+        self.length = block_length(n)?;
+        Ok(())
+    }
+
+    pub fn seal(&mut self) { self.sealed = true; }
+
+    pub fn add_ref(&mut self) -> Result<(), BlockError> {
+        self.refs = self.refs.checked_add(1).ok_or(BlockError::Overflow)?;
+        Ok(())
+    }
+
+    pub fn drop_ref(&mut self) -> Result<(), BlockError> {
+        self.refs = self.refs.checked_sub(1).ok_or(BlockError::Refs)?;
+        Ok(())
+    }
 }
 
 /// One table entry. The kind is on the entry, not implied by a packed index alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlockEntry {
-    pub slot: Slot,
-    pub generation: u32,
-    pub offset: u64,
-    pub kind: BlockKind,
+    slot: Slot,
+    generation: u32,
+    offset: u64,
+    kind: BlockKind,
+}
+
+impl BlockEntry {
+    pub fn new(slot: Slot, generation: u32, offset: u64, kind: BlockKind) -> BlockEntry {
+        BlockEntry { slot, generation, offset, kind }
+    }
+    pub fn slot(&self) -> Slot { self.slot }
+    pub fn generation(&self) -> u32 { self.generation }
+    pub fn offset(&self) -> u64 { self.offset }
+    pub fn kind(&self) -> BlockKind { self.kind }
 }
 
 /// One kind's pool. This commit keeps the records and does not allocate GPU buffers.
@@ -243,7 +289,7 @@ mod tests {
         let index = u64::from(slot.pool_index().get());
         assert_eq!(byte_offset(BlockKind::Window, slot).unwrap(), index * WINDOW_STRIDE);
         let empty = BlockPool::new(BlockKind::Window, 0);
-        assert_eq!(empty.record(Slot::new(1).unwrap()).map(|r| r.kind), Err(BlockError::OutOfRange));
+        assert_eq!(empty.record(Slot::new(1).unwrap()).map(|r| r.kind()), Err(BlockError::OutOfRange));
         let one = BlockPool::new(BlockKind::Full, 1);
         assert_eq!(one.kind(), BlockKind::Full);
         assert_eq!(one.len(), 1);
@@ -282,9 +328,29 @@ mod tests {
         let t = BlockTable::new(4).unwrap();
         assert_eq!(t.get(BlockKind::Window, BlockIndex::new(0)).unwrap(), None);
         assert_eq!(t.get(BlockKind::Full, BlockIndex::new(4)), Err(BlockError::OutOfRange));
-        let fresh = SlotRecord::fresh(BlockKind::Full);
-        assert_eq!(fresh.generation, 0);
-        assert!(!fresh.sealed);
-        assert_eq!(fresh.refs, 0);
+        let mut fresh = SlotRecord::fresh(BlockKind::Full);
+        assert_eq!(fresh.generation(), 0);
+        assert!(!fresh.sealed());
+        assert_eq!(fresh.refs(), 0);
+        fresh.bump_generation().unwrap();
+        assert_eq!(fresh.generation(), 1);
+        assert_eq!(fresh.set_length(70), Err(BlockError::Length));
+        assert_eq!(fresh.length(), 0);
+        fresh.set_length(64).unwrap();
+        assert_eq!(fresh.length(), 64);
+        fresh.seal();
+        assert!(fresh.sealed());
+        assert_eq!(fresh.drop_ref(), Err(BlockError::Refs));
+        fresh.add_ref().unwrap();
+        fresh.drop_ref().unwrap();
+        assert_eq!(fresh.refs(), 0);
+        let mut last = SlotRecord::at_generation(BlockKind::Window, u32::MAX);
+        assert_eq!(last.bump_generation(), Err(BlockError::Generation));
+        assert_eq!(last.generation(), u32::MAX);
+        let entry = BlockEntry::new(Slot::new(1).unwrap(), 1, 0, BlockKind::Full);
+        assert_eq!(entry.kind(), BlockKind::Full);
+        assert_eq!(entry.offset(), 0);
+        assert_eq!(entry.generation(), 1);
+        assert_eq!(entry.slot().get(), 1);
     }
 }
