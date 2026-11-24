@@ -147,7 +147,7 @@ INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl \
   cargo test --locked serve::scheduler_trace::dump -- --ignored --exact
 ```
 
-The first JSON line records the schema version, seed, lane count, queue limit,
+The first JSON line records the schema version (currently 2), seed, lane count, queue limit,
 prefill chunk budget and context. Each subsequent line records one event in
 execution order. Request IDs (`job`) identify arrivals through termination.
 Lane indices and token positions start at zero.
@@ -155,7 +155,8 @@ Lane indices and token positions start at zero.
 | Event | Observation |
 | --- | --- |
 | `arrive`, `refuse429` | The client submits a request with prompt length and generation limit. A refusal is the outcome of the same atomic capacity claim used by both HTTP handlers. |
-| `admit` | The scheduler assigns a request to a free lane and records its cached prefix length. |
+| `admit` | The scheduler assigns a request to a free lane (`lane`) and records its cached prefix length (`cached`) and where that prefix comes from: `source` is `cold` (nothing cached, `cached` is 0), `own` (the lane's own kept prompt) or `copy` (copied from the busy lane `from`, whose prefill has just finished). `from` equals `lane` unless `source` is `copy`. |
+| `refuse_ctx` | The request reached a free lane but its prompt plus generation limit plus two reserved tokens exceeds one lane's context. The scheduler refuses it; this ends the request. |
 | `build_step` | The scheduler submits a prefill or decode batch. Each span names its lane, request, starting position and token count. |
 | `finish_step` | The submitted batch has completed. This is the engine fence for that step. |
 | `disconnect`, `cancel` | The simulated client drops its receiver; the scheduler observes delivery failure and releases the lane. These can occur on different ticks. |
@@ -165,7 +166,9 @@ The fake supplies cache state and logits at the engine boundary. The production
 scheduler still chooses lanes and builds batches, samples tokens, sends events
 and observes disconnects. The trace covers the current serving decisions.
 The default test repeats 33 seeds with two lanes and one queued request and
-checks that the trace drains. These workloads use cold prompts and a constant
-winning token, so normal generation ends at the requested length. Cache hits,
-model output and GPU execution have separate tests. A TLC replay against
+checks that the trace drains. Some prompts extend the previous prompt, so the
+seeds cover cold, own-lane and cross-lane admissions; each walk also submits one
+request too long for a lane, which ends in `refuse_ctx`. A constant winning
+token means normal generation ends at the requested length. Model output and GPU
+execution have separate tests. A TLC replay against
 CacheScheduler is a separate verification step.

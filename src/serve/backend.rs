@@ -12,7 +12,9 @@ pub(super) trait SchedulerEngine {
     fn chunk(&self) -> usize;
     fn softcap(&self) -> f32;
     fn tier_on(&self, lane: &Self::Lane) -> bool;
-    fn prepare(&self, lanes: &[LaneS<Self::Lane>], adm: Admission, j: &Job);
+    /// Readies the destination lane for the request (reset, reservation, a cross-lane prefix copy, the kept
+    /// convolution state, the prompt tokens) and returns the wall time that took.
+    fn prepare(&self, lanes: &[LaneS<Self::Lane>], adm: Admission, j: &Job) -> Duration;
     fn prefill(&self, lanes: &[LaneS<Self::Lane>], spans: &[(usize, usize, usize)]) -> Duration;
     fn decode(&self, lanes: &[LaneS<Self::Lane>], chosen: &[usize]) -> Duration;
     fn save_state(&self, lane: &Self::Lane) -> Vec<u8>;
@@ -29,7 +31,8 @@ impl SchedulerEngine for Engine {
     fn softcap(&self) -> f32 { self.softcap }
     fn tier_on(&self, lane: &Lane) -> bool { self.on(lane).tier_on() }
 
-    fn prepare(&self, lanes: &[LaneS<Lane>], adm: Admission, j: &Job) {
+    fn prepare(&self, lanes: &[LaneS<Lane>], adm: Admission, j: &Job) -> Duration {
+        let began = Instant::now();
         let dst = &lanes[adm.dst].lane;
         let run = self.on(dst);
         let capacity = j.toks.len() + j.max + 2;
@@ -46,6 +49,7 @@ impl SchedulerEngine for Engine {
         }
         run.reserve(capacity, true);
         run.set_tokens(0, &j.toks);
+        began.elapsed()
     }
 
     fn prefill(&self, lanes: &[LaneS<Lane>], plan: &[(usize, usize, usize)]) -> Duration {
