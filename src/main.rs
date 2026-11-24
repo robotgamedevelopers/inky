@@ -1,3 +1,4 @@
+mod blocks;
 mod engine;
 mod gguf;
 mod metal;
