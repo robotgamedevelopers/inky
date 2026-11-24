@@ -135,3 +135,8 @@ check DonorWindow GroupedLayout VisitedKeys
 check TilePartial GroupedLayout OrderedPartials
 check Restage GroupedLayout StagedOnce
 check StalledTraversal GroupedLayout TraversalCompletes temporal
+check PoisonGate3 PoisonGate
+check PoisonGate4 PoisonGate
+check PoisonUnguarded PoisonGate NoFalsePoison
+check PoisonNoSave PoisonGate LiveIntact
+check PoisonOwnedOnly PoisonGate Coverage

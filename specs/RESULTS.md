@@ -60,3 +60,25 @@ As a separate negative-control check, the redundant-load mutant passed both
 output invariants across all 2,887 distinct states when `StagedOnce` was
 omitted. A test copy with a three-key split and a two-key tile was rejected by
 the divisibility assumption before exploring any states.
+
+## Poisoned-slot gate
+
+Run on `mini-m5`, 2026-11-24 02:30 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| PoisonGate3 | 158,849 | 34,504 | 1.104 | PASS |
+| PoisonGate4 | 3,239,729 | 563,728 | 8.197 | PASS |
+| PoisonUnguarded | 17 | 17 | 0.677 | NoFalsePoison violated |
+| PoisonNoSave | 124 | 79 | 0.673 | LiveIntact violated |
+| PoisonOwnedOnly | 74 | 51 | 0.695 | Coverage violated |
+
+Inspected counterexamples, each checked against `poison_plan` by hand:
+
+- **PoisonUnguarded, state 3:** lane `a` takes slot 1 and steps alone; slot 1
+  is poisoned in its own step (`poison_plan(.., guard = false)`, the
+  `INK_POOLGATE_SABOTAGE` run on the GPU).
+- **PoisonNoSave, state 4:** lane `a` owns slot 1, lane `b` steps; slot 1 is
+  poisoned, not saved, and still poison after the restore.
+- **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
+  the next step leaves the free slot 1 unpoisoned.
