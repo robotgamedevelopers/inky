@@ -1,0 +1,3249 @@
+//! Layer 4 cache-aware lane scheduler, explicit lane lifecycle, starvation bound (`W`),
+//! cancel-in-step barrier, TLA+ trace emission (`specs/CacheScheduler.tla`), and real
+//! server step-planning adapter (`ServeStepPlanner`).
+//!
+//! Kept strictly `std`-only (zero `objc2`, `Metal`, or external crate dependencies) so it
+//! compiles identically both inside `inky` and under standalone CPU-only `rustc` in
+//! `scripts/check-scheduler-traces.sh`.
+
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+/// Explicit Layer 4 lane lifecycle (`docs/ROADMAP.md:129`, `specs/CacheScheduler.tla`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LaneState {
+    Idle,
+    Queued,
+    Admitted,
+    Restoring,
+    Ready,
+    InStep,
+    Cancelling,
+    Cancelled,
+    Finished,
+    Refused,
+}
+
+impl LaneState {
+    pub fn as_tla(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Queued => "Queued",
+            Self::Admitted => "Admitted",
+            Self::Restoring => "Restoring",
+            Self::Ready => "Ready",
+            Self::InStep => "InStep",
+            Self::Cancelling => "Cancelling",
+            Self::Cancelled => "Cancelled",
+            Self::Finished => "Finished",
+            Self::Refused => "Refused",
+        }
+    }
+
+    pub fn is_terminal_or_idle(self) -> bool {
+        matches!(self, Self::Idle | Self::Refused | Self::Cancelled | Self::Finished)
+    }
+
+    pub fn is_mem_holding(self) -> bool {
+        matches!(self, Self::Restoring | Self::Ready | Self::InStep | Self::Cancelling)
+    }
+
+    pub fn is_admitted(self) -> bool {
+        self == Self::Admitted || self.is_mem_holding()
+    }
+
+    pub fn is_waiting(self) -> bool {
+        matches!(self, Self::Queued | Self::Admitted | Self::Restoring | Self::Ready)
+    }
+}
+
+/// Cache block kind matching `specs/BlockLayout.tla` and `specs/CacheScheduler.tla`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BlockKind {
+    Full,
+    Window,
+}
+
+impl BlockKind {
+    pub fn as_tla(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Window => "window",
+        }
+    }
+}
+
+/// Residence tier of a cache block across GPU memory and SSD disk tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BlockTier {
+    None,
+    Memory,
+    Disk,
+    Both,
+}
+
+impl BlockTier {
+    pub fn as_tla(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn in_memory(self) -> bool {
+        matches!(self, Self::Memory | Self::Both)
+    }
+
+    pub fn on_disk(self) -> bool {
+        matches!(self, Self::Disk | Self::Both)
+    }
+
+    pub fn is_present(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// Canonical block identifier matching `TreeIds` and `PrivIds` in `specs/CacheScheduler.tla`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BlockId {
+    Tree {
+        prefix: String,
+        kind: BlockKind,
+        idx: u32,
+    },
+    Priv {
+        lane: usize,
+        kind: BlockKind,
+    },
+}
+
+/// Metadata for a single logical cache block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockRecord {
+    pub tier: BlockTier,
+    pub sealed: bool,
+    pub idx: u32,
+    pub length: u32,
+    pub data: Vec<u8>,
+    pub ref_count: usize,
+}
+
+impl BlockRecord {
+    fn empty(block_size: u32) -> Self {
+        Self {
+            tier: BlockTier::None,
+            sealed: false,
+            idx: 0,
+            length: 0,
+            data: vec![0; block_size as usize],
+            ref_count: 0,
+        }
+    }
+}
+
+/// Retained prefix start point at a block-aligned boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StartPoint {
+    pub kept: bool,
+    pub state_kept: bool,
+    pub full: BTreeSet<BlockId>,
+    pub win: BTreeSet<BlockId>,
+}
+
+/// Per-lane scheduler state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneSlot {
+    pub name: String,
+    pub state: LaneState,
+    pub prefix: String,
+    pub target: u32,
+    pub pos: u32,
+    pub full: BTreeMap<u32, BlockId>,
+    pub win: BTreeMap<u32, BlockId>,
+    pub reservation: u32,
+    pub admit_budget: u32,
+    pub wait_ticks: u32,
+    /// Pending async restore disk I/O block (if any). While `Some`, cancelling a
+    /// `Restoring` lane enters `Cancelling` and holds slot + blocks until I/O finishes.
+    pub restore_io_block: Option<BlockId>,
+}
+
+/// Configuration parameters matching `CONSTANTS` of `specs/CacheScheduler.tla`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulerConfig {
+    pub lanes: Vec<String>,
+    pub prefixes: Vec<String>,
+    pub request_lengths: Vec<u32>,
+    pub block_size: u32,
+    pub window_size: u32,
+    pub max_pos: u32,
+    pub max_span: u32,
+    pub step_token_budget: u32,
+    pub mem_budget: u32,
+    pub disk_budget: u32,
+    pub max_queue: usize,
+    pub max_bypass: u32,
+    /// Stride in blocks for retained start points (`1` = every block boundary, matching
+    /// `specs/CacheScheduler.tla`; `16` = every 16 blocks + prompt end, `docs/ROADMAP.md:111`).
+    pub start_point_stride_blocks: u32,
+}
+
+impl SchedulerConfig {
+    pub fn validate(&self) -> Result<(), SchedError> {
+        if self.start_point_stride_blocks == 0 {
+            return Err(SchedError::InvalidConfig("start_point_stride_blocks must be >= 1"));
+        }
+        if self.lanes.is_empty() {
+            return Err(SchedError::InvalidConfig("lanes must be non-empty"));
+        }
+        if self.prefixes.is_empty() {
+            return Err(SchedError::InvalidConfig("prefixes must be non-empty"));
+        }
+        if self.request_lengths.is_empty() {
+            return Err(SchedError::InvalidConfig("request_lengths must be non-empty"));
+        }
+        if self.block_size == 0 {
+            return Err(SchedError::InvalidConfig("block_size must be > 0"));
+        }
+        if self.window_size < self.block_size {
+            return Err(SchedError::InvalidConfig("window_size must be >= block_size"));
+        }
+        if self.max_pos < self.block_size || self.max_pos % self.block_size != 0 {
+            return Err(SchedError::InvalidConfig("max_pos must be a positive multiple of block_size"));
+        }
+        for &r in &self.request_lengths {
+            if r == 0 || r > self.max_pos || r % self.block_size != 0 {
+                return Err(SchedError::InvalidConfig("each request length must be in 1..=max_pos and block-aligned"));
+            }
+        }
+        if self.max_span == 0 || self.max_span > self.block_size {
+            return Err(SchedError::InvalidConfig("max_span must be in 1..=block_size"));
+        }
+        if self.step_token_budget < self.max_span {
+            return Err(SchedError::InvalidConfig("step_token_budget must be >= max_span"));
+        }
+        if self.mem_budget < 2 || self.disk_budget < 2 {
+            return Err(SchedError::InvalidConfig("mem_budget and disk_budget must be >= 2"));
+        }
+        if self.max_bypass < 1 {
+            return Err(SchedError::InvalidConfig("max_bypass (W) must be >= 1"));
+        }
+        Ok(())
+    }
+
+    pub fn default_prefix(&self) -> &str {
+        &self.prefixes[0]
+    }
+
+    pub fn default_target(&self) -> u32 {
+        self.request_lengths[0]
+    }
+
+    pub fn num_blocks(&self) -> u32 {
+        self.max_pos / self.block_size
+    }
+
+    pub fn boundaries(&self) -> Vec<u32> {
+        (1..=self.num_blocks()).map(|i| i * self.block_size).collect()
+    }
+}
+
+/// Outcome of submitting a request to a lane slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArriveOutcome {
+    Queued,
+    DirectAdmitted,
+    Refused429,
+}
+
+/// Description of one scheduled execution step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltStep {
+    pub lanes: Vec<usize>,
+    pub spans: BTreeMap<usize, u32>,
+    pub total_tokens: u32,
+    pub pins: BTreeSet<BlockId>,
+}
+
+/// Summary returned when `complete_step()` retires an in-flight step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedStep {
+    pub survived: Vec<usize>,
+    pub cancelled: Vec<usize>,
+    pub sealed_boundaries: Vec<(usize, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchedError {
+    InvalidConfig(&'static str),
+    InvalidLane(usize),
+    InvalidPrefix(String),
+    InvalidTarget(u32),
+    InvalidState { lane: usize, expected: &'static str, actual: LaneState },
+    Precondition(&'static str),
+}
+
+impl fmt::Display for SchedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(m) => write!(f, "invalid scheduler config: {m}"),
+            Self::InvalidLane(l) => write!(f, "invalid lane index {l}"),
+            Self::InvalidPrefix(p) => write!(f, "unknown prefix {p:?}"),
+            Self::InvalidTarget(t) => write!(f, "disallowed request target length {t}"),
+            Self::InvalidState { lane, expected, actual } => {
+                write!(f, "lane {lane} expected {expected}, found {actual:?}")
+            }
+            Self::Precondition(m) => write!(f, "scheduler precondition failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for SchedError {}
+
+// ---- Exact Logical Block-Range Helpers (`specs/BlockLayout.tla` / `CacheScheduler.tla`) ----
+
+pub fn ceil_div(n: u32, d: u32) -> u32 {
+    (n + d - 1) / d
+}
+
+pub fn span_bound(window_size: u32, block_size: u32, c: u32) -> u32 {
+    ceil_div(window_size - 1 + c, block_size) + 1
+}
+
+pub fn window_indices(lo: u32, hi: u32, block_size: u32) -> BTreeSet<u32> {
+    if hi < lo {
+        return BTreeSet::new();
+    }
+    let start = lo / block_size;
+    let end = hi / block_size;
+    (start..=end).collect()
+}
+
+pub fn full_indices(n: u32, block_size: u32) -> BTreeSet<u32> {
+    if n == 0 {
+        BTreeSet::new()
+    } else {
+        window_indices(0, n - 1, block_size)
+    }
+}
+
+pub fn history_indices(n: u32, window_size: u32, block_size: u32) -> BTreeSet<u32> {
+    if n == 0 {
+        return BTreeSet::new();
+    }
+    let lo = n.saturating_sub(window_size);
+    window_indices(lo, n - 1, block_size)
+}
+
+pub fn span_window_indices(n: u32, c: u32, window_size: u32, block_size: u32) -> BTreeSet<u32> {
+    if c == 0 {
+        return BTreeSet::new();
+    }
+    let lo = if n >= window_size { n - window_size + 1 } else { 0 };
+    let hi = n + c - 1;
+    window_indices(lo, hi, block_size)
+}
+
+pub fn worst_case_blocks(target: u32, block_size: u32, window_size: u32, max_span: u32) -> u32 {
+    let total_full = full_indices(target, block_size).len() as u32;
+    let max_win = span_bound(window_size, block_size, max_span).min(total_full);
+    total_full + max_win
+}
+
+/// Positions below `prompt_end(target)` are prefill spans (up to `max_span`);
+/// positions at or above `prompt_end(target)` are 1-token decode steps.
+pub fn prompt_end(target: u32, block_size: u32) -> u32 {
+    target.saturating_sub(block_size)
+}
+
+// ---- Core Layer 4 Cache-Aware Scheduler -----------------------------------------------------
+
+/// Deterministic Layer 4 cache-aware lane scheduler implementing:
+/// - Explicit lane lifecycle (`Queued -> Admitted -> Restoring -> Ready -> InStep -> Finished`,
+///   plus `Cancelling -> Cancelled`),
+/// - Worst-case admission and bounded FIFO queue with 429 refusal,
+/// - Starvation-bounded bypass ceiling `W` (`max_bypass`) across `Queued`, `Restoring`, and `Ready`,
+/// - Deterministic step building (starvation-ceiling lanes, longest-waiting ready lane first,
+///   active 1-token decoding lanes, prefill chunks up to `step_token_budget`),
+/// - Cancel-in-step and cancel-in-restore barriers waiting for GPU work and disk I/O.
+#[derive(Clone, Debug)]
+pub struct Scheduler {
+    cfg: SchedulerConfig,
+    blocks: BTreeMap<BlockId, BlockRecord>,
+    start_points: BTreeMap<(String, u32), StartPoint>,
+    lanes: Vec<LaneSlot>,
+    queue_seq: Vec<usize>,
+    step_active: bool,
+    step_lanes: BTreeSet<usize>,
+    step_span: Vec<u32>,
+    step_pins: BTreeSet<BlockId>,
+    step_io: BTreeSet<BlockId>,
+    gpu_done: bool,
+}
+
+impl Scheduler {
+    pub fn new(cfg: SchedulerConfig) -> Result<Self, SchedError> {
+        cfg.validate()?;
+        let n_lanes = cfg.lanes.len();
+        let default_prefix = cfg.default_prefix().to_string();
+        let default_target = cfg.default_target();
+        let lanes = cfg
+            .lanes
+            .iter()
+            .map(|name| LaneSlot {
+                name: name.clone(),
+                state: LaneState::Idle,
+                prefix: default_prefix.clone(),
+                target: default_target,
+                pos: 0,
+                full: BTreeMap::new(),
+                win: BTreeMap::new(),
+                reservation: 0,
+                admit_budget: 0,
+                wait_ticks: 0,
+                restore_io_block: None,
+            })
+            .collect();
+        Ok(Self {
+            cfg,
+            blocks: BTreeMap::new(),
+            start_points: BTreeMap::new(),
+            lanes,
+            queue_seq: Vec::new(),
+            step_active: false,
+            step_lanes: BTreeSet::new(),
+            step_span: vec![0; n_lanes],
+            step_pins: BTreeSet::new(),
+            step_io: BTreeSet::new(),
+            gpu_done: false,
+        })
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.cfg
+    }
+
+    pub fn lanes(&self) -> &[LaneSlot] {
+        &self.lanes
+    }
+
+    pub fn lane(&self, l: usize) -> Option<&LaneSlot> {
+        self.lanes.get(l)
+    }
+
+    pub fn blocks(&self) -> &BTreeMap<BlockId, BlockRecord> {
+        &self.blocks
+    }
+
+    pub fn start_points(&self) -> &BTreeMap<(String, u32), StartPoint> {
+        &self.start_points
+    }
+
+    pub fn queue_seq(&self) -> &[usize] {
+        &self.queue_seq
+    }
+
+    pub fn step_active(&self) -> bool {
+        self.step_active
+    }
+
+    pub fn step_lanes(&self) -> &BTreeSet<usize> {
+        &self.step_lanes
+    }
+
+    pub fn step_span(&self, lane: usize) -> u32 {
+        self.step_span.get(lane).copied().unwrap_or(0)
+    }
+
+    pub fn step_pins(&self) -> &BTreeSet<BlockId> {
+        &self.step_pins
+    }
+
+    pub fn step_io(&self) -> &BTreeSet<BlockId> {
+        &self.step_io
+    }
+
+    pub fn gpu_done(&self) -> bool {
+        self.gpu_done
+    }
+
+    // ---- Queries ----------------------------------------------------------------------------
+
+    pub fn worst_case(&self, target: u32) -> u32 {
+        worst_case_blocks(target, self.cfg.block_size, self.cfg.window_size, self.cfg.max_span)
+    }
+
+    pub fn mem_used(&self) -> u32 {
+        self.blocks.values().filter(|b| b.tier.in_memory()).count() as u32
+    }
+
+    pub fn disk_used(&self) -> u32 {
+        self.blocks.values().filter(|b| b.tier.on_disk()).count() as u32
+    }
+
+    pub fn reserved_total(&self) -> u32 {
+        self.lanes
+            .iter()
+            .filter(|l| l.state.is_mem_holding())
+            .map(|l| l.reservation)
+            .sum()
+    }
+
+    pub fn admitted_total(&self) -> u32 {
+        self.lanes
+            .iter()
+            .filter(|l| l.state.is_admitted())
+            .map(|l| l.admit_budget)
+            .sum()
+    }
+
+    pub fn lane_block_set(&self, l: usize) -> BTreeSet<BlockId> {
+        let slot = &self.lanes[l];
+        let mut s = BTreeSet::new();
+        for b in slot.full.values().chain(slot.win.values()) {
+            s.insert(b.clone());
+        }
+        s
+    }
+
+    fn block_tier(&self, id: &BlockId) -> BlockTier {
+        self.blocks.get(id).map_or(BlockTier::None, |b| b.tier)
+    }
+
+    fn lane_referrers(&self, id: &BlockId) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| {
+                l.state.is_admitted()
+                    && (l.full.values().any(|b| b == id) || l.win.values().any(|b| b == id))
+            })
+            .count()
+    }
+
+    fn start_referrers(&self, id: &BlockId) -> usize {
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && (sp.full.contains(id) || sp.win.contains(id)))
+            .count()
+    }
+
+    fn sync_ref_counts(&mut self) {
+        let mut counts: BTreeMap<BlockId, usize> = BTreeMap::new();
+        for l in &self.lanes {
+            if l.state.is_admitted() {
+                for b in l.full.values().chain(l.win.values()) {
+                    *counts.entry(b.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        for sp in self.start_points.values() {
+            if sp.kept {
+                for b in sp.full.iter().chain(&sp.win) {
+                    *counts.entry(b.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        self.blocks.retain(|id, rec| {
+            if !rec.tier.is_present() {
+                return false;
+            }
+            let refs = counts.get(id).copied().unwrap_or(0);
+            if !rec.sealed && refs == 0 {
+                return false;
+            }
+            rec.ref_count = refs;
+            true
+        });
+    }
+
+    fn queue_pos(&self, lane: usize) -> Option<usize> {
+        self.queue_seq.iter().position(|&q| q == lane)
+    }
+
+    fn older_queued(&self, a: usize, b: usize) -> bool {
+        match (self.queue_pos(a), self.queue_pos(b)) {
+            (Some(ia), Some(ib)) => ia < ib,
+            _ => false,
+        }
+    }
+
+    pub fn is_prefilling(&self, l: usize) -> bool {
+        let slot = &self.lanes[l];
+        slot.state == LaneState::Ready && slot.pos < prompt_end(slot.target, self.cfg.block_size)
+    }
+
+    pub fn is_decoding(&self, l: usize) -> bool {
+        let slot = &self.lanes[l];
+        let pe = prompt_end(slot.target, self.cfg.block_size);
+        slot.state == LaneState::Ready && slot.pos >= pe && slot.pos < slot.target
+    }
+
+    pub fn is_steppable_ready(&self, l: usize) -> bool {
+        let slot = &self.lanes[l];
+        slot.state == LaneState::Ready && slot.pos < slot.target
+    }
+
+    pub fn need_alloc(&self, l: usize) -> u32 {
+        if !self.is_steppable_ready(l) {
+            return 0;
+        }
+        let slot = &self.lanes[l];
+        let bi = slot.pos / self.cfg.block_size;
+        let nf = u32::from(!slot.full.contains_key(&bi));
+        let nw = u32::from(!slot.win.contains_key(&bi));
+        nf + nw
+    }
+
+    pub fn current_working_set(&self, l: usize) -> u32 {
+        let slot = &self.lanes[l];
+        let base = self.lane_block_set(l).len() as u32;
+        let extra = if slot.pos < slot.target {
+            let bi = slot.pos / self.cfg.block_size;
+            u32::from(!slot.full.contains_key(&bi)) + u32::from(!slot.win.contains_key(&bi))
+        } else {
+            0
+        };
+        base + extra
+    }
+
+    fn all_lane_referred_blocks(&self) -> BTreeSet<BlockId> {
+        let mut owned = BTreeSet::new();
+        for l in &self.lanes {
+            if l.state.is_admitted() {
+                for b in l.full.values().chain(l.win.values()) {
+                    owned.insert(b.clone());
+                }
+            }
+        }
+        owned
+    }
+
+    pub fn cold_mem_blocks(&self) -> Vec<BlockId> {
+        let owned = self.all_lane_referred_blocks();
+        self.blocks
+            .iter()
+            .filter(|(id, rec)| {
+                rec.tier.in_memory() && !owned.contains(*id) && !self.step_io.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub fn cold_disk_blocks(&self) -> Vec<BlockId> {
+        let owned = self.all_lane_referred_blocks();
+        self.blocks
+            .iter()
+            .filter(|(id, rec)| {
+                rec.tier.on_disk() && !owned.contains(*id) && !self.step_io.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub fn mem_pressure(&self) -> bool {
+        if self.cold_mem_blocks().is_empty() {
+            return false;
+        }
+        let restore_blocked = self.mem_used() >= self.cfg.mem_budget
+            && (0..self.lanes.len()).any(|l| {
+                self.lanes[l].state == LaneState::Restoring
+                    && self
+                        .lane_block_set(l)
+                        .iter()
+                        .any(|b| !self.block_tier(b).in_memory())
+            });
+        let steppable_need: u32 = (0..self.lanes.len())
+            .filter(|&l| self.is_steppable_ready(l))
+            .map(|l| self.need_alloc(l))
+            .sum();
+        let ready_blocked = (0..self.lanes.len()).any(|l| self.is_steppable_ready(l))
+            && self.mem_used() + steppable_need > self.cfg.mem_budget;
+        restore_blocked || ready_blocked
+    }
+
+    pub fn best_boundary(&self, prefix: &str, max_p: u32) -> u32 {
+        self.start_points
+            .iter()
+            .filter(|((p, k), sp)| p == prefix && *k <= max_p && sp.kept)
+            .map(|((_, k), _)| *k)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn can_fit_request(&self, target: u32) -> bool {
+        self.admitted_total() + self.worst_case(target) <= self.cfg.mem_budget
+    }
+
+    pub fn can_fit_admit(&self, l: usize) -> bool {
+        self.can_fit_request(self.lanes[l].target)
+    }
+
+    /// True iff queued lane `l` is eligible to admit now under longest-waiting-first,
+    /// FIFO tie-breaking, and starvation-ceiling (`max_bypass`) anti-leapfrogging.
+    pub fn can_admit_now(&self, l: usize) -> bool {
+        if self.lanes[l].state != LaneState::Queued || !self.can_fit_admit(l) {
+            return false;
+        }
+        let wl = self.lanes[l].wait_ticks;
+        for q in 0..self.lanes.len() {
+            if q == l || self.lanes[q].state != LaneState::Queued {
+                continue;
+            }
+            let wq = self.lanes[q].wait_ticks;
+            if self.can_fit_admit(q) && !(wl > wq || (wl == wq && self.older_queued(l, q))) {
+                return false;
+            }
+            if wq >= self.cfg.max_bypass && !(self.older_queued(l, q) || wl > wq) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn can_advance_admitted(&self, l: usize) -> bool {
+        self.lanes[l].state == LaneState::Admitted
+            && self.reserved_total() + self.worst_case(self.lanes[l].target) <= self.cfg.mem_budget
+    }
+
+    pub fn can_advance_restoring(&self, l: usize) -> bool {
+        if self.lanes[l].state != LaneState::Restoring {
+            return false;
+        }
+        let all_in_mem = self
+            .lane_block_set(l)
+            .iter()
+            .all(|b| self.block_tier(b).in_memory());
+        all_in_mem || self.mem_used() < self.cfg.mem_budget || !self.cold_mem_blocks().is_empty()
+    }
+
+    /// All waiting lanes across `Ready`, `Restoring`, `Admitted`, and `Queued` that can
+    /// advance immediately without waiting for running lanes to finish.
+    pub fn actionable_waiting(&self) -> BTreeSet<usize> {
+        let mut set = BTreeSet::new();
+        for l in 0..self.lanes.len() {
+            if self.is_steppable_ready(l)
+                || self.can_advance_admitted(l)
+                || self.can_advance_restoring(l)
+                || self.can_admit_now(l)
+            {
+                set.insert(l);
+            }
+        }
+        set
+    }
+
+    pub fn step_bypassed(&self, chosen: &BTreeSet<usize>) -> BTreeSet<usize> {
+        self.actionable_waiting()
+            .difference(chosen)
+            .copied()
+            .collect()
+    }
+
+    fn check_lane_idx(&self, l: usize) -> Result<(), SchedError> {
+        if l < self.lanes.len() {
+            Ok(())
+        } else {
+            Err(SchedError::InvalidLane(l))
+        }
+    }
+
+    // ---- Transitions ------------------------------------------------------------------------
+
+    /// Atomic request arrival: enqueue (`Queued`), direct-admit (`Admitted`) when queue is
+    /// full and no older queued lane can fit or reached `W`, or refuse (`Refused`, HTTP 429).
+    pub fn arrive(
+        &mut self,
+        lane: usize,
+        prefix: &str,
+        target: u32,
+    ) -> Result<ArriveOutcome, SchedError> {
+        self.check_lane_idx(lane)?;
+        if !self.lanes[lane].state.is_terminal_or_idle() {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Idle|Refused|Cancelled|Finished",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if !self.cfg.prefixes.iter().any(|p| p == prefix) {
+            return Err(SchedError::InvalidPrefix(prefix.to_string()));
+        }
+        if !self.cfg.request_lengths.contains(&target) {
+            return Err(SchedError::InvalidTarget(target));
+        }
+
+        let wc = self.worst_case(target);
+        let queued_cnt = self.queue_seq.len();
+        let can_enqueue = wc <= self.cfg.mem_budget && queued_cnt < self.cfg.max_queue;
+        let can_direct_admit = wc <= self.cfg.mem_budget
+            && queued_cnt == self.cfg.max_queue
+            && self.can_fit_request(target)
+            && self.queue_seq.iter().all(|&q| {
+                !self.can_fit_admit(q) && self.lanes[q].wait_ticks < self.cfg.max_bypass
+            });
+
+        if can_enqueue {
+            let slot = &mut self.lanes[lane];
+            slot.state = LaneState::Queued;
+            slot.prefix = prefix.to_string();
+            slot.target = target;
+            slot.pos = 0;
+            slot.full.clear();
+            slot.win.clear();
+            slot.reservation = 0;
+            slot.admit_budget = 0;
+            slot.wait_ticks = 0;
+            slot.restore_io_block = None;
+            self.queue_seq.push(lane);
+            Ok(ArriveOutcome::Queued)
+        } else if can_direct_admit {
+            let queued_snapshot: Vec<usize> = self.queue_seq.clone();
+            for q in queued_snapshot {
+                self.lanes[q].wait_ticks += 1;
+            }
+            let slot = &mut self.lanes[lane];
+            slot.state = LaneState::Admitted;
+            slot.prefix = prefix.to_string();
+            slot.target = target;
+            slot.pos = 0;
+            slot.full.clear();
+            slot.win.clear();
+            slot.reservation = 0;
+            slot.admit_budget = wc;
+            slot.wait_ticks = 0;
+            slot.restore_io_block = None;
+            Ok(ArriveOutcome::DirectAdmitted)
+        } else {
+            let default_prefix = self.cfg.default_prefix().to_string();
+            let default_target = self.cfg.default_target();
+            let slot = &mut self.lanes[lane];
+            slot.state = LaneState::Refused;
+            slot.prefix = default_prefix;
+            slot.target = default_target;
+            slot.pos = 0;
+            slot.full.clear();
+            slot.win.clear();
+            slot.reservation = 0;
+            slot.admit_budget = 0;
+            slot.wait_ticks = 0;
+            slot.restore_io_block = None;
+            Ok(ArriveOutcome::Refused429)
+        }
+    }
+
+    /// Admit a `Queued` lane (`Queued -> Admitted`), preserving its `wait_ticks` and
+    /// incrementing `wait_ticks` on any older queued lanes it bypassed.
+    pub fn admit(&mut self, lane: usize) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Queued {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Queued",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if !self.can_admit_now(lane) {
+            return Err(SchedError::Precondition("lane is not eligible to admit now"));
+        }
+        let wc = self.worst_case(self.lanes[lane].target);
+        let bypassed: Vec<usize> = self
+            .queue_seq
+            .iter()
+            .copied()
+            .filter(|&q| {
+                q != lane
+                    && self.older_queued(q, lane)
+                    && self.lanes[q].wait_ticks < self.cfg.max_bypass
+            })
+            .collect();
+        self.lanes[lane].state = LaneState::Admitted;
+        self.lanes[lane].admit_budget = wc;
+        for q in bypassed {
+            self.lanes[q].wait_ticks += 1; // MUTANT_ANCHOR_ADMIT_BYPASS
+        }
+        self.queue_seq.retain(|&q| q != lane);
+        Ok(())
+    }
+
+    /// Pick and admit the highest-priority eligible queued lane, if any.
+    pub fn admit_next(&mut self) -> Result<Option<usize>, SchedError> {
+        let candidate = self
+            .queue_seq
+            .iter()
+            .copied()
+            .find(|&q| self.can_admit_now(q));
+        if let Some(l) = candidate {
+            self.admit(l)?;
+            Ok(Some(l))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Prefix match and atomic worst-case working-set reservation (`Admitted -> Restoring`).
+    pub fn begin_restore(&mut self, lane: usize) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Admitted {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Admitted",
+                actual: self.lanes[lane].state,
+            });
+        }
+        let prefix = self.lanes[lane].prefix.clone();
+        let target = self.lanes[lane].target;
+        let wc = self.worst_case(target);
+        if self.reserved_total() + wc > self.cfg.mem_budget {
+            return Err(SchedError::Precondition("insufficient memory budget for atomic restore reservation"));
+        }
+        let k = self.best_boundary(&prefix, target);
+        let mut nf = BTreeMap::new();
+        let mut nw = BTreeMap::new();
+        if k > 0 {
+            if let Some(sp) = self.start_points.get(&(prefix, k)) {
+                for b in &sp.full {
+                    if let BlockId::Tree { idx, .. } = b {
+                        nf.insert(*idx, b.clone());
+                    }
+                }
+                for b in &sp.win {
+                    if let BlockId::Tree { idx, .. } = b {
+                        nw.insert(*idx, b.clone());
+                    }
+                }
+            }
+        }
+        let slot = &mut self.lanes[lane];
+        slot.state = LaneState::Restoring;
+        slot.pos = k;
+        slot.full = nf;
+        slot.win = nw;
+        slot.reservation = wc;
+        slot.restore_io_block = None;
+        self.sync_ref_counts();
+        Ok(())
+    }
+
+    /// Atomic single-block disk restore (`CacheScheduler.tla::RestoreBlock`), respecting
+    /// longest-waiting restoring lane priority.
+    pub fn restore_block(&mut self, lane: usize, block: &BlockId) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Restoring {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Restoring",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if !self.lane_block_set(lane).contains(block) {
+            return Err(SchedError::Precondition("block not owned by restoring lane"));
+        }
+        if self.block_tier(block) != BlockTier::Disk {
+            return Err(SchedError::Precondition("block is not disk-only"));
+        }
+        if self.mem_used() >= self.cfg.mem_budget {
+            return Err(SchedError::Precondition("memory budget full during restore"));
+        }
+        let wl = self.lanes[lane].wait_ticks;
+        let active_max = (0..self.lanes.len())
+            .filter(|&r| {
+                self.lanes[r].state == LaneState::Restoring
+                    && self
+                        .lane_block_set(r)
+                        .iter()
+                        .any(|rb| self.block_tier(rb) == BlockTier::Disk)
+            })
+            .map(|r| self.lanes[r].wait_ticks)
+            .max()
+            .unwrap_or(0);
+        if wl < active_max {
+            return Err(SchedError::Precondition("longer-waiting restoring lane must read first"));
+        }
+        if let Some(rec) = self.blocks.get_mut(block) {
+            rec.tier = BlockTier::Both;
+        }
+        Ok(())
+    }
+
+    /// Begin an asynchronous disk restore read for `lane`, arming the cancel-in-restore
+    /// barrier so a disconnect during disk I/O enters `Cancelling` and holds slot + blocks
+    /// until `complete_restore_io(lane)` finishes (`docs/ROADMAP.md:135`).
+    pub fn begin_restore_io(&mut self, lane: usize, block: &BlockId) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Restoring {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Restoring",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if self.lanes[lane].restore_io_block.is_some() {
+            return Err(SchedError::Precondition("restore I/O already in flight for lane"));
+        }
+        if !self.lane_block_set(lane).contains(block) {
+            return Err(SchedError::Precondition("block not owned by restoring lane"));
+        }
+        if self.block_tier(block) != BlockTier::Disk {
+            return Err(SchedError::Precondition("block is not disk-only"));
+        }
+        if self.mem_used() >= self.cfg.mem_budget {
+            return Err(SchedError::Precondition("memory budget full during restore"));
+        }
+        self.lanes[lane].restore_io_block = Some(block.clone());
+        Ok(())
+    }
+
+    /// Complete an in-flight async restore read. If the lane was cancelled while reading
+    /// (`Cancelling`), it now transitions cleanly to `Cancelled` and releases its slot,
+    /// reservation, and block references.
+    pub fn complete_restore_io(&mut self, lane: usize) -> Result<LaneState, SchedError> {
+        self.check_lane_idx(lane)?;
+        let Some(block) = self.lanes[lane].restore_io_block.take() else {
+            return Err(SchedError::Precondition("no restore I/O in flight for lane"));
+        };
+        match self.lanes[lane].state {
+            LaneState::Restoring => {
+                if let Some(rec) = self.blocks.get_mut(&block) {
+                    if rec.tier == BlockTier::Disk {
+                        rec.tier = BlockTier::Both;
+                    }
+                }
+                Ok(LaneState::Restoring)
+            }
+            LaneState::Cancelling => {
+                self.release_lane_to(lane, LaneState::Cancelled);
+                Ok(LaneState::Cancelled)
+            }
+            other => Err(SchedError::InvalidState {
+                lane,
+                expected: "Restoring|Cancelling",
+                actual: other,
+            }),
+        }
+    }
+
+    /// Finish restoring once every owned block is resident in memory (`Restoring -> Ready`),
+    /// preserving `wait_ticks` into `Ready`.
+    pub fn finish_restore(&mut self, lane: usize) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Restoring {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Restoring",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if self.lanes[lane].restore_io_block.is_some() {
+            return Err(SchedError::Precondition("restore disk I/O still in flight"));
+        }
+        if !self
+            .lane_block_set(lane)
+            .iter()
+            .all(|b| self.block_tier(b).in_memory())
+        {
+            return Err(SchedError::Precondition("not all lane blocks are in memory"));
+        }
+        self.lanes[lane].state = LaneState::Ready;
+        Ok(())
+    }
+
+    /// Maximum single-step prefill span allowed for a prefilling lane under `max_span`,
+    /// block boundary alignment, and `prompt_end`.
+    fn max_prefill_span(&self, lane: usize) -> u32 {
+        let slot = &self.lanes[lane];
+        let pe = prompt_end(slot.target, self.cfg.block_size);
+        let to_pe = pe.saturating_sub(slot.pos);
+        let to_blk = self.cfg.block_size - (slot.pos % self.cfg.block_size);
+        self.cfg.max_span.min(to_pe).min(to_blk)
+    }
+
+    fn violates_bypass_ceiling(&self, bypassed: &BTreeSet<usize>) -> bool {
+        bypassed.iter().any(|&w| self.lanes[w].wait_ticks >= self.cfg.max_bypass) // MUTANT_ANCHOR_BYPASS_CEILING
+    }
+
+    /// Deterministically plan and launch the next step (`Ready -> InStep`):
+    /// 1. Block step launch if any non-Ready actionable waiting lane (`Queued`, `Admitted`,
+    ///    `Restoring`) has reached the starvation ceiling `W` (`max_bypass`).
+    /// 2. Pick the longest-waiting fitting `Ready` lane as leader (decoders win ties at `max_w`),
+    ///    plus every other `Ready` lane at `wait_ticks >= W`.
+    /// 3. Pack all remaining fitting 1-token decoding lanes up to `step_token_budget`.
+    /// 4. Fill remaining `step_token_budget` with prefill chunks without starving fitting decoders.
+    ///
+    /// Returns `Ok(None)` when no valid step can start right now (e.g. step already active,
+    /// no steppable ready lanes, a non-Ready lane hit `W` and must advance first, or memory
+    /// reclaim is needed before allocating private tail blocks).
+    pub fn build_step(&mut self) -> Result<Option<BuiltStep>, SchedError> {
+        if self.step_active {
+            return Ok(None);
+        }
+        let steppable: Vec<usize> = (0..self.lanes.len())
+            .filter(|&l| self.is_steppable_ready(l))
+            .collect();
+        if steppable.is_empty() {
+            return Ok(None);
+        }
+
+        let mem_used = self.mem_used();
+        let mem_budget = self.cfg.mem_budget;
+        let max_w = steppable
+            .iter()
+            .map(|&l| self.lanes[l].wait_ticks)
+            .max()
+            .unwrap_or(0);
+
+        let has_max_decoder = steppable.iter().any(|&l| {
+            self.is_decoding(l)
+                && self.lanes[l].wait_ticks == max_w
+                && mem_used + self.need_alloc(l) <= mem_budget
+        });
+
+        // 1. Leader: longest-waiting fitting Ready lane (decoder preferred on tie at max_w).
+        let leader = steppable
+            .iter()
+            .copied()
+            .filter(|&l| {
+                self.lanes[l].wait_ticks == max_w
+                    && mem_used + self.need_alloc(l) <= mem_budget
+                    && (!has_max_decoder || self.is_decoding(l))
+            })
+            .min(); // lowest lane index tie-breaker
+        let Some(leader) = leader else {
+            return Ok(None);
+        };
+
+        let mut chosen_set = BTreeSet::new();
+        let mut chosen_order = Vec::new();
+        let mut spans: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut used_tokens: u32 = 0;
+        let mut alloc_cnt: u32 = 0;
+
+        // Helper closure-style additions: reserve 1 token first for leader and ceiling lanes.
+        chosen_set.insert(leader);
+        chosen_order.push(leader);
+        spans.insert(leader, 1);
+        used_tokens += 1;
+        alloc_cnt += self.need_alloc(leader);
+
+        // 2. Any other Ready lane at the starvation ceiling W MUST be included so none exceeds W.
+        let mut ceiling_ready: Vec<usize> = steppable
+            .iter()
+            .copied()
+            .filter(|&l| l != leader && self.lanes[l].wait_ticks >= self.cfg.max_bypass)
+            .collect();
+        ceiling_ready.sort_by_key(|&l| {
+            (
+                std::cmp::Reverse(self.lanes[l].wait_ticks),
+                !self.is_decoding(l),
+                l,
+            )
+        });
+        for l in ceiling_ready {
+            let need = self.need_alloc(l);
+            if used_tokens + 1 > self.cfg.step_token_budget
+                || mem_used + alloc_cnt + need > mem_budget
+            {
+                break;
+            }
+            chosen_set.insert(l);
+            chosen_order.push(l);
+            spans.insert(l, 1);
+            used_tokens += 1;
+            alloc_cnt += need;
+        }
+
+        // 3. Active 1-token decoding lanes (descending wait_ticks, then lane index).
+        let mut decoders: Vec<usize> = steppable
+            .iter()
+            .copied()
+            .filter(|&l| !chosen_set.contains(&l) && self.is_decoding(l))
+            .collect();
+        decoders.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
+        for d in decoders {
+            let need = self.need_alloc(d);
+            if used_tokens + 1 <= self.cfg.step_token_budget
+                && mem_used + alloc_cnt + need <= mem_budget
+            {
+                chosen_set.insert(d);
+                chosen_order.push(d);
+                spans.insert(d, 1);
+                used_tokens += 1;
+                alloc_cnt += need;
+            }
+        }
+
+        // Check if any fitting decoder remained unchosen due to token budget saturation.
+        let any_fit_unchosen_decoder = steppable.iter().any(|&d| {
+            !chosen_set.contains(&d)
+                && self.is_decoding(d)
+                && mem_used + alloc_cnt + self.need_alloc(d) <= mem_budget
+        });
+
+        // 4. Prefill chunks sliced up to step_token_budget (only when no fitting decoder is starved).
+        if !any_fit_unchosen_decoder {
+            // Expand already-chosen prefill lanes first (leader, then ceiling lanes).
+            for &l in &chosen_order {
+                if self.is_prefilling(l) && used_tokens < self.cfg.step_token_budget {
+                    let rem = self.cfg.step_token_budget - used_tokens;
+                    let cur = spans[&l];
+                    let cap = self.max_prefill_span(l);
+                    let extra = cap.saturating_sub(cur).min(rem);
+                    if extra > 0 {
+                        spans.insert(l, cur + extra);
+                        used_tokens += extra;
+                    }
+                }
+            }
+            // Add additional ready prefill lanes up to token & memory budget.
+            let mut prefillers: Vec<usize> = steppable
+                .iter()
+                .copied()
+                .filter(|&l| !chosen_set.contains(&l) && self.is_prefilling(l))
+                .collect();
+            prefillers.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
+            for p in prefillers {
+                if used_tokens >= self.cfg.step_token_budget {
+                    break;
+                }
+                let need = self.need_alloc(p);
+                if mem_used + alloc_cnt + need > mem_budget {
+                    continue;
+                }
+                let rem = self.cfg.step_token_budget - used_tokens;
+                let span = self.max_prefill_span(p).min(rem);
+                if span > 0 {
+                    chosen_set.insert(p);
+                    chosen_order.push(p);
+                    spans.insert(p, span);
+                    used_tokens += span;
+                    alloc_cnt += need;
+                }
+            }
+        }
+
+        // Enforce starvation ceiling across Queued, Admitted, Restoring, and unchosen Ready lanes.
+        let bypassed = self.step_bypassed(&chosen_set);
+        if self.violates_bypass_ceiling(&bypassed) {
+            return Ok(None);
+        }
+
+        // Allocate private unsealed zero-padded tail blocks for chosen lanes that need them.
+        let bsz = self.cfg.block_size;
+        let mut new_ids: Vec<(usize, BlockId, u32)> = Vec::new();
+        for &l in &chosen_set {
+            let bi = self.lanes[l].pos / bsz;
+            if !self.lanes[l].full.contains_key(&bi) {
+                let id = BlockId::Priv { lane: l, kind: BlockKind::Full };
+                if self.block_tier(&id).is_present() {
+                    return Err(SchedError::Precondition("private full tail already allocated"));
+                }
+                new_ids.push((l, id, bi));
+            }
+            if !self.lanes[l].win.contains_key(&bi) {
+                let id = BlockId::Priv { lane: l, kind: BlockKind::Window };
+                if self.block_tier(&id).is_present() {
+                    return Err(SchedError::Precondition("private window tail already allocated"));
+                }
+                new_ids.push((l, id, bi));
+            }
+        }
+        for (l, id, bi) in new_ids {
+            match id {
+                BlockId::Priv { kind: BlockKind::Full, .. } => {
+                    self.lanes[l].full.insert(bi, id.clone());
+                }
+                BlockId::Priv { kind: BlockKind::Window, .. } => {
+                    self.lanes[l].win.insert(bi, id.clone());
+                }
+                _ => unreachable!(),
+            }
+            self.blocks.insert(
+                id,
+                BlockRecord {
+                    tier: BlockTier::Memory,
+                    sealed: false,
+                    idx: bi,
+                    length: 0,
+                    data: vec![0; bsz as usize],
+                    ref_count: 1,
+                },
+            );
+        }
+
+        // Transition chosen lanes Ready -> InStep and compute step pins.
+        let mut all_pins = BTreeSet::new();
+        for &l in &chosen_set {
+            self.lanes[l].state = LaneState::InStep;
+            self.lanes[l].wait_ticks = 0;
+            let pos = self.lanes[l].pos;
+            let sp = spans[&l];
+            for bi in full_indices(pos + sp, bsz) {
+                if let Some(b) = self.lanes[l].full.get(&bi) {
+                    all_pins.insert(b.clone());
+                }
+            }
+            for bi in span_window_indices(pos, sp, self.cfg.window_size, bsz) {
+                if let Some(b) = self.lanes[l].win.get(&bi) {
+                    all_pins.insert(b.clone());
+                }
+            }
+        }
+
+        // Increment wait_ticks on every bypassed actionable waiting lane.
+        for w in bypassed {
+            if self.lanes[w].wait_ticks <= self.cfg.max_bypass {
+                self.lanes[w].wait_ticks += 1; // MUTANT_ANCHOR_STEP_BYPASS
+            }
+        }
+
+        self.sync_ref_counts();
+        self.step_active = true;
+        self.step_lanes = chosen_set.clone();
+        self.step_span = vec![0; self.lanes.len()];
+        for (&l, &sp) in &spans {
+            self.step_span[l] = sp;
+        }
+        self.step_pins = all_pins.clone();
+        self.gpu_done = false;
+
+        Ok(Some(BuiltStep {
+            lanes: chosen_order,
+            spans,
+            total_tokens: used_tokens,
+            pins: all_pins,
+        }))
+    }
+
+    /// Execute the GPU work of the active step, populating `[off..off+cnt]` in each chosen
+    /// lane's private tail blocks and setting `gpu_done = true`.
+    pub fn gpu_execute(&mut self) -> Result<(), SchedError> {
+        if !self.step_active || self.gpu_done {
+            return Err(SchedError::Precondition("gpu_execute requires active step with gpu_done == false"));
+        }
+        let bsz = self.cfg.block_size;
+        let step_lanes: Vec<usize> = self.step_lanes.iter().copied().collect();
+        for l in step_lanes {
+            let pos = self.lanes[l].pos;
+            let bi = pos / bsz;
+            let off = (pos % bsz) as usize;
+            let cnt = self.step_span[l] as usize;
+            for bid in [self.lanes[l].full.get(&bi).cloned(), self.lanes[l].win.get(&bi).cloned()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(rec) = self.blocks.get_mut(&bid) {
+                    if rec.tier.is_present() && !rec.sealed {
+                        rec.length = (off + cnt) as u32;
+                        for v in &mut rec.data[off..off + cnt] {
+                            *v = 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.gpu_done = true;
+        Ok(())
+    }
+
+    /// Complete all pending disk I/O in `step_io`.
+    pub fn complete_step_io(&mut self) -> Result<(), SchedError> {
+        if self.step_io.is_empty() {
+            return Err(SchedError::Precondition("no pending step I/O"));
+        }
+        if self.disk_used() + self.step_io.len() as u32 > self.cfg.disk_budget {
+            return Err(SchedError::Precondition("disk budget exceeded on CompleteStepIO"));
+        }
+        let pending: Vec<BlockId> = self.step_io.iter().cloned().collect();
+        for id in pending {
+            let has_lane_ref = self.lane_referrers(&id) > 0;
+            if let Some(rec) = self.blocks.get_mut(&id) {
+                if rec.tier == BlockTier::Memory {
+                    rec.tier = if has_lane_ref {
+                        BlockTier::Both
+                    } else {
+                        BlockTier::Disk
+                    };
+                }
+            }
+        }
+        self.step_io.clear();
+        Ok(())
+    }
+
+    /// Retire the completed step (`FinishStep`): requires `gpu_done && step_io.is_empty()`.
+    /// Surviving `InStep` lanes advance to `Ready`, seal full blocks & start points, and
+    /// prune their sliding window; `Cancelling` lanes now transition to `Cancelled` and
+    /// release their slot, blocks, and reservations cleanly (`docs/ROADMAP.md:135`).
+    pub fn complete_step(&mut self) -> Result<CompletedStep, SchedError> {
+        if !self.step_active || !self.gpu_done || !self.step_io.is_empty() {
+            return Err(SchedError::Precondition(
+                "complete_step requires step_active && gpu_done && step_io.is_empty()",
+            ));
+        }
+        let bsz = self.cfg.block_size;
+        let wsz = self.cfg.window_size;
+        let step_lanes: Vec<usize> = self.step_lanes.iter().copied().collect();
+        let surviving: Vec<usize> = step_lanes
+            .iter()
+            .copied()
+            .filter(|&l| self.lanes[l].state == LaneState::InStep)
+            .collect();
+        let cancelling: Vec<usize> = step_lanes
+            .iter()
+            .copied()
+            .filter(|&l| self.lanes[l].state == LaneState::Cancelling)
+            .collect();
+
+        let mut boundary_lanes: Vec<(usize, u32)> = Vec::new();
+        for &l in &surviving {
+            let npos = self.lanes[l].pos + self.step_span[l];
+            if npos % bsz == 0 {
+                boundary_lanes.push((l, npos));
+            }
+        }
+
+        // Publish sealed tree blocks for boundary lanes and retire private tails.
+        let mut published_tree: BTreeSet<BlockId> = BTreeSet::new();
+        let mut retired_priv: BTreeSet<BlockId> = BTreeSet::new();
+        for &(l, npos) in &boundary_lanes {
+            let bi = (npos / bsz) - 1;
+            let pfx = self.lanes[l].prefix.clone();
+            published_tree.insert(BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi });
+            published_tree.insert(BlockId::Tree { prefix: pfx, kind: BlockKind::Window, idx: bi });
+            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Full });
+            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Window });
+        }
+        for &l in &cancelling {
+            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Full });
+            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Window });
+        }
+
+        for id in &retired_priv {
+            self.blocks.remove(id);
+        }
+        for id in &published_tree {
+            let idx = match id {
+                BlockId::Tree { idx, .. } => *idx,
+                _ => unreachable!(),
+            };
+            let prev_tier = self.block_tier(id);
+            let next_tier = if prev_tier.on_disk() {
+                BlockTier::Both
+            } else {
+                BlockTier::Memory
+            };
+            self.blocks.insert(
+                id.clone(),
+                BlockRecord {
+                    tier: next_tier,
+                    sealed: true,
+                    idx,
+                    length: bsz,
+                    data: vec![1; bsz as usize],
+                    ref_count: 0,
+                },
+            );
+        }
+
+        // Update surviving lanes: advance position, bind sealed blocks, prune window to History(npos).
+        for &l in &surviving {
+            let npos = self.lanes[l].pos + self.step_span[l];
+            let pfx = self.lanes[l].prefix.clone();
+            self.lanes[l].pos = npos;
+            if npos % bsz == 0 {
+                let bi = (npos / bsz) - 1;
+                self.lanes[l].full.insert(
+                    bi,
+                    BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi },
+                );
+                self.lanes[l].win.insert(
+                    bi,
+                    BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: bi },
+                );
+            }
+            let keep = history_indices(npos, wsz, bsz);
+            self.lanes[l].win.retain(|bi, _| keep.contains(bi));
+            self.lanes[l].state = LaneState::Ready;
+        }
+
+        // Record kept start points at configured block stride and prompt ends.
+        let stride = self.cfg.start_point_stride_blocks;
+        for &(l, npos) in &boundary_lanes {
+            let blk_cnt = npos / bsz;
+            let at_prompt_end = npos == prompt_end(self.lanes[l].target, bsz) || npos == self.lanes[l].target;
+            if !at_prompt_end && blk_cnt % stride != 0 {
+                continue;
+            }
+            let pfx = self.lanes[l].prefix.clone();
+            let full = full_indices(npos, bsz)
+                .into_iter()
+                .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: i })
+                .collect();
+            let win = history_indices(npos, wsz, bsz)
+                .into_iter()
+                .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: i })
+                .collect();
+            self.start_points.insert(
+                (pfx, npos),
+                StartPoint { kept: true, state_kept: true, full, win },
+            );
+        }
+
+        // Release cancelling lanes now that GPU work and step I/O are complete.
+        let default_prefix = self.cfg.default_prefix().to_string();
+        let default_target = self.cfg.default_target();
+        for &l in &cancelling {
+            let slot = &mut self.lanes[l];
+            slot.state = LaneState::Cancelled;
+            slot.prefix = default_prefix.clone();
+            slot.target = default_target;
+            slot.pos = 0;
+            slot.full.clear();
+            slot.win.clear();
+            slot.reservation = 0;
+            slot.admit_budget = 0;
+            slot.restore_io_block = None;
+        }
+
+        self.step_active = false;
+        self.step_lanes.clear();
+        self.step_span.fill(0);
+        self.step_pins.clear();
+        self.gpu_done = false;
+        self.sync_ref_counts();
+
+        Ok(CompletedStep {
+            survived: surviving,
+            cancelled: cancelling,
+            sealed_boundaries: boundary_lanes,
+        })
+    }
+
+    /// Cancel a lane.
+    /// - If `InStep`: enters `Cancelling` and holds slot + KV blocks + pins + reservation
+    ///   until `complete_step()` completes GPU work and step I/O (`docs/ROADMAP.md:135`).
+    /// - If `Restoring` with active async restore disk I/O: enters `Cancelling` and holds
+    ///   slot + blocks + reservation until `complete_restore_io(lane)` finishes.
+    /// - Otherwise (`Queued`, `Admitted`, `Ready`, or `Restoring` with no active I/O):
+    ///   transitions immediately to `Cancelled` and frees resources cleanly.
+    pub fn cancel(&mut self, lane: usize) -> Result<LaneState, SchedError> {
+        self.check_lane_idx(lane)?;
+        match self.lanes[lane].state {
+            LaneState::InStep => {
+                self.lanes[lane].state = LaneState::Cancelling; // MUTANT_ANCHOR_CANCEL_IN_STEP
+                Ok(LaneState::Cancelling)
+            }
+            LaneState::Restoring if self.lanes[lane].restore_io_block.is_some() => {
+                self.lanes[lane].state = LaneState::Cancelling;
+                Ok(LaneState::Cancelling)
+            }
+            LaneState::Queued | LaneState::Admitted | LaneState::Restoring | LaneState::Ready => {
+                if self.lanes[lane].state == LaneState::Queued {
+                    self.queue_seq.retain(|&q| q != lane);
+                }
+                self.release_lane_to(lane, LaneState::Cancelled);
+                Ok(LaneState::Cancelled)
+            }
+            other => Err(SchedError::InvalidState {
+                lane,
+                expected: "Queued|Admitted|Restoring|Ready|InStep",
+                actual: other,
+            }),
+        }
+    }
+
+    /// Finish a `Ready` lane that has reached its target length (`Ready -> Finished`).
+    pub fn finish_ready(&mut self, lane: usize) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Ready {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Ready",
+                actual: self.lanes[lane].state,
+            });
+        }
+        if self.lanes[lane].pos != self.lanes[lane].target {
+            return Err(SchedError::Precondition("lane has not reached target length"));
+        }
+        self.release_lane_to(lane, LaneState::Finished);
+        Ok(())
+    }
+
+    fn release_lane_to(&mut self, lane: usize, target_state: LaneState) {
+        let default_prefix = self.cfg.default_prefix().to_string();
+        let default_target = self.cfg.default_target();
+        let slot = &mut self.lanes[lane];
+        slot.state = target_state;
+        slot.prefix = default_prefix;
+        slot.target = default_target;
+        slot.pos = 0;
+        slot.full.clear();
+        slot.win.clear();
+        slot.reservation = 0;
+        slot.admit_budget = 0;
+        slot.wait_ticks = 0;
+        slot.restore_io_block = None;
+        self.sync_ref_counts();
+    }
+
+    // ---- Memory Pressure, Cold Spill & Window Maintenance -----------------------------------
+
+    pub fn evict_clean_or_unref_mem(&mut self) -> bool {
+        if !self.mem_pressure() {
+            return false;
+        }
+        let victim = self.cold_mem_blocks().into_iter().find(|id| {
+            let rec = &self.blocks[id];
+            rec.tier.on_disk() || rec.ref_count == 0
+        });
+        let Some(id) = victim else {
+            return false;
+        };
+        let rec = &self.blocks[&id];
+        if rec.ref_count == 0 && !rec.tier.on_disk() {
+            self.blocks.remove(&id);
+        } else if let Some(r) = self.blocks.get_mut(&id) {
+            r.tier = BlockTier::Disk;
+        }
+        true
+    }
+
+    pub fn start_cold_writeback(&mut self) -> Option<BlockId> {
+        if !self.step_io.is_empty() || !self.mem_pressure() {
+            return None;
+        }
+        let has_clean_or_unref = self.cold_mem_blocks().iter().any(|id| {
+            let rec = &self.blocks[id];
+            rec.tier.on_disk() || rec.ref_count == 0
+        });
+        if has_clean_or_unref || self.disk_used() >= self.cfg.disk_budget {
+            return None;
+        }
+        let victim = self.cold_mem_blocks().into_iter().find(|id| {
+            let rec = &self.blocks[id];
+            rec.tier == BlockTier::Memory && rec.sealed
+        })?;
+        self.step_io.insert(victim.clone());
+        Some(victim)
+    }
+
+    pub fn reclaim_cold_disk(&mut self) -> bool {
+        if self.disk_used() + (self.step_io.len() as u32) < self.cfg.disk_budget {
+            return false;
+        }
+        let cold_disk = self.cold_disk_blocks();
+        let has_unref_disk = cold_disk.iter().any(|id| self.blocks[id].ref_count == 0);
+        if !self.mem_pressure() && !has_unref_disk {
+            return false;
+        }
+        if let Some(id) = cold_disk.into_iter().find(|id| self.blocks[id].ref_count == 0) {
+            if self.blocks[&id].tier.in_memory() {
+                self.blocks.get_mut(&id).unwrap().tier = BlockTier::Memory;
+            } else {
+                self.blocks.remove(&id);
+            }
+            return true;
+        }
+        let cold_mem: BTreeSet<BlockId> = self.cold_mem_blocks().into_iter().collect();
+        let cold_disk_set: BTreeSet<BlockId> = self.cold_disk_blocks().into_iter().collect();
+        let victim_pk = self
+            .start_points
+            .iter()
+            .find(|(_, sp)| {
+                sp.kept
+                    && sp.full.iter().chain(&sp.win).all(|b| !self.step_io.contains(b))
+                    && sp
+                        .full
+                        .iter()
+                        .chain(&sp.win)
+                        .any(|b| cold_disk_set.contains(b) || cold_mem.contains(b))
+            })
+            .map(|(pk, _)| pk.clone());
+        if let Some(pk) = victim_pk {
+            self.start_points.remove(&pk);
+            self.sync_ref_counts();
+            return true;
+        }
+        false
+    }
+
+    pub fn drop_unreferenced(&mut self, id: &BlockId) -> bool {
+        let Some(rec) = self.blocks.get(id) else {
+            return false;
+        };
+        if !rec.tier.is_present()
+            || rec.ref_count != 0
+            || self.step_pins.contains(id)
+            || self.step_io.contains(id)
+        {
+            return false;
+        }
+        self.blocks.remove(id);
+        true
+    }
+
+    pub fn slide_window(&mut self, lane: usize) -> bool {
+        if lane >= self.lanes.len() || self.lanes[lane].state != LaneState::Ready {
+            return false;
+        }
+        let keep = history_indices(
+            self.lanes[lane].pos,
+            self.cfg.window_size,
+            self.cfg.block_size,
+        );
+        let before = self.lanes[lane].win.len();
+        self.lanes[lane].win.retain(|bi, _| keep.contains(bi));
+        if self.lanes[lane].win.len() != before {
+            self.sync_ref_counts();
+            true
+        } else {
+            false
+        }
+    }
+
+    // ---- Runtime Safety Invariant Checker ---------------------------------------------------
+
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let bsz = self.cfg.block_size;
+        let wsz = self.cfg.window_size;
+
+        // 1. BudgetsAndReservations
+        if self.mem_used() > self.cfg.mem_budget {
+            return Err(format!("MemUsed {} > MemBudget {}", self.mem_used(), self.cfg.mem_budget));
+        }
+        if self.disk_used() > self.cfg.disk_budget {
+            return Err(format!("DiskUsed {} > DiskBudget {}", self.disk_used(), self.cfg.disk_budget));
+        }
+        if self.reserved_total() > self.cfg.mem_budget {
+            return Err(format!(
+                "ReservedTotal {} > MemBudget {}",
+                self.reserved_total(),
+                self.cfg.mem_budget
+            ));
+        }
+
+        // 2. BypassBoundHolds
+        for (i, slot) in self.lanes.iter().enumerate() {
+            if slot.state.is_waiting() && slot.wait_ticks > self.cfg.max_bypass {
+                return Err(format!(
+                    "lane {i} ({:?}) wait_ticks {} > max_bypass {}",
+                    slot.state, slot.wait_ticks, self.cfg.max_bypass
+                ));
+            }
+            if matches!(slot.state, LaneState::Restoring | LaneState::Ready | LaneState::InStep) {
+                let ws = self.current_working_set(i);
+                if slot.reservation < ws {
+                    return Err(format!(
+                        "lane {i} reservation {} < current_working_set {}",
+                        slot.reservation, ws
+                    ));
+                }
+                for bi in full_indices(slot.pos, bsz) {
+                    let Some(bid) = slot.full.get(&bi) else {
+                        return Err(format!("lane {i} missing full block {bi}"));
+                    };
+                    if !self.block_tier(bid).is_present() {
+                        return Err(format!("lane {i} full block {bi} not present"));
+                    }
+                }
+                for bi in history_indices(slot.pos, wsz, bsz) {
+                    let Some(bid) = slot.win.get(&bi) else {
+                        return Err(format!("lane {i} missing window block {bi}"));
+                    };
+                    if !self.block_tier(bid).is_present() {
+                        return Err(format!("lane {i} window block {bi} not present"));
+                    }
+                }
+            }
+        }
+
+        // 3. QueueBounded
+        let queued_cnt = self
+            .lanes
+            .iter()
+            .filter(|l| l.state == LaneState::Queued)
+            .count();
+        if queued_cnt != self.queue_seq.len() || queued_cnt > self.cfg.max_queue {
+            return Err(format!(
+                "queue invariant broken: queued={queued_cnt}, seq={}, max={}",
+                self.queue_seq.len(),
+                self.cfg.max_queue
+            ));
+        }
+
+        // 4. StepBlocksInMemoryAndOwned & StepBudgetHolds
+        if self.step_active {
+            let total_tokens: u32 = self.step_lanes.iter().map(|&l| self.step_span[l]).sum();
+            if total_tokens > self.cfg.step_token_budget {
+                return Err(format!(
+                    "step tokens {} > step_token_budget {}",
+                    total_tokens, self.cfg.step_token_budget
+                ));
+            }
+            for &l in &self.step_lanes {
+                let st = self.lanes[l].state;
+                if !matches!(st, LaneState::InStep | LaneState::Cancelling) {
+                    return Err(format!("step lane {l} in illegal state {st:?}"));
+                }
+                let pos = self.lanes[l].pos;
+                let sp = self.step_span[l];
+                if pos >= prompt_end(self.lanes[l].target, bsz) && sp != 1 {
+                    return Err(format!("decoding lane {l} has span {sp} != 1"));
+                }
+                for bi in full_indices(pos + sp, bsz) {
+                    let bid = self.lanes[l]
+                        .full
+                        .get(&bi)
+                        .ok_or_else(|| format!("step lane {l} missing full block {bi}"))?;
+                    if !self.step_pins.contains(bid) {
+                        return Err(format!("step lane {l} full block {bi} not pinned"));
+                    }
+                }
+                for bi in span_window_indices(pos, sp, wsz, bsz) {
+                    let bid = self.lanes[l]
+                        .win
+                        .get(&bi)
+                        .ok_or_else(|| format!("step lane {l} missing window block {bi}"))?;
+                    if !self.step_pins.contains(bid) {
+                        return Err(format!("step lane {l} window block {bi} not pinned"));
+                    }
+                }
+            }
+            for b in &self.step_pins {
+                if !self.block_tier(b).in_memory() {
+                    return Err(format!("pinned block {b:?} not in memory"));
+                }
+                if self.lane_referrers(b) == 0 {
+                    return Err(format!("pinned block {b:?} has no lane referrer"));
+                }
+            }
+        }
+
+        // 5. RefCountMatchesReferrers & UnsealedPrivateInvisibleZero (O(N) count pass)
+        let mut expected_counts: BTreeMap<BlockId, usize> = BTreeMap::new();
+        for l in &self.lanes {
+            if l.state.is_admitted() {
+                for b in l.full.values().chain(l.win.values()) {
+                    *expected_counts.entry(b.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        for sp in self.start_points.values() {
+            if sp.kept {
+                for b in sp.full.iter().chain(&sp.win) {
+                    *expected_counts.entry(b.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        for (id, rec) in &self.blocks {
+            let expected_refs = expected_counts.get(id).copied().unwrap_or(0);
+            if rec.ref_count != expected_refs {
+                return Err(format!(
+                    "block {id:?} ref_count {} != expected {expected_refs}",
+                    rec.ref_count
+                ));
+            }
+            if !rec.sealed {
+                if !matches!(id, BlockId::Priv { .. }) {
+                    return Err(format!("unsealed block {id:?} is not private"));
+                }
+                if rec.tier != BlockTier::Memory || rec.ref_count != 1 {
+                    return Err(format!("unsealed private block {id:?} has invalid tier/refs"));
+                }
+                for &v in &rec.data[rec.length as usize..] {
+                    if v != 0 {
+                        return Err(format!("unsealed private block {id:?} has non-zero tail"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---- TLA+ Trace Capture & Bundle Rendering (`specs/CacheScheduler.tla`) ---------------------
+
+/// One recorded state snapshot for TLC trace conformance checking.
+#[derive(Clone, Debug)]
+pub struct TraceStep {
+    pub action: String,
+    pub blocks: BTreeMap<BlockId, BlockRecord>,
+    pub start_points: BTreeMap<(String, u32), StartPoint>,
+    pub lanes: Vec<LaneSlot>,
+    pub queue_seq: Vec<usize>,
+    pub step_active: bool,
+    pub step_lanes: BTreeSet<usize>,
+    pub step_span: Vec<u32>,
+    pub step_pins: BTreeSet<BlockId>,
+    pub step_io: BTreeSet<BlockId>,
+    pub gpu_done: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SchedulerTrace {
+    pub config: SchedulerConfig,
+    pub steps: Vec<TraceStep>,
+}
+
+impl SchedulerTrace {
+    pub fn new(sched: &Scheduler) -> Self {
+        let mut t = Self {
+            config: sched.cfg.clone(),
+            steps: Vec::new(),
+        };
+        t.record("Init", sched);
+        t
+    }
+
+    pub fn record(&mut self, action: &str, sched: &Scheduler) {
+        self.steps.push(TraceStep {
+            action: action.to_string(),
+            blocks: sched.blocks.clone(),
+            start_points: sched.start_points.clone(),
+            lanes: sched.lanes.clone(),
+            queue_seq: sched.queue_seq.clone(),
+            step_active: sched.step_active,
+            step_lanes: sched.step_lanes.clone(),
+            step_span: sched.step_span.clone(),
+            step_pins: sched.step_pins.clone(),
+            step_io: sched.step_io.clone(),
+            gpu_done: sched.gpu_done,
+        });
+    }
+}
+
+fn tla_str(s: &str) -> String {
+    format!("\"{s}\"")
+}
+
+fn tla_block_id(id: &BlockId, lane_names: &[String]) -> String {
+    match id {
+        BlockId::Tree { prefix, kind, idx } => {
+            format!("<<\"tree\", \"{}\", \"{}\", {}>>", prefix, kind.as_tla(), idx)
+        }
+        BlockId::Priv { lane, kind } => {
+            format!("<<\"priv\", \"{}\", \"{}\">>", lane_names[*lane], kind.as_tla())
+        }
+    }
+}
+
+fn tla_block_set(set: &BTreeSet<BlockId>, lane_names: &[String]) -> String {
+    let items: Vec<String> = set.iter().map(|b| tla_block_id(b, lane_names)).collect();
+    format!("{{{}}}", items.join(", "))
+}
+
+fn tla_lane_set(set: &BTreeSet<usize>, lane_names: &[String]) -> String {
+    let items: Vec<String> = set.iter().map(|&l| tla_str(&lane_names[l])).collect();
+    format!("{{{}}}", items.join(", "))
+}
+
+fn tla_seq_strings(items: &[String]) -> String {
+    format!("<<{}>>", items.join(", "))
+}
+
+fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
+    let ln = &cfg.lanes;
+    let n_blks = cfg.num_blocks();
+
+    // Only serialize present blocks as an association tuple; TraceCheck hydrates the full domain.
+    let mut blk_entries = Vec::new();
+    for (id, rec) in &step.blocks {
+        if !rec.tier.is_present() {
+            continue;
+        }
+        let data_seq: Vec<String> = rec.data.iter().map(|v| v.to_string()).collect();
+        blk_entries.push(format!(
+            "[id |-> {}, tier |-> \"{}\", sealed |-> {}, idx |-> {}, length |-> {}, data |-> <<{}>>, refCount |-> {}]",
+            tla_block_id(id, ln),
+            rec.tier.as_tla(),
+            if rec.sealed { "TRUE" } else { "FALSE" },
+            rec.idx,
+            rec.length,
+            data_seq.join(", "),
+            rec.ref_count
+        ));
+    }
+
+    let mut sp_entries = Vec::new();
+    for ((pfx, k), sp) in &step.start_points {
+        if !sp.kept {
+            continue;
+        }
+        sp_entries.push(format!(
+            "[prefix |-> \"{}\", boundary |-> {}, stateKept |-> {}, full |-> {}, win |-> {}]",
+            pfx,
+            k,
+            if sp.state_kept { "TRUE" } else { "FALSE" },
+            tla_block_set(&sp.full, ln),
+            tla_block_set(&sp.win, ln)
+        ));
+    }
+
+    let mut lane_entries = Vec::new();
+    for (i, slot) in step.lanes.iter().enumerate() {
+        let full_seq: Vec<String> = (0..n_blks)
+            .map(|bi| {
+                slot.full
+                    .get(&bi)
+                    .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln))
+            })
+            .collect();
+        let win_seq: Vec<String> = (0..n_blks)
+            .map(|bi| {
+                slot.win
+                    .get(&bi)
+                    .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln))
+            })
+            .collect();
+        lane_entries.push(format!(
+            "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, stepSpan |-> {}]",
+            slot.state.as_tla(),
+            slot.prefix,
+            slot.target,
+            slot.pos,
+            tla_seq_strings(&full_seq),
+            tla_seq_strings(&win_seq),
+            slot.reservation,
+            slot.admit_budget,
+            slot.wait_ticks,
+            step.step_span[i]
+        ));
+    }
+
+    let q_items: Vec<String> = step.queue_seq.iter().map(|&l| tla_str(&ln[l])).collect();
+
+    format!(
+        "[blocks |-> {{{}}}, startPoints |-> {{{}}}, lanes |-> {}, queueSeq |-> {}, stepActive |-> {}, stepLanes |-> {}, stepPins |-> {}, stepIO |-> {}, gpuDone |-> {}]",
+        blk_entries.join(", "),
+        sp_entries.join(", "),
+        tla_seq_strings(&lane_entries),
+        tla_seq_strings(&q_items),
+        if step.step_active { "TRUE" } else { "FALSE" },
+        tla_lane_set(&step.step_lanes, ln),
+        tla_block_set(&step.step_pins, ln),
+        tla_block_set(&step.step_io, ln),
+        if step.gpu_done { "TRUE" } else { "FALSE" }
+    )
+}
+
+/// Render `(TraceData.tla, TraceCheck.tla, TraceCheck.cfg)` verifying one or more concrete
+/// `SchedulerTrace` runs directly against `specs/CacheScheduler.tla` (`Init /\ [][Next]_vars`
+/// plus all 12 safety invariants and 4 action properties).
+pub fn render_cache_scheduler_tla_bundle(
+    traces: &[SchedulerTrace],
+) -> Result<(String, String, String), SchedError> {
+    let Some(first) = traces.first() else {
+        return Err(SchedError::Precondition("cannot render empty trace slice"));
+    };
+    let cfg = &first.config;
+    cfg.validate()?;
+    for t in traces {
+        if t.config != *cfg || t.steps.len() < 2 {
+            return Err(SchedError::Precondition(
+                "all traces must share config and have at least 2 steps",
+            ));
+        }
+    }
+
+    let mut data = String::from(
+        "---------------------------- MODULE TraceData ----------------------------\n\
+         EXTENDS Integers, Sequences\n\n",
+    );
+    let mut trace_names = Vec::new();
+    for (ti, tr) in traces.iter().enumerate() {
+        let name = format!("Trace{}", ti + 1);
+        data.push_str(&format!("{name} == <<\n"));
+        for (si, st) in tr.steps.iter().enumerate() {
+            let comma = if si + 1 < tr.steps.len() { "," } else { "" };
+            data.push_str("  ");
+            data.push_str(&render_trace_step(cfg, st));
+            data.push_str(comma);
+            data.push('\n');
+        }
+        data.push_str(">>\n\n");
+        trace_names.push(name);
+    }
+    data.push_str(&format!(
+        "Traces == <<{}>>\n=============================================================================\n",
+        trace_names.join(", ")
+    ));
+
+    let lane_seq_lit = cfg
+        .lanes
+        .iter()
+        .map(|s| tla_str(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pfx_seq_lit = cfg
+        .prefixes
+        .iter()
+        .map(|s| tla_str(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let req_set_lit = cfg
+        .request_lengths
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let check = format!(
+        "---------------------------- MODULE TraceCheck ----------------------------\n\
+         EXTENDS CacheScheduler, TraceData, Sequences\n\
+         \n\
+         VARIABLES traceIdx, stepIdx\n\
+         \n\
+         LaneSeq == <<{lane_seq_lit}>>\n\
+         LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l\n\
+         \n\
+         HydrateBlocks(bs) ==\n\
+             [b \\in BlockIds |->\n\
+                 IF \\E e \\in bs : e.id = b\n\
+                 THEN LET e == CHOOSE x \\in bs : x.id = b\n\
+                      IN [tier |-> e.tier,\n\
+                          sealed |-> e.sealed,\n\
+                          idx |-> e.idx,\n\
+                          length |-> e.length,\n\
+                          data |-> [i \\in 0..(BlockSize - 1) |-> e.data[i + 1]],\n\
+                          refCount |-> e.refCount]\n\
+                 ELSE EmptyBlock]\n\
+         \n\
+         HydrateStartPoints(sps) ==\n\
+             [pk \\in Prefixes \\X Boundaries |->\n\
+                 IF \\E e \\in sps : e.prefix = pk[1] /\\ e.boundary = pk[2]\n\
+                 THEN LET e == CHOOSE x \\in sps : x.prefix = pk[1] /\\ x.boundary = pk[2]\n\
+                      IN [kept |-> TRUE, stateKept |-> e.stateKept, full |-> e.full, win |-> e.win]\n\
+                 ELSE EmptyStart]\n\
+         \n\
+         ApplyStep(s) ==\n\
+             /\\ blocks      = HydrateBlocks(s.blocks)\n\
+             /\\ startPoints = HydrateStartPoints(s.startPoints)\n\
+             /\\ laneState   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].state]\n\
+             /\\ lanePrefix  = [l \\in Lanes |-> s.lanes[LaneIdx(l)].prefix]\n\
+             /\\ laneTarget  = [l \\in Lanes |-> s.lanes[LaneIdx(l)].target]\n\
+             /\\ lanePos     = [l \\in Lanes |-> s.lanes[LaneIdx(l)].pos]\n\
+             /\\ laneFull    = [l \\in Lanes |-> [i \\in BlkIdx |-> s.lanes[LaneIdx(l)].full[i + 1]]]\n\
+             /\\ laneWin     = [l \\in Lanes |-> [i \\in BlkIdx |-> s.lanes[LaneIdx(l)].win[i + 1]]]\n\
+             /\\ reservation = [l \\in Lanes |-> s.lanes[LaneIdx(l)].reservation]\n\
+             /\\ admitBudget = [l \\in Lanes |-> s.lanes[LaneIdx(l)].admitBudget]\n\
+             /\\ waitTicks   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].waitTicks]\n\
+             /\\ queueSeq    = s.queueSeq\n\
+             /\\ stepActive  = s.stepActive\n\
+             /\\ stepLanes   = s.stepLanes\n\
+             /\\ stepSpan    = [l \\in Lanes |-> s.lanes[LaneIdx(l)].stepSpan]\n\
+             /\\ stepPins    = s.stepPins\n\
+             /\\ stepIO      = s.stepIO\n\
+             /\\ gpuDone     = s.gpuDone\n\
+         \n\
+         ApplyNext(s) ==\n\
+             /\\ blocks'      = HydrateBlocks(s.blocks)\n\
+             /\\ startPoints' = HydrateStartPoints(s.startPoints)\n\
+             /\\ laneState'   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].state]\n\
+             /\\ lanePrefix'  = [l \\in Lanes |-> s.lanes[LaneIdx(l)].prefix]\n\
+             /\\ laneTarget'  = [l \\in Lanes |-> s.lanes[LaneIdx(l)].target]\n\
+             /\\ lanePos'     = [l \\in Lanes |-> s.lanes[LaneIdx(l)].pos]\n\
+             /\\ laneFull'    = [l \\in Lanes |-> [i \\in BlkIdx |-> s.lanes[LaneIdx(l)].full[i + 1]]]\n\
+             /\\ laneWin'     = [l \\in Lanes |-> [i \\in BlkIdx |-> s.lanes[LaneIdx(l)].win[i + 1]]]\n\
+             /\\ reservation' = [l \\in Lanes |-> s.lanes[LaneIdx(l)].reservation]\n\
+             /\\ admitBudget' = [l \\in Lanes |-> s.lanes[LaneIdx(l)].admitBudget]\n\
+             /\\ waitTicks'   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].waitTicks]\n\
+             /\\ queueSeq'    = s.queueSeq\n\
+             /\\ stepActive'  = s.stepActive\n\
+             /\\ stepLanes'   = s.stepLanes\n\
+             /\\ stepSpan'    = [l \\in Lanes |-> s.lanes[LaneIdx(l)].stepSpan]\n\
+             /\\ stepPins'    = s.stepPins\n\
+             /\\ stepIO'      = s.stepIO\n\
+             /\\ gpuDone'     = s.gpuDone\n\
+         \n\
+         ReplayInit ==\n\
+             /\\ traceIdx \\in 1..Len(Traces)\n\
+             /\\ stepIdx = 1\n\
+             /\\ ApplyStep(Traces[traceIdx][1])\n\
+         \n\
+         ReplayNext ==\n\
+             /\\ stepIdx < Len(Traces[traceIdx])\n\
+             /\\ traceIdx' = traceIdx\n\
+             /\\ stepIdx' = stepIdx + 1\n\
+             /\\ ApplyNext(Traces[traceIdx][stepIdx + 1])\n\
+         \n\
+         ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>\n\
+         Conforms == Init /\\ [][Next]_vars\n\
+         =============================================================================\n"
+    );
+
+    let cfg_file = format!(
+        "SPECIFICATION ReplaySpec\n\
+         CHECK_DEADLOCK FALSE\n\
+         CONSTANTS\n\
+          Lanes = {{{lane_seq_lit}}}\n\
+          Prefixes = {{{pfx_seq_lit}}}\n\
+          RequestLengths = {{{req_set_lit}}}\n\
+          BlockSize = {}\n\
+          WindowSize = {}\n\
+          MaxPos = {}\n\
+          MaxSpan = {}\n\
+          StepTokenBudget = {}\n\
+          MemBudget = {}\n\
+          DiskBudget = {}\n\
+          MaxQueue = {}\n\
+          MaxBypass = {}\n\
+          Bug = \"none\"\n\
+         INVARIANTS\n\
+          TypeOK\n\
+          StepBlocksInMemoryAndOwned\n\
+          SealedValid\n\
+          UnsealedPrivateInvisibleZero\n\
+          LaneHistoryCovered\n\
+          RefCountMatchesReferrers\n\
+          StartPointsKept\n\
+          BudgetsAndReservations\n\
+          ColdBlocksSpillable\n\
+          BypassBoundHolds\n\
+          StepBudgetHolds\n\
+          QueueBounded\n\
+         PROPERTIES\n\
+          Conforms\n\
+          ActionSealedImmutable\n\
+          ActionNoQueuedRefusal\n\
+          ActionLazyColdWriteback\n\
+          ActionDecodePriority\n",
+        cfg.block_size,
+        cfg.window_size,
+        cfg.max_pos,
+        cfg.max_span,
+        cfg.step_token_budget,
+        cfg.mem_budget,
+        cfg.disk_budget,
+        cfg.max_queue,
+        cfg.max_bypass
+    );
+
+    Ok((data, check, cfg_file))
+}
+
+/// Deterministic seeded PRNG (splitmix64) for reproducible walks and stress gates.
+struct SplitMix(u64);
+impl SplitMix {
+    fn new(seed: u64) -> Self {
+        Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn pick(&mut self, n: usize) -> usize {
+        (self.next_u64() as usize) % n
+    }
+}
+
+/// Summary statistics for a trace walk to prove coverage of key transitions.
+#[derive(Clone, Debug, Default)]
+pub struct WalkStats {
+    pub steps: usize,
+    pub arrivals: usize,
+    pub refused_429: usize,
+    pub admits: usize,
+    pub admit_bypasses: usize,
+    pub step_bypasses: usize,
+    pub cancel_in_step: usize,
+    pub finished: usize,
+    pub cold_writebacks: usize,
+    pub disk_restores: usize,
+    pub max_wait_ticks_seen: u32,
+}
+
+/// Run one deterministic multi-lane workload walk on `Scheduler`, recording every state
+/// transition into a `SchedulerTrace` for TLC verification.
+pub fn walk_scheduler_trace(
+    cfg: SchedulerConfig,
+    seed: u64,
+    max_ops: usize,
+) -> Result<(SchedulerTrace, WalkStats), SchedError> {
+    let mut sched = Scheduler::new(cfg.clone())?;
+    let mut trace = SchedulerTrace::new(&sched);
+    let mut rng = SplitMix::new(seed);
+    let mut stats = WalkStats::default();
+    let n_lanes = cfg.lanes.len();
+
+    for op in 0..max_ops {
+        // 1. If a step is active: occasionally cancel an InStep lane BEFORE gpu_done or FinishStep
+        //    to exercise the InStep -> Cancelling -> Cancelled barrier!
+        if sched.step_active() {
+            if !sched.gpu_done() {
+                if rng.pick(5) == 0 {
+                    if let Some(&victim) = sched
+                        .step_lanes()
+                        .iter()
+                        .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
+                    {
+                        sched.cancel(victim)?;
+                        trace.record("CancelInStep", &sched);
+                        stats.cancel_in_step += 1;
+                        continue;
+                    }
+                }
+                sched.gpu_execute()?;
+                trace.record("GpuExecute", &sched);
+                continue;
+            }
+            if !sched.step_io().is_empty() {
+                if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
+                    sched.complete_step_io()?;
+                    trace.record("CompleteStepIO", &sched);
+                    continue;
+                } else if sched.reclaim_cold_disk() {
+                    trace.record("ReclaimColdDisk", &sched);
+                    continue;
+                }
+            }
+            // Occasionally cancel right after gpu_done before FinishStep too.
+            if rng.pick(9) == 0 {
+                if let Some(&victim) = sched
+                    .step_lanes()
+                    .iter()
+                    .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
+                {
+                    sched.cancel(victim)?;
+                    trace.record("CancelInStep", &sched);
+                    stats.cancel_in_step += 1;
+                    continue;
+                }
+            }
+            sched.complete_step()?;
+            trace.record("FinishStep", &sched);
+            continue;
+        }
+
+        // Complete any pending cold writeback I/O when no step is active.
+        if !sched.step_io().is_empty() {
+            if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
+                sched.complete_step_io()?;
+                trace.record("CompleteStepIO", &sched);
+                continue;
+            } else if sched.reclaim_cold_disk() {
+                trace.record("ReclaimColdDisk", &sched);
+                continue;
+            }
+        }
+
+        // 2. Finish any Ready lane that has reached its target.
+        if let Some(l) = (0..n_lanes)
+            .find(|&i| sched.lanes()[i].state == LaneState::Ready && sched.lanes()[i].pos == sched.lanes()[i].target)
+        {
+            sched.finish_ready(l)?;
+            trace.record("FinishReady", &sched);
+            stats.finished += 1;
+            continue;
+        }
+
+        // 3. Relieve memory pressure lazily (evict clean/unref, cold writeback, or reclaim cold disk).
+        if sched.mem_pressure() {
+            if sched.evict_clean_or_unref_mem() {
+                trace.record("EvictCleanOrUnrefMem", &sched);
+                continue;
+            }
+            if sched.start_cold_writeback().is_some() {
+                trace.record("StartColdWriteback", &sched);
+                stats.cold_writebacks += 1;
+                continue;
+            }
+            if sched.reclaim_cold_disk() {
+                trace.record("ReclaimColdDisk", &sched);
+                continue;
+            }
+        }
+
+        // 4. Try building a step first when Ready lanes exist and another waiting lane is at W
+        //    so `build_step` enforces the bypass ceiling itself (returning Ok(None) cleanly in
+        //    production, and immediately tripping BypassBoundHolds if the ceiling check is mutated).
+        let has_non_ready_ceiling = (0..n_lanes).any(|i| {
+            !sched.is_steppable_ready(i)
+                && sched.lanes()[i].state.is_waiting()
+                && sched.lanes()[i].wait_ticks >= cfg.max_bypass
+        });
+        if has_non_ready_ceiling {
+            let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
+            if sched.build_step()?.is_some() {
+                for (i, l) in sched.lanes().iter().enumerate() {
+                    if l.wait_ticks > before_waits[i] {
+                        stats.step_bypasses += 1;
+                    }
+                    stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
+                }
+                trace.record("BuildStep", &sched);
+                continue;
+            }
+        }
+
+        // Advance any waiting non-Ready lane that has reached the starvation ceiling W first!
+        let mut advanced_ceiling = false;
+        if let Some(l) = (0..n_lanes).find(|&i| {
+            sched.lanes()[i].state == LaneState::Restoring
+                && sched.lanes()[i].wait_ticks >= cfg.max_bypass
+        }) {
+            let disk_blk = sched
+                .lane_block_set(l)
+                .into_iter()
+                .find(|b| sched.block_tier(b) == BlockTier::Disk);
+            if let Some(b) = disk_blk {
+                if sched.restore_block(l, &b).is_ok() {
+                    trace.record("RestoreBlock", &sched);
+                    stats.disk_restores += 1;
+                    advanced_ceiling = true;
+                }
+            } else if sched.finish_restore(l).is_ok() {
+                trace.record("FinishRestore", &sched);
+                advanced_ceiling = true;
+            }
+        }
+        if advanced_ceiling {
+            continue;
+        }
+        if let Some(l) = (0..n_lanes).find(|&i| {
+            sched.lanes()[i].state == LaneState::Admitted
+                && sched.lanes()[i].wait_ticks >= cfg.max_bypass
+                && sched.can_advance_admitted(i)
+        }) {
+            sched.begin_restore(l)?;
+            trace.record("BeginRestore", &sched);
+            continue;
+        }
+        if let Some(l) = sched
+            .queue_seq()
+            .iter()
+            .copied()
+            .find(|&q| sched.lanes()[q].wait_ticks >= cfg.max_bypass && sched.can_admit_now(q))
+        {
+            sched.admit(l)?;
+            trace.record("Admit", &sched);
+            stats.admits += 1;
+            continue;
+        }
+
+        // 5. Mix arrivals, admissions, restores, and steps deterministically (draining near end).
+        let draining = op + 36 >= max_ops;
+        let roll = rng.pick(100);
+
+        if !draining && roll < 32 {
+            let idle: Vec<usize> = (0..n_lanes)
+                .filter(|&i| sched.lanes()[i].state.is_terminal_or_idle())
+                .collect();
+            if !idle.is_empty() {
+                let l = idle[rng.pick(idle.len())];
+                let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
+                let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
+                let outcome = sched.arrive(l, &pfx, len)?;
+                trace.record("Arrive", &sched);
+                stats.arrivals += 1;
+                if outcome == ArriveOutcome::Refused429 {
+                    stats.refused_429 += 1;
+                }
+                continue;
+            }
+        }
+
+        // Prefer building a step frequently when Ready lanes exist AND other lanes are waiting
+        // so bypass increments and decode priority are thoroughly exercised!
+        if roll < 68 {
+            let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
+            if sched.build_step()?.is_some() {
+                for (i, l) in sched.lanes().iter().enumerate() {
+                    if l.wait_ticks > before_waits[i] {
+                        stats.step_bypasses += 1;
+                    }
+                    stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
+                }
+                trace.record("BuildStep", &sched);
+                continue;
+            }
+        }
+
+        // Advance Restoring lanes (longest-waiting first).
+        let mut restoring: Vec<usize> = (0..n_lanes)
+            .filter(|&i| sched.lanes()[i].state == LaneState::Restoring)
+            .collect();
+        restoring.sort_by_key(|&i| (std::cmp::Reverse(sched.lanes()[i].wait_ticks), i));
+        let mut did_restore = false;
+        for l in restoring {
+            let disk_blk = sched
+                .lane_block_set(l)
+                .into_iter()
+                .find(|b| sched.block_tier(b) == BlockTier::Disk);
+            if let Some(b) = disk_blk {
+                if sched.restore_block(l, &b).is_ok() {
+                    trace.record("RestoreBlock", &sched);
+                    stats.disk_restores += 1;
+                    did_restore = true;
+                    break;
+                }
+            } else if sched.finish_restore(l).is_ok() {
+                trace.record("FinishRestore", &sched);
+                did_restore = true;
+                break;
+            }
+        }
+        if did_restore {
+            continue;
+        }
+
+        // Advance Admitted -> Restoring.
+        if let Some(l) = (0..n_lanes).find(|&i| sched.can_advance_admitted(i)) {
+            sched.begin_restore(l)?;
+            trace.record("BeginRestore", &sched);
+            continue;
+        }
+
+        // Admit next eligible Queued lane.
+        let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
+        if sched.admit_next()?.is_some() {
+            for (i, l) in sched.lanes().iter().enumerate() {
+                if l.state == LaneState::Queued && l.wait_ticks > before_waits[i] {
+                    stats.admit_bypasses += 1;
+                }
+                stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
+            }
+            trace.record("Admit", &sched);
+            stats.admits += 1;
+            continue;
+        }
+
+        // Fallback: build a step if possible.
+        let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
+        if sched.build_step()?.is_some() {
+            for (i, l) in sched.lanes().iter().enumerate() {
+                if l.wait_ticks > before_waits[i] {
+                    stats.step_bypasses += 1;
+                }
+                stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
+            }
+            trace.record("BuildStep", &sched);
+            continue;
+        }
+
+        // Otherwise arrive into an idle lane if not draining, or cancel a stuck lane.
+        if !draining {
+            if let Some(l) = (0..n_lanes).find(|&i| sched.lanes()[i].state.is_terminal_or_idle()) {
+                let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
+                let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
+                let outcome = sched.arrive(l, &pfx, len)?;
+                trace.record("Arrive", &sched);
+                stats.arrivals += 1;
+                if outcome == ArriveOutcome::Refused429 {
+                    stats.refused_429 += 1;
+                }
+                continue;
+            }
+        }
+        break;
+    }
+
+    stats.steps = trace.steps.len();
+    Ok((trace, stats))
+}
+
+// ---- Production Server Step-Planning Adapter (`src/serve.rs`) -------------------------------
+
+/// Lightweight snapshot of one `serve.rs` lane for starvation-bounded step planning.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeLaneInput {
+    pub runnable: bool,
+    pub n_past: usize,
+    pub pf_end: usize,
+    pub has_pending_decode: bool,
+}
+
+impl ServeLaneInput {
+    pub fn needs_prefill(&self) -> bool {
+        self.runnable && self.n_past < self.pf_end
+    }
+
+    pub fn needs_decode(&self) -> bool {
+        self.runnable && self.n_past >= self.pf_end && self.has_pending_decode
+    }
+}
+
+/// Planned step batch for `src/serve.rs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServeStepPlan {
+    /// Batched 1-token decode over these lane indices.
+    Decode(Vec<usize>),
+    /// Chunked prefill spans `(lane_idx, p0, len)` up to `step_token_budget`.
+    Prefill(Vec<(usize, usize, usize)>),
+}
+
+/// Real-server lane lifecycle tracker, starvation-bounded step builder (`wait_ticks <= W`),
+/// and cancel-in-step barrier used directly inside `src/serve.rs::scheduler`.
+pub struct ServeStepPlanner {
+    states: Vec<LaneState>,
+    wait_ticks: Vec<u32>,
+    in_step: Vec<usize>,
+    max_bypass: u32,
+}
+
+impl ServeStepPlanner {
+    pub fn new(nlanes: usize, max_bypass: u32) -> Self {
+        assert!(max_bypass >= 1, "max_bypass (W) must be >= 1");
+        Self {
+            states: vec![LaneState::Idle; nlanes],
+            wait_ticks: vec![0; nlanes],
+            in_step: Vec::new(),
+            max_bypass,
+        }
+    }
+
+    pub fn state(&self, lane: usize) -> LaneState {
+        self.states[lane]
+    }
+
+    pub fn wait_ticks(&self, lane: usize) -> u32 {
+        self.wait_ticks[lane]
+    }
+
+    pub fn max_bypass(&self) -> u32 {
+        self.max_bypass
+    }
+
+    pub fn on_admit(&mut self, lane: usize) {
+        self.states[lane] = LaneState::Ready;
+        self.wait_ticks[lane] = 0;
+    }
+
+    pub fn on_finish(&mut self, lane: usize) {
+        self.states[lane] = LaneState::Finished;
+        self.wait_ticks[lane] = 0;
+    }
+
+    /// Cancel a lane. If it is currently `InStep`, transition to `Cancelling` and return
+    /// `false` so the caller NEVER releases the GPU lane slot until `complete_step()` runs!
+    /// If not `InStep`, transition to `Cancelled` and return `true` (safe to release now).
+    pub fn request_cancel(&mut self, lane: usize) -> bool {
+        match self.states[lane] {
+            LaneState::InStep | LaneState::Cancelling => {
+                self.states[lane] = LaneState::Cancelling;
+                false
+            }
+            _ => {
+                self.states[lane] = LaneState::Cancelled;
+                self.wait_ticks[lane] = 0;
+                true
+            }
+        }
+    }
+
+    /// Deterministically plan the next GPU step obeying `ROADMAP.md:130-131`:
+    /// 1. Any ready lane at the starvation ceiling `W` (`wait_ticks >= max_bypass`),
+    /// 2. Longest-waiting ready lane first (decoders win ties over prefillers),
+    /// 3. Active 1-token decoding lanes,
+    /// 4. Prefill chunks sliced up to `step_token_budget` (aligned to 64-token boundaries
+    ///    unless finishing a prompt).
+    ///
+    /// Transitions chosen lanes `Ready -> InStep`, resets their `wait_ticks = 0`, and
+    /// increments `wait_ticks` on every bypassed runnable lane (enforcing `wait_ticks <= W`).
+    pub fn plan_and_begin_step(
+        &mut self,
+        inputs: &[ServeLaneInput],
+        step_token_budget: usize,
+        block_align: usize,
+    ) -> Option<ServeStepPlan> {
+        debug_assert!(self.in_step.is_empty(), "previous step must complete before planning next");
+        let need_dec: Vec<usize> = inputs
+            .iter()
+            .enumerate()
+            .filter(|&(_, inp)| inp.needs_decode())
+            .map(|(i, _)| i)
+            .collect();
+        let need_pf: Vec<usize> = inputs
+            .iter()
+            .enumerate()
+            .filter(|&(_, inp)| inp.needs_prefill())
+            .map(|(i, _)| i)
+            .collect();
+
+        if need_dec.is_empty() && need_pf.is_empty() {
+            return None;
+        }
+
+        let max_dec_w = need_dec.iter().map(|&i| self.wait_ticks[i]).max();
+        let max_pf_w = need_pf.iter().map(|&i| self.wait_ticks[i]).max();
+
+        // Pick decode vs prefill batch:
+        // - If a prefiller reached W and no decoder reached W, prefill wins so wait_ticks <= W.
+        // - Otherwise longest-waiting lane wins, with active decoders winning ties!
+        let choose_decode = match (max_dec_w, max_pf_w) {
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(dw), Some(pw)) => {
+                if pw >= self.max_bypass && dw < self.max_bypass {
+                    false
+                } else {
+                    dw >= pw
+                }
+            }
+            (None, None) => return None,
+        };
+
+        let (plan, chosen): (ServeStepPlan, Vec<usize>) = if choose_decode {
+            let mut dec = need_dec.clone();
+            dec.sort_by_key(|&i| (std::cmp::Reverse(self.wait_ticks[i]), i));
+            let cap = step_token_budget.max(1);
+            dec.truncate(cap);
+            (ServeStepPlan::Decode(dec.clone()), dec)
+        } else {
+            let mut pf = need_pf.clone();
+            // Longest-waiting (and ceiling >= W) prefill lanes first.
+            pf.sort_by_key(|&i| (std::cmp::Reverse(self.wait_ticks[i]), i));
+            let ceiling_cnt = pf.iter().filter(|&&i| self.wait_ticks[i] >= self.max_bypass).count();
+            let mut budget = step_token_budget.max(1);
+            let mut spans = Vec::new();
+            let mut chosen = Vec::new();
+            for (idx, &i) in pf.iter().enumerate() {
+                if budget == 0 {
+                    break;
+                }
+                let inp = inputs[i];
+                let rem_ceiling_after = ceiling_cnt.saturating_sub(idx + 1);
+                let max_for_this = budget.saturating_sub(rem_ceiling_after).max(1);
+                let raw_t = (inp.pf_end - inp.n_past).min(max_for_this);
+                // Keep 64-token start-point alignment when chunk does not finish the prompt.
+                let t = if block_align > 0 && inp.n_past + raw_t < inp.pf_end && raw_t > block_align
+                {
+                    let aligned = raw_t - ((inp.n_past + raw_t) % block_align);
+                    if aligned > 0 { aligned } else { raw_t }
+                } else {
+                    raw_t
+                };
+                spans.push((i, inp.n_past, t));
+                chosen.push(i);
+                budget -= t;
+            }
+            (ServeStepPlan::Prefill(spans), chosen)
+        };
+
+        let chosen_set: BTreeSet<usize> = chosen.iter().copied().collect();
+        for &i in &chosen {
+            self.states[i] = LaneState::InStep;
+            self.wait_ticks[i] = 0;
+        }
+        for &i in need_dec.iter().chain(&need_pf) {
+            if !chosen_set.contains(&i) {
+                self.wait_ticks[i] = (self.wait_ticks[i] + 1).min(self.max_bypass);
+            }
+        }
+        self.in_step = chosen;
+        Some(plan)
+    }
+
+    /// Complete the in-flight GPU step: surviving `InStep` lanes return to `Ready`, while
+    /// any lane marked `Cancelling` mid-step now transitions to `Cancelled` and is returned
+    /// so the caller releases its GPU lane slot ONLY AFTER GPU work completed.
+    pub fn complete_step(&mut self) -> Vec<usize> {
+        let mut cancelled = Vec::new();
+        for l in self.in_step.drain(..) {
+            if self.states[l] == LaneState::Cancelling {
+                self.states[l] = LaneState::Cancelled;
+                self.wait_ticks[l] = 0;
+                cancelled.push(l);
+            } else if self.states[l] == LaneState::InStep {
+                self.states[l] = LaneState::Ready;
+            }
+        }
+        cancelled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_cfg() -> SchedulerConfig {
+        SchedulerConfig {
+            lanes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            prefixes: vec!["p1".into(), "p2".into()],
+            request_lengths: vec![2, 4],
+            block_size: 2,
+            window_size: 2,
+            max_pos: 4,
+            max_span: 2,
+            step_token_budget: 2,
+            mem_budget: 6,
+            disk_budget: 4,
+            max_queue: 2,
+            max_bypass: 2,
+            start_point_stride_blocks: 1,
+        }
+    }
+
+    #[test]
+    fn explicit_lane_lifecycle_and_illegal_transitions() {
+        let mut s = Scheduler::new(small_cfg()).unwrap();
+        assert_eq!(s.lanes()[0].state, LaneState::Idle);
+        // Cannot admit before Queued.
+        assert!(s.admit(0).is_err());
+        assert_eq!(s.arrive(0, "p1", 4).unwrap(), ArriveOutcome::Queued);
+        assert_eq!(s.lanes()[0].state, LaneState::Queued);
+        // Cannot begin_restore before Admitted.
+        assert!(s.begin_restore(0).is_err());
+        s.admit(0).unwrap();
+        assert_eq!(s.lanes()[0].state, LaneState::Admitted);
+        // Cannot finish_restore before Restoring.
+        assert!(s.finish_restore(0).is_err());
+        s.begin_restore(0).unwrap();
+        assert_eq!(s.lanes()[0].state, LaneState::Restoring);
+        s.finish_restore(0).unwrap();
+        assert_eq!(s.lanes()[0].state, LaneState::Ready);
+
+        // Run through prefill (pos 0->2) and decode (pos 2->3->4) to Finished.
+        while s.lanes()[0].pos < s.lanes()[0].target {
+            let step = s.build_step().unwrap().expect("step built");
+            assert_eq!(step.lanes, vec![0]);
+            assert_eq!(s.lanes()[0].state, LaneState::InStep);
+            // complete_step must fail before gpu_execute!
+            assert!(s.complete_step().is_err());
+            s.gpu_execute().unwrap();
+            let done = s.complete_step().unwrap();
+            assert_eq!(done.survived, vec![0]);
+            assert_eq!(s.lanes()[0].state, LaneState::Ready);
+            s.check_invariants().unwrap();
+        }
+        s.finish_ready(0).unwrap();
+        assert_eq!(s.lanes()[0].state, LaneState::Finished);
+        assert_eq!(s.reserved_total(), 0);
+        assert_eq!(s.admitted_total(), 0);
+        s.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn cancel_in_step_waits_for_gpu_and_io_barrier() {
+        let mut s = Scheduler::new(small_cfg()).unwrap();
+        s.arrive(0, "p1", 4).unwrap();
+        s.admit(0).unwrap();
+        s.begin_restore(0).unwrap();
+        s.finish_restore(0).unwrap();
+
+        let step = s.build_step().unwrap().unwrap();
+        assert_eq!(step.lanes, vec![0]);
+        assert_eq!(s.lanes()[0].state, LaneState::InStep);
+        let res_before = s.lanes()[0].reservation;
+        let mem_before = s.mem_used();
+        assert!(res_before > 0 && mem_before > 0);
+
+        // Client disconnects mid-step: must enter Cancelling and HOLD slot, blocks, pins, reservation!
+        assert_eq!(s.cancel(0).unwrap(), LaneState::Cancelling);
+        assert_eq!(s.lanes()[0].state, LaneState::Cancelling);
+        assert_eq!(s.lanes()[0].reservation, res_before);
+        assert_eq!(s.mem_used(), mem_before);
+        assert!(!s.step_pins().is_empty());
+        // Cannot reuse the slot while Cancelling!
+        assert!(s.arrive(0, "p1", 2).is_err());
+        // Cannot finish step until GPU completes!
+        assert!(s.complete_step().is_err());
+        s.check_invariants().unwrap();
+
+        // GPU work finishes -> complete_step transitions Cancelling -> Cancelled and frees everything.
+        s.gpu_execute().unwrap();
+        let done = s.complete_step().unwrap();
+        assert_eq!(done.cancelled, vec![0]);
+        assert_eq!(s.lanes()[0].state, LaneState::Cancelled);
+        assert_eq!(s.lanes()[0].reservation, 0);
+        assert_eq!(s.lanes()[0].admit_budget, 0);
+        assert_eq!(s.mem_used(), 0);
+        assert!(s.step_pins().is_empty());
+        s.check_invariants().unwrap();
+
+        // Slot is now cleanly reusable.
+        assert_eq!(s.arrive(0, "p2", 2).unwrap(), ArriveOutcome::Queued);
+    }
+
+    #[test]
+    fn cancel_in_restore_io_waits_for_disk_read_barrier() {
+        let mut cfg = small_cfg();
+        cfg.mem_budget = 4;
+        cfg.disk_budget = 4;
+        let mut s = Scheduler::new(cfg).unwrap();
+
+        // Seed a kept start point at (p1, 2) and force its blocks to disk via cold writeback.
+        s.arrive(0, "p1", 2).unwrap();
+        s.admit(0).unwrap();
+        s.begin_restore(0).unwrap();
+        s.finish_restore(0).unwrap();
+        s.build_step().unwrap();
+        s.gpu_execute().unwrap();
+        s.complete_step().unwrap();
+        s.build_step().unwrap();
+        s.gpu_execute().unwrap();
+        s.complete_step().unwrap();
+        s.finish_ready(0).unwrap();
+
+        // Fill memory with p2 on lane 1 so p1's cold blocks spill to disk under pressure.
+        s.arrive(1, "p2", 4).unwrap();
+        s.admit(1).unwrap();
+        s.begin_restore(1).unwrap();
+        s.finish_restore(1).unwrap();
+        // Trigger pressure: lane 1 needs 2 private blocks, mem_used == 2 (p1's 2 sealed blocks),
+        // mem_budget == 4 -> let's push another block or spill p1 explicitly via pressure.
+        s.build_step().unwrap();
+        s.gpu_execute().unwrap();
+        s.complete_step().unwrap();
+        // Now mem_used == 4 (p1: 2 blocks, p2: 2 sealed blocks), lane 1 at pos 2 needs 2 more!
+        assert!(s.mem_pressure());
+        let wb1 = s.start_cold_writeback().expect("cold writeback 1");
+        s.complete_step_io().unwrap();
+        assert_eq!(s.block_tier(&wb1), BlockTier::Disk);
+
+        // Cancel lane 1 to free budget, then admit lane 2 on p1 -> Restoring with disk block!
+        s.cancel(1).unwrap();
+        s.arrive(2, "p1", 4).unwrap();
+        s.admit(2).unwrap();
+        s.begin_restore(2).unwrap();
+        assert_eq!(s.lanes()[2].state, LaneState::Restoring);
+
+        // Start async disk restore read, then cancel mid-read!
+        s.begin_restore_io(2, &wb1).unwrap();
+        assert_eq!(s.cancel(2).unwrap(), LaneState::Cancelling);
+        assert_eq!(s.lanes()[2].state, LaneState::Cancelling);
+        assert!(s.lanes()[2].reservation > 0, "reservation held until disk I/O completes");
+        assert!(s.arrive(2, "p1", 2).is_err(), "slot cannot be reused during restore I/O");
+
+        // Once disk read completes, lane transitions Cancelling -> Cancelled and releases cleanly.
+        assert_eq!(s.complete_restore_io(2).unwrap(), LaneState::Cancelled);
+        assert_eq!(s.lanes()[2].state, LaneState::Cancelled);
+        assert_eq!(s.lanes()[2].reservation, 0);
+        assert_eq!(s.lanes()[2].admit_budget, 0);
+        s.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
+        // W = 2: 1 prefiller + 3 decoders competing for StepTokenBudget = 2.
+        let mut cfg = small_cfg();
+        cfg.lanes = vec!["l0".into(), "l1".into(), "l2".into(), "l3".into()];
+        cfg.request_lengths = vec![2, 4];
+        cfg.step_token_budget = 2;
+        cfg.mem_budget = 16;
+        cfg.max_bypass = 2;
+        let mut s = Scheduler::new(cfg).unwrap();
+
+        // Put l0, l1, l2 into decode phase (target=2 -> prompt_end=0 -> decoding from pos 0)
+        // and l3 into prefill phase (target=4 -> prompt_end=2 -> prefilling at pos 0).
+        for (l, len) in [(0, 2), (1, 2), (2, 2), (3, 4)] {
+            s.arrive(l, "p1", len).unwrap();
+            s.admit(l).unwrap();
+            s.begin_restore(l).unwrap();
+            s.finish_restore(l).unwrap();
+        }
+        assert!(s.is_decoding(0) && s.is_decoding(1) && s.is_decoding(2));
+        assert!(s.is_prefilling(3));
+
+        // Run steps until all complete; verify l3 (prefiller) is NEVER bypassed > W=2 ticks!
+        let mut max_seen = 0u32;
+        for _ in 0..32 {
+            for l in 0..4 {
+                if s.lanes()[l].state == LaneState::Ready
+                    && s.lanes()[l].pos == s.lanes()[l].target
+                {
+                    s.finish_ready(l).unwrap();
+                }
+            }
+            if s.lanes().iter().all(|l| l.state == LaneState::Finished) {
+                break;
+            }
+            let _step = s.build_step().unwrap().expect("step built");
+            for l in s.lanes() {
+                max_seen = max_seen.max(l.wait_ticks);
+                assert!(
+                    l.wait_ticks <= 2,
+                    "starvation bound violated: {} > 2",
+                    l.wait_ticks
+                );
+            }
+            s.check_invariants().unwrap();
+            s.gpu_execute().unwrap();
+            s.complete_step().unwrap();
+        }
+        assert!(s.lanes().iter().all(|l| l.state == LaneState::Finished));
+        assert!(max_seen >= 1 && max_seen <= 2);
+    }
+
+    /// Layer 4 Gate (`docs/ROADMAP.md:139`):
+    /// Bimodal workload mixing short (`2K` = 2048 tokens) and long (`64K` = 65536 tokens)
+    /// requests under a tight memory budget where `64K` requests force queueing + starvation-
+    /// bound promotion while clients disconnect mid-step (`InStep -> Cancelling -> Cancelled`),
+    /// proving zero memory/slot leak and bounded wait ticks (`<= W`).
+    #[test]
+    fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
+        const BLK: u32 = 64;
+        const WIN: u32 = 1024;
+        const SHORT_2K: u32 = 2048;
+        const LONG_64K: u32 = 65536;
+        // Worst-case blocks:
+        //   2K:  full=32, win=min(SpanBound(64)=18, 32)=18 -> 50 blocks
+        //   64K: full=1024, win=18 -> 1042 blocks
+        let wc_2k = worst_case_blocks(SHORT_2K, BLK, WIN, BLK);
+        let wc_64k = worst_case_blocks(LONG_64K, BLK, WIN, BLK);
+        assert_eq!(wc_2k, 50);
+        assert_eq!(wc_64k, 1042);
+
+        // Tight budget: 1150 blocks -> fits ONE 64K (1042) + TWO 2K (100), OR many 2K,
+        // so when 3+ 2K lanes are running (150 blocks), a queued 64K lane CANNOT fit until
+        // starvation-bound W blocks further 2K leapfrogging and lets 2K lanes drain!
+        let mem_budget = wc_64k + 2 * wc_2k + 8; // 1150 blocks
+        let w_bound = 3u32;
+        let cfg = SchedulerConfig {
+            lanes: (0..8).map(|i| format!("lane{i}")).collect(),
+            prefixes: vec!["short".into(), "long".into()],
+            request_lengths: vec![SHORT_2K, LONG_64K],
+            block_size: BLK,
+            window_size: WIN,
+            max_pos: LONG_64K,
+            max_span: BLK,
+            step_token_budget: 256,
+            mem_budget,
+            disk_budget: 128,
+            max_queue: 4,
+            max_bypass: w_bound,
+            start_point_stride_blocks: 16,
+        };
+        let mut s = Scheduler::new(cfg).unwrap();
+
+        // Phase 1: fill 4 lanes with 2K requests (200 blocks admitted -> remaining 950 < 1042).
+        for l in 0..4 {
+            assert_eq!(s.arrive(l, "short", SHORT_2K).unwrap(), ArriveOutcome::Queued);
+            s.admit(l).unwrap();
+            s.begin_restore(l).unwrap();
+            s.finish_restore(l).unwrap();
+        }
+        assert!(!s.can_fit_request(LONG_64K), "tight budget must force 64K to queue");
+
+        // Phase 2: enqueue a 64K request on lane 4, plus a flood of 2K requests behind it!
+        assert_eq!(s.arrive(4, "long", LONG_64K).unwrap(), ArriveOutcome::Queued);
+        assert_eq!(s.arrive(5, "short", SHORT_2K).unwrap(), ArriveOutcome::Queued);
+        assert_eq!(s.arrive(6, "short", SHORT_2K).unwrap(), ArriveOutcome::Queued);
+        assert_eq!(s.arrive(7, "short", SHORT_2K).unwrap(), ArriveOutcome::Queued);
+
+        // Younger 2K requests leapfrog lane 4 (64K) ONLY up to W=3 times, then lane 4 hits W
+        // and blocks any further younger 2K leapfrogging!
+        assert!(s.can_admit_now(5));
+        s.admit(5).unwrap();
+        assert_eq!(s.lanes()[4].wait_ticks, 1);
+        assert!(s.can_admit_now(6));
+        s.admit(6).unwrap();
+        assert_eq!(s.lanes()[4].wait_ticks, 2);
+        assert!(s.can_admit_now(7));
+        s.admit(7).unwrap();
+        assert_eq!(s.lanes()[4].wait_ticks, 3);
+        assert_eq!(s.lanes()[4].wait_ticks, w_bound);
+
+        // Advance admitted 5,6,7 to Ready.
+        for l in 5..=7 {
+            s.begin_restore(l).unwrap();
+            s.finish_restore(l).unwrap();
+        }
+
+        // Now run steps with mid-step client disconnects (lanes 1, 5, 6 disconnect mid-step!)
+        // and new 2K arrivals attempting to leapfrog lane 4 while it sits at wait_ticks == W.
+        let mut mid_step_cancels = 0usize;
+        let mut completed_2k = 0usize;
+        let mut completed_64k = 0usize;
+        let mut max_wait_observed = 0u32;
+        let mut extra_short_submitted = 0usize;
+        let mut long_admitted = false;
+
+        for tick in 0..4000 {
+            // Track wait_ticks bound across EVERY waiting state.
+            for l in s.lanes() {
+                if l.state.is_waiting() {
+                    max_wait_observed = max_wait_observed.max(l.wait_ticks);
+                    assert!(
+                        l.wait_ticks <= w_bound,
+                        "tick {tick}: lane {} ({:?}) exceeded W={w_bound}: {}",
+                        l.name,
+                        l.state,
+                        l.wait_ticks
+                    );
+                }
+            }
+
+            // Finish any completed Ready lanes.
+            for l in 0..8 {
+                if s.lanes()[l].state == LaneState::Ready && s.lanes()[l].pos == s.lanes()[l].target
+                {
+                    let was_long = s.lanes()[l].target == LONG_64K;
+                    s.finish_ready(l).unwrap();
+                    if was_long {
+                        completed_64k += 1;
+                    } else {
+                        completed_2k += 1;
+                    }
+                }
+            }
+
+            // Submit a few extra 2K requests while lane 4 is queued at W to prove zero leapfrogging!
+            if !long_admitted && extra_short_submitted < 2 {
+                if let Some(idle_l) = (0..8).find(|&i| s.lanes()[i].state.is_terminal_or_idle()) {
+                    if s.arrive(idle_l, "short", SHORT_2K).unwrap() == ArriveOutcome::Queued {
+                        extra_short_submitted += 1;
+                        // Lane 4 is at W=3 -> younger queued 2K MUST NOT be allowed to admit!
+                        if s.lanes()[4].state == LaneState::Queued
+                            && s.lanes()[4].wait_ticks >= w_bound
+                        {
+                            assert!(
+                                !s.can_admit_now(idle_l),
+                                "younger 2K lane {idle_l} illegally leapfrogged 64K lane 4 at W"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Evict cold memory blocks lazily if under pressure.
+            while s.mem_pressure() {
+                if s.evict_clean_or_unref_mem() {
+                    continue;
+                }
+                if s.start_cold_writeback().is_some() {
+                    s.complete_step_io().unwrap();
+                    continue;
+                }
+                if s.reclaim_cold_disk() {
+                    continue;
+                }
+                break;
+            }
+
+            // Admit eligible queued lanes (lane 4 admits as soon as enough 2K lanes drain!).
+            while let Some(admitted) = s.admit_next().unwrap() {
+                if admitted == 4 {
+                    long_admitted = true;
+                }
+            }
+            for l in 0..8 {
+                if s.can_advance_admitted(l) {
+                    s.begin_restore(l).unwrap();
+                }
+                if s.lanes()[l].state == LaneState::Restoring {
+                    s.finish_restore(l).unwrap();
+                }
+            }
+
+            // All drained?
+            if s.lanes().iter().all(|l| l.state.is_terminal_or_idle()) {
+                break;
+            }
+
+            // Build & execute one step, injecting mid-step disconnects on lanes 1, 5, 6 and
+            // on a second 64K request if desired.
+            let Some(step) = s.build_step().unwrap() else {
+                panic!("deadlock at tick {tick}: no lane could make progress");
+            };
+
+            // Inject mid-step disconnects while lanes are InStep (before gpu_execute!).
+            for &victim in &[1usize, 5, 6] {
+                if step.lanes.contains(&victim)
+                    && s.lanes()[victim].state == LaneState::InStep
+                    && s.lanes()[victim].pos >= 128
+                {
+                    assert_eq!(s.cancel(victim).unwrap(), LaneState::Cancelling);
+                    // Verify barrier: slot & reservation remain held while Cancelling!
+                    assert!(s.lanes()[victim].reservation > 0);
+                    mid_step_cancels += 1;
+                }
+            }
+
+            s.gpu_execute().unwrap();
+            let done = s.complete_step().unwrap();
+            for c in &done.cancelled {
+                assert_eq!(s.lanes()[*c].state, LaneState::Cancelled);
+                assert_eq!(s.lanes()[*c].reservation, 0);
+                assert_eq!(s.lanes()[*c].admit_budget, 0);
+            }
+            if tick % 25 == 0 {
+                s.check_invariants().unwrap();
+            }
+        }
+
+        s.check_invariants().unwrap();
+        assert!(long_admitted, "64K request must be promoted and admitted");
+        assert_eq!(completed_64k, 1, "64K request must complete cleanly");
+        assert!(completed_2k >= 4, "surviving 2K requests must complete");
+        assert_eq!(mid_step_cancels, 3, "all 3 mid-step disconnects exercised");
+        assert!(max_wait_observed <= w_bound);
+        assert_eq!(s.reserved_total(), 0, "zero reservation leak after drain");
+        assert_eq!(s.admitted_total(), 0, "zero admission budget leak after drain");
+        assert!(
+            s.lanes().iter().all(|l| l.state.is_terminal_or_idle()),
+            "all lanes drained cleanly"
+        );
+        // Every remaining in-memory block must be a sealed cold prefix block (zero unsealed tails!).
+        assert!(
+            s.blocks().values().all(|b| b.sealed && b.tier.is_present()),
+            "zero leaked private tail blocks"
+        );
+    }
+
+    #[test]
+    fn serve_step_planner_enforces_starvation_bound_and_cancel_barrier() {
+        let mut p = ServeStepPlanner::new(3, 2);
+        for l in 0..3 {
+            p.on_admit(l);
+        }
+        // Lane 0 is decoding; lane 1 is prefilling (256 tokens); lane 2 is decoding.
+        let inputs = [
+            ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: 0, pf_end: 256, has_pending_decode: false },
+            ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+        ];
+
+        // Step 1: tie at wait_ticks=0 -> decoders win; prefiller wait_ticks becomes 1.
+        let plan1 = p.plan_and_begin_step(&inputs, 128, 64).unwrap();
+        assert_eq!(plan1, ServeStepPlan::Decode(vec![0, 2]));
+        assert_eq!(p.state(0), LaneState::InStep);
+        assert_eq!(p.wait_ticks(1), 1);
+
+        // Client 2 disconnects mid-step -> Cancelling, NOT immediately freed!
+        assert!(!p.request_cancel(2));
+        assert_eq!(p.state(2), LaneState::Cancelling);
+        let freed = p.complete_step();
+        assert_eq!(freed, vec![2]);
+        assert_eq!(p.state(2), LaneState::Cancelled);
+        assert_eq!(p.state(0), LaneState::Ready);
+
+        // Step 2: lane 1 (wait_ticks=1) > lane 0 (wait_ticks=0) -> longest-waiting prefiller wins!
+        let inputs2 = [
+            ServeLaneInput { runnable: true, n_past: 65, pf_end: 64, has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: 0, pf_end: 256, has_pending_decode: false },
+            ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
+        ];
+        let plan2 = p.plan_and_begin_step(&inputs2, 128, 64).unwrap();
+        assert_eq!(plan2, ServeStepPlan::Prefill(vec![(1, 0, 128)]));
+        assert_eq!(p.wait_ticks(1), 0);
+        assert_eq!(p.wait_ticks(0), 1);
+        assert!(p.complete_step().is_empty());
+    }
+
+    #[test]
+    fn walk_scheduler_trace_satisfies_invariants_across_seeds() {
+        let cfg = small_cfg();
+        let mut total_cancel = 0;
+        let mut total_step_bypass = 0;
+        for seed in 0..8 {
+            let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 120).unwrap();
+            assert!(trace.steps.len() >= 10);
+            assert!(stats.max_wait_ticks_seen <= cfg.max_bypass);
+            total_cancel += stats.cancel_in_step;
+            total_step_bypass += stats.step_bypasses;
+        }
+        assert!(total_cancel > 0, "walks must exercise cancel-in-step");
+        assert!(total_step_bypass > 0, "walks must exercise step bypass");
+        let (tr, _) = walk_scheduler_trace(cfg, 0, 60).unwrap();
+        let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
+        assert!(data.contains("MODULE TraceData"));
+        assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
+        assert!(tlc_cfg.contains("BypassBoundHolds"));
+    }
+}

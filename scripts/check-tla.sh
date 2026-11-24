@@ -141,3 +141,4 @@ fi
 
 # Required since PR #23: a missing checker must fail this gate.
 bash "$root/scripts/check-memmode-traces.sh"
+bash "$root/scripts/check-scheduler-traces.sh"

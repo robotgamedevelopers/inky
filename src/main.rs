@@ -2,6 +2,7 @@ mod engine;
 mod gguf;
 mod metal;
 mod sampler;
+mod scheduler;
 mod session;
 mod memd;
 mod record;
@@ -891,6 +892,297 @@ fn xcopy(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// dev, Layer 4 gate (`docs/ROADMAP.md:141`): temperature = 1.0 with fixed seeds gives bit-identical
+/// sampled token sequences with prefix caching + multi-lane scheduler batching vs uncached solo execution,
+/// across both GPU Gumbel-max (`top_p = 1.0, top_k = 0`) and CPU top-p (`top_p = 0.95`) sampling paths.
+/// `INK_TEMP1_SABOTAGE=1` is the negative control and must fail with `TEMP1 NOT EQUIVALENT`.
+fn temp1(o: &Opts) {
+    use engine::Span;
+    use scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(4);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    let (head, tail, ndec) = (384usize, 192usize, 24usize);
+    assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
+    let sabotage = std::env::var("INK_TEMP1_SABOTAGE").is_ok();
+
+    let mut rot1 = base.clone();
+    rot1.rotate_left(997);
+    let mut rot2 = base.clone();
+    rot2.rotate_left(1999);
+    // Prompts 0 & 1 share the 384-token prefix `head`; prompt 2 is an independent cold stream.
+    let prompts: Vec<Vec<u32>> = vec![
+        base[..head + tail].to_vec(),
+        {
+            let mut v = base[..head].to_vec();
+            v.extend_from_slice(&rot1[head..head + tail]);
+            v
+        },
+        rot2[..head + tail].to_vec(),
+    ];
+    let seeds = [0x1111_2222_3333_4444u64, 0xCAFE_BABE_DEAD_BEEFu64];
+    let modes: [(&str, f32); 2] = [("gpu-gumbel (temp=1.0, top_p=1.0)", 1.0), ("cpu-sampler (temp=1.0, top_p=0.95)", 0.95)];
+    let mut ok = true;
+
+    for &(mode_name, top_p) in &modes {
+        for &seed in &seeds {
+            // 1. Uncached solo reference for each prompt (fresh lane, spans.len() == 1, poisoned scratch).
+            let mut solo_seqs: Vec<Vec<u32>> = Vec::with_capacity(prompts.len());
+            for (idx, prompt) in prompts.iter().enumerate() {
+                let req_seed = seed.wrapping_add((idx as u64) * 0x9E37_79B9);
+                let l = Lane::new(&eng);
+                let r = eng.on(&l);
+                r.reset();
+                r.reserve(prompt.len() + ndec + 2, false);
+                r.set_tokens(0, prompt);
+                let mut sampler = Sampler::new(1.0, 0, top_p, eng.softcap, req_seed);
+                let mut pos = 0usize;
+                for &chunk in &[128usize, 256, 192] {
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans(&cb, &[Span { lane: &l, p0: pos, t: chunk }], pos + chunk == prompt.len(), false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    pos += chunk;
+                }
+                let first_tok = if sampler.uses_gpu_gumbel() {
+                    let gcb = eng.gpu.cmd();
+                    eng.encode_gumbel_solo(&gcb, &l, pos, req_seed, pos, 1.0, None);
+                    gcb.commit();
+                    gcb.waitUntilCompleted();
+                    r.token_at(pos)
+                } else {
+                    sampler.sample_next(eng.logits()).expect("solo prefill sample")
+                };
+                let mut toks = vec![first_tok];
+                while toks.len() < ndec {
+                    let cur = *toks.last().unwrap();
+                    r.set_tokens(pos, &[cur]);
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_decode(&cb, &[Span { lane: &l, p0: pos, t: 1 }], true, false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    let next_pos = pos + 1;
+                    let tok = if sampler.uses_gpu_gumbel() {
+                        let gcb = eng.gpu.cmd();
+                        eng.encode_gumbel_span(&gcb, 0, &l, next_pos, req_seed, next_pos, 1.0, None);
+                        gcb.commit();
+                        gcb.waitUntilCompleted();
+                        r.token_at(next_pos)
+                    } else {
+                        sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
+                    };
+                    pos = next_pos;
+                    toks.push(tok);
+                }
+                solo_seqs.push(toks);
+            }
+
+            // 2. Prefix-cached + multi-lane scheduler-batched execution via ServeStepPlanner.
+            let src = Lane::new(&eng);
+            {
+                let r = eng.on(&src);
+                r.reset();
+                r.reserve(head + tail + ndec + 2, false);
+                r.set_tokens(0, &prompts[0][..head]);
+                let mut p = 0;
+                for &c in &[128usize, 256] {
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t: c }], false, false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    p += c;
+                }
+            }
+            let cs_head = eng.on(&src).get_cs();
+
+            struct ReqState {
+                lane: Lane,
+                n_past: usize,
+                pf_end: usize,
+                seed: u64,
+                sampler: Sampler,
+                toks: Vec<u32>,
+            }
+            let mut reqs: Vec<ReqState> = prompts
+                .iter()
+                .enumerate()
+                .map(|(idx, prompt)| {
+                    let req_seed = seed.wrapping_add((idx as u64) * 0x9E37_79B9);
+                    let l = Lane::new(&eng);
+                    let r = eng.on(&l);
+                    r.reset();
+                    r.reserve(prompt.len() + ndec + 2, false);
+                    let start = if idx < 2 {
+                        let copy_len = if sabotage && idx == 1 { head - 1 } else { head };
+                        eng.copy_lane_prefix(&src, &l, copy_len);
+                        r.set_cs(&cs_head);
+                        head
+                    } else {
+                        0
+                    };
+                    r.set_tokens(0, prompt);
+                    ReqState {
+                        lane: l,
+                        n_past: start,
+                        pf_end: prompt.len(),
+                        seed: req_seed,
+                        sampler: Sampler::new(1.0, 0, top_p, eng.softcap, req_seed),
+                        toks: Vec::with_capacity(ndec),
+                    }
+                })
+                .collect();
+
+            let mut planner = ServeStepPlanner::new(reqs.len(), 2);
+            for i in 0..reqs.len() {
+                planner.on_admit(i);
+            }
+
+            while reqs.iter().any(|r| r.toks.len() < ndec) {
+                let inputs: Vec<ServeLaneInput> = reqs
+                    .iter()
+                    .map(|r| ServeLaneInput {
+                        runnable: r.toks.len() < ndec,
+                        n_past: r.n_past,
+                        pf_end: r.pf_end,
+                        has_pending_decode: !r.toks.is_empty() && r.n_past < r.pf_end + r.toks.len(),
+                    })
+                    .collect();
+                let plan = planner
+                    .plan_and_begin_step(&inputs, 256, 64)
+                    .expect("temp1 scheduler must make progress");
+                match plan {
+                    ServeStepPlan::Prefill(sp_list) => {
+                        let spans: Vec<Span> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t })
+                            .collect();
+                        let many = spans.len() > 1;
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_spans(&cb, &spans, true, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        let mut gpu_pf = Vec::new();
+                        for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
+                            reqs[i].n_past = p0 + t;
+                            if reqs[i].n_past == reqs[i].pf_end {
+                                if reqs[i].sampler.uses_gpu_gumbel() {
+                                    gpu_pf.push((k, i));
+                                } else {
+                                    let lg = if many { eng.span_logits(k) } else { eng.logits() };
+                                    let tok = reqs[i].sampler.sample_next(lg).expect("batched pf sample");
+                                    reqs[i].toks.push(tok);
+                                }
+                            }
+                        }
+                        if !gpu_pf.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_pf {
+                                let p = reqs[i].n_past;
+                                if many {
+                                    eng.encode_gumbel_span(&gcb, k, &reqs[i].lane, p, reqs[i].seed, p, 1.0, None);
+                                } else {
+                                    eng.encode_gumbel_solo(&gcb, &reqs[i].lane, p, reqs[i].seed, p, 1.0, None);
+                                }
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                            for &(_, i) in &gpu_pf {
+                                let p = reqs[i].n_past;
+                                let tok = eng.on(&reqs[i].lane).token_at(p);
+                                reqs[i].toks.push(tok);
+                            }
+                        }
+                    }
+                    ServeStepPlan::Decode(dec_lanes) => {
+                        for &i in &dec_lanes {
+                            let tok = *reqs[i].toks.last().unwrap();
+                            eng.on(&reqs[i].lane).set_tokens(reqs[i].n_past, &[tok]);
+                        }
+                        let spans: Vec<Span> = dec_lanes
+                            .iter()
+                            .map(|&i| Span { lane: &reqs[i].lane, p0: reqs[i].n_past, t: 1 })
+                            .collect();
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_decode(&cb, &spans, true, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        let gpu_dec: Vec<(usize, usize)> = dec_lanes
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &i)| reqs[i].sampler.uses_gpu_gumbel())
+                            .map(|(k, &i)| (k, i))
+                            .collect();
+                        if !gpu_dec.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_dec {
+                                let next_pos = reqs[i].n_past + 1;
+                                eng.encode_gumbel_span(&gcb, k, &reqs[i].lane, next_pos, reqs[i].seed, next_pos, 1.0, None);
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                        }
+                        for (k, &i) in dec_lanes.iter().enumerate() {
+                            reqs[i].n_past += 1;
+                            let tok = if reqs[i].sampler.uses_gpu_gumbel() {
+                                eng.on(&reqs[i].lane).token_at(reqs[i].n_past)
+                            } else {
+                                reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
+                            };
+                            reqs[i].toks.push(tok);
+                        }
+                    }
+                }
+                let _ = planner.complete_step();
+            }
+
+            let mut seed_ok = true;
+            for (i, (solo, req)) in solo_seqs.iter().zip(&reqs).enumerate() {
+                if solo != &req.toks {
+                    let first_diff = solo.iter().zip(&req.toks).position(|(a, b)| a != b);
+                    println!(
+                        "{mode_name} seed=0x{seed:016x} req {i}: DIFFERS at token {:?} (solo={:?} vs cached={:?})",
+                        first_diff,
+                        first_diff.map(|k| solo[k]),
+                        first_diff.map(|k| req.toks[k])
+                    );
+                    seed_ok = false;
+                }
+            }
+            if seed_ok {
+                println!(
+                    "{mode_name} seed=0x{seed:016x}: 3 lanes x {ndec} tokens (2 prefix-cached + 1 cold) IDENTICAL to uncached solo"
+                );
+            }
+            ok &= seed_ok;
+        }
+    }
+    if sabotage {
+        println!("INK_TEMP1_SABOTAGE: copied {} of {} head tokens on lane 1", head - 1, head);
+    }
+    println!(
+        "{}",
+        if ok {
+            "temp1 equivalent: temperature=1.0 fixed-seed cached+scheduled outputs match uncached solo bit for bit (GPU Gumbel + CPU top-p)"
+        } else {
+            "TEMP1 NOT EQUIVALENT"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
+}
+
 /// dev, layer 2's performance gate: decode steps over N lanes at a given context. Each context is prefilled once (the
 /// --ref tokens repeated) and copied into every lane; lane i then decodes its own stream (the --ref tokens rotated by
 /// 97 i), so routing differs across lanes as it would in use. INK_CTXS and INK_LANES list what to measure.
@@ -1300,6 +1592,7 @@ fn main() {
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
+        "temp1" => temp1(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "maxctx" => maxctx(&o),
