@@ -109,7 +109,7 @@ mutant shallowest \
                 best = StartMatch'
 mutant ref-leak \
     'self.records.drop_ref(h.slot(), h.kind())' \
-    'Ok(())'
+    'Ok::<(), BlockError>(())'
 if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
 check PrefixTree PrefixTree
 fi
