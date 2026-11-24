@@ -1,0 +1,10 @@
+# Apple M5 Pro Mac mini with 64 GB: secondary fleet measurement host.
+name = m5-pro-64gb
+chip = Apple M5 Pro
+memory_gb = 64
+# GPU wired-memory limit in inky mode (MB): 64 GB less 8 GB for macOS.
+wired_limit_mb = 57344
+# kept free of lane caches inside Metal's working set (GiB)
+lane_margin_gib = 4
+# conservative lane count for 64 GB / ~290 GB/s memory bandwidth
+default_lanes = 32
