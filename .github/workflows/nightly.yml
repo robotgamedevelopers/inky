@@ -58,7 +58,9 @@ jobs:
         run: |
           test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
   # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
-  # its sabotage, dbatch, crosspath, the golden hashes (about 16 min together) and the serve API negative control.
+  # its sabotage, dbatch, crosspath, the golden hashes (about 16 min together), the long poolgate (tests/nightly.sh)
+  # and the serve API negative control.
+  # Every gate step runs even when an earlier one fails (if: !cancelled()), so one red gate never hides another.
   m5-full:
     needs: guard
     runs-on: [self-hosted, macOS, ARM64, m5]
@@ -68,15 +70,22 @@ jobs:
         run: cargo build --locked --release
       - name: GPU gates (full set)
         run: tests/ci.sh full
+      # The long poisoned-slot gate (17 lanes, 64 decode steps; about 126-140 s), from #55.
+      - name: long GPU gates
+        if: ${{ !cancelled() }}
+        run: tests/nightly.sh
       - uses: actions/setup-go@v5
+        if: ${{ !cancelled() }}
         with:
           go-version: '1.26.10'
           cache: false
       - name: serve API probes
+        if: ${{ !cancelled() }}
         env:
           SERVECHECK_SABOTAGE: ''
         run: tests/serve.sh
       - name: serve API negative control
+        if: ${{ !cancelled() }}
         env:
           SERVECHECK_SABOTAGE: health-status
         run: |

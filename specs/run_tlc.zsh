@@ -78,3 +78,8 @@ check SplitArena4 SplitArena
 check SplitArena6 SplitArena
 check SplitEdgeDropped SplitArena CombineReadsOwn
 check SplitRowsUnbounded SplitArena WritesInArena
+check PoisonGate3 PoisonGate
+check PoisonGate4 PoisonGate
+check PoisonUnguarded PoisonGate NoFalsePoison
+check PoisonNoSave PoisonGate LiveIntact
+check PoisonOwnedOnly PoisonGate Coverage

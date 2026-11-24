@@ -141,3 +141,25 @@ initial state at floor 6. Its state count equals floor 4's by coincidence of the
 reachable batch starts; the case is the point, not the count. The PR-tier TLA step
 (`scripts/check-tla.sh`, all runners but CacheScheduler) took 54.5 seconds on
 hetzner1, inside the two-minute budget.
+
+## Poisoned-slot gate
+
+Run on `mini-m5`, 2026-11-24 02:30 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| PoisonGate3 | 158,849 | 34,504 | 1.104 | PASS |
+| PoisonGate4 | 3,239,729 | 563,728 | 8.197 | PASS |
+| PoisonUnguarded | 17 | 17 | 0.677 | NoFalsePoison violated |
+| PoisonNoSave | 124 | 79 | 0.673 | LiveIntact violated |
+| PoisonOwnedOnly | 74 | 51 | 0.695 | Coverage violated |
+
+Inspected counterexamples, each checked against `poison_plan` by hand:
+
+- **PoisonUnguarded, state 3:** lane `a` takes slot 1 and steps alone; slot 1
+  is poisoned in its own step (`poison_plan(.., guard = false)`, the
+  `INK_POOLGATE_SABOTAGE` run on the GPU).
+- **PoisonNoSave, state 4:** lane `a` owns slot 1, lane `b` steps; slot 1 is
+  poisoned, not saved, and still poison after the restore.
+- **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
+  the next step leaves the free slot 1 unpoisoned.

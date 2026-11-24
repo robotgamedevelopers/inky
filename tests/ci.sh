@@ -7,11 +7,13 @@
 #     lanes (inky dbatch) and the cross-lane prefix copy (inky xcopy): every lane identical to itself alone; decode
 #     steps also agree with llama.cpp. Crosspath compares tensor prefill and decode on the same row.
 #     The sabotaged spans and xcopy runs are required to fail.
+#     inky poolgate: 3 lanes with every pool slot outside the step poisoned give layer 2's outputs; its sabotaged run
+#     must fail. The long poolgate runs in tests/nightly.sh.
 #  3. tests/golden.sh is byte-identical to tests/golden-<chip>.txt: the logits did not change. A change that changes them
 #     on purpose updates that file in the same commit and says why.
 # Usage: tests/ci.sh [full|pr]. full (the default; the nightly workflow) runs everything above. pr (every pull request
 # and push, which must finish in about a minute) runs the fast representative set: the three llama.cpp agreements and
-# the xcopy pair with its negative control (about 25 s on an M5). INKY_BIN overrides the binary (default
+# the xcopy and poolgate pairs with their negative controls (about 40 s on an M5). INKY_BIN overrides the binary (default
 # ./target/release/inky).
 set -e
 cd "${0:A:h}/.."
@@ -49,6 +51,9 @@ agree "decode steps, short prompt vs llama.cpp " "INK_DEC=1" short
 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
 # negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
 if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
+$B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate"; fail=1; }
+# negative control: a step whose own slots are poisoned must report POOL GATE DIFFERS (src/main.rs); a crash does not count
+if INK_POOLGATE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1 | grep -q 'POOL GATE DIFFERS'; then echo "poolgate sabotage: detected, as required"; else echo "FAIL: poolgate sabotage not detected"; fail=1; fi
 if [ "$mode" = pr ]; then
     echo "pr set done; binv, lanes, spans (and its sabotage), dbatch, crosspath and golden run in the nightly workflow (tests/ci.sh full)"
     exit $fail
