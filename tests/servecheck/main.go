@@ -72,7 +72,7 @@ func readyURL(output string) (string, error) {
 	return "", nil
 }
 
-func (g *gate) server(ctx context.Context, bin, model, dir string, lanes int, checks func()) error {
+func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue int, checks func()) error {
 	g.log = filepath.Join(dir, fmt.Sprintf("lanes-%d.log", lanes))
 	log, err := os.Create(g.log)
 	if err != nil {
@@ -81,7 +81,7 @@ func (g *gate) server(ctx context.Context, bin, model, dir string, lanes int, ch
 	defer log.Close()
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "serve", "-m", model, "-c", "6144", "-n", "4096", "--lanes", strconv.Itoa(lanes), "--queue", "1", "--key-env", "INKY_SERVE_TEST_KEY", "--effort", "none", "--bind", "127.0.0.1:0")
+	cmd := exec.CommandContext(ctx, bin, "serve", "-m", model, "-c", "6144", "-n", "4096", "--lanes", strconv.Itoa(lanes), "--queue", strconv.Itoa(queue), "--key-env", "INKY_SERVE_TEST_KEY", "--effort", "none", "--bind", "127.0.0.1:0")
 	cmd.Env = append(os.Environ(), "INKY_SERVE_TEST_KEY="+g.key, "INK_CHUNK=64")
 	cmd.Stdout, cmd.Stderr = log, log
 	if err = cmd.Start(); err != nil {
@@ -138,20 +138,28 @@ func execute() error {
 	http.DefaultTransport.(*http.Transport).Proxy = nil
 	http.DefaultClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	sabotage := os.Getenv("SERVECHECK_SABOTAGE")
-	if sabotage != "" && sabotage != "health-status" {
+	switch sabotage {
+	case "", "health-status", "memory-budget", "concurrent-tool-calls", "disconnect-mid-thinking":
+	default:
 		return fmt.Errorf("unknown SERVECHECK_SABOTAGE probe %q", sabotage)
 	}
 	g := gate{key: "local-gate-test", sabotage: sabotage}
 	bin, model := os.Args[1], os.Args[2]
 	g.run("lane limit checked before model load", func() error { return checkLaneRange(ctx, bin, dir) })
-	if err = g.server(ctx, bin, model, dir, 1, func() {
-		g.validation()
+	if err = g.server(ctx, bin, model, dir, 1, 1, func() {
+		g.validation(1)
 		g.cancelJobs()
+		g.run("disconnect in mid-thinking stops generation", g.disconnectMidThinking)
 		g.run("follow-up after window overwrite matches cold generation", g.overwrittenWindow)
 	}); err != nil {
 		return err
 	}
-	if err = g.server(ctx, bin, model, dir, 2, func() { g.replies(); g.queueJobs() }); err != nil {
+	if err = g.server(ctx, bin, model, dir, 2, 1, func() { g.replies(); g.queueJobs() }); err != nil {
+		return err
+	}
+	if err = g.server(ctx, bin, model, dir, 4, 2, func() {
+		g.run("concurrent identical tool calls", g.concurrentToolCalls)
+	}); err != nil {
 		return err
 	}
 	if g.failed {
