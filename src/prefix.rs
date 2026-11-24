@@ -1019,6 +1019,8 @@ mod tests {
         rows.push(snapshot(&live, &seq_of, "unpin", &req_abstract, 0, 0, &[], false));
         let m = live.deepest_start(&req).unwrap();
         rows.push(snapshot(&live, &seq_of, "seek", &[], 0, 0, &req_abstract[..m.at / BLOCK * 2], true));
+        live.unpin(root).unwrap();
+        rows.push(snapshot(&live, &seq_of, "unpin", &[1, 2], 0, 0, &[], false));
         // the root's slots move on: the root (and the child below it) is stale
         live.records.reuse(Slot::new(1).unwrap(), BlockKind::Full);
         live.records.reuse(Slot::new(1).unwrap(), BlockKind::Window);
@@ -1101,10 +1103,16 @@ mod tests {
                     let seq = seq_of[&id].clone();
                     rows.push(snapshot(&live, &seq_of, "release", &seq, 0, 0, &[], false));
                 }
-                4 => { // reuse a slot, both kinds together (abstract generation at most 2)
+                4 => { // reuse a slot, both kinds together (abstract generation at most 2);
+                       // never a slot a pinned block names: the pool's Free rule
                     let slot = 1 + pick(3) as u32;
                     let gen = live.records.generation(Slot::new(slot).unwrap(), BlockKind::Full).unwrap();
                     if gen >= 3 { continue; }
+                    let pinned_slots: Vec<u32> = live.tree.entries().into_iter()
+                        .filter(|(id, _)| live.pin_count(*id) > 0)
+                        .flat_map(|(_, h)| h.entries().map(|e| e.slot().get()).collect::<Vec<_>>())
+                        .collect();
+                    if pinned_slots.contains(&slot) { continue; }
                     live.records.reuse(Slot::new(slot).unwrap(), BlockKind::Full);
                     live.records.reuse(Slot::new(slot).unwrap(), BlockKind::Window);
                     rows.push(snapshot(&live, &seq_of, "reuse", &[], slot, 0, &[], false));
