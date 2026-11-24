@@ -268,6 +268,60 @@ fn check(o: &Opts) {
     }
 }
 
+/// dev, per-row logits gate. One lane, a forced token sequence, no drafter. Run `encode_spans` of t=1 through
+/// position p, then a verify span that starts at the already-cached position p-1 with length 1+k. Each vocabulary
+/// row must match the same positions run as `encode_spans` of t=1, one position at a time. `INK_K` (default 3) and
+/// `INK_P` (default 5) choose the span. Exits 1 on a mismatch.
+fn rows(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(p >= 1, "INK_P is the frontier after the cached position");
+    let ntok = p + k;
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    // forced synthetic ids, inside the embedding table. Not a drafter.
+    let toks: Vec<u32> = (0..ntok).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+    let fresh = || {
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.reserve(ntok + 1, false);
+        run.set_tokens(0, &toks);
+        lane
+    };
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let lane_r = fresh();
+    let mut expect: Vec<Vec<f32>> = Vec::with_capacity(1 + k);
+    for pos in 0..ntok {
+        step1(&lane_r, pos, true);
+        if pos + 1 >= p { expect.push(eng.logits().to_vec()); }
+    }
+    let lane = fresh();
+    let run = eng.on(&lane);
+    for pos in 0..p - 1 { step1(&lane, pos, false); }
+    let cs = run.get_cs();
+    step1(&lane, p - 1, false);
+    run.set_cs(&cs);
+    let cb = eng.gpu.cmd();
+    eng.encode_verify(&cb, &[Span { lane: &lane, p0: p - 1, t: 1 + k }], k);
+    cb.commit();
+    cb.waitUntilCompleted();
+    let mut ok = true;
+    for r in 0..1 + k {
+        let got = eng.span_logits(r);
+        let same = got == expect[r].as_slice();
+        ok &= same;
+        println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
+    }
+    println!("{}", if ok { "per-row logits match encode_spans of t=1" } else { "PER-ROW LOGITS DIFFER" });
+    if !ok { std::process::exit(1); }
+}
+
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
 fn binv(o: &Opts) {
@@ -842,6 +896,7 @@ fn main() {
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
+        "rows" => rows(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),

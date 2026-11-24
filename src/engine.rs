@@ -199,8 +199,10 @@ struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_of
 /// batch (prefill) arena: per-token activation arrays [T][dim], f32 offsets into the same arena buffer
 #[derive(Clone, Copy, Default, Debug)]
 pub struct BArena {
-    /// logits of each span of a step with several spans (one vocabulary row each)
+    /// logits in `b.lg`: one vocabulary row per span for a prefill (`lg_rows` of them, at most `MAX_SPANS`).
+    /// A verify span uses `1 + k` of those rows, one per position. This is not one row per token.
     lg: u32,
+    lg_rows: u32,
     vec0: u32, q: u32, gate: u32, k: u32, v: u32, rel: u32, sink: u32, kdyn: u32, vdyn: u32, qp: u32, rp: u32, attn_g: u32,
     inp: [u32; 3], msg: [u32; 4], cin: [u32; 3], fin: u32, finc: u32, ctrlg: [u32; 4],
     cat_u: [u32; 4], cat_m: [u32; 4], gain_o: [u32; 4], forget_o: [u32; 4],
@@ -240,7 +242,9 @@ impl BArena {
         b.ind = take(64); b.aw = take(t * TOPK); b.fh = take(t * E / 2);
         // sliding-window K/V scratch of the batch: [guard | window history | batch keys | guard] per group, half
         b.sk = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4); b.sv = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
-        b.lg = take(t.min(MAX_SPANS) * vocab_pad);
+        // Not `t` rows. At chunk 4096 that would be 32× this buffer (128 rows today). A verify span reuses them.
+        b.lg_rows = t.min(MAX_SPANS) as u32;
+        b.lg = take(b.lg_rows as usize * vocab_pad);
         b.perm = take(t * TOPK); b.inv = take(t * TOPK); b.tiles = take(fb((t * TOPK / 32 + NEXP + 1) * 4)); b.ntiles = take(64);
         b.act = take(fb(t * TOPK * FF)); b.yd = take(hf(t * TOPK * E));
         b.end = o;
@@ -480,9 +484,13 @@ impl Engine {
         use objc2_metal::MTLDevice;
         (self.gpu.dev.currentAllocatedSize(), self.gpu.dev.recommendedMaxWorkingSetSize() as usize)
     }
-    /// the logits of span `i` of the last step with several spans
+    /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
+    /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
+    /// (span `s`, position `r`, at `s * (1 + k) + r`).
     pub fn span_logits(&self, i: usize) -> &[f32] {
-        let off = self.ba.get().lg as usize + i * self.vocab_pad();
+        let b = self.ba.get();
+        assert!(i < b.lg_rows as usize, "span_logits: row {i} but b.lg has {} rows", b.lg_rows);
+        let off = b.lg as usize + i * self.vocab_pad();
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
     /// the decode path's arena at the current base
@@ -1472,7 +1480,15 @@ impl Engine {
     /// preparation and cache writes, attention, the convolutions and their state) runs span by span with that lane's
     /// buffers bound. Optionally computes each span's logits (and argmax, written to the lane's tokens) for its last row:
     /// in the decode arena for a single span (`logits()`), in the batch arena for several (`span_logits`).
-    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false); }
+    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None); }
+    /// Verify step. Each span has length `1 + k` (the last committed token again, then `k` drafts). `k` is the
+    /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
+    /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
+    /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
+    pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
+        assert!(!spans.is_empty() && spans.iter().all(|s| s.t == 1 + k), "a verify span has length 1 + k");
+        self.encode_spans_x(cb, spans, true, false, false, Some(k));
+    }
     /// Encode one decode step: one token for each lane in `spans` (every span has t = 1). Row-wise work runs through the
     /// batched tensor path as in `encode_spans`; each lane's attention is the decode path's fused kernel (K/V conv, cache
     /// write, split-K attention over its own cache). A decode step's arithmetic is its own: a token's numbers depend
@@ -1480,9 +1496,9 @@ impl Engine {
     /// blocks written by decode steps are never shared (docs/DESIGN.md).
     pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
         assert!(spans.iter().all(|s| s.t == 1));
-        self.encode_spans_x(cb, spans, logits, argmax, true);
+        self.encode_spans_x(cb, spans, logits, argmax, true, None);
     }
-    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool) {
+    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>) {
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
         let t: usize = spans.iter().map(|s| s.t).sum();
         for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
@@ -1491,6 +1507,13 @@ impl Engine {
         assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
                 "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
+        if let Some(k) = verify_k {
+            assert!(!dec && !argmax, "verify is not a decode step, and argmax would overwrite toks[p0 + t]");
+            let need = spans.len() * (1 + k);
+            assert!(need <= self.ba.get().lg_rows as usize,
+                    "verify needs {need} vocabulary rows and this batch has {}; lg is not grown to one row per token",
+                    self.ba.get().lg_rows);
+        }
         let mut row0 = Vec::with_capacity(spans.len());
         { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
         let e = Enc::new(cb);
@@ -1516,7 +1539,8 @@ impl Engine {
         // rows of the two branch outputs). It is a full-attention layer, so K/V still cover every token, but queries, attention,
         // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
         let mut trim = [0usize; N_PHYS];
-        if spans.len() == 1 && self.hgemm && self.tail.get() && t > 16 { trim[N_PHYS - 1] = t - 8; }
+        // Verify needs every row's logits, so it does not take the last-layer tail trim (single span, t > 16).
+        if verify_k.is_none() && spans.len() == 1 && self.hgemm && self.tail.get() && t > 16 { trim[N_PHYS - 1] = t - 8; }
         let mut va = VecAlloc { next: 1, n: B_NVEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
@@ -1532,7 +1556,25 @@ impl Engine {
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
         for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
-        if logits && dec {
+        // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
+        // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
+        // use of b.lg, for that span only: 1+k rows, one per position, argmax off.
+        if let Some(k) = verify_k {
+            let ar = self.ar;
+            let rows = 1 + k;
+            let vp = self.vocab_pad();
+            for (si, sp) in spans.iter().enumerate() {
+                for r in 0..sp.t {
+                    let row = ((row0[si] + r) * E) as u32;
+                    let lg = b.lg + ((si * rows + r) * vp) as u32;
+                    let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + row).collect();
+                    st.push(b.vec(cur) + row);
+                    let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
+                    self.mix(&e, C_OMIX, &[j]);
+                    self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                }
+            }
+        } else if logits && dec {
             // a decode step: every lane's last row through the output mix and one tensor GEMM over the output matrix (read
             // once for all lanes, whatever their number); logits in the batch arena (`span_logits`)
             let ar = self.ar;
@@ -2694,5 +2736,25 @@ impl<'a> Run<'a> {
     /// Encode prefill of `t` tokens (toks[p0..p0+t]) of this lane as one batch: a step with one span.
     pub fn encode_prefill(&self, cb: &CmdBuf, p0: usize, t: usize, logits: bool, argmax: bool) {
         self.eng.encode_spans(cb, &[Span { lane: self.lane, p0, t }], logits, argmax);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chunk 4096 keeps `min(t, MAX_SPANS)` vocabulary rows. A verify span of k=3 needs 4 of them.
+    /// Growing `lg` to one row per token would be 32× those rows; this layout does not.
+    /// fp16 path, fp16 K/V, vocab pad 201024 (`output.weight` rows of Inkling-2-Mini).
+    #[test]
+    fn chunk_4096_batch_arena_is_unchanged_for_verify_rows() {
+        let vocab_pad = 201024usize;
+        let b = BArena::new(0, 4096, true, 2, vocab_pad);
+        assert_eq!(b.lg_rows, 128);
+        assert_eq!(b.cap, 4096);
+        let bytes = b.end as usize * 4;
+        assert_eq!(bytes, 1_791_665_152);
+        assert!(4 <= b.lg_rows as usize, "k=3 is 4 rows and must fit the existing lg");
+        assert!(b.lg_rows as usize * 32 == 4096);
     }
 }
