@@ -1,6 +1,6 @@
 # inky roadmap
 
-inky serves Inkling 2 Mini to many coding-agent tasks at once from one process on one Apple silicon machine. The design is in [DESIGN.md](DESIGN.md). The work is built bottom up, one layer at a time: a layer's gates are green before the next layer starts, and nothing in "After the first build" starts before layer 8.
+inky serves Inkling 2 Mini to many coding-agent tasks at once from one process on one Apple silicon machine. The design is in [DESIGN.md](DESIGN.md). The work is built bottom up, one layer at a time: a layer's gates are green before the next layer starts, and nothing in "After the first build" starts before layer 8. At Glenn's direction (2026-11-23) the server (layer 5) was built ahead of the block cache and scheduler, so inky can serve as a provider now; layers 3 and 4 follow underneath it.
 
 <!-- The tables between the nova-work markers are generated from roadmap.sexp by nova-roadmap: edit the data and run `nova-roadmap render`. Everything else on this page is written by hand. -->
 
@@ -12,6 +12,8 @@ What was measured and tried before any design, and the design itself.
 
 | feature | done |
 |---|:---:|
+| Four real cards at once through inky serve, each landing the merged fix | ✅ |
+| Max-context eval: one stream and memory-bounded lanes from 16K to 256K on real code | ✅ |
 | Single-stream speed and memory bandwidth measured on an M5 Max | ✅ |
 | Separate processes measured as a baseline: 1.35x at best | ✅ |
 | Grouping lanes by predicted experts simulated on the routing dumps: about 20% fewer weight bytes | ✅ |
@@ -80,14 +82,14 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 | feature | done |
 |---|:---:|
 | Profile of where the batched path's 58 ms fixed cost goes | ✅ |
-| One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ❌ |
-| Attention per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span | ❌ |
-| Each lane's convolution state and cache written by its own span only | ❌ |
-| Per-lane sampling with one step in flight, seeded by the request | ❌ |
-| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ❌ |
-| Gate: agreement with llama.cpp as CI checks it | ❌ |
-| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ❌ |
-| complete | 12% |
+| One kind of step: it advances a set of (lane, tokens) spans through the batched projections, router, experts and controllers | ✅ |
+| Attention per span in two arithmetics — prefill rows and decode steps — each batch-invariant, so prefill chunking never changes a token's numbers | ✅ |
+| Each lane's convolution state and cache written by its own span only | ✅ |
+| Per-lane sampling with one step in flight, seeded by the request | ✅ |
+| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |
+| Gate: agreement with llama.cpp as CI checks it | ✅ |
+| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -102,7 +104,7 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | feature | done |
 |---|:---:|
 | CacheScheduler.tla: blocks of both kinds, start points, lanes, the step in flight, budgets; exhaustive in TLC, safety and liveness | ❌ |
-| BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses | ❌ |
+| BlockLayout.tla: slot reuse, window sliding and 64-bit table indexing at capacity 3 or 4, with reversed witnesses | ✅ |
 | Append-only blocks of 64 positions, window and full kinds, in a pool of GPU buffers | ❌ |
 | Attention reads keys through a per-lane block table of 64-bit offsets | ❌ |
 | A request matches the deepest start point in a prefix tree of sealed blocks | ❌ |
@@ -110,7 +112,7 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ❌ |
 | Gate: the engine's traces are behaviours of both models, checked in CI | ❌ |
 | Gate: outputs identical to layer 2 with poisoned pool slots | ❌ |
-| complete | 0% |
+| complete | 11% |
 
 [Source data](roadmap.sexp)
 
@@ -129,7 +131,7 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | No Ready, Restoring or Queued lane is passed over more than W ticks | ❌ |
 | Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ❌ |
 | The memory budget read from Metal's recommended working set at start, never passed by hand | ❌ |
-| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ❌ |
+| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ✅ |
 | Cancel in a step waits for the step's GPU work and disk I/O | ❌ |
 | Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ❌ |
 | Restoring reserves the whole working set atomically before reading | ❌ |
@@ -137,7 +139,7 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ❌ |
 | Gate: kill -9 in mid-write loses cache and never correctness | ❌ |
 | Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ❌ |
-| complete | 0% |
+| complete | 7% |
 
 [Source data](roadmap.sexp)
 
@@ -151,15 +153,16 @@ The endpoint a coding-agent harness talks to.
 
 | feature | done |
 |---|:---:|
-| OpenAI-compatible chat completions, streaming and not, over the lanes | ❌ |
-| The chat template rendered exactly, tested against the GGUF's own template | ❌ |
-| Tool declarations, tool calls and tool results translated both ways | ❌ |
-| Earlier turns rendered exactly as the client sends them | ❌ |
-| A client that disconnects cancels its lane | ❌ |
-| A health endpoint, and binding to loopback or a private network only | ❌ |
-| Gate: the tracer card and a recorded replay set land through it | ❌ |
+| OpenAI-compatible chat completions, streaming and not, over the lanes | ✅ |
+| The chat template rendered exactly, tested against the GGUF's own template | ✅ |
+| Tool declarations, tool calls and tool results translated both ways | ✅ |
+| Earlier turns rendered exactly as the client sends them | ✅ |
+| A client that disconnects cancels its lane | ✅ |
+| A health endpoint, and binding to loopback or a private network only | ✅ |
+| Gate: the tracer card and a recorded replay set land through it | ✅ |
 | Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ❌ |
-| complete | 0% |
+| Gate: memd traces are behaviours of MemMode.tla, checked in CI | ✅ |
+| complete | 88% |
 
 [Source data](roadmap.sexp)
 
@@ -220,12 +223,22 @@ Run it for days.
 
 Improvements that wait for the layers above. Those that change the model's numbers also wait for the quality replay.
 
+Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in parallel lanes and lands the first whose check passes; the N attempts share their prompt through cross-lane prompt-prefix reuse (pull request 22). Its gate is the tier test from the flash+ provider goal (pull request 17): land rate per tier, 1 attempt against best-of-4, on mas-bandwidth/sprint-corpus. Aggregation and critic start only if pro still misses the flash+ bar after best-of-N.
+
 <!-- nova-work:later:start -->
 
 | feature | done |
 |---|:---:|
+| The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ❌ |
+| Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ❌ |
+| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
-| A shared prefix is read once per step for all lanes' queries (later) | ❌ |
+| Shared-prefix design and measured overlap on four concurrent cards (later) | ✅ |
+| Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails (later) | ❌ |
+| Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks (later) | ❌ |
+| Grouped prefix reads match private fixed-split logits and goldens bit for bit (later) | ❌ |
+| Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries (later) | ❌ |
+| Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time (later) | ❌ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |
 | The 8-bit cache, behind the quality replay (later) | ❌ |
@@ -234,7 +247,10 @@ Improvements that wait for the layers above. Those that change the model's numbe
 | Tool calls constrained to valid JSON while sampling (later) | ❌ |
 | Sampling on the GPU (later) | ❌ |
 | General fixes sent upstream to inkling (later) | ❌ |
-| complete | 0% |
+| Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
+| Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
+| Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
+| complete | 4% |
 
 [Source data](roadmap.sexp)
 

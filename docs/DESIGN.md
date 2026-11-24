@@ -72,15 +72,33 @@ A second reader read this design and the code cold on 2026-11-22 (verdict: revis
 - **One-token batches** were a real bug, fixed before layer 1 (`mix_t`).
 - **Masked rows reaching the tensor multiply** were real: the window K/V scratch is now zeroed at every prefill (`k_zero`), found by `inky lanes`.
 - **The convolution state exists only at the end of a step.** Inside a prefill chunk it is never kept, so a block boundary is a start point only where a step ended there (Blocks, below).
-- **Batched attention does not suit decode spans.** At 3K context it takes about 5 ms for a tile of 32 queries, where the decode path's split-K attention takes about 1.3 ms for one token; a lane's single token would pay for the whole tile. Decode spans use the split-K kernel (Decisions, 2).
+- **Batched attention does not suit decode spans.** At 3K context it takes about 5 ms for a tile of 32 queries, where the decode path's split-K attention takes about 1.3 ms for one token; a lane's single token pays for the whole tile. The decode path's kernel cannot simply be used for decode spans: it gives different bits from the prefill path, which would make the cache change answers (Decisions, 2). The fix is one attention kernel for all spans (Follow-ons).
 - **The cache is read at about 210 GB/s and every lane reads all of its own:** the lane table above.
+
+## Measured: lanes on the M5 Max (2026-11-23)
+
+Decode steps (`encode_decode`): row-wise work through the tensor path, each lane's attention through the decode path's fused split-K kernel, lanes' independent dispatches overlapped, the output layer one GEMM for all lanes. Every lane is bit-identical to itself decoding alone (`inky dbatch`) and agrees with llama.cpp (short reference: 58/58, worst KL 0.0022).
+
+| context | one stream (decode path) | lanes | total | gain |
+|---:|---:|---:|---:|---:|
+| 2K | 93 tok/s | 64 | 578 tok/s | 6.2x |
+| 16K | 79 | 64 | 389 | 4.9x |
+| 64K | 53 | 27 | 150 | 2.9x |
+| 128K | 33 | 14 | 78 | 2.4x |
+| 256K | 21 | 7 | 40 | 1.9x |
+
+(16K and up from `inky maxctx` on real code, 60 GB for lanes.) The gain falls with context because each lane reads its own cache for every token; at 42K a lane already costs about 80% of that bandwidth floor. Prefill at 128K to 256K runs at 875 tok/s: 214 s to the first token at 256K.
+
+**Four cards at once through `inky serve`** (8 lanes, 131K context per lane), the tracer card four times: all four landed the same two-line fix as the merged change. 208 requests, 10.6 M prompt tokens of which 97% came from the lanes' kept prompts, 314 K prefilled, 53 K generated, largest prompt 97 K.
+
+Tried and reverted: decode-step experts with the decode path's f32 dot products (exact, KL 0.0004, but compute-bound: 262 tok/s at 64 lanes against 578).
 
 ## Decisions
 
 1. **One process, one copy of the weights.** Separate processes cannot share weight reads.
-2. **One kind of step.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token, a prefilling lane up to a chunk. The projections, router, experts and controllers run once over every span's tokens through the batched path. Attention runs per span: the decode path's split-K kernel for a one-token span, the batched kernel for a prefill span. The reference for a lane's numbers is that lane alone in a step, and a lane's numbers do not change with what else shares its step.
+2. **One kind of step, two arithmetics.** A step advances a set of spans, each (lane, tokens). A decoding lane brings one token, a prefilling lane up to a chunk. The projections, router, experts and controllers run once over every span's tokens; attention and the convolutions run per span. The two kinds of span do not share an arithmetic: a prefill row's attention is the batched path's, a decode step's attention is the decode path's fused split-K kernel, and the same token comes out with different bits from each. Each arithmetic is batch-invariant on its own — a token's numbers depend neither on what else shares its step nor, for a prefill row, on how its own lane's work was chunked (`inky spans` for prefill rows, `inky dbatch` for decode steps, `inky binv` for prefill splits) — but neither invariance crosses from one arithmetic to the other. So the decode path is used for a lane, as its decode step; it just never stands in for a prefill row. One attention kernel for every span would merge the two arithmetics (Follow-ons); until then both stand, and decision 4 is what makes that safe.
 3. **The server is stateless; the cache is a tree of blocks.** A request is a token list, matched against a prefix tree of sealed cache blocks. A lane lives for one request: it starts at the deepest start point the tree holds for its tokens, and when the request ends its blocks stay in the tree. There are no sessions. A shared prefix, a resumed conversation, a harness side request and a rollback are all the same case.
-4. **The cache never changes an answer.** A request's output is a function of the request and its seed; the cache only changes how fast it comes. This rests on batch invariance and on start points being exact. The seed is the request's own (its `seed`, or a hash of the request), never arrival order.
+4. **The cache never changes an answer.** A request's output is a function of the request and its seed; the cache only changes how fast it comes. That is well-defined because the boundary between the two arithmetics is the end of the prompt, which the request itself fixes: the prompt is prefilled and the reply is decoded, whatever the cache held, so the same request always splits at the same place. Only what the prefill wrote is reused across a card's turns: the kept prompt and the convolution state at its end. Cache written while decoding a reply is never read as history; the next turn prefills the reply again exactly as the client rendered it (decision 5), over it. The seed is the request's own (its `seed`, or a hash of the rendered tokens and the sampling settings), never arrival order.
 5. **Earlier turns are rendered exactly as the client sends them.** A client that drops the reasoning of earlier turns gets them rendered without it, as the chat template does. The tokens a lane generated are therefore reused only up to where its turn began; the turn itself is prefilled again with the next request (its visible text and tool calls: short). No map from visible text back to generated tokens exists.
 6. **Exact by default.** fp16 cache, no pruning. The 8-bit cache and far-key pruning are flags that go on only if the quality replay passes.
 7. **One step in flight.** The CPU picks every step's lanes. This costs about 3% against GPU-chained decode and removes the hardest ordering cases.
@@ -163,7 +181,7 @@ Each is secured before the next starts.
 
 ## Follow-ons, not in the first build
 
-- **An attention kernel for many lanes.** One dispatch over every decoding lane's span, grouping the three query heads of each key head, split-K, reading the cache through the block table near bus speed. At long context this is the largest gain: today's per-lane split-K reads the cache at about 210 GB/s.
+- **One attention kernel for every span, split over keys at positions fixed by the cache, not by the batch.** Each split's partial softmax is computed by the same arithmetic for one query or thirty-two, and splits merge in a fixed order, so a decode span and a prefill row give identical bits. It runs over every lane's span in one dispatch, groups the three query heads of each key head, and reads the cache through the block table near bus speed. At long context this is the largest gain: today a decode span runs the prefill tile over its lane's keys with one threadgroup per head, about 4x the decode path's split-K.
 - **A kernel for decode-size batches.** Up to 2x at 16 to 32 lanes of short context, less as more lanes touch more experts. Read each touched expert's quantized rows once at full bandwidth and apply them to every lane routed to it, and the same for the dense projections (see "Where the batched path's time goes").
 - **Read a shared prefix once per step** for all lanes' queries, then each lane's own keys, merged with the online softmax the engine already has.
 - **Grouping lanes by predicted experts.** It saves nothing while every Ready lane steps; it pays only when more lanes are ready than a step takes.

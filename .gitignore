@@ -7,3 +7,4 @@
 /ref/*.log
 /tools/ref_logits
 .DS_Store
+specs/**/states/

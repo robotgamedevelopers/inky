@@ -3,6 +3,9 @@ mod gguf;
 mod metal;
 mod sampler;
 mod session;
+mod memd;
+mod serve;
+mod tuning;
 mod tokenizer;
 mod unicode_tables;
 
@@ -207,6 +210,9 @@ fn check(o: &Opts) {
     eng.set_tokens(0, &toks);
     // --pf N: prefill the first N tokens as one batch, then decode the rest one by one
     let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
+    let dec_steps = std::env::var("INK_DEC").is_ok();
+    if dec_steps { eng.ensure_dbatch(1); }
     let mut agree = 0;
     let mut worst = 0f32;
     let kv_disk = engine::KV_DISK.load(std::sync::atomic::Ordering::Relaxed);
@@ -227,6 +233,8 @@ fn check(o: &Opts) {
         } else if kv_disk {
             eng.gen_reserve(pos);
             eng.step(pos, true, false).waitUntilCompleted();
+        } else if dec_steps {
+            eng.encode_decode(&cb, &[engine::Span { lane: eng.lane, p0: pos, t: 1 }], true, false);
         } else { eng.encode_step(&cb, pos, true, false); }
         cb.commit();
         cb.waitUntilCompleted();
@@ -235,8 +243,9 @@ fn check(o: &Opts) {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
-        let lg: Vec<f32> = eng.logits().iter().map(|&x| softcap(x, eng.softcap)).collect();
-        for x in eng.logits() { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        let raw: &[f32] = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.softcap)).collect();
+        for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
@@ -257,6 +266,139 @@ fn check(o: &Opts) {
         eprintln!("disk tier: {:.1} MiB in memory, {:.1} MiB on disk only (all in memory: {:.1} MiB); read {:.0} MiB in {:.0} ms",
                   eng.mem().0 as f64 / 1048576.0, eng.kv_disk_bytes(n) as f64 / 1048576.0, eng.kv_exact_bytes(n) as f64 / 1048576.0, rb as f64 / 1048576.0, rt.as_secs_f64() * 1e3);
     }
+}
+
+/// dev, per-row logits gate. One lane, a forced token sequence, no drafter. Run `encode_spans` of t=1 through
+/// position p, then a verify span that starts at the already-cached position p-1 with length 1+k. Each vocabulary
+/// row must match the same positions run as `encode_spans` of t=1, one position at a time. `INK_K` (default 3) and
+/// `INK_P` (default 5) choose the span. Exits 1 on a mismatch.
+fn rows(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(p >= 1, "INK_P is the frontier after the cached position");
+    let ntok = p + k;
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    // forced synthetic ids, inside the embedding table. Not a drafter.
+    let toks: Vec<u32> = (0..ntok).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+    let fresh = || {
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.reserve(ntok + 1, false);
+        run.set_tokens(0, &toks);
+        lane
+    };
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let lane_r = fresh();
+    let mut expect: Vec<Vec<f32>> = Vec::with_capacity(1 + k);
+    for pos in 0..ntok {
+        step1(&lane_r, pos, true);
+        if pos + 1 >= p { expect.push(eng.logits().to_vec()); }
+    }
+    let lane = fresh();
+    let run = eng.on(&lane);
+    for pos in 0..p - 1 { step1(&lane, pos, false); }
+    let cs = run.get_cs();
+    step1(&lane, p - 1, false);
+    run.set_cs(&cs);
+    let cb = eng.gpu.cmd();
+    eng.encode_verify(&cb, &[Span { lane: &lane, p0: p - 1, t: 1 + k }], k);
+    cb.commit();
+    cb.waitUntilCompleted();
+    let mut ok = true;
+    for r in 0..1 + k {
+        let got = eng.span_logits(r);
+        let same = got == expect[r].as_slice();
+        ok &= same;
+        println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
+    }
+    println!("{}", if ok { "per-row logits match encode_spans of t=1" } else { "PER-ROW LOGITS DIFFER" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, rollback gate. One lane, synthetic draft tokens, no drafter. Two forced rejects of a verify span:
+/// one in the middle of the draft, one at the last draft position. After rollback, `lane_hash` (cs and both
+/// K/V buffers) matches `encode_spans` of t=1 stopped at the accepted length, and again after the correction
+/// token is encoded as its own step. A match of the logits at the reject position is printed and is not the gate.
+/// `INK_K` (default 3) and `INK_P` (default 5) choose the span. Exits 1 unless both rejects match.
+fn rollback(o: &Opts) {
+    use engine::Span;
+    let k: usize = std::env::var("INK_K").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let p: usize = std::env::var("INK_P").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    assert!(k >= 3 && p >= 1, "INK_K >= 3 so the middle draft and the last draft differ; INK_P >= 1");
+    let p0 = p - 1;
+    let t = 1 + k;
+    let ntok = p0 + t;
+    let one = engine::Engine::cs_image_bytes();
+    println!("cs image {one} bytes ({:.2} MiB). The span holds 1+k of these, transient, not one per context token.", one as f64 / 1048576.0);
+    println!("k=3: {} bytes ({:.2} MiB per lane). k=7: {} bytes ({:.2} MiB per lane).", one * 4, (one * 4) as f64 / 1048576.0, one * 8, (one * 8) as f64 / 1048576.0);
+    let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
+    eng.ensure_batch(eng.chunk);
+    let true_tok = |i: usize| ((i * 17 + 3) % 1000) as u32;
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    };
+    let mut ok = true;
+    for (name, n_keep) in [("middle", (k + 1) / 2), ("last", k)] {
+        let reject_at = p0 + n_keep;
+        assert!(n_keep >= 1 && n_keep < t && reject_at < ntok);
+        let draft_tok = |i: usize| if i >= reject_at { ((i * 17 + 9) % 1000) as u32 } else { true_tok(i) };
+        assert_ne!(draft_tok(reject_at), true_tok(reject_at), "the rejected token is not the correction");
+        let fresh = || {
+            let lane = Lane::new(&eng);
+            let run = eng.on(&lane);
+            run.reserve(ntok + 1, false);
+            lane
+        };
+        let lane_r = fresh();
+        eng.on(&lane_r).set_tokens(0, &(0..=reject_at).map(true_tok).collect::<Vec<_>>());
+        let mut ref_logits = Vec::new();
+        let mut hash_pref = 0u64;
+        for pos in 0..=reject_at {
+            step1(&lane_r, pos, pos + 1 == reject_at);
+            if pos + 1 == reject_at {
+                ref_logits = eng.logits().to_vec();
+                hash_pref = eng.lane_hash(&lane_r);
+            }
+        }
+        let hash_ref = eng.lane_hash(&lane_r);
+        let lane = fresh();
+        let run = eng.on(&lane);
+        run.set_tokens(0, &(0..ntok).map(draft_tok).collect::<Vec<_>>());
+        for pos in 0..p0 { step1(&lane, pos, false); }
+        let cs = run.get_cs();
+        step1(&lane, p0, false);
+        run.set_cs(&cs);
+        let cb = eng.gpu.cmd();
+        eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let logits_same = eng.span_logits(n_keep - 1) == ref_logits.as_slice();
+        eng.rollback_verify(&lane, 0, n_keep);
+        let pref_ok = eng.lane_hash(&lane) == hash_pref;
+        run.set_tokens(reject_at, &[true_tok(reject_at)]);
+        step1(&lane, reject_at, false);
+        let corr_ok = eng.lane_hash(&lane) == hash_ref;
+        ok &= pref_ok && corr_ok;
+        println!("case {name} n_keep {n_keep} reject-row logits {} prefix lane_hash {} correction lane_hash {}",
+            if logits_same { "same" } else { "DIFFERENT" },
+            if pref_ok { "same" } else { "DIFFERENT" },
+            if corr_ok { "same" } else { "DIFFERENT" });
+        if logits_same && !(pref_ok && corr_ok) {
+            println!("case {name}: reject-row logits match and lane_hash does not; logits alone do not pass");
+        }
+    }
+    println!("{}", if ok { "rollback lane_hash matches encode_spans of t=1" } else { "ROLLBACK LANE_HASH DIFFERS" });
+    if !ok { std::process::exit(1); }
 }
 
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
@@ -361,6 +503,328 @@ fn lanes(o: &Opts) {
     let ok = ha == ia && hb == ib && ha != hb;
     println!("{}", if ok { "lanes independent: interleaved and poisoned, each lane gives exactly its own logits" } else { "LANES NOT INDEPENDENT" });
     if !ok { std::process::exit(1); }
+}
+
+/// dev, layer 2's gate: N lanes advanced together in steps of several spans must each give exactly what they give alone:
+/// the same logits at every step, the same cache and convolution rows at the end. Lane i reads the --ref tokens rotated by
+/// 17 i; it prefills in prime-sized chunks with one-token chunks among them, then decodes; lanes start staggered, so a step
+/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try.
+/// INK_SPANS_SABOTAGE=1 is the negative control: one span is bound to the next lane's state, and the gate must then
+/// fail; tests/ci.sh runs it and requires that failure, so the gate is known to catch a wrong-lane binding.
+fn spans(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let chunks = [31usize, 1, 23, 7, 17, 1, 29];
+    let ndec: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+    let plen: usize = chunks.iter().sum();
+    let len = plen + ndec;
+    let work: Vec<(usize, usize)> = { let mut w = Vec::new(); let mut p = 0; for &c in &chunks { w.push((p, c)); p += c; } for q in plen..len { w.push((q, 1)); } w };
+    let stream = |i: usize| -> Vec<u32> { let mut v = base.clone(); v.rotate_left((17 * i) % base.len()); v.truncate(len + 1); v };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let sabotage = std::env::var("INK_SPANS_SABOTAGE").is_ok();
+    let nmax = *counts.iter().max().unwrap();
+    // each lane alone: one span per step
+    let mut alone: Vec<(Vec<u64>, u64)> = Vec::new();
+    for i in 0..nmax {
+        let l = fresh(i);
+        let mut hs = Vec::new();
+        for &(p0, t) in &work {
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); cb.waitUntilCompleted();
+            hs.push(fnv(eng.logits()));
+        }
+        alone.push((hs, eng.lane_hash(&l)));
+    }
+    let mut ok = true;
+    for &n in &counts {
+        let mut sabotaged = false;
+        let lanes: Vec<Lane> = (0..n).map(fresh).collect();
+        let delay = |i: usize| i % 3;                       // lane i starts i % 3 steps late
+        let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let steps = work.len() + 2;
+        let (mut nsteps, mut mixed) = (0, 0);
+        for s in 0..steps {
+            let mut sp = Vec::new(); let mut who = Vec::new();
+            for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
+            if sp.is_empty() { continue; }
+            if sabotage && !sabotaged && sp.len() >= 2 {
+                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
+                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
+                sp[0].lane = &lanes[who[1]];
+                sabotaged = true;
+            }
+            if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
+            nsteps += 1;
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
+            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
+        }
+        let mut bad = Vec::new();
+        for i in 0..n {
+            let step = hs[i].iter().zip(&alone[i].0).position(|(a, b)| a != b);
+            let cache = eng.lane_hash(&lanes[i]) != alone[i].1;
+            if step.is_some() || cache { bad.push(format!("lane {i}: {}{}", step.map_or(String::new(), |s| format!("logits differ from step {s} ({:?}) ", work[s])), if cache { "cache or state differs" } else { "" })); }
+        }
+        println!("{n:4} lanes, {nsteps} steps ({mixed} mixing prefill and decode spans): {}", if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER, first: {}", bad.len(), bad[0]) });
+        ok &= bad.is_empty();
+    }
+    println!("{}", if ok { "spans invariant: every lane, in every batch, gives exactly what it gives alone" } else { "SPANS NOT INVARIANT" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
+/// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
+/// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
+/// same logits at every shared boundary and decode step, and the same cache and convolution rows at the end,
+/// with the scratch poisoned before every step. Two tails share the one head. The copy must not move the
+/// source. INK_XCOPY_SABOTAGE=1 is the reversed witness: it copies one head token too few while the tail
+/// still starts at the head's end, and the gate must then fail (tests/ci.sh requires that failure).
+fn xcopy(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(2);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let (head, tail, ndec) = (384usize, 256usize, 8usize);
+    assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
+    let mut rot = base.clone(); rot.rotate_left(997);
+    let stream = |which: usize| -> Vec<u32> { let mut v: Vec<u32> = base[..head].to_vec(); v.extend_from_slice(if which == 0 { &base[head..head + tail + ndec] } else { &rot[head..head + tail + ndec] }); v };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let sabotage = std::env::var("INK_XCOPY_SABOTAGE").is_ok();
+    let step = |lane: &Lane, p0: usize, t: usize, dec: bool| -> u64 {
+        eng.poison_scratch();
+        let cb = eng.gpu.cmd();
+        if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
+        cb.commit(); cb.waitUntilCompleted();
+        fnv(if dec { eng.span_logits(0) } else { eng.logits() })
+    };
+    let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
+        let mut hs = Vec::new(); let mut p = from;
+        for &t in chunks { hs.push((p + t, step(lane, p, t, false))); p += t; }
+        let mut ds = Vec::new();
+        if decode { for q in 0..ndec { ds.push(step(lane, head + tail + q, 1, true)); } }
+        (hs, ds)
+    };
+    // cold: head and tail prefilled on one lane, split at 101, 384 and 640
+    let cold = |which: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(which));
+                                let out = run_stream(&l, &[101, 283, 256], 0, true); (l, out) };
+    // the source: the shared head alone, split at 101 and 384; its state at the head's end is kept
+    let src = Lane::new(&eng);
+    { let r = eng.on(&src); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(0)[..head]); run_stream(&src, &[101, 283], 0, false); }
+    let cs_head = eng.on(&src).get_cs();
+    let src_before = eng.lane_hash(&src);
+    let mut ok = true;
+    for which in 0..2 {
+        let (cl, (chs, cds)) = cold(which);
+        let l = Lane::new(&eng); let r = eng.on(&l);
+        r.reset(); r.reserve(head + tail + ndec + 1, false);
+        eng.copy_lane_prefix(&src, &l, if sabotage { head - 1 } else { head });
+        r.set_cs(&cs_head); r.set_tokens(0, &stream(which));
+        let (hs, ds) = run_stream(&l, &[63, 193], head, true);
+        let at = |v: &[(usize, u64)], p: usize| v.iter().find(|(q, _)| *q == p).map(|(_, h)| *h);
+        let same = at(&hs, head + tail) == at(&chs, head + tail) && ds == cds && eng.lane_hash(&l) == eng.lane_hash(&cl);
+        println!("tail {}: copied head {} + tail {} {} cold (logits at {}, decode steps, final state)", which, head, tail, if same { "matches" } else { "DIFFERS from" }, head + tail);
+        ok &= same;
+    }
+    if eng.lane_hash(&src) != src_before { println!("the copy moved the source lane"); ok = false; }
+    if sabotage { println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head); }
+    println!("{}", if ok { "xcopy lossless: two tails from one copied head match cold prefill bit for bit" } else { "XCOPY NOT LOSSLESS" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, layer 2's performance gate: decode steps over N lanes at a given context. Each context is prefilled once (the
+/// --ref tokens repeated) and copied into every lane; lane i then decodes its own stream (the --ref tokens rotated by
+/// 97 i), so routing differs across lanes as it would in use. INK_CTXS and INK_LANES list what to measure.
+fn lanebench(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let ctxs: Vec<usize> = std::env::var("INK_CTXS").unwrap_or("2048,20480".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,8,16,32,64".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let steps: usize = std::env::var("INK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    println!("{:>6} {:>5} {:>9} {:>10} {:>9} {:>10}", "ctx", "lanes", "ms/step", "total t/s", "per lane", "GPU GiB");
+    for &c in &ctxs {
+        let len = c + steps + 1;
+        let toks: Vec<u32> = (0..len).map(|i| base[i % base.len()]).collect();
+        let src = Lane::new(&eng);
+        { let r = eng.on(&src); r.reserve(len, false); r.set_tokens(0, &toks);
+          let mut p = 0; while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; } }
+        // the baseline: one stream on the single-stream decode path at this context
+        {
+            let r = eng.on(&src);
+            let tok = |q: usize| { let cb = eng.gpu.cmd(); r.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+            tok(0);
+            let t0 = std::time::Instant::now();
+            for q in 0..steps { tok(q); }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+            println!("{c:>6} {:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}  (one stream, decode path)", 1, 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+            // (the decode path advanced src's state by `steps` tokens: harmless here, this measures time only)
+        }
+        let nmax = *counts.iter().max().unwrap();
+        let lanes: Vec<Lane> = (0..nmax).map(|i| {
+            let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false);
+            let mut t = toks.clone();
+            for q in 0..=steps { t[c + q] = base[(97 * i + q) % base.len()]; }
+            r.set_tokens(0, &t); eng.copy_lane(&src, &l); l
+        }).collect();
+        eng.ensure_dbatch(nmax);
+        for &n in &counts {
+            // a warm-up step, then the timed steps: lanes decode positions c, c + 1, ... (the context grows by `steps` at most)
+            let step = |q: usize| { let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                                    let cb = eng.gpu.cmd(); if std::env::var("INK_SPANS_DEC").is_ok() { eng.encode_spans(&cb, &sp, true, false) } else { eng.encode_decode(&cb, &sp, true, false) }; cb.commit(); cb.waitUntilCompleted(); };
+            step(0);
+            let t0 = std::time::Instant::now();
+            for q in 0..steps { step(q); }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+            println!("{c:>6} {n:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}", n as f64 * 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+        }
+    }
+    let (_, ws) = eng.gpu_mem();
+    println!("recommended GPU working set: {:.1} GiB", gib(ws));
+}
+
+/// dev, the batched decode gate: N lanes on different streams (the --ref tokens rotated by 97 i), each prefilled to
+/// INK_PF tokens, then INK_DECODE decode steps, twice: each lane alone through the single-stream decode path, and all
+/// lanes together through `encode_dbatch`. Every lane's logits at every step and its final cache and convolution rows
+/// must be bit-identical; the time per step of both is printed. INK_LANES lists the lane counts.
+/// lanes the decode-batch gate can use
+const MAX_SPANS_DB: usize = 128;
+fn dbatch(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(MAX_SPANS_DB);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,8".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let len = pf + nd + 1;
+    let stream = |i: usize| -> Vec<u32> { (0..len).map(|q| base[(97 * i + q) % base.len()]).collect() };
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let prefilled = |i: usize| -> Lane {
+        let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false); r.set_tokens(0, &stream(i));
+        let mut p = 0; while p < pf { let t = (pf - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
+        l
+    };
+    let nmax = *counts.iter().max().unwrap();
+    // INK_DB_OLD: the decode-path batch (encode_dbatch) against the single-stream decode path; otherwise decode steps
+    // (encode_decode) of N lanes against each lane's decode steps alone
+    let old = std::env::var("INK_DB_OLD").is_ok();
+    // dev: INK_DB_PROF=1 times the batch with each kernel class skipped in turn (results then differ; timing only)
+    if std::env::var("INK_DB_PROF").is_ok() {
+        for &n in &counts {
+            let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
+            eng.ensure_dbatch(n);
+            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf)).collect();
+            let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect();
+            let time = |skip: u32| { eng.skip.set(skip); let mut best = f64::MAX; for _ in 0..3 { let cb = eng.gpu.cmd(); if old { eng.encode_dbatch(&cb, &b, true); } else { eng.encode_decode(&cb, &sp, true, false); } cb.commit(); cb.waitUntilCompleted();
+                best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3); } eng.skip.set(0); best };
+            let full = time(0);
+            println!("{n} lanes: {full:.1} ms GPU per step");
+            for (c, name) in engine::CLS_NAMES.iter().enumerate() { let d = full - time(1 << c); if d > 0.5 { println!("  {name:>11}: {d:7.1} ms ({:4.1}%)", d / full * 100.0); } }
+        }
+        return;
+    }
+    // alone, through the decode path
+    let mut alone = Vec::new();
+    let mut t_alone = 0.0;
+    for i in 0..nmax {
+        let l = prefilled(i); let r = eng.on(&l);
+        let mut hs = Vec::new();
+        let t0 = std::time::Instant::now();
+        for q in 0..nd {
+            let cb = eng.gpu.cmd();
+            if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
+            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(if old { eng.logits() } else { eng.span_logits(0) }));
+        }
+        t_alone += t0.elapsed().as_secs_f64();
+        alone.push((hs, eng.lane_hash(&l)));
+    }
+    let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
+    println!("alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s", if old { "decode path" } else { "decode steps of one lane" }, 1e3 / ms_alone);
+    let mut ok = true;
+    for &n in &counts {
+        let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
+        eng.ensure_dbatch(n);
+        let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let t0 = std::time::Instant::now();
+        for q in 0..nd {
+            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            let cb = eng.gpu.cmd();
+            if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
+            cb.commit(); cb.waitUntilCompleted();
+            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
+        let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
+        println!("{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}", n as f64 * 1e3 / ms, 1e3 / ms,
+                 if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) });
+        ok &= bad.is_empty();
+    }
+    println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
+    if !ok { std::process::exit(1); }
+}
+
+/// dev, the max-context eval: one lane prefills the --file text (real code) to the engine's limit, timing each stretch of
+/// prefill; at each checkpoint (INK_CKPTS) one stream decodes on the decode path, then as many lanes as fit a budget of
+/// INK_LANE_GIB GiB (copies of the prefilled cache, each decoding its own tokens) decode together. Timing only.
+fn maxctx(o: &Opts) {
+    use engine::Span;
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(64);
+    let tk = Tokenizer::load(&eng.g);
+    let mut toks = tk.encode(&o.prompt, false);
+    let steps = 8usize;
+    let ckpts: Vec<usize> = std::env::var("INK_CKPTS").unwrap_or("16384,65536,131072,262000".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let last = *ckpts.iter().max().unwrap();
+    assert!(last + steps + 1 <= eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
+    toks.truncate(last + steps + 1);
+    // lane memory: what Metal's working set leaves after everything allocated so far, less the tuning's margin
+    let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64).unwrap_or_else(|| {
+        let (alloc, ws) = eng.gpu_mem();
+        let (chip, mem) = tuning::this_machine();
+        let margin = tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64;
+        (ws as f64 - alloc as f64 - margin - 9.0 * (1u64 << 30) as f64).max(1.0)      // (9 GiB: the source lane at the longest context)
+    });
+    println!("lane budget {:.1} GiB", budget / (1u64 << 30) as f64);
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    let src = Lane::new(&eng);
+    let rs = eng.on(&src);
+    rs.reserve(last + steps + 1, false);
+    rs.set_tokens(0, &toks);
+    println!("{} tokens of text; KV per lane at {}: {:.1} GiB", toks.len(), last, gib(rs.kv_exact_bytes(last + steps + 1)));
+    println!("{:>7} {:>13} {:>11} {:>14} {:>6} {:>11} {:>9} {:>8}", "ctx", "prefill t/s", "TTFT s", "1 stream t/s", "lanes", "lanes t/s", "gain", "GPU GiB");
+    let (mut p, mut tpf) = (0usize, 0.0f64);
+    for &c in &ckpts {
+        let t0 = std::time::Instant::now();
+        let p_start = p;
+        while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
+        let dt = t0.elapsed().as_secs_f64(); tpf += dt;
+        let pf_rate = (c - p_start) as f64 / dt;
+        // one stream, decode path (timing only: it advances src's state; the prefill above already finished)
+        let tok = |q: usize| { let cb = eng.gpu.cmd(); rs.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        tok(0);
+        let t1 = std::time::Instant::now(); for q in 0..steps { tok(q); }
+        let one = steps as f64 / t1.elapsed().as_secs_f64();
+        // lanes: as many as fit the budget at this context
+        let per = rs.kv_exact_bytes(c + steps + 1) as f64;
+        let n = ((budget / per) as usize).clamp(1, 64);
+        let lanes: Vec<Lane> = (0..n).map(|i| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(c + steps + 1, false);
+            let mut t: Vec<u32> = toks[..=c + steps].to_vec(); for q in 0..=steps { t[c + q] = toks[(c + 7919 * (i + 1) + q) % c]; }
+            r.set_tokens(0, &t); eng.copy_lane_prefix(&src, &l, c); l }).collect();
+        let step = |q: usize| { let sp: Vec<Span> = lanes.iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                                let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        step(0);
+        let t2 = std::time::Instant::now(); for q in 0..steps { step(q); }
+        let lt = (n * steps) as f64 / t2.elapsed().as_secs_f64();
+        println!("{c:>7} {pf_rate:>13.0} {tpf:>11.1} {one:>14.1} {n:>6} {lt:>11.1} {:>8.2}x {:>8.1}", lt / one, gib(eng.gpu_mem().0));
+        drop(lanes);
+    }
 }
 
 fn stats(name: &str, v: &[f32]) {
@@ -530,11 +994,56 @@ fn vcost(o: &Opts) {
 }
 
 fn main() {
+    // inky mode's helper and its install take their own arguments
+    let raw: Vec<String> = std::env::args().collect();
+    match raw.get(1).map(|s| s.as_str()) {
+        Some("memd") => { memd::daemon(&raw[2..]); return; }
+        Some("tune-memory") => { memd::install(&raw[2..]); return; }
+        _ => {}
+    }
+    if !matches!(raw.get(1).map(|s| s.as_str()), None | Some("help") | Some("-h") | Some("--help")) {
+        let (chip, mem) = tuning::this_machine();
+        let t = tuning::select(&chip, mem);
+        let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
+        match memd::enter(&sock) {
+            Some(v) => eprintln!("[inky] inky mode: tuning {}, GPU wired limit {} MB while this runs", t.name, v),
+            None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {})", t.name),
+        }
+    }
+    // `inky serve [-m MODEL] [-c CTX] [--lanes N] [--bind ADDR] [--effort E] [-n MAX]`: the OpenAI endpoint over lanes
+    if raw.get(1).map(|s| s.as_str()) == Some("serve") {
+        let arg = |k: &str| raw.iter().position(|a| a == k).and_then(|i| raw.get(i + 1)).cloned();
+        let home = std::env::var("HOME").unwrap_or_default();
+        serve::serve(serve::ServeOpts {
+            model: arg("-m").unwrap_or(DEFAULT_MODEL.replace('~', &home)),
+            ctx: arg("-c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(65536).div_ceil(64) * 64,
+            bind: arg("--bind").unwrap_or("127.0.0.1:8090".into()),
+            lanes: arg("--lanes").and_then(|v| v.parse().ok()).unwrap_or(16),
+            effort: arg("--effort").unwrap_or("medium".into()),
+            max_tokens: arg("-n").and_then(|v| v.parse().ok()).unwrap_or(16384),
+            key: arg("--key-env").map(|k| std::env::var(&k).unwrap_or_else(|_| { eprintln!("--key-env {k}: not in the environment"); std::process::exit(2) })),
+            queue: arg("--queue").and_then(|v| v.parse().ok()).unwrap_or(64),
+        });
+        return;
+    }
+    // `inky mode [SECONDS]`: enter inky mode (above) and hold it, then leave by exiting
+    if raw.get(1).map(|s| s.as_str()) == Some("mode") {
+        let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return;
+    }
     let (cmd, o) = parse();
     match cmd.as_str() {
         "check" => check(&o),
+        "rows" => rows(&o),
+        "rollback" => rollback(&o),
         "binv" => binv(&o),
         "lanes" => lanes(&o),
+        "spans" => spans(&o),
+        "xcopy" => xcopy(&o),
+        "lanebench" => lanebench(&o),
+        "dbatch" => dbatch(&o),
+        "maxctx" => maxctx(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
         "routes" => routes(&o),

@@ -25,6 +25,8 @@ pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
 /// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
 const KGUARD: usize = 64;
+/// most spans one step can carry (each has a logits row in the batch arena)
+pub const MAX_SPANS: usize = 128;
 /// process-wide default for `Engine::load`: keep only part of the (exact, fp16) K/V cache in memory while generating and
 /// stream the older part from a temporary file on every token (`--kv-disk`)
 pub static KV_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -80,10 +82,10 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_mix", "k_mv", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
+    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -126,6 +128,8 @@ struct DevCopyArgs { src: u32, dst: u32, n: u32, pad: u32 }
 pub struct Prune { bag: Buf, rows: usize, r0: usize, lastbias: f32, use_sum: bool }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CombineArgs { part_off: u32, nsplit: u32, gate_off: u32, out_off: u32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct EpiArgs { out_off: u32, res_off: i32, cs_off: u32, convw_off: u32, n: u32, pad: [u32; 3] }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct MoeArgs {
@@ -180,6 +184,8 @@ struct MoeCombArgs { yd_off: u32, inv_off: u32, sel_off: u32, out_off: u32 }
 struct ConvBArgs { y_off: u32, ldy: u32, res_off: u32, out_off: u32, cs_off: u32, convw_off: u32, has_res: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct StateArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, pad: [u32; 3] }
+#[repr(C)] #[derive(Clone, Copy)]
+struct StateKeepArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, snap_off: u32, stride: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct KvPrepArgs {
     t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, cs_off: u32, q_off: u32,
@@ -195,6 +201,10 @@ struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_of
 /// batch (prefill) arena: per-token activation arrays [T][dim], f32 offsets into the same arena buffer
 #[derive(Clone, Copy, Default, Debug)]
 pub struct BArena {
+    /// logits in `b.lg`: one vocabulary row per span for a prefill (`lg_rows` of them, at most `MAX_SPANS`).
+    /// A verify span uses `1 + k` of those rows, one per position. This is not one row per token.
+    lg: u32,
+    lg_rows: u32,
     vec0: u32, q: u32, gate: u32, k: u32, v: u32, rel: u32, sink: u32, kdyn: u32, vdyn: u32, qp: u32, rp: u32, attn_g: u32,
     inp: [u32; 3], msg: [u32; 4], cin: [u32; 3], fin: u32, finc: u32, ctrlg: [u32; 4],
     cat_u: [u32; 4], cat_m: [u32; 4], gain_o: [u32; 4], forget_o: [u32; 4],
@@ -207,7 +217,7 @@ pub struct BArena {
 impl BArena {
     /// offsets for a batch of up to `t` tokens. `lean`: the fp16 path, which never touches the f32 intermediates of the
     /// fallback kernels and keeps q / gate / the per-assignment outputs as half.
-    fn new(start: u32, t: usize, lean: bool, kvb: usize) -> BArena {
+    fn new(start: u32, t: usize, lean: bool, kvb: usize, vocab_pad: usize) -> BArena {
         let mut o = start;
         let mut take = |n: usize| { let r = o; o += ((n + 63) / 64 * 64) as u32; r };
         let fb = |n: usize| if lean { 0 } else { n };      // only the fallback paths use it
@@ -234,6 +244,9 @@ impl BArena {
         b.ind = take(64); b.aw = take(t * TOPK); b.fh = take(t * E / 2);
         // sliding-window K/V scratch of the batch: [guard | window history | batch keys | guard] per group, half
         b.sk = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4); b.sv = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
+        // Not `t` rows. At chunk 4096 that would be 32× this buffer (128 rows today). A verify span reuses them.
+        b.lg_rows = t.min(MAX_SPANS) as u32;
+        b.lg = take(b.lg_rows as usize * vocab_pad);
         b.perm = take(t * TOPK); b.inv = take(t * TOPK); b.tiles = take(fb((t * TOPK / 32 + NEXP + 1) * 4)); b.ntiles = take(64);
         b.act = take(fb(t * TOPK * FF)); b.yd = take(hf(t * TOPK * E));
         b.end = o;
@@ -328,9 +341,18 @@ impl Arena {
         Arena { q, gate, k, v, rel, sink, kdyn, vdyn, attn_g, inp, msg, cin, ctrlg, ssp, cat, fin, finc, fout, rlog, sel, sel_log, act, part, logits, amax, total: o }
     }
     pub fn vec(i: usize) -> u32 { (i * E) as u32 }
+    /// the same layout starting `b` floats further into the activation buffer (a lane's own copy in a decode batch)
+    fn shift(&self, b: u32) -> Arena {
+        let mut a = *self;
+        for f in [&mut a.q, &mut a.gate, &mut a.k, &mut a.v, &mut a.rel, &mut a.sink, &mut a.kdyn, &mut a.vdyn, &mut a.attn_g, &mut a.fin, &mut a.finc,
+                  &mut a.fout, &mut a.rlog, &mut a.sel, &mut a.sel_log, &mut a.act, &mut a.part, &mut a.logits, &mut a.amax] { *f += b; }
+        for f in a.inp.iter_mut().chain(a.msg.iter_mut()).chain(a.cin.iter_mut()).chain(a.ctrlg.iter_mut()).chain(a.ssp.iter_mut()).chain(a.cat.iter_mut()) { *f += b; }
+        a
+    }
 }
 
 // round-robin vector allocator that never hands out a live vector
+#[derive(Clone)]
 struct VecAlloc { next: usize, n: usize }
 impl VecAlloc {
     fn alloc(&mut self, live: &[usize]) -> usize {
@@ -357,6 +379,10 @@ pub struct Engine {
     loops: Vec<LoopW>,
     tok_embd: QW, tok_norm: u32, output: QW, output_norm: u32, output_res_query: u32,
     pub ar: Arena,
+    /// where the decode path's arena starts in the activation buffer: 0, or a lane's copy during a decode batch
+    abase: Cell<u32>,
+    /// first float of the decode batch's lane arenas (see `ensure_dbatch`)
+    dstart: Cell<u32>,
     pub kv8: bool, kvb: usize, ba: std::cell::Cell<BArena>, pub chunk: usize, pub tensor: bool, pub hgemm: bool, sep_comb: bool, sep_topk: bool,
     /// last-layer tail mode of the prefill (dev tools switch it off to profile full layers)
     pub tail: std::cell::Cell<bool>,
@@ -365,6 +391,11 @@ pub struct Engine {
     pub max_ctx: usize,
     pub n_vocab: usize,
     eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
+    /// Convolution images for the verify span in flight, one per position, plus the K/V bytes that span overwrote.
+    /// Not `cs_at_prompt`: a rejected tail must not become the next turn's resume point.
+    verify_keep: RefCell<Option<VerifyKeep>>,
+    /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
+    verify_record: Cell<bool>,
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
@@ -386,6 +417,28 @@ pub struct Lane {
 #[derive(Clone, Copy)]
 pub struct Run<'a> { pub eng: &'a Engine, pub lane: &'a Lane }
 impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Engine { self.eng } }
+
+/// One lane's part of a step: positions [p0, p0 + t) of that lane.
+#[derive(Clone, Copy)]
+pub struct Span<'a> { pub lane: &'a Lane, pub p0: usize, pub t: usize }
+
+/// K/V rows one verify position overwrote, copied before the span ran.
+#[derive(Clone)]
+struct KvUndo { pos: usize, rows: Vec<u8> }
+struct VerifySpan {
+    lane: *const Lane,
+    p0: usize,
+    kv: Vec<KvUndo>,
+    /// `p0 + n_keep` after rollback. Absent until then. Not a seal of the span's end, and not `cs_at_prompt`.
+    accepted_end: Option<usize>,
+}
+struct VerifyKeep {
+    /// `spans * (1+k)` convolution images, span-major, each `cs`'s layout. Transient.
+    cs: Buf,
+    stride: usize,
+    t: usize,
+    spans: Vec<VerifySpan>,
+}
 
 static LANE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -425,6 +478,69 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 }
 
 impl Engine {
+    /// the vocabulary as the arena stores it (rounded up to 64)
+    fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
+    pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
+    /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
+    pub fn lane_hash(&self, lane: &Lane) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut eat = |b: &Buf| { let p = b.contents().as_ptr() as *const u64; for i in 0..b.length() / 8 { h = (h ^ unsafe { *p.add(i) }).wrapping_mul(0x100000001b3); } };
+        eat(&lane.kv_swa.borrow()); eat(&lane.kv_full.borrow()); eat(&lane.cs);
+        h
+    }
+    /// dev: make `dst` a copy of `src` (cache and convolution rows); `dst` must have been reserved to the same capacity
+    pub fn copy_lane(&self, src: &Lane, dst: &Lane) {
+        let cp = |a: &Buf, b: &Buf| { assert_eq!(a.length(), b.length()); unsafe { std::ptr::copy_nonoverlapping(a.contents().as_ptr() as *const u8, b.contents().as_ptr() as *mut u8, a.length()); } };
+        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow()); cp(&src.cs, &dst.cs);
+    }
+    /// dev: make `dst` hold `src`'s first `n` positions (cache rows of every slot, convolution rows); the two may have
+    /// different capacities
+    pub fn copy_lane_prefix(&self, src: &Lane, dst: &Lane, n: usize) {
+        for (sb, db, sc, dc, nk) in [(&src.kv_swa, &dst.kv_swa, src.swa_cap.get(), dst.swa_cap.get(), n.min(EXT)), (&src.kv_full, &dst.kv_full, src.full_cap.get(), dst.full_cap.get(), n)] {
+            assert!(nk <= sc && nk <= dc);
+            let (sp, dp) = (sb.borrow().contents().as_ptr() as *const u8, db.borrow().contents().as_ptr() as *mut u8);
+            let rows = sb.borrow().length() / (sc * HD * self.kvb);
+            assert_eq!(rows, db.borrow().length() / (dc * HD * self.kvb));
+            for r in 0..rows { unsafe { std::ptr::copy_nonoverlapping(sp.add(r * sc * HD * self.kvb), dp.add(r * dc * HD * self.kvb), nk * HD * self.kvb); } }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.cs.contents().as_ptr() as *const u8, dst.cs.contents().as_ptr() as *mut u8, src.cs.length()); }
+    }
+    /// GPU memory the device has allocated (bytes) and the working set it recommends
+    pub fn gpu_mem(&self) -> (usize, usize) {
+        use objc2_metal::MTLDevice;
+        (self.gpu.dev.currentAllocatedSize(), self.gpu.dev.recommendedMaxWorkingSetSize() as usize)
+    }
+    /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
+    /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
+    /// (span `s`, position `r`, at `s * (1 + k) + r`).
+    pub fn span_logits(&self, i: usize) -> &[f32] {
+        let b = self.ba.get();
+        assert!(i < b.lg_rows as usize, "span_logits: row {i} but b.lg has {} rows", b.lg_rows);
+        let off = b.lg as usize + i * self.vocab_pad();
+        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
+    }
+    /// the decode path's arena at the current base
+    fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
+    /// offset of residual vector `i` of the decode path at the current base
+    fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) as u32 }
+    /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, after everything else in the activation
+    /// buffer. Call after `ensure_batch` (a later batch arena may overlap it). Nothing may be in flight on the GPU.
+    pub fn ensure_dbatch(&self, n: usize) {
+        let start = (self.ar.total).max(self.ba.get().end);
+        let need = (start as usize + n * self.ar.total as usize) * 4;
+        self.dstart.set(start);
+        if self.act.borrow().length() < need {
+            let nb = self.gpu.buffer(need);
+            unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.act.borrow().length()); }
+            *self.act.borrow_mut() = nb;
+        }
+    }
+    /// the logits lane `j` of the last decode batch produced
+    pub fn dbatch_logits(&self, j: usize) -> &[f32] {
+        let off = (self.dstart.get() + j as u32 * self.ar.total + self.ar.logits) as usize;
+        unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
+    }
     /// the engine working on `lane`
     pub fn on<'a>(&'a self, lane: &'a Lane) -> Run<'a> { Run { eng: self, lane } }
     pub fn load(path: &str, max_ctx: usize) -> Engine { Engine::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed)) }
@@ -546,13 +662,14 @@ impl Engine {
             softcap: g.f(&a("final_logit_softcapping")) as f32,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
             slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
-            ar, kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
+            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
             tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
+            verify_keep: RefCell::new(None), verify_record: Cell::new(false),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -570,7 +687,7 @@ impl Engine {
     pub fn ensure_batch(&self, t: usize) {
         let t = t.div_ceil(64) * 64;
         if t <= self.ba.get().cap { return; }
-        let nb = BArena::new(self.ar.total, t, self.hgemm, self.kvb);
+        let nb = BArena::new(self.ar.total, t, self.hgemm, self.kvb, self.vocab_pad());
         self.realloc_act(nb.end as usize * 4);
         self.ba.set(nb);
     }
@@ -989,6 +1106,10 @@ impl Engine {
             .unwrap_or((0usize, usize::MAX));
         for i in lo..hi.min(a.length() / 4) { unsafe { *p.add(i) = 0x7fc0_7fc0; } }
     }
+    /// bind a lane's cache (sliding-window buffer), convolution rows and tokens
+    fn bind_lane(&self, e: &Enc, lane: &Lane) {
+        e.buf(&lane.kv_swa.borrow(), 0, 3); e.buf(&lane.cs, 0, 4); e.buf(&lane.toks, 0, 6);
+    }
     /// bind the engine's buffers: weights, parameters, scratch arenas, counters
     fn bind_eng(&self, e: &Enc) {
         e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.ctr, 0, 7);
@@ -1003,6 +1124,13 @@ impl Engine {
         Seg { w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, in_off, in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0, out_off, ..Default::default() }
     }
     #[inline]
+    /// `go` without the barrier: for dispatches that do not depend on each other (one per lane), followed by one barrier
+    fn go_nb<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
+        if self.skip.get() & (1 << cls) != 0 { return; }
+        e.pso(&self.gpu.pso(pso));
+        e.bytes(args, 5);
+        e.dispatch(grid, tg);
+    }
     fn go<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
         if self.skip.get() & (1 << cls) != 0 { return; }
         e.pso(&self.gpu.pso(pso));
@@ -1020,6 +1148,18 @@ impl Engine {
             tg += s.nrows.div_ceil(8);
         }
         self.go(e, cls, "k_mv", &a, (tg as usize, 1, 1), 128);
+    }
+    /// k_mv for the `n` lanes of a decode batch (segments at lane 0's offsets; lane j's are `j * ar.total` further)
+    fn mvb(&self, e: &Enc, cls: u32, segs: &[Seg], post: MvArgs, n: usize) {
+        if self.skip.get() & (1 << cls) != 0 { return; }
+        let mut a = MvArgs { nseg: segs.len() as u32, eps: self.eps, ..post };
+        let mut tg = 0u32;
+        for (i, s) in segs.iter().enumerate() { assert!(s.epi == 0); a.seg[i] = *s; a.seg[i].tg_start = tg; tg += s.nrows.div_ceil(8); }
+        e.pso(&self.gpu.pso("k_mvb"));
+        e.bytes(&a, 5);
+        e.bytes(&[n as u32, self.ar.total], 8);
+        e.dispatch((tg as usize, 1, 1), 128);
+        e.barrier();
     }
     /// decode: one token, the decode arena's layout
     fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_impl(e, cls, jobs, 1, false); }
@@ -1046,7 +1186,7 @@ impl Engine {
         e.barrier();
     }
     fn mix_job(&self, states: &[usize], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32]) -> MixJob {
-        let offs: Vec<u32> = states.iter().map(|&s| Arena::vec(s)).collect();
+        let offs: Vec<u32> = states.iter().map(|&s| self.v(s)).collect();
         self.mix_job_off(&offs, q_off, n_q, outs, norms, 0)
     }
     fn mix_job_off(&self, states: &[u32], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32], tstride: u32) -> MixJob {
@@ -1063,7 +1203,7 @@ impl Engine {
     /// decode loop controllers: g = D.cat[j] (bf16 matvec on the mix kernel's normalized copies), then gain/forget apply
     /// with the RMSNorm fused into the last threadgroup of each controller
     fn ctrl_dec(&self, e: &Enc, jobs: &[CtrlJob]) {
-        let ar = self.ar;
+        let ar = self.ar_at();
         let segs: Vec<Seg> = jobs.iter().map(|j| {
             let c = ar.ctrlg.iter().position(|&o| o == j.out_off).unwrap();
             Self::seg_pb(j.d_off, 64, (2 * E) as u32, ar.cat[c], j.out_off)
@@ -1150,6 +1290,776 @@ impl Engine {
     fn gseg(w: &QW, in_off: u32, out_off: u32) -> GSeg {
         GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
                in_off, out_off, ldo: w.rows, ..Default::default() }
+    }
+
+
+    /// Encode one decode step for each of `lanes` (lane, position of the token it decodes) in one command buffer, through
+    /// the decode path: every lane runs today's single-stream kernels on its own copy of the decode arena with its own
+    /// buffers bound, layer by layer, so each lane's numbers are exactly what it gets decoding alone. Logits for each lane
+    /// land in its arena (`dbatch_logits`). Needs `ensure_dbatch(lanes.len())`; no disk tier, no pruning.
+    /// This is the decode-path reference the `dbatch` harness checks (`INK_DB_OLD`), not the serving path:
+    /// `inky serve` decodes through `encode_decode`.
+    pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
+        let n = lanes.len();
+        let (start, tot) = (self.dstart.get(), self.ar.total);
+        assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
+                "decode batch arenas: call ensure_dbatch() after ensure_batch()");
+        for (l, pos) in lanes { assert!(l.tier.is_none() && l.prune.borrow().is_none() && *pos < self.on(l).kv_capacity(), "K/V capacity: call reserve() first"); }
+        let base = |j: usize| start + j as u32 * tot;
+        let mut cx = Cx { e: Enc::new(cb), cb: None };
+        self.bind_eng(&cx.e);
+        for (j, (l, pos)) in lanes.iter().enumerate() {
+            self.abase.set(base(j));
+            self.bind_lane(&cx.e, l);
+            let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
+                                 norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: *pos as u32, eps: self.eps };
+            self.go(&cx.e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
+        }
+        // the residual bookkeeping is the same for every lane: run it once per layer, and every lane's layer from it
+        let (mut cur, mut blocks, mut va, mut exec) = (0usize, Vec::<usize>::new(), VecAlloc { next: 1, n: N_VEC }, 0usize);
+        let stage_a = std::env::var("INK_DBATCH_A").is_ok();
+        let mut layer_all = |cx: &mut Cx, cur: &mut usize, blocks: &mut Vec<usize>, va: &mut VecAlloc, slot: usize, ip: usize, msg: Option<(usize, usize)>, pinned: &[usize]| {
+            if !stage_a {
+                *cur = self.layer_db(&cx.e, lanes, start, exec, slot, ip, *cur, blocks, msg, va, pinned);
+                exec += 1;
+                return;
+            }
+            let mut after = None;
+            for (j, (l, pos)) in lanes.iter().enumerate() {
+                self.abase.set(base(j));
+                self.bind_lane(&cx.e, l);
+                self.done.set(exec);
+                let (mut b2, mut v2) = (blocks.clone(), va.clone());
+                let c2 = self.on(l).layer(cx, *pos, slot, ip, *cur, &mut b2, msg, &mut v2, pinned);
+                after = Some((c2, b2, v2));
+            }
+            let (c2, b2, v2) = after.unwrap();
+            *cur = c2; *blocks = b2; *va = v2; exec += 1;
+        };
+        for ip in 0..LOOP_START { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        let prelude = cur;
+        let prelude_blocks = blocks.clone();
+        let mut bank = (0usize, 0usize);
+        for pass in 0..N_PASS {
+            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            let msg = if pass > 0 { Some(bank) } else { None };
+            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            for ip in LOOP_START..LOOP_END { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, slot_of(pass, ip), ip, msg, &pinned); }
+            bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
+        }
+        for ip in LOOP_END..N_PHYS { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        if logits {
+            self.abase.set(base(0));
+            let ar = self.ar_at();
+            let mut st = blocks.clone(); st.push(cur);
+            let mut jb = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
+            jb.tstride = tot;
+            self.mix_impl(&cx.e, C_OMIX, &[jb], n, false);
+            self.mvb(&cx.e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)], MvArgs::default(), n);
+        }
+        self.abase.set(0);
+        cx.e.end();
+    }
+
+    /// One layer execution of a decode batch: the decode path's layer for every lane, with the row-wise work (mixes,
+    /// projections, output projection, router) run once over all lanes and the rest per lane. Each lane's arithmetic is
+    /// the decode path's, so its numbers are exactly what it gets decoding alone.
+    #[allow(clippy::too_many_arguments)]
+    fn layer_db(&self, e: &Enc, lanes: &[(&Lane, usize)], start: u32, exec: usize, slot: usize, ip: usize, cur: usize,
+                blocks: &mut Vec<usize>, msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
+        let n = lanes.len();
+        let tot = self.ar.total;
+        let at = |j: usize| self.abase.set(start + j as u32 * tot);
+        let l = &self.layers[ip];
+        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
+        let cs_slot = (slot * NCH * 3) as u32;
+        let ts = |mut j: MixJob| { j.tstride = tot; j };
+        at(0);
+        let ar = self.ar_at();
+        // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
+        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
+        let mut st = blocks.clone(); st.push(cur);
+        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
+        let xin: [u32; 3];
+        if let Some(lw) = ctl {
+            let (b0, b1) = msg.unwrap();
+            let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
+            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
+            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
+            let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
+            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
+            self.mix_impl(e, C_MIXA, &[ts(ja), ts(jm)], n, false);
+            for jl in 0..n {
+                at(jl);
+                let ar = self.ar_at();
+                let mut cj = Vec::new();
+                for j in 0..3 {
+                    let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
+                    cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
+                                      forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
+                }
+                self.ctrl_dec(e, &cj);
+            }
+            at(0);
+            xin = ar.cin;
+        } else {
+            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
+            self.mix_impl(e, C_MIXA, &[ts(self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn))], n, false);
+            xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
+        }
+        // ---- fused projections, once for every lane
+        let mut segs = vec![Engine::seg(&l.wq, xin[0], ar.q), Engine::seg(&l.wgate, xin[0], ar.gate), Engine::seg(&l.wrel, xin[0], ar.rel),
+                            Engine::seg(&l.wsink, xin[0], ar.sink), Engine::seg(&l.wk, xin[1], ar.k), Engine::seg(&l.wv, xin[2], ar.v)];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::seg(kp, xin[1], ar.kdyn)); segs.push(Engine::seg(vp, xin[2], ar.vdyn)); }
+        self.mvb(e, C_QKV, &segs, MvArgs::default(), n);
+        // ---- attention (split-K, fused K/V conv and cache write) per lane, on the lane's cache and state
+        for (jl, (lane, pos)) in lanes.iter().enumerate() {
+            at(jl);
+            let ar = self.ar_at();
+            let run = self.on(lane);
+            self.bind_lane(e, lane);
+            let pos = *pos;
+            let (kb, vb, kcap) = run.kv_slot(slot);
+            let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+            let base = AttnArgs {
+                pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
+                q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
+                kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
+                kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
+                ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
+            };
+            run.bind_kv(e, l.swa);
+            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
+            let kps = Run::split_kps(nkeys);
+            let nsplit = nkeys.div_ceil(kps);
+            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                                pad: self.sep_comb as u32, ..base };
+            self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+            if self.sep_comb {
+                let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
+                self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
+            }
+        }
+        at(0);
+        // ---- output projection once for every lane, then each lane's post-conv (+ residual) on its own state
+        let block_start = ip % BLOCK == 0;
+        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mid = va.alloc(&live);
+        self.mvb(e, C_WO, &[Engine::seg(&l.wo, ar.attn_g, self.v(mid))], MvArgs::default(), n);
+        for (jl, (lane, _)) in lanes.iter().enumerate() {
+            at(jl);
+            self.bind_lane(e, lane);
+            let ea = EpiArgs { out_off: self.v(mid), res_off: if block_start { -1 } else { self.v(cur) as i32 }, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                               convw_off: l.attn_post_conv, n: E as u32, pad: [0; 3] };
+            self.go(e, C_WO, "k_epi", &ea, (E.div_ceil(256), 1, 1), 256);
+        }
+        at(0);
+        if block_start { blocks.push(cur); }
+        // ---- FFN input: depth mix (+ control) -> normalized
+        let mut st = blocks.clone(); st.push(mid);
+        let x_off = if let Some(lw) = ctl {
+            let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
+            jf.ncopy[0][0] = ar.cat[3] as i32;
+            self.mix_impl(e, C_MIXF, &[ts(jf)], n, false);
+            for jl in 0..n {
+                at(jl);
+                let ar = self.ar_at();
+                self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
+                                             forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
+            }
+            at(0);
+            ar.finc
+        } else {
+            self.mix_impl(e, C_MIXF, &[ts(self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32]))], n, false);
+            ar.fin
+        };
+        // ---- router with fused top-k, once for every lane
+        assert!(!self.sep_topk);
+        let sel = ar.sel_log + (exec * 16) as u32;
+        let rpost = MvArgs { post: 1, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        self.mvb(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost, n);
+        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let out = va.alloc(&live);
+        // ---- experts per lane (the down projection's epilogue updates the lane's state)
+        for (jl, (lane, _)) in lanes.iter().enumerate() {
+            at(jl);
+            let ar = self.ar_at();
+            self.bind_lane(e, lane);
+            let sel = ar.sel_log + (exec * 16) as u32;
+            let x = if ctl.is_some() { ar.finc } else { ar.fin };
+            let ma = MoeArgs {
+                logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off: x,
+                norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
+                gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
+                act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
+                dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                convw_off: l.ffn_post_conv, pad: [0; 3],
+            };
+            self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
+            self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
+        }
+        at(0);
+        out
+    }
+
+    /// Encode one step over `spans`, each lane's positions [p0, p0 + t), as one batch: row-wise work (mixes, controllers,
+    /// projections, router, experts) runs once over every span's rows; what couples a row to its lane (embedding, K/V
+    /// preparation and cache writes, attention, the convolutions and their state) runs span by span with that lane's
+    /// buffers bound. Optionally computes each span's logits (and argmax, written to the lane's tokens) for its last row:
+    /// in the decode arena for a single span (`logits()`), in the batch arena for several (`span_logits`).
+    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None); }
+    /// Verify step. Each span has length `1 + k` (the last committed token again, then `k` drafts). `k` is the
+    /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
+    /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
+    /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
+    pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
+        assert!(!spans.is_empty() && spans.iter().all(|s| s.t == 1 + k), "a verify span has length 1 + k");
+        // A --kv-disk lane stages cache from the single-token step path. This span does not, and it must not run there.
+        assert!(spans.iter().all(|s| s.lane.tier.is_none()), "verify does not run on a --kv-disk lane");
+        let t = 1 + k;
+        let stride = N_SLOT * NCH * 3;
+        let cs = self.gpu.buffer(spans.len() * t * stride * 4);
+        unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
+        let kept = spans.iter().map(|sp| VerifySpan {
+            lane: sp.lane as *const Lane,
+            p0: sp.p0,
+            kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
+            accepted_end: None,
+        }).collect();
+        *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
+        self.encode_spans_x(cb, spans, true, false, false, Some(k));
+    }
+    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
+    /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
+    /// the span, so a rejected draft and anything after it do not stay. The recorded length is `p0 + n_keep`, never
+    /// a seal of the span's end. The images live on `verify_keep`, not in serve's `cs_at_prompt`. Nothing may be in
+    /// flight on the GPU. The correction token is not written here: its K and V land when that token is encoded.
+    pub fn rollback_verify(&self, lane: &Lane, si: usize, n_keep: usize) {
+        assert!(lane.tier.is_none(), "verify does not run on a --kv-disk lane");
+        let tail = {
+            let mut slot = self.verify_keep.borrow_mut();
+            let g = slot.as_mut().expect("rollback_verify without encode_verify");
+            assert!(si < g.spans.len(), "verify span {si} is out of range");
+            let t = g.t;
+            let stride = g.stride;
+            let cs = g.cs.clone();
+            assert!(n_keep >= 1 && n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
+            let rec = &mut g.spans[si];
+            assert!(std::ptr::eq(rec.lane, lane), "rollback lane is not the lane encode_verify ran");
+            let end = rec.p0 + n_keep;
+            // Layer 2 has no block table. The only length this step records is the accepted prefix.
+            rec.accepted_end = Some(end);
+            assert!(end <= rec.p0 + t);
+            if n_keep < t { assert!(end < rec.p0 + t, "a rejected tail is not sealed"); }
+            let bytes = stride * 4;
+            assert_eq!(bytes, lane.cs.length());
+            unsafe {
+                let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
+                std::ptr::copy_nonoverlapping(src, lane.cs.contents().as_ptr() as *mut u8, bytes);
+            }
+            rec.kv.iter().skip(n_keep).cloned().collect::<Vec<_>>()
+        };
+        for undo in &tail { self.restore_kv_pos(lane, undo); }
+    }
+    /// Bytes of every slot's K and V row at positions [p0, p0+t), before the span writes them.
+    fn snapshot_kv_positions(&self, lane: &Lane, p0: usize, t: usize) -> Vec<KvUndo> {
+        let eb = self.kvb;
+        let row = HD * eb;
+        let mut out = Vec::with_capacity(t);
+        for d in 0..t {
+            let pos = p0 + d;
+            let mut rows = Vec::new();
+            for slot in 0..N_SLOT {
+                let (swa, i) = self.slot_kind[slot];
+                let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
+                assert!(swa || pos < cap, "full-attention row {pos} is past the cache");
+                let idx = if swa { pos % cap } else { pos };
+                let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
+                let base = buf.contents().as_ptr() as *const u8;
+                let k0 = i * 2 * NKV * cap * HD * eb;
+                for which in 0..2 {
+                    let b0 = k0 + which * NKV * cap * HD * eb;
+                    for g in 0..NKV {
+                        let off = b0 + (g * cap + idx) * row;
+                        rows.extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), row) });
+                    }
+                }
+            }
+            out.push(KvUndo { pos, rows });
+        }
+        out
+    }
+    fn restore_kv_pos(&self, lane: &Lane, undo: &KvUndo) {
+        let eb = self.kvb;
+        let row = HD * eb;
+        let pos = undo.pos;
+        let mut at = 0usize;
+        for slot in 0..N_SLOT {
+            let (swa, i) = self.slot_kind[slot];
+            let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
+            let idx = if swa { pos % cap } else { pos };
+            let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
+            let base = buf.contents().as_ptr() as *mut u8;
+            let k0 = i * 2 * NKV * cap * HD * eb;
+            for which in 0..2 {
+                let b0 = k0 + which * NKV * cap * HD * eb;
+                for g in 0..NKV {
+                    let off = b0 + (g * cap + idx) * row;
+                    unsafe { std::ptr::copy_nonoverlapping(undo.rows.as_ptr().add(at), base.add(off), row); }
+                    at += row;
+                }
+            }
+        }
+        assert_eq!(at, undo.rows.len());
+    }
+    /// Write this conv site's state after every prefix of the span. Runs only while a verify span is recording,
+    /// and only before `k_state_upd` overwrites `cs` with the state at the end.
+    fn keep_state(&self, e: &Enc, si: usize, su: &StateArgs, cls: u32, grid: (usize, usize, usize)) {
+        if !self.verify_record.get() { return; }
+        let (sk, buf) = {
+            let slot = self.verify_keep.borrow();
+            let g = slot.as_ref().expect("verify recording without convolution images");
+            let sk = StateKeepArgs {
+                x_off: su.x_off, ldx: su.ldx, cs_off: su.cs_off, nch: su.nch, t: su.t,
+                snap_off: (si * g.t * g.stride) as u32, stride: g.stride as u32, pad: 0,
+            };
+            (sk, g.cs.clone())
+        };
+        e.buf(&buf, 0, 9);
+        self.go(e, cls, "k_state_keep", &sk, grid, 256);
+    }
+    /// Encode one decode step: one token for each lane in `spans` (every span has t = 1). Row-wise work runs through the
+    /// batched tensor path as in `encode_spans`; each lane's attention is the decode path's fused kernel (K/V conv, cache
+    /// write, split-K attention over its own cache). A decode step's arithmetic is its own: a token's numbers depend
+    /// neither on the other lanes in the step nor on how many there are, but differ from a prefill row's, so cache
+    /// blocks written by decode steps are never shared (docs/DESIGN.md).
+    pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
+        assert!(spans.iter().all(|s| s.t == 1));
+        self.encode_spans_x(cb, spans, logits, argmax, true, None);
+    }
+    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>) {
+        assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
+        let t: usize = spans.iter().map(|s| s.t).sum();
+        for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
+        assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
+        assert!(!dec || (self.hgemm && 2 * spans.len() <= self.ba.get().cap), "a decode step needs the fp16 path and room for f32 queries");
+        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
+                "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
+        assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
+        if let Some(k) = verify_k {
+            assert!(!dec && !argmax, "verify is not a decode step, and argmax would overwrite toks[p0 + t]");
+            let need = spans.len() * (1 + k);
+            assert!(need <= self.ba.get().lg_rows as usize,
+                    "verify needs {need} vocabulary rows and this batch has {}; lg is not grown to one row per token",
+                    self.ba.get().lg_rows);
+        }
+        let mut row0 = Vec::with_capacity(spans.len());
+        { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
+        let e = Enc::new(cb);
+        self.bind_eng(&e);
+        self.bind_lane(&e, spans[0].lane);
+        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step does not use it)
+        if !dec {
+            let bz = self.ba.get();
+            let zr = [bz.sk, bz.perm - bz.sk];
+            e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
+            e.barrier();
+        }
+        let b = self.ba.get();
+        for (si, sp) in spans.iter().enumerate() {
+            let r0 = (row0[si] * E) as u32;
+            let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
+                                 norm_off: self.tok_norm, out0: b.vec(0) + r0, out1: b.vec(0) + r0, tok_index: sp.p0 as u32, eps: self.eps };
+            e.buf(&sp.lane.toks, 0, 6);
+            self.go_nb(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
+        }
+        e.barrier();
+        // Last layer: nothing after the batch reads its outputs except the final token (logits) and the conv states (last 3
+        // rows of the two branch outputs). It is a full-attention layer, so K/V still cover every token, but queries, attention,
+        // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
+        let mut trim = [0usize; N_PHYS];
+        // Verify needs every row's logits, so it does not take the last-layer tail trim (single span, t > 16).
+        if verify_k.is_none() && spans.len() == 1 && self.hgemm && self.tail.get() && t > 16 { trim[N_PHYS - 1] = t - 8; }
+        let mut va = VecAlloc { next: 1, n: B_NVEC };
+        let mut blocks: Vec<usize> = Vec::new();
+        let mut cur = 0usize;
+        if verify_k.is_some() { self.verify_record.set(true); }
+        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        let prelude = cur;
+        let prelude_blocks = blocks.clone();
+        let mut bank = (0usize, 0usize);
+        for pass in 0..N_PASS {
+            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            let msg = if pass > 0 { Some(bank) } else { None };
+            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
+            bank = (blocks[prelude_blocks.len() + 1], cur);
+        }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        self.verify_record.set(false);
+        // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
+        // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
+        // use of b.lg, for that span only: 1+k rows, one per position, argmax off.
+        if let Some(k) = verify_k {
+            let ar = self.ar;
+            let rows = 1 + k;
+            let vp = self.vocab_pad();
+            for (si, sp) in spans.iter().enumerate() {
+                for r in 0..sp.t {
+                    let row = ((row0[si] + r) * E) as u32;
+                    let lg = b.lg + ((si * rows + r) * vp) as u32;
+                    let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + row).collect();
+                    st.push(b.vec(cur) + row);
+                    let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
+                    self.mix(&e, C_OMIX, &[j]);
+                    self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                }
+            }
+        } else if logits && dec {
+            // a decode step: every lane's last row through the output mix and one tensor GEMM over the output matrix (read
+            // once for all lanes, whatever their number); logits in the batch arena (`span_logits`)
+            let ar = self.ar;
+            let n = spans.len();
+            let st: Vec<u32> = blocks.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur))).collect();
+            let mut j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
+            j.hout[0] = b.xh[0] as i32; j.nof32 = 1;
+            self.mix_t(&e, C_OMIX, &[j], n);
+            let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
+            hs.ldo = self.vocab_pad() as u32;
+            self.gemm_h(&e, C_LMHEAD, &[hs], n);
+            if argmax {
+                for (si, sp) in spans.iter().enumerate() {
+                    let nparts = 128u32;
+                    let am = ArgmaxArgs { logits_off: b.lg + (si * self.vocab_pad()) as u32, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + 1) as u32, pad: [0; 3] };
+                    e.buf(&sp.lane.toks, 0, 6);
+                    self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+                    self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+                }
+            }
+        } else if logits {
+            let ar = self.ar;
+            for (si, sp) in spans.iter().enumerate() {
+                let last = ((row0[si] + sp.t - 1) * E) as u32;
+                let lg = if spans.len() == 1 { ar.logits } else { b.lg + (si * self.vocab_pad()) as u32 };
+                let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + last).collect();
+                st.push(b.vec(cur) + last);
+                let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
+                self.mix(&e, C_OMIX, &[j]);
+                self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                if argmax {
+                    let nparts = 128u32;
+                    let am = ArgmaxArgs { logits_off: lg, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + sp.t) as u32, pad: [0; 3] };
+                    e.buf(&sp.lane.toks, 0, 6);
+                    self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+                    self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+                }
+            }
+        }
+        e.end();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+               msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
+        let l = &self.layers[ip];
+        let b = self.ba.get();
+        let vo = |i: usize| b.vec(i);
+        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
+        let cs_slot = (slot * NCH * 3) as u32;
+        let tt = t as u32;
+        let es = E as u32;
+        let hatt = self.hgemm;      // fp16 path: k_attn_h, half q / gate, router on the fp16 FFN input
+        let (qgh, rth) = (hatt, hatt);
+        // the query side (queries, attention, output projection, FFN) covers rows [ts, t); the key side always all rows
+        assert!(ts == 0 || (ctl.is_none() && hatt));
+        let n = t - ts;
+        let nn_ = n as u32;
+        let sh = |off: u32, dim: usize| off + (ts * dim) as u32;
+        // ---- attention inputs
+        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
+        let mut st: Vec<u32> = blocks.iter().map(|&v| vo(v)).collect(); st.push(vo(cur));
+        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
+        let xin: [u32; 3];
+        if let Some(lw) = ctl {
+            let (b0, b1) = msg.unwrap();
+            let mut ja = self.mix_job_off(&st, l.attn_res_query, nq, &b.inp[..nq as usize], &[], es);
+            let mut jm = self.mix_job_off(&[vo(b0), vo(b1)], lw.msg_query as i32, 4, &b.msg, &[], es);
+            if self.hgemm {
+                // normalized copies straight into the controllers' fp16 inputs [u^ | m^]
+                if l.swa { ja.hcopy[0] = [b.cath[0] as i32, b.cath[1] as i32, b.cath[2] as i32]; }
+                else { for j in 0..3 { ja.hcopy[j][0] = b.cath[j] as i32; } }
+                for j in 0..4 { jm.hcopy[j][0] = (b.cath[j] + (E / 2) as u32) as i32; }
+            } else {
+                if l.swa { ja.ncopy[0] = [b.cat_u[0] as i32, b.cat_u[1] as i32, b.cat_u[2] as i32]; }
+                else { for j in 0..3 { ja.ncopy[j][0] = b.cat_u[j] as i32; } }
+                for j in 0..4 { jm.ncopy[j][0] = b.cat_m[j] as i32; }
+            }
+            self.mix_t(e, C_MIXA, &[ja, jm], t);
+            let jobs: Vec<(usize, u32, u32, u32, u32)> = (0..3).map(|j| (j, if l.swa { b.inp[0] } else { b.inp[j] }, b.msg[j], b.cin[j], norms[j] as u32)).collect();
+            let ho: Vec<(u32, bool)> = if self.hgemm { (0..3).map(|j| (b.xh[j], true)).collect() } else { vec![] };
+            self.ctrl_b(e, lw, &jobs, t, &ho);
+            xin = b.cin;
+        } else {
+            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
+            let mut ja = self.mix_job_off(&st, l.attn_res_query, nq, &b.inp[..nq as usize], &nn, es);
+            if self.hgemm { for q in 0..nq as usize { ja.hout[q] = b.xh[q] as i32; } ja.nof32 = 0xF; }
+            self.mix_t(e, C_MIXA, &[ja], t);
+            xin = if l.swa { [b.inp[0]; 3] } else { [b.inp[0], b.inp[1], b.inp[2]] };
+        }
+        // ---- projections (one batched GEMM over all segments)
+        let mut segs = vec![Engine::gseg(&l.wq, xin[0], b.q), Engine::gseg(&l.wgate, xin[0], b.gate), Engine::gseg(&l.wrel, xin[0], b.rel),
+                            Engine::gseg(&l.wsink, xin[0], b.sink), Engine::gseg(&l.wk, xin[1], b.k), Engine::gseg(&l.wv, xin[2], b.v)];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::gseg(kp, xin[1], b.kdyn)); segs.push(Engine::gseg(vp, xin[2], b.vdyn)); }
+        if self.hgemm {
+            // the fp16 inputs b.xh[..] were written by the mix / controller kernels: one shared input in an uncontrolled
+            // sliding-window layer, separate q / k / v inputs otherwise
+            let xi: [usize; 3] = if ctl.is_some() || !l.swa { [0, 1, 2] } else { [0, 0, 0] };
+            let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
+                              Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
+            // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
+            if hatt && qgh && !dec { hq[0].hout = 1; hq[1].hout = 1; }     // a decode step keeps them f32 for k_attn
+            let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
+            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
+            if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
+            else {
+                // query-side projections for the tail rows only (the two GEMMs are independent)
+                for sg in hq.iter_mut() { sg.xh_off = sh(sg.xh_off, E / 2); sg.out_off = sh(sg.out_off, sg.nrows as usize / (1 + sg.hout as usize)); }
+                self.gemm_h(e, C_QKV, &hs, t);
+                self.gemm_h(e, C_QKV, &hq, n);
+            }
+        } else {
+            self.gemm(e, C_QKV, &segs, t);
+        }
+        // ---- K/V conv + cache write, Q/R prep, attention: span by span, each with its lane's cache and convolution rows.
+        // Sliding-window layers: a span attends through a linear scratch [window history | span keys] in the arena (reused by
+        // the next span: every dispatch ends with a barrier), and the ring (exactly one window) only receives the last window
+        // of keys. Full layers address their cache directly.
+        let scap = (EXT + b.cap + 2 * KGUARD) as u32;
+        if dec {
+            // a decode step: each lane's token through the decode path's fused attention (K/V conv from the lane's state,
+            // cache write, split-K attention over the lane's cache, combine + output gate), into qp as f32 rows. The lanes'
+            // attention dispatches are independent (own cache, state, rows and split partials): no barrier between them.
+            let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
+            for (si, sp) in spans.iter().enumerate() {
+                let run = self.on(sp.lane);
+                let (pos, r0) = (sp.p0, row0[si]);
+                self.bind_lane(e, sp.lane);
+                let (kb, vb, kcap) = run.kv_slot(slot);
+                let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+                let ar = self.ar;
+                let base = AttnArgs {
+                    pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
+                    q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
+                    r_off: b.rel + (r0 * NH * NREL) as u32, sink_off: b.sink + (r0 * NH) as u32,
+                    kdyn_off: if l.swa { -1 } else { (b.kdyn + (r0 * 32) as u32) as i32 }, vdyn_off: if l.swa { -1 } else { (b.vdyn + (r0 * 32) as u32) as i32 },
+                    part_off: self.dstart.get() + si as u32 * ar.total + ar.part, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
+                    ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
+                    ..Default::default()
+                };
+                run.bind_kv(e, l.swa);
+                let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
+                let kps = Run::split_kps(nkeys);
+                let nsplit = nkeys.div_ceil(kps);
+                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                                    pad: self.sep_comb as u32, ..base };
+                assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
+                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
+            }
+            e.barrier();
+            for ca in &combs { self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128); }
+            e.barrier();
+            e.buf(&self.act.borrow(), 0, 3);
+            // f32 attention outputs -> the half rows the output projection reads
+            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+            e.barrier();
+        }
+        for (si, sp) in spans.iter().enumerate() {
+        if dec { break; }
+        let run = self.on(sp.lane);
+        let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
+        let tt = t as u32;
+        // a row-major region shifted to this span's first row
+        let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
+        let (n, nn_) = (t - ts, (t - ts) as u32);
+        let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
+        e.buf(&sp.lane.cs, 0, 4);
+        let (kb, vb, kcap) = run.kv_slot(slot);
+        let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
+        let kcopy = |n: usize, pos0: usize, to_ring: u32| {
+            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
+            e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
+            self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
+            e.buf(&self.act.borrow(), 0, 3);
+        };
+        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
+        let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
+        let qpd = if hatt { NH * HD / 2 } else { NH * HD };
+        let ka = KvPrepArgs {
+            t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qd),
+            k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
+            kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
+            qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
+            log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0,
+        };
+        self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
+        if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
+            assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
+            let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
+            e.buf(qc, 0, 3);
+            let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
+            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
+            let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
+            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
+            e.buf(&sp.lane.kv_full.borrow(), 0, 3);
+        }
+        if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
+        let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+        let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+        // ---- attention (causal, query-tiled)
+        let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv,
+                             window: if l.swa { EXT as u32 } else { 0 }, qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), sink_off: rs(b.sink, NH), gate_off: rs(b.gate, gd),
+                             out_off: rs(b.attn_g, NH * HD), relbias_w: l.rel_bias, ghalf: 0, kpos0, pad: 0 };
+        if hatt {
+            let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: shs(b.qp, NH * HD / 2), rp_off: shs(b.rp, NH * NREL), sink_off: shs(b.sink, NH),
+                                 gate_off: shs(b.gate, gd), out_off: shs(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
+            self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
+        }
+        else if self.tensor { self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256); }
+        else { self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128); }
+        }
+        // ---- output projection + post-conv (+ residual)
+        if self.hgemm {
+            if !hatt { self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None); e.barrier(); }
+            self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
+        } else {
+            self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
+        }
+        let block_start = ip % BLOCK == 0;
+        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mid = va.alloc(&live);
+        // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
+        // post-conv and its state: span by span (the convolution runs along each lane's own rows, from its own state)
+        // (each span's convolution reads its lane's state before the state update overwrites it; spans are independent)
+        for (si, sp) in spans.iter().enumerate() {
+            let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
+            e.buf(&sp.lane.cs, 0, 4);
+            let cv = ConvBArgs { y_off: b.wo_y + q0, ldy: es, res_off: vo(cur) + q0, out_off: vo(mid) + q0, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                                 convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
+            self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+        }
+        e.barrier();
+        for (si, sp) in spans.iter().enumerate() {
+            e.buf(&sp.lane.cs, 0, 4);
+            let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
+            self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+        }
+        e.barrier();
+        if block_start { blocks.push(cur); }
+        // ---- FFN input
+        let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect(); st.push(sh(vo(mid), E));
+        let x = if let Some(lw) = ctl {
+            let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[b.fin], &[], es);
+            if self.hgemm { jf.hcopy[0][0] = b.cath[3] as i32; } else { jf.ncopy[0][0] = b.cat_u[3] as i32; }
+            self.mix_t(e, C_MIXF, &[jf], t);
+            let ho: Vec<(u32, bool)> = if self.hgemm { vec![(b.fh, rth)] } else { vec![] };
+            self.ctrl_b(e, lw, &[(3, b.fin, b.msg[3], b.finc, l.ffn_norm)], t, &ho);
+            b.finc
+        } else {
+            let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[sh(b.fin, E)], &[l.ffn_norm as i32], es);
+            if self.hgemm { jf.hout[0] = sh(b.fh, E / 2) as i32; jf.nof32 = rth as u32; }
+            self.mix_t(e, C_MIXF, &[jf], n);
+            b.fin
+        };
+        // ---- router + top-k + expert grouping
+        let rs = GSeg { w_lo: l.router, w_hi: 0, row_bytes: es * 2, wtype: T_BF16, nrows: NEXP as u32, k: es, in_off: sh(x, E), out_off: b.rlog,
+                        ldo: NEXP as u32, wsrc: 1, ..Default::default() };
+        if rth { self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
+        else { self.gemm(e, C_ROUTER, &[rs], n); }
+        let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
+        self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
+        let tile = 32usize;
+        if self.hgemm {
+            let ra = Route3Args { sel_off: b.sel, t: nn_, perm_off: b.perm, inv_off: b.inv, aw_off: b.aw, ind_off: b.ind, gu_y: (FF / 32) as u32,
+                                  dn_y: (E / 64) as u32, tiles_off: b.tl, pad: [0; 2] };
+            self.go(e, C_TOPK, "k_moe_route3", &ra, (1, 1, 1), 1024);
+        } else {
+            let ra = RouteArgs { sel_off: b.sel, t: tt, perm_off: b.perm, inv_off: b.inv, tiles_off: b.tiles, ntiles_off: b.ntiles, tile: tile as u32, pad: 0 };
+            self.go(e, C_ROUTER, "k_moe_route", &ra, (1, 1, 1), 1024);
+        }
+        let max_tiles = (t * TOPK).div_ceil(tile) + NEXP;
+        let gu = MoeGemmArgs {
+            w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
+            wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, x_off: x, gather: 1, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
+            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta, pad2: [0.0; 2],
+        };
+        let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
+        if self.hgemm {
+            // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
+            // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
+            self.tohalf_x(e, C_GATHER, sh(b.fh, E / 2), E, b.xgh, E, E, n * TOPK, Some(b.perm), true);
+            e.barrier();
+            // tiles in four widths, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently
+            if self.skip.get() & (1 << C_GU) == 0 {
+                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                    let g = MoeGemmHArgs {
+                        w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
+                        wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
+                        out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                    };
+                    e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
+                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
+                }
+                e.barrier();
+            }
+            if self.skip.get() & (1 << C_DOWN) == 0 {
+                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                    let d = MoeGemmHArgs {
+                        w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
+                        wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
+                        out_off: b.yd, ldo: es, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
+                    };
+                    e.pso(&self.gpu.pso(name)); e.bytes(&d, 5);
+                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
+                }
+                e.barrier();
+            }
+        } else {
+        self.go(e, C_GU, mg, &gu, (FF / 32, max_tiles, 1), 128);
+        let dn = MoeGemmArgs {
+            w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
+            wtype: l.dn.ty, nrows: es, k: FF as u32, x_off: b.act, gather: 0, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
+            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0, pad2: [0.0; 2],
+        };
+        self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
+        }
+        let ca = MoeCombArgs { yd_off: b.yd, inv_off: b.inv, sel_off: b.sel, out_off: sh(b.ffn_y, E) };
+        if self.hgemm { self.go(e, C_COMB2, "k_moe_comb_h", &ca, (n, E.div_ceil(1024), 1), 256); }
+        else { self.go(e, C_DOWN, "k_moe_comb_b", &ca, (E / 256, t, 1), 256); }
+        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let out = va.alloc(&live);
+        for (si, sp) in spans.iter().enumerate() {
+            let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
+            e.buf(&sp.lane.cs, 0, 4);
+            let cv = ConvBArgs { y_off: b.ffn_y + q0, ldy: es, res_off: vo(mid) + q0, out_off: vo(out) + q0, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                                 convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
+            self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+        }
+        e.barrier();
+        for (si, sp) in spans.iter().enumerate() {
+            e.buf(&sp.lane.cs, 0, 4);
+            let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+            self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
+            self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+        }
+        e.barrier();
+        out
     }
 
 }
@@ -1747,6 +2657,10 @@ impl<'a> Run<'a> {
         (swa, full)
     }
 
+    /// a copy of this lane's convolution rows (its recurrent state at the current position)
+    pub fn get_cs(&self) -> Vec<u8> { unsafe { std::slice::from_raw_parts(self.lane.cs.contents().as_ptr() as *const u8, self.lane.cs.length()).to_vec() } }
+    /// put back convolution rows `get_cs` copied. Nothing may be in flight on the GPU.
+    pub fn set_cs(&self, v: &[u8]) { assert_eq!(v.len(), self.lane.cs.length()); unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.lane.cs.contents().as_ptr() as *mut u8, v.len()); } }
     pub fn reset(&self) {
         self.tier_reset();
         unsafe { std::ptr::write_bytes(self.lane.cs.contents().as_ptr() as *mut u8, 0, self.lane.cs.length()); }
@@ -1769,10 +2683,10 @@ impl<'a> Run<'a> {
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
         let e = &cx.e;
         self.bind(e);
-        let ar = self.ar;
+        let ar = self.ar_at();
         // embedding -> vec 0 (x0)
         let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                             norm_off: self.tok_norm, out0: Arena::vec(0), out1: Arena::vec(0), tok_index: pos as u32, eps: self.eps };
+                             norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: pos as u32, eps: self.eps };
         self.go(e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
 
         self.done.set(0);
@@ -1816,7 +2730,7 @@ impl<'a> Run<'a> {
         self.done.set(self.done.get() + 1);
         let e = &cx.e;
         let l = &self.layers[ip];
-        let ar = self.ar;
+        let ar = self.ar_at();
         let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
         let cs_slot = (slot * NCH * 3) as u32;
 
@@ -1922,8 +2836,8 @@ impl<'a> Run<'a> {
         let block_start = ip % BLOCK == 0;
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
-        let mut so = Engine::seg(&l.wo, ar.attn_g, Arena::vec(mid));
-        so.epi = 1; so.res_off = if block_start { -1 } else { Arena::vec(cur) as i32 };
+        let mut so = Engine::seg(&l.wo, ar.attn_g, self.v(mid));
+        so.epi = 1; so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
         so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
         self.mv(e, C_WO, &[so]);
         if block_start { blocks.push(cur); }
@@ -1954,7 +2868,7 @@ impl<'a> Run<'a> {
             gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
             act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
             dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
-            dn_type: l.dn.ty, out_off: Arena::vec(out), res_off: Arena::vec(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+            dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
             convw_off: l.ffn_post_conv, pad: [0; 3],
         };
         // ---- experts
@@ -1965,281 +2879,38 @@ impl<'a> Run<'a> {
     }
 
     // ======================================================================== batched prefill
-    /// Encode prefill of `t` tokens (toks[p0..p0+t]) as one batch. Optionally computes logits/argmax for the last token.
+    /// Encode prefill of `t` tokens (toks[p0..p0+t]) of this lane as one batch: a step with one span.
     pub fn encode_prefill(&self, cb: &CmdBuf, p0: usize, t: usize, logits: bool, argmax: bool) {
-        assert!(t >= 1 && t <= self.chunk && p0 + t <= self.kv_capacity(), "K/V capacity: call reserve() first");
-        assert!(t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
-        let e = Enc::new(cb);
-        self.bind(&e);
-        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero
-        let bz = self.ba.get();
-        let zr = [bz.sk, bz.perm - bz.sk];
-        e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
-        e.barrier();
-        let b = self.ba.get();
-        let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                             norm_off: self.tok_norm, out0: b.vec(0), out1: b.vec(0), tok_index: p0 as u32, eps: self.eps };
-        self.go(&e, C_EMBED, "k_embed", &ea, (t, 1, 1), 256);
-        // Last layer: nothing after the batch reads its outputs except the final token (logits) and the conv states (last 3
-        // rows of the two branch outputs). It is a full-attention layer, so K/V still cover every token, but queries, attention,
-        // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
-        let mut trim = [0usize; N_PHYS];
-        if self.hgemm && self.tail.get() && t > 16 { trim[N_PHYS - 1] = t - 8; }
-        let mut va = VecAlloc { next: 1, n: B_NVEC };
-        let mut blocks: Vec<usize> = Vec::new();
-        let mut cur = 0usize;
-        for ip in 0..LOOP_START { cur = self.layer_b(&e, p0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
-        let prelude = cur;
-        let prelude_blocks = blocks.clone();
-        let mut bank = (0usize, 0usize);
-        for pass in 0..N_PASS {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
-            let msg = if pass > 0 { Some(bank) } else { None };
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, p0, t, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
-            bank = (blocks[prelude_blocks.len() + 1], cur);
-        }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, p0, t, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
-        if logits {
-            let ar = self.ar;
-            let last = ((t - 1) * E) as u32;
-            let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + last).collect();
-            st.push(b.vec(cur) + last);
-            let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
-            self.mix(&e, C_OMIX, &[j]);
-            self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
-            if argmax {
-                let nparts = 128u32;
-                let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (p0 + t) as u32, pad: [0; 3] };
-                self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
-                self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
-            }
-        }
-        e.end();
+        self.eng.encode_spans(cb, &[Span { lane: self.lane, p0, t }], logits, argmax);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chunk 4096 keeps `min(t, MAX_SPANS)` vocabulary rows. A verify span of k=3 needs 4 of them.
+    /// Growing `lg` to one row per token would be 32× those rows; this layout does not.
+    /// fp16 path, fp16 K/V, vocab pad 201024 (`output.weight` rows of Inkling-2-Mini).
+    #[test]
+    fn chunk_4096_batch_arena_is_unchanged_for_verify_rows() {
+        let vocab_pad = 201024usize;
+        let b = BArena::new(0, 4096, true, 2, vocab_pad);
+        assert_eq!(b.lg_rows, 128);
+        assert_eq!(b.cap, 4096);
+        let bytes = b.end as usize * 4;
+        assert_eq!(bytes, 1_791_665_152);
+        assert!(4 <= b.lg_rows as usize, "k=3 is 4 rows and must fit the existing lg");
+        assert!(b.lg_rows as usize * 32 == 4096);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn layer_b(&self, e: &Enc, p0: usize, t: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-               msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
-        let l = &self.layers[ip];
-        let b = self.ba.get();
-        let vo = |i: usize| b.vec(i);
-        let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
-        let cs_slot = (slot * NCH * 3) as u32;
-        let tt = t as u32;
-        let es = E as u32;
-        let hatt = self.hgemm;      // fp16 path: k_attn_h, half q / gate, router on the fp16 FFN input
-        let (qgh, rth) = (hatt, hatt);
-        // the query side (queries, attention, output projection, FFN) covers rows [ts, t); the key side always all rows
-        assert!(ts == 0 || (ctl.is_none() && hatt));
-        let n = t - ts;
-        let nn_ = n as u32;
-        let sh = |off: u32, dim: usize| off + (ts * dim) as u32;
-        // ---- attention inputs
-        let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
-        let mut st: Vec<u32> = blocks.iter().map(|&v| vo(v)).collect(); st.push(vo(cur));
-        let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
-        let xin: [u32; 3];
-        if let Some(lw) = ctl {
-            let (b0, b1) = msg.unwrap();
-            let mut ja = self.mix_job_off(&st, l.attn_res_query, nq, &b.inp[..nq as usize], &[], es);
-            let mut jm = self.mix_job_off(&[vo(b0), vo(b1)], lw.msg_query as i32, 4, &b.msg, &[], es);
-            if self.hgemm {
-                // normalized copies straight into the controllers' fp16 inputs [u^ | m^]
-                if l.swa { ja.hcopy[0] = [b.cath[0] as i32, b.cath[1] as i32, b.cath[2] as i32]; }
-                else { for j in 0..3 { ja.hcopy[j][0] = b.cath[j] as i32; } }
-                for j in 0..4 { jm.hcopy[j][0] = (b.cath[j] + (E / 2) as u32) as i32; }
-            } else {
-                if l.swa { ja.ncopy[0] = [b.cat_u[0] as i32, b.cat_u[1] as i32, b.cat_u[2] as i32]; }
-                else { for j in 0..3 { ja.ncopy[j][0] = b.cat_u[j] as i32; } }
-                for j in 0..4 { jm.ncopy[j][0] = b.cat_m[j] as i32; }
-            }
-            self.mix_t(e, C_MIXA, &[ja, jm], t);
-            let jobs: Vec<(usize, u32, u32, u32, u32)> = (0..3).map(|j| (j, if l.swa { b.inp[0] } else { b.inp[j] }, b.msg[j], b.cin[j], norms[j] as u32)).collect();
-            let ho: Vec<(u32, bool)> = if self.hgemm { (0..3).map(|j| (b.xh[j], true)).collect() } else { vec![] };
-            self.ctrl_b(e, lw, &jobs, t, &ho);
-            xin = b.cin;
-        } else {
-            let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
-            let mut ja = self.mix_job_off(&st, l.attn_res_query, nq, &b.inp[..nq as usize], &nn, es);
-            if self.hgemm { for q in 0..nq as usize { ja.hout[q] = b.xh[q] as i32; } ja.nof32 = 0xF; }
-            self.mix_t(e, C_MIXA, &[ja], t);
-            xin = if l.swa { [b.inp[0]; 3] } else { [b.inp[0], b.inp[1], b.inp[2]] };
-        }
-        // ---- projections (one batched GEMM over all segments)
-        let mut segs = vec![Engine::gseg(&l.wq, xin[0], b.q), Engine::gseg(&l.wgate, xin[0], b.gate), Engine::gseg(&l.wrel, xin[0], b.rel),
-                            Engine::gseg(&l.wsink, xin[0], b.sink), Engine::gseg(&l.wk, xin[1], b.k), Engine::gseg(&l.wv, xin[2], b.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::gseg(kp, xin[1], b.kdyn)); segs.push(Engine::gseg(vp, xin[2], b.vdyn)); }
-        if self.hgemm {
-            // the fp16 inputs b.xh[..] were written by the mix / controller kernels: one shared input in an uncontrolled
-            // sliding-window layer, separate q / k / v inputs otherwise
-            let xi: [usize; 3] = if ctl.is_some() || !l.swa { [0, 1, 2] } else { [0, 0, 0] };
-            let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
-                              Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
-            // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
-            if hatt && qgh { hq[0].hout = 1; hq[1].hout = 1; }
-            let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
-            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
-            if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
-            else {
-                // query-side projections for the tail rows only (the two GEMMs are independent)
-                for sg in hq.iter_mut() { sg.xh_off = sh(sg.xh_off, E / 2); sg.out_off = sh(sg.out_off, sg.nrows as usize / (1 + sg.hout as usize)); }
-                self.gemm_h(e, C_QKV, &hs, t);
-                self.gemm_h(e, C_QKV, &hq, n);
-            }
-        } else {
-            self.gemm(e, C_QKV, &segs, t);
-        }
-        // ---- K/V conv + cache write, Q/R prep
-        // Sliding-window layers: the batch attends through a linear scratch [window history | batch keys] in the arena, and the
-        // ring (exactly one window) only receives the last window of keys. Full layers address their cache directly.
-        let (kb, vb, kcap) = self.kv_slot(slot);
-        let scap = (EXT + b.cap + 2 * KGUARD) as u32;
-        let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
-        let kcopy = |n: usize, pos0: usize, to_ring: u32| {
-            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
-            e.buf(&self.lane.kv_swa.borrow(), 0, 3);
-            self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
-            e.buf(&self.act.borrow(), 0, 3);
-        };
-        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { self.bind_kv(e, false); }
-        let ka = KvPrepArgs {
-            t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: b.q,
-            k_off: b.k, v_off: b.v, r_off: b.rel, kdyn_off: if l.swa { -1 } else { b.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { b.vdyn as i32 },
-            qp_off: b.qp, rp_off: b.rp, qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
-            log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0,
-        };
-        self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
-        if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
-            assert!(hatt && ts == 0 && p0 + t <= *ncap, "query capture needs the fp16 attention path, no tail trimming and room");
-            let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
-            e.buf(qc, 0, 3);
-            let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
-            let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
-            self.bind_kv(e, false);
-        }
-        if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
-        let su = StateArgs { x_off: b.k, ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        let su = StateArgs { x_off: b.v, ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        // ---- attention (causal, query-tiled)
-        let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv,
-                             window: if l.swa { EXT as u32 } else { 0 }, qp_off: b.qp, rp_off: b.rp, sink_off: b.sink, gate_off: b.gate,
-                             out_off: b.attn_g, relbias_w: l.rel_bias, ghalf: 0, kpos0, pad: 0 };
-        if hatt {
-            let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: sh(b.qp, NH * HD / 2), rp_off: sh(b.rp, NH * NREL), sink_off: sh(b.sink, NH),
-                                 gate_off: sh(b.gate, if qgh { NH * HD / 2 } else { NH * HD }), out_off: sh(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
-            self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
-        }
-        else if self.tensor { self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256); }
-        else { self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128); }
-        // ---- output projection + post-conv (+ residual)
-        if self.hgemm {
-            if !hatt { self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None); e.barrier(); }
-            self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
-        } else {
-            self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
-        }
-        let block_start = ip % BLOCK == 0;
-        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
-        let mid = va.alloc(&live);
-        // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
-        let cv = ConvBArgs { y_off: sh(b.wo_y, E), ldy: es, res_off: sh(vo(cur), E), out_off: sh(vo(mid), E), cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
-                             convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
-        self.go(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, n, 1), 256);
-        let su = StateArgs { x_off: b.wo_y, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: tt, pad: [0; 3] };
-        self.go(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
-        if block_start { blocks.push(cur); }
-        // ---- FFN input
-        let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect(); st.push(sh(vo(mid), E));
-        let x = if let Some(lw) = ctl {
-            let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[b.fin], &[], es);
-            if self.hgemm { jf.hcopy[0][0] = b.cath[3] as i32; } else { jf.ncopy[0][0] = b.cat_u[3] as i32; }
-            self.mix_t(e, C_MIXF, &[jf], t);
-            let ho: Vec<(u32, bool)> = if self.hgemm { vec![(b.fh, rth)] } else { vec![] };
-            self.ctrl_b(e, lw, &[(3, b.fin, b.msg[3], b.finc, l.ffn_norm)], t, &ho);
-            b.finc
-        } else {
-            let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[sh(b.fin, E)], &[l.ffn_norm as i32], es);
-            if self.hgemm { jf.hout[0] = sh(b.fh, E / 2) as i32; jf.nof32 = rth as u32; }
-            self.mix_t(e, C_MIXF, &[jf], n);
-            b.fin
-        };
-        // ---- router + top-k + expert grouping
-        let rs = GSeg { w_lo: l.router, w_hi: 0, row_bytes: es * 2, wtype: T_BF16, nrows: NEXP as u32, k: es, in_off: sh(x, E), out_off: b.rlog,
-                        ldo: NEXP as u32, wsrc: 1, ..Default::default() };
-        if rth { self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
-        else { self.gemm(e, C_ROUTER, &[rs], n); }
-        let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
-        self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
-        let tile = 32usize;
-        if self.hgemm {
-            let ra = Route3Args { sel_off: b.sel, t: nn_, perm_off: b.perm, inv_off: b.inv, aw_off: b.aw, ind_off: b.ind, gu_y: (FF / 32) as u32,
-                                  dn_y: (E / 64) as u32, tiles_off: b.tl, pad: [0; 2] };
-            self.go(e, C_TOPK, "k_moe_route3", &ra, (1, 1, 1), 1024);
-        } else {
-            let ra = RouteArgs { sel_off: b.sel, t: tt, perm_off: b.perm, inv_off: b.inv, tiles_off: b.tiles, ntiles_off: b.ntiles, tile: tile as u32, pad: 0 };
-            self.go(e, C_ROUTER, "k_moe_route", &ra, (1, 1, 1), 1024);
-        }
-        let max_tiles = (t * TOPK).div_ceil(tile) + NEXP;
-        let gu = MoeGemmArgs {
-            w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
-            wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, x_off: x, gather: 1, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta, pad2: [0.0; 2],
-        };
-        let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
-        if self.hgemm {
-            // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
-            // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
-            self.tohalf_x(e, C_GATHER, sh(b.fh, E / 2), E, b.xgh, E, E, n * TOPK, Some(b.perm), true);
-            e.barrier();
-            // tiles in four widths, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently
-            if self.skip.get() & (1 << C_GU) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
-                    let g = MoeGemmHArgs {
-                        w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
-                        wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
-                    };
-                    e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
-                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
-                }
-                e.barrier();
-            }
-            if self.skip.get() & (1 << C_DOWN) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
-                    let d = MoeGemmHArgs {
-                        w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
-                        wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.yd, ldo: es, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
-                    };
-                    e.pso(&self.gpu.pso(name)); e.bytes(&d, 5);
-                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
-                }
-                e.barrier();
-            }
-        } else {
-        self.go(e, C_GU, mg, &gu, (FF / 32, max_tiles, 1), 128);
-        let dn = MoeGemmArgs {
-            w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
-            wtype: l.dn.ty, nrows: es, k: FF as u32, x_off: b.act, gather: 0, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0, pad2: [0.0; 2],
-        };
-        self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
-        }
-        let ca = MoeCombArgs { yd_off: b.yd, inv_off: b.inv, sel_off: b.sel, out_off: sh(b.ffn_y, E) };
-        if self.hgemm { self.go(e, C_COMB2, "k_moe_comb_h", &ca, (n, E.div_ceil(1024), 1), 256); }
-        else { self.go(e, C_DOWN, "k_moe_comb_b", &ca, (E / 256, t, 1), 256); }
-        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
-        let out = va.alloc(&live);
-        let cv = ConvBArgs { y_off: sh(b.ffn_y, E), ldy: es, res_off: sh(vo(mid), E), out_off: sh(vo(out), E), cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                             convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
-        self.go(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, n, 1), 256);
-        let su = StateArgs { x_off: b.ffn_y, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: tt, pad: [0; 3] };
-        self.go(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
-        out
+    /// One image is N_SLOT × NCH × 3 floats. At k=3 the span holds 4 of them (the page's 14.64 MiB); at k=7, 8 (29.28 MiB).
+    #[test]
+    fn verify_cs_image_is_one_convolution_state() {
+        let one = N_SLOT * NCH * 3 * 4;
+        assert_eq!(one, 3_833_856);
+        assert_eq!(one * 4, 15_335_424);
+        assert_eq!(one * 8, 30_670_848);
+        assert_eq!(Engine::cs_image_bytes(), one);
     }
 }
