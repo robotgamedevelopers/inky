@@ -73,3 +73,8 @@ check AdvanceUnfair GroupedLayout TraversalCompletes temporal
 # Negative control: the redundant-load mutant must keep both output invariants,
 # so only StagedOnce can see it. Restage above proves the same mutant is live.
 check RestageOutputs GroupedLayout
+check SplitArena3 SplitArena
+check SplitArena4 SplitArena
+check SplitArena6 SplitArena
+check SplitEdgeDropped SplitArena CombineReadsOwn
+check SplitRowsUnbounded SplitArena WritesInArena
