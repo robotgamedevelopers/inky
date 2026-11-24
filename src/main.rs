@@ -1,5 +1,7 @@
 mod engine;
 mod gguf;
+#[allow(dead_code)] // wired to the scheduler when Johnny's block interface lands (PR 49 v2)
+mod prefix;
 mod metal;
 mod sampler;
 mod session;

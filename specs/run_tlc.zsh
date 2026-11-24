@@ -54,6 +54,8 @@ check() {
     printf "%s | %s | %.3f | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}"
 }
 print "run | generated | distinct | wall seconds | result"
+check PrefixTree PrefixTree
+check PrefixTreeShallow PrefixTree DeepestStart
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
 check StaleEntry BlockLayout GenerationMatches
