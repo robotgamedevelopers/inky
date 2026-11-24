@@ -506,6 +506,12 @@ impl Engine {
         }
         unsafe { std::ptr::copy_nonoverlapping(src.cs.contents().as_ptr() as *const u8, dst.cs.contents().as_ptr() as *mut u8, src.cs.length()); }
     }
+    /// dev, the poisoned-pool gate (src/poolgate.rs): CPU views of the memory a layer-2 lane owns: its window cache,
+    /// its full cache and its convolution rows. Valid until the lane's next `reserve`; nothing may be in flight on the GPU.
+    pub fn lane_regions(&self, lane: &Lane) -> [(*mut u8, usize); 3] {
+        let r = |b: &Buf| (b.contents().as_ptr() as *mut u8, b.length());
+        [r(&lane.kv_swa.borrow()), r(&lane.kv_full.borrow()), r(&lane.cs)]
+    }
     /// GPU memory the device has allocated (bytes) and the working set it recommends
     pub fn gpu_mem(&self) -> (usize, usize) {
         use objc2_metal::MTLDevice;
