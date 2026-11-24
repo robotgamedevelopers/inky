@@ -26,6 +26,9 @@ pub struct ResponseMetrics {
     pub completion_tokens: usize,
     pub ttft_ms: u64,
     pub total_ms: u64,
+    pub queue_ms: u64,
+    pub prefill_ms: u64,
+    pub decode_ms: u64,
     pub finish_reason: String,
     pub status_code: u16,
 }
@@ -37,6 +40,9 @@ impl ResponseMetrics {
             "completion_tokens": self.completion_tokens,
             "ttft_ms": self.ttft_ms,
             "total_ms": self.total_ms,
+            "queue_ms": self.queue_ms,
+            "prefill_ms": self.prefill_ms,
+            "decode_ms": self.decode_ms,
             "finish_reason": self.finish_reason,
             "status_code": self.status_code,
         })
@@ -62,6 +68,9 @@ impl ResponseMetrics {
             .get("total_ms")
             .and_then(|x| x.as_u64())
             .ok_or("response.total_ms missing or invalid")?;
+        let queue_ms = obj.get("queue_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        let prefill_ms = obj.get("prefill_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        let decode_ms = obj.get("decode_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let finish_reason = obj
             .get("finish_reason")
             .and_then(|x| x.as_str())
@@ -77,6 +86,9 @@ impl ResponseMetrics {
             completion_tokens,
             ttft_ms,
             total_ms,
+            queue_ms,
+            prefill_ms,
+            decode_ms,
             finish_reason,
             status_code,
         })
@@ -483,6 +495,9 @@ mod tests {
                 completion_tokens: 64,
                 ttft_ms: 19,
                 total_ms: 410,
+                queue_ms: 3,
+                prefill_ms: 15,
+                decode_ms: 391,
                 finish_reason: "stop".into(),
                 status_code: 200,
             },
@@ -506,6 +521,9 @@ mod tests {
                 completion_tokens: 5,
                 ttft_ms: 1,
                 total_ms: 5,
+                queue_ms: 0,
+                prefill_ms: 0,
+                decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
             },
@@ -553,6 +571,9 @@ mod tests {
                         completion_tokens: 10,
                         ttft_ms: 12,
                         total_ms: 42,
+                        queue_ms: 0,
+                        prefill_ms: 0,
+                        decode_ms: 0,
                         finish_reason: "stop".into(),
                         status_code: 200,
                     },
@@ -612,6 +633,9 @@ mod tests {
                     completion_tokens: 3,
                     ttft_ms: 4,
                     total_ms: 9,
+                    queue_ms: 0,
+                    prefill_ms: 0,
+                    decode_ms: 0,
                     finish_reason: "stop".into(),
                     status_code: 200,
                 },
@@ -648,6 +672,9 @@ mod tests {
                 completion_tokens: 1,
                 ttft_ms: 1,
                 total_ms: 1,
+                queue_ms: 0,
+                prefill_ms: 0,
+                decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
             },
@@ -688,6 +715,9 @@ mod tests {
                 completion_tokens: 0,
                 ttft_ms: 0,
                 total_ms: 0,
+                queue_ms: 0,
+                prefill_ms: 0,
+                decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
             },

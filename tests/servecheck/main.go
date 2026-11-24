@@ -154,7 +154,12 @@ func execute() error {
 	}); err != nil {
 		return err
 	}
-	if err = g.server(ctx, bin, model, dir, 2, 1, func() { g.replies(); g.queueJobs() }); err != nil {
+	if err = g.server(ctx, bin, model, dir, 2, 1, func() {
+		g.replies()
+		g.run("claude harness /v1/messages multi-turn tool loop and timing", g.claudeHarnessMessagesLoop)
+		g.run("opencode harness /v1/chat/completions include_usage and tool loop", g.opencodeHarnessChatLoop)
+		g.queueJobs()
+	}); err != nil {
 		return err
 	}
 	if err = g.server(ctx, bin, model, dir, 4, 2, func() {

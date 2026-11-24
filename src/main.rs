@@ -66,6 +66,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   -c, --ctx N       context per lane (default 65536, maximum 262080, rounded up to a multiple of 64)
   --bind ADDR       listen address (default 127.0.0.1:8090)
   --key-env NAME    use a nonempty key from the named environment variable
+  --api-key-env NAME
+                    alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
   --lanes N         active inference lanes (default 16)
@@ -123,14 +125,14 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--lanes" => o.lanes = parse_usize(flag, value()?)?,
             "--effort" => o.effort = value()?.into(),
             "-n" => o.max_tokens = parse_usize(flag, value()?)?,
-            "--key-env" => {
+            "--key-env" | "--api-key-env" => {
                 let name = value()?;
                 let key = read_key(name).map_err(|error| match error {
-                    std::env::VarError::NotPresent => format!("--key-env {name}: variable is not set"),
-                    std::env::VarError::NotUnicode(_) => format!("--key-env {name}: variable must contain valid UTF-8"),
+                    std::env::VarError::NotPresent => format!("{flag} {name}: variable is not set"),
+                    std::env::VarError::NotUnicode(_) => format!("{flag} {name}: variable must contain valid UTF-8"),
                 })?;
                 if key.is_empty() || key.trim() != key || key.bytes().any(|b| b.is_ascii_control()) {
-                    return Err(format!("--key-env {name} must contain a nonempty HTTP header value without surrounding whitespace or control characters"));
+                    return Err(format!("{flag} {name} must contain a nonempty HTTP header value without surrounding whitespace or control characters"));
                 }
                 o.key = Some(key);
             }
@@ -185,6 +187,10 @@ mod cli_tests {
             (&["--key-env", "EMPTY"], "nonempty HTTP header"),
             (&["--key-env", "BLANK", "--allow-unauthenticated-non-loopback"], "nonempty HTTP header"),
             (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
+            (&["--api-key-env"], "missing value for --api-key-env"),
+            (&["--api-key-env", "ABSENT"], "--api-key-env ABSENT"),
+            (&["--api-key-env", "EMPTY"], "nonempty HTTP header"),
+            (&["--api-key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
             (&["--record-dir"], "missing value for --record-dir"),
             (&["--spill-dir"], "missing value for --spill-dir"),
@@ -209,6 +215,8 @@ mod cli_tests {
         let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576"]).unwrap();
         assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
         assert_eq!(spilled.max_spill_bytes, 1_048_576);
+        assert_eq!(serve_args(&[]).unwrap().effort, "medium");
+        assert_eq!(serve_args(&["--effort", "high"]).unwrap().effort, "high");
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
@@ -218,6 +226,9 @@ mod cli_tests {
             let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
             assert_eq!(keyed.bind, [bind.parse::<std::net::SocketAddr>().unwrap()]);
             assert_eq!(keyed.key.as_deref(), Some("configured-key"));
+            let api_keyed = serve_args(&["--bind", bind, "--api-key-env", "PRESENT"]).unwrap();
+            assert_eq!(api_keyed.bind, keyed.bind);
+            assert_eq!(api_keyed.key.as_deref(), Some("configured-key"));
             let unkeyed = serve_args(&["--bind", bind, "--allow-unauthenticated-non-loopback"]).unwrap();
             assert_eq!(unkeyed.bind, keyed.bind);
             assert!(unkeyed.key.is_none());

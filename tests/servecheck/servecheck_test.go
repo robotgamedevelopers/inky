@@ -149,3 +149,80 @@ func TestVerifyHealthBudget(t *testing.T) {
 		t.Fatalf("expected non-zero queued_requests to fail")
 	}
 }
+
+func TestVerifyModelsList(t *testing.T) {
+	good := []struct{ ID string }{{ID: "inkling-2-mini"}, {ID: "inky/inkling-2-mini"}}
+	if err := verifyModelsList(good); err != nil {
+		t.Fatalf("expected dual model aliases to pass, got %v", err)
+	}
+	missing := []struct{ ID string }{{ID: "inkling-2-mini"}}
+	if err := verifyModelsList(missing); err == nil {
+		t.Fatalf("expected missing namespaced alias to fail")
+	}
+}
+
+func TestParseAnthropicSSEAndOpenAIUsageStream(t *testing.T) {
+	anthropicBody := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"inky/inkling-2-mini","content":[],"stop_reason":null,"usage":{"input_tokens":50,"output_tokens":0}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_n_1_0","name":"get_weather","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Seattle\"}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"cache_read_input_tokens":40,"output_tokens":12}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	asum, err := parseAnthropicSSE(strings.NewReader(anthropicBody))
+	if err != nil {
+		t.Fatalf("parseAnthropicSSE failed: %v", err)
+	}
+	if asum.Model != "inky/inkling-2-mini" || asum.StopReason != "tool_use" || asum.Text != "Checking." || len(asum.ToolUses) != 1 || asum.ToolUses[0].Name != "get_weather" || asum.CacheRead != 40 || asum.OutputTokens != 12 {
+		t.Fatalf("unexpected Anthropic SSE summary: %+v", asum)
+	}
+	if _, err := parseAnthropicSSE(strings.NewReader("event: ping\ndata: {\"type\":\"ping\"}\n\n")); err == nil {
+		t.Fatalf("expected missing message_stop to fail")
+	}
+
+	openaiBody := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[{"index":0,"delta":{"content":"58F"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":5,"total_tokens":45,"prompt_tokens_details":{"cached_tokens":30}}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	osum, err := parseOpenAIUsageStream(strings.NewReader(openaiBody))
+	if err != nil {
+		t.Fatalf("parseOpenAIUsageStream failed: %v", err)
+	}
+	if osum.Content != "58F" || osum.Finish != "stop" || osum.TotalTokens != 45 || !osum.SawUsageChunk || osum.Usage.Details.Cached == nil || *osum.Usage.Details.Cached != 30 {
+		t.Fatalf("unexpected OpenAI usage stream summary: %+v", osum)
+	}
+	noUsageBody := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
+	if _, err := parseOpenAIUsageStream(strings.NewReader(noUsageBody)); err == nil {
+		t.Fatalf("expected missing final usage chunk to fail")
+	}
+}
