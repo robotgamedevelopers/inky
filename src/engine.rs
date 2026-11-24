@@ -100,7 +100,7 @@ const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
     "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_combine",
-    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2",
+    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
     "k_topk", "k_norm",
     "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_attn_b", "k_attn_bt", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
@@ -156,7 +156,8 @@ struct MoeArgs {
     act_off: u32, wscale: f32, beta: f32, lbeta: f32,
     dn_lo: u32, dn_hi: u32, dn_expert_bytes: u32, dn_row_bytes: u32,
     dn_type: u32, out_off: u32, res_off: i32, cs_off: u32,
-    convw_off: u32, pad: [u32; 3],
+    convw_off: u32, gu_type: u32, gu_gs_lo: u32, gu_gs_hi: u32,
+    dn_gs_lo: u32, dn_gs_hi: u32, pad0: u32, pad1: u32,
 }
 
 // ---- prefill arg structs (mirror prefill.metal)
@@ -172,6 +173,7 @@ struct GemmHArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [HSeg; 10] }
 struct MoeGemmHArgs {
     w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, xh_off: u32,
     tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, aw_off: u32, beta: f32, lbeta: f32,
+    gs_lo: u32, gs_hi: u32, pad0: u32, pad1: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CtrlBJob { u_off: u32, m_off: u32, g_off: u32, f_off: u32, out_off: u32, norm_w: u32, h_off: i32, nof32: u32 }
@@ -187,7 +189,7 @@ struct GemmArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [GSeg; 10] }
 struct MoeGemmArgs {
     w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, x_off: u32,
     gather: u32, perm_off: u32, tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, pad: u32,
-    beta: f32, lbeta: f32, pad2: [f32; 2],
+    beta: f32, lbeta: f32, gs_lo: u32, gs_hi: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct TopkBArgs { logits_off: u32, bias_off: u32, sel_off: u32, t: u32, wscale: f32, pad: [u32; 3] }
@@ -273,10 +275,12 @@ impl BArena {
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, pad: [u32; 3] }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
 
 // ----------------------------------------------------------------------------- weights
 #[derive(Clone, Copy, Default, Debug)]
-pub struct QW { pub off: u64, pub row_bytes: u32, pub ty: u32, pub rows: u32, pub k: u32, pub expert_bytes: u64 }
+pub struct QW { pub off: u64, pub row_bytes: u32, pub ty: u32, pub rows: u32, pub k: u32, pub expert_bytes: u64, pub gs: u64 }
 
 fn qw(g: &Gguf, name: &str, shape: &[usize], types: &[u32]) -> io::Result<QW> {
     let t = g.tensor(name, shape, types)?;
@@ -284,6 +288,12 @@ fn qw(g: &Gguf, name: &str, shape: &[usize], types: &[u32]) -> io::Result<QW> {
     // All callers pass the target model's fixed geometry. The shaders use 32-bit strides.
     let expert_bytes = u32::try_from(rb * t.ne[1])
         .map_err(|_| invalid_model(format_args!("tensor {name} exceeds the GPU stride limit")))?;
+    let gs = if t.ty == T_NV4 {
+        let gname = name.replace(".weight", ".gscale");
+        g.tensor(&gname, &[NEXP], &[T_F32])?.file_off as u64
+    } else {
+        0
+    };
     Ok(QW {
         off: t.file_off as u64,
         row_bytes: rb as u32,
@@ -291,6 +301,7 @@ fn qw(g: &Gguf, name: &str, shape: &[usize], types: &[u32]) -> io::Result<QW> {
         rows: t.ne[1] as u32,
         k: t.ne[0] as u32,
         expert_bytes: u64::from(expert_bytes),
+        gs,
     })
 }
 
@@ -573,6 +584,34 @@ impl Engine {
         let off = b.lg as usize + i * self.vocab_pad();
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
+    /// GPU Gumbel-max sampling for a batch span's logits row (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky):
+    /// transforms logits in-place with softcap + Gumbel noise (and optional `ban_tok` mask) and writes the drawn
+    /// token ID into `lane.toks[out_index]`.
+    pub fn encode_gumbel_span(&self, cb: &CmdBuf, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+        let b = self.ba.get();
+        assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
+        assert!(out_index * 4 < lane.toks.length(), "encode_gumbel_span: out_index {out_index} out of bounds");
+        let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
+        let sa = SampArgs {
+            logits_off,
+            n: self.n_vocab as u32,
+            seed_lo: seed as u32,
+            seed_hi: (seed >> 32) as u32,
+            pos: pos as u32,
+            ban_tok: ban_tok.unwrap_or(u32::MAX),
+            temp,
+            softcap: self.softcap,
+        };
+        let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
+        let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
+        let e = Enc::new(cb);
+        self.bind_eng(&e);
+        self.bind_lane(&e, lane);
+        self.go(&e, C_ARGMAX, "k_gumbel", &sa, (self.n_vocab.div_ceil(256), 1, 1), 256);
+        self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+        self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+        e.end();
+    }
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
     /// offset of residual vector `i` of the decode path at the current base
@@ -648,8 +687,8 @@ impl Engine {
 
         let n_vocab = validate_vocab(&g, g.uint(&a("vocab_size_unpadded"))?, N_VOCAB_PAD)?;
         let embed_shape = [E, N_VOCAB_PAD];
-        let tok_embd = qw(&g, "token_embd.weight", &embed_shape, &[T_Q4_K])?;
-        let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K])?;
+        let tok_embd = qw(&g, "token_embd.weight", &embed_shape, &[T_Q4_K, T_Q8_0])?;
+        let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K, T_Q8_0])?;
 
         let eps = g.f(&a("attention.layer_norm_rms_epsilon"))?;
         let log_alpha = g.f(&a("attention.log_scale_alpha"))?;
@@ -682,19 +721,19 @@ impl Engine {
                         pb.f32(&g, &n("attn_v_inp_norm.weight"), &[E])? as i32,
                         pb.f32(&g, &n("attn_res_query.weight"), &[E, 3])? as i32,
                         3,
-                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K])?),
-                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K])?),
+                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
                     )
                 };
             layers.push(Layer {
                 swa,
-                wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K])?,
-                wgate: qw(&g, &n("attn_gate.weight"), &[E, NH * HD], &[T_Q4_K])?,
-                wk: qw(&g, &n("attn_k.weight"), &[E, NKV * HD], &[T_Q4_K])?,
-                wv: qw(&g, &n("attn_v.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q6_K])?,
-                wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K])?,
-                wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K])?,
-                wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K])?,
+                wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
+                wgate: qw(&g, &n("attn_gate.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
+                wk: qw(&g, &n("attn_k.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q8_0])?,
+                wv: qw(&g, &n("attn_v.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q6_K, T_Q8_0])?,
+                wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K, T_Q8_0])?,
+                wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K, T_Q8_0])?,
+                wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K, T_Q8_0])?,
                 kconvp, vconvp,
                 attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q,
                 ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight"), &[E])?,
@@ -708,8 +747,8 @@ impl Engine {
                 ffn_post_conv: pb.f32(&g, &n("ffn_post_conv.weight"), &[CONV_TAPS, E])?,
                 router: pb.bf16(&g, &n("ffn_gate_inp.weight"), &[E, NEXP])?,
                 exp_bias: pb.f32(&g, &n("exp_probs_b.bias"), &[NEXP])?,
-                gu: qw(&g, &n("ffn_gate_up_exps.weight"), &[E, 2 * FF, NEXP], &[T_Q4_K])?,
-                dn: qw(&g, &n("ffn_down_exps.weight"), &[FF, E, NEXP], &[T_Q8_0, T_Q5_0])?,
+                gu: qw(&g, &n("ffn_gate_up_exps.weight"), &[E, 2 * FF, NEXP], &[T_Q4_K, T_Q8_0, T_NV4, T_MX8])?,
+                dn: qw(&g, &n("ffn_down_exps.weight"), &[FF, E, NEXP], &[T_Q8_0, T_Q5_0, T_NV4, T_MX8])?,
             });
         }
         let mut loops = Vec::new();
@@ -926,7 +965,8 @@ impl Engine {
                     let dn = &self.layers[l].dn;
                     let ma = MoeArgs { sel_off: ar.logits + 100000 + ((l * 4 + it) as u32 % 32) * 16, act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
                                        dn_lo: dn.off as u32, dn_hi: (dn.off >> 32) as u32, dn_expert_bytes: dn.expert_bytes as u32,
-                                       dn_row_bytes: dn.row_bytes, dn_type: dn.ty, ..Default::default() };
+                                       dn_row_bytes: dn.row_bytes, dn_type: dn.ty,
+                                       dn_gs_lo: dn.gs as u32, dn_gs_hi: (dn.gs >> 32) as u32, ..Default::default() };
                     sels.push(ma.sel_off);
                     e.pso(&self.gpu.pso(name));
                     e.bytes(&ma, 5);
@@ -1008,8 +1048,10 @@ impl Engine {
                     let ld = &self.layers[l];
                     let ma = MoeArgs { sel_off: sel, x_off: Arena::vec(1), act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
                         gu_lo: ld.gu.off as u32, gu_hi: (ld.gu.off >> 32) as u32, gu_expert_bytes: ld.gu.expert_bytes as u32, gu_row_bytes: ld.gu.row_bytes,
+                        gu_type: ld.gu.ty, gu_gs_lo: ld.gu.gs as u32, gu_gs_hi: (ld.gu.gs >> 32) as u32,
                         dn_lo: ld.dn.off as u32, dn_hi: (ld.dn.off >> 32) as u32, dn_expert_bytes: ld.dn.expert_bytes as u32, dn_row_bytes: ld.dn.row_bytes,
-                        dn_type: ld.dn.ty, beta: 4.0, lbeta: 25.0, cs_off: 0, convw_off: ld.ffn_post_conv, ..Default::default() };
+                        dn_type: ld.dn.ty, dn_gs_lo: ld.dn.gs as u32, dn_gs_hi: (ld.dn.gs >> 32) as u32,
+                        beta: 4.0, lbeta: 25.0, cs_off: 0, convw_off: ld.ffn_post_conv, ..Default::default() };
                     e.pso(&self.gpu.pso(which));
                     e.bytes(&ma, 5);
                     e.dispatch((grid.0, grid.1, 1), tgs);
@@ -1085,10 +1127,12 @@ impl Engine {
                             w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                             wtype: l.gu.ty, nrows: (2 * FF) as u32, k: E as u32, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                             out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
                         } } else { MoeGemmHArgs {
                             w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                             wtype: l.dn.ty, nrows: E as u32, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                             out_off: b.yd, ldo: E as u32, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
+                            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
                         } };
                         e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
                         e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + which * 4 * NTC + c * 4) * 4, *tg);
@@ -1593,7 +1637,8 @@ impl Engine {
                 act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
                 dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
                 dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                convw_off: l.ffn_post_conv, pad: [0; 3],
+                convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
+                dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
             };
             self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
             self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
@@ -2096,7 +2141,8 @@ impl Engine {
         let gu = MoeGemmArgs {
             w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
             wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, x_off: x, gather: 1, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta, pad2: [0.0; 2],
+            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta,
+            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32,
         };
         let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
         if self.hgemm {
@@ -2111,6 +2157,7 @@ impl Engine {
                         w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                         wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                         out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
+                        gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
                     };
                     e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
@@ -2123,6 +2170,7 @@ impl Engine {
                         w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                         wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
                         out_off: b.yd, ldo: es, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
+                        gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
                     };
                     e.pso(&self.gpu.pso(name)); e.bytes(&d, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
@@ -2134,7 +2182,8 @@ impl Engine {
         let dn = MoeGemmArgs {
             w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
             wtype: l.dn.ty, nrows: es, k: FF as u32, x_off: b.act, gather: 0, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0, pad2: [0.0; 2],
+            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0,
+            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32,
         };
         self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
         }
@@ -2976,7 +3025,8 @@ impl<'a> Run<'a> {
             act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
             dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
             dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-            convw_off: l.ffn_post_conv, pad: [0; 3],
+            convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
+            dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
         };
         // ---- experts
         self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
@@ -3093,5 +3143,13 @@ mod tests {
         assert_eq!(one * 4, 15_335_424);
         assert_eq!(one * 8, 30_670_848);
         assert_eq!(Engine::cs_image_bytes(), one);
+    }
+
+    #[test]
+    fn shader_arg_structs_match_metal_abi_sizes() {
+        assert_eq!(std::mem::size_of::<MoeArgs>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
     }
 }

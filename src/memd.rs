@@ -690,6 +690,8 @@ fn install_helper() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    // bind_socket temporarily sets process-wide umask(0o177); serialize filesystem tests within this binary.
+    static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
     #[test] fn raised_while_connected_and_restored_after_the_last() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
@@ -759,6 +761,7 @@ mod tests {
         assert_eq!(lim.get(), 70000, "the next session saves the owner's newer limit afresh");
     }
     #[test] fn the_socket_directory_must_be_a_real_directory() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-dirtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -780,6 +783,7 @@ mod tests {
     }
     #[test]
     fn startup_refuses_an_invalid_or_unreadable_save() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-save-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();
@@ -807,6 +811,7 @@ mod tests {
     }
     #[test]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-bind-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let path = base.join("memd.sock");
@@ -823,6 +828,7 @@ mod tests {
     }
     #[test]
     fn legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-old-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();
@@ -840,6 +846,7 @@ mod tests {
     }
     #[test]
     fn absent_legacy_helper_requires_no_trusted_homebrew_directory() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-homebrew-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();
@@ -885,6 +892,7 @@ mod tests {
     }
     #[test]
     fn boot_tagged_saved_limit_ignores_prior_boot_and_syncs_atomically() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::current_dir().unwrap().join(format!("inky-memd-boot-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir(&base).unwrap();

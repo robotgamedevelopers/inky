@@ -31,6 +31,23 @@ inline void deq16_q4k(device const uchar * row, uint k0, thread half * out) {
 
 inline void deq16(device const uchar * row, uint wtype, uint k0, thread half * out) {
     if (wtype == 12) { deq16_q4k(row, k0, out); return; }
+    if (wtype == 200) {         // NV4: fp4 * e4m3 scale is exact in half (|w| <= 6 * 448); expert gscale applied later in fp32
+        device const uchar * b = row + (k0 / 32) * 18;
+        const uint hp = (k0 % 32) / 16;
+        const float s = e4m3f(b[hp]) * NV4_K;
+        device const packed_uchar4 * q4 = (device const packed_uchar4 *) (b + 2);
+        thread half4 * o = (thread half4 *) out;
+        for (int i = 0; i < 4; i++) { const uchar4 q = uchar4(q4[i]); o[i] = half4(fp4f4(hp ? q >> 4 : q & 0xF) * s); }
+        return;
+    }
+    if (wtype == 201) {         // MX8: e4m3 * a power of two
+        device const uchar * b = row + (k0 / 32) * 34;
+        const float d = float(*(device const half *) b) * MX8_K;
+        device const packed_uchar4 * q4 = (device const packed_uchar4 *) (b + 2 + (k0 % 32));
+        thread half4 * o = (thread half4 *) out;
+        for (int i = 0; i < 4; i++) o[i] = half4(e4m3f4(uchar4(q4[i])) * d);
+        return;
+    }
     if (wtype == 8) {           // Q8_0: int8 * d. |q| <= 127 is exact in half, so the half product is the correctly rounded w
         device const block_q8_0 * b = (device const block_q8_0 *) row + k0 / 32;
         const half d = b->d;
@@ -170,7 +187,7 @@ struct MoeGemmArgs {
     uint wtype, nrows, K, x_off;
     uint gather, perm_off, tiles_off, ntiles_off;
     uint out_off, ldo, situ, pad;
-    float beta, lbeta, pad2, pad3;
+    float beta, lbeta; uint gs_lo, gs_hi;
 };
 
 kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmArgs & a [[buffer(5)]],
@@ -215,6 +232,11 @@ kernel void k_moe_gemm(device const uchar * W [[buffer(0)]], device float * A [[
     for (int t = 0; t < 4; t++) for (int r = 0; r < 2; r++)
         simdgroup_store(mc[t * 2 + r], sc + (t * 8) * GM_BM + sg * 16 + r * 8, GM_BM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.wtype == 200) {
+        const float g = gscale_at(W, a.gs_lo, a.gs_hi, e);
+        for (uint i = tid; i < GM_BN * GM_BM; i += 128) sc[i] *= g;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (a.situ) {
         for (uint i = tid; i < GM_BN * 32; i += 128) {
             const uint t = i / 32, r = i % 32;
@@ -692,6 +714,11 @@ kernel void k_moe_gemm_t(device const uchar * W [[buffer(0)]], device float * A 
     auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(GM_BM, GM_BN));
     cT.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.wtype == 200) {
+        const float g = gscale_at(W, a.gs_lo, a.gs_hi, e);
+        for (uint i = tid; i < GM_BN * GM_BM; i += 128) sc[i] *= g;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (a.situ) {
         for (uint i = tid; i < GM_BN * 32; i += 128) {
             const uint t = i / 32, r = i % 32;
@@ -1199,6 +1226,7 @@ template [[host_name("k_gemm_sg4")]] kernel void k_gemm_sg<4>(device const uchar
 struct MoeGemmHArgs {
     uint w_lo, w_hi, expert_bytes, row_bytes, wtype, nrows, K, xh_off;
     uint tiles_off, ntiles_off, out_off, ldo, situ, aw_off; float beta, lbeta;
+    uint gs_lo, gs_hi, pad0, pad1;
 };
 template <int NSG>
 kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmHArgs & a [[buffer(5)]],
@@ -1233,6 +1261,7 @@ kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[bu
         buf ^= 1;
     }
     if (!on) return;
+    if (a.wtype == 200) { const float g = gscale_at(W, a.gs_lo, a.gs_hi, e); for (short i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] *= g; }
     if (!a.situ) {
         device half * yd = (device half *) (A + a.out_off);
         for (short q = 0; q < 8; ++q) {
