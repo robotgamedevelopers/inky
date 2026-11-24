@@ -1,18 +1,19 @@
 #!/bin/zsh
-# tests/soak.sh — N clients against `inky serve` for --duration seconds (receipt run: 3600).
-# Mixed prompt lengths, mixed max_tokens, random mid-response disconnects.
-# Checks: client in-flight back to 0 (the server has no stats route), no 5xx, and
-# iogpu.wired_limit_mb back to the value read before serve. Reads the sysctl only.
-# Does not sudo and does not install inky mode.
+# tests/soak.sh — N clients against `inky serve` for --duration (receipt run: 3600 or 72h).
+# Mixed prompt lengths, mixed max_tokens, random mid-response disconnects, longitudinal
+# post-drain RSS/lane/block/disk drift monitoring, and bounded --record-dir rotation.
 #
 # The bearer is INKY_SERVE_KEY, injected by nova-secrets exec into serve and the
-# client. This script never expands that variable. Do not run it under xtrace.
+# client (or already present in INKY_SERVE_KEY). This script never expands that
+# variable on stdout/argv. Do not run it under xtrace.
 set -eu
 setopt pipefail
 
 cd "${0:A:h}/.."
 
 duration=3600
+epoch=0
+warmup_epochs=1
 lanes=16
 clients=24
 bind=127.0.0.1:18090
@@ -22,16 +23,25 @@ seed=
 inky=
 model=
 disconnect=30
+record_dir=
+record_max_bytes=1048576
+spill_dir=
+spill_max_bytes=0
+max_rss_drift_pct=15
+allow_existing=0
 effort_note=medium
 
 usage() {
-    print -r -- "usage: tests/soak.sh [--duration SEC] [--lanes N] [--clients N] [--bind ADDR] [--ctx N] [--queue N] [--seed N] [--inky PATH] [--model PATH] [--disconnect-pct N]"
+    print -r -- "usage: tests/soak.sh [--duration DUR] [--epoch DUR] [--warmup-epochs N] [--lanes N] [--clients N] [--bind ADDR] [--ctx N] [--queue N] [--seed N] [--inky PATH] [--model PATH] [--disconnect-pct N] [--record-dir DIR] [--record-max-bytes N] [--spill-dir DIR] [--allow-existing-inky]"
     print -r -- "receipt run: tests/soak.sh --duration 3600 --lanes 16"
+    print -r -- "multi-day:   tests/soak.sh --duration 72h --lanes 16"
 }
 
 while (( $# )); do
     case $1 in
         --duration) duration=$2; shift 2 ;;
+        --epoch) epoch=$2; shift 2 ;;
+        --warmup-epochs) warmup_epochs=$2; shift 2 ;;
         --lanes) lanes=$2; shift 2 ;;
         --clients) clients=$2; shift 2 ;;
         --bind) bind=$2; shift 2 ;;
@@ -41,18 +51,34 @@ while (( $# )); do
         --inky) inky=$2; shift 2 ;;
         --model) model=$2; shift 2 ;;
         --disconnect-pct) disconnect=$2; shift 2 ;;
+        --record-dir) record_dir=$2; shift 2 ;;
+        --record-max-bytes) record_max_bytes=$2; shift 2 ;;
+        --spill-dir) spill_dir=$2; shift 2 ;;
+        --spill-max-bytes) spill_max_bytes=$2; shift 2 ;;
+        --max-rss-drift-pct) max_rss_drift_pct=$2; shift 2 ;;
+        --allow-existing-inky) allow_existing=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) print -r -- "unknown argument: $1"; usage; exit 2 ;;
     esac
 done
 
 integer_ok() { [[ $1 == <-> ]] }
-integer_ok "$duration" && (( duration >= 1 )) || { print -r -- "bad --duration"; exit 2 }
+duration_ok() {
+    [[ $1 == <-> ]] && (( $1 >= 1 )) && return 0
+    [[ $1 =~ ^[0-9]+(h|m|s)+([0-9]+(h|m|s))*$ ]] && return 0
+    return 1
+}
+
+duration_ok "$duration" || { print -r -- "bad --duration: $duration"; exit 2 }
+[[ $epoch == 0 ]] || duration_ok "$epoch" || { print -r -- "bad --epoch: $epoch"; exit 2 }
+integer_ok "$warmup_epochs" || { print -r -- "bad --warmup-epochs"; exit 2 }
 integer_ok "$lanes" && (( lanes >= 1 )) || { print -r -- "bad --lanes"; exit 2 }
 integer_ok "$clients" && (( clients >= 1 )) || { print -r -- "bad --clients"; exit 2 }
 integer_ok "$ctx" && (( ctx >= 64 )) || { print -r -- "bad --ctx"; exit 2 }
 integer_ok "$queue" && (( queue >= 0 )) || { print -r -- "bad --queue"; exit 2 }
 integer_ok "$disconnect" && (( disconnect >= 0 && disconnect <= 100 )) || { print -r -- "bad --disconnect-pct"; exit 2 }
+integer_ok "$record_max_bytes" && (( record_max_bytes >= 1 )) || { print -r -- "bad --record-max-bytes"; exit 2 }
+integer_ok "$spill_max_bytes" || { print -r -- "bad --spill-max-bytes"; exit 2 }
 if [[ -z $seed ]]; then
     seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
 fi
@@ -75,19 +101,34 @@ if [[ -z $model ]]; then
 fi
 [[ -f $model ]] || { print -r -- "model file not found: $model"; exit 4 }
 
-secrets=${NOVA_SECRETS:-}
-if [[ -z $secrets ]]; then
-    secrets=$(command -v nova-secrets || true)
+use_env_key=0
+if [[ -n ${INKY_SERVE_KEY:-} ]]; then
+    use_env_key=1
+else
+    secrets=${NOVA_SECRETS:-}
+    if [[ -z $secrets ]]; then
+        secrets=$(command -v nova-secrets || true)
+    fi
+    if [[ -z $secrets ]]; then
+        secrets=$HOME/.local/bin/nova-secrets
+    fi
+    [[ -x $secrets ]] || { print -r -- "nova-secrets not found"; exit 4 }
+    [[ -x /opt/homebrew/bin/sops ]] || { print -r -- "sops not found at /opt/homebrew/bin/sops"; exit 4 }
+    host_id=$(hostname -s)
+    if [[ -f "$HOME/.config/nova-secrets/${host_id}.key" ]]; then
+        secrets_as=$host_id
+        secrets_key="$HOME/.config/nova-secrets/${host_id}.key"
+    else
+        secrets_as=mini-m5
+        secrets_key="$HOME/.config/nova-secrets/mini-m5.key"
+    fi
+    [[ -f $secrets_key ]] || { print -r -- "nova-secrets key not found: $secrets_key"; exit 4 }
 fi
-if [[ -z $secrets ]]; then
-    secrets=$HOME/.local/bin/nova-secrets
-fi
-[[ -x $secrets ]] || { print -r -- "nova-secrets not found"; exit 4 }
-[[ -x /opt/homebrew/bin/sops ]] || { print -r -- "sops not found at /opt/homebrew/bin/sops"; exit 4 }
+
 command -v curl >/dev/null || { print -r -- "curl not found"; exit 4 }
 command -v go >/dev/null || { print -r -- "go not found (needed to build tests/soak_client.go)"; exit 4 }
 
-if ps -ax -o command= | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
+if (( allow_existing == 0 )) && ps -ax -o command= | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
     print -r -- "refusing: inky or a cargo build is already running on this machine; not starting a second server"
     exit 3
 fi
@@ -125,7 +166,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/inky-soak-client.XXXXXX")
+scratch_base=${TMPDIR:-$PWD/target/soak-scratch}
+mkdir -p "$scratch_base"
+work=$(mktemp -d "${scratch_base%/}/inky-soak-client.XXXXXX")
 [[ -n $work && -d $work ]] || { print -r -- "mktemp failed"; exit 1 }
 cp tests/soak_client.go "$work/main.go"
 (
@@ -134,47 +177,72 @@ cp tests/soak_client.go "$work/main.go"
     GOPROXY=off go build -mod=readonly -o "$work/soak-client" .
 )
 
-log=$(mktemp "${TMPDIR:-/tmp}/inky-soak-serve.XXXXXX")
-client_out=$(mktemp "${TMPDIR:-/tmp}/inky-soak-client-out.XXXXXX")
+log=$(mktemp "${scratch_base%/}/inky-soak-serve.XXXXXX")
+client_out=$(mktemp "${scratch_base%/}/inky-soak-client-out.XXXXXX")
+if [[ -z $record_dir ]]; then
+    record_dir="$work/records"
+fi
+mkdir -p "$record_dir"
+# Two generations (.jsonl + .jsonl.1) plus single-line framing margin.
+record_max_total_bytes=$(( record_max_bytes * 2 + 65536 ))
 
-# argv only. The key stays in the environment nova-secrets exec becomes.
-serve_cmd=(
-    "$secrets" exec
-    --store "$HOME/.local/share/nova/secrets"
-    --as mini-m5
-    --key "$HOME/.config/nova-secrets/mini-m5.key"
-    --sops /opt/homebrew/bin/sops
-    --only INKY_SERVE_KEY
-    --
+serve_args=(
     "$inky" serve
     --key-env INKY_SERVE_KEY
     --lanes "$lanes"
     --bind "$bind"
     -c "$ctx"
     --queue "$queue"
+    --record-dir "$record_dir"
+    --record-max-bytes "$record_max_bytes"
     -n 512
     -m "$model"
 )
-client_cmd=(
-    "$secrets" exec
-    --store "$HOME/.local/share/nova/secrets"
-    --as mini-m5
-    --key "$HOME/.config/nova-secrets/mini-m5.key"
-    --sops /opt/homebrew/bin/sops
-    --only INKY_SERVE_KEY
-    --
+client_args=(
     "$work/soak-client"
     -url "http://$bind/v1/chat/completions"
     -duration "$duration"
+    -epoch "$epoch"
+    -warmup-epochs "$warmup_epochs"
     -clients "$clients"
     -lanes "$lanes"
     -queue "$queue"
     -seed "$seed"
     -disconnect-pct "$disconnect"
+    -record-dir "$record_dir"
+    -record-max-total-bytes "$record_max_total_bytes"
+    -max-rss-drift-pct "$max_rss_drift_pct"
 )
+if [[ -n $spill_dir ]]; then
+    client_args+=( -spill-dir "$spill_dir" -spill-max-total-bytes "$spill_max_bytes" )
+fi
+
+if (( use_env_key == 1 )); then
+    serve_cmd=( "${serve_args[@]}" )
+    client_cmd_prefix=( )
+else
+    serve_cmd=(
+        "$secrets" exec
+        --store "$HOME/.local/share/nova/secrets"
+        --as "$secrets_as"
+        --key "$secrets_key"
+        --sops /opt/homebrew/bin/sops
+        --only INKY_SERVE_KEY
+        --
+        "${serve_args[@]}"
+    )
+    client_cmd_prefix=(
+        "$secrets" exec
+        --store "$HOME/.local/share/nova/secrets"
+        --as "$secrets_as"
+        --key "$secrets_key"
+        --sops /opt/homebrew/bin/sops
+        --only INKY_SERVE_KEY
+        --
+    )
+fi
 
 print -r -- "command: ${serve_cmd[*]}"
-print -r -- "clients_command: ${client_cmd[*]}"
 
 "${serve_cmd[@]}" >"$log" 2>&1 &
 serve_pid=$!
@@ -197,6 +265,9 @@ if (( health_ok == 0 )); then
     tail -n 40 "$log" 2>/dev/null || true
     exit 1
 fi
+
+client_cmd=( "${client_cmd_prefix[@]}" "${client_args[@]}" -server-pid "$serve_pid" )
+print -r -- "clients_command: ${client_cmd[*]}"
 
 start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 print -r -- "start=$start"
@@ -244,21 +315,24 @@ fi
 inflight_end=${rec[inflight_end]:-}
 server_active_lanes_end=${rec[server_active_lanes_end]:-}
 server_inflight_end=${rec[server_inflight_end]:-}
+server_queued_end=${rec[server_queued_end]:-}
 server_health_ok=${rec[server_health_ok]:-}
 recovery_completed=${rec[recovery_completed]:-}
 recovery_requested=${rec[recovery_requested]:-}
 workload_completed=${rec[workload_completed]:-}
+drift_ok=${rec[drift_ok]:-}
 
 recovery_ok=0
-if [[ $inflight_end == 0 && $server_health_ok == 1 && $server_active_lanes_end == 0 && $server_inflight_end == 0 && $recovery_completed == "$lanes" && $recovery_requested == "$lanes" ]]; then
+if [[ $inflight_end == 0 && $server_health_ok == 1 && $server_active_lanes_end == 0 && $server_inflight_end == 0 && ${server_queued_end:-0} == 0 && $recovery_completed == "$lanes" && $recovery_requested == "$lanes" ]]; then
     recovery_ok=1
 fi
 client_ok=0
 if (( client_ec == 0 )); then
     client_ok=1
 fi
-print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} server_active_lanes_end=${server_active_lanes_end:-missing} server_inflight_end=${server_inflight_end:-missing} source=server_health_and_client_outstanding"
+print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} server_active_lanes_end=${server_active_lanes_end:-missing} server_inflight_end=${server_inflight_end:-missing} server_queued_end=${server_queued_end:-missing} source=server_health_and_client_outstanding"
 print -r -- "check_client=$client_ok workload_completed=${workload_completed:-missing} client_exit=$client_ec"
+print -r -- "check_drift=${drift_ok:-0} epochs_total=${rec[epochs_total]:-0} epochs_steady=${rec[epochs_steady]:-0} rss_steady_first=${rec[rss_steady_first_bytes]:-0} rss_steady_last=${rec[rss_steady_last_bytes]:-0} rss_drift_bytes=${rec[rss_drift_bytes]:-0} record_dir_bytes_max=${rec[record_dir_bytes_max]:-0}"
 print -r -- "check_wired_limit=$wired_restored before=$wired_before after=${wired_after:-unread}"
 print -r -- "prompt_lengths=short:${rec[prompt_short_bytes]:-64}B medium:${rec[prompt_medium_bytes]:-1024}B long:${rec[prompt_long_bytes]:-4096}B"
 print -r -- "max_tokens=${rec[max_tokens]:-16,64,256}"
@@ -266,7 +340,7 @@ print -r -- "requests=${rec[requests]:-0} http_200=${rec[http_200]:-0} http_429=
 print -r -- "effort_default=$effort_note temperature=0 stream=true"
 
 exit_code=0
-if (( recovery_ok == 0 || client_ok == 0 || wired_restored == 0 )); then
+if (( recovery_ok == 0 || client_ok == 0 || wired_restored == 0 )) || [[ ${drift_ok:-0} != 1 ]]; then
     exit_code=1
     print -r -- "serve_log=$log"
 else

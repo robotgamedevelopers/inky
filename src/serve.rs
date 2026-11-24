@@ -31,7 +31,9 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// default hard cap on thinking tokens before forcing `<|end_message|>` (`0` = unlimited)
                       pub thinking_budget: usize,
                       /// optional directory for opt-in JSONL card traffic recording (`--record-dir`)
-                      pub record_dir: Option<std::path::PathBuf> }
+                      pub record_dir: Option<std::path::PathBuf>,
+                      /// max bytes per cards-YYYYMMDD.jsonl file before rotating to `.1`
+                      pub record_max_bytes: u64 }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -1390,16 +1392,23 @@ impl PermitPool {
 }
 
 fn health_body(cx: &Ctx) -> String {
-    json!({
-        "ok": true,
-        "active_lanes": cx.active_lanes.load(Ordering::Relaxed),
-        "inflight": cx.admission.inflight(),
-        "recommended_working_set_bytes": cx.budget.recommended_working_set_bytes,
-        "model_bytes": cx.budget.model_bytes,
-        "per_lane_worst_case_bytes": cx.budget.per_lane_worst_case_bytes,
-        "max_admitted_lanes": cx.budget.max_admitted_lanes,
-        "queued_requests": cx.admission.queued(),
-    }).to_string()
+    let mut obj = serde_json::Map::from_iter([
+        ("ok".into(), json!(true)),
+        ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
+        ("inflight".into(), json!(cx.admission.inflight())),
+        ("recommended_working_set_bytes".into(), json!(cx.budget.recommended_working_set_bytes)),
+        ("model_bytes".into(), json!(cx.budget.model_bytes)),
+        ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
+        ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
+        ("queued_requests".into(), json!(cx.admission.queued())),
+    ]);
+    if let Some(rec) = &cx.recorder {
+        obj.insert("record_written".into(), json!(rec.written_count()));
+        obj.insert("record_dropped".into(), json!(rec.dropped_count()));
+        obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
+        obj.insert("record_rotations".into(), json!(rec.rotation_count()));
+    }
+    Value::Object(obj).to_string()
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -1893,7 +1902,7 @@ pub fn serve(o: ServeOpts) {
     let (jtx, jrx) = channel::<Job>();
     let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
-    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::new(d.clone())));
+    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
     let cx = Arc::new(Ctx { tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
@@ -3262,6 +3271,24 @@ mod tests {
         assert_eq!(entries[1].turn_index, 1);
         assert_eq!(entries[0].response.status_code, 200);
         assert_eq!(entries[0].response.completion_tokens, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn health_body_reports_recorder_telemetry_when_enabled() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-health-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::with_options(dir.clone(), 16, 4096));
+        let (mut cx, _jrx) = admission_test_ctx_with(2, 1, Duration::from_secs(1), 2);
+        cx.recorder = Some(rec);
+        let body: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["record_written"], 0);
+        assert_eq!(body["record_dropped"], 0);
+        assert_eq!(body["record_write_errors"], 0);
+        assert_eq!(body["record_rotations"], 0);
+        drop(cx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

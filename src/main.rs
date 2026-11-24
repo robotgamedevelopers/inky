@@ -64,6 +64,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
+  --record-max-bytes N
+                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -73,6 +75,14 @@ fn cli_error(error: String) -> ! {
 
 fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
     value.parse().map_err(|_| format!("{flag} requires a nonnegative integer"))
+}
+
+fn parse_u64_positive(flag: &str, value: &str) -> Result<u64, String> {
+    let v: u64 = value.parse().map_err(|_| format!("{flag} requires a positive integer"))?;
+    if v == 0 {
+        return Err(format!("{flag} must be greater than 0"));
+    }
+    Ok(v)
 }
 
 fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
@@ -91,6 +101,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: 16, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
+        record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -119,6 +130,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
             "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
+            "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -167,6 +179,9 @@ mod cli_tests {
             (&["--key-env", "NONUNICODE"], "variable must contain valid UTF-8"),
             (&["--bind"], "missing value for --bind"),
             (&["--record-dir"], "missing value for --record-dir"),
+            (&["--record-max-bytes"], "missing value for --record-max-bytes"),
+            (&["--record-max-bytes", "0"], "--record-max-bytes must be greater than 0"),
+            (&["--record-max-bytes", "abc"], "--record-max-bytes requires a positive integer"),
             (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
             (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
             (&["--typo"], "unknown serve option --typo"),
@@ -180,7 +195,9 @@ mod cli_tests {
     #[test]
     fn serve_checks_the_addresses_it_will_bind() {
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
+        assert_eq!(serve_args(&[]).unwrap().record_max_bytes, record::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
+        assert_eq!(serve_args(&["--record-max-bytes", "4096"]).unwrap().record_max_bytes, 4096);
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
