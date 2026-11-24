@@ -457,7 +457,8 @@ pub struct Engine {
     verify_keep: RefCell<Option<VerifyKeep>>,
     /// Set only while `encode_verify`'s layers run, so a later prefill does not write into the images.
     verify_record: Cell<bool>,
-    /// Layer 3 pools, one per kind. Not allocated yet. The table lives on the lane.
+    /// Layer 3 pools, one per kind. One contiguous GPU slab per kind, sized by `kvb`,
+    /// splitting into at most four slabs at `maxBufferLength`. Attention does not read them yet. The table lives on the lane.
     /// `RefCell` because a step mutates the pool through `&Engine`.
     block_pool: std::cell::RefCell<crate::blocks::BlockPools>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
@@ -555,7 +556,7 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
-    /// Both block pools. Empty until the pool worker sizes them.
+    /// Both block pools. One GPU slab per kind, sized at load to `kvb` and the initial cache block.
     /// Interior mutability: callers borrow through the `RefCell`.
     #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
     pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
@@ -818,6 +819,8 @@ impl Engine {
         let ctr = gpu.buffer(4096 * 4);
         eprintln!("[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
             path.rsplit('/').next().unwrap_or(path), g.file_len() as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
+        // KV_CAP0 positions is one block. Further slots come from `BlockPool::grow`.
+        let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
         let eng = Engine {
             eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
@@ -830,7 +833,7 @@ impl Engine {
             last_out: Default::default(), last_mid: Default::default(),
             max_ctx, n_vocab,
             verify_keep: RefCell::new(None), verify_record: Cell::new(false),
-            block_pool: std::cell::RefCell::new(crate::blocks::BlockPools::stub()),
+            block_pool,
         };
         let mut eng = eng;
         eng.ensure_batch(64);
