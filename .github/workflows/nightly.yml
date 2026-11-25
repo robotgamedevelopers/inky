@@ -125,10 +125,7 @@ jobs:
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: LoopCD model and mixed-lane regressions
         if: ${{ !cancelled() }}
-        run: |
-          out=$(cargo test --locked --release --bins loopcd_ -- --ignored --test-threads=1 2>&1) || { printf '%s\n' "$out"; exit 1; }
-          printf '%s\n' "$out"
-          printf '%s\n' "$out" | grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' || { echo 'loopcd_: expected >=1 passed; 0 failed' >&2; exit 1; }
+        run: tests/loopcd-gate.sh
       - name: GPU window attention split-invariance regression
         if: ${{ !cancelled() }}
         run: |
@@ -167,3 +164,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: tests/serve-negative.sh tests/serve.sh
+      - name: one-hour steady-state soak
+        if: ${{ !cancelled() }}
+        run: |
+          INKY_SERVE_KEY=$(openssl rand -hex 16)
+          export INKY_SERVE_KEY
+          tests/soak.sh --inky "$PWD/target/release/inky" --duration 1h --epoch 10m --seed 20261125
+      - name: soak fault qualification
+        if: ${{ !cancelled() }}
+        run: tests/soak_faults.sh --inky "$PWD/target/release/inky"

@@ -277,6 +277,7 @@ if want traces; then
             *) echo "traces: scripts/check-$t-traces.sh is not in trace_scripts in scripts/check-tla.sh; wire it" >&2; exit 1 ;;
         esac
     done
+    (cd "$root" && rustc --version >/dev/null)
     pids= names=
     total_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     light_jobs=$(( (total_cpus + 1) / 2 ))

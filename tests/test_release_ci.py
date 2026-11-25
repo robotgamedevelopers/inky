@@ -200,6 +200,9 @@ class ReleaseCiTests(unittest.TestCase):
         expanded = set()
         for key, job in ci_jobs.items():
             self.assertIn("timeout-minutes", job, f"ci.yml job {key} missing timeout-minutes")
+            if key == "m5-pr-result":
+                self.assertIn("github.event_name == 'pull_request'", job["if"])
+                continue
             base = job.get("name", key)
             parts = job.get("strategy", {}).get("matrix", {}).get("part")
             if parts:
@@ -372,6 +375,32 @@ class ReleaseCiTests(unittest.TestCase):
         self.assertEqual(now[0], 180.0)
         self.assertIn("::error::No online M5 self-hosted runner picked up the job (0 active M5 runs", out.getvalue())
         self.assertEqual(cancelled, ["repos/robotgamedevelopers/inky/actions/runs/100/cancel"])
+
+
+    def test_pr_m5_result_requires_real_success_and_same_repository(self):
+        job = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]["m5-pr-result"]
+        self.assertIn("always()", job["if"])
+        self.assertIn("github.base_ref == 'main'", job["if"])
+        self.assertEqual(job["needs"], ["m5-gpu", "m5-serve"])
+        step = job["steps"][0]
+        self.assertEqual(step["env"]["GPU"], "${{ needs.m5-gpu.result }}")
+        self.assertEqual(step["env"]["SERVE"], "${{ needs.m5-serve.result }}")
+        for same_repo, gpu, serve, passes in (
+            ("true", "success", "success", True),
+            ("false", "success", "success", False),
+            ("false", "skipped", "skipped", False),
+            ("true", "skipped", "success", False),
+            ("true", "success", "skipped", False),
+            ("true", "failure", "success", False),
+            ("true", "success", "cancelled", False),
+        ):
+            with self.subTest(same_repo=same_repo, gpu=gpu, serve=serve):
+                result = subprocess.run(
+                    ["bash", "-c", step["run"]],
+                    env={"SAME_REPOSITORY": same_repo, "GPU": gpu, "SERVE": serve},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
 
 
 if __name__ == "__main__":
