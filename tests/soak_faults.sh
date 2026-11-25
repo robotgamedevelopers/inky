@@ -5,7 +5,7 @@
 #   3. Full disk (hdiutil ENOSPC mount) --record-dir write-error isolation without 5xx/panic/corruption
 #   4. SIGKILL (kill -9) crash mid-flight + memd socket-close cleanup + restart + exact seeded output
 #
-# Never uses /tmp. Always cleans up spawned processes, mounts, and temp dirs via trap EXIT.
+# Cleans up spawned processes, mounts, and temporary directories via trap EXIT.
 set -eu
 setopt pipefail
 
@@ -70,6 +70,7 @@ serve_pid=0
 memd_pid=0
 bg_pid=0
 mounted_dir=
+memd_dir=
 
 stop_pid() {
     local pid=$1 sig=${2:-TERM}
@@ -103,6 +104,9 @@ cleanup() {
     fi
     if [[ -n ${mounted_dir:-} ]] && mount | grep -F "$mounted_dir" >/dev/null 2>&1; then
         hdiutil detach "$mounted_dir" >/dev/null 2>&1 || hdiutil detach -force "$mounted_dir" >/dev/null 2>&1 || true
+    fi
+    if [[ -n $memd_dir ]]; then
+        rm -rf -- "$memd_dir"
     fi
     if [[ -n ${work:-} && -d $work ]]; then
         chmod -R u+rwX "$work" 2>/dev/null || true
@@ -242,7 +246,9 @@ hdiutil detach "$mounted_dir" >/dev/null 2>&1 || hdiutil detach -force "$mounted
 mounted_dir=
 
 print -r -- "=== [4/4] SIGKILL (kill -9) Crash, memd Recovery, and Restart Reference Check ==="
-memd_sock="$work/memd.sock"
+# The checkout path can exceed the Unix-domain socket pathname limit.
+memd_dir=$(mktemp -d "${TMPDIR:-/tmp}/inky-memd.XXXXXX")
+memd_sock="$memd_dir/s"
 memd_log="$work/memd.log"
 crash_rec="$work/rec-crash"
 mkdir -p "$crash_rec"

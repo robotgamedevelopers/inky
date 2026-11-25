@@ -5,11 +5,12 @@
 #    greedy decode steps, every pool slot outside the step poisoned; must give layer 2's outputs bit for bit
 #    (measured 194 s wall, 3:14, on an M5 Pro, 2026-11-23).
 set -e
+setopt pipefail
 cd "${0:A:h}/.."
 B=./target/release/inky
 fail=0
 INK_POOLGATE_LANES=17 INK_POOLGATE_CHUNKS=31,1,23,7,17,1,29,64,127,61,1,256 INK_POOLGATE_DECODE=64 \
-    $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
+    $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
 # A fresh path makes a skipped test or a disconnected trace hook fail the replay.
 trace_work=$(mktemp -d "${TMPDIR:-/tmp}/inky-nightly-serve.XXXXXX")
 trap 'rm -rf "$trace_work"' EXIT
