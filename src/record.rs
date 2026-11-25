@@ -700,10 +700,10 @@ mod tests {
             turn_index: 0,
             endpoint: "/v1/chat/completions".into(),
             request: json!({"text": ""}),
-            response: ResponseMetrics {
-                prompt_tokens: 1, completion_tokens: 1, ttft_ms: 1, total_ms: 1,
-                queue_ms: 0, prefill_ms: 0, decode_ms: 0, finish_reason: "stop".into(), status_code: 200,
-            },
+            response: ResponseMetrics::from_json(&json!({
+                "prompt_tokens": 1, "completion_tokens": 1, "ttft_ms": 1, "total_ms": 1,
+                "queue_ms": 0, "prefill_ms": 0, "decode_ms": 0, "finish_reason": "stop", "status_code": 200,
+            })).unwrap(),
         };
         let max_bytes = serde_json::to_vec(&entry.to_json()).unwrap().len() as u64 + 1;
         let recorder = Recorder::with_options(dir.clone(), 4, max_bytes);
