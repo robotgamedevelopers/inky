@@ -161,6 +161,7 @@ type healthSnapshot struct {
 	ActiveLanes                *int   `json:"active_lanes"`
 	Inflight                   *int   `json:"inflight"`
 	QueuedRequests             *int   `json:"queued_requests"`
+	OutputTokens               *int64 `json:"output_tokens,omitempty"`
 	RecommendedWorkingSetBytes *int64 `json:"recommended_working_set_bytes"`
 	ModelBytes                 *int64 `json:"model_bytes"`
 	PerLaneWorstCaseBytes      *int64 `json:"per_lane_worst_case_bytes"`
@@ -201,22 +202,25 @@ type driftConfig struct {
 	WarmupEpochs        int
 	MaxRSSDriftPct      float64
 	MaxRSSDriftBytes    int64
+	ModelBytes          int64
 	RecordMaxTotalBytes int64
 	SpillMaxTotalBytes  int64
 }
 
 type driftReport struct {
-	OK                  bool   `json:"ok"`
-	Reason              string `json:"reason,omitempty"`
-	EpochsTotal         int    `json:"epochs_total"`
-	EpochsSteady        int    `json:"epochs_steady"`
-	RSSWarmupBytes      int64  `json:"rss_warmup_bytes"`
-	RSSSteadyFirstBytes int64  `json:"rss_steady_first_bytes"`
-	RSSSteadyLastBytes  int64  `json:"rss_steady_last_bytes"`
-	RSSSteadyMaxBytes   int64  `json:"rss_steady_max_bytes"`
-	RSSDriftBytes       int64  `json:"rss_drift_bytes"`
-	RecordDirBytesMax   int64  `json:"record_dir_bytes_max"`
-	SpillDirBytesMax    int64  `json:"spill_dir_bytes_max"`
+	OK                     bool   `json:"ok"`
+	Reason                 string `json:"reason,omitempty"`
+	EpochsTotal            int    `json:"epochs_total"`
+	EpochsSteady           int    `json:"epochs_steady"`
+	ModelBytes             int64  `json:"model_bytes"`
+	RSSWarmupBytes         int64  `json:"rss_warmup_bytes"`
+	RSSSteadyFirstBytes    int64  `json:"rss_steady_first_bytes"`
+	RSSNetSteadyFirstBytes int64  `json:"rss_net_steady_first_bytes"`
+	RSSSteadyLastBytes     int64  `json:"rss_steady_last_bytes"`
+	RSSSteadyMaxBytes      int64  `json:"rss_steady_max_bytes"`
+	RSSDriftBytes          int64  `json:"rss_drift_bytes"`
+	RecordDirBytesMax      int64  `json:"record_dir_bytes_max"`
+	SpillDirBytesMax       int64  `json:"spill_dir_bytes_max"`
 }
 
 func analyzeDrift(samples []epochSample, cfg driftConfig) driftReport {
@@ -296,56 +300,122 @@ func analyzeDrift(samples []epochSample, cfg driftConfig) driftReport {
 			rep.RSSSteadyMaxBytes = s.ServerRSSBytes
 		}
 	}
+	effectiveModelBytes := cfg.ModelBytes
+	if effectiveModelBytes <= 0 {
+		effectiveModelBytes = firstModelBytes
+	}
+	rep.ModelBytes = effectiveModelBytes
+	netFirst := rep.RSSSteadyFirstBytes
+	if effectiveModelBytes > 0 {
+		if rep.RSSSteadyFirstBytes > effectiveModelBytes {
+			netFirst = rep.RSSSteadyFirstBytes - effectiveModelBytes
+		} else {
+			netFirst = 0
+		}
+	}
+	rep.RSSNetSteadyFirstBytes = netFirst
+
 	if rep.RSSSteadyFirstBytes > 0 {
 		rep.RSSDriftBytes = rep.RSSSteadyLastBytes - rep.RSSSteadyFirstBytes
 		if len(steady) >= 2 {
-			pctAllowed := int64(float64(rep.RSSSteadyFirstBytes) * (cfg.MaxRSSDriftPct / 100.0))
+			// Measure percentage drift net of static model weights so multi-GiB models cannot mask heap/KV leaks.
+			pctAllowed := int64(float64(netFirst) * (cfg.MaxRSSDriftPct / 100.0))
 			allowed := cfg.MaxRSSDriftBytes
 			if pctAllowed > allowed {
 				allowed = pctAllowed
 			}
 			if rep.RSSDriftBytes > allowed {
 				rep.OK = false
-				rep.Reason = fmt.Sprintf("steady-state RSS drifted upward by %d bytes (first=%d last=%d allowed=%d)",
-					rep.RSSDriftBytes, rep.RSSSteadyFirstBytes, rep.RSSSteadyLastBytes, allowed)
+				rep.Reason = fmt.Sprintf("steady-state RSS drifted upward by %d bytes net of model=%d (first=%d net_first=%d last=%d allowed=%d)",
+					rep.RSSDriftBytes, effectiveModelBytes, rep.RSSSteadyFirstBytes, netFirst, rep.RSSSteadyLastBytes, allowed)
 				return rep
 			}
-			// Detect strict monotonic upward RSS creep across 4+ steady epochs even below coarse floor.
-			if len(steady) >= 4 && cfg.MaxRSSDriftBytes > 0 && rep.RSSDriftBytes > cfg.MaxRSSDriftBytes/2 && strictlyIncreasingRSS(steady) {
+			// Detect sustained upward RSS creep across 4+ steady epochs even when an intermediate epoch is flat or dips slightly.
+			if len(steady) >= 4 && cfg.MaxRSSDriftBytes > 0 && sustainedUpwardRSSCreep(steady, cfg.MaxRSSDriftBytes/2) {
 				rep.OK = false
-				rep.Reason = fmt.Sprintf("steady-state RSS increased monotonically across %d epochs (%d -> %d)",
-					len(steady), rep.RSSSteadyFirstBytes, rep.RSSSteadyLastBytes)
+				rep.Reason = fmt.Sprintf("steady-state RSS crept upward across %d epochs (%d -> %d, delta=%d)",
+					len(steady), rep.RSSSteadyFirstBytes, rep.RSSSteadyLastBytes, rep.RSSDriftBytes)
 				return rep
 			}
 		}
 	}
 
-	// If spill directory is monitored across 3+ steady epochs, ensure post-drain spill bytes do not strictly climb.
-	if len(steady) >= 3 && steady[len(steady)-1].SpillDirBytes > steady[0].SpillDirBytes && strictlyIncreasingSpill(steady) {
+	// If spill directory is monitored across 3+ steady epochs, ensure post-drain spill bytes do not climb.
+	if len(steady) >= 3 && sustainedUpwardSpillCreep(steady) {
 		rep.OK = false
-		rep.Reason = fmt.Sprintf("steady-state spill_dir_bytes grew monotonically (%d -> %d)",
+		rep.Reason = fmt.Sprintf("steady-state spill_dir_bytes crept upward (%d -> %d)",
 			steady[0].SpillDirBytes, steady[len(steady)-1].SpillDirBytes)
 		return rep
 	}
 	return rep
 }
 
-func strictlyIncreasingRSS(s []epochSample) bool {
-	for i := 1; i < len(s); i++ {
-		if s[i].ServerRSSBytes <= s[i-1].ServerRSSBytes {
-			return false
+func sustainedUpwardRSSCreep(s []epochSample, threshold int64) bool {
+	n := len(s)
+	if n < 4 {
+		return false
+	}
+	netDelta := s[n-1].ServerRSSBytes - s[0].ServerRSSBytes
+	if netDelta <= threshold {
+		return false
+	}
+	nonDecreasing := true
+	upSteps := 0
+	for i := 1; i < n; i++ {
+		if s[i].ServerRSSBytes < s[i-1].ServerRSSBytes {
+			nonDecreasing = false
+		} else if s[i].ServerRSSBytes > s[i-1].ServerRSSBytes {
+			upSteps++
 		}
 	}
-	return true
+	if nonDecreasing && upSteps >= 2 {
+		return true
+	}
+	// Linear regression trend check catches steady leaks even if one noisy epoch dips slightly.
+	if upSteps*2 <= n-1 {
+		return false
+	}
+	meanX := float64(n-1) / 2.0
+	var sumY float64
+	for _, ep := range s {
+		sumY += float64(ep.ServerRSSBytes)
+	}
+	meanY := sumY / float64(n)
+	var covXY, varX, varY float64
+	for i, ep := range s {
+		dx := float64(i) - meanX
+		dy := float64(ep.ServerRSSBytes) - meanY
+		covXY += dx * dy
+		varX += dx * dx
+		varY += dy * dy
+	}
+	if varX <= 0 || varY <= 0 {
+		return false
+	}
+	slope := covXY / varX
+	r2 := (covXY * covXY) / (varX * varY)
+	return slope > 0 && slope*float64(n-1) > float64(threshold) && r2 >= 0.70
 }
 
-func strictlyIncreasingSpill(s []epochSample) bool {
-	for i := 1; i < len(s); i++ {
-		if s[i].SpillDirBytes <= s[i-1].SpillDirBytes {
+func sustainedUpwardSpillCreep(s []epochSample) bool {
+	n := len(s)
+	if n < 3 || s[n-1].SpillDirBytes <= s[0].SpillDirBytes {
+		return false
+	}
+	upSteps := 0
+	for i := 1; i < n; i++ {
+		if s[i].SpillDirBytes < s[i-1].SpillDirBytes {
 			return false
 		}
+		if s[i].SpillDirBytes > s[i-1].SpillDirBytes {
+			upSteps++
+		}
 	}
-	return true
+	return upSteps >= 2
+}
+
+func unexpected429UnderCapacity(clients, lanes, queue int, allow429 bool, count429 int64) bool {
+	return !allow429 && clients <= lanes+queue && count429 > 0
 }
 
 func ptrIntVal(p *int) int {
@@ -486,9 +556,11 @@ type clientConfig struct {
 	clients               int
 	lanes                 int
 	queue                 int
+	allow429              bool
 	seed                  uint64
 	disconnectPct         int
 	serverPID             int
+	modelBytes            int64
 	recordDir             string
 	recordMaxTotalBytes   int64
 	spillDir              string
@@ -499,6 +571,8 @@ type clientConfig struct {
 	stormRequests         int
 	expectRecordWriteErrs bool
 	referenceFile         string
+	noSleep               bool
+	drainTimeout          time.Duration
 }
 
 func main() {
@@ -511,9 +585,11 @@ func main() {
 	clients := flag.Int("clients", 24, "concurrent clients")
 	lanes := flag.Int("lanes", 16, "server lane count, recorded in the summary")
 	queue := flag.Int("queue", 64, "server queue depth, recorded in the summary")
+	allow429 := flag.Bool("allow-429", false, "allow HTTP 429 responses even when clients <= lanes + queue")
 	seed := flag.Uint64("seed", 1, "RNG seed")
 	disconnect := flag.Int("disconnect-pct", 30, "percent of requests closed mid-response")
 	serverPID := flag.Int("server-pid", 0, "optional server PID for RSS drift sampling")
+	modelBytes := flag.Int64("model-bytes", 0, "optional model weight bytes override for net RSS drift analysis")
 	recordDir := flag.String("record-dir", "", "optional server --record-dir to verify bounded disk usage")
 	recordMaxTotalBytes := flag.Int64("record-max-total-bytes", 0, "optional max total bytes allowed in record-dir")
 	spillDir := flag.String("spill-dir", "", "optional spill directory to verify bounded disk usage")
@@ -594,9 +670,11 @@ func main() {
 		clients:               *clients,
 		lanes:                 *lanes,
 		queue:                 *queue,
+		allow429:              *allow429,
 		seed:                  *seed,
 		disconnectPct:         *disconnect,
 		serverPID:             *serverPID,
+		modelBytes:            *modelBytes,
 		recordDir:             *recordDir,
 		recordMaxTotalBytes:   *recordMaxTotalBytes,
 		spillDir:              *spillDir,
@@ -711,9 +789,11 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 		WarmupEpochs:        cfg.warmupEpochs,
 		MaxRSSDriftPct:      cfg.maxRSSDriftPct,
 		MaxRSSDriftBytes:    cfg.maxRSSDriftBytes,
+		ModelBytes:          cfg.modelBytes,
 		RecordMaxTotalBytes: cfg.recordMaxTotalBytes,
 		SpillMaxTotalBytes:  cfg.spillMaxTotalBytes,
 	})
+	bad429 := unexpected429UnderCapacity(cfg.clients, cfg.lanes, cfg.queue, cfg.allow429, tot.http429.Load())
 
 	fmt.Printf("seed=%d\n", cfg.seed)
 	fmt.Printf("duration_s=%d\n", int(cfg.duration.Seconds()))
@@ -747,13 +827,16 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	fmt.Printf("recovery_requested=%d\n", cfg.lanes)
 	fmt.Printf("epochs_total=%d\n", drift.EpochsTotal)
 	fmt.Printf("epochs_steady=%d\n", drift.EpochsSteady)
+	fmt.Printf("model_bytes=%d\n", drift.ModelBytes)
 	fmt.Printf("rss_warmup_bytes=%d\n", drift.RSSWarmupBytes)
 	fmt.Printf("rss_steady_first_bytes=%d\n", drift.RSSSteadyFirstBytes)
+	fmt.Printf("rss_net_steady_first_bytes=%d\n", drift.RSSNetSteadyFirstBytes)
 	fmt.Printf("rss_steady_last_bytes=%d\n", drift.RSSSteadyLastBytes)
 	fmt.Printf("rss_steady_max_bytes=%d\n", drift.RSSSteadyMaxBytes)
 	fmt.Printf("rss_drift_bytes=%d\n", drift.RSSDriftBytes)
 	fmt.Printf("record_dir_bytes_max=%d\n", drift.RecordDirBytesMax)
 	fmt.Printf("spill_dir_bytes_max=%d\n", drift.SpillDirBytesMax)
+	fmt.Printf("unexpected_429=%d\n", boolInt(bad429))
 	fmt.Printf("drift_ok=%d\n", boolInt(drift.OK))
 	if !drift.OK {
 		fmt.Printf("drift_reason=%s\n", drift.Reason)
@@ -761,7 +844,7 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	fmt.Println("inflight_source=server_health_and_client_outstanding")
 
 	if inflightEnd != 0 || !serverHealthOK || serverActiveLanes != 0 || serverInflight != 0 || serverQueued != 0 ||
-		tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 ||
+		tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || bad429 || tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 ||
 		tot.completed.Load() == 0 || tot.transport.Load() != 0 || tot.timeouts.Load() != 0 || probeOK != cfg.lanes || !drift.OK {
 		return 1
 	}
@@ -938,6 +1021,64 @@ func (s disconnectStage) String() string {
 	}
 }
 
+func stormSleep(cfg clientConfig, d time.Duration) {
+	if !cfg.noSleep && d > 0 {
+		time.Sleep(d)
+	}
+}
+
+func verifyEarlyAbortsStopGeneration(httpClient *http.Client, cfg clientConfig) (int64, int64, int64, bool) {
+	hURL := healthURL(cfg.chatURL)
+	snap0, ok0 := waitHealthDrain(httpClient, hURL, 10*time.Second)
+	if !ok0 || !snap0.isDrained() || snap0.OutputTokens == nil {
+		return -1, -1, 0, false
+	}
+
+	var preTot totals
+	rng := rand.New(rand.NewPCG(cfg.seed^0x7711, 1))
+	nPre := 4
+	for i := 0; i < nPre; i++ {
+		runStormOne(&preTot, httpClient, cfg, stageZeroMs, cfg.seed^uint64(1000+i), 256, rng)
+		runStormOne(&preTot, httpClient, cfg, stageHeaderDone, cfg.seed^uint64(2000+i), 256, rng)
+	}
+	snap1, ok1 := waitHealthDrain(httpClient, hURL, 10*time.Second)
+	if !ok1 || !snap1.isDrained() || snap1.OutputTokens == nil {
+		return -1, -1, 0, false
+	}
+	preTTFTGen := *snap1.OutputTokens - *snap0.OutputTokens
+
+	var ttftTot totals
+	nTTFT := cfg.lanes
+	if nTTFT < 2 {
+		nTTFT = 2
+	}
+	if nTTFT > 4 {
+		nTTFT = 4
+	}
+	const ttftMaxTokens = 256
+	var wg sync.WaitGroup
+	for i := 0; i < nTTFT; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(cfg.seed^0x8822, uint64(i)+1))
+			runStormOne(&ttftTot, httpClient, cfg, stageTTFT, cfg.seed^uint64(3000+i), ttftMaxTokens, r)
+		}(i)
+	}
+	wg.Wait()
+	snap2, ok2 := waitHealthDrain(httpClient, hURL, 10*time.Second)
+	if !ok2 || !snap2.isDrained() || snap2.OutputTokens == nil {
+		return preTTFTGen, -1, 0, false
+	}
+	ttftGen := *snap2.OutputTokens - *snap1.OutputTokens
+	ttft200 := ttftTot.http200.Load()
+	maxBudget := ttft200 * ttftMaxTokens
+	// 0ms and header-done aborts happen before a valid body completes and must generate 0 tokens;
+	// ttft aborts close immediately after the first SSE byte and must stop far short of max_tokens=256.
+	ok := preTTFTGen == 0 && ttft200 > 0 && ttftGen >= 0 && ttftGen < ttft200*64
+	return preTTFTGen, ttftGen, maxBudget, ok
+}
+
 func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	refSeed := cfg.seed ^ 0x9001
 	baseline, err := runSeededSoloReference(httpClient, cfg.key, cfg.chatURL, refSeed)
@@ -945,6 +1086,8 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 		fmt.Fprintf(os.Stderr, "pre-storm solo reference failed: %v\n", err)
 		return 1
 	}
+
+	preTTFTGen, ttftGen, ttftBudget, earlyAbortOK := verifyEarlyAbortsStopGeneration(httpClient, cfg)
 
 	var tot totals
 	var stageCounts [6]atomic.Int64
@@ -970,14 +1113,18 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 					stage = stageComplete
 				}
 				stageCounts[stage].Add(1)
-				runStormOne(&tot, httpClient, cfg.key, cfg.chatURL, stage, cfg.seed^uint64(idx), rng)
+				runStormOne(&tot, httpClient, cfg, stage, cfg.seed^uint64(idx), 0, rng)
 			}
 		}(w)
 	}
 	wg.Wait()
 
 	hURL := healthURL(cfg.chatURL)
-	snap, healthOK := waitHealthDrain(httpClient, hURL, 20*time.Second)
+	drainWait := cfg.drainTimeout
+	if drainWait <= 0 {
+		drainWait = 20 * time.Second
+	}
+	snap, healthOK := waitHealthDrain(httpClient, hURL, drainWait)
 	drained := healthOK && snap.isDrained()
 
 	postRef, err := runSeededSoloReference(httpClient, cfg.key, cfg.chatURL, refSeed)
@@ -987,6 +1134,7 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	if drained {
 		probeOK = runRecoveryProbes(httpClient, cfg.key, cfg.chatURL, cfg.lanes, cfg.seed)
 	}
+	bad429 := unexpected429UnderCapacity(cfg.clients, cfg.lanes, cfg.queue, cfg.allow429, tot.http429.Load())
 
 	fmt.Printf("storm_requests=%d\n", tot.requests.Load())
 	fmt.Printf("storm_stage_0ms=%d\n", stageCounts[stageZeroMs].Load())
@@ -1001,6 +1149,11 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	fmt.Printf("storm_disconnected=%d\n", tot.disconnected.Load())
 	fmt.Printf("storm_completed=%d\n", tot.completed.Load())
 	fmt.Printf("storm_stream_errors=%d\n", tot.streamErrors.Load())
+	fmt.Printf("storm_early_pre_ttft_tokens=%d\n", preTTFTGen)
+	fmt.Printf("storm_early_ttft_tokens=%d\n", ttftGen)
+	fmt.Printf("storm_early_ttft_max_budget=%d\n", ttftBudget)
+	fmt.Printf("early_abort_stopped=%d\n", boolInt(earlyAbortOK))
+	fmt.Printf("unexpected_429=%d\n", boolInt(bad429))
 	fmt.Printf("drain_ok=%d\n", boolInt(drained))
 	fmt.Printf("server_active_lanes_end=%d\n", ptrIntVal(snap.ActiveLanes))
 	fmt.Printf("server_inflight_end=%d\n", ptrIntVal(snap.Inflight))
@@ -1009,15 +1162,17 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	fmt.Printf("recovery_completed=%d\n", probeOK)
 	fmt.Printf("recovery_requested=%d\n", cfg.lanes)
 
-	if tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 ||
+	if tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || bad429 || tot.unexpected.Load() != 0 ||
 		tot.streamErrors.Load() != 0 || tot.timeouts.Load() != 0 ||
-		!drained || !refMatch || probeOK != cfg.lanes {
+		!earlyAbortOK || !drained || !refMatch || probeOK != cfg.lanes {
 		return 1
 	}
 	return 0
 }
 
-func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stage disconnectStage, reqSeed uint64, rng *rand.Rand) {
+func runStormOne(tot *totals, httpClient *http.Client, cfg clientConfig, stage disconnectStage, reqSeed uint64, overrideMaxTokens int, rng *rand.Rand) {
+	key := cfg.key
+	chatURL := cfg.chatURL
 	tot.enter()
 	defer tot.inflight.Add(-1)
 	id := uint64(tot.requests.Add(1))
@@ -1042,7 +1197,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 		return
 	}
 
-	payload := buildStormPayload(stage, id, reqSeed, rng)
+	payload := buildStormPayload(stage, id, reqSeed, overrideMaxTokens, rng)
 	if stage == stageHeaderDone {
 		c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 		if err != nil {
@@ -1057,7 +1212,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 			u.RequestURI(), u.Host, key, len(payload))
 		_, _ = c.Write([]byte(hdr))
 		_, _ = c.Write(payload[:partialLen])
-		time.Sleep(time.Duration(1+rng.IntN(5)) * time.Millisecond)
+		stormSleep(cfg, time.Duration(1+rng.IntN(5))*time.Millisecond)
 		_ = c.Close()
 		tot.disconnected.Add(1)
 		return
@@ -1116,11 +1271,11 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 				break
 			}
 		}
-		time.Sleep(time.Duration(1+rng.IntN(25)) * time.Millisecond)
+		stormSleep(cfg, time.Duration(1+rng.IntN(25))*time.Millisecond)
 	case stageMidDecode:
 		buf := make([]byte, 512)
 		_, _ = resp.Body.Read(buf)
-		time.Sleep(time.Duration(15+rng.IntN(160)) * time.Millisecond)
+		stormSleep(cfg, time.Duration(15+rng.IntN(160))*time.Millisecond)
 	}
 	if c := box.conn(); c != nil {
 		_ = c.Close()
@@ -1128,7 +1283,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 	tot.disconnected.Add(1)
 }
 
-func buildStormPayload(stage disconnectStage, id, reqSeed uint64, rng *rand.Rand) []byte {
+func buildStormPayload(stage disconnectStage, id, reqSeed uint64, overrideMaxTokens int, rng *rand.Rand) []byte {
 	var r chatReq
 	switch {
 	case stage == stageMidThinking || id%3 == 1:
@@ -1176,6 +1331,9 @@ func buildStormPayload(stage disconnectStage, id, reqSeed uint64, rng *rand.Rand
 			Seed:        reqSeed,
 		}
 	}
+	if overrideMaxTokens > 0 {
+		r.MaxTokens = overrideMaxTokens
+	}
 	b, _ := json.Marshal(r)
 	return b
 }
@@ -1206,6 +1364,7 @@ func runFaultCheck(httpClient *http.Client, cfg clientConfig) int {
 	if snap.RecordWritten != nil {
 		recWritten = *snap.RecordWritten
 	}
+	bad429 := unexpected429UnderCapacity(cfg.clients, cfg.lanes, cfg.queue, cfg.allow429, tot.http429.Load())
 
 	fmt.Printf("requests=%d\n", tot.requests.Load())
 	fmt.Printf("http_200=%d\n", tot.http200.Load())
@@ -1215,11 +1374,12 @@ func runFaultCheck(httpClient *http.Client, cfg clientConfig) int {
 	fmt.Printf("stream_errors=%d\n", tot.streamErrors.Load())
 	fmt.Printf("transport_errors=%d\n", tot.transport.Load())
 	fmt.Printf("timeouts=%d\n", tot.timeouts.Load())
+	fmt.Printf("unexpected_429=%d\n", boolInt(bad429))
 	fmt.Printf("drain_ok=%d\n", boolInt(drained))
 	fmt.Printf("record_written=%d\n", recWritten)
 	fmt.Printf("record_write_errors=%d\n", writeErrs)
 
-	if tot.inflight.Load() != 0 || !drained || tot.http5xx.Load() != 0 || tot.http401.Load() != 0 ||
+	if tot.inflight.Load() != 0 || !drained || tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || bad429 ||
 		tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 || tot.completed.Load() == 0 ||
 		tot.transport.Load() != 0 || tot.timeouts.Load() != 0 {
 		return 1

@@ -894,7 +894,9 @@ fn lanes(o: &Opts) {
 /// dev, layer 2's gate: N lanes advanced together in steps of several spans must each give exactly what they give alone:
 /// the same logits at every step, the same cache and convolution rows at the end. Lane i reads the --ref tokens rotated by
 /// 17 i; it prefills in prime-sized chunks with one-token chunks among them, then decodes; lanes start staggered, so a step
-/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try.
+/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try (including 64, matching
+/// serve's M5 Max default; counts up to engine::MAX_SPANS = 128 run in one encode_spans call, and larger counts such as 129
+/// dispatch in waves of at most MAX_SPANS spans).
 /// INK_SPANS_SABOTAGE=1 is the negative control: one span is bound to the next lane's state, and the gate must then
 /// fail; tests/ci.sh runs it and requires that failure, so the gate is known to catch a wrong-lane binding.
 fn spans(o: &Opts) {
@@ -910,7 +912,7 @@ fn spans(o: &Opts) {
     let stream = |i: usize| -> Vec<u32> { let mut v = base.clone(); v.rotate_left((17 * i) % base.len()); v.truncate(len + 1); v };
     let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128,129".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let sabotage = std::env::var("INK_SPANS_SABOTAGE").is_ok();
     let nmax = *counts.iter().max().unwrap();
     // each lane alone: one span per step
@@ -936,16 +938,18 @@ fn spans(o: &Opts) {
             let mut sp = Vec::new(); let mut who = Vec::new();
             for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
             if sp.is_empty() { continue; }
-            if sabotage && !sabotaged && sp.len() >= 2 {
-                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
-                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
-                sp[0].lane = &lanes[who[1]];
-                sabotaged = true;
+            for (w_sp_slice, w_who) in sp.chunks_mut(engine::MAX_SPANS).zip(who.chunks(engine::MAX_SPANS)) {
+                if sabotage && !sabotaged && w_sp_slice.len() >= 2 {
+                    // negative control: bind the first span to the next lane's state; its logits and cache must then differ
+                    println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", w_who[0], w_who[1]);
+                    w_sp_slice[0].lane = &lanes[w_who[1]];
+                    sabotaged = true;
+                }
+                if w_sp_slice.iter().any(|x| x.t > 1) && w_sp_slice.iter().any(|x| x.t == 1) { mixed += 1; }
+                nsteps += 1;
+                let cb = eng.gpu.cmd(); eng.encode_spans(&cb, w_sp_slice, true, false); cb.commit(); cb.waitUntilCompleted();
+                for (k, &i) in w_who.iter().enumerate() { hs[i].push(fnv(if w_sp_slice.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
             }
-            if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
-            nsteps += 1;
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
-            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
         }
         let mut bad = Vec::new();
         for i in 0..n {
@@ -960,28 +964,32 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
-/// dev, layer 3's output gate (src/poolgate.rs): lanes run together with every pool slot outside the step poisoned must
-/// give exactly the logits and greedy tokens of layer 2's path, each lane alone. Today the candidate is layer 2 itself,
-/// over each lane's own buffers; the block cache replaces it in `cand` below. INK_POOLGATE_LANES (default 3),
-/// INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position block boundary) and
-/// INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a long one.
-/// INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are poisoned, and the gate must then fail.
+/// dev, layer 3's output gate (src/poolgate.rs): lanes run together over production `ServeBlockCache` with every pool
+/// slot outside the step poisoned must give exactly the logits and greedy tokens of layer 2's path, each lane alone.
+/// INK_POOLGATE_LANES (default 3), INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position
+/// block boundary) and INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a
+/// 17-lane >1024-token window-crossing run.
+/// INK_POOLGATE_SABOTAGE=1 poisons one step's own slots and must fail in that lane alone; INK_POOLGATE_CACHE_SABOTAGE=1
+/// plants a ServeBlockCache shared-prefix/start-point corruption and must also fail closed with POOL GATE DIFFERS.
 fn poolgate(o: &Opts) {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
     let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
     let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
     let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
+    let cache_sabotage = std::env::var("INK_POOLGATE_CACHE_SABOTAGE").is_ok();
     let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let plen: usize = chunks.iter().sum();
     let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
     let eng = Engine::load(&o.model, o.ctx);
     let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
-    // the candidate: real Layer 3 BlockPool + BlockTable + PrefixTree over the same engine
-    let cand = poolgate::Layer3Pool::new(&eng, n);
+    // Primary candidate: production ServeBlockCache + BlockPools + BlockTable + EntryTree
+    let cand = poolgate::ServePoolCandidate::new(&eng, n, plen + decode + 2, cache_sabotage);
     let label = cand.candidate_label();
     println!("poolgate candidate: {label}");
     let got = poolgate::poisoned(&cand, &w, sabotage);
     let st = cand.stats();
+    let cache_sab_hit = cand.cache_sabotage_triggered();
     cand.shutdown();
     if sabotage && got.sabotaged.is_none() { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
     // the poisoned lane must differ and no other lane may: lanes share no unpoisoned cache with a sabotaged lane,
@@ -994,12 +1002,34 @@ fn poolgate(o: &Opts) {
     match poolgate::compare(&want, &got) {
         Ok(lines) => {
             for l in lines { println!("{l}"); }
-            println!("layer 3 stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, tails_dropped={}",
-                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.tails_dropped);
+            println!("serve block cache stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, starts_saved={}, starts_matched={}",
+                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.start_points_saved, st.start_matches);
+            if !sabotage && n >= 2 && plen >= 64 && st.shared_dedups == 0 {
+                println!("POOL GATE DIFFERS [{label}]: expected shared_dedups > 0 across shared-prefix lanes");
+                std::process::exit(1);
+            }
+            if !sabotage && plen + decode > engine::EXT && st.window_pruned == 0 {
+                println!("POOL GATE DIFFERS [{label}]: expected window_pruned > 0 past EXT={}", engine::EXT);
+                std::process::exit(1);
+            }
             if !sabotage {
+                match poolgate::verify_serve_cache_start_points(&eng, &base, o.ctx, cache_sabotage) {
+                    Ok(msg) => {
+                        if cache_sabotage {
+                            println!("INK_POOLGATE_CACHE_SABOTAGE: sabotage did not cause divergence (hit={cache_sab_hit})");
+                            std::process::exit(2);
+                        }
+                        println!("{msg}");
+                    }
+                    Err(err) => {
+                        println!("SERVE CACHE START-POINT GATE: {err}");
+                        println!("POOL GATE DIFFERS [{label}]");
+                        std::process::exit(1);
+                    }
+                }
                 match poolgate::verify_prefix_start_points(&eng, &base, o.ctx) {
                     Ok(msg) => println!("{msg}"),
-                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); std::process::exit(1); }
+                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
                 }
             }
             println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs");

@@ -242,12 +242,21 @@ if want traces; then
         esac
     done
     pids= names=
+    total_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    light_jobs=$(( (total_cpus + 1) / 2 ))
+    [ "$light_jobs" -ge 2 ] || light_jobs=2
+    heavy_jobs=$total_cpus
+    [ "$heavy_jobs" -ge 2 ] || heavy_jobs=2
     for t in $trace_scripts; do
         if [ ! -f "$root/scripts/check-$t-traces.sh" ]; then
             echo "traces: scripts/check-$t-traces.sh missing" >&2
             exit 1
         fi
-        bash "$root/scripts/check-$t-traces.sh" >"$work/traces-$t.log" 2>&1 &
+        case $t in
+            cache) def_jobs=$heavy_jobs ;;
+            *) def_jobs=$light_jobs ;;
+        esac
+        INKY_TRACE_JOBS="${INKY_TRACE_JOBS:-$def_jobs}" bash "$root/scripts/check-$t-traces.sh" >"$work/traces-$t.log" 2>&1 &
         pids="$pids $!" names="$names $t"
     done
     failed=0

@@ -24,7 +24,7 @@ impl Gpu {
         let dev = MTLCreateSystemDefaultDevice().expect("no Metal device");
         let queue = dev.newCommandQueue().expect("queue");
         let opts = MTLCompileOptions::new();
-        opts.setMathMode(MTLMathMode::Fast);
+        opts.setMathMode(MTLMathMode::Safe);
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
         let lib = dev
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))

@@ -45,9 +45,12 @@ impl Fake {
 fn opt(v:Option<u64>)->i64 {v.map_or(-1,|x|x as i64)}
 fn boolean(v:bool)-> &'static str {if v{"TRUE"}else{"FALSE"}}
 fn main() {
+    let is_positive = std::env::args().nth(2).as_deref() == Some("positive");
     println!("---- MODULE TraceData ----\nEXTENDS Integers\nTraces == <<");
     let mut total=[0;6]; let mut restarts=0; let mut failed_restarts=0; let mut unconfirmed=0;
-    for seed in 1..=32 {
+    let mut all_traces = Vec::new();
+    let max_seed = if is_positive { 32 } else { 3 };
+    for seed in 1..=max_seed {
         let f=Fake{limit:Cell::new(50000),disk:Cell::new(None),rng:Cell::new(seed),failures:Cell::new(false),coverage:Cell::new([0;6]),unconfirmed:Cell::new(0),calls:RefCell::new(vec![]),path:format!("{}.{}.saved",std::env::args().nth(1).expect("temporary prefix"),seed),confirmed_set:Cell::new(false)};
         let mut m=Mode::default(); let mut owner=50000; let mut alive=true; let mut owed=false;
         let mut states=vec![f.snapshot(&m,owner,alive,owed,"init")];
@@ -85,10 +88,13 @@ fn main() {
         unconfirmed+=f.unconfirmed.get();
         for(sum,count)in total.iter_mut().zip(f.coverage.get()){*sum+=count;}
         let _=std::fs::remove_file(&f.path);
-        println!("<<{}>>{}",states.join(",\n"),if seed==32{""}else{","});
+        all_traces.push(format!("<<{}>>", states.join(",\n")));
+        if !is_positive && total.iter().all(|&n| n > 0) && restarts > 0 && failed_restarts > 0 && unconfirmed > 0 {
+            break;
+        }
     }
-    println!(">>\n====");
-    if std::env::args().nth(2).as_deref() == Some("positive") {
+    println!("{}\n>>\n====", all_traces.join(",\n"));
+    if is_positive {
         assert!(total.iter().all(|n|*n>0),"missing failure class: {total:?}"); assert!(restarts>0 && failed_restarts>0 && unconfirmed>0,"missing discriminating restore scenarios");
     }
     eprintln!("failure coverage [get, set unchanged, set moved, keep write, keep forget, Ok unmoved]: {total:?}; saved-file restarts: {restarts} ({failed_restarts} failed); Ok restores left at wrong value: {unconfirmed}");

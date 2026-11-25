@@ -2,11 +2,11 @@
 # GitHub release as a prerelease: it becomes latest only after a real run on it
 # (gh release edit TAG --prerelease=false --latest). Assets are inky_<tag>_darwin_arm64,
 # inky_<tag>_tunings.tar.gz (the tunings/ folder the binary is built with) and SHA256SUMS.
-# The tag must equal Cargo.toml's version with a leading v, and the release notes are
-# docs/releases/<tag>.md; the run fails before building if either is wrong or CRATES_IO_TOKEN is unset.
-# Every job in ci.yml must pass on the tagged commit in main CI before release assets are built.
-# The crate inky-engine is verified with cargo publish --dry-run before creating the GitHub release and
-# published automatically to crates.io on every tagged release.
+# The tag must be refs/tags/v*, point to an ancestor of origin/main, match Cargo.toml's version
+# with a leading v, have docs/releases/<tag>.md, and carry a non-empty CRATES_IO_TOKEN in the
+# tag-scoped crates-io-release environment (docs/RELEASE-TAG-PROTECTION.md).
+# Immediately before creating the GitHub release AND immediately before cargo publish, the remote
+# tag SHA is re-queried via git ls-remote so a force-moved or deleted tag aborts before publishing.
 name: release
 on:
   push:
@@ -22,12 +22,26 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: verify tag ref, ancestry on origin/main, Cargo.toml, and release notes
+        shell: bash
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          TAG_SHA="$(git rev-parse HEAD)"
+          export TAG_SHA
+          python3 scripts/release_ci.py --verify-preflight --no-token
       - name: wait for main CI on the tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release_ci.py "$GITHUB_REPOSITORY" "$(git rev-parse HEAD)"
   release:
     needs: main-ci
+    environment: crates-io-release
     permissions:
       contents: write
     # GitHub's own Apple silicon runner: the shaders compile at runtime (newLibraryWithSource),
@@ -41,28 +55,16 @@ jobs:
       - name: verify tag is on main, matches Cargo.toml, has release notes, and has CRATES_IO_TOKEN
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "CRATES_IO_TOKEN secret is not set; refusing to cut a release without crates.io publishing" >&2
-            exit 1
-          fi
           git fetch origin main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "tagged commit $(git rev-parse HEAD) is not an ancestor of origin/main" >&2
-            exit 1
-          fi
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          if [ "${TAG#v}" != "$version" ]; then
-            echo "tag $TAG does not match Cargo.toml version $version" >&2
-            exit 1
-          fi
-          if [ ! -f "docs/releases/$TAG.md" ]; then
-            echo "docs/releases/$TAG.md is missing" >&2
-            exit 1
-          fi
+          TAG_SHA="$(git rev-parse HEAD)"
+          export TAG_SHA
+          python3 scripts/release_ci.py --verify-preflight
+          echo "TAG_SHA=$TAG_SHA" >> "$GITHUB_ENV"
       - name: unit tests
         run: cargo test --locked --release --bins
       - name: crates.io package dry-run
@@ -86,13 +88,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          TAG_SHA: ${{ env.TAG_SHA }}
         run: |
           set -euo pipefail
+          python3 scripts/release_ci.py --verify-remote-tag origin "$TAG" "$TAG_SHA"
           gh release create "$TAG" dist/* --title "inky $TAG" --notes-file "docs/releases/$TAG.md" --verify-tag --prerelease
       - name: publish inky-engine to crates.io
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TAG_SHA: ${{ env.TAG_SHA }}
         run: |
           set -euo pipefail
+          python3 scripts/release_ci.py --verify-remote-tag origin "$TAG" "$TAG_SHA"
           cargo publish --locked

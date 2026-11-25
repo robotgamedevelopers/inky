@@ -1329,7 +1329,8 @@ pub fn render_block_layout_tla_bundle(
 EXTENDS BlockLayout, TraceData, Sequences
 
 LaneSeq == <<{lane_seq_lit}>>
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+LaneIdx(l) == LaneIdxMap[l]
 KindIdx(k) == IF k = \"full\" THEN 1 ELSE 2
 DecodeKind(c) == IF c = 1 THEN \"full\" ELSE IF c = 2 THEN \"window\" ELSE \"none\"
 DecodeEntry(e) ==
@@ -2323,10 +2324,15 @@ PrefixSeq == <<{pfx_seq_lit}>>
 BoundarySeq == <<{bnd_seq_lit}>>
 BlockSeq == <<{blk_seq_lit}>>
 
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
-PrefixIdx(p) == CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p
-BoundaryIdx(k) == CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k
-BlockIdxOf(b) == CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+PrefixIdxMap == [p \\in Prefixes |-> CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p]
+BoundaryIdxMap == [k \\in Boundaries |-> CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k]
+BlockIdxMap == [b \\in BlockIds |-> CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b]
+
+LaneIdx(l) == LaneIdxMap[l]
+PrefixIdx(p) == PrefixIdxMap[p]
+BoundaryIdx(k) == BoundaryIdxMap[k]
+BlockIdxOf(b) == BlockIdxMap[b]
 
 DecodeTier(c) ==
   IF c = 1 THEN \"memory\"
@@ -2407,7 +2413,20 @@ ReplayNext ==
        /\\ gpuDone' = nxt.gpuDone
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+\\* Exact one-point specialization of AnyBuildStep (BuildStep fixes stepActive'=TRUE,
+\\* stepLanes'=chosen, stepSpan'=spans), avoiding 15 * 81 = 1,215 blind enumerations per step.
+TraceAnyBuildStep ==
+  /\\ stepActive' = TRUE
+  /\\ stepLanes' \\in ((SUBSET Lanes) \\ {{}})
+  /\\ stepSpan' \\in [Lanes -> 0..MaxSpan]
+  /\\ BuildStep(stepLanes', stepSpan')
+TraceNext ==
+  \\/ (\\E l \\in Lanes : AdvanceLane(l))
+  \\/ MemReclaim
+  \\/ TraceAnyBuildStep
+  \\/ StepProgress
+  \\/ UnfairEnvActions
+Conforms == Init /\\ [][TraceNext]_vars
 =============================================================================
 "
     );

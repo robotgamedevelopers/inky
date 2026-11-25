@@ -23,7 +23,7 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender,
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-mod block_cache;
+pub mod block_cache;
 mod timing;
 use block_cache::{
     effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
@@ -1977,10 +1977,12 @@ impl PermitPool {
 
 fn health_body(cx: &Ctx) -> String {
     let kv_bytes_per_elem: u32 = if cx.kv8 { 1 } else { 2 };
+    let output_tokens = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).output as u64;
     let mut obj = serde_json::Map::from_iter([
         ("ok".into(), json!(true)),
         ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
         ("inflight".into(), json!(cx.admission.inflight())),
+        ("output_tokens".into(), json!(output_tokens)),
         ("recommended_working_set_bytes".into(), json!(cx.budget.recommended_working_set_bytes)),
         ("model_bytes".into(), json!(cx.budget.model_bytes)),
         ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
@@ -3357,29 +3359,92 @@ mod tests {
     }
 
     #[test] fn messages_stream_polls_even_during_hidden_thinking() {
-        struct Gone { bytes: Vec<u8>, checks: std::cell::Cell<usize> }
-        impl Write for Gone {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.bytes.extend_from_slice(buf); Ok(buf.len()) }
+        struct GoneAfterStreamStart {
+            bytes: Vec<u8>,
+            armed: std::cell::Cell<bool>,
+            checks: std::cell::Cell<usize>,
+        }
+        impl Write for GoneAfterStreamStart {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(buf);
+                if self.bytes.starts_with(b"HTTP/1.1 200") {
+                    self.armed.set(true);
+                }
+                Ok(buf.len())
+            }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        impl ClientWrite for Gone {
-            fn client_gone(&self) -> bool { self.checks.set(self.checks.get() + 1); true }
+        impl ClientWrite for GoneAfterStreamStart {
+            fn client_gone(&self) -> bool {
+                if !self.armed.get() {
+                    return false;
+                }
+                self.checks.set(self.checks.get() + 1);
+                true
+            }
         }
-        let tk = Tokenizer::for_test();
-        let sp = test_sp(&tk);
-        let (jtx, jrx) = channel::<Job>();
-        let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
-        let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-            let _ = job.out.send(Ev::Tok(sp.c_think));
-            for _ in 0..50 { if job.out.send(Ev::Tok(sp.c_think)).is_err() { break; } }
-        });
-        let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
-        messages(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
-        scheduler.join().unwrap();
-        assert!(out.checks.get() > 0);
+        for use_chat in [false, true] {
+            let tk = Tokenizer::for_test();
+            let sp = test_sp(&tk);
+            let payload_tok = tk.encode("a", false)[0];
+            let (jtx, jrx) = channel::<Job>();
+            let cx = Ctx {
+                metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
+                tk: Arc::new(Tokenizer::for_test()),
+                sp,
+                jobs: jtx,
+                effort: "none".into(),
+                max_tokens: 64,
+                thinking_budget: 0,
+                loopcd_omega: 0.0,
+                kv8: false,
+                seq: Default::default(),
+                nonce: "test".into(),
+                key: None,
+                ctx: 64,
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
+                budget: test_budget(4),
+                preprocess: PermitPool::new(PREPROCESS_LIMIT),
+                active_lanes: Default::default(),
+                conns: Default::default(),
+                recorder: None,
+            };
+            let (done_tx, done_rx) = channel::<()>();
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
+                // Pre-buffer 24 hidden thinking tokens immediately while holding `job` alive until the
+                // handler exits: neither RecvTimeoutError::Timeout nor Disconnected can fire, so ONLY
+                // the every-16-tokens Ev::Tok poll can notice disconnect and abort at token 16!
+                job.out.send(Ev::Tok(sp.c_think)).unwrap();
+                for _ in 0..23 {
+                    let _ = job.out.send(Ev::Tok(payload_tok));
+                }
+                done_rx.recv_timeout(Duration::from_secs(2)).expect("stream handler must abort via Ev::Tok poll without waiting on sender drop");
+                let cancelled_on_poll = job.out.cancelled() && job.out.send(Ev::Tok(payload_tok)).is_err();
+                let queued_left = job.out.queued();
+                (cancelled_on_poll, queued_left)
+            });
+            let mut out = GoneAfterStreamStart {
+                bytes: Vec::new(),
+                armed: std::cell::Cell::new(false),
+                checks: std::cell::Cell::new(0),
+            };
+            let req = json!({"max_tokens": 32, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+            if use_chat {
+                chat(&cx, &req, &mut out).unwrap();
+            } else {
+                messages(&cx, &req, &mut out).unwrap();
+            }
+            done_tx.send(()).unwrap();
+            let (cancelled_on_poll, queued_left) = scheduler.join().unwrap();
+            let body = String::from_utf8_lossy(&out.bytes);
+            assert!(body.starts_with("HTTP/1.1 200"), "use_chat={use_chat}: {body}");
+            assert_eq!(out.checks.get(), 1, "use_chat={use_chat}: must poll exactly once at 16th hidden-thinking token");
+            assert!(cancelled_on_poll, "use_chat={use_chat}: dropping receiver on Ev::Tok poll must mark job.out cancelled");
+            assert_eq!(queued_left, 8, "use_chat={use_chat}: 24 buffered tokens - 16 consumed before abort = 8 unconsumed");
+            assert!(!body.contains("the request was dropped") && !body.contains("message_stop") && !body.contains("[DONE]"),
+                "use_chat={use_chat}: must abort cleanly without Disconnected error or completion marker: {body}");
+        }
     }
 
     #[test] fn chat_and_messages_streams_poll_during_silent_tool_json() {
@@ -3636,6 +3701,51 @@ mod tests {
             job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
             worker.join().unwrap();
         }
+
+        // Verify scheduler-side sampling + ThinkBudget enforcement loop (`sample_next_with_ban_and_softcap` + `ThinkBudget::observe`):
+        // even when raw logits overwhelmingly favor `<|content_thinking|>` and thinking tokens, after `budget = 2`
+        // thinking tokens the scheduler forces `<|end_message|>` and passes `ban_tok = Some(sp.c_think)` into the
+        // sampler so subsequent steps cannot re-enter thinking and instead emit `<|content_text|>`.
+        let vocab = 512usize;
+        let tok_think_body = a as usize;
+        let tok_answer = (a + 1) as usize;
+        let mut sampler = Sampler::new(0.0, 64, 0.95, 30.0, 42);
+        let mut think = ThinkBudget::new(2);
+        let mut emitted = Vec::new();
+        for step in 0..7usize {
+            let mut logits = vec![-20.0f32; vocab];
+            match step {
+                0 => logits[sp.msg_model as usize] = 15.0,
+                1 => logits[sp.c_think as usize] = 15.0,
+                2..=4 => logits[tok_think_body] = 15.0, // step 4 is 3rd thinking token -> forced sp.end!
+                5 => {
+                    // Model tries to re-open <|content_thinking|> with higher logit than <|content_text|>,
+                    // which MUST be masked to -inf by `think.ban_token(&sp)`.
+                    logits[sp.c_think as usize] = 25.0;
+                    logits[sp.c_text as usize] = 12.0;
+                }
+                _ => {
+                    logits[sp.c_think as usize] = 25.0;
+                    logits[tok_answer] = 10.0;
+                }
+            }
+            let raw_tok = sampler.sample_next_with_ban_and_softcap(&logits, think.ban_token(&sp), 30.0).unwrap();
+            let observed = think.observe(raw_tok, &sp);
+            emitted.push(observed);
+        }
+        assert_eq!(
+            emitted,
+            vec![
+                sp.msg_model,
+                sp.c_think,
+                tok_think_body as u32,
+                tok_think_body as u32,
+                sp.end,
+                sp.c_text,
+                tok_answer as u32,
+            ],
+            "scheduler sampling + ThinkBudget must cap thinking at 2 tokens and ban c_think re-entry"
+        );
     }
 
     #[test] fn loopcd_omega_defaults_overrides_and_rejects_invalid_on_both_apis() {
@@ -3849,6 +3959,7 @@ mod tests {
             "ok": true,
             "active_lanes": 0,
             "inflight": 0,
+            "output_tokens": 0,
             "recommended_working_set_bytes": b.recommended_working_set_bytes,
             "model_bytes": b.model_bytes,
             "per_lane_worst_case_bytes": b.per_lane_worst_case_bytes,
@@ -4456,7 +4567,8 @@ mod tests {
     #[ignore = "requires local Inkling-2-Mini GGUF model on Metal GPU"]
     fn serve_layer3_three_turn_10k_cached_matches_cold_solo() {
         let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
-            "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf".to_string()
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf")
         });
         assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
 
@@ -4531,6 +4643,11 @@ mod tests {
         let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
         let turn2_suffix = tk.encode("Now give step two concisely, covering block table indexing, sliding-window expiration across 1024 tokens, recurrent convolution state restoration, and exact LRU start-point eviction under pool pressure so that this turn crosses at least one full 64-token block boundary.", false);
         let turn3_suffix = tk.encode("Finally summarize step three.", false);
+        let think_req = json!({
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "Prove there are infinitely many primes step by step."}]
+        });
+        let think_prompt_base = render(&tk, &sp, &think_req, "high").expect("render thinking prompt");
         let turn1_for_client = turn1.clone();
         let client = std::thread::spawn(move || {
             let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
@@ -4578,6 +4695,48 @@ mod tests {
             turn3.extend_from_slice(&turn3_suffix);
             turn3.extend_from_slice(&[sp.end, sp.msg_model, sp.c_text]);
             let (t3_out, t3_pf, t3_cached) = send_turn(3, turn3.clone());
+
+            // Also verify `thinking_budget` enforcement directly through the live `serve::scheduler`
+            // on both GPU Gumbel (`top_k = 0, top_p = 1.0`) and CPU sampler (`top_k = 64, top_p = 0.95`) paths!
+            for (seq, top_k, top_p) in [(4u64, 0usize, 1.0f32), (5u64, 64usize, 0.95f32)] {
+                let think_prompt = think_prompt_base.clone();
+                let (out, events) = job_events();
+                jtx.send(Job {
+                    seq,
+                    toks: think_prompt,
+                    max: 24,
+                    temp: 0.6,
+                    top_k,
+                    top_p,
+                    seed: 77,
+                    thinking_budget: 3,
+                    loopcd_omega: 0.0,
+                    queued_at: Instant::now(),
+                    out,
+                    _permit: admission.try_acquire().unwrap(),
+                }).unwrap();
+                let mut gen_toks = Vec::new();
+                loop {
+                    match events.recv_timeout(Duration::from_secs(60)).unwrap() {
+                        Ev::Tok(t) => gen_toks.push(t),
+                        Ev::Alive => {}
+                        Ev::Done { .. } => break,
+                        Ev::Err(e) | Ev::Failed(e) => panic!("thinking_budget turn {seq} failed: {e}"),
+                    }
+                }
+                let think_opens: Vec<usize> = gen_toks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &t)| (t == sp.c_think).then_some(idx))
+                    .collect();
+                assert_eq!(think_opens.len(), 1, "turn {seq} (top_k={top_k}): expected exactly 1 <|content_thinking|> block (re-entry must be banned), got {gen_toks:?}");
+                let think_start = think_opens[0] + 1;
+                let think_end = gen_toks[think_start..]
+                    .iter()
+                    .position(|&t| t == sp.end)
+                    .expect("thinking block must be closed by <|end_message|>");
+                assert!(think_end <= 3, "turn {seq} (top_k={top_k}): scheduler must cap thinking tokens at budget=3, got {think_end} ({gen_toks:?})");
+            }
 
             drop(jtx);
 
