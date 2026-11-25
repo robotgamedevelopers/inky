@@ -87,6 +87,9 @@ class ReleaseCiTests(unittest.TestCase):
         ci_jobs = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]
         expanded = set()
         for key, job in ci_jobs.items():
+            if key in {"m5-approval", "m5-attestation"}:
+                self.assertIn("github.event_name == 'issue_comment'", job["if"])
+                continue
             base = job.get("name", key)
             parts = job.get("strategy", {}).get("matrix", {}).get("part")
             if parts:

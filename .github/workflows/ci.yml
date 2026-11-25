@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  issue_comment:
+    types: [created]
 permissions:
   contents: read
 # Each pull request has one group, and a new push to it cancels the run in progress.
@@ -18,6 +20,7 @@ jobs:
   # unit: a GitHub-hosted ARM Mac; the CPU-only unit tests in the test profile (overflow checks and debug asserts on).
   # Shaders compile at runtime, so the build needs no GPU. rust-cache keeps target/ and ~/.cargo keyed on Cargo.lock.
   unit:
+    if: github.event_name != 'issue_comment'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -36,6 +39,7 @@ jobs:
         run: cargo publish --locked --dry-run
   # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, servecheck, and replay tools.
   go:
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -44,8 +48,10 @@ jobs:
         with:
           go-version: '1.26.10'
           cache: false
-      - name: release gate tests
-        run: python3 tests/test_release_ci.py
+      - name: CI policy tests
+        run: |
+          python3 tests/test_release_ci.py
+          python3 tests/test_reviewed_m5.py
       - name: soak client tests
         run: go test -race tests/soak_client.go tests/soak_client_test.go
       - name: load client tests
@@ -73,6 +79,7 @@ jobs:
         run: go vet ./... && go test -race ./...
   # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel.
   tla:
+    if: github.event_name != 'issue_comment'
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
@@ -99,17 +106,50 @@ jobs:
           key: tla2tools-fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
       - name: TLA ${{ matrix.part }}
         run: TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh ${{ matrix.part }}
-  # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
-  # Pull requests from forks never run here (the repository also requires approval for outside contributors).
-  # Every same-repository pull request runs both, stream bases included: each takes about 40 s.
-  # Both jobs build the `ci` profile (release without fat LTO, incremental), which rebuilds in about a second on a
-  # runner's warm target/; the nightly workflow runs every gate on the true release profile.
+  # issue_comment runs the default branch workflow. Resolve the approved PR head and
+  # GitHub's exact merge candidate on a hosted machine before scheduling any M5 job.
+  m5-approval:
+    if: >-
+      github.repository == 'robotgamedevelopers/inky' &&
+      github.ref == 'refs/heads/main' && github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request && startsWith(github.event.comment.body, '/test-m5 ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      candidate: ${{ steps.approval.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: resolve reviewed merge candidate
+        id: approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/reviewed_m5.py
+
+  # The organization group only admits the main-branch versions of ci.yml and
+  # nightly.yml. The event and approval checks decide which code those workflows run.
   m5-gpu:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, m5]
+    needs: m5-approval
+    if: >-
+      !cancelled() && github.repository == 'robotgamedevelopers/inky' &&
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'push' ||
+        (github.event_name == 'issue_comment' && github.run_attempt == '1' &&
+         needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != '')
+      )
+    runs-on:
+      group: inky-reviewed-m5
+      labels: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.m5-approval.outputs.candidate || github.sha }}
+          persist-credentials: false
       - name: build
         run: cargo build --locked --profile ci
       - name: GPU router regression
@@ -119,11 +159,23 @@ jobs:
           INKY_BIN: ./target/ci/inky
         run: tests/ci.sh pr
   m5-serve:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, m5]
+    needs: m5-approval
+    if: >-
+      !cancelled() && github.repository == 'robotgamedevelopers/inky' &&
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'push' ||
+        (github.event_name == 'issue_comment' && github.run_attempt == '1' &&
+         needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != '')
+      )
+    runs-on:
+      group: inky-reviewed-m5
+      labels: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.m5-approval.outputs.candidate || github.sha }}
+          persist-credentials: false
       - name: build
         run: cargo build --locked --profile ci
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -144,3 +196,40 @@ jobs:
         env:
           INKY_SERVE_PROBES_ONLY: '1'
         run: tests/serve-negative.sh tests/serve.sh ./target/ci/inky
+
+  m5-attestation:
+    if: >-
+      always() && github.repository == 'robotgamedevelopers/inky' &&
+      github.ref == 'refs/heads/main' && github.event_name == 'issue_comment' &&
+      needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != ''
+    needs: [m5-approval, m5-gpu, m5-serve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: inky-m5-attestation
+    permissions: {}
+    steps:
+      - name: get the check publisher token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.INKY_M5_APP_ID }}
+          private-key: ${{ secrets.INKY_M5_APP_PRIVATE_KEY }}
+          permission-checks: write
+      - name: report the reviewed M5 result on the merge candidate
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CANDIDATE: ${{ needs.m5-approval.outputs.candidate }}
+          M5_GPU: ${{ needs.m5-gpu.result }}
+          M5_SERVE: ${{ needs.m5-serve.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          conclusion=failure
+          if [[ "$M5_GPU" = success && "$M5_SERVE" = success ]]; then
+            conclusion=success
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name=m5-reviewed -f head_sha="$CANDIDATE" -f status=completed \
+            -f conclusion="$conclusion" \
+            -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --silent

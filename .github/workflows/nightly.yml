@@ -2,7 +2,7 @@ name: nightly
 # The checks too slow for the one-minute pull-request CI (ci.yml). Each still fails red here.
 # No timeout-minutes on any job or step: a nightly has no time limit, and a slow nightly is not a failure.
 # GitHub runs a schedule only from the default branch, so the cron starts once this file is on main;
-# workflow_dispatch runs it on any branch by hand (gh workflow run nightly.yml --ref <branch>).
+# Dispatch the M5 nightly from main with gh workflow run nightly.yml --ref main.
 on:
   schedule:
     - cron: '17 6 * * *'
@@ -70,17 +70,26 @@ jobs:
       - name: this repository owns the M5 runners
         env:
           REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
         run: |
           test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
+          test "$REF" = refs/heads/main || { echo "m5-full runs only on main, not $REF" >&2; exit 1; }
   # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
   # its sabotage, dbatch, CLI checks, the golden hashes, the long poolgate (tests/nightly.sh) and the serve API
   # negative control.
   # Every gate step runs even when an earlier one fails (if: !cancelled()), so one red gate never hides another.
   m5-full:
     needs: guard
-    runs-on: [self-hosted, macOS, ARM64, m5]
+    if: >-
+      github.repository == 'robotgamedevelopers/inky' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      group: inky-reviewed-m5
+      labels: [self-hosted, macOS, ARM64, m5]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: build
         run: cargo build --locked --release
       - name: GPU router regression
