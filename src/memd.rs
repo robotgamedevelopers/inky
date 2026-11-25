@@ -766,9 +766,9 @@ mod tests {
         peer.set_nonblocking(true).unwrap();
         let mut byte = [0; 1];
         assert_eq!(peer.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        drop(lease);
         peer.set_nonblocking(false).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        drop(lease);
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
     }
 
