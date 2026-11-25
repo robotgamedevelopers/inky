@@ -26,8 +26,7 @@ use std::time::{Duration, Instant};
 mod block_cache;
 mod timing;
 use block_cache::{
-    effective_pf_target, find_prefill_leader, inflight_shared_checkpoint,
-    reserved_inflight_full_slots, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
+    effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
     ServeBlockCache,
 };
 use timing::{Counters, RequestTiming, TimingSnapshot};
@@ -979,6 +978,10 @@ fn scheduler(
     let mut queue: VecDeque<Job> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
+    let (context, window_slots) = {
+        let pools = eng.block_pool().borrow();
+        (pooled_context(eng.max_ctx, pools.full.len(), pools.window.len()), pools.window.len())
+    };
     let mut pool_deferred = vec![false; nlanes];
     let mut prev_lanes_released = cache.stats().lanes_released;
     let mut prev_window_pruned = cache.stats().window_pruned;
@@ -1043,14 +1046,13 @@ fn scheduler(
                 m.queued = m.queued.saturating_sub(1);
                 continue;
             }
-            if context_over(j.toks.len(), j.max, eng.max_ctx) {
+            if context_over(j.toks.len(), j.max, context) {
                 let j = queue.pop_front().unwrap();
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
-                let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, eng.max_ctx)));
+                let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
                 continue;
             }
-            let active_now = lanes.iter().filter(|l| l.job.is_some()).count();
             {
                 let pools = eng.block_pool().borrow();
                 let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
@@ -1072,29 +1074,7 @@ fn scheduler(
                         })
                     })
                     .collect();
-                let leaders: Vec<InflightPrefillLane<'_>> = active_reserves
-                    .iter()
-                    .filter(|r| r.gen == 0 && r.n_past < r.pf_end)
-                    .map(|r| InflightPrefillLane {
-                        lane: r.lane,
-                        toks: r.toks,
-                        n_past: r.n_past,
-                        pf_end: r.pf_end,
-                        runnable: r.runnable,
-                        eligible_follower: false,
-                    })
-                    .collect();
-                let shared_ckpt = inflight_shared_checkpoint(&j.toks, &leaders);
-                let reserved_inflight_full = reserved_inflight_full_slots(&active_reserves);
-                if !cache.can_admit_with_shared(
-                    &pools,
-                    active_now,
-                    &j.toks,
-                    j.max,
-                    eng.chunk,
-                    shared_ckpt,
-                    reserved_inflight_full,
-                ) {
+                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
                     break;
                 }
             }
@@ -1182,7 +1162,7 @@ fn scheduler(
                 deferred_by_singleflight[cand.lane] = true;
             }
         }
-        let step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
+        let mut step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
             Some(a) => crate::scheduler::ServeLaneInput {
                 runnable: runnable(i, a) && !deferred_by_singleflight[i],
                 n_past: a.n_past,
@@ -1191,6 +1171,9 @@ fn scheduler(
             },
             None => crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
         }).collect();
+        for input in &mut step_inputs {
+            input.pf_end = input.pf_end.min(window_span_end(input.n_past, window_slots));
+        }
         let step_plan = planner.plan_and_begin_step(&step_inputs, eng.chunk, 64);
         match step_plan {
             Some(crate::scheduler::ServeStepPlan::Prefill(sp_list)) => {
@@ -1826,6 +1809,24 @@ fn peer_gone(s: &TcpStream) -> bool {
     gone
 }
 
+/// Largest write end for one prefill span. Keep every block covering the preceding
+/// WINDOW - 1 positions until the GPU completes this step and releases old history.
+fn window_span_end(start: usize, window_slots: usize) -> usize {
+    use crate::blocks::{BLOCK, WINDOW};
+    let first_live_block = start.saturating_sub(WINDOW - 1) / BLOCK;
+    (first_live_block + window_slots) * BLOCK
+}
+
+/// Both APIs reserve two logical lookahead tokens. A P-token prompt emitting G tokens
+/// writes P + G - 1 physical rows: the final sampled token is returned without another step.
+fn pooled_context(configured: usize, full_slots: usize, window_slots: usize) -> usize {
+    use crate::blocks::{BLOCK, WINDOW};
+    // At <= WINDOW / BLOCK slots the first rollover cannot allocate the next block
+    // while the oldest block is still live. Above that threshold the window can slide.
+    let hard_slots = if window_slots <= WINDOW / BLOCK { full_slots.min(window_slots) } else { full_slots };
+    configured.min(hard_slots * BLOCK + 3)
+}
+
 /// The startup shape of a serve run: a context to serve in, and a token budget inside it.
 fn check_serve_shape(ctx: usize, max_tokens: usize) -> Result<(), String> {
     if ctx == 0 { return Err("--ctx must be greater than 0".to_string()); }
@@ -2184,7 +2185,7 @@ fn clamped_chat_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, Stri
 fn clamped_messages_max(prompt: usize, max: usize, ctx: usize) -> Result<usize, String> {
     if !context_over(prompt, max, ctx) { return Ok(max); }
     if prompt.saturating_add(3) <= ctx { return Ok(ctx - prompt - 2); }
-    Err(format!("prompt is too long: {prompt} tokens > {ctx} maximum"))
+    Err(format!("prompt is too long: {prompt} tokens > {} maximum", ctx.saturating_sub(3)))
 }
 
 fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
@@ -2540,7 +2541,8 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         Err(AdmitError::Overloaded(e)) => { turn.status(429, "rate_limit_error"); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
         Err(AdmitError::ClientGone) => { turn.status(499, "cancelled"); return Ok(()); }
     };
-    let rendered = render_messages(cx, req, cx.ctx);
+    let prompt_limit = cx.ctx.saturating_sub(3);
+    let rendered = render_messages(cx, req, prompt_limit);
     drop(preprocess);
     let toks = match rendered {
         Ok(t) => t,
@@ -2549,7 +2551,7 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
             let message = match e {
                 RenderError::Invalid(message) => message,
                 // Retain the numeric error format used by clients for reactive compaction.
-                RenderError::TooLong => format!("prompt is too long: {} tokens > {} maximum", cx.ctx.saturating_add(1), cx.ctx),
+                RenderError::TooLong => format!("prompt is too long: {} tokens > {prompt_limit} maximum", prompt_limit + 1),
             };
             turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &message);
@@ -2713,6 +2715,7 @@ pub fn serve(o: ServeOpts) {
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
     let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
@@ -2746,7 +2749,7 @@ pub fn serve(o: ServeOpts) {
         None
     };
     let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, seq: Default::default(),
-        nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
+        nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
         preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
@@ -2791,7 +2794,7 @@ pub fn serve(o: ServeOpts) {
     if o.loopcd_omega > 0.0 {
         eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
     }
-    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, o.ctx, o.effort, effective_queue);
+    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
         for c in l.incoming() {
@@ -2904,6 +2907,8 @@ mod tests {
         let budget = BodyBudget::new(2 * max);
         super::read_chunked(r, max, &budget).map(|body| body.bytes)
     }
+
+    include!("serve/physical_context_tests.rs");
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
@@ -3823,8 +3828,8 @@ mod tests {
         assert_eq!(clamped_messages_max(100, 32_000, 131_072), Ok(32_000), "what fits is untouched");
         assert_eq!(clamped_messages_max(108_582, 32_000, 131_072), Ok(22_488), "131072 - 108582 - the two reserved tokens");
         assert_eq!(clamped_messages_max(61, 32, 64), Ok(1), "one token and the reserve exactly fit");
-        assert_eq!(clamped_messages_max(62, 32, 64), Err("prompt is too long: 62 tokens > 64 maximum".to_string()));
-        assert_eq!(clamped_messages_max(200, 8, 64), Err("prompt is too long: 200 tokens > 64 maximum".to_string()));
+        assert_eq!(clamped_messages_max(62, 32, 64), Err("prompt is too long: 62 tokens > 61 maximum".to_string()));
+        assert_eq!(clamped_messages_max(200, 8, 64), Err("prompt is too long: 200 tokens > 61 maximum".to_string()));
         // the handler really sends the clamped budget to the scheduler
         let tk0 = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
@@ -3859,7 +3864,7 @@ mod tests {
             "messages": [{"role": "user", "content": long}]}), &mut out).unwrap();
         let a = String::from_utf8(out).unwrap();
         assert!(a.starts_with("HTTP/1.1 400"), "messages over-cap must be an HTTP 400, got: {}", &a[..a.len().min(80)]);
-        assert!(a.contains("invalid_request_error") && a.contains("prompt is too long:") && a.contains("tokens > 64 maximum"),
+        assert!(a.contains("invalid_request_error") && a.contains("prompt is too long:") && a.contains("tokens > 61 maximum"),
             "a prompt that itself does not fit must read as Anthropic's over-long error, so Claude Code compacts: {a}");
         assert!(!a.contains("text/event-stream"), "no SSE headers may precede the refusal: {a}");
         let mut out: Vec<u8> = Vec::new();
