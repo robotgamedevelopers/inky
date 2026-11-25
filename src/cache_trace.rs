@@ -766,29 +766,29 @@ impl BlockLayoutState {
             return Err(TraceError::InvalidSchema("pool metadata length mismatch".into()));
         }
         let mut full_out = Vec::with_capacity(pools.full.len());
-        for i in 0..pools.full.len() {
+        for (i, (block, data)) in full_meta.iter().enumerate() {
             let slot = Slot::new((i + 1) as u32).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             let rec = pools.full.record(slot).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             full_out.push(PoolSlotSnapshot {
                 slot: slot.get(),
                 generation: rec.generation(),
                 kind: BlockKind::Full,
-                block: full_meta[i].0,
+                block: *block,
                 length: rec.length(),
-                data: full_meta[i].1.clone(),
+                data: data.clone(),
             });
         }
         let mut win_out = Vec::with_capacity(pools.window.len());
-        for i in 0..pools.window.len() {
+        for (i, (block, data)) in win_meta.iter().enumerate() {
             let slot = Slot::new((i + 1) as u32).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             let rec = pools.window.record(slot).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             win_out.push(PoolSlotSnapshot {
                 slot: slot.get(),
                 generation: rec.generation(),
                 kind: BlockKind::Window,
-                block: win_meta[i].0,
+                block: *block,
                 length: rec.length(),
-                data: win_meta[i].1.clone(),
+                data: data.clone(),
             });
         }
         Ok((full_out, win_out))
@@ -1183,16 +1183,16 @@ pub fn render_block_layout_tla_bundle(
             grid[ki][e.block as usize] = Some(e);
         }
         out.push_str("<<");
-        for ki in 0..2 {
+        for (ki, row) in grid.iter().enumerate() {
             if ki > 0 {
                 out.push_str(", ");
             }
             out.push_str("<<");
-            for bi in 0..(num_blocks as usize) {
+            for (bi, cell) in row.iter().enumerate() {
                 if bi > 0 {
                     out.push_str(", ");
                 }
-                if let Some(e) = grid[ki][bi] {
+                if let Some(e) = cell {
                     let kcode = if e.kind == BlockKind::Full { 1 } else { 2 };
                     let _ = write!(
                         out,
@@ -1364,7 +1364,8 @@ pub fn render_block_layout_tla_bundle(
 EXTENDS BlockLayout, TraceData, Sequences
 
 LaneSeq == <<{lane_seq_lit}>>
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+LaneIdx(l) == LaneIdxMap[l]
 KindIdx(k) == IF k = \"full\" THEN 1 ELSE 2
 DecodeKind(c) == IF c = 1 THEN \"full\" ELSE IF c = 2 THEN \"window\" ELSE \"none\"
 DecodeEntry(e) ==
@@ -1615,7 +1616,7 @@ impl CacheSchedulerConfig {
         if self.block_size == 0 || self.window_size < self.block_size {
             return Err(TraceError::InvalidSchema("invalid block_size/window_size".into()));
         }
-        if self.max_pos < self.block_size || self.max_pos % self.block_size != 0 {
+        if self.max_pos < self.block_size || !self.max_pos.is_multiple_of(self.block_size) {
             return Err(TraceError::InvalidSchema("max_pos must be a positive multiple of block_size".into()));
         }
         for &r in &self.request_lengths {
@@ -2570,7 +2571,7 @@ pub fn render_cache_scheduler_tla_bundle(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let check = format!(
+    let mut check = format!(
         "---------------------------- MODULE TraceCheck ----------------------------
 EXTENDS CacheScheduler, TraceData, Sequences
 
@@ -2579,10 +2580,15 @@ PrefixSeq == <<{pfx_seq_lit}>>
 BoundarySeq == <<{bnd_seq_lit}>>
 BlockSeq == <<{blk_seq_lit}>>
 
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
-PrefixIdx(p) == CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p
-BoundaryIdx(k) == CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k
-BlockIdxOf(b) == CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+PrefixIdxMap == [p \\in Prefixes |-> CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p]
+BoundaryIdxMap == [k \\in Boundaries |-> CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k]
+BlockIdxMap == [b \\in BlockIds |-> CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b]
+
+LaneIdx(l) == LaneIdxMap[l]
+PrefixIdx(p) == PrefixIdxMap[p]
+BoundaryIdx(k) == BoundaryIdxMap[k]
+BlockIdxOf(b) == BlockIdxMap[b]
 
 DecodeTier(c) ==
   IF c = 1 THEN \"memory\"
@@ -2666,43 +2672,60 @@ ReplayNext ==
        /\\ gpuDone' = nxt.gpuDone /\\ restoreIO' = nxt.restoreIO
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
+"
+    );
+    check.push_str(
+        r#"\* Exact one-point specialization of AnyBuildStep (BuildStep fixes stepActive'=TRUE,
+\* stepLanes'=chosen, stepSpan'=spans), avoiding 15 * 81 = 1,215 blind enumerations per step.
+TraceAnyBuildStep ==
+  /\ stepActive' = TRUE
+  /\ stepLanes' \in ((SUBSET Lanes) \ {})
+  /\ stepSpan' \in [Lanes -> 0..MaxSpan]
+  /\ BuildStep(stepLanes', stepSpan')
+TraceNext ==
+  \/ (\E l \in Lanes : AdvanceLane(l))
+  \/ MemReclaim
+  \/ TraceAnyBuildStep
+  \/ StepProgress
+  \/ UnfairEnvActions
+
 InitConforms == (stepIdx = 1) => Init
-StepConforms == [][Next]_vars
+StepConforms == [][TraceNext]_vars
 
 DispatchStep(act) ==
-  IF act[1] = \"Arrive\"                    THEN Arrive(act[2], act[3], act[4])
-  ELSE IF act[1] = \"Refuse429\"            THEN Refuse429(act[2])
-  ELSE IF act[1] = \"Admit\"                THEN Admit(act[2])
-  ELSE IF act[1] = \"BeginRestore\"         THEN BeginRestore(act[2])
-  ELSE IF act[1] = \"RestoreBlock\"         THEN RestoreBlock(act[2], DecodeBlockId(act[3]))
-  ELSE IF act[1] = \"RestoreStartState\"    THEN RestoreStartState(act[2])
-  ELSE IF act[1] = \"FinishRestore\"        THEN FinishRestore(act[2])
-  ELSE IF act[1] = \"EvictCleanOrUnrefMem\" THEN (EvictCleanOrUnrefMem
-                                                  /\\ InMemory(DecodeBlockId(act[2]))
-                                                  /\\ blocks'[DecodeBlockId(act[2])].tier \\notin {{\"memory\", \"both\"}})
-  ELSE IF act[1] = \"StartColdWriteback\"   THEN (StartColdWriteback
-                                                  /\\ stepIO' = {{DecodeBlockId(act[2])}})
-  ELSE IF act[1] = \"EvictCleanStartState\" THEN (EvictCleanStartState
-                                                  /\\ StateInMem(<<act[2], act[3]>>)
-                                                  /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")
-  ELSE IF act[1] = \"SpillStartState\"      THEN (SpillStartState
-                                                  /\\ startPoints[<<act[2], act[3]>>].stateTier = \"memory\"
-                                                  /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")
-  ELSE IF act[1] = \"ReclaimColdDisk\"      THEN ReclaimColdDisk
-  ELSE IF act[1] = \"DropUnreferenced\"     THEN DropUnreferenced(DecodeBlockId(act[2]))
-  ELSE IF act[1] = \"SlideWindow\"          THEN SlideWindow(act[2])
-  ELSE IF act[1] = \"FinishReady\"          THEN FinishReady(act[2])
-  ELSE IF act[1] = \"BuildStep\"            THEN BuildStep(act[2], [l \\in Lanes |-> act[3][LaneIdx(l)]])
-  ELSE IF act[1] = \"GpuExecute\"           THEN GpuExecute
-  ELSE IF act[1] = \"CompleteStepIO\"       THEN CompleteStepIO
-  ELSE IF act[1] = \"FinishStep\"           THEN FinishStep
-  ELSE IF act[1] = \"Cancel\"               THEN Cancel(act[2])
-  ELSE IF act[1] = \"Stutter\"              THEN UNCHANGED vars
+  IF act[1] = "Arrive"                    THEN Arrive(act[2], act[3], act[4])
+  ELSE IF act[1] = "Refuse429"            THEN Refuse429(act[2])
+  ELSE IF act[1] = "Admit"                THEN Admit(act[2])
+  ELSE IF act[1] = "BeginRestore"         THEN BeginRestore(act[2])
+  ELSE IF act[1] = "RestoreBlock"         THEN RestoreBlock(act[2], DecodeBlockId(act[3]))
+  ELSE IF act[1] = "RestoreStartState"    THEN RestoreStartState(act[2])
+  ELSE IF act[1] = "FinishRestore"        THEN FinishRestore(act[2])
+  ELSE IF act[1] = "EvictCleanOrUnrefMem" THEN (EvictCleanOrUnrefMem
+                                                  /\ InMemory(DecodeBlockId(act[2]))
+                                                  /\ blocks'[DecodeBlockId(act[2])].tier \notin {"memory", "both"})
+  ELSE IF act[1] = "StartColdWriteback"   THEN (StartColdWriteback
+                                                  /\ stepIO' = {DecodeBlockId(act[2])})
+  ELSE IF act[1] = "EvictCleanStartState" THEN (EvictCleanStartState
+                                                  /\ StateInMem(<<act[2], act[3]>>)
+                                                  /\ startPoints'[<<act[2], act[3]>>].stateTier = "disk")
+  ELSE IF act[1] = "SpillStartState"      THEN (SpillStartState
+                                                  /\ startPoints[<<act[2], act[3]>>].stateTier = "memory"
+                                                  /\ startPoints'[<<act[2], act[3]>>].stateTier = "disk")
+  ELSE IF act[1] = "ReclaimColdDisk"      THEN ReclaimColdDisk
+  ELSE IF act[1] = "DropUnreferenced"     THEN DropUnreferenced(DecodeBlockId(act[2]))
+  ELSE IF act[1] = "SlideWindow"          THEN SlideWindow(act[2])
+  ELSE IF act[1] = "FinishReady"          THEN FinishReady(act[2])
+  ELSE IF act[1] = "BuildStep"            THEN BuildStep(act[2], [l \in Lanes |-> act[3][LaneIdx(l)]])
+  ELSE IF act[1] = "GpuExecute"           THEN GpuExecute
+  ELSE IF act[1] = "CompleteStepIO"       THEN CompleteStepIO
+  ELSE IF act[1] = "FinishStep"           THEN FinishStep
+  ELSE IF act[1] = "Cancel"               THEN Cancel(act[2])
+  ELSE IF act[1] = "Stutter"              THEN UNCHANGED vars
   ELSE FALSE
 
 StepActionCheck ==
   (stepIdx' = stepIdx + 1) =>
-    \\E act \\in {{Traces[traceIdx][stepIdx + 1][20]}} : DispatchStep(act)
+    \E act \in {Traces[traceIdx][stepIdx + 1][20]} : DispatchStep(act)
 
 ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>
 
@@ -2710,28 +2733,28 @@ BlkTick(s, b) == s[1][BlockIdxOf(b)][7]
 StartTick(s, pk) == s[2][PrefixIdx(pk[1])][BoundaryIdx(pk[2])][5]
 
 LruCheck(s, act) ==
-  IF act[1] = \"EvictCleanOrUnrefMem\"
-  THEN \\A c \\in {{d \\in ColdMemBlocks : OnDisk(d) \\/ blocks[d].refCount = 0}} :
+  IF act[1] = "EvictCleanOrUnrefMem"
+  THEN \A c \in {d \in ColdMemBlocks : OnDisk(d) \/ blocks[d].refCount = 0} :
          BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
-  ELSE IF act[1] = \"StartColdWriteback\"
-  THEN \\A c \\in {{d \\in ColdMemBlocks : blocks[d].tier = \"memory\" /\\ blocks[d].sealed}} :
+  ELSE IF act[1] = "StartColdWriteback"
+  THEN \A c \in {d \in ColdMemBlocks : blocks[d].tier = "memory" /\ blocks[d].sealed} :
          BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
-  ELSE IF act[1] = \"EvictCleanStartState\"
-  THEN \\A c \\in {{x \\in ColdMemStates : StateOnDisk(x)}} :
+  ELSE IF act[1] = "EvictCleanStartState"
+  THEN \A c \in {x \in ColdMemStates : StateOnDisk(x)} :
          StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
-  ELSE IF act[1] = \"SpillStartState\"
-  THEN \\A c \\in {{x \\in ColdMemStates : startPoints[x].stateTier = \"memory\"}} :
+  ELSE IF act[1] = "SpillStartState"
+  THEN \A c \in {x \in ColdMemStates : startPoints[x].stateTier = "memory"} :
          StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
   ELSE TRUE
 
 StepLruCheck ==
   (stepIdx' = stepIdx + 1) =>
-    \\E prev \\in {{Traces[traceIdx][stepIdx]}}, act \\in {{Traces[traceIdx][stepIdx + 1][20]}} :
+    \E prev \in {Traces[traceIdx][stepIdx]}, act \in {Traces[traceIdx][stepIdx + 1][20]} :
       LruCheck(prev, act)
 
 ActionLruOrder == [][StepLruCheck]_<<vars, traceIdx, stepIdx>>
 =============================================================================
-"
+"#,
     );
 
     let cfg_file = format!(

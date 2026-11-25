@@ -1,6 +1,8 @@
 //! Standalone entry point for the CPU build of the production serving cache.
 #![allow(dead_code)]
 
+extern crate libc;
+
 mod block_cache;
 mod blockbook;
 mod blocks;

@@ -11,6 +11,7 @@ java -cp tla2tools.jar tlc2.TLC -config NoPersist.cfg -workers 1 MemMode.tla    
 java -cp tla2tools.jar tlc2.TLC -config LostSeed.cfg -workers 1 MemMode.tla        # witness: SavedIsOwner violated
 java -cp tla2tools.jar tlc2.TLC -config StaleSaved.cfg -workers 1 MemMode.tla       # witness: RestoredWhenIdle violated
 java -cp tla2tools.jar tlc2.TLC -config NoRollback.cfg -workers 1 MemMode.tla       # witness: RefusedRollbackSafe violated
+java -cp tla2tools.jar tlc2.TLC -config LowerHigher.cfg -workers 1 MemMode.tla      # witness: RaisedWhileConnected violated
 ```
 
 - `RestoreDefault`: restoring the macOS default (0) instead of the value found throws away a limit the owner set by hand.
@@ -20,6 +21,7 @@ java -cp tla2tools.jar tlc2.TLC -config NoRollback.cfg -workers 1 MemMode.tla   
 - `StaleSaved`: a helper that keeps its in-memory save after a confirmed restore, or after a failed raise it should have forgotten (when forgetting the file fails): the owner then changes the limit by hand, and the next connect skips reading it — an admitted one later restores the stale value over the owner's, a refused one rolls back to it. The witness checks the owner's limit (`RestoredWhenIdle`), so TLC runs past the stale state itself (which also breaks `SavedIsOwed`, checked in the main config) to the overwrite.
 
 - `NoRollback`: a failed raise moves the limit and the helper omits the rollback. The standalone model rejects the refused connection left at the target with no attempted rollback, even though the saved obligation remains. This witness runs against `MemMode.tla` alone, without `TraceProtocol` or generated traces.
+- `LowerHigher`: when the owner has already set `iogpu.wired_limit_mb` above `Target`, a helper that unconditionally writes `Target` lowers the owner's limit while inky runs instead of leaving the higher limit untouched.
 
 The refused-connect action explicitly chooses the failed raise's assignment, the first read-back, whether the rollback write assigns the saved value, and the final read-back. `RollbackAttempted` requires an attempt whenever the first read-back does not confirm the saved value. `RefusedRollbackSafe` requires an assigning rollback to restore that value; a refused connect still left elsewhere must have attempted rollback and retained the saved obligation. The `rollback` record is observation state, cleared on other operations; trace replay derives attempts and assignment effects from the fake closure call log, rather than inferring an attempt from a retained `Mode.saved`.
 
@@ -27,7 +29,7 @@ An unconditional “no clients means the limit is restored” would be false for
 
 What the model covers: clients connecting and closing (however a connection closes), the owner setting the limit outside inky mode while no restore is owed, the helper crashing at any moment and launchd restarting it, the saved limit on disk, and the fallible steps — writing the saved file, setting the limit (including a raise that moves it and is then rolled back, and one that is forgotten once the rollback is confirmed), restoring, forgetting the file, and a starting helper seeding its save from the file when its restore fails. The save is held across the idle time while a restore is still owed. Safety, and the liveness that the owner's limit comes back or a restore of it is still pending and has not been silently dropped. What it does not: the socket and its permissions, a hand change of the limit racing an owed restore, or one made while only the saved file remains (the helper's saved value wins there by design until its restore is confirmed or the next connect overwrites the file), the choice of target, or the real socket/sysctl integration. The CPU trace check below connects the actual Rust Mode transitions to the model.
 
-TLA+ tools 2.19. Checked with three clients and three limit values; small enough for any machine.
+TLA+ tools 2.19. Checked with three clients and four limit values (below, at, and above `Target`); small enough for any machine.
 
 
 ## Production Mode trace conformance
@@ -40,6 +42,6 @@ Each state includes the operation and the ordered closure calls, arguments, resu
 
 `TraceCheck.tla` replays every recorded state and checks initial/next-state conformance from **MemMode itself**, its safety invariants, and the operation protocol. This checks finite prefixes, including simulated crash/restart and the real startup restore block, but does not establish infinite fairness/liveness, socket handling, process supervision, or real syscall behavior. The separate exhaustive model run checks the model's liveness.
 
-Five committed negative controls mutate temporary extracts of the production Rust: early release, omitted rollback, omitted close read-back, lost startup seed, and omitted persistence. Each must produce a TLC action-property or invariant counterexample (exit 13 or 12); compiler, parser or infrastructure failures cannot count as successful controls. The generator separately requires coverage of all six fault classes, failed saved-file restarts, and successful restore calls that leave the limit at the wrong value.
+Six committed negative controls mutate temporary extracts of the production Rust: early release, omitted rollback, omitted close read-back, lost startup seed, omitted persistence, and lowering a higher owner limit. Each must produce a TLC action-property or invariant counterexample (exit 13 or 12); compiler, parser or infrastructure failures cannot count as successful controls. The generator separately requires coverage of all six fault classes, failed saved-file restarts, successful restore calls that leave the limit at the wrong value, and keep-higher connects.
 
-The initial traces exposed existing implementation behaviors missing from the model: a failed raise/read-back can retain a save while the original limit is intact, an unconfirmed restore can move the limit, and a previously owed save can be restored by rollback. Production Rust is unchanged. The main model and all six model bug witnesses remain discriminating.
+The initial traces exposed existing implementation behaviors missing from the model: a failed raise/read-back can retain a save while the original limit is intact, an unconfirmed restore can move the limit, and a previously owed save can be restored by rollback. The main model and all seven model bug witnesses remain discriminating.

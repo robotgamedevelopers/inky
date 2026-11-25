@@ -18,20 +18,31 @@ fn parse_tool_call(header: &[u8], body: &[u8]) -> (String, Value) {
 fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut(ReplyPart)) {
     #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
     let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
+    let flush_open = |mode: &M, cur: &mut Vec<u8>, emit: &mut dyn FnMut(ReplyPart)| {
+        match mode {
+            M::Think => emit(ReplyPart::Thinking(take_stream_text(cur, true))),
+            M::Text => emit(ReplyPart::Text(take_stream_text(cur, true))),
+            _ => cur.clear(),
+        }
+    };
     for &t in toks {
+        if sp.is_role_stop(t) {
+            flush_open(&mode, &mut cur, &mut emit);
+            mode = M::None;
+            break;
+        }
         let ends = t == sp.end || t == sp.end_sampling || t == tk.eos;
         if t == sp.msg_model || t == sp.c_think || t == sp.c_text || t == sp.c_tool || ends {
             if t == sp.c_text && mode == M::Text { continue; }
             match mode {
-                M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
-                M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
+                M::Text | M::Think => flush_open(&mode, &mut cur, &mut emit),
                 M::Tool if ends => {
                     let (name, args) = parse_tool_call(&header, &cur);
                     emit(ReplyPart::Tool(name, args));
+                    cur.clear();
                 }
-                _ => {}
+                _ => cur.clear(),
             }
-            cur.clear();
             mode = if t == sp.msg_model { header.clear(); M::Header }
                 else if t == sp.c_think { M::Think } else if t == sp.c_text { M::Text }
                 else if t == sp.c_tool { M::Tool } else { M::None };
@@ -39,11 +50,7 @@ fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut
             match mode { M::Header => header.extend(tk.decode_bytes(t)), M::None => {}, _ => cur.extend(tk.decode_bytes(t)) }
         }
     }
-    match mode {
-        M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
-        M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
-        _ => {}
-    }
+    flush_open(&mode, &mut cur, &mut emit);
 }
 
 /// Chat represents text, reasoning and tool calls in separate fields.
@@ -106,10 +113,10 @@ pub(super) fn take_stream_text(pend: &mut Vec<u8>, end: bool) -> String {
 /// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
 /// the block must stream on their own. Thinking tokens open no block.
 pub(super) struct BlockStream { nonce: String, seq: u64, next: usize, pub(super) calls: usize, text_index: usize, open_text: bool,
-                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool }
+                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool, stopped: bool }
 impl BlockStream {
     pub(super) fn new(nonce: &str, seq: u64) -> BlockStream {
-        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
+        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false, stopped: false }
     }
     fn flush_text(&mut self, out: &mut Vec<String>) {
         if !self.open_text { self.pend.clear(); return; }
@@ -143,11 +150,26 @@ impl BlockStream {
         self.tool.clear();
     }
     pub(super) fn on_token(&mut self, tk: &Tokenizer, sp: &Specials, t: u32) -> Vec<String> {
+        if self.stopped { return Vec::new(); }
         let mut out = Vec::new();
+        if sp.is_role_stop(t) {
+            if self.mode == 3 { self.tool.clear(); }
+            self.close_text(&mut out);
+            self.mode = 0;
+            self.in_header = false;
+            self.stopped = true;
+            return out;
+        }
         if t == sp.msg_model { self.close_text(&mut out); self.mode = 0; self.in_header = true; self.header.clear(); return out; }
         if t == sp.c_think { self.close_text(&mut out); self.mode = 1; self.in_header = false; return out; }
         if t == sp.c_text {
-            if !self.open_text {
+            if self.open_text {
+                let text = take_stream_text(&mut self.pend, true);
+                if !text.is_empty() {
+                    out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
+                        "delta": {"type": "text_delta", "text": text}})));
+                }
+            } else {
                 self.text_index = self.next; self.next += 1; self.open_text = true;
                 out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": self.text_index,
                     "content_block": {"type": "text", "text": ""}})));

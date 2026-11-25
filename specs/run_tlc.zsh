@@ -47,6 +47,9 @@ prepare_prefix_trace() {
         mutant-ref-leak)
             from='self.records.drop_ref(e.slot(), e.kind(), e.generation())'
             to='Ok::<(), BlockError>(())' ;;
+        mutant-kind-mixup)
+            from='self.records.generation(e.slot(), e.kind()) != Some(e.generation())'
+            to='self.records.generation(e.slot(), BlockKind::Full) != Some(e.generation())' ;;
     esac
     if [[ -n ${from:-} ]]; then
         MUT_FROM="$from" MUT_TO="$to" perl -0pi -e \
@@ -199,6 +202,7 @@ check PrefixTreeFast PrefixTree
 check PrefixTreeEvictFast PrefixTree
 check PrefixTreeShallow PrefixTree DeepestStart
 check PrefixTreeStale PrefixTree ResultLive
+check PrefixTreeKindMixup PrefixTree ResultLive
 check PrefixTreeFirstToken PrefixTree MatchExact
 check PrefixTreeAnyParent PrefixTree ResultIsStart
 check PrefixTreePartial PrefixTree StartOnBoundary
@@ -217,6 +221,7 @@ fi
 check_nightly mutant-no-evict PrefixTreeTrace 'Deadlock reached' trace-mutant
 check_nightly mutant-full-match PrefixTreeTrace 'Deadlock reached' trace-mutant
 check_nightly mutant-ref-leak PrefixTreeTrace 'Invariant PoolBooks is violated' trace-mutant
+check_nightly mutant-kind-mixup PrefixTreeTrace 'Deadlock reached' trace-mutant
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
 check BlockLayoutHigh BlockLayout

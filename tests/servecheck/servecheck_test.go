@@ -225,6 +225,8 @@ func TestParseAnthropicSSEAndOpenAIUsageStream(t *testing.T) {
 	}
 
 	openaiBody := strings.Join([]string{
+		`: keepalive`,
+		``,
 		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
 		``,
 		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"inky/inkling-2-mini","choices":[{"index":0,"delta":{"content":"58F"},"finish_reason":null}]}`,

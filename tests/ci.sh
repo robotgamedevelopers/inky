@@ -88,6 +88,8 @@ if [ "$pg_rc" = 1 ] && print -r -- "$pg_out" | grep -q 'POOL GATE DIFFERS'; then
 if print -r -- "$pg_out" | grep -q '^INK_POOLGATE_SABOTAGE: no other lane differs'; then echo "poolgate sabotage: no other lane differs, as required"; else print -r -- "$pg_out" | grep 'LANE LEAK' || true; echo "FAIL: poolgate sabotage leaked across lanes"; fail=1; fi
 pgs_out=$(INK_POOLGATE_START_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pgs_rc=0 || pgs_rc=$?
 if [ "$pgs_rc" = 1 ] && print -r -- "$pgs_out" | grep -q 'PREFIX START-POINT GATE DIFFERS'; then echo "poolgate start-point sabotage: detected, as required"; else echo "FAIL: poolgate start-point sabotage not detected (exit $pgs_rc)"; fail=1; fi
+pgc_out=$(INK_POOLGATE_CACHE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pgc_rc=0 || pgc_rc=$?
+if [ "$pgc_rc" = 1 ] && print -r -- "$pgc_out" | grep -q 'POOL GATE DIFFERS'; then echo "poolgate ServeBlockCache sabotage: detected, as required"; else echo "FAIL: poolgate ServeBlockCache sabotage not detected (exit $pgc_rc)"; fail=1; fi
 $B loopcdgate --ref ref/long.tokens -c 256 2>&1 | tail -1 | tee /dev/stderr | grep -q '^loopcd gate exact' || { echo "FAIL: loopcdgate"; fail=1; }
 # negative control: perturbing one lane's blended LoopCD logit must exit 1 AND report LOOPCD GATE DIFFERS
 lc_out=$(INK_LOOPCDGATE_SABOTAGE=1 $B loopcdgate --ref ref/long.tokens -c 256 2>&1) && lc_rc=0 || lc_rc=$?
@@ -102,7 +104,7 @@ if [ "$binv_rc" = 1 ] && print -r -- "$binv_out" | grep -q '^NOT batch invariant
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
 lanes_out=$(INK_LANES_SABOTAGE=1 INK_PF=2380 $B lanes --ref ref/long.tokens -c 4096 2>&1) && lanes_rc=0 || lanes_rc=$?
 if [ "$lanes_rc" = 1 ] && print -r -- "$lanes_out" | grep -q '^LANES NOT INDEPENDENT$'; then echo "lanes sabotage: detected, as required"; else echo "FAIL: lanes sabotage not detected (exit $lanes_rc)"; fail=1; fi
-INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
+INK_LANES=1,2,17,64,65,129 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
 # A shorter private lane must clear the masked tail of its last K/V tile.
 private_test=engine::tests::private_prefill_clears_the_last_window_tile_between_lanes
 if private_out=$(cargo test --locked --release --bin inky "$private_test" -- --ignored --exact 2>&1) &&
@@ -117,7 +119,7 @@ fi
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other status does not count
 sp_out=$(INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1) && sp_rc=0 || sp_rc=$?
 if [ "$sp_rc" = 1 ] && print -r -- "$sp_out" | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else print -r -- "$sp_out"; echo "FAIL: spans sabotage not detected (exit $sp_rc)"; fail=1; fi
-INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
+INK_LANES=1,8,33,64 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
 db_out=$(INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 $B dbatch --ref ref/long.tokens -c 4096 2>&1) && db_rc=0 || db_rc=$?
 if [ "$db_rc" = 1 ] && print -r -- "$db_out" | grep -q '^DBATCH NOT EXACT$'; then echo "dbatch sabotage: detected, as required"; else echo "FAIL: dbatch sabotage not detected (exit $db_rc)"; fail=1; fi
 $B blockedinv --ref ref/long.tokens -c 4160 2>&1 | tail -1 | tee /dev/stderr | grep -q '^blockedinv exact' || { echo "FAIL: blockedinv"; fail=1; }

@@ -22,12 +22,21 @@ driver="$root/scripts/scheduler-traces.rs"
 work=$(mktemp -d "${TMPDIR:-/tmp}/inky-sched-traces.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
+JOBS=${INKY_TRACE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+if [[ "$JOBS" -lt 1 ]]; then JOBS=1; fi
+
 run_bundle() {
-    local dir=$1
+    local dir=$1 workers=${2:-1} mode=${3:-fast}
     cp "$spec" "$dir/CacheScheduler.tla"
-    (cd "$dir" && "$java_bin" -Xmx4g -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
-        -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
-        -config TraceCheck.cfg TraceCheck.tla) > "$dir/tlc.log" 2>&1
+    if [[ "$mode" == "c2" ]]; then
+        (cd "$dir" && "$java_bin" -Xmx1536m -XX:+UseParallelGC -XX:CICompilerCount=2 -cp "$jar" tlc2.TLC \
+            -noGenerateSpecTE -workers "$workers" -metadir "$dir/states" \
+            -config TraceCheck.cfg TraceCheck.tla) > "$dir/tlc.log" 2>&1
+    else
+        (cd "$dir" && "$java_bin" -Xmx1536m -XX:+UseParallelGC -XX:TieredStopAtLevel=1 -cp "$jar" tlc2.TLC \
+            -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
+            -config TraceCheck.cfg TraceCheck.tla) > "$dir/tlc.log" 2>&1
+    fi
 }
 
 check_production() {
@@ -37,7 +46,7 @@ check_production() {
     mkdir -p "$dir/scheduler"
     cp "$root/src/scheduler/trace.rs" "$dir/scheduler/"
     cp "$driver" "$dir/main.rs"
-    rustc --edition=2021 -D warnings -O "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
+    rustc --edition=2021 -D warnings -C debug-assertions=on -C debuginfo=0 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
         cat "$dir/rustc.log" >&2
         return 1
     }
@@ -49,7 +58,7 @@ check_production() {
         cat "$dir/walk.log" >&2
         return 1
     fi
-    if ! run_bundle "$dir/bundle"; then
+    if ! run_bundle "$dir/bundle" 2 c2; then
         cat "$dir/walk.log" "$dir/bundle/tlc.log" >&2
         return 1
     fi
@@ -84,7 +93,7 @@ PY
         echo "ERROR: $name changed nothing" >&2
         return 1
     fi
-    rustc --edition=2021 -O "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
+    rustc --edition=2021 -C debug-assertions=on -C debuginfo=0 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
         cat "$dir/rustc.log" >&2
         return 1
     }
@@ -108,7 +117,27 @@ PY
 }
 
 names=() pids=()
-start() { names+=("$1"); "${@:2}" & pids+=($!); }
+has_slot() {
+    local n=0 pid st
+    for pid in "${pids[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ st _ < "/proc/$pid/stat" 2>/dev/null || continue
+            [[ "$st" != "Z" ]] && n=$((n + 1))
+        elif kill -0 "$pid" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    [[ "$n" -lt "$JOBS" ]]
+}
+start() {
+    while ! has_slot; do
+        sleep 0.05
+    done
+    names+=("$1")
+    "${@:2}" &
+    pids+=($!)
+}
 
 start production check_production
 

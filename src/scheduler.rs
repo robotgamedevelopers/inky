@@ -234,7 +234,7 @@ impl SchedulerConfig {
         if self.window_size < self.block_size {
             return Err(SchedError::InvalidConfig("window_size must be >= block_size"));
         }
-        if self.max_pos < self.block_size || self.max_pos % self.block_size != 0 {
+        if self.max_pos < self.block_size || !self.max_pos.is_multiple_of(self.block_size) {
             return Err(SchedError::InvalidConfig("max_pos must be a positive multiple of block_size"));
         }
         for &r in &self.request_lengths {
@@ -331,7 +331,7 @@ impl std::error::Error for SchedError {}
 // ---- Exact Logical Block-Range Helpers (`specs/BlockLayout.tla` / `CacheScheduler.tla`) ----
 
 pub fn ceil_div(n: u32, d: u32) -> u32 {
-    (n + d - 1) / d
+    n.div_ceil(d)
 }
 
 pub fn span_bound(window_size: u32, block_size: u32, c: u32) -> u32 {
@@ -1208,7 +1208,7 @@ impl Scheduler {
             return Err(SchedError::Precondition("restore I/O already in flight for lane"));
         }
         let pos = self.lanes[lane].pos;
-        if pos == 0 || pos % self.cfg.block_size != 0 {
+        if pos == 0 || !pos.is_multiple_of(self.cfg.block_size) {
             return Err(SchedError::Precondition("lane has no start-point boundary to restore"));
         }
         let pk = (self.lanes[lane].prefix.clone(), pos);
@@ -1479,7 +1479,7 @@ impl Scheduler {
                 continue;
             }
             let need = self.need_alloc(d);
-            if used_tokens + 1 <= self.cfg.step_token_budget
+            if used_tokens < self.cfg.step_token_budget
                 && mem_used + alloc_cnt + need <= mem_budget
             {
                 chosen_set.insert(d);
@@ -1829,7 +1829,7 @@ impl Scheduler {
         for &(l, bnd) in &boundary_lanes {
             let blk_cnt = bnd / bsz;
             let at_prompt_end = bnd == prompt_end(self.lanes[l].target, bsz);
-            if !at_prompt_end && blk_cnt % stride != 0 {
+            if !at_prompt_end && !blk_cnt.is_multiple_of(stride) {
                 continue;
             }
             let pfx = self.lanes[l].prefix.clone();
@@ -2196,12 +2196,11 @@ impl Scheduler {
             if slot.state.is_mem_holding() {
                 let dec_bi = prompt_end(slot.target, bsz) / bsz;
                 for (&bi, bid) in slot.full.iter().chain(&slot.win) {
-                    if bi >= dec_bi {
-                        if !matches!(bid, BlockId::Priv { .. })
-                            || self.blocks.get(bid).is_some_and(|r| r.sealed)
-                        {
-                            return Err(format!("lane {i} decode block {bi} ({bid:?}) sealed"));
-                        }
+                    if bi >= dec_bi
+                        && (!matches!(bid, BlockId::Priv { .. })
+                            || self.blocks.get(bid).is_some_and(|r| r.sealed))
+                    {
+                        return Err(format!("lane {i} decode block {bi} ({bid:?}) sealed"));
                     }
                 }
             }

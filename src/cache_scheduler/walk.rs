@@ -187,7 +187,7 @@ pub fn walk_cache_scheduler(
             }
         }
         sched.cancel(&lanes[0], event_sink, state_sink)?;
-    } else if seed % 2 == 0
+    } else if seed.is_multiple_of(2)
         && cfg.max_queue >= 2
         && lanes.len() >= 3
         && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget

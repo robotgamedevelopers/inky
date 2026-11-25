@@ -141,7 +141,7 @@ func (g *gate) sampleToolReply(ctx context.Context, body string, stream bool) (t
 	done := false
 	for lines.Scan() {
 		line := lines.Text()
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		data, ok := strings.CutPrefix(line, "data: ")
@@ -408,7 +408,7 @@ func (g *gate) disconnectMidThinking() error {
 	thinkingChunks := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		data, ok := strings.CutPrefix(line, "data: ")

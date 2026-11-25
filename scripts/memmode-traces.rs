@@ -50,9 +50,12 @@ impl Fake {
 fn opt(v:Option<u64>)->i64 {v.map_or(-1,|x|x as i64)}
 fn boolean(v:bool)-> &'static str {if v{"TRUE"}else{"FALSE"}}
 fn main() {
+    let is_positive = std::env::args().nth(2).as_deref() == Some("positive");
     println!("---- MODULE TraceData ----\nEXTENDS Integers\nTraces == <<");
-    let mut total=[0;6]; let mut restarts=0; let mut stale_restarts=0; let mut failed_restarts=0; let mut unconfirmed=0;
-    for seed in 1..=32 {
+    let mut total=[0;6]; let mut restarts=0; let mut stale_restarts=0; let mut failed_restarts=0; let mut unconfirmed=0; let mut kept_higher=0;
+    let mut all_traces = Vec::new();
+    let max_seed = if is_positive { 32 } else { 8 };
+    for seed in 1..=max_seed {
         let f=Fake{limit:Cell::new(50000),disk:Cell::new(None),disk_stale:Cell::new(false),boot:Cell::new(1),rng:Cell::new(seed),failures:Cell::new(false),coverage:Cell::new([0;6]),unconfirmed:Cell::new(0),calls:RefCell::new(vec![]),path:format!("{}.{}.saved",std::env::args().nth(1).expect("temporary prefix"),seed),confirmed_set:Cell::new(false)};
         let mut m=Mode::default(); let mut owner=50000; let mut alive=true; let mut owed=false;
         let mut states=vec![f.snapshot(&m,owner,alive,owed,"init")];
@@ -73,11 +76,15 @@ fn main() {
                 owed=had_disk && !was_stale && f.calls.borrow().first().is_some_and(|c|c.kind=="set" && c.result!=0);
                 if owed {failed_restarts+=1;}
             } else {match action {
-                0 if m.clients<3=>{op="connect";let _=m.connect(118000,||f.get(),|v|f.set(v),|v|f.keep(v));}
+                0 if m.clients<3=>{
+                    let was_idle_higher=m.clients==0 && m.saved.is_none() && owner>118000;
+                    op="connect";
+                    if m.connect(118000,||f.get(),|v|f.set(v),|v|f.keep(v)).is_ok() && was_idle_higher {kept_higher+=1;}
+                }
                 1 if m.clients>0=>{op="close";f.confirmed_set.set(false);m.close(||f.get(),|v|f.set(v),|v|f.keep(v));}
-                2 if m.clients==0 && !owed && (f.disk.get().is_none() || f.disk_stale.get())=>{op="owner";owner=[0,50000,118000][f.draw(3)as usize];f.limit.set(owner);}
+                2 if m.clients==0 && !owed && (f.disk.get().is_none() || f.disk_stale.get())=>{op="owner";owner=[0,50000,118000,130000][f.draw(4)as usize];f.limit.set(owner);}
                 3=>{op="crash";m=Mode::default();alive=false;owed=false;}
-                4=>{op="reboot";f.boot.set(f.boot.get()+1);f.disk_stale.set(f.disk.get().is_some());owner=[0,50000,118000][f.draw(3)as usize];f.limit.set(owner);m=Mode::default();alive=false;owed=false;}
+                4=>{op="reboot";f.boot.set(f.boot.get()+1);f.disk_stale.set(f.disk.get().is_some());owner=[0,50000,118000,130000][f.draw(4)as usize];f.limit.set(owner);m=Mode::default();alive=false;owed=false;}
                 _=>{op="idle";}
             }}
             if op=="connect" || op=="close" {
@@ -94,12 +101,15 @@ fn main() {
         unconfirmed+=f.unconfirmed.get();
         for(sum,count)in total.iter_mut().zip(f.coverage.get()){*sum+=count;}
         let _=std::fs::remove_file(&f.path);
-        println!("<<{}>>{}",states.join(",\n"),if seed==32{""}else{","});
+        all_traces.push(format!("<<{}>>", states.join(",\n")));
+        if !is_positive && total.iter().all(|&n| n > 0) && restarts > 0 && stale_restarts > 0 && failed_restarts > 0 && unconfirmed > 0 && kept_higher > 0 {
+            break;
+        }
     }
-    println!(">>\n====");
-    if std::env::args().nth(2).as_deref() == Some("positive") {
+    println!("{}\n>>\n====", all_traces.join(",\n"));
+    if is_positive {
         assert!(total.iter().all(|n|*n>0),"missing failure class: {total:?}");
-        assert!(restarts>0 && stale_restarts>0 && failed_restarts>0 && unconfirmed>0,"missing discriminating restore scenarios: restarts={restarts} stale={stale_restarts} failed={failed_restarts} unconfirmed={unconfirmed}");
+        assert!(restarts>0 && stale_restarts>0 && failed_restarts>0 && unconfirmed>0 && kept_higher>0,"missing discriminating restore or keep-higher scenarios: restarts={restarts} stale={stale_restarts} failed={failed_restarts} unconfirmed={unconfirmed} kept_higher={kept_higher}");
     }
-    eprintln!("failure coverage [get, set unchanged, set moved, keep write, keep forget, Ok unmoved]: {total:?}; saved-file restarts: {restarts} ({failed_restarts} failed), stale-boot restarts: {stale_restarts}; Ok restores left at wrong value: {unconfirmed}");
+    eprintln!("failure coverage [get, set unchanged, set moved, keep write, keep forget, Ok unmoved]: {total:?}; saved-file restarts: {restarts} ({failed_restarts} failed), stale-boot restarts: {stale_restarts}; Ok restores left at wrong value: {unconfirmed}; keep-higher connects: {kept_higher}");
 }

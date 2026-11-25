@@ -14,13 +14,13 @@ cp "$root/src/blockbook.rs" "$original"
 
 # run_trace DIR: compile the walk against DIR/blockbook.rs, record it, replay it.
 run_trace() {
-    local dir=$1
+    local dir=$1 mode=${2:-prod}
     cp "$root"/specs/{StartTails.tla,StartTailsTrace.tla,StartTailsTrace.cfg} "$root/src/blocks.rs" "$dir/"
     cp "$root/scripts/blockbook-traces.rs" "$dir/main.rs"
     : > "$dir/tlc.log"
-    rustc --edition=2021 --cfg standalone_blocks "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
-    "$dir/generate" > "$dir/StartTailsTraceData.tla" 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
-    (cd "$dir" && "${TLC_JAVA:-java}" -Xmx2g -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
+    rustc --edition=2021 --cfg standalone_blocks -C debug-assertions=on -C debuginfo=0 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
+    "$dir/generate" "$mode" > "$dir/StartTailsTraceData.tla" 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
+    (cd "$dir" && "${TLC_JAVA:-java}" -Xmx512m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -cp "$jar" tlc2.TLC \
         -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
         -config StartTailsTrace.cfg StartTailsTrace.tla) > "$dir/tlc.log" 2>&1
 }
@@ -55,8 +55,31 @@ check_production() {
     { grep -E '^[0-9,]+ states generated' "$dir/tlc.log"; cat "$dir/walk.log"; } > "$dir/result"
 }
 
+JOBS=${INKY_TRACE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+if [[ "$JOBS" -lt 1 ]]; then JOBS=1; fi
+
 names=() pids=()
-start() { names+=("$1"); "${@:2}" & pids+=($!); }
+has_slot() {
+    local n=0 pid st
+    for pid in "${pids[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ st _ < "/proc/$pid/stat" 2>/dev/null || continue
+            [[ "$st" != "Z" ]] && n=$((n + 1))
+        elif kill -0 "$pid" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    [[ "$n" -lt "$JOBS" ]]
+}
+start() {
+    while ! has_slot; do
+        sleep 0.05
+    done
+    names+=("$1")
+    "${@:2}" &
+    pids+=($!)
+}
 start production check_production
 # (a) a start point that does not hold its window blocks
 start unheld-window check_mutant unheld-window 'Invariant RefsMatch is violated.' \
@@ -79,7 +102,7 @@ start kept-tail check_mutant kept-tail 'Invariant RefsMatch is violated.' \
     '        for (_, e) in table.entries() { if self.pools.of(e.kind()).record(e.slot())?.sealed() { self.release(e)?; } }'
 # every-16 points on the wrong boundaries
 start every-off check_mutant every-off 'Action property StepConforms is violated.' \
-    'if (n / geo.block) % geo.every == 0 { reasons |= EVERY; }' \
+    'if (n / geo.block).is_multiple_of(geo.every) { reasons |= EVERY; }' \
     'if (n / geo.block) % geo.every == 1 { reasons |= EVERY; }'
 
 failed=0

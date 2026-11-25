@@ -1,7 +1,8 @@
 //! Inky mode: while any inky process runs, the GPU may wire the memory this machine's tuning gives it; when the last one
 //! stops, the limit goes back to what it was. A small root helper (`inky memd`, installed once by `sudo inky
 //! tune-memory`) owns the setting; inky processes connect to it over a Unix socket only the owner can open. A connection
-//! closes on a clean exit, a crash, kill -9 or sleep alike, so the memory is always given back. specs/memmode/MemMode.tla
+//! closes on a clean exit, a crash, or kill -9 alike, so the memory is given back whenever inky stops; local Unix sockets
+//! stay open across macOS sleep, so the limit remains held while inky stays connected. specs/memmode/MemMode.tla
 //! models the helper.
 
 use std::fs::{self, Metadata, OpenOptions, Permissions};
@@ -39,15 +40,21 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 pub struct Mode { pub saved: Option<u64>, pub clients: usize }
 
 impl Mode {
-    /// A client connected: the first one raises the limit to `target`, remembering the limit found (and `keep` stores it
-    /// before the raise). If the limit cannot be read, the saved limit cannot be written, or the raise itself fails,
-    /// the client is refused. A raise that moved the limit before failing is rolled back to the limit found; the save
-    /// (in memory and on disk) is forgotten once the limit is confirmed back where it was, and kept only while the
-    /// limit is still moved, so the helper's exit paths can still restore it.
+    /// A client connected: the first one raises the limit to `target` when the current limit is below `target`,
+    /// remembering the limit found (and `keep` stores it before the raise). If the owner already set a limit at or
+    /// above `target`, the helper admits the client without lowering or saving it. If the limit cannot be read, the
+    /// saved limit cannot be written, or the raise itself fails, the client is refused. A raise that moved the limit
+    /// before failing is rolled back to the limit found; the save (in memory and on disk) is forgotten once the limit
+    /// is confirmed back where it was, and kept only while the limit is still moved, so the helper's exit paths can
+    /// still restore it.
     pub fn connect(&mut self, target: u64, get: impl Fn() -> Option<u64>, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Result<(), String> {
         if self.clients == 0 {
             if self.saved.is_none() {
                 let found = get().ok_or("the current limit cannot be read; not raising it")?;
+                if found >= target {
+                    self.clients += 1;
+                    return Ok(());
+                }
                 keep(Some(found)).map_err(|e| format!("the saved limit could not be written; not raising it: {e}"))?;
                 self.saved = Some(found);
             }
@@ -99,23 +106,19 @@ fn set_limit(v: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn read_saved(path: &str) -> Result<Option<u64>, String> {
-    match read_saved_record(path, None)? {
-        SavedRecord::Absent | SavedRecord::StaleBoot(_, _) => Ok(None),
-        SavedRecord::Current(v) => Ok(Some(v)),
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SavedRecord {
     Absent,
     StaleBoot(String, u64),
+    Unparsable(String),
     Current(u64),
 }
 
 fn is_valid_boot_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 64
+        && tag != "0"
+        && !tag.starts_with('-')
         && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
@@ -126,15 +129,25 @@ pub(super) fn read_saved_record(path: &str, current_boot: Option<&str>) -> Resul
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SavedRecord::Absent),
         Err(e) => return Err(format!("could not inspect the saved limit at {path}: {e}")),
     }
-    let value = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read the saved limit at {path}: {e}"))?;
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SavedRecord::Absent),
+        Err(e) => return Err(format!("could not read the saved limit at {path}: {e}")),
+    };
+    let Ok(value) = std::str::from_utf8(&bytes) else {
+        return Ok(SavedRecord::Unparsable(format!("invalid UTF-8 in {path}")));
+    };
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(SavedRecord::Unparsable(format!("empty saved limit in {path}")));
+    }
     if let Some((boot_tag, limit_str)) = trimmed.split_once(':') {
         if !is_valid_boot_tag(boot_tag) {
-            return Err(format!("could not parse the saved boot tag at {path}: invalid tag"));
+            return Ok(SavedRecord::Unparsable(format!("could not parse the saved boot tag at {path}: invalid tag")));
         }
-        let limit = limit_str.parse::<u32>()
-            .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))?;
+        let Ok(limit) = limit_str.parse::<u32>() else {
+            return Ok(SavedRecord::Unparsable(format!("could not parse the saved limit at {path}")));
+        };
         if let Some(now_boot) = current_boot {
             if boot_tag != now_boot {
                 return Ok(SavedRecord::StaleBoot(boot_tag.to_string(), u64::from(limit)));
@@ -142,8 +155,10 @@ pub(super) fn read_saved_record(path: &str, current_boot: Option<&str>) -> Resul
         }
         return Ok(SavedRecord::Current(u64::from(limit)));
     }
-    trimmed.parse::<u32>().map(|v| SavedRecord::Current(u64::from(v)))
-        .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))
+    match trimmed.parse::<u32>() {
+        Ok(v) => Ok(SavedRecord::Current(u64::from(v))),
+        Err(_) => Ok(SavedRecord::Unparsable(format!("could not parse the saved limit at {path}"))),
+    }
 }
 
 pub(super) fn write_saved_atomic(path: &str, value: u64, boot: Option<&str>) -> Result<(), String> {
@@ -171,13 +186,20 @@ pub(super) fn write_saved_atomic(path: &str, value: u64, boot: Option<&str>) -> 
 
 pub(super) fn restore_on_startup(saved_path: &str, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Result<Mode, String> {
     let mut seed = None;
-    if let Some(v) = read_saved(saved_path)? {
-        eprintln!("[inky memd] the previous helper stopped while the limit was raised: restoring {v}");
-        match set(v) {
-            Ok(()) => { if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); } }
-            Err(e) => {
-                eprintln!("[inky memd] restoring {v} failed: {e}; keeping the saved limit in {saved_path}");
-                seed = Some(v);
+    match read_saved_record(saved_path, None)? {
+        SavedRecord::Absent | SavedRecord::StaleBoot(_, _) => {}
+        SavedRecord::Unparsable(reason) => {
+            eprintln!("[inky memd] ignoring unparsable saved limit in {saved_path} ({reason}); clearing corrupt file");
+            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+        }
+        SavedRecord::Current(v) => {
+            eprintln!("[inky memd] the previous helper stopped while the limit was raised: restoring {v}");
+            match set(v) {
+                Ok(()) => { if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); } }
+                Err(e) => {
+                    eprintln!("[inky memd] restoring {v} failed: {e}; keeping the saved limit in {saved_path}");
+                    seed = Some(v);
+                }
             }
         }
     }
@@ -194,6 +216,11 @@ pub(super) fn restore_on_startup_for_boot(
         SavedRecord::Absent => Ok(Mode::default()),
         SavedRecord::StaleBoot(old_boot, old_val) => {
             eprintln!("[inky memd] ignoring stale saved limit {old_val} from earlier boot {old_boot}");
+            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            Ok(Mode::default())
+        }
+        SavedRecord::Unparsable(reason) => {
+            eprintln!("[inky memd] ignoring unparsable saved limit in {saved_path} ({reason}); clearing corrupt file");
             if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
             Ok(Mode::default())
         }
@@ -313,9 +340,153 @@ fn bind_socket(path: &Path, owner: u32, directory_uid: u32, fake: bool) -> Resul
 }
 
 const MAX_MEMD_LINE: usize = 256;
-const MAX_MEMD_CLIENTS: usize = 256;
+/// Sits comfortably below launchd's default 256 soft descriptor limit and `PLIST_SOFT_NOFILE`.
+const MAX_MEMD_CLIENTS: usize = 128;
+#[cfg(test)]
+const LAUNCHD_DEFAULT_SOFT_NOFILE: usize = 256;
+const PLIST_SOFT_NOFILE: usize = 1024;
+const PLIST_HARD_NOFILE: usize = 2048;
 const TARGET_SOFT_NOFILE: u64 = 4096;
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+fn configure_socket_timeouts(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn accept_error_backoff(err: &io::Error) -> Option<Duration> {
+    if matches!(err.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
+        None
+    } else {
+        Some(ACCEPT_ERROR_BACKOFF)
+    }
+}
+
+fn wait_for_disconnect<R: Read>(r: &mut R) {
+    let mut sink = [0u8; 256];
+    loop {
+        match r.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn sanitize_reason(msg: &str) -> String {
+    let clean: String = msg
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect();
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        "request refused".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub enum LeaseOutcome {
+    /// Helper socket is not installed or not listening; caller stays on macOS default limit.
+    NotInstalled,
+    /// Helper admitted this process, confirmed active wired-memory limit, and started lease monitor.
+    Entered(Lease),
+    /// Helper is installed/reachable and refused or failed the handshake with an explicit reason.
+    Refused(String),
+}
+
+fn parse_enter_reply(line: &str) -> Result<u64, String> {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if let Some(rest) = trimmed.strip_prefix("ok ") {
+        rest.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid limit in helper reply: {trimmed}"))
+    } else if let Some(reason) = trimmed.strip_prefix("err ") {
+        Err(sanitize_reason(reason))
+    } else if trimmed == "err" {
+        Err("helper refused request".to_string())
+    } else {
+        Err(format!("unexpected helper reply: {}", sanitize_reason(trimmed)))
+    }
+}
+
+fn serve_client_stream<R: Read, W: Write>(
+    reader: R,
+    mut writer: W,
+    mode: &Mutex<Mode>,
+    target: u64,
+    get: impl Fn() -> Option<u64>,
+    set: impl Fn(u64) -> Result<(), String>,
+    keep: impl Fn(Option<u64>) -> Result<(), String>,
+) {
+    let mut r = BufReader::new(reader);
+    let line = match read_bounded_line(&mut r, MAX_MEMD_LINE) {
+        Ok(Some(line)) => line,
+        Ok(None) => return,
+        Err(e) => {
+            let reason = sanitize_reason(&format!("invalid client request: {e}"));
+            let _ = writer.write_all(format!("err {reason}\n").as_bytes());
+            return;
+        }
+    };
+    let cmd = line.trim_end_matches(['\r', '\n']);
+    if cmd != "enter" && !cmd.starts_with("enter ") {
+        let _ = writer.write_all(b"err unknown command\n");
+        return;
+    }
+    let active_mb = {
+        let mut m = mode.lock().unwrap();
+        if let Err(e) = m.connect(target, &get, &set, &keep) {
+            eprintln!("[inky memd] refused a client: {e}");
+            let reason = sanitize_reason(&e);
+            let _ = writer.write_all(format!("err {reason}\n").as_bytes());
+            return;
+        }
+        if m.saved.is_some() {
+            target
+        } else {
+            get().unwrap_or(target).max(target)
+        }
+    };
+    if writer.write_all(format!("ok {active_mb}\n").as_bytes()).is_err() {
+        mode.lock().unwrap().close(&get, &set, &keep);
+        return;
+    }
+    let _ = writer.flush();
+    // Hold until the client's end closes; periodic read timeouts loop cleanly without dropping the client.
+    wait_for_disconnect(&mut r);
+    mode.lock().unwrap().close(&get, &set, &keep);
+}
+
+fn render_plist(owner: u32) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array><string>{HELPER}</string><string>memd</string><string>--owner</string><string>{owner}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_SOFT_NOFILE}</integer></dict>
+  <key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_HARD_NOFILE}</integer></dict>
+  <key>StandardErrorPath</key><string>/var/log/inky-memd.log</string>
+</dict></plist>
+"#
+    )
+}
 
 /// Immutable per-boot identifier from XNU (`kern.bootsessionuuid`), unaffected by `settimeofday`
 /// or NTP clock steps.
@@ -552,44 +723,75 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
                 continue;
             }
         };
+        if let Err(e) = configure_socket_timeouts(&s, SOCKET_IO_TIMEOUT) {
+            eprintln!("[inky memd] could not set socket timeouts: {e}");
+            continue;
+        }
         // The socket owner can change its mode, so also check the kernel-supplied peer UID.
-        if !peer_uid(&s).is_some_and(|uid| uid == owner || uid == 0) { continue; }
+        if !peer_uid(&s).is_some_and(|uid| uid == owner || uid == 0) {
+            let _ = (&s).write_all(b"err unauthorized peer uid\n");
+            continue;
+        }
         let Some(slot) = ClientGuard::try_acquire(&active_clients, max_clients) else {
             let _ = (&s).write_all(b"err too many clients\n");
+            continue;
+        };
+        let Ok(writer) = s.try_clone() else {
+            let _ = (&s).write_all(b"err could not clone client socket\n");
             continue;
         };
         let (mode, get, set, keep) = (mode.clone(), get.clone(), set.clone(), keep.clone());
         std::thread::spawn(move || {
             let _slot = slot;
-            let mut r = BufReader::new(&s);
-            let Ok(Some(line)) = read_bounded_line(&mut r, MAX_MEMD_LINE) else { return; };
-            if !line.starts_with("enter") { return; }
-            if let Err(e) = mode.lock().unwrap().connect(target, || get(), |v| set(v), |v| keep(v)) {
-                eprintln!("[inky memd] refused a client: {e}");
-                let _ = (&s).write_all(format!("err {e}\n").as_bytes());
-                return;
-            }
-            let _ = (&s).write_all(format!("ok {target}\n").as_bytes());
-            // hold until the client's end closes, however it closes, without allocating per byte
-            let mut sink = [0u8; 256];
-            while r.read(&mut sink).unwrap_or(0) > 0 {}
-            mode.lock().unwrap().close(|| get(), |v| set(v), |v| keep(v));
+            serve_client_stream(s, writer, &mode, target, || get(), |v| set(v), |v| keep(v));
         });
     }
     Ok(())
 }
 
-fn connect_lease(path: &str) -> Option<(UnixStream, u64)> {
-    let s = UnixStream::connect(path).ok()?;
-    if path == SOCKET && peer_uid(&s) != Some(0) { return None; }
-    let timeout = Some(Duration::from_secs(2));
-    s.set_write_timeout(timeout).ok()?;
-    s.set_read_timeout(timeout).ok()?;
-    (&s).write_all(format!("enter {}\n", std::process::id()).as_bytes()).ok()?;
+enum ConnectErr {
+    NotInstalled,
+    Refused(String),
+}
+
+fn connect_lease(path: &str) -> Result<(UnixStream, u64), ConnectErr> {
+    let s = match UnixStream::connect(path) {
+        Ok(s) => s,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused | io::ErrorKind::PermissionDenied
+            ) && (e.kind() != io::ErrorKind::PermissionDenied || path != SOCKET) =>
+        {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                return Err(ConnectErr::Refused(format!("permission denied opening {path}: {e}")));
+            }
+            return Err(ConnectErr::NotInstalled);
+        }
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+            return Err(ConnectErr::NotInstalled);
+        }
+        Err(e) => return Err(ConnectErr::Refused(format!("could not connect to {path}: {e}"))),
+    };
+    if let Err(e) = configure_socket_timeouts(&s, SOCKET_IO_TIMEOUT) {
+        return Err(ConnectErr::Refused(format!("could not configure socket timeouts on {path}: {e}")));
+    }
+    if path == SOCKET && peer_uid(&s) != Some(0) {
+        return Err(ConnectErr::Refused(format!("{path} is not owned by root")));
+    }
+    if let Err(e) = (&s).write_all(format!("enter {}\n", std::process::id()).as_bytes()) {
+        return Err(ConnectErr::Refused(format!("could not write handshake to {path}: {e}")));
+    }
     let mut r = BufReader::new(&s);
-    let line = read_bounded_line(&mut r, MAX_MEMD_LINE).ok()??;
-    let v = line.strip_prefix("ok ")?.trim().parse().ok()?;
-    Some((s, v))
+    let line = match read_bounded_line(&mut r, MAX_MEMD_LINE) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Err(ConnectErr::Refused("helper closed socket without replying".to_string())),
+        Err(e) => return Err(ConnectErr::Refused(format!("reading helper reply failed: {e}"))),
+    };
+    match parse_enter_reply(&line) {
+        Ok(v) => Ok((s, v)),
+        Err(reason) => Err(ConnectErr::Refused(reason)),
+    }
 }
 
 /// Keeps the reservation alive until its owner drops it, including across helper restarts.
@@ -627,7 +829,7 @@ fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
         if connection.take().is_some() {
             eprintln!("[inky] lost memory-helper connection; retrying");
             retry_ms = 100;
-        } else if let Some((stream, limit)) = connect_lease(&path) {
+        } else if let Ok((stream, limit)) = connect_lease(&path) {
             eprintln!("[inky] memory-helper connection restored; GPU wired limit {limit} MB");
             connection = Some(stream);
         } else {
@@ -636,13 +838,34 @@ fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
     }
 }
 
+/// Enter inky mode and maintain the reservation lease across helper restarts until the returned [`Lease`] drops.
+pub fn enter_lease(path: &str) -> LeaseOutcome {
+    let (stream, initial_limit) = match connect_lease(path) {
+        Ok(pair) => pair,
+        Err(ConnectErr::NotInstalled) => return LeaseOutcome::NotInstalled,
+        Err(ConnectErr::Refused(reason)) => return LeaseOutcome::Refused(reason),
+    };
+    let (stop, monitor) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => return LeaseOutcome::Refused(format!("could not create lease stop socket: {e}")),
+    };
+    let owned_path = path.to_owned();
+    let worker = match std::thread::Builder::new()
+        .name("inky-memd-lease".into())
+        .spawn(move || maintain_lease(owned_path, stream, monitor))
+    {
+        Ok(w) => w,
+        Err(e) => return LeaseOutcome::Refused(format!("could not spawn lease monitor thread: {e}")),
+    };
+    LeaseOutcome::Entered(Lease { initial_limit, stop, worker: Some(worker) })
+}
+
+#[cfg(test)]
 pub fn enter(path: &str) -> Option<Lease> {
-    let (stream, initial_limit) = connect_lease(path)?;
-    let (stop, monitor) = UnixStream::pair().ok()?;
-    let path = path.to_owned();
-    let worker = std::thread::Builder::new().name("inky-memd-lease".into())
-        .spawn(move || maintain_lease(path, stream, monitor)).ok()?;
-    Some(Lease { initial_limit, stop, worker: Some(worker) })
+    match enter_lease(path) {
+        LeaseOutcome::Entered(lease) => Some(lease),
+        LeaseOutcome::NotInstalled | LeaseOutcome::Refused(_) => None,
+    }
 }
 
 /// `sudo inky tune-memory [--undo]`: install (or remove) the helper as a root LaunchDaemon. The helper runs a root-owned
@@ -760,7 +983,7 @@ fn uninstall_helper() -> Result<(), String> {
             set_limit(value).map_err(|e| format!("restoring {value} failed: {e}; kept {SAVED} and the helper"))?;
             remove_file_if_present(Path::new(SAVED))?;
         }
-        SavedRecord::StaleBoot(_, _) => remove_file_if_present(Path::new(SAVED))?,
+        SavedRecord::StaleBoot(_, _) | SavedRecord::Unparsable(_) => remove_file_if_present(Path::new(SAVED))?,
         SavedRecord::Absent => {}
     }
     checked_directory(Path::new("/Library"), 0)?;
@@ -815,7 +1038,10 @@ fn install_helper() -> Result<(), String> {
     let dir = socket_directory(socket)?;
     check_system_socket_ancestors(dir)?;
     stop_helper()?;
-    read_saved_record(SAVED, boot_session_id().as_deref())?;
+    if let SavedRecord::Unparsable(reason) = read_saved_record(SAVED, boot_session_id().as_deref())? {
+        eprintln!("[inky memd] clearing unparsable saved limit at {SAVED} ({reason})");
+        remove_file_if_present(Path::new(SAVED))?;
+    }
     retire_legacy_socket(Path::new(OLD_SOCKET_DIR))?;
     prepare_socket_directory(dir, 0, false)?;
     remove_socket(socket)?;
@@ -830,16 +1056,7 @@ fn install_helper() -> Result<(), String> {
     };
     copy_helper().map_err(|e| format!("could not install {HELPER}: {e}"))?;
     check_installed_helper()?;
-    let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{HELPER}</string><string>memd</string><string>--owner</string><string>{owner}</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/var/log/inky-memd.log</string>
-</dict></plist>
-"#);
+    let plist = render_plist(owner);
     remove_file_if_present(Path::new(PLIST_TEMP))?;
     let write_plist = || -> io::Result<()> {
         let mut staged = OpenOptions::new().create_new(true).write(true).mode(0o600).open(PLIST_TEMP)?;
@@ -868,8 +1085,19 @@ fn install_helper() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    // Coordinate the filesystem fixtures in this module.
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    // bind_socket temporarily sets process-wide umask(0o177); serialize filesystem tests within this binary.
     static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("md")
+            .join(format!("{tag}-{}-{n}", std::process::id()))
+    }
 
     #[test]
     fn explicit_target_is_only_for_the_fake_daemon() {
@@ -884,15 +1112,14 @@ mod tests {
     }
 
     // Darwin bounds the full pathname stored in sockaddr_un, including the scratch directory.
-    struct SocketTestDir(std::path::PathBuf);
+    struct SocketTestDir(PathBuf);
 
     impl SocketTestDir {
-        fn new() -> Self {
-            let mut template = *b"/tmp/inky-memd-XXXXXX\0";
-            let dir = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
-            assert!(!dir.is_null(), "creating socket test directory: {}", io::Error::last_os_error());
-            let path = std::ffi::CStr::from_bytes_until_nul(&template).unwrap().to_str().unwrap();
-            Self(path.into())
+        fn new(tag: &str) -> Self {
+            let dir = scratch_dir(tag);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("creating socket test directory");
+            Self(dir)
         }
     }
 
@@ -903,7 +1130,7 @@ mod tests {
     #[test]
     fn dropping_client_lease_closes_its_connection() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let scratch = SocketTestDir::new();
+        let scratch = SocketTestDir::new("lease");
         let path = scratch.0.join("owned.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let helper = std::thread::spawn(move || {
@@ -937,6 +1164,37 @@ mod tests {
         assert_eq!(lim.get(), 118000, "still one client: still raised");
         m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
         assert_eq!((lim.get(), m.saved, disk.get()), (50000, None, None), "the limit found, not the default; nothing left on disk");
+    }
+    #[test] fn owner_higher_or_equal_limit_is_never_lowered_or_saved() {
+        for initial in [118_000u64, 130_000u64] {
+            let lim = Cell::new(initial);
+            let mut m = Mode::default();
+            m.connect(
+                118_000,
+                || Some(lim.get()),
+                |_| panic!("set must not be called when current limit {initial} >= target"),
+                |_| panic!("keep must not be called when current limit {initial} >= target"),
+            ).unwrap();
+            assert_eq!((lim.get(), m.clients, m.saved), (initial, 1, None));
+            m.connect(
+                118_000,
+                || panic!("get must not be called while clients > 0"),
+                |_| panic!("set must not be called while clients > 0"),
+                |_| panic!("keep must not be called while clients > 0"),
+            ).unwrap();
+            assert_eq!((lim.get(), m.clients, m.saved), (initial, 2, None));
+            m.close(
+                || panic!("get must not be called on non-final close"),
+                |_| panic!("set must not be called on non-final close"),
+                |_| panic!("keep must not be called on non-final close"),
+            );
+            m.close(
+                || panic!("get must not be called when nothing was saved"),
+                |_| panic!("set must not be called when nothing was saved"),
+                |_| panic!("keep must not be called when nothing was saved"),
+            );
+            assert_eq!((lim.get(), m.clients, m.saved), (initial, 0, None));
+        }
     }
     #[test] fn a_second_session_saves_afresh() {
         let (lim, disk) = (Cell::new(0u64), Cell::new(None));
@@ -996,9 +1254,10 @@ mod tests {
     }
     #[test] fn the_socket_directory_must_be_a_real_directory() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-dirtest-{}", std::process::id()));
+        let base = scratch_dir("dirtest");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, Permissions::from_mode(0o700)).unwrap();
         let uid = unsafe { libc::geteuid() };
         assert!(checked_directory(&base, uid).is_ok(), "a private directory is accepted");
         let target = base.join("real");
@@ -1016,41 +1275,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
     #[test]
-    fn startup_refuses_an_invalid_or_unreadable_save() {
+    fn startup_survives_unparsable_saves_and_refuses_symlinks_or_unreadable_files() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-save-{}", std::process::id()));
+        let base = scratch_dir("save");
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir(&base).unwrap();
+        fs::create_dir_all(&base).unwrap();
         let path = base.join("saved");
         let name = path.to_str().unwrap();
-        let set = |_| panic!("startup tried to restore an unusable saved limit");
-        let keep = |_| panic!("startup tried to modify an unusable saved limit");
-        assert!(restore_on_startup(name, set, keep).unwrap().saved.is_none());
+        let set_never = |_| panic!("startup tried to restore an unusable saved limit");
+        assert!(restore_on_startup(name, set_never, |_| panic!("absent save should not call keep")).unwrap().saved.is_none());
 
-        for bytes in [b"malformed".as_slice(), b"4294967296", b"\xff"] {
+        for bytes in [b"".as_slice(), b"malformed", b"4294967296", b"\xff", b"0:50000", b"-5:50000", b"1700000000:notanumber"] {
             fs::write(&path, bytes).unwrap();
-            assert!(restore_on_startup(name, set, keep).is_err());
-            assert_eq!(fs::read(&path).unwrap(), bytes);
+            let cleared = Cell::new(false);
+            let mode = restore_on_startup(name, set_never, |v| {
+                assert_eq!(v, None);
+                cleared.set(true);
+                fs::remove_file(&path).map_err(|e| e.to_string())
+            }).expect("helper startup must survive an unparsable saved file");
+            assert!(mode.saved.is_none());
+            assert!(cleared.get(), "corrupt saved file should be cleared via keep(None)");
+            assert!(!path.exists());
+
+            fs::write(&path, bytes).unwrap();
+            let cleared_boot = Cell::new(false);
+            let mode_boot = restore_on_startup_for_boot(name, Some("00112233-4455-6677-8899-AABBCCDDEEFF"), set_never, |v| {
+                assert_eq!(v, None);
+                cleared_boot.set(true);
+                fs::remove_file(&path).map_err(|e| e.to_string())
+            }).expect("boot-tagged startup must survive an unparsable saved file");
+            assert!(mode_boot.saved.is_none());
+            assert!(cleared_boot.get());
+            assert!(!path.exists());
         }
         fs::write(&path, b"50000").unwrap();
         fs::set_permissions(&path, Permissions::from_mode(0o000)).unwrap();
         if unsafe { libc::geteuid() } != 0 {
-            let result = restore_on_startup(name, set, keep);
+            let result = restore_on_startup(name, set_never, |_| Ok(()));
             assert!(matches!(result, Err(e) if e.contains("could not read")));
         }
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(base.join("missing"), &path).unwrap();
-        assert!(restore_on_startup(name, set, keep).is_err());
+        assert!(restore_on_startup(name, set_never, |_| Ok(())).is_err());
         fs::remove_dir_all(&base).unwrap();
     }
     #[test]
+    #[ignore = "binds real Unix domain sockets; run in CI socket integration step"]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
         // bind_socket changes the process umask around bind. Run the real operation
         // in its own process so other tests can create directories concurrently.
         const CHILD: &str = "INKY_TEST_MEMD_BIND_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid"])
+                .args(["--ignored", "--exact", "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid"])
                 .env(CHILD, "1")
                 .output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1059,21 +1337,26 @@ mod tests {
             return;
         }
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let scratch = SocketTestDir::new();
+        let scratch = SocketTestDir::new("bind");
         let path = scratch.0.join("helper").join("memd.sock");
         let uid = unsafe { libc::geteuid() };
         drop(bind_socket(&path, uid, uid, true).unwrap());
         let listener = bind_socket(&path, uid, uid, true).unwrap();
         assert!(check_socket(&path, uid).is_ok());
         let client = UnixStream::connect(&path).unwrap();
+        configure_socket_timeouts(&client, SOCKET_IO_TIMEOUT).unwrap();
+        assert_eq!(client.read_timeout().unwrap(), Some(SOCKET_IO_TIMEOUT));
+        assert_eq!(client.write_timeout().unwrap(), Some(SOCKET_IO_TIMEOUT));
         let (accepted, _) = listener.accept().unwrap();
+        configure_socket_timeouts(&accepted, SOCKET_IO_TIMEOUT).unwrap();
         assert_eq!(peer_uid(&client), Some(uid));
         assert_eq!(peer_uid(&accepted), Some(uid));
     }
     #[test]
+    #[ignore = "binds real Unix domain sockets; run in CI socket integration step"]
     fn legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let scratch = SocketTestDir::new();
+        let scratch = SocketTestDir::new("old");
         let base = scratch.0.join("legacy");
         fs::create_dir(&base).unwrap();
         let socket = base.join("memd.sock");
@@ -1091,9 +1374,9 @@ mod tests {
     #[test]
     fn absent_legacy_helper_requires_no_trusted_homebrew_directory() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-homebrew-{}", std::process::id()));
+        let base = scratch_dir("homebrew");
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir(&base).unwrap();
+        fs::create_dir_all(&base).unwrap();
         fs::set_permissions(&base, Permissions::from_mode(0o775)).unwrap();
         let path = base.join("inky-memd");
         remove_legacy_helper(&path).unwrap();
@@ -1135,11 +1418,172 @@ mod tests {
         assert_eq!(active.load(Ordering::Acquire), 0);
     }
     #[test]
+    fn protocol_stream_propagates_refusal_reasons_timeouts_and_higher_limits() {
+        // 1. Keep-higher reports the owner's higher limit ("ok 130000\n") and restores nothing on EOF.
+        let mode = Mutex::new(Mode::default());
+        let lim = Cell::new(130_000u64);
+        let mut out = Vec::new();
+        serve_client_stream(
+            io::Cursor::new(b"enter 99\n".as_slice()),
+            &mut out,
+            &mode,
+            118_000,
+            || Some(lim.get()),
+            |_| panic!("set must not run when owner limit >= target"),
+            |_| panic!("keep must not run when owner limit >= target"),
+        );
+        let reply = String::from_utf8(out).unwrap();
+        assert_eq!(reply, "ok 130000\n");
+        assert_eq!(parse_enter_reply(&reply), Ok(130_000));
+        assert_eq!(mode.lock().unwrap().clients, 0);
+
+        // 2. Helper refusal reason propagates verbatim through parse_enter_reply.
+        let mut refused_out = Vec::new();
+        let lim2 = Cell::new(50_000u64);
+        let disk2 = Cell::new(None);
+        serve_client_stream(
+            io::Cursor::new(b"enter 100\n".as_slice()),
+            &mut refused_out,
+            &mode,
+            118_000,
+            || Some(lim2.get()),
+            |_| Err("sysctl Operation not permitted".into()),
+            |v| { disk2.set(v); Ok(()) },
+        );
+        let refused_line = String::from_utf8(refused_out).unwrap();
+        assert_eq!(
+            parse_enter_reply(&refused_line),
+            Err("the limit could not be raised: sysctl Operation not permitted".into())
+        );
+        assert_eq!(parse_enter_reply("err too many clients\n"), Err("too many clients".into()));
+
+        // 3. Unknown command is rejected with an explicit reason.
+        let mut bad_cmd_out = Vec::new();
+        serve_client_stream(
+            io::Cursor::new(b"status\n".as_slice()),
+            &mut bad_cmd_out,
+            &mode,
+            118_000,
+            || Some(50_000),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        assert_eq!(parse_enter_reply(&String::from_utf8(bad_cmd_out).unwrap()), Err("unknown command".into()));
+
+        // 4. Handshake read timeout aborts before connect; post-handshake read timeouts keep holding until EOF.
+        struct ScriptedReader {
+            steps: Vec<io::Result<&'static [u8]>>,
+            idx: usize,
+        }
+        impl Read for ScriptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.idx >= self.steps.len() {
+                    return Ok(0);
+                }
+                let step = std::mem::replace(&mut self.steps[self.idx], Ok(&[]));
+                self.idx += 1;
+                match step {
+                    Ok(bytes) => {
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        let mut timeout_handshake_out = Vec::new();
+        serve_client_stream(
+            ScriptedReader {
+                steps: vec![Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))],
+                idx: 0,
+            },
+            &mut timeout_handshake_out,
+            &mode,
+            118_000,
+            || panic!("connect must not run after handshake timeout"),
+            |_| panic!("set must not run after handshake timeout"),
+            |_| panic!("keep must not run after handshake timeout"),
+        );
+        assert!(
+            parse_enter_reply(&String::from_utf8(timeout_handshake_out).unwrap())
+                .unwrap_err()
+                .contains("handshake timed out")
+        );
+
+        let lim3 = Cell::new(50_000u64);
+        let disk3 = Cell::new(None);
+        let timeouts_observed = Cell::new(0usize);
+        struct CountingHoldReader {
+            sent_handshake: bool,
+            timeouts_left: usize,
+            observed: *const Cell<usize>,
+        }
+        impl Read for CountingHoldReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.sent_handshake {
+                    self.sent_handshake = true;
+                    let msg = b"enter 7\n";
+                    buf[..msg.len()].copy_from_slice(msg);
+                    return Ok(msg.len());
+                }
+                if self.timeouts_left > 0 {
+                    self.timeouts_left -= 1;
+                    unsafe { (*self.observed).set((*self.observed).get() + 1); }
+                    return Err(io::Error::new(
+                        if self.timeouts_left.is_multiple_of(2) { io::ErrorKind::TimedOut } else { io::ErrorKind::WouldBlock },
+                        "periodic hold timeout",
+                    ));
+                }
+                Ok(0)
+            }
+        }
+        let mut hold_out = Vec::new();
+        serve_client_stream(
+            CountingHoldReader {
+                sent_handshake: false,
+                timeouts_left: 3,
+                observed: &timeouts_observed,
+            },
+            &mut hold_out,
+            &mode,
+            118_000,
+            || Some(lim3.get()),
+            |v| { lim3.set(v); Ok(()) },
+            |v| { disk3.set(v); Ok(()) },
+        );
+        assert_eq!(String::from_utf8(hold_out).unwrap(), "ok 118000\n");
+        assert_eq!(timeouts_observed.get(), 3, "periodic read timeouts must not drop held connection early");
+        assert_eq!((lim3.get(), disk3.get(), mode.lock().unwrap().clients), (50_000, None, 0));
+    }
+    #[test]
+    fn accept_backoff_and_descriptor_headroom_invariants() {
+        assert_eq!(accept_error_backoff(&io::Error::from(io::ErrorKind::Interrupted)), None);
+        assert_eq!(accept_error_backoff(&io::Error::from(io::ErrorKind::ConnectionAborted)), None);
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::ENOBUFS] {
+            assert_eq!(
+                accept_error_backoff(&io::Error::from_raw_os_error(errno)),
+                Some(ACCEPT_ERROR_BACKOFF),
+                "errno {errno} must back off instead of spinning"
+            );
+        }
+        const {
+            assert!(
+                MAX_MEMD_CLIENTS < LAUNCHD_DEFAULT_SOFT_NOFILE && MAX_MEMD_CLIENTS + 64 <= LAUNCHD_DEFAULT_SOFT_NOFILE,
+                "client cap must leave ample descriptor headroom below launchd default"
+            );
+            assert!(MAX_MEMD_CLIENTS * 4 <= PLIST_SOFT_NOFILE && PLIST_SOFT_NOFILE < PLIST_HARD_NOFILE);
+        };
+        let xml = render_plist(501);
+        assert!(xml.contains(&format!("<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_SOFT_NOFILE}</integer></dict>")));
+        assert!(xml.contains(&format!("<key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_HARD_NOFILE}</integer></dict>")));
+    }
+    #[test]
     fn boot_tagged_saved_limit_ignores_prior_boot_and_syncs_atomically() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-boot-{}", std::process::id()));
+        let base = scratch_dir("boot");
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir(&base).unwrap();
+        fs::create_dir_all(&base).unwrap();
         let path = base.join("saved");
         let name = path.to_str().unwrap();
 
@@ -1176,10 +1620,13 @@ mod tests {
         assert_eq!(restored.get(), Some(50000));
         assert_eq!(mode2.saved, None);
 
-        // Malformed boot tags are rejected rather than misread.
+        // Malformed boot tags are rejected as Unparsable rather than misread.
         for bad in [":50000", "bad tag:50000", "boot_underscore:50000"] {
             fs::write(&path, bad).unwrap();
-            assert!(read_saved_record(name, Some(boot2)).is_err(), "expected {bad:?} to fail");
+            assert!(
+                matches!(read_saved_record(name, Some(boot2)), Ok(SavedRecord::Unparsable(_))),
+                "expected {bad:?} to be rejected as Unparsable"
+            );
         }
         assert!(write_saved_atomic(name, 50000, Some("bad:tag")).is_err());
 

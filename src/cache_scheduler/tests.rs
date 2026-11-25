@@ -5,39 +5,18 @@ use crate::cache_trace::{
 };
 
 #[test]
-fn working_set_budget_handles_dynamic_kvb_and_refuses_zero_or_overflow() {
-    let g = 1u64 << 30;
-    let fp16 = WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 20 * g, 2 * g, 2).unwrap();
-    assert_eq!(fp16.cache_budget_bytes, 42 * g);
-    assert_eq!(fp16.full_stride_bytes, FULL_STRIDE);
-    assert_eq!(fp16.window_stride_bytes, WINDOW_STRIDE);
-    assert_eq!(
-        fp16.worst_case_request_bytes(4096, 512).unwrap(),
-        64 * FULL_STRIDE + 25 * WINDOW_STRIDE
-    );
+fn worst_case_blocks_and_span_bounds_handle_kvb_and_refuse_zero_or_overflow() {
+    assert_eq!(BlockKind::Full.stride_bytes(2).unwrap(), FULL_STRIDE);
+    assert_eq!(BlockKind::Window.stride_bytes(2).unwrap(), WINDOW_STRIDE);
+    assert_eq!(BlockKind::Full.stride_bytes(1).unwrap(), FULL_STRIDE / 2);
+    assert_eq!(BlockKind::Window.stride_bytes(1).unwrap(), WINDOW_STRIDE / 2);
+    assert!(BlockKind::Full.stride_bytes(0).is_err());
+    assert!(BlockKind::Full.stride_bytes(3).is_err());
 
-    // --kv8 (`kvb = 1`) uses half the stride per block:
-    let kv8 = WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 20 * g, 2 * g, 1).unwrap();
-    assert_eq!(kv8.full_stride_bytes, FULL_STRIDE / 2);
-    assert_eq!(kv8.window_stride_bytes, WINDOW_STRIDE / 2);
-    assert_eq!(
-        kv8.worst_case_request_bytes(4096, 512).unwrap(),
-        64 * (FULL_STRIDE / 2) + 25 * (WINDOW_STRIDE / 2)
-    );
-    assert!(kv8.partition_pools(256).unwrap().0 > fp16.partition_pools(256).unwrap().0);
-
-    // Invalid kvb, underflow, overflow, and zero inputs are all refused cleanly (never panic or wrap):
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 0, 0, 0).is_err());
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 0, 0, 3).is_err());
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(u64::MAX, u64::MAX, 1, 2).is_err());
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(100, 200, 0, 2).is_err());
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(12 * 1024 * 1024 - 1, 0, 0, 2).is_err());
-    assert!(WorkingSetBudget::from_recommended_working_set_bytes(6 * 1024 * 1024, 0, 0, 1).is_ok());
-
-    assert!(fp16.worst_case_request_bytes(0, 512).is_err());
-    assert!(fp16.worst_case_request_bytes(4096, 0).is_err());
-    assert!(fp16.worst_case_request_bytes(1 << 20, u32::MAX).is_err());
-    assert!(fp16.partition_pools(0).is_err());
+    assert_eq!(worst_case_blocks_checked(4096, 512, 64, 1024).unwrap(), (64, 25, 89));
+    assert!(worst_case_blocks_checked(0, 512, 64, 1024).is_err());
+    assert!(worst_case_blocks_checked(4096, 0, 64, 1024).is_err());
+    assert!(worst_case_blocks_checked(1 << 20, u32::MAX, 64, 1024).is_err());
     assert!(span_bound_blocks(0, 64, 1024).is_err());
     assert!(span_bound_blocks(1, 0, 1024).is_err());
     assert!(span_bound_blocks(1, 64, 0).is_err());

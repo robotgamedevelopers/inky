@@ -9,7 +9,7 @@ use std::fmt;
 use crate::blockbook::Geometry;
 use crate::blocks::{
     block_length, byte_offset, BlockEntry, BlockError, BlockIndex, BlockKind, BlockPools,
-    BlockTable, Slot, BLOCK, WINDOW,
+    BlockTable, Slot,
 };
 use crate::cache_trace::{
     emit_block_layout_config, emit_block_layout_event, emit_block_layout_step,
@@ -144,102 +144,6 @@ pub fn worst_case_blocks_checked(
         .checked_add(win)
         .ok_or(SchedulerError::Block(BlockError::Overflow))?;
     Ok((full, win, total))
-}
-
-/// Cache memory budget derived from Metal's `recommendedMaxWorkingSetSize` at startup
-/// (`DESIGN.md`: never passed by hand) and parameterized by element width `kvb` (`1` for `--kv8`, `2` for fp16).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WorkingSetBudget {
-    pub recommended_working_set_bytes: u64,
-    pub fixed_non_cache_bytes: u64,
-    pub safety_headroom_bytes: u64,
-    pub cache_budget_bytes: u64,
-    pub kvb: u32,
-    pub full_stride_bytes: u64,
-    pub window_stride_bytes: u64,
-}
-
-impl WorkingSetBudget {
-    pub fn from_recommended_working_set_bytes(
-        recommended_working_set_bytes: u64,
-        fixed_non_cache_bytes: u64,
-        safety_headroom_bytes: u64,
-        kvb: u32,
-    ) -> Result<WorkingSetBudget, SchedulerError> {
-        let full_stride_bytes = BlockKind::Full.stride_bytes(kvb)?;
-        let window_stride_bytes = BlockKind::Window.stride_bytes(kvb)?;
-        let reserved = fixed_non_cache_bytes
-            .checked_add(safety_headroom_bytes)
-            .ok_or(SchedulerError::InvalidConfig("working-set reservation overflow"))?;
-        let cache_budget_bytes = recommended_working_set_bytes
-            .checked_sub(reserved)
-            .ok_or(SchedulerError::InvalidConfig(
-                "recommended working set smaller than non-cache footprint",
-            ))?;
-        let min_pair = full_stride_bytes
-            .checked_add(window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        if cache_budget_bytes < min_pair {
-            return Err(SchedulerError::InvalidConfig(
-                "remaining cache working-set budget cannot hold one full + one window block",
-            ));
-        }
-        Ok(WorkingSetBudget {
-            recommended_working_set_bytes,
-            fixed_non_cache_bytes,
-            safety_headroom_bytes,
-            cache_budget_bytes,
-            kvb,
-            full_stride_bytes,
-            window_stride_bytes,
-        })
-    }
-
-    /// Checked worst-case GPU byte demand (`full * full_stride(kvb) + window * window_stride(kvb)`).
-    /// Refuses zero `target_positions`, zero `max_span_tokens`, and any `u32`/`u64` overflow.
-    pub fn worst_case_request_bytes(
-        &self,
-        target_positions: u32,
-        max_span_tokens: u32,
-    ) -> Result<u64, SchedulerError> {
-        let (full, win, _) = worst_case_blocks_checked(
-            target_positions,
-            max_span_tokens,
-            BLOCK as u32,
-            WINDOW as u32,
-        )?;
-        let full_bytes = u64::from(full)
-            .checked_mul(self.full_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        let win_bytes = u64::from(win)
-            .checked_mul(self.window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        full_bytes
-            .checked_add(win_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))
-    }
-
-    /// Partition `cache_budget_bytes` into `(full_slots, window_slots)` at this pool's `kvb`.
-    /// Refuses `desired_window_slots == 0` and budgets that leave zero full slots.
-    pub fn partition_pools(&self, desired_window_slots: u32) -> Result<(u32, u32), SchedulerError> {
-        if desired_window_slots == 0 {
-            return Err(SchedulerError::InvalidConfig("desired_window_slots must be at least 1"));
-        }
-        let win_bytes = u64::from(desired_window_slots)
-            .checked_mul(self.window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        if win_bytes >= self.cache_budget_bytes {
-            return Err(SchedulerError::InvalidConfig("window pool exhausts entire cache budget"));
-        }
-        let rem = self.cache_budget_bytes - win_bytes;
-        let full_slots64 = rem / self.full_stride_bytes;
-        if full_slots64 == 0 {
-            return Err(SchedulerError::InvalidConfig("zero full-block slots left after window pool"));
-        }
-        let full_slots = u32::try_from(full_slots64)
-            .map_err(|_| SchedulerError::Block(BlockError::Overflow))?;
-        Ok((full_slots, desired_window_slots))
-    }
 }
 
 // ---- Part A: `TrackedBlockAllocator` (`specs/BlockLayout.tla` over `src/blocks.rs`) ----
@@ -1319,11 +1223,7 @@ impl CacheScheduler {
     }
 
     fn prompt_end_of(&self, target: u32) -> u32 {
-        if target > self.cfg.block_size {
-            target - self.cfg.block_size
-        } else {
-            0
-        }
+        target.saturating_sub(self.cfg.block_size)
     }
 
     fn is_prefilling(&self, l: &SchedLane) -> bool {
@@ -2807,14 +2707,12 @@ impl CacheScheduler {
             for bi in window_range(l.pos, end_pos, bsz) {
                 let lo_in_blk = if bi == l.pos / bsz { (l.pos % bsz) as usize } else { 0 };
                 let hi_excl = if bi == end_pos / bsz { ((end_pos % bsz) + 1) as usize } else { bsz as usize };
-                for opt_id in [&l.full[bi as usize], &l.win[bi as usize]] {
-                    if let Some(id) = opt_id {
-                        let b = self.blocks.get_mut(id).unwrap();
-                        if b.present() && !b.sealed {
-                            b.length = hi_excl as u32;
-                            for d in &mut b.data[lo_in_blk..hi_excl] {
-                                *d = 1;
-                            }
+                for id in [&l.full[bi as usize], &l.win[bi as usize]].into_iter().flatten() {
+                    let b = self.blocks.get_mut(id).unwrap();
+                    if b.present() && !b.sealed {
+                        b.length = hi_excl as u32;
+                        for d in &mut b.data[lo_in_blk..hi_excl] {
+                            *d = 1;
                         }
                     }
                 }
@@ -2855,7 +2753,6 @@ impl CacheScheduler {
             .filter(|l| self.lanes[*l].state == "Cancelling")
             .cloned()
             .collect();
-
         let mut seal_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for ln in &surviving {
             let l = &self.lanes[ln];
@@ -3140,13 +3037,11 @@ impl CacheScheduler {
             if matches!(l.state, "Restoring" | "Ready" | "InStep" | "Cancelling") {
                 let pend_blk = self.prompt_end_of(l.target) / self.cfg.block_size;
                 for i in pend_blk..self.cfg.num_blocks() {
-                    for opt in [&l.full[i as usize], &l.win[i as usize]] {
-                        if let Some(id) = opt {
-                            if !matches!(id, CacheBlockId::Priv { .. }) || self.blocks[id].sealed {
-                                return Err(SchedulerError::InvariantViolation(
-                                    "NoDecodeBlocksSealed violated".into(),
-                                ));
-                            }
+                    for id in [&l.full[i as usize], &l.win[i as usize]].into_iter().flatten() {
+                        if !matches!(id, CacheBlockId::Priv { .. }) || self.blocks[id].sealed {
+                            return Err(SchedulerError::InvariantViolation(
+                                "NoDecodeBlocksSealed violated".into(),
+                            ));
                         }
                     }
                 }

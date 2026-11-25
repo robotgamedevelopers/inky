@@ -1,6 +1,7 @@
 use super::super::*;
 use super::ScratchDir;
 use crate::engine::{Engine, Lane, Span};
+use crate::prefix::PrefixMatch;
 use crate::tokenizer::Tokenizer;
 use objc2_metal::MTLCommandBuffer;
 

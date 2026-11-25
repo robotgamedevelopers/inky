@@ -26,6 +26,7 @@ fn lane<'a>(
 ) -> InflightLaneReserve<'a> {
     InflightLaneReserve {
         lane: id,
+        namespace: 0,
         toks: prompt,
         block_hashes: None,
         n_past: written,
@@ -155,7 +156,7 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
     // cost of that restore before scheduling either lane; no disk I/O is needed here.
     let spill_id = 1;
     let mut tip = None;
-    for (i, tokens) in prompt.chunks_exact(BLOCK).enumerate() {
+    for (i, tokens) in prompt.as_chunks::<BLOCK>().0.iter().enumerate() {
         tip = Some(
             cache
                 .spilled_tree
@@ -167,6 +168,7 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
     cache.spilled_starts.insert(
         spill_id,
         SpilledStart {
+            namespace: 0,
             pos: 8192,
             reasons: EVERY,
             cs_key: SpillKey::new(SpillBlockKind::Full, 1),
@@ -366,6 +368,7 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
             if ok {
                 let r = InflightLaneReserve {
                     lane: i,
+                    namespace: 0,
                     toks: &prompts[i],
                     block_hashes: Some(&hashes[i]),
                     n_past: 0,
@@ -414,6 +417,7 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
         let mut trial = ref_active.clone();
         trial.push(InflightLaneReserve {
             lane: i,
+            namespace: 0,
             toks: &prompts[i],
             block_hashes: None,
             n_past: 0,
