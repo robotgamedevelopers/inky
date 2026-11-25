@@ -25,7 +25,10 @@ use std::time::{Duration, Instant};
 
 mod block_cache;
 mod timing;
-use block_cache::{effective_pf_target, LaneBlockState, ServeBlockCache};
+use block_cache::{
+    effective_pf_target, find_prefill_leader, inflight_shared_checkpoint, InflightPrefillLane,
+    LaneBlockState, ServeBlockCache,
+};
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAddr>, pub lanes: usize, pub effort: String, pub max_tokens: usize,
@@ -644,8 +647,12 @@ impl JobOutput {
         self.state.cancelled.load(Ordering::Acquire)
     }
 
+    fn queued(&self) -> usize {
+        self.state.queued.load(Ordering::Relaxed)
+    }
+
     fn backpressured(&self) -> bool {
-        self.state.queued.load(Ordering::Relaxed) >= JOB_OUTPUT_EVENTS
+        self.queued() >= JOB_OUTPUT_EVENTS
     }
 
     fn send(&self, event: Ev) -> Result<(), ()> {
@@ -781,8 +788,8 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
 #[allow(dead_code)]
 fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
 
-fn commit_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
-    cb.commit();
+/// Wait for an already-committed `MTLCommandBuffer` and inspect its completion status.
+fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
     cb.waitUntilCompleted();
     let status = cb.status();
     if status == MTLCommandBufferStatus::Completed { return Ok(()); }
@@ -792,6 +799,62 @@ fn commit_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
         eprintln!("[serve] Metal {stage} failed ({status:?})");
     }
     Err(format!("Metal {stage} failed"))
+}
+
+/// Safe non-GPU host work overlapped while a committed `MTLCommandBuffer` executes on GPU:
+/// drains newly arrived queued jobs, drops cancelled queued jobs, and sends keepalive
+/// `Ev::Alive` pings to waiting (`Ready`, non-`InStep`) prefilling lanes without touching
+/// `eng`, `pools`, `Lane` Metal buffers, or logits.
+fn overlap_host_work_during_gpu(
+    rx: &Receiver<Job>,
+    queue: &mut VecDeque<Job>,
+    lanes: &[LaneS],
+    planner: &crate::scheduler::ServeStepPlanner,
+    metrics: &Mutex<Counters>,
+) -> Vec<usize> {
+    loop {
+        match rx.try_recv() {
+            Ok(j) => queue.push_back(j),
+            // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    let dropped = discard_cancelled_jobs(queue);
+    if dropped > 0 {
+        let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+        m.queued = m.queued.saturating_sub(dropped);
+    }
+    let mut waiting_cancelled = Vec::new();
+    for (i, l) in lanes.iter().enumerate() {
+        if planner.state(i) != crate::scheduler::LaneState::Ready {
+            continue;
+        }
+        let Some(a) = l.job.as_ref() else { continue };
+        if a.job.out.cancelled()
+            || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
+        {
+            waiting_cancelled.push(i);
+        }
+    }
+    waiting_cancelled
+}
+
+fn release_cancelled_waiting(
+    waiting_cancelled: &[usize],
+    eng: &Engine,
+    cache: &mut ServeBlockCache,
+    lanes: &mut [LaneS],
+    planner: &mut crate::scheduler::ServeStepPlanner,
+    metrics: &Mutex<Counters>,
+    tick_seq: &mut u64,
+) {
+    for &i in waiting_cancelled {
+        if planner.request_cancel(i) {
+            if let Some(a) = lanes[i].release_job(eng, cache, metrics, tick_seq) {
+                a.log_cancellation(i);
+            }
+        }
+    }
 }
 
 fn fail_step(
@@ -835,6 +898,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
     let mut queue: VecDeque<Job> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
+    let mut checkpoints_sealed = false;
     loop {
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
@@ -899,7 +963,24 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let active_now = lanes.iter().filter(|l| l.job.is_some()).count();
             {
                 let pools = eng.block_pool().borrow();
-                if !cache.can_admit(&pools, active_now, &j.toks, j.max, eng.chunk) {
+                let leaders: Vec<InflightPrefillLane<'_>> = lanes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, l)| {
+                        let a = l.job.as_ref()?;
+                        let run = !a.job.out.cancelled() && !a.job.out.backpressured();
+                        (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
+                            lane: idx,
+                            toks: &a.job.toks,
+                            n_past: a.n_past,
+                            pf_end: a.pf_end,
+                            runnable: run,
+                            eligible_follower: false,
+                        })
+                    })
+                    .collect();
+                let shared_ckpt = inflight_shared_checkpoint(&j.toks, &leaders);
+                if !cache.can_admit_with_shared(&pools, active_now, &j.toks, j.max, eng.chunk, shared_ckpt) {
                     break;
                 }
             }
@@ -943,12 +1024,52 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             planner.on_admit(i);
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
+        // Rebind eligible untouched followers whenever the prior prefill step sealed new checkpoints.
+        if checkpoints_sealed {
+            checkpoints_sealed = false;
+            let mut pools = eng.block_pool().borrow_mut();
+            for l in lanes.iter_mut() {
+                let Some(a) = l.job.as_mut() else { continue };
+                if a.gen == 0 && a.n_past == a.cached && l.blocks.written == a.n_past && !a.job.out.cancelled() {
+                    let rebound = {
+                        let mut tbl = l.lane.block_table().borrow_mut();
+                        cache.rebind_if_deeper_match(&mut pools, &mut tbl, &mut l.blocks, &a.job.toks, a.n_past)
+                    };
+                    if let Some((matched_at, cs)) = rebound {
+                        eng.on(&l.lane).set_cs(&cs);
+                        a.n_past = matched_at;
+                        a.cached = matched_at;
+                    }
+                }
+            }
+        }
         // Starvation-bounded Layer 4 step selection: ceiling >= W, longest-waiting first,
         // active 1-token decoding lanes, then 64-aligned prefill spans capped at checkpoint boundaries.
         let runnable = |a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured();
-        let step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().map(|l| match &l.job {
+        let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let a = l.job.as_ref()?;
+                (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
+                    lane: i,
+                    toks: &a.job.toks,
+                    n_past: a.n_past,
+                    pf_end: a.pf_end,
+                    runnable: runnable(a),
+                    eligible_follower: a.n_past == a.cached && l.blocks.written == a.n_past,
+                })
+            })
+            .collect();
+        let mut deferred_by_singleflight = vec![false; lanes.len()];
+        for (idx, cand) in prefill_cands.iter().enumerate() {
+            if find_prefill_leader(&prefill_cands, idx).is_some() {
+                deferred_by_singleflight[cand.lane] = true;
+            }
+        }
+        let step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
             Some(a) => crate::scheduler::ServeLaneInput {
-                runnable: runnable(a),
+                runnable: runnable(a) && !deferred_by_singleflight[i],
                 n_past: a.n_past,
                 pf_end: effective_pf_target(a.n_past, a.pf_end),
                 has_pending_decode: a.pending.is_some() && a.n_past < a.pf_end + a.gen,
@@ -995,13 +1116,17 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         }
                     }
                 }
-                if let Err(e) = commit_step(&cb, "prefill") {
+                cb.commit();
+                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &planner, metrics);
+                if let Err(e) = wait_committed_step(&cb, "prefill") {
                     fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for &(i, _, _) in &live_sp { planner.on_finish(i); }
+                    release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
                     continue;
                 }
                 let elapsed = began.elapsed();
+                let before_starts = cache.stats().start_points_saved;
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &(i, p0, t) in &live_sp {
@@ -1018,6 +1143,9 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                             || eng.on(&l.lane).get_cs(),
                         );
                     }
+                }
+                if cache.stats().start_points_saved > before_starts {
+                    checkpoints_sealed = true;
                 }
                 metrics.lock().unwrap_or_else(|e| e.into_inner()).input += live_sp.iter().map(|&(_, _, t)| t).sum::<usize>();
                 for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
@@ -1057,6 +1185,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         a.log_cancellation(cancelled_i);
                     }
                 }
+                release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             Some(crate::scheduler::ServeStepPlan::Decode(need_dec)) => {
                 let mut live_dec: Vec<usize> = Vec::with_capacity(need_dec.len());
@@ -1097,10 +1226,13 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
                     }
                 }
-                if let Err(e) = commit_step(&cb, "decode") {
+                cb.commit();
+                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &planner, metrics);
+                if let Err(e) = wait_committed_step(&cb, "decode") {
                     fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for i in live_dec { planner.on_finish(i); }
+                    release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
                     continue;
                 }
                 {
@@ -1138,6 +1270,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         a.log_cancellation(cancelled_i);
                     }
                 }
+                release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             None => {
                 // No GPU work can proceed while every live lane's output buffer is full.
@@ -4235,5 +4368,50 @@ mod tests {
         assert_eq!(planner.wait_ticks(1), 0);
         assert_eq!(planner.wait_ticks(0), 1);
         assert!(planner.complete_step().is_empty());
+    }
+
+    #[test] fn singleflight_deferred_followers_do_not_accrue_bypass_ticks_and_keep_alive() {
+        let mut planner = crate::scheduler::ServeStepPlanner::new(3, SERVE_STEP_MAX_BYPASS);
+        planner.on_admit(0);
+        planner.on_admit(1);
+        planner.on_admit(2);
+
+        let toks_shared: Vec<u32> = (0..8500u32).collect();
+        let mut toks1 = toks_shared.clone();
+        toks1.extend(10000..10300);
+        let mut toks2 = toks_shared.clone();
+        toks2.extend(20000..20300);
+        let mut toks0 = toks_shared;
+        toks0.extend(30000..30300);
+
+        let cands = [
+            InflightPrefillLane { lane: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 1, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 2, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
+        ];
+        assert_eq!(find_prefill_leader(&cands, 0), None);
+        assert_eq!(find_prefill_leader(&cands, 1), Some(0));
+        assert_eq!(find_prefill_leader(&cands, 2), Some(0));
+
+        let inputs = [
+            crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: effective_pf_target(0, toks0.len()), has_pending_decode: false },
+            crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: effective_pf_target(0, toks1.len()), has_pending_decode: false },
+            crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: effective_pf_target(0, toks2.len()), has_pending_decode: false },
+        ];
+        let plan = planner.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, crate::scheduler::ServeStepPlan::Prefill(vec![(0, 0, 2048)]));
+        assert_eq!(planner.wait_ticks(1), 0);
+        assert_eq!(planner.wait_ticks(2), 0);
+        assert!(planner.complete_step().is_empty());
+
+        let (out, events) = job_events();
+        assert_eq!(out.queued(), 0);
+        assert!(out.send(Ev::Alive).is_ok());
+        assert_eq!(out.queued(), 1);
+        assert!(matches!(events.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
+        assert_eq!(out.queued(), 0);
+        drop(events);
+        assert!(out.cancelled());
+        assert!(out.send(Ev::Alive).is_err());
     }
 }
