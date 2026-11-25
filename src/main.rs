@@ -266,7 +266,7 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
-        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0", "100.117.59.68:18096"] {
+        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0", "100.64.0.1:18096"] {
             let args = ["--bind", bind];
             assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"));
             let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
@@ -279,7 +279,7 @@ mod cli_tests {
             assert_eq!(unkeyed.bind, keyed.bind);
             assert!(unkeyed.key.is_none());
         }
-        assert!(serve::is_private_ip("100.117.59.68".parse().unwrap()));
+        assert!(serve::is_private_ip("100.64.0.1".parse().unwrap()));
     }
 
     #[test]

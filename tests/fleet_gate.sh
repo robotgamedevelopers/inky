@@ -3,7 +3,7 @@
 #
 # Usage:
 #   # Run unit tests + remote live card against an already-running private-network endpoint:
-#   INKY_URL=http://100.117.59.68:18096 INKY_SERVE_KEY=... tests/fleet_gate.sh
+#   INKY_URL=http://<server-tailnet-ip>:18096 INKY_SERVE_KEY=... tests/fleet_gate.sh
 #
 #   # Or run offline self-checks (Go -race unit tests + script validation) without live server:
 #   tests/fleet_gate.sh --offline
