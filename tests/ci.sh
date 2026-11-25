@@ -7,13 +7,23 @@
 #     lanes (inky dbatch) and the cross-lane prefix copy (inky xcopy): every lane identical to itself alone; decode
 #     steps also agree with llama.cpp. The sabotaged spans and xcopy runs are required to fail.
 #     inky poolgate: 3 lanes with every pool slot outside the step poisoned give layer 2's outputs; its sabotaged run
-#     must fail. The long poolgate runs in tests/nightly.sh.
+#     must fail, and only in the lane it poisoned. The long poolgate runs in tests/nightly.sh.
 #  3. tests/golden.sh is byte-identical to tests/golden-<chip>.txt: the logits did not change. A change that changes them
 #     on purpose updates that file in the same commit and says why.
+# Usage: tests/ci.sh [full|pr]. full (the default; the nightly workflow) runs everything above. pr (every pull request
+# and push, which must finish in about a minute) runs the fast representative set: the three llama.cpp agreements and
+# the xcopy and poolgate pairs with their negative controls (about 40 s on an M5). INKY_BIN overrides the binary (default
+# ./target/release/inky).
 set -e
 cd "${0:A:h}/.."
-B=./target/release/inky
+B=${INKY_BIN:-./target/release/inky}
 REF=${INKY_REF:-$HOME/inky-ci/ref}
+mode=${1:-full}
+case $mode in
+    full|pr) ;;
+    *) echo "usage: tests/ci.sh [full|pr]" >&2; exit 2 ;;
+esac
+[ -x "$B" ] || { echo "FAIL: no inky binary at $B" >&2; exit 1; }
 fail=0
 agree() {  # name, ref, expected positions, env...
     local name=$1 ref=$2 expected=$3
@@ -39,20 +49,26 @@ agree() {  # name, ref, expected positions, env...
 agree "decode, short prompt vs llama.cpp" short 58
 agree "prefill, long prompt vs llama.cpp" long 24 INK_PF=2380
 agree "decode steps, short prompt vs llama.cpp" short 58 INK_DEC=1
+$B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
+# negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
+if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
+$B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate"; fail=1; }
+# negative control: a step whose own slots are poisoned must exit 1 AND print POOL GATE DIFFERS (src/main.rs); a crash
+# (any other status, a panic) does not count, nor does the text without status 1. And only the poisoned lane may differ:
+# another lane that differs read the poison through state the lanes share.
+pg_out=$(INK_POOLGATE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pg_rc=0 || pg_rc=$?
+if [ "$pg_rc" = 1 ] && print -r -- "$pg_out" | grep -q 'POOL GATE DIFFERS'; then echo "poolgate sabotage: detected, as required"; else echo "FAIL: poolgate sabotage not detected (exit $pg_rc)"; fail=1; fi
+if print -r -- "$pg_out" | grep -q '^INK_POOLGATE_SABOTAGE: no other lane differs'; then echo "poolgate sabotage: no other lane differs, as required"; else print -r -- "$pg_out" | grep 'LANE LEAK' || true; echo "FAIL: poolgate sabotage leaked across lanes"; fail=1; fi
+if [ "$mode" = pr ]; then
+    echo "pr set done; binv, lanes, spans (and its sabotage), dbatch, cli checks and golden run in the nightly workflow (tests/ci.sh full)"
+    exit $fail
+fi
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
 INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
 # negative control: the sabotaged spans run (one span bound to the wrong lane's state) must report SPANS NOT INVARIANT
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other failure does not count
 if INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1 | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else echo "FAIL: spans sabotage not detected"; fail=1; fi
-$B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
-# negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
-if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
-$B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate"; fail=1; }
-# negative control: a step whose own slots are poisoned must exit 1 AND print POOL GATE DIFFERS (src/main.rs); a crash
-# (any other status, a panic) does not count, nor does the text without status 1
-pg_out=$(INK_POOLGATE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pg_rc=0 || pg_rc=$?
-if [ "$pg_rc" = 1 ] && printf '%s\n' "$pg_out" | grep -q 'POOL GATE DIFFERS'; then echo "poolgate sabotage: detected, as required"; else echo "FAIL: poolgate sabotage not detected (exit $pg_rc)"; fail=1; fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
 zero_out=$(mktemp)
 if zero_stats=$($B run -c 128 --raw -n 0 -p 'Once upon a time' 2>&1 > "$zero_out") &&

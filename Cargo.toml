@@ -1,6 +1,6 @@
 [package]
 name = "inky-engine"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "A hand-fused Metal inference engine for Thinking Machines' Inkling 2 Mini, for Apple Silicon M5 Macs (Metal 4)"
 license = "GPL-3.0-or-later"
@@ -29,6 +29,14 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = 1
+
+# Pull-request CI on the M5 runners (.github/workflows/ci.yml): release optimisation without fat LTO, incremental,
+# so a warm runner rebuilds in about a second instead of 13-19 s. Releases and the nightly gates use [profile.release].
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(standalone_blocks)'] }

@@ -73,10 +73,60 @@ with deadlock checking enabled. Times include JVM startup.
 | Restage | 149 | 149 | 0.335 | StagedOnce violated |
 | StalledTraversal | 195 | 195 | 0.397 | TraversalCompletes violated |
 
-As a separate negative-control check, the redundant-load mutant passed both
-output invariants across all 2,887 distinct states when `StagedOnce` was
-omitted. A test copy with a three-key split and a two-key tile was rejected by
-the divisibility assumption before exploring any states.
+A test copy with a three-key split and a two-key tile was rejected by the
+divisibility assumption before exploring any states.
+
+### Fairness witness and negative control in CI
+
+Run on the `hetzner1` bench (AMD Ryzen 7 PRO 8700GE), 2026-11-24 01:58 UTC, through
+`specs/run_tlc.zsh` with the pinned v1.8.0 tools jar (TLC reports
+2026.11.19, rev `bc1b506`), OpenJDK 21.0.12.1, one TLC worker. Times include JVM
+startup. The whole `run_tlc.zsh` list, all 17 runs, took 27.0 seconds.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| GroupedLayout3 | 579 | 485 | 1.157 | PASS |
+| GroupedLayout4 | 1,553 | 1,329 | 1.676 | PASS |
+| StalledTraversal | 195 | 195 | 1.098 | TraversalCompletes violated |
+| AdvanceUnfair | 579 | 485 | 1.144 | TraversalCompletes violated |
+| RestageOutputs | 18,231 | 13,611 | 1.592 | PASS (expected) |
+
+`StalledTraversal` disables Advance, so the stalled state has no successor and
+weak fairness holds trivially. It cannot tell whether the spec has fairness at
+all. It stays because it is the witness for a lost enabling condition, which no
+fairness can repair.
+
+`AdvanceUnfair` keeps every action and keeps deadlock checking on, so TLC confirms
+that a step exists in every reachable state. Weak fairness covers staging only.
+Its counterexample, inspected: lengths `<<1, 1>>`, nothing shared, no window, one
+tile. State 3 has staged both private slots, so `loaded = Requests` and
+`tile = 0 < TileCount = 1`: Advance is enabled. State 4 stutters forever.
+
+Deleting `WF_vars(FairWork)` from `Spec` in a scratch copy made the healthy
+`GroupedLayout3` run fail with `TraversalCompletes` violated (485 distinct states,
+stuttering at state 4). The healthy runs check the property, so CI catches that
+deletion.
+
+`RestageOutputs` is the negative control that was run by hand before. It runs the
+redundant-load mutant against `VisitedKeys` and `OrderedPartials` only, at four
+slots, and the runner requires a clean exhaustive pass. `Restage` in the same list
+shows that the mutant is live. At three slots the same configuration covers
+2,887 distinct states, the count of the earlier hand run.
+
+Runner checks, by scratch copies: with `RestageOutputs` set to the `localMatch`
+mutant, and with `AdvanceUnfair` set to `Bug = "none"`, `run_tlc.zsh` stopped
+with "Unexpected result" for that run.
+
+### Time budget of the CI TLA step
+
+`scripts/check-tla.sh` on hetzner1, 2026-11-24, with every runner: 355 seconds.
+The CacheScheduler runner took about 305 of them; its DecodePriority run alone
+took 177 seconds (2,210,338 states). On the hosted macOS runner the same step
+took 4 min 58 s for pull request #43. That breaks the two-minute budget, so
+pull request CI no longer runs the CacheScheduler runner. The nightly workflow
+`.github/workflows/nightly.yml` runs everything with `TLA_NIGHTLY=1`. No
+configuration, bound or check was changed. The pull request tier (MemMode, the
+production traces, and all 17 `run_tlc.zsh` runs) took 49.5 seconds on hetzner1.
 
 ## Start points and tails
 
@@ -145,6 +195,26 @@ Inspected counterexamples, each checked against `poison_plan` by hand:
   poisoned, not saved, and still poison after the restore.
 - **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
   the next step leaves the free slot 1 unpoisoned.
+
+## Sliding-window scratch tail
+
+Run on `mini-m5`, 2026-11-24 02:45 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| ScratchTail3 | 469,184 | 435,360 | 3.608 | PASS |
+| ScratchTail4 | 2,359,830 | 2,190,375 | 16.883 | PASS |
+| ScratchTailOneSpan | 832 | 728 | 0.864 | PASS (`notail`, one span) |
+| ScratchTailNoZero | 1,429 | 1,429 | 0.923 | NoForeignRead violated |
+
+Inspected counterexample, checked against `layer_b` by hand:
+
+- **ScratchTailNoZero, state 4:** spans `<<[p0 0, t 2], [p0 0, t 1]>>`; span 1
+  writes rows 0 and 1, span 2 writes row 0 and its tile (AK = 2) reads row 1,
+  span 1's key. On the GPU (`INK_POOLGATE_SABOTAGE`): lane 0 (t 23, NaN after
+  the sabotage) then lane 1 (p0 31, t 1, its tile reaching position 63) in one
+  step; lane 1 read lane 0's NaN keys in rows 1 .. 22 and diverged, then lane 2
+  the same way a step later.
 
 ## BlockLayout and CacheScheduler trace conformance
 

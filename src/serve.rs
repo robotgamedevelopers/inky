@@ -1056,7 +1056,9 @@ fn scheduler(
                 }
             }
             let j = queue.pop_front().unwrap();
-            let timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
+            // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
+            let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
+            let prep_began = Instant::now();
             let start = {
                 let l = &mut lanes[i];
                 let mut pools = eng.block_pool().borrow_mut();
@@ -1076,6 +1078,7 @@ fn scheduler(
                 }
             };
             eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
+            timing.prep = prep_began.elapsed();
             let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
             // once per request, not per round and not per emitted token
             let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);

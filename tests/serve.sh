@@ -13,7 +13,12 @@ model=${2:-$HOME/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling
 bin_abs=${bin:A}
 model_abs=${model:A}
 # Exercise header rejection order on parsed metadata, entirely in-process.
-out=$(cargo test --locked --offline serve_header_policy) || { print -ru2 -- "$out"; exit 1; }
-[[ "$out" == *'1 passed; 0 failed;'* ]] || { print -ru2 -- "$out"; exit 1; }
+# INKY_SERVE_PROBES_ONLY=1 (the pull-request m5-serve job) leaves this to the unit job's cargo test --bins.
+if [[ "${INKY_SERVE_PROBES_ONLY:-}" == 1 ]]; then
+    print -r -- "serve_header_policy: runs in the unit job (cargo test --bins), not here"
+else
+    out=$(cargo test --locked --offline serve_header_policy) || { print -ru2 -- "$out"; exit 1; }
+    [[ "$out" == *'1 passed; 0 failed;'* ]] || { print -ru2 -- "$out"; exit 1; }
+fi
 cd tests
 exec go run ./servecheck "$bin_abs" "$model_abs"

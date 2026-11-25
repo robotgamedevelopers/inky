@@ -61,6 +61,10 @@ pub trait PoisonPool {
     /// True when `slot` below `slot_count` legitimately has no memory now (a layer-2 lane that ended). Any other slot
     /// with no memory is a bug in the pool and the gate fails on it, naming the slot.
     fn absent_ok(&self, _kind: BlockKind, _slot: Slot) -> bool { false }
+    /// Called when `INK_POOLGATE_SABOTAGE` drops the guard on `lane`. A deduplicating candidate (`Layer3Pool`) uses
+    /// this so the intentionally poisoned lane never publishes corrupted blocks into its shared prefix tree for other
+    /// lanes to adopt; any remaining divergence on another lane proves a genuine cross-lane leak in the engine.
+    fn note_sabotaged(&self, _lane: LaneId) {}
 }
 
 /// The candidate is a path with a pool.
@@ -227,8 +231,8 @@ pub fn reference(path: &dyn StepPath, w: &Workload) -> Vec<Record> {
     }).collect()
 }
 
-/// What the poisoned run saw.
-pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub absent: usize, pub sabotaged: bool }
+/// What the poisoned run saw. `sabotaged`: the lane whose own slots were poisoned, if any.
+pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub absent: usize, pub sabotaged: Option<usize> }
 
 /// The lanes together through `cand`, with the pool poisoned before every step. Lane i starts i % 3 rounds late; a
 /// round is a prefill step of every prefilling lane, then a decode step of every decoding lane. `sabotage` drops the
@@ -239,7 +243,7 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
     let mut lane: Vec<Option<LaneId>> = vec![None; n];
     let mut next = vec![0usize; n];
     let mut rec = vec![Record::default(); n];
-    let (mut steps, mut poisoned, mut saved_n, mut absent, mut sabotaged) = (0, 0, 0, 0, false);
+    let (mut steps, mut poisoned, mut saved_n, mut absent, mut sabotaged) = (0, 0, 0, 0, None);
     let mut round = 0;
     while next.iter().any(|&k| k < work.len()) {
         for i in 0..n { if lane[i].is_none() && next[i] == 0 && round >= i % 3 { lane[i] = Some(cand.new_lane(&w.prompts[i], w.len() + 1)); } }
@@ -249,8 +253,12 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             let live: Vec<usize> = (0..n).filter(|&i| lane[i].is_some()).collect();
             let tables: Vec<Vec<(BlockKind, Slot)>> = live.iter().map(|&i| cand.lane_slots(lane[i].unwrap())).collect();
             let stepping: Vec<usize> = who.iter().map(|i| live.iter().position(|j| j == i).unwrap()).collect();
-            let unguard = sabotage && !sabotaged && work[next[who[0]]].0 > 0;
-            if unguard { sabotaged = true; println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0); }
+            let unguard = sabotage && sabotaged.is_none() && work[next[who[0]]].0 > 0;
+            if unguard {
+                sabotaged = Some(who[0]);
+                cand.note_sabotaged(lane[who[0]].unwrap());
+                println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0);
+            }
             let ps = plans(cand, &tables, &stepping, !unguard);
             let (saved, done) = apply(cand, &ps);
             poisoned += done.poisoned; saved_n += done.saved; absent += done.absent;
@@ -270,6 +278,14 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
         round += 1;
     }
     Report { records: rec, steps, poisoned, saved: saved_n, absent, sabotaged }
+}
+
+/// The lanes other than lane poisoned whose records differ from the reference. A sabotaged run poisons one lane's own
+/// slots in one step; lanes share no unpoisoned cache with a sabotaged lane, so every other lane must still match, or
+/// something the engine shares across lanes carried the poison over (the sliding-window scratch tail, src/engine.rs,
+/// specs/ScratchTail.tla).
+pub fn leaked(want: &[Record], got: &Report, poisoned: usize) -> Vec<usize> {
+    want.iter().zip(&got.records).enumerate().filter(|&(i, (a, b))| i != poisoned && a != b).map(|(i, _)| i).collect()
 }
 
 /// The reference against the poisoned candidate: Ok(lines) when every lane matches at every step, Err(lines) naming
@@ -371,6 +387,7 @@ struct L3Lane {
     written: usize,
     sealed: Vec<SealedId>,
     head_start: Option<SealedId>,
+    sabotaged: bool,
 }
 
 /// Layer 3 block-cache candidate: contiguous GPU `BlockPools` per kind (`Window`, `Full`),
@@ -495,6 +512,7 @@ impl<'a> Layer3Pool<'a> {
             written,
             sealed,
             head_start: None,
+            sabotaged: false,
         }));
         (v.len() - 1, written)
     }
@@ -606,7 +624,7 @@ impl<'a> Layer3Pool<'a> {
             }
             if block_len == BLOCK as u32 {
                 self.stats.borrow_mut().blocks_sealed += 1;
-                if b == 0 || l3.sealed.len() == b {
+                if !l3.sabotaged && (b == 0 || l3.sealed.len() == b) {
                     let parent = if b == 0 { None } else { l3.sealed.get(b - 1).copied() };
                     let blk_toks = &l3.tokens[b * BLOCK..(b + 1) * BLOCK];
                     let handles = BlockHandles::new(full_e, Some(win_e));
@@ -735,6 +753,7 @@ impl StepPath for Layer3Pool<'_> {
             written: 0,
             sealed: Vec::new(),
             head_start: None,
+            sabotaged: false,
         }));
         v.len() - 1
     }
@@ -833,6 +852,11 @@ impl PoisonPool for Layer3Pool<'_> {
     }
     fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
         self.eng.block_pool().borrow().of(kind).slot_raw_region(slot)
+    }
+    fn note_sabotaged(&self, lane: LaneId) {
+        if let Some(l3) = self.lanes.borrow_mut()[lane].as_mut() {
+            l3.sabotaged = true;
+        }
     }
 }
 
@@ -1143,16 +1167,26 @@ mod tests {
     }
 
     #[test]
+    fn leaked_names_every_other_lane_that_differs() {
+        let r = |s: u64| Record { steps: vec![1, s], tokens: vec![7] };
+        let want = vec![r(2), r(3), r(4)];
+        let got = |v: Vec<Record>| Report { records: v, steps: 0, poisoned: 0, saved: 0, absent: 0, sabotaged: Some(0) };
+        assert_eq!(leaked(&want, &got(vec![r(9), r(3), r(4)]), 0), Vec::<usize>::new());
+        assert_eq!(leaked(&want, &got(vec![r(9), r(9), r(4)]), 0), vec![1]);
+        assert_eq!(leaked(&want, &got(vec![r(2), r(3), Record { steps: vec![1, 4], tokens: vec![8] }]), 1), vec![2]);
+    }
+
+    #[test]
     fn compare_rejects_short_or_extra_candidate_record_lists() {
         let r0 = Record { steps: vec![1, 2], tokens: vec![10] };
         let r1 = Record { steps: vec![3, 4], tokens: vec![20] };
         let want = vec![r0.clone(), r1.clone()];
-        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
         let err = compare(&want, &short).unwrap_err();
         assert!(err[0].contains("lane count mismatch"), "short candidate must fail compare: {err:?}");
-        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
         assert!(compare(&want, &extra).is_err(), "extra candidate lanes must fail compare");
-        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: false };
+        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
         assert!(compare(&want, &exact).is_ok());
     }
 }

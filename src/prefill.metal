@@ -537,7 +537,8 @@ kernel void k_kvcopy(device float * A [[buffer(2)]], device kv_t * KV [[buffer(3
     const uint ri = (g * a.cap + pos % a.cap) * HD + lane * 4, si = (g * a.scap + (uint) ((int) pos - a.kpos0)) * HD + lane * 4;
     device kvw_t * rk = (device kvw_t *) (KV + a.ring_k + ri), * rv = (device kvw_t *) (KV + a.ring_v + ri);
     device kvw_t * sk = (device kvw_t *) ((device kv_t *) (A + a.sk_off) + si), * sv = (device kvw_t *) ((device kv_t *) (A + a.sv_off) + si);
-    if (a.to_ring) { *rk = *sk; *rv = *sv; } else { *sk = *rk; *sv = *rv; }
+    if (a.to_ring == 2) { *sk = kvw_t(0); *sv = kvw_t(0); }       // zero scratch rows (the ring is not touched)
+    else if (a.to_ring) { *rk = *sk; *rv = *sv; } else { *sk = *rk; *sv = *rv; }
 }
 
 // dev: copy 32-bit words from the arena to a side buffer

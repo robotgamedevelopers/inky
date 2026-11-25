@@ -10,29 +10,30 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Every job here must finish in about a minute (Glenn, 2026-11-23: pull request and push CI averages one minute or
+# less). Anything slower runs in .github/workflows/nightly.yml, where it still fails red:
+#   the CacheScheduler and nightly layout TLC models, the release-profile unit tests and clean release build,
+#   the slow GPU gates (binv, lanes, spans and its sabotage, dbatch, CLI checks, golden hashes) and the serve
+#   API negative control.
 jobs:
-  # Jobs:
-  #   cpu: a GitHub-hosted ARM Mac; builds and runs the CPU-only unit tests. Shaders compile at
-  #        runtime, so the build needs no GPU. It reports in minutes without waiting for the M5.
-  #   m5:  the self-hosted M5 Mac; runs GPU gates and loopback API probes against the local model.
-  #   go:  Linux-hosted regression tests for the soak and load clients.
-  cpu:
+  # unit: a GitHub-hosted ARM Mac; the CPU-only unit tests in the test profile (overflow checks and debug asserts on).
+  # Shaders compile at runtime, so the build needs no GPU. rust-cache keeps target/ and ~/.cargo keyed on Cargo.lock.
+  unit:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: TLA models, witnesses and production traces
-        run: scripts/check-tla.sh
-      - name: build
-        run: cargo build --release
-      - name: unit tests (debug assertions)
-        run: cargo test --bins
-      - name: unit tests (release)
-        run: cargo test --release --bins
+      - uses: Swatinem/rust-cache@v2
+      - name: unit tests
+        run: cargo test --locked --bins
+      # tests/serve.sh's in-process header test runs here, not in m5-serve. Like serve.sh, require exactly one
+      # serve_header_policy test to run and pass, so a rename or removal fails this job.
+      - name: serve_header_policy runs exactly once
+        run: |
+          out=$(cargo test --locked --bins serve_header_policy 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+  # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, and replay tools.
   go:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -56,43 +57,71 @@ jobs:
       - name: replay sweep tests
         working-directory: tools/replay
         run: go vet ./... && go test -race ./...
-  m5:
-    # A self-hosted M5 Mac: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
-    # Pull requests from forks never run here (the repository also requires approval for outside contributors).
+  # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel.
+  tla:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [memmode, blocks, grouped, traces]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Every TLA check and trace mutant must sit in exactly one tier (this file or nightly.yml); the self-test
+      # plants a dropped check, a dropped mutant, an unwired trace script and a doubled part, and needs each red.
+      - name: TLA tier coverage
+        if: matrix.part == 'memmode'
+        run: |
+          scripts/check-tla-tiers.sh
+          scripts/check-tla-tiers.sh --self-test
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The pinned tla2tools.jar, kept across runs; check-tla.sh still checks its SHA-256 every time.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/inky-tla
+          key: tla2tools-fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
+      - name: TLA ${{ matrix.part }}
+        run: TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh ${{ matrix.part }}
+  # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
+  # Pull requests from forks never run here (the repository also requires approval for outside contributors).
+  # Every same-repository pull request runs both, stream bases included: each takes about 40 s.
+  # Both jobs build the `ci` profile (release without fat LTO, incremental), which rebuilds in about a second on a
+  # runner's warm target/; the nightly workflow runs every gate on the true release profile.
+  m5-gpu:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: build
-        run: cargo build --release
+        run: cargo build --locked --profile ci
       - name: GPU router regression
-        run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
-      - name: tests
-        run: tests/ci.sh
+        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
+      - name: GPU gates (pull request set)
+        env:
+          INKY_BIN: ./target/ci/inky
+        run: tests/ci.sh pr
+  m5-serve:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: build
+        run: cargo build --locked --profile ci
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.10'
           cache: false
       # servecheck allocates ephemeral loopback ports, bounds requests/server
       # lifetime, and cancels/waits for each child server before removing logs.
+      # serve_header_policy runs in the unit job (cargo test --bins), so this job runs the probes alone.
       - name: serve API probes
         timeout-minutes: 10
         env:
           SERVECHECK_SABOTAGE: ''
-        run: tests/serve.sh
-      - name: serve API negative control
-        timeout-minutes: 10
-        env:
-          SERVECHECK_SABOTAGE: health-status
-        run: |
-          log=$(mktemp)
-          trap 'rm -f "$log"' EXIT
-          if tests/serve.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
-          cat "$log"
-          # Require the deliberate mismatch and completed suite; a crash is not proof.
-          test "$rc" -eq 1
-          grep -Fxq 'FAIL bearer authentication and public health: sabotage health-status: got HTTP 200, want 418' "$log"
-          grep -Fxq 'one or more serve checks failed' "$log"
-          test "$(grep -c '^FAIL ' "$log")" -eq 1
-          echo 'serve health-status sabotage: detected, as required'
+          INKY_SERVE_PROBES_ONLY: '1'
+        run: tests/serve.sh ./target/ci/inky

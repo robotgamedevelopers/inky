@@ -977,7 +977,14 @@ fn poolgate(o: &Opts) {
     let got = poolgate::poisoned(&cand, &w, sabotage);
     let st = cand.stats();
     cand.shutdown();
-    if sabotage && !got.sabotaged { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
+    if sabotage && got.sabotaged.is_none() { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
+    // the poisoned lane must differ and no other lane may: lanes share no unpoisoned cache with a sabotaged lane,
+    // so a second lane that differs read the poison through state the engine shares across lanes
+    if let Some(s) = got.sabotaged {
+        let leak = poolgate::leaked(&want, &got, s);
+        if leak.is_empty() { println!("INK_POOLGATE_SABOTAGE: no other lane differs from layer 2's outputs"); }
+        else { println!("LANE LEAK: lanes {leak:?} differ though only lane {s}'s slots were poisoned"); }
+    }
     match poolgate::compare(&want, &got) {
         Ok(lines) => {
             for l in lines { println!("{l}"); }
