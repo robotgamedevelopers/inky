@@ -230,18 +230,11 @@ func TestParseAnthropicSSEAndOpenAIUsageStream(t *testing.T) {
 
 func TestNegativeControlVerdict(t *testing.T) {
 	budget := healthSnapshot{OK: true, RecommendedWorkingSetBytes: int64Ptr(0)}
-	late := []byte("[serve] client gone after 512 generated tokens; lane freed\n")
-	ref := sampleToolReplyFixture(1, `{"city":"Seattle"}`)
-	replies := make([]toolSample, 4)
-	for i := range replies {
-		replies[i] = sampleToolReplyFixture(i+2, ref.ToolCalls[0].Function.Arguments)
-	}
-	replies[1].ToolCalls[0].ID = replies[0].ToolCalls[0].ID
 	lines := []string{
-		fmt.Sprintf("FAIL bearer authentication and public health: sabotage health-status: %v", (apiObservation{code: 200}).expect(418)),
-		fmt.Sprintf("FAIL health reports Metal memory budget and admission limits: sabotage memory-budget: %v", verifyHealthBudget(budget, 1)),
-		fmt.Sprintf("FAIL disconnect in mid-thinking stops generation: sabotage disconnect-mid-thinking: %v", verifyDisconnectMidThinking(late, 512, healthSnapshot{}, replySample{}, replySample{})),
-		fmt.Sprintf("FAIL concurrent identical tool calls: sabotage concurrent-tool-calls: %v", verifyConcurrentToolCalls("get_weather", ref, replies)),
+		fmt.Sprintf("FAIL bearer authentication and public health: %v", (apiObservation{code: 503, Error: struct{ Message string }{Message: "injected health-status fault"}}).expect(200)),
+		fmt.Sprintf("FAIL health reports Metal memory budget and admission limits: %v", verifyHealthBudget(budget, 1)),
+		"FAIL disconnect in mid-thinking stops generation: /health did not drain within 3s: active_lanes=1 inflight=1 queued=0",
+		"FAIL concurrent identical tool calls: stream drain: /health did not drain within 5s: active_lanes=0 inflight=1 queued=0",
 		"one or more serve checks failed",
 	}
 	complete := strings.Join(lines, "\n")
@@ -249,7 +242,7 @@ func TestNegativeControlVerdict(t *testing.T) {
 		name, log, exit string
 		ok              bool
 	}{
-		{"four observed controls", complete, "1", true},
+		{"four observed server faults", complete, "1", true},
 		{"probe silently passed", strings.Replace(complete, lines[1], "PASS memory budget", 1), "1", false},
 		{"wrong diagnostic", strings.Replace(complete, lines[1], "FAIL memory budget: timed out", 1), "1", false},
 		{"extra failure", complete + "\nFAIL another probe", "1", false},

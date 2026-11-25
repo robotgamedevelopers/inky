@@ -1461,6 +1461,44 @@ struct AdmissionInner {
     waiters: VecDeque<u64>,
 }
 
+/// Server-side negative-control faults for `tests/servecheck`, strictly inert unless BOTH
+/// `INKY_SERVE_ALLOW_FAULT_INJECTION=1` AND `INKY_SERVE_FAULT` are set in the environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ServeFaults {
+    health_status: bool,
+    ignore_budget: bool,
+    skip_thinking_cancel: bool,
+    leak_permit: bool,
+}
+
+impl ServeFaults {
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        if get("INKY_SERVE_ALLOW_FAULT_INJECTION").as_deref() != Some("1") {
+            return Ok(Self::default());
+        }
+        let Some(raw) = get("INKY_SERVE_FAULT") else {
+            return Ok(Self::default());
+        };
+        let mut out = Self::default();
+        for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match token {
+                "all" => {
+                    out.health_status = true;
+                    out.ignore_budget = true;
+                    out.skip_thinking_cancel = true;
+                    out.leak_permit = true;
+                }
+                "health-status" => out.health_status = true,
+                "ignore-budget" => out.ignore_budget = true,
+                "skip-thinking-cancel" => out.skip_thinking_cancel = true,
+                "leak-permit" => out.leak_permit = true,
+                other => return Err(format!("unknown INKY_SERVE_FAULT {other:?} (expected health-status|leak-permit|skip-thinking-cancel|ignore-budget|all)")),
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Bounded FIFO admission gate: up to `max_lanes` requests hold active lane slots,
 /// up to `max_queue` additional requests wait with a bounded timeout, and any request
 /// beyond queue capacity (or timing out waiting for admission) is refused with 429 + Retry-After.
@@ -1469,14 +1507,22 @@ struct AdmissionGate {
     queue_timeout: Duration,
     poll_interval: Duration,
     retry_after_secs: u64,
+    leak_first_release: Option<Arc<std::sync::atomic::AtomicBool>>,
+    faults: ServeFaults,
 }
 
 struct LanePermit {
     inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+    leak_first_release: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for LanePermit {
     fn drop(&mut self) {
+        if let Some(flag) = &self.leak_first_release {
+            if !flag.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
         let (lock, cvar) = &*self.inner;
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         st.admitted = st.admitted.saturating_sub(1);
@@ -1528,7 +1574,17 @@ impl AdmissionGate {
             queue_timeout,
             poll_interval: poll_interval.max(Duration::from_millis(1)),
             retry_after_secs: retry_after_secs.max(1),
+            leak_first_release: None,
+            faults: ServeFaults::default(),
         }
+    }
+
+    fn with_faults(mut self, faults: ServeFaults) -> Self {
+        if faults.leak_permit {
+            self.leak_first_release = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        }
+        self.faults = faults;
+        self
     }
 
     #[cfg(test)]
@@ -1537,7 +1593,7 @@ impl AdmissionGate {
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.admitted < st.max_lanes && st.waiters.is_empty() {
             st.admitted += 1;
-            return Some(LanePermit { inner: self.inner.clone() });
+            return Some(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
         }
         None
     }
@@ -1547,7 +1603,7 @@ impl AdmissionGate {
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.admitted < st.max_lanes && st.waiters.is_empty() {
             st.admitted += 1;
-            return Ok(LanePermit { inner: self.inner.clone() });
+            return Ok(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
         }
         if st.waiters.len() >= st.max_queue {
             return Err(AdmissionReject::QueueFull);
@@ -1563,7 +1619,7 @@ impl AdmissionGate {
                 st.admitted += 1;
                 guard.armed = false;
                 cvar.notify_all();
-                return Ok(LanePermit { inner: self.inner.clone() });
+                return Ok(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
             }
             if is_gone() {
                 drop(st);
@@ -1610,16 +1666,23 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              count_preprocess: PermitPool,
              /// Lanes currently occupied by an active job in the scheduler.
              active_lanes: Arc<AtomicUsize>,
-             /// Live connections, capped globally and per peer.
+             /// Live connections, capped globally (clamped below soft RLIMIT_NOFILE) and per peer.
              conns: ConnectionSlots,
              /// opt-in non-blocking JSONL card traffic recorder
              recorder: Option<Arc<crate::record::Recorder>> }
 const MAX_CONNS: usize = 512;
 const MAX_PEER_CONNS: usize = 128;
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-#[derive(Default)]
-struct ConnectionSlots(Arc<Mutex<ConnectionCounts>>);
+struct ConnectionSlots {
+    counts: Arc<Mutex<ConnectionCounts>>,
+    max_total: usize,
+}
+
+impl Default for ConnectionSlots {
+    fn default() -> Self {
+        Self::with_max_total(MAX_CONNS)
+    }
+}
 
 #[derive(Default)]
 struct ConnectionCounts {
@@ -1633,10 +1696,14 @@ struct ConnectionSlot {
 }
 
 impl ConnectionSlots {
+    fn with_max_total(max_total: usize) -> Self {
+        Self { counts: Arc::new(Mutex::new(ConnectionCounts::default())), max_total }
+    }
+
     fn acquire(&self, peer: IpAddr) -> Option<ConnectionSlot> {
         let peer = peer.to_canonical();
-        let mut counts = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if counts.total >= MAX_CONNS {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.total >= self.max_total {
             return None;
         }
         let active = counts.peers.entry(peer).or_default();
@@ -1645,7 +1712,7 @@ impl ConnectionSlots {
         }
         *active += 1;
         counts.total += 1;
-        Some(ConnectionSlot { counts: self.0.clone(), peer })
+        Some(ConnectionSlot { counts: self.counts.clone(), peer })
     }
 }
 
@@ -1992,6 +2059,8 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         s.flush()?;
     }
     let sp = cx.sp;
+    let skip_thinking_cancel = cx.admission.faults.skip_thinking_cancel;
+    let mut saw_thinking = false;
     let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
     loop {
         // wait for the scheduler, watching the client: a client gone drops `rx`, and the scheduler's next send to this
@@ -1999,7 +2068,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2009,7 +2078,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         };
         match ev {
             Ev::Alive => {
-                if s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2017,7 +2086,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
             Ev::Tok(t) => {
                 turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && gen.len() % 16 == 0 && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2026,11 +2095,16 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        let line = format!("data: {}\n\n", chunk(json!({key: text}), Value::Null));
+                        if skip_thinking_cancel && saw_thinking {
+                            let _ = s.write_all(line.as_bytes()).and_then(|()| s.flush());
+                        } else {
+                            s.write_all(line.as_bytes())?;
+                            s.flush()?;
+                        }
                     }
                 }
-                if t == sp.c_think { mode = 1; continue; }
+                if t == sp.c_think { mode = 1; saw_thinking = true; continue; }
                 if t == sp.c_text { mode = 2; continue; }
                 if t == sp.c_tool { mode = 3; continue; }
                 if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); continue; }
@@ -2040,8 +2114,13 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                     if !text.is_empty() {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
                         // a failed write drops `rx`: the scheduler sees the client gone and cancels the lane
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        let line = format!("data: {}\n\n", chunk(json!({key: text}), Value::Null));
+                        if skip_thinking_cancel && saw_thinking {
+                            let _ = s.write_all(line.as_bytes()).and_then(|()| s.flush());
+                        } else {
+                            s.write_all(line.as_bytes())?;
+                            s.flush()?;
+                        }
                     }
                 }
             }
@@ -2309,13 +2388,15 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
+    let faults = ServeFaults::from_lookup(|k| std::env::var(k).ok()).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2); });
+    let max_conns = crate::memd::raise_and_clamp_max_conns(MAX_CONNS, 64);
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     eng.ensure_batch(eng.chunk);
     let (chip, mem) = crate::tuning::this_machine();
     let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
-    let budget = MemoryBudget::compute(
+    let mut budget = MemoryBudget::compute(
         eng.gpu.recommended_max_working_set_size(),
         eng.model_and_scratch_bytes(),
         safety_headroom_bytes,
@@ -2326,6 +2407,9 @@ pub fn serve(o: ServeOpts) {
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
     let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    if faults.ignore_budget {
+        budget.recommended_working_set_bytes = 0;
+    }
     let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -2335,7 +2419,7 @@ pub fn serve(o: ServeOpts) {
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
     let (jtx, jrx) = channel::<Job>();
-    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
+    let effective_queue = o.queue.min(max_conns.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
@@ -2361,11 +2445,13 @@ pub fn serve(o: ServeOpts) {
     } else {
         None
     };
+    let admission = AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT)
+        .with_faults(faults);
     let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
-        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
+        admission,
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2411,12 +2497,15 @@ pub fn serve(o: ServeOpts) {
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
+        let mut backoff = crate::memd::AcceptBackoff::new("serve");
         loop {
             let (mut s, peer) = match l.accept() {
-                Ok(connection) => connection,
+                Ok(connection) => {
+                    backoff.on_accept_ok();
+                    connection
+                }
                 Err(e) => {
-                    eprintln!("[serve] accept: {e}");
-                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    backoff.on_accept_err(&e);
                     continue;
                 }
             };
@@ -2470,6 +2559,7 @@ fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accep
         drop(r);
         let result = match route {
             Route::Models => respond(&mut s, 200, &models_body()),
+            Route::Health if cx.admission.faults.health_status => respond(&mut s, 503, &json!({"ok": false, "error": {"message": "injected health-status fault"}}).to_string()),
             Route::Health => respond(&mut s, 200, &health_body(cx)),
             Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
             Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
@@ -2555,6 +2645,55 @@ mod tests {
     }
 
     include!("serve/physical_context_tests.rs");
+
+    #[test]
+    fn serve_fault_injection_requires_explicit_allow_gate_and_leaks_once() {
+        // Without INKY_SERVE_ALLOW_FAULT_INJECTION=1, INKY_SERVE_FAULT is unconditionally ignored.
+        for allow in [None, Some("0"), Some("true"), Some("yes")] {
+            let f = ServeFaults::from_lookup(|k| match k {
+                "INKY_SERVE_ALLOW_FAULT_INJECTION" => allow.map(str::to_owned),
+                "INKY_SERVE_FAULT" => Some("all".into()),
+                _ => None,
+            }).unwrap();
+            assert_eq!(f, ServeFaults::default());
+        }
+
+        // With INKY_SERVE_ALLOW_FAULT_INJECTION=1, individual, comma-separated, and "all" faults parse cleanly.
+        let parsed = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("health-status,leak-permit".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(parsed, ServeFaults { health_status: true, ignore_budget: false, skip_thinking_cancel: false, leak_permit: true });
+
+        let all = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("all".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(all, ServeFaults { health_status: true, ignore_budget: true, skip_thinking_cancel: true, leak_permit: true });
+
+        // Unknown fault names fail closed when fault injection is enabled.
+        let bad = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("not-a-fault".into()),
+            _ => None,
+        });
+        assert!(bad.is_err());
+
+        // leak-permit leaks the first released LanePermit and releases subsequent permits cleanly.
+        let gate = AdmissionGate::new(2, 1, Duration::from_millis(50)).with_faults(ServeFaults {
+            leak_permit: true,
+            ..ServeFaults::default()
+        });
+        let p1 = gate.try_acquire().unwrap();
+        let p2 = gate.try_acquire().unwrap();
+        assert_eq!(gate.inflight(), 2);
+        drop(p1);
+        assert_eq!(gate.inflight(), 2, "first permit release must leak under leak-permit fault");
+        drop(p2);
+        assert_eq!(gate.inflight(), 1, "subsequent permit releases decrement normally, leaving 1 leaked permit");
+    }
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
