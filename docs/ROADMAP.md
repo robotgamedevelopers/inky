@@ -577,11 +577,11 @@ Measure the curve and pick the lane count where adding lanes stops paying.
 
 | feature | done |
 |---|:---:|
-| Real card traffic recorded as a replay set | ✅ |
+| Real card traffic recorded as a replay set | ❌ |
 | Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ❌ |
 | Each candidate machine measured: memory bandwidth, single-stream decode, prefill | ✅ |
 | Measure the lane-count knee against streamed first-token latency and observed memory, then apply each machine profile | ❌ |
-| complete | 50% |
+| complete | 25% |
 
 [Source data](roadmap.sexp)
 
