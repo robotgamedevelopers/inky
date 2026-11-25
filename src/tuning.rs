@@ -79,5 +79,14 @@ mod tests {
         assert_eq!(t.name, "default");
         assert_eq!(t.wired_limit_mb, 65536 - 8192);
     }
+    #[test] fn default_tuning_saturates_to_zero_on_small_or_unreadable_memory() {
+        for bytes in [0u64, 512 << 20, 4 << 30, 8 << 30] {
+            let t = select("Unknown Mac", bytes);
+            assert_eq!(t.name, "default");
+            assert_eq!(t.wired_limit_mb, 0, "memory_bytes={bytes} must saturate wired_limit_mb to 0 without underflow");
+        }
+        let nine_gib = select("Unknown Mac", 9 << 30);
+        assert_eq!(nine_gib.wired_limit_mb, 9216 - 8192);
+    }
     #[test] fn refuses_a_missing_key() { assert!(parse("name = x\nchip = y\n").is_err()); }
 }

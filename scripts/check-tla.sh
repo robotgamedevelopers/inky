@@ -214,6 +214,7 @@ fi
 for p in blocks grouped; do
     want "$p" && [ -f "$root/specs/BlockLayout.tla" ] || continue
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
+    if command -v rustc >/dev/null 2>&1; then (cd "$root" && rustc --version >/dev/null); fi
     env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" bash "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout-$p" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
@@ -284,6 +285,7 @@ if want traces; then
     [ "$light_jobs" -ge 2 ] || light_jobs=2
     heavy_jobs=$total_cpus
     [ "$heavy_jobs" -ge 2 ] || heavy_jobs=2
+    (cd "$root" && rustc --version >/dev/null)
     for t in $trace_scripts; do
         if [ ! -f "$root/scripts/check-$t-traces.sh" ]; then
             echo "traces: scripts/check-$t-traces.sh missing" >&2
