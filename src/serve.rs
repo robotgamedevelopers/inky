@@ -1519,14 +1519,57 @@ fn models_body() -> String {
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
+#[derive(Default, Debug, Clone)]
+struct Head {
+    method: String,
+    path: String,
+    len: usize,
+    auth: Option<String>,
+    api_key: Option<String>,
+    card_id: Option<String>,
+    chunked: bool,
+    host: Option<String>,
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    content_type: Option<String>,
+}
 const MAX_BODY: usize = 32 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(600);
+const MAX_STREAM_WRITE_TIME: Duration = Duration::from_secs(15);
+
+trait ServeClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn wait_timeout<'a>(
+        &self,
+        cvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, AdmissionInner>,
+        dur: Duration,
+    ) -> std::sync::MutexGuard<'a, AdmissionInner>;
+    fn on_admission_parked(&self) {}
+}
+
+struct SystemServeClock;
+
+impl ServeClock for SystemServeClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wait_timeout<'a>(
+        &self,
+        cvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, AdmissionInner>,
+        dur: Duration,
+    ) -> std::sync::MutexGuard<'a, AdmissionInner> {
+        cvar.wait_timeout(guard, dur).unwrap_or_else(|e| e.into_inner()).0
+    }
+}
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
 /// rather than resetting a timeout on every read syscall.
+#[cfg(test)]
 struct DeadlineReader<R, N, S> {
     inner: R,
     deadline: Option<Instant>,
@@ -1534,6 +1577,7 @@ struct DeadlineReader<R, N, S> {
     set_timeout: S,
 }
 
+#[cfg(test)]
 impl<R, N, S> DeadlineReader<R, N, S> {
     fn new(inner: R, deadline: Instant, now: N, set_timeout: S) -> Self {
         Self { inner, deadline: Some(deadline), now, set_timeout }
@@ -1544,6 +1588,7 @@ impl<R, N, S> DeadlineReader<R, N, S> {
     }
 }
 
+#[cfg(test)]
 impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> Read for DeadlineReader<R, N, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(deadline) = self.deadline {
@@ -1554,6 +1599,140 @@ impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> 
             (self.set_timeout)(rem)?;
         }
         self.inner.read(buf)
+    }
+}
+
+trait ConnIo: Read + Write {
+    fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn peer_disconnected(&self) -> bool;
+}
+
+impl ConnIo for TcpStream {
+    fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(dur)
+    }
+    fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(dur)
+    }
+    fn peer_disconnected(&self) -> bool {
+        peer_gone(self)
+    }
+}
+
+struct ConnDeadlineReader<'a, S> {
+    inner: &'a mut S,
+    clock: &'a dyn ServeClock,
+    deadline: Option<Instant>,
+    timeout_msg: &'static str,
+}
+
+impl<'a, S: ConnIo> ConnDeadlineReader<'a, S> {
+    fn new(inner: &'a mut S, clock: &'a dyn ServeClock, deadline: Instant, timeout_msg: &'static str) -> Self {
+        Self { inner, clock, deadline: Some(deadline), timeout_msg }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant, timeout_msg: &'static str) {
+        self.deadline = Some(deadline);
+        self.timeout_msg = timeout_msg;
+    }
+}
+
+impl<S: ConnIo> Read for ConnDeadlineReader<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let rem = deadline.saturating_duration_since(self.clock.now());
+            if rem.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, self.timeout_msg));
+            }
+            self.inner.set_read_timeout_opt(Some(rem))?;
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Bounds response / SSE writes across an entire connection so a dribbling reader that drains
+/// a few bytes under each per-syscall write timeout is still cut off once cumulative write stall
+/// (`max_write_time`) or total stream wall time (`max_total_duration`) expires.
+struct StreamDeadlineWriter<'a, S> {
+    inner: &'a mut S,
+    clock: &'a dyn ServeClock,
+    stream_deadline: Instant,
+    max_write_time: Duration,
+    per_write_timeout: Duration,
+    write_elapsed: Duration,
+}
+
+impl<'a, S: ConnIo> StreamDeadlineWriter<'a, S> {
+    fn new(
+        inner: &'a mut S,
+        clock: &'a dyn ServeClock,
+        max_total_duration: Duration,
+        max_write_time: Duration,
+        per_write_timeout: Duration,
+    ) -> Self {
+        let now = clock.now();
+        Self {
+            inner,
+            clock,
+            stream_deadline: now + max_total_duration,
+            max_write_time,
+            per_write_timeout,
+            write_elapsed: Duration::ZERO,
+        }
+    }
+
+    fn prepare_write_window(&mut self) -> std::io::Result<Instant> {
+        let now = self.clock.now();
+        let rem_total = self.stream_deadline.saturating_duration_since(now);
+        let rem_write = self.max_write_time.saturating_sub(self.write_elapsed);
+        let rem = rem_total.min(rem_write).min(self.per_write_timeout);
+        if rem.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streaming response write deadline exceeded",
+            ));
+        }
+        self.inner.set_write_timeout_opt(Some(rem))?;
+        Ok(now)
+    }
+
+    fn finish_write_window(&mut self, started_at: Instant) -> std::io::Result<()> {
+        let now = self.clock.now();
+        self.write_elapsed = self.write_elapsed.saturating_add(now.saturating_duration_since(started_at));
+        if self.write_elapsed >= self.max_write_time || now >= self.stream_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streaming response write deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<S: ConnIo> Write for StreamDeadlineWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let started_at = self.prepare_write_window()?;
+        let n = match self.inner.write(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, e));
+            }
+            Err(e) => return Err(e),
+        };
+        self.finish_write_window(started_at)?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let started_at = self.prepare_write_window()?;
+        if let Err(e) = self.inner.flush() {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, e));
+            }
+            return Err(e);
+        }
+        self.finish_write_window(started_at)
     }
 }
 
@@ -1570,7 +1749,11 @@ fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<Stri
 fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, card_id: None, chunked: false };
+    let mut h = Head {
+        method: it.next().unwrap_or("").to_string(),
+        path: it.next().unwrap_or("").to_string(),
+        ..Head::default()
+    };
     for _ in 0..128 {
         let l = read_bounded_line(r, 16384)?;
         if l == "\r\n" || l == "\n" { return Ok(h); }
@@ -1583,14 +1766,31 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
             }
             if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
             if k.eq_ignore_ascii_case("x-inky-card-id") { h.card_id = crate::record::sanitize_card_id(Some(v)); }
+            if k.eq_ignore_ascii_case("host") {
+                if h.host.is_some() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate Host header"));
+                }
+                h.host = Some(v.to_string());
+            }
+            if k.eq_ignore_ascii_case("origin") { h.origin = Some(v.to_string()); }
+            if k.eq_ignore_ascii_case("sec-fetch-site") { h.sec_fetch_site = Some(v.to_string()); }
+            if k.eq_ignore_ascii_case("content-type") { h.content_type = Some(v.to_string()); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
 }
 
-/// Why a chunked body was refused: over the cap (413) or malformed framing (400).
+/// Why a chunked body was refused: over the cap (413), timed out (408), or malformed framing (400).
 #[derive(Debug)]
-enum BodyError { TooLarge, Malformed(String) }
+enum BodyError { TooLarge, TimedOut, Malformed(String) }
+
+fn map_chunk_io_err(ctx: &str, e: std::io::Error) -> BodyError {
+    if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+        BodyError::TimedOut
+    } else {
+        BodyError::Malformed(format!("{ctx}: {e}"))
+    }
+}
 
 /// A chunked request body decoded under `max`: chunk sizes are hex with
 /// optional extensions, each chunk is followed by CRLF, the zero chunk is
@@ -1601,13 +1801,13 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
     let mut body = Vec::new();
     let mut framing = 0usize;
     loop {
-        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
+        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| map_chunk_io_err("chunk size", e))?;
         framing += line.len();
         let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
         let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
         if n == 0 {
             for _ in 0..128 {
-                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("trailer: {e}")))?;
+                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| map_chunk_io_err("trailer", e))?;
                 framing += t.len();
                 if t == "\r\n" || t == "\n" { return Ok(body); }
                 if !t.contains(':') { return Err(bad("bad trailer")); }
@@ -1617,11 +1817,11 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
         if n > max - body.len().min(max) { return Err(BodyError::TooLarge); }
         let at = body.len();
         body.resize(at + n, 0);
-        r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
+        r.read_exact(&mut body[at..]).map_err(|e| map_chunk_io_err("chunk body", e))?;
         let mut eol = [0u8; 1];
-        r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+        r.read_exact(&mut eol).map_err(|e| map_chunk_io_err("chunk end", e))?;
         let eol_len = if eol[0] == b'\r' {
-            r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+            r.read_exact(&mut eol).map_err(|e| map_chunk_io_err("chunk end", e))?;
             2
         } else { 1 };
         if eol[0] != b'\n' { return Err(bad("chunk not followed by CRLF")); }
@@ -1643,17 +1843,93 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
+fn parse_host_authority(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    if s.is_empty() || s.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (inside, tail) = rest.split_once(']')?;
+        if inside.is_empty() {
+            return None;
+        }
+        if !tail.is_empty() {
+            let port_s = tail.strip_prefix(':')?;
+            let _: u16 = port_s.parse().ok()?;
+        }
+        return Some(inside);
+    }
+    if let Some((host_part, port_s)) = s.rsplit_once(':') {
+        if host_part.is_empty() || host_part.contains(':') {
+            return None;
+        }
+        let _: u16 = port_s.parse().ok()?;
+        return Some(host_part);
+    }
+    Some(s)
+}
+
+fn is_allowed_unkeyed_host(raw: &str, allow_private_non_loopback: bool) -> bool {
+    let Some(host) = parse_host_authority(raw) else { return false };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else { return false };
+    if allow_private_non_loopback {
+        is_private_ip(ip)
+    } else {
+        ip.to_canonical().is_loopback()
+    }
+}
+
+fn has_json_content_type(ct: Option<&str>) -> bool {
+    let Some(raw) = ct else { return false };
+    let media = raw.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("application/json")
+}
+
 /// Decide header-only rejections before allocating or reading the request body.
 /// A chunked body has no length to check here: its cap is enforced chunk by
 /// chunk in `read_chunked`, after this gate and after the key check.
+#[cfg(test)]
 fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, String)> {
+    check_headers_with_policy(h, path, key, false, MAX_BODY)
+}
+
+fn check_headers_with_policy(
+    h: &Head,
+    path: &str,
+    key: Option<&str>,
+    allow_private_non_loopback: bool,
+    max_body: usize,
+) -> Result<(), (u16, String)> {
     if let Some(k) = key {
         let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
         if path != "/health" && !authed {
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
         }
+    } else {
+        if h.origin.is_some()
+            || h.sec_fetch_site
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case("none"))
+        {
+            return Err((403, "browser Origin / Fetch requests are refused on an unauthenticated server".into()));
+        }
+        if !h
+            .host
+            .as_deref()
+            .is_some_and(|host| is_allowed_unkeyed_host(host, allow_private_non_loopback))
+        {
+            return Err((403, "Host header must name a loopback address on an unauthenticated server".into()));
+        }
+        if matches!(route(&h.method, path), Route::Chat | Route::Messages | Route::CountTokens)
+            && !has_json_content_type(h.content_type.as_deref())
+        {
+            return Err((415, "Content-Type must be application/json".into()));
+        }
     }
-    if !h.chunked && h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
+    if !h.chunked && h.len > max_body { return Err((413, format!("the body is over {} bytes", max_body))); }
     Ok(())
 }
 
@@ -1727,6 +2003,9 @@ fn check_serve_shape(ctx: usize, max_tokens: usize) -> Result<(), String> {
 trait ClientWrite: Write {
     fn client_gone(&self) -> bool;
 }
+impl<S: ConnIo> ClientWrite for StreamDeadlineWriter<'_, S> {
+    fn client_gone(&self) -> bool { self.inner.peer_disconnected() }
+}
 impl ClientWrite for TcpStream {
     fn client_gone(&self) -> bool { peer_gone(self) }
 }
@@ -1794,6 +2073,7 @@ struct AdmissionInner {
 /// beyond queue capacity (or timing out waiting for admission) is refused with 429 + Retry-After.
 struct AdmissionGate {
     inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+    clock: Arc<dyn ServeClock>,
     queue_timeout: Duration,
     poll_interval: Duration,
     retry_after_secs: u64,
@@ -1842,6 +2122,24 @@ impl AdmissionGate {
         poll_interval: Duration,
         retry_after_secs: u64,
     ) -> Self {
+        Self::with_clock(
+            max_lanes,
+            max_queue,
+            queue_timeout,
+            poll_interval,
+            retry_after_secs,
+            Arc::new(SystemServeClock),
+        )
+    }
+
+    fn with_clock(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        poll_interval: Duration,
+        retry_after_secs: u64,
+        clock: Arc<dyn ServeClock>,
+    ) -> Self {
         Self {
             inner: Arc::new((
                 Mutex::new(AdmissionInner {
@@ -1853,6 +2151,7 @@ impl AdmissionGate {
                 }),
                 Condvar::new(),
             )),
+            clock,
             queue_timeout,
             poll_interval: poll_interval.max(Duration::from_millis(1)),
             retry_after_secs: retry_after_secs.max(1),
@@ -1884,7 +2183,8 @@ impl AdmissionGate {
         st.next_ticket = st.next_ticket.wrapping_add(1);
         st.waiters.push_back(ticket);
         let mut guard = WaiterGuard { inner: &self.inner, ticket, armed: true };
-        let deadline = Instant::now() + self.queue_timeout;
+        let deadline = self.clock.now() + self.queue_timeout;
+        let mut announced_park = false;
         loop {
             if st.waiters.front() == Some(&ticket) && st.admitted < st.max_lanes {
                 st.waiters.pop_front();
@@ -1898,15 +2198,18 @@ impl AdmissionGate {
                 drop(guard);
                 return Err(AdmissionReject::ClientGone);
             }
-            let rem = deadline.saturating_duration_since(Instant::now());
+            let rem = deadline.saturating_duration_since(self.clock.now());
             if rem.is_zero() {
                 drop(st);
                 drop(guard);
                 return Err(AdmissionReject::QueueTimeout);
             }
+            if !announced_park {
+                announced_park = true;
+                self.clock.on_admission_parked();
+            }
             let wait = rem.min(self.poll_interval);
-            let (next_st, _) = cvar.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
-            st = next_st;
+            st = self.clock.wait_timeout(cvar, st, wait);
         }
     }
 
@@ -2135,13 +2438,9 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
 
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
     let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let mut first_tok: Option<Instant> = None;
-    // every client-controlled number is checked here, never in the scheduler
-    let mut bad = |m: String| {
-        record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
-        respond(s, 400, &json!({"error": {"message": m}}).to_string())
-    };
+    // Refused requests (400 / 429 / pre-admission 499 / 503) never allocate a turn or clone `req` into the recorder.
+    let mut bad = |m: String| respond(s, 400, &json!({"error": {"message": m}}).to_string());
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -2189,11 +2488,9 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "overloaded", 429);
             return openai_overloaded(s, cx.admission.retry_after_secs(), e);
         }
         Err(AdmitError::ClientGone) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "cancelled", 499);
             return Ok(());
         }
     };
@@ -2208,7 +2505,6 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 RenderError::Invalid(message) => message,
                 RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
             };
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2216,7 +2512,6 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         Ok(m) => m,
         Err(message) => {
             drop(permit);
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2230,9 +2525,9 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     let (tx, rx) = job_events();
     let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
-        record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
+    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -2360,16 +2655,12 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
 
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
     let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let mut first_tok: Option<Instant> = None;
-    let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
-        record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
-    };
-    // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+    // Refused requests (400 / 429 / pre-admission 499 / 503) never allocate a turn or clone `req` into the recorder.
     let max = match req["max_tokens"].as_u64() {
-        Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
+        Some(0) => return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"),
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
+        None => return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"),
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
@@ -2377,7 +2668,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         None | Some(Value::Null) => 64,
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
             Some(k) => k,
-            None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            None => return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"),
         },
     };
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
@@ -2390,18 +2681,15 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         None | Some(Value::Null) => cx.loopcd_omega,
         Some(v) => match v.as_f64() {
             Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
-            _ => {
-                record_err(first_tok, 400, "invalid_request_error", 0);
-                return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4");
-            }
+            _ => return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4"),
         },
     };
-    if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(AdmitError::Overloaded(e)) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
-        Err(AdmitError::ClientGone) => { record_err(first_tok, 499, "cancelled", 0); return Ok(()); }
+        Err(AdmitError::Overloaded(e)) => return anthropic_overloaded(s, cx.admission.retry_after_secs(), e),
+        Err(AdmitError::ClientGone) => return Ok(()),
     };
     let prompt_limit = cx.ctx.saturating_sub(3);
     let rendered = render_messages(cx, req, prompt_limit);
@@ -2415,7 +2703,6 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                 // Retain the numeric error format used by clients for reactive compaction.
                 RenderError::TooLong => format!("prompt is too long: {} tokens > {prompt_limit} maximum", prompt_limit + 1),
             };
-            record_err(first_tok, 400, "invalid_request_error", 0);
             return anthropic_error(s, 400, "invalid_request_error", &message);
         }
     };
@@ -2424,7 +2711,6 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         Ok(m) => m,
         Err(e) => {
             drop(permit);
-            record_err(first_tok, 400, "invalid_request_error", 0);
             return anthropic_error(s, 400, "invalid_request_error", &e);
         }
     };
@@ -2437,7 +2723,11 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     };
     let (tx, rx) = job_events();
     let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
-    if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
+    let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
+        record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
+    };
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -2556,9 +2846,232 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Validates resolved `--bind` socket addresses against `serve`'s binding and authentication rules:
+/// every bound IP must be loopback or private/Tailscale/link-local/ULA (wildcard `0.0.0.0` / `::`
+/// and public addresses are refused), and non-loopback binds require `--key-env` unless
+/// `--allow-unauthenticated-non-loopback` is explicitly set.
+pub fn validate_bind_addrs(
+    addrs: &[std::net::SocketAddr],
+    has_key: bool,
+    allow_unauthenticated_non_loopback: bool,
+) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err("--bind resolved to no addresses".into());
+    }
+    if let Some(bad) = addrs.iter().find(|addr| !is_private_ip(addr.ip())) {
+        return Err(format!(
+            "--bind address {} is neither loopback nor a private/Tailscale network address",
+            bad.ip()
+        ));
+    }
+    if !has_key
+        && !allow_unauthenticated_non_loopback
+        && addrs.iter().any(|addr| !addr.ip().to_canonical().is_loopback())
+    {
+        return Err("a non-loopback --bind requires --key-env or --allow-unauthenticated-non-loopback".into());
+    }
+    Ok(())
+}
+
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ConnConfig {
+    clock: Arc<dyn ServeClock>,
+    max_conns: usize,
+    max_body: usize,
+    allow_private_non_loopback_host: bool,
+    header_read_timeout: Duration,
+    body_read_timeout: Duration,
+    client_write_timeout: Duration,
+    stream_total_timeout: Duration,
+    stream_write_budget: Duration,
+}
+
+impl ConnConfig {
+    fn production(allow_private_non_loopback_host: bool) -> Self {
+        Self {
+            clock: Arc::new(SystemServeClock),
+            max_conns: MAX_CONNS,
+            max_body: MAX_BODY,
+            allow_private_non_loopback_host,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            body_read_timeout: BODY_READ_TIMEOUT,
+            client_write_timeout: CLIENT_WRITE_TIMEOUT,
+            stream_total_timeout: MAX_STREAM_DURATION,
+            stream_write_budget: MAX_STREAM_WRITE_TIME,
+        }
+    }
+}
+
+fn try_acquire_conn_slot<S: ConnIo>(cx: &Ctx, s: &mut S, cfg: &ConnConfig) -> Option<ConnGuard> {
+    if s.set_write_timeout_opt(Some(cfg.client_write_timeout)).is_err() {
+        return None;
+    }
+    if cx.conns.fetch_add(1, Ordering::SeqCst) >= cfg.max_conns {
+        cx.conns.fetch_sub(1, Ordering::SeqCst);
+        let _ = respond(s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+        return None;
+    }
+    Some(ConnGuard(cx.conns.clone()))
+}
+
+fn respond_header_or_body_error<W: Write + ?Sized>(s: &mut W, path: &str, code: u16, message: &str) -> std::io::Result<()> {
+    if path.starts_with("/v1/messages") {
+        let kind = match code {
+            401 => "authentication_error",
+            403 => "permission_error",
+            413 => "request_too_large",
+            _ => "invalid_request_error",
+        };
+        anthropic_error(s, code, kind, message)
+    } else if code == 401 {
+        respond(
+            s,
+            code,
+            &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string(),
+        )
+    } else {
+        respond(s, code, &json!({"error": {"message": message}}).to_string())
+    }
+}
+
+fn handle_connection<S: ConnIo>(cx: &Ctx, mut s: S, _conn: ConnGuard, cfg: &ConnConfig) {
+    let clock = cfg.clock.as_ref();
+    let header_deadline = clock.now() + cfg.header_read_timeout;
+    let mut r = BufReader::new(ConnDeadlineReader::new(
+        &mut s,
+        clock,
+        header_deadline,
+        "request header read deadline exceeded",
+    ));
+    let h = match read_head(&mut r) {
+        Ok(h) => h,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+            drop(r);
+            let _ = respond(&mut s, 408, &json!({"error": {"message": "request header read timed out"}}).to_string());
+            return;
+        }
+        Err(_) => return,
+    };
+    let path = route_path(&h.path);
+    let method = h.method.clone();
+    // Header checks (auth, Origin/Host/Content-Type on unkeyed servers, fixed Content-Length cap)
+    // execute strictly before reading any request body bytes.
+    if let Err((code, message)) = check_headers_with_policy(
+        &h,
+        &path,
+        cx.key.as_deref(),
+        cfg.allow_private_non_loopback_host,
+        cfg.max_body,
+    ) {
+        drop(r);
+        let _ = respond_header_or_body_error(&mut s, &path, code, &message);
+        return;
+    }
+    let route = route(&method, &path);
+    if matches!(route, Route::Models | Route::Health | Route::NotFound) {
+        drop(r);
+        let result = match route {
+            Route::Models => respond(&mut s, 200, &models_body()),
+            Route::Health => respond(&mut s, 200, &health_body(cx)),
+            Route::NotFound if path.starts_with("/v1/messages") => {
+                anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}"))
+            }
+            Route::NotFound => {
+                respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string())
+            }
+            _ => unreachable!("body routes are handled below"),
+        };
+        if let Err(e) = result {
+            eprintln!("[serve] client: {e}");
+        }
+        return;
+    }
+    // Bound the entire body upload by `body_read_timeout`, read only after the header gate above.
+    r.get_mut()
+        .set_deadline(clock.now() + cfg.body_read_timeout, "request body read deadline exceeded");
+    let body = if h.chunked {
+        match read_chunked(&mut r, cfg.max_body) {
+            Ok(b) => b,
+            Err(BodyError::TooLarge) => {
+                drop(r);
+                let _ = respond_header_or_body_error(&mut s, &path, 413, &format!("the body is over {} bytes", cfg.max_body));
+                return;
+            }
+            Err(BodyError::TimedOut) => {
+                drop(r);
+                let _ = respond_header_or_body_error(&mut s, &path, 408, "request body read timed out");
+                return;
+            }
+            Err(BodyError::Malformed(m)) => {
+                drop(r);
+                let _ = respond_header_or_body_error(&mut s, &path, 400, &format!("malformed chunked body: {m}"));
+                return;
+            }
+        }
+    } else {
+        let mut body = vec![0u8; h.len];
+        if let Err(e) = r.read_exact(&mut body) {
+            drop(r);
+            if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+                let _ = respond_header_or_body_error(&mut s, &path, 408, "request body read timed out");
+            }
+            return;
+        }
+        body
+    };
+    drop(r);
+    let _ = s.set_read_timeout_opt(None);
+    let card_id = h.card_id.as_deref();
+    let mut writer = StreamDeadlineWriter::new(
+        &mut s,
+        clock,
+        cfg.stream_total_timeout,
+        cfg.stream_write_budget,
+        cfg.client_write_timeout,
+    );
+    let r = match route {
+        Route::Chat => match serde_json::from_slice::<Value>(&body) {
+            Ok(v) => chat_with_card(cx, &v, card_id, &mut writer),
+            Err(e) => respond(&mut writer, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
+        },
+        Route::Messages => match serde_json::from_slice::<Value>(&body) {
+            Ok(v) => messages_with_card(cx, &v, card_id, &mut writer),
+            Err(e) => anthropic_error(&mut writer, 400, "invalid_request_error", &e.to_string()),
+        },
+        Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
+            Ok(v) => count_tokens(cx, &v, &mut writer),
+            Err(e) => anthropic_error(&mut writer, 400, "invalid_request_error", &e.to_string()),
+        },
+        _ => unreachable!("bodyless routes were handled above"),
+    };
+    if let Err(e) = r {
+        eprintln!("[serve] client: {e}");
+    }
+}
+
+#[cfg(test)]
+fn serve_one_connection<S: ConnIo>(cx: &Ctx, mut s: S, cfg: &ConnConfig) {
+    if let Some(guard) = try_acquire_conn_slot(cx, &mut s, cfg) {
+        handle_connection(cx, s, guard, cfg);
+    }
+}
+
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
+    if o.bind.is_empty() || o.bind.iter().any(|a| !is_private_ip(a.ip())) {
+        eprintln!("--bind must resolve only to loopback or private/Tailscale network addresses");
+        std::process::exit(2);
+    }
+    let allow_private_non_loopback_host =
+        o.key.is_none() && o.bind.iter().any(|a| !a.ip().to_canonical().is_loopback());
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
@@ -2575,7 +3088,13 @@ pub fn serve(o: ServeOpts) {
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let (pool_win_slots, pool_full_slots) = match eng.try_init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes) {
+        Ok(slots) => slots,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -2659,80 +3178,15 @@ pub fn serve(o: ServeOpts) {
         eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+    let conn_cfg = Arc::new(ConnConfig::production(allow_private_non_loopback_host));
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
-            if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
+            let Some(conn_guard) = try_acquire_conn_slot(&cx, &mut s, &conn_cfg) else { continue };
             let cx = cx.clone();
-            if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
-                cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
-                continue;
-            }
+            let cfg = conn_cfg.clone();
             std::thread::spawn(move || {
-                struct Conn(Arc<std::sync::atomic::AtomicUsize>);
-                impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
-                let _conn = Conn(cx.conns.clone());
-                let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
-                let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
-                let Ok(h) = read_head(&mut r) else { return };
-                r.get_mut().clear_deadline();
-                let _ = s.set_read_timeout(Some(BODY_READ_TIMEOUT));
-                let path = route_path(&h.path);
-                let method = h.method.clone();
-                // the key is checked before any body is read
-                if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
-                    drop(r);
-                    let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message) }
-                            else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                            else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
-                    return;
-                }
-                // Routes that do not use a body can answer without waiting for one.
-                let route = route(&method, &path);
-                if matches!(route, Route::Models | Route::Health | Route::NotFound) {
-                    drop(r);
-                    let result = match route {
-                        Route::Models => respond(&mut s, 200, &models_body()),
-                        Route::Health => respond(&mut s, 200, &health_body(&cx)),
-                        Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
-                        Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
-                        _ => unreachable!("body routes are handled below"),
-                    };
-                    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-                    return;
-                }
-                // the body is read only now, after the header gate above
-                let body = if h.chunked {
-                    match read_chunked(&mut r, MAX_BODY) {
-                        Ok(b) => b,
-                        Err(BodyError::TooLarge) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
-                        Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
-                    }
-                } else {
-                    let mut body = vec![0u8; h.len];
-                    if r.read_exact(&mut body).is_err() { return; }
-                    body
-                };
-                drop(r);
-                let _ = s.set_read_timeout(None);
-                let card_id = h.card_id.as_deref();
-                let r = match route {
-                    Route::Chat => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
-                    },
-                    Route::Messages => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
-                    Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => count_tokens(&cx, &v, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
-                    _ => unreachable!("bodyless routes were handled above"),
-                };
-                if let Err(e) = r { eprintln!("[serve] client: {e}"); }
+                handle_connection(&cx, s, conn_guard, &cfg);
             });
         }
     });
@@ -2762,29 +3216,113 @@ mod tests {
         )
     }
 
+    struct FakeServeClock {
+        now: Mutex<Instant>,
+        auto_advance_on_wait: bool,
+        wait_calls: AtomicUsize,
+        parked_tx: Mutex<Option<Sender<()>>>,
+    }
+
+    impl FakeServeClock {
+        fn auto_advancing() -> Arc<Self> {
+            Arc::new(Self {
+                now: Mutex::new(Instant::now()),
+                auto_advance_on_wait: true,
+                wait_calls: AtomicUsize::new(0),
+                parked_tx: Mutex::new(None),
+            })
+        }
+
+        fn parkable() -> (Arc<Self>, Receiver<()>) {
+            let (tx, rx) = channel();
+            (
+                Arc::new(Self {
+                    now: Mutex::new(Instant::now()),
+                    auto_advance_on_wait: false,
+                    wait_calls: AtomicUsize::new(0),
+                    parked_tx: Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+
+        fn advance(&self, dur: Duration) {
+            let mut now = self.now.lock().unwrap_or_else(|e| e.into_inner());
+            *now += dur;
+        }
+
+        fn wait_calls(&self) -> usize {
+            self.wait_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ServeClock for FakeServeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn wait_timeout<'a>(
+            &self,
+            cvar: &Condvar,
+            guard: std::sync::MutexGuard<'a, AdmissionInner>,
+            dur: Duration,
+        ) -> std::sync::MutexGuard<'a, AdmissionInner> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            if self.auto_advance_on_wait {
+                self.advance(dur);
+                guard
+            } else {
+                cvar.wait(guard).unwrap_or_else(|e| e.into_inner())
+            }
+        }
+
+        fn on_admission_parked(&self) {
+            if let Some(tx) = self.parked_tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn admission_test_ctx_with_clock(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        preprocess_limit: usize,
+        clock: Arc<dyn ServeClock>,
+    ) -> (Ctx, Receiver<Job>) {
+        let tk = Arc::new(Tokenizer::for_test());
+        let (jobs, rx) = channel();
+        let cx = Ctx {
+            metrics: Arc::new(Mutex::new(Counters::new(clock.now()))),
+            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
+            seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            admission: AdmissionGate::with_clock(
+                max_lanes,
+                max_queue,
+                queue_timeout,
+                Duration::from_millis(5),
+                DEFAULT_RETRY_AFTER_SECS,
+                clock,
+            ),
+            budget: test_budget(max_lanes),
+            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+        };
+        (cx, rx)
+    }
+
     fn admission_test_ctx_with(
         max_lanes: usize,
         max_queue: usize,
         queue_timeout: Duration,
         preprocess_limit: usize,
     ) -> (Ctx, Receiver<Job>) {
-        let tk = Arc::new(Tokenizer::for_test());
-        let (jobs, rx) = channel();
-        let cx = Ctx {
-            metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
-            seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::with_timings(
-                max_lanes,
-                max_queue,
-                queue_timeout,
-                Duration::from_millis(5),
-                DEFAULT_RETRY_AFTER_SECS,
-            ),
-            budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
-        };
-        (cx, rx)
+        admission_test_ctx_with_clock(
+            max_lanes,
+            max_queue,
+            queue_timeout,
+            preprocess_limit,
+            FakeServeClock::auto_advancing(),
+        )
     }
 
     fn admission_test_ctx(lanes_and_queue: usize) -> (Ctx, Receiver<Job>) {
@@ -3338,7 +3876,7 @@ mod tests {
         assert!(expected_clamped > 0 && expected_clamped < 64);
 
         let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("opencode-style 128000 max_tokens request must reach scheduler");
+            let job = jrx.recv().expect("opencode-style 128000 max_tokens request must reach scheduler");
             assert_eq!(job.max, expected_clamped, "positive max_tokens above ctx must clamp to remaining lane budget");
             let _ = job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() });
         });
@@ -3372,7 +3910,7 @@ mod tests {
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+            let job = jrx.recv().expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
             for _ in 0..50 { if job.out.send(Ev::Tok(sp.c_think)).is_err() { break; } }
         });
@@ -3400,7 +3938,7 @@ mod tests {
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                 admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
-                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+                let job = jrx.recv().expect("messages request must reach scheduler");
                 let mut sent = 0usize;
                 if job.out.send(Ev::Tok(sp.c_tool)).is_ok() {
                     sent += 1;
@@ -3445,8 +3983,9 @@ mod tests {
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
         assert!(want < 63, "the test prompt must actually overrun with max_tokens 63 (prompt {prompt})");
         let (cx2, req2) = (cx.clone(), req.clone());
+        drop(cx);
         let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+        let job = jrx.recv().expect("messages request must reach scheduler");
         assert_eq!(job.max, want, "the job carries the clamped budget, not the refused 63");
         job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
         let out = String::from_utf8(worker.join().unwrap()).unwrap();
@@ -3484,6 +4023,7 @@ mod tests {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
             len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
+            ..Head::default()
         };
         let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
@@ -3496,10 +4036,50 @@ mod tests {
         head.chunked = true;
         head.len = 0;
         assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
-        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false };
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false, ..Head::default() };
         assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
         by_key.api_key = Some("wrong".into());
         assert_eq!(status(&by_key), Err(401));
+
+        // Unkeyed loopback policy (U94): checks Origin, Sec-Fetch-Site, Host, and Content-Type.
+        let unkeyed = |h: &Head| check_headers(h, &h.path, None).map_err(|(code, _)| code);
+        let mut local_post = Head {
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            len: 16,
+            host: Some("127.0.0.1:8090".into()),
+            content_type: Some("application/json; charset=utf-8".into()),
+            ..Head::default()
+        };
+        assert_eq!(unkeyed(&local_post), Ok(()));
+        for valid_host in ["localhost", "localhost:8090", "127.0.0.1", "127.0.0.1:8090", "[::1]", "[::1]:8090", "[::ffff:127.0.0.1]:8090"] {
+            local_post.host = Some(valid_host.into());
+            assert_eq!(unkeyed(&local_post), Ok(()), "valid loopback host {valid_host}");
+        }
+        for bad_host in ["", "rebind.attacker.tld:8090", "evil.example", "10.0.0.1:8090", "0.0.0.0:8090", "[::]:8090"] {
+            local_post.host = Some(bad_host.into());
+            assert_eq!(unkeyed(&local_post), Err(403), "bad host {bad_host}");
+        }
+        local_post.host = None;
+        assert_eq!(unkeyed(&local_post), Err(403), "missing Host must be refused on unkeyed server");
+        local_post.host = Some("localhost:8090".into());
+
+        local_post.origin = Some("https://evil.example".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "browser Origin header must be refused");
+        local_post.origin = Some("null".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "sandboxed/file Origin: null must be refused");
+        local_post.origin = None;
+
+        local_post.sec_fetch_site = Some("cross-site".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "Sec-Fetch-Site: cross-site must be refused");
+        local_post.sec_fetch_site = Some("none".into());
+        assert_eq!(unkeyed(&local_post), Ok(()));
+        local_post.sec_fetch_site = None;
+
+        for bad_ct in [None, Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data")] {
+            local_post.content_type = bad_ct.map(str::to_owned);
+            assert_eq!(unkeyed(&local_post), Err(415), "POST without application/json must be refused: {bad_ct:?}");
+        }
     }
     #[test] fn serve_shape_refuses_an_empty_context_and_a_budget_outside_it() {
         assert!(check_serve_shape(0, 1).is_err(), "no context to serve in");
@@ -3543,13 +4123,14 @@ mod tests {
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                     admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
-                    let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+                    let job = jrx.recv().expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
                 });
                 let req = json!({"max_tokens": 8, "stream": stream, "messages": [{"role": "user", "content": "hi"}]});
                 let mut out = Vec::new();
                 if anthropic { messages(&cx, &req, &mut out).unwrap(); }
                 else { chat(&cx, &req, &mut out).unwrap(); }
+                drop(cx);
                 scheduler.join().unwrap();
                 let response = String::from_utf8(out).unwrap();
                 assert!(response.contains("model returned non-finite logits"));
@@ -3618,28 +4199,27 @@ mod tests {
         assert_eq!(tb.ban_token(&sp), Some(sp.c_think));
 
         // Verify both /v1/chat/completions and /v1/messages propagate thinking_budget onto Job
-        let (cx, jrx) = admission_test_ctx(4);
+        let (cx, mut jrx) = admission_test_ctx(4);
         let cx = Arc::new(cx);
         for (is_msg, req, want_budget, want_top_k) in [
             (false, json!({"max_tokens": 8, "thinking_budget": 128, "top_k": 0, "top_p": 1.0, "messages": [{"role": "user", "content": "hi"}]}), 128usize, 0usize),
             (true, json!({"max_tokens": 8, "thinking": {"type": "enabled", "budget_tokens": 1024}, "top_k": 0, "top_p": 1.0, "messages": [{"role": "user", "content": "hi"}]}), 1024usize, 0usize),
         ] {
-            let cx2 = cx.clone();
-            let req2 = req.clone();
-            let worker = std::thread::spawn(move || {
-                let mut out = Vec::new();
-                if is_msg { messages(&cx2, &req2, &mut out).unwrap(); } else { chat(&cx2, &req2, &mut out).unwrap(); }
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("messages request must reach scheduler");
+                assert_eq!(job.thinking_budget, want_budget);
+                assert_eq!(job.top_k, want_top_k);
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+                jrx
             });
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-            assert_eq!(job.thinking_budget, want_budget);
-            assert_eq!(job.top_k, want_top_k);
-            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
-            worker.join().unwrap();
+            let mut out = Vec::new();
+            if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+            jrx = scheduler.join().unwrap();
         }
     }
 
     #[test] fn loopcd_omega_defaults_overrides_and_rejects_invalid_on_both_apis() {
-        let (mut cx, jrx) = admission_test_ctx(4);
+        let (mut cx, mut jrx) = admission_test_ctx(4);
         cx.loopcd_omega = 0.25;
         let cx = Arc::new(cx);
 
@@ -3663,16 +4243,15 @@ mod tests {
             (false, json!({"max_tokens": 8, "loopcd_omega": 0.6, "messages": [{"role": "user", "content": "hi"}]}), 0.6f32),
             (true, json!({"max_tokens": 8, "loopcd_omega": 0.0, "messages": [{"role": "user", "content": "hi"}]}), 0.0f32),
         ] {
-            let cx2 = cx.clone();
-            let req2 = req.clone();
-            let worker = std::thread::spawn(move || {
-                let mut out = Vec::new();
-                if is_msg { messages(&cx2, &req2, &mut out).unwrap(); } else { chat(&cx2, &req2, &mut out).unwrap(); }
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("request must reach scheduler");
+                assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+                jrx
             });
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
-            assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
-            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
-            worker.join().unwrap();
+            let mut out = Vec::new();
+            if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+            jrx = scheduler.join().unwrap();
         }
     }
 
@@ -3915,13 +4494,14 @@ mod tests {
     }
 
     #[test] fn admission_queue_overflow_and_fifo_wakeup_with_health_telemetry() {
-        // Fake tight budget: 1 admitted lane, bounded queue of 1.
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        // Fake tight budget: 1 admitted lane, bounded queue of 1, deterministic injected clock.
+        let (clock, parked_rx) = FakeServeClock::parkable();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock);
         let cx = Arc::new(cx);
         let held_lane = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
 
-        // Request 2 enters the bounded wait queue and blocks until held_lane is dropped.
+        // Request 2 enters the bounded wait queue and parks deterministically until held_lane is dropped.
         let cx_q = cx.clone();
         let queued_worker = std::thread::spawn(move || {
             let mut out = Vec::new();
@@ -3929,12 +4509,8 @@ mod tests {
             out
         });
 
-        // Wait until request 2 is visibly sitting in the wait queue via /health telemetry.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while cx.admission.queued() != 1 {
-            assert!(Instant::now() < deadline, "queued request did not enter wait queue");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Deterministic handshake: notified the instant request 2 registers in `waiters`.
+        parked_rx.recv().expect("queued request must park in wait queue");
         let snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(snap["active_lanes"], 1);
         assert_eq!(snap["queued_requests"], 1);
@@ -3953,10 +4529,10 @@ mod tests {
         assert_eq!(body["error"]["code"], "rate_limit_exceeded");
         assert_eq!(body["error"]["message"], QUEUE_FULL);
 
-        // Free lane 1 -> queued request 2 wakes up, enters scheduler, and completes with HTTP 200.
+        // Free lane 1 -> queued request 2 wakes up via Condvar, enters scheduler, and completes with HTTP 200.
         cx.active_lanes.store(0, Ordering::Relaxed);
         drop(held_lane);
-        let job = jrx.recv_timeout(Duration::from_secs(2)).expect("queued job must be admitted once lane frees");
+        let job = jrx.recv().expect("queued job must be admitted once lane frees");
         job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
         job.out.send(Ev::Tok(cx.sp.c_text)).unwrap();
         for tok in cx.tk.encode("ok", false) { job.out.send(Ev::Tok(tok)).unwrap(); }
@@ -3971,7 +4547,9 @@ mod tests {
     }
 
     #[test] fn admission_queue_timeout_returns_429_with_retry_after_for_stream_and_nonstream() {
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_millis(25), 4);
+        // Auto-advancing FakeServeClock exercises the full 60s QUEUE_WAIT_TIMEOUT with zero real sleeping.
+        let clock = FakeServeClock::auto_advancing();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
         let _held = cx.admission.try_acquire().unwrap();
 
         for stream in [false, true] {
@@ -3984,6 +4562,7 @@ mod tests {
             let body: Value = serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
             assert_eq!(body["error"]["message"], QUEUE_TIMED_OUT);
         }
+        assert!(clock.wait_calls() > 0, "fake clock must advance across poll intervals");
 
         // Anthropic /v1/messages also returns 429 + Retry-After on queue timeout.
         let mut out = Vec::new();
@@ -4006,11 +4585,11 @@ mod tests {
             fn client_gone(&self) -> bool { true }
         }
 
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        let (clock, _parked_rx) = FakeServeClock::parkable();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
         let _held = cx.admission.try_acquire().unwrap();
-        let start = Instant::now();
         chat(&cx, &json!({"max_tokens": 4, "stream": true, "messages": [{"role": "user", "content": "bye"}]}), &mut GoneWriter).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1), "disconnected queued client must exit promptly");
+        assert_eq!(clock.wait_calls(), 0, "disconnected queued client must exit before parking on Condvar");
         assert_eq!(cx.admission.queued(), 0, "disconnected client must free its queue slot");
         assert_eq!(cx.admission.inflight(), 1);
         assert!(jrx.try_recv().is_err());
@@ -4173,21 +4752,20 @@ mod tests {
             assert_eq!(m["owned_by"], "inky");
         }
 
-        let (cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        let (cx, mut jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
         let cx = Arc::new(cx);
         for alias in ["inkling-2-mini", "inky/inkling-2-mini", "custom/caller-alias"] {
             for is_msg in [false, true] {
-                let cx2 = cx.clone();
-                let alias_s = alias.to_string();
-                let worker = std::thread::spawn(move || {
-                    let mut out = Vec::new();
-                    let req = json!({"model": alias_s, "max_tokens": 8, "stream": false, "messages": [{"role": "user", "content": "hi"}]});
-                    if is_msg { messages(&cx2, &req, &mut out).unwrap(); } else { chat(&cx2, &req, &mut out).unwrap(); }
-                    out
+                let scheduler = std::thread::spawn(move || {
+                    let job = jrx.recv().expect("messages request must reach scheduler");
+                    job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+                    jrx
                 });
-                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
-                let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+                let mut out = Vec::new();
+                let req = json!({"model": alias, "max_tokens": 8, "stream": false, "messages": [{"role": "user", "content": "hi"}]});
+                if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+                jrx = scheduler.join().unwrap();
+                let resp = String::from_utf8(out).unwrap();
                 assert!(resp.starts_with("HTTP/1.1 200"));
                 let body: Value = serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                 assert_eq!(body["model"], alias, "is_msg={is_msg} must accept and echo model alias {alias}");
@@ -4210,9 +4788,15 @@ mod tests {
             api_key: api_key.map(str::to_owned),
             card_id: None,
             chunked: false,
+            host: Some("127.0.0.1:8090".into()),
+            ..Head::default()
         };
-        // Unkeyed server permits loopback requests without headers
+        // Unkeyed server permits loopback Host requests without auth headers
         assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None).is_ok());
+        // Unkeyed server refuses missing or non-loopback Host
+        let mut missing_host = req("/v1/models", None, None);
+        missing_host.host = None;
+        assert_eq!(check_headers(&missing_host, "/v1/models", None).unwrap_err().0, 403);
         // Keyed server keeps /health public and requires Bearer or x-api-key on /v1/*
         assert!(check_headers(&req("/health", None, None), "/health", Some("k")).is_ok());
         assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k")).unwrap_err().0, 401);
@@ -4247,6 +4831,7 @@ mod tests {
 
         // Streaming with stream_options.include_usage=true emits finish_reason chunk then final choices:[] usage chunk before [DONE]
         let cx2 = cx.clone();
+        drop(cx);
         let worker = std::thread::spawn(move || {
             let mut out = Vec::new();
             let req = json!({
@@ -4260,7 +4845,7 @@ mod tests {
             chat(&cx2, &req, &mut out).unwrap();
             out
         });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("chat request must reach scheduler");
+        let job = jrx.recv().expect("chat request must reach scheduler");
         let prompt_len = job.toks.len();
         for &tok in &stream_toks { job.out.send(Ev::Tok(tok)).unwrap(); }
         job.out.send(Ev::Done { prompt: prompt_len, cached: 5, gen: stream_toks.len(), reason: "stop", timing: Default::default() }).unwrap();
@@ -4325,13 +4910,14 @@ mod tests {
 
         let stream_toks = reply_stream(&tk, &sp);
         let cx2 = cx.clone();
+        drop(cx);
         let req2 = req.clone();
         let worker = std::thread::spawn(move || {
             let mut out = Vec::new();
             messages(&cx2, &req2, &mut out).unwrap();
             out
         });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+        let job = jrx.recv().expect("messages request must reach scheduler");
         assert_eq!(job.thinking_budget, 1024);
         let prompt_len = job.toks.len();
         for &tok in &stream_toks { job.out.send(Ev::Tok(tok)).unwrap(); }
@@ -4951,5 +5537,518 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[derive(Default)]
+    struct ScriptedConnState {
+        written: Vec<u8>,
+        read_timeouts: Vec<Option<Duration>>,
+        write_timeouts: Vec<Option<Duration>>,
+        body_reads: usize,
+    }
+
+    struct ScriptedConnIo {
+        head: Vec<u8>,
+        head_pos: usize,
+        body: Vec<u8>,
+        body_pos: usize,
+        read_chunk_max: usize,
+        read_advance: Duration,
+        body_read_advance: Duration,
+        write_advance: Duration,
+        flush_advance: Duration,
+        forbid_body_read: bool,
+        disconnected: bool,
+        clock: Arc<FakeServeClock>,
+        state: Arc<Mutex<ScriptedConnState>>,
+    }
+
+    impl ScriptedConnIo {
+        fn new(head: impl Into<Vec<u8>>, body: impl Into<Vec<u8>>, clock: Arc<FakeServeClock>) -> (Self, Arc<Mutex<ScriptedConnState>>) {
+            let state = Arc::new(Mutex::new(ScriptedConnState::default()));
+            (
+                Self {
+                    head: head.into(),
+                    head_pos: 0,
+                    body: body.into(),
+                    body_pos: 0,
+                    read_chunk_max: usize::MAX,
+                    read_advance: Duration::ZERO,
+                    body_read_advance: Duration::ZERO,
+                    write_advance: Duration::ZERO,
+                    flush_advance: Duration::ZERO,
+                    forbid_body_read: false,
+                    disconnected: false,
+                    clock,
+                    state: state.clone(),
+                },
+                state,
+            )
+        }
+    }
+
+    impl Read for ScriptedConnIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.head_pos < self.head.len() {
+                let n = (self.head.len() - self.head_pos).min(buf.len()).min(self.read_chunk_max.max(1));
+                buf[..n].copy_from_slice(&self.head[self.head_pos..self.head_pos + n]);
+                self.head_pos += n;
+                if !self.read_advance.is_zero() {
+                    self.clock.advance(self.read_advance);
+                }
+                return Ok(n);
+            }
+            assert!(!self.forbid_body_read, "handle_connection must not read body bytes before check_headers rejects");
+            self.state.lock().unwrap().body_reads += 1;
+            if self.body_pos >= self.body.len() {
+                return Ok(0);
+            }
+            let cur_to = self.state.lock().unwrap().read_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.body_read_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket read timeout"));
+                }
+            }
+            let n = (self.body.len() - self.body_pos).min(buf.len()).min(self.read_chunk_max.max(1));
+            buf[..n].copy_from_slice(&self.body[self.body_pos..self.body_pos + n]);
+            self.body_pos += n;
+            if !self.body_read_advance.is_zero() {
+                self.clock.advance(self.body_read_advance);
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for ScriptedConnIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let cur_to = self.state.lock().unwrap().write_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.write_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket write timeout"));
+                }
+            }
+            if !self.write_advance.is_zero() {
+                self.clock.advance(self.write_advance);
+            }
+            self.state.lock().unwrap().written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let cur_to = self.state.lock().unwrap().write_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.flush_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket flush timeout"));
+                }
+            }
+            if !self.flush_advance.is_zero() {
+                self.clock.advance(self.flush_advance);
+            }
+            Ok(())
+        }
+    }
+
+    impl ConnIo for ScriptedConnIo {
+        fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+            self.state.lock().unwrap().read_timeouts.push(dur);
+            Ok(())
+        }
+        fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+            self.state.lock().unwrap().write_timeouts.push(dur);
+            Ok(())
+        }
+        fn peer_disconnected(&self) -> bool {
+            self.disconnected
+        }
+    }
+
+    fn test_conn_config(clock: Arc<FakeServeClock>) -> ConnConfig {
+        ConnConfig {
+            clock,
+            max_conns: MAX_CONNS,
+            max_body: 1024,
+            allow_private_non_loopback_host: false,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            body_read_timeout: BODY_READ_TIMEOUT,
+            client_write_timeout: CLIENT_WRITE_TIMEOUT,
+            stream_total_timeout: MAX_STREAM_DURATION,
+            stream_write_budget: MAX_STREAM_WRITE_TIME,
+        }
+    }
+
+    #[test]
+    fn validate_bind_addrs_accepts_loopback_and_private_and_refuses_public_or_wildcard() {
+        assert!(validate_bind_addrs(&[], true, false).is_err());
+        let sock = |s: &str| vec![s.parse::<std::net::SocketAddr>().unwrap()];
+        for loopback in ["127.0.0.1:8090", "[::1]:8090", "[::ffff:127.0.0.1]:8090"] {
+            assert_eq!(validate_bind_addrs(&sock(loopback), false, false), Ok(()));
+        }
+        for priv_addr in [
+            "10.0.0.1:8096",
+            "172.16.0.1:8096",
+            "192.168.1.10:8096",
+            "100.64.0.1:8096",
+            "169.254.1.1:8096",
+            "[fd7a:115c:a1e0::1]:8096",
+            "[fe80::1]:8096",
+        ] {
+            assert!(validate_bind_addrs(&sock(priv_addr), false, false).is_err());
+            assert_eq!(validate_bind_addrs(&sock(priv_addr), true, false), Ok(()));
+            assert_eq!(validate_bind_addrs(&sock(priv_addr), false, true), Ok(()));
+        }
+        for disallowed in [
+            "0.0.0.0:8096",
+            "[::]:8096",
+            "8.8.8.8:8096",
+            "192.0.2.1:8096",
+            "[2001:4860:4860::8888]:8096",
+        ] {
+            for (has_key, allow_unauth) in [(false, false), (true, false), (false, true), (true, true)] {
+                let err = validate_bind_addrs(&sock(disallowed), has_key, allow_unauth).unwrap_err();
+                assert!(err.contains("neither loopback nor a private"), "{disallowed}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn checked_serve_block_pool_counts_enforces_hard_floor_and_preserves_usable_context() {
+        let gib = 1u64 << 30;
+        let win_stride = crate::blocks::stride_at(crate::blocks::BlockKind::Window, 2).unwrap();
+        let full_stride = crate::blocks::stride_at(crate::blocks::BlockKind::Full, 2).unwrap();
+        let (min_win, min_full) = Engine::serve_pool_floor_counts(4096, 6144);
+        assert_eq!((min_win, min_full), (81, 96));
+        let floor_bytes = (min_win as u64) * win_stride + (min_full as u64) * full_stride;
+
+        for bad_budget in [0u64, 64 << 20, floor_bytes - 1] {
+            let err = Engine::checked_serve_block_pool_counts(bad_budget, 2, 4096, 6144, 1, 32 * gib).unwrap_err();
+            assert!(err.contains("insufficient Metal K/V pool budget"), "{bad_budget}: {err}");
+        }
+
+        let (w_exact, f_exact) = Engine::checked_serve_block_pool_counts(floor_bytes, 2, 4096, 6144, 1, 32 * gib).unwrap();
+        assert_eq!((w_exact, f_exact), (min_win, min_full));
+        assert_eq!(pooled_context(6144, f_exact, w_exact), 6144);
+
+        // Verify servecheck's `-c 6144 --lanes 1..4` capped budgets comfortably satisfy the floor.
+        for lanes in [1usize, 4usize] {
+            let capped = Engine::capped_serve_kv_budget(27 * gib, 2, 4096, 6144, lanes);
+            let (w, f) = Engine::checked_serve_block_pool_counts(capped, 2, 4096, 6144, lanes, 32 * gib).unwrap();
+            assert!(w >= min_win && f >= min_full, "lanes={lanes}: w={w} f={f}");
+            assert_eq!(pooled_context(6144, f, w), 6144);
+        }
+    }
+
+    #[test]
+    fn unkeyed_loopback_refuses_browser_origin_dns_rebinding_and_non_json_post() {
+        let clock = FakeServeClock::auto_advancing();
+        let (cx, jrx) = admission_test_ctx_with_clock(2, 2, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
+        let cfg = test_conn_config(clock.clone());
+        let body = br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#.to_vec();
+
+        // 1. Browser Origin header on unkeyed server -> 403 before reading body.
+        let head_origin = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_origin, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got: {resp}");
+
+        // 2. DNS-rebinding Host header -> 403 before reading body.
+        let head_rebind = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: rebind.attacker.tld:8090\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_rebind, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got: {resp}");
+        assert!(resp.contains("permission_error"), "got: {resp}");
+
+        // 3. Simple-CORS text/plain POST -> 415 before reading body.
+        let head_plain = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost:8090\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_plain, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 415 "), "got: {resp}");
+        assert!(jrx.try_recv().is_err());
+
+        // 4. Legitimate local CLI/SDK request (loopback Host, application/json; charset=utf-8, no Origin) -> 200 OK.
+        let head_ok = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost:8090\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (io, st) = ScriptedConnIo::new(head_ok, body, clock);
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv().unwrap();
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+        });
+        serve_one_connection(&cx, io, &cfg);
+        scheduler.join().unwrap();
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
+    }
+
+    #[test]
+    fn dribbling_stream_reader_hits_total_write_deadline_and_frees_lane_on_both_apis() {
+        for (path, body) in [
+            ("/v1/chat/completions", br#"{"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#.as_slice()),
+            ("/v1/messages", br#"{"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#.as_slice()),
+        ] {
+            let clock = FakeServeClock::auto_advancing();
+            let (cx, jrx) = admission_test_ctx_with_clock(1, 0, QUEUE_WAIT_TIMEOUT, 2, clock.clone());
+            let tok_a = cx.tk.encode("a", false)[0];
+            let sp = cx.sp;
+            let cfg = test_conn_config(clock.clone());
+            let head = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            // Each flush stalls 4s (< 5s per-write CLIENT_WRITE_TIMEOUT), accumulating past 15s MAX_STREAM_WRITE_TIME.
+            let (mut io, st) = ScriptedConnIo::new(head, body.to_vec(), clock.clone());
+            io.flush_advance = Duration::from_secs(4);
+
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("streaming job must reach scheduler");
+                let _ = job.out.send(Ev::Tok(sp.msg_model));
+                let _ = job.out.send(Ev::Tok(sp.c_text));
+                for _ in 0..12 {
+                    if job.out.send(Ev::Tok(tok_a)).is_err() {
+                        break;
+                    }
+                }
+                job
+            });
+            serve_one_connection(&cx, io, &cfg);
+            let job = scheduler.join().unwrap();
+
+            assert!(job.out.cancelled(), "{path}: slow streaming reader must drop rx and mark job cancelled");
+            assert!(job.out.queued() > 0, "{path}: dribbling reader must be cut off before draining queued tokens");
+            let write_tos: Vec<Duration> = st.lock().unwrap().write_timeouts.iter().filter_map(|&d| d).collect();
+            assert!(
+                write_tos.iter().any(|&d| d < CLIENT_WRITE_TIMEOUT),
+                "{path}: remaining stream write budget must shrink socket write timeout below 5s: {write_tos:?}"
+            );
+            assert!(cx.admission.try_acquire().is_none(), "{path}: permit held while cancelled job awaits scheduler step");
+            drop(job);
+            assert!(cx.admission.try_acquire().is_some(), "{path}: dropping cancelled job must immediately free its lane permit");
+            assert_eq!(cx.conns.load(Ordering::SeqCst), 0);
+        }
+
+        // Fast client over a 120s GPU generation (1ms per flush, 30s GPU compute between tokens)
+        // stays well under MAX_STREAM_WRITE_TIME (15s), whereas exceeding MAX_STREAM_DURATION (600s)
+        // cuts off cleanly with TimedOut.
+        let clock = FakeServeClock::auto_advancing();
+        let (mut io, st) = ScriptedConnIo::new(Vec::new(), Vec::new(), clock.clone());
+        io.write_advance = Duration::from_millis(1);
+        io.flush_advance = Duration::from_millis(1);
+        {
+            let mut sw = StreamDeadlineWriter::new(
+                &mut io,
+                clock.as_ref(),
+                MAX_STREAM_DURATION,
+                MAX_STREAM_WRITE_TIME,
+                CLIENT_WRITE_TIMEOUT,
+            );
+            for step in 0..4 {
+                clock.advance(Duration::from_secs(30)); // 30s of GPU prefill/decode outside socket writes
+                write!(sw, "data: {{\"step\":{step}}}\n\n").unwrap();
+                sw.flush().unwrap();
+            }
+            assert!(sw.write_elapsed < Duration::from_millis(50));
+            clock.advance(MAX_STREAM_DURATION);
+            let err = sw.write(b"data: late\n\n").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        }
+        let written = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(written.contains("{\"step\":3}"), "fast reader over 120s GPU run must complete: {written}");
+    }
+
+    #[test]
+    fn serve_connection_handler_covers_chunked_413_prebody_401_slow_408_and_max_conns_503() {
+        let clock = FakeServeClock::auto_advancing();
+        let (mut cx, jrx) = admission_test_ctx_with_clock(2, 2, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
+        cx.key = Some("top-secret".into());
+        let mut cfg = test_conn_config(clock.clone());
+        cfg.max_body = 128;
+
+        // (a) Valid chunked request body -> 200 OK.
+        let payload = br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#;
+        let split = payload.len() / 2;
+        let chunked_body = format!(
+            "{:x}\r\n{}\r\n{:x};ext=ok\r\n{}\r\n0\r\nX-Trailer: 1\r\n\r\n",
+            split,
+            std::str::from_utf8(&payload[..split]).unwrap(),
+            payload.len() - split,
+            std::str::from_utf8(&payload[split..]).unwrap(),
+        );
+        let head_chunked = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (io, st) = ScriptedConnIo::new(head_chunked, chunked_body.into_bytes(), clock.clone());
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv().unwrap();
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+            jrx
+        });
+        serve_one_connection(&cx, io, &cfg);
+        let jrx = scheduler.join().unwrap();
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "(a) valid chunked: {resp}");
+        assert_eq!(cx.conns.load(Ordering::SeqCst), 0);
+
+        // (b1) 413 oversized fixed Content-Length -> rejected before reading body!
+        let head_fixed_413 = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nContent-Length: {}\r\n\r\n",
+            cfg.max_body + 1
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_fixed_413, vec![b'x'; cfg.max_body + 1], clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 "), "(b1) fixed 413: {resp}");
+
+        // (b2) 413 oversized chunked body -> rejected without allocating past max_body!
+        let head_chunk_413 = "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let over_chunk = format!("{:x}\r\n{}\r\n0\r\n\r\n", cfg.max_body + 1, "a".repeat(cfg.max_body + 1));
+        let (io, st) = ScriptedConnIo::new(head_chunk_413, over_chunk.into_bytes(), clock.clone());
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 "), "(b2) chunked 413: {resp}");
+        assert!(resp.contains("request_too_large"), "(b2) anthropic 413 body: {resp}");
+
+        // (c) Unauthenticated request with oversized/invalid body rejected with 401 STRICTLY BEFORE reading body!
+        for raw_head in [
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nContent-Length: {}\r\n\r\n",
+                cfg.max_body + 9999
+            ),
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer wrong\r\nTransfer-Encoding: chunked\r\n\r\n".to_string(),
+        ] {
+            let (mut io, st) = ScriptedConnIo::new(raw_head, b"not-hex\r\ngarbage".to_vec(), clock.clone());
+            io.forbid_body_read = true;
+            serve_one_connection(&cx, io, &cfg);
+            let guard = st.lock().unwrap();
+            assert_eq!(guard.body_reads, 0);
+            let resp = String::from_utf8(guard.written.clone()).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 401 "), "(c) unauth must return 401 before body read: {resp}");
+        }
+
+        // (d1) Slow header read exceeding HEADER_READ_TIMEOUT -> 408 Request Timeout.
+        let slow_head = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n\r\n";
+        let (mut io, st) = ScriptedConnIo::new(slow_head, Vec::new(), clock.clone());
+        io.read_chunk_max = 1;
+        io.read_advance = Duration::from_secs(1);
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 408 "), "(d1) slow header read: {resp}");
+        assert_eq!(cx.conns.load(Ordering::SeqCst), 0);
+
+        // (d2) Slow fixed-length and chunked body reads exceeding BODY_READ_TIMEOUT -> 408 Request Timeout.
+        for (head_s, body_s) in [
+            (
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nContent-Length: 16\r\n\r\n",
+                b"{\"messages\":[]} ".as_slice(),
+            ),
+            (
+                "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n",
+                b"4\r\n{\"a\"\r\n4\r\n:1} \r\n0\r\n\r\n".as_slice(),
+            ),
+        ] {
+            let (mut io, st) = ScriptedConnIo::new(head_s, body_s.to_vec(), clock.clone());
+            io.read_chunk_max = 2;
+            io.body_read_advance = Duration::from_secs(25);
+            serve_one_connection(&cx, io, &cfg);
+            let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 408 "), "(d2) slow body read: {resp}");
+            assert_eq!(cx.conns.load(Ordering::SeqCst), 0);
+        }
+
+        // (e) Over-max_conns -> immediate 503 with connection counter preserved.
+        cfg.max_conns = 2;
+        cx.conns.store(2, Ordering::SeqCst);
+        let (mut io, st) = ScriptedConnIo::new("GET /health HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n\r\n", Vec::new(), clock);
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        assert_eq!(cx.conns.load(Ordering::SeqCst), 2, "rejected over-cap connection must restore cx.conns");
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 503 "), "(e) max_conns 503: {resp}");
+        assert!(resp.contains("too many connections"), "(e) max_conns body: {resp}");
+        assert!(jrx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recorder_ignores_refused_requests_and_preserves_contiguous_card_turns() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-refused-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::new(dir.clone()));
+        let clock = FakeServeClock::auto_advancing();
+        let (mut cx, jrx) = admission_test_ctx_with_clock(1, 0, Duration::from_millis(10), 2, clock.clone());
+        cx.key = Some("secret".into());
+        cx.recorder = Some(rec.clone());
+        let mut cfg = test_conn_config(clock.clone());
+        cfg.max_body = 256;
+
+        // Exercise 401, 413, 400 (malformed JSON), 400 (bad max_tokens), and 429 (queue full) with X-Inky-Card-Id.
+        let post = |cx: &Ctx, auth: &str, body: &[u8]| {
+            let head = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n{auth}X-Inky-Card-Id: card-clean\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let (io, st) = ScriptedConnIo::new(head, body.to_vec(), clock.clone());
+            serve_one_connection(cx, io, &cfg);
+            let written = st.lock().unwrap().written.clone();
+            String::from_utf8(written).unwrap()
+        };
+        assert!(post(&cx, "", b"{}").starts_with("HTTP/1.1 401 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", &vec![b'a'; 300]).starts_with("HTTP/1.1 413 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", b"{not json").starts_with("HTTP/1.1 400 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":0,"messages":[{"role":"user","content":"hi"}]}"#).starts_with("HTTP/1.1 400 "));
+        let held = cx.admission.try_acquire().unwrap();
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#).starts_with("HTTP/1.1 429 "));
+        drop(held);
+
+        assert_eq!(rec.queued_bytes(), 0);
+        assert_eq!(rec.written_count(), 0);
+        assert_eq!(rec.dropped_count(), 0);
+
+        // Now send two valid requests on `card-clean` and verify they record as turns 0 and 1.
+        let scheduler = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let job = jrx.recv().unwrap();
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let r = post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#);
+            assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+        }
+        scheduler.join().unwrap();
+        drop(cx);
+        drop(rec);
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|p| p.path()))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let entries = crate::record::parse_jsonl(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(entries.len(), 2, "only admitted turns may be recorded");
+        assert_eq!(entries[0].card_id, "card-clean");
+        assert_eq!(entries[0].turn_index, 0);
+        assert_eq!(entries[1].turn_index, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

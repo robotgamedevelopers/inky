@@ -176,10 +176,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
         }
     }
     o.bind = bind.to_socket_addrs().map_err(|e| format!("cannot resolve --bind {bind}: {e}"))?.collect();
-    if o.bind.is_empty() { return Err(format!("--bind {bind} resolved to no addresses")); }
-    if o.key.is_none() && !allow_unauthenticated && o.bind.iter().any(|addr| !addr.ip().to_canonical().is_loopback()) {
-        return Err("a non-loopback --bind requires --key-env or --allow-unauthenticated-non-loopback".into());
-    }
+    serve::validate_bind_addrs(&o.bind, o.key.is_some(), allow_unauthenticated)?;
     Ok(o)
 }
 
@@ -266,9 +263,18 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
         assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
-        for bind in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "[::ffff:192.0.2.1]:0", "100.64.0.1:18096"] {
+        for bind in [
+            "10.0.0.1:0",
+            "172.16.0.1:0",
+            "192.168.1.1:0",
+            "100.64.0.1:18096",
+            "169.254.1.1:0",
+            "[fd7a:115c:a1e0::1]:18096",
+            "[fe80::1]:0",
+            "[::ffff:100.64.0.1]:0",
+        ] {
             let args = ["--bind", bind];
-            assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"));
+            assert!(serve_args(&args).err().unwrap().contains("a non-loopback --bind requires"), "{bind}");
             let keyed = serve_args(&["--bind", bind, "--key-env", "PRESENT"]).unwrap();
             assert_eq!(keyed.bind, [bind.parse::<std::net::SocketAddr>().unwrap()]);
             assert_eq!(keyed.key.as_deref(), Some("configured-key"));
@@ -278,6 +284,24 @@ mod cli_tests {
             let unkeyed = serve_args(&["--bind", bind, "--allow-unauthenticated-non-loopback"]).unwrap();
             assert_eq!(unkeyed.bind, keyed.bind);
             assert!(unkeyed.key.is_none());
+        }
+        for rejected in [
+            "0.0.0.0:0",
+            "0.0.0.0:8096",
+            "[::]:0",
+            "[::]:8096",
+            "8.8.8.8:8096",
+            "192.0.2.1:0",
+            "[::ffff:192.0.2.1]:0",
+            "[::ffff:0.0.0.0]:0",
+            "[2001:4860:4860::8888]:8096",
+        ] {
+            for extra in [&[][..], &["--key-env", "PRESENT"][..], &["--allow-unauthenticated-non-loopback"][..]] {
+                let mut argv = vec!["--bind", rejected];
+                argv.extend_from_slice(extra);
+                let err = serve_args(&argv).err().unwrap_or_else(|| panic!("expected {argv:?} to be refused"));
+                assert!(err.contains("neither loopback nor a private"), "{argv:?}: {err}");
+            }
         }
         assert!(serve::is_private_ip("100.64.0.1".parse().unwrap()));
     }
