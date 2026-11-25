@@ -1,8 +1,6 @@
 use super::*;
 use crate::blocks::{FULL_STRIDE, WINDOW_STRIDE};
-use crate::cache_trace::{
-    parse_block_layout_jsonl, parse_cache_scheduler_jsonl, JsonlSink, MemorySink, NullSink,
-};
+use crate::cache_trace::{parse_block_layout_jsonl, parse_cache_scheduler_jsonl, JsonlSink, MemorySink, NullSink};
 
 #[test]
 fn worst_case_blocks_and_span_bounds_handle_kvb_and_refuse_zero_or_overflow() {
@@ -48,10 +46,7 @@ fn block_allocator_reissues_generations_exhausts_max_gen_and_uses_real_byte_offs
         let e_w1 = alloc.alloc_lowest_free("a", BlockKind::Window, 0, &mut ev, &mut st).unwrap();
         assert_eq!((e_f1.slot().get(), e_f1.generation()), (1, 1));
         assert_eq!((e_w1.slot().get(), e_w1.generation()), (1, 1));
-        assert_eq!(
-            e_f1.offset(),
-            byte_offset(BlockKind::Full, Slot::new(slot_base + 1).unwrap(), kvb).unwrap()
-        );
+        assert_eq!(e_f1.offset(), byte_offset(BlockKind::Full, Slot::new(slot_base + 1).unwrap(), kvb).unwrap());
         assert_eq!(OffsetLimbs::from_u64(e_f1.offset()).unwrap().hi, want_hi);
         alloc.begin_step("a", &mut ev, &mut st).unwrap();
         alloc.write_one("a", &mut ev, &mut st).unwrap();

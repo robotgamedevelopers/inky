@@ -4,7 +4,11 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 fn rate(tokens: usize, elapsed: Duration) -> f64 {
-    if elapsed.is_zero() { 0.0 } else { tokens as f64 / elapsed.as_secs_f64() }
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / elapsed.as_secs_f64()
+    }
 }
 
 #[derive(Default)]
@@ -124,11 +128,8 @@ impl Counters {
     pub(super) fn summarize(&mut self, now: Instant, waiting_in_gate: usize) -> String {
         self.accrue(now);
         let elapsed = now.saturating_duration_since(self.start);
-        let lanes_busy_avg = if elapsed.is_zero() {
-            self.busy as f64
-        } else {
-            self.lane_seconds / elapsed.as_secs_f64()
-        };
+        let lanes_busy_avg =
+            if elapsed.is_zero() { self.busy as f64 } else { self.lane_seconds / elapsed.as_secs_f64() };
         let queue_depth = self.queued.saturating_add(waiting_in_gate);
         let line = format!(
             "[serve] summary interval_s={:.1} lanes_busy_avg={:.2} input_tok_s={:.2} output_tok_s={:.2} queue_depth={}",

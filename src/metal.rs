@@ -76,7 +76,9 @@ pub fn wait_completed(cb: &CmdBuf, stage: &str, pos: usize) -> Result<(), String
         }
     }
     let status = cb.status();
-    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
+    if status == MTLCommandBufferStatus::Completed {
+        return Ok(());
+    }
     let detail = cb.error().map(|err| format!(": {}", err.localizedDescription())).unwrap_or_default();
     Err(format!("Metal {stage} at token {pos} failed ({status:?}){detail}"))
 }
@@ -99,15 +101,23 @@ impl Gpu {
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
             .unwrap_or_else(|e| panic!("Metal compile failed:\n{}", e.localizedDescription()));
         let g = Gpu { dev, queue, lib, psos: Default::default() };
-        for k in kernels { g.pso(k); }
+        for k in kernels {
+            g.pso(k);
+        }
         g
     }
 
     /// pipeline state by kernel name (compiled on first use; production kernels are pre-built at load)
     pub fn pso(&self, name: &str) -> Pso {
-        if let Some(p) = self.psos.borrow().get(name) { return p.clone(); }
-        let f = self.lib.newFunctionWithName(&NSString::from_str(name)).unwrap_or_else(|| panic!("kernel {name} missing"));
-        let p = self.dev.newComputePipelineStateWithFunction_error(&f).unwrap_or_else(|e| panic!("pso {name}: {}", e.localizedDescription()));
+        if let Some(p) = self.psos.borrow().get(name) {
+            return p.clone();
+        }
+        let f =
+            self.lib.newFunctionWithName(&NSString::from_str(name)).unwrap_or_else(|| panic!("kernel {name} missing"));
+        let p = self
+            .dev
+            .newComputePipelineStateWithFunction_error(&f)
+            .unwrap_or_else(|e| panic!("pso {name}: {}", e.localizedDescription()));
         self.psos.borrow_mut().insert(name.to_string(), p.clone());
         p
     }
@@ -118,7 +128,9 @@ impl Gpu {
 
     pub fn buffer_with(&self, data: &[u8]) -> Buf {
         let b = self.buffer(data.len());
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents().as_ptr() as *mut u8, data.len()); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents().as_ptr() as *mut u8, data.len());
+        }
         b
     }
 
@@ -127,12 +139,18 @@ impl Gpu {
         unsafe {
             self.dev
                 .newBufferWithBytesNoCopy_length_options_deallocator(
-                    NonNull::new(ptr as *mut c_void).unwrap(), len, MTLResourceOptions::StorageModeShared, None)
+                    NonNull::new(ptr as *mut c_void).unwrap(),
+                    len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
                 .expect("no-copy buffer (needs page-aligned ptr/len)")
         }
     }
 
-    pub fn cmd(&self) -> CmdBuf { self.queue.commandBufferWithUnretainedReferences().expect("cmdbuf") }
+    pub fn cmd(&self) -> CmdBuf {
+        self.queue.commandBufferWithUnretainedReferences().expect("cmdbuf")
+    }
 
     /// Metal's recommended maximum working set size in bytes, queried directly from MTLDevice.
     pub fn recommended_max_working_set_size(&self) -> u64 {
@@ -153,22 +171,59 @@ impl Enc {
     pub fn new(cb: &CmdBuf) -> Enc {
         Enc { e: cb.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent).expect("encoder") }
     }
-    #[inline] pub fn pso(&self, p: &Pso) { self.e.setComputePipelineState(p); }
-    #[inline] pub fn buf(&self, b: &Buf, off: usize, idx: usize) { unsafe { self.e.setBuffer_offset_atIndex(Some(b), off, idx); } }
-    #[inline] pub fn bytes<T>(&self, v: &T, idx: usize) {
-        unsafe { self.e.setBytes_length_atIndex(NonNull::new(v as *const T as *mut c_void).unwrap(), std::mem::size_of::<T>(), idx); }
+    #[inline]
+    pub fn pso(&self, p: &Pso) {
+        self.e.setComputePipelineState(p);
     }
-    #[inline] pub fn bytes_slice<T>(&self, v: &[T], idx: usize) {
-        unsafe { self.e.setBytes_length_atIndex(NonNull::new(v.as_ptr() as *mut c_void).unwrap(), std::mem::size_of_val(v), idx); }
+    #[inline]
+    pub fn buf(&self, b: &Buf, off: usize, idx: usize) {
+        unsafe {
+            self.e.setBuffer_offset_atIndex(Some(b), off, idx);
+        }
     }
-    #[inline] pub fn dispatch(&self, grid: (usize, usize, usize), tg: usize) {
+    #[inline]
+    pub fn bytes<T>(&self, v: &T, idx: usize) {
+        unsafe {
+            self.e.setBytes_length_atIndex(
+                NonNull::new(v as *const T as *mut c_void).unwrap(),
+                std::mem::size_of::<T>(),
+                idx,
+            );
+        }
+    }
+    #[inline]
+    pub fn bytes_slice<T>(&self, v: &[T], idx: usize) {
+        unsafe {
+            self.e.setBytes_length_atIndex(
+                NonNull::new(v.as_ptr() as *mut c_void).unwrap(),
+                std::mem::size_of_val(v),
+                idx,
+            );
+        }
+    }
+    #[inline]
+    pub fn dispatch(&self, grid: (usize, usize, usize), tg: usize) {
         self.e.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: grid.0, height: grid.1, depth: grid.2 }, MTLSize { width: tg, height: 1, depth: 1 });
+            MTLSize { width: grid.0, height: grid.1, depth: grid.2 },
+            MTLSize { width: tg, height: 1, depth: 1 },
+        );
     }
     /// grid size read on the GPU from 3 uint32 at `off` bytes into `b` (written by an earlier kernel of the same encoder)
-    #[inline] pub fn dispatch_indirect(&self, b: &Buf, off: usize, tg: usize) {
-        unsafe { self.e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(b, off, MTLSize { width: tg, height: 1, depth: 1 }); }
+    #[inline]
+    pub fn dispatch_indirect(&self, b: &Buf, off: usize, tg: usize) {
+        unsafe {
+            self.e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                b,
+                off,
+                MTLSize { width: tg, height: 1, depth: 1 },
+            );
+        }
     }
-    #[inline] pub fn barrier(&self) { self.e.memoryBarrierWithScope(MTLBarrierScope::Buffers); }
-    pub fn end(self) { self.e.endEncoding(); }
+    #[inline]
+    pub fn barrier(&self) {
+        self.e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+    }
+    pub fn end(self) {
+        self.e.endEncoding();
+    }
 }

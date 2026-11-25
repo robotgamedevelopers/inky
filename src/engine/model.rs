@@ -4,20 +4,32 @@ use super::*;
 
 const MAX_PREFILL_CHUNK: usize = 4096;
 
-pub(super) fn configured_prefill_chunk(value: Result<String, std::env::VarError>, context: usize) -> Result<usize, &'static str> {
+pub(super) fn configured_prefill_chunk(
+    value: Result<String, std::env::VarError>,
+    context: usize,
+) -> Result<usize, &'static str> {
     let chunk = match value {
         Err(std::env::VarError::NotPresent) => Some(MAX_PREFILL_CHUNK),
         Ok(value) => value.parse::<usize>().ok(),
         Err(std::env::VarError::NotUnicode(_)) => None,
     };
-    chunk.filter(|&n| (32..=MAX_PREFILL_CHUNK).contains(&n) && n % 32 == 0)
+    chunk
+        .filter(|&n| (32..=MAX_PREFILL_CHUNK).contains(&n) && n % 32 == 0)
         .map(|n| n.min(context))
         .ok_or("INK_CHUNK must be a multiple of 32 between 32 and 4096")
 }
 
 // ----------------------------------------------------------------------------- weights
 #[derive(Clone, Copy, Default, Debug)]
-pub struct QW { pub off: u64, pub row_bytes: u32, pub ty: u32, pub rows: u32, pub k: u32, pub expert_bytes: u64, pub gs: u64 }
+pub struct QW {
+    pub off: u64,
+    pub row_bytes: u32,
+    pub ty: u32,
+    pub rows: u32,
+    pub k: u32,
+    pub expert_bytes: u64,
+    pub gs: u64,
+}
 
 fn qw(g: &Gguf, name: &str, shape: &[usize], types: &[u32]) -> io::Result<QW> {
     let t = g.tensor(name, shape, types)?;
@@ -55,7 +67,13 @@ fn validate_vocab(g: &Gguf, unpadded: u64, padded: usize) -> io::Result<usize> {
     check_vocab_lengths(unpadded, padded, token_count, type_count, eos)
 }
 
-pub(super) fn check_vocab_lengths(unpadded: u64, padded: usize, tokens: usize, types: usize, eos: u64) -> io::Result<usize> {
+pub(super) fn check_vocab_lengths(
+    unpadded: u64,
+    padded: usize,
+    tokens: usize,
+    types: usize,
+    eos: u64,
+) -> io::Result<usize> {
     if unpadded == 0 || unpadded > padded as u64 || unpadded != tokens as u64 || tokens != types {
         return Err(invalid_model(format_args!(
             "vocabulary length {unpadded} must fit {padded} rows and match the tokenizer's {tokens} tokens and {types} token types",
@@ -69,22 +87,52 @@ pub(super) fn check_vocab_lengths(unpadded: u64, padded: usize, tokens: usize, t
 
 pub struct Layer {
     pub swa: bool,
-    pub wq: QW, pub wgate: QW, pub wk: QW, pub wv: QW, pub wo: QW, pub wrel: QW, pub wsink: QW,
-    pub kconvp: Option<QW>, pub vconvp: Option<QW>,
-    pub attn_norm: i32, pub q_inp_norm: i32, pub k_inp_norm: i32, pub v_inp_norm: i32,
-    pub attn_res_query: i32, pub n_attn_q: u32,
-    pub ffn_res_query: u32, pub ffn_norm: u32,
-    pub q_clip: u32, pub rel_clip: u32, pub rel_bias: u32, pub k_conv: u32, pub v_conv: u32,
-    pub attn_post_conv: u32, pub ffn_post_conv: u32,
-    pub router: u32, pub exp_bias: u32,
-    pub gu: QW, pub dn: QW,
+    pub wq: QW,
+    pub wgate: QW,
+    pub wk: QW,
+    pub wv: QW,
+    pub wo: QW,
+    pub wrel: QW,
+    pub wsink: QW,
+    pub kconvp: Option<QW>,
+    pub vconvp: Option<QW>,
+    pub attn_norm: i32,
+    pub q_inp_norm: i32,
+    pub k_inp_norm: i32,
+    pub v_inp_norm: i32,
+    pub attn_res_query: i32,
+    pub n_attn_q: u32,
+    pub ffn_res_query: u32,
+    pub ffn_norm: u32,
+    pub q_clip: u32,
+    pub rel_clip: u32,
+    pub rel_bias: u32,
+    pub k_conv: u32,
+    pub v_conv: u32,
+    pub attn_post_conv: u32,
+    pub ffn_post_conv: u32,
+    pub router: u32,
+    pub exp_bias: u32,
+    pub gu: QW,
+    pub dn: QW,
 }
 
-pub struct LoopW { pub msg_query: u32, pub down: [u32; 4], pub gain: [u32; 4], pub forget: [u32; 4] }
+pub struct LoopW {
+    pub msg_query: u32,
+    pub down: [u32; 4],
+    pub gain: [u32; 4],
+    pub forget: [u32; 4],
+}
 
-struct Pb { data: Vec<u8> }
+struct Pb {
+    data: Vec<u8>,
+}
 impl Pb {
-    fn align(&mut self) { while !self.data.len().is_multiple_of(256) { self.data.push(0); } }
+    fn align(&mut self) {
+        while !self.data.len().is_multiple_of(256) {
+            self.data.push(0);
+        }
+    }
     fn f32(&mut self, g: &Gguf, name: &str, shape: &[usize]) -> io::Result<u32> {
         let t = g.tensor(name, shape, &[T_F32])?;
         self.align();
@@ -165,22 +213,49 @@ impl PreparedModel {
         let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
         let blocked_slab = Rc::new(RefCell::new(BlockedSlab::new(self.max_ctx.div_ceil(crate::blocks::BLOCK))));
         let mut eng = Engine {
-            eps: self.eps, log_alpha: self.log_alpha, log_floor: self.log_floor,
-            situ_beta: self.situ_beta, situ_lbeta: self.situ_lbeta, wscale: self.wscale, softcap: self.softcap,
-            g: self.g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
-            slot_kind: self.slot_kind, qcap: RefCell::new(None), ctr, layers: self.layers, loops: self.loops,
-            tok_embd: self.tok_embd, tok_norm: self.tok_norm, output: self.output,
-            output_norm: self.output_norm, output_res_query: self.output_res_query,
-            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk,
+            eps: self.eps,
+            log_alpha: self.log_alpha,
+            log_floor: self.log_floor,
+            situ_beta: self.situ_beta,
+            situ_lbeta: self.situ_lbeta,
+            wscale: self.wscale,
+            softcap: self.softcap,
+            g: self.g,
+            gpu,
+            w,
+            pb: pbuf,
+            act: std::cell::RefCell::new(act),
+            slot_kind: self.slot_kind,
+            qcap: RefCell::new(None),
+            ctr,
+            layers: self.layers,
+            loops: self.loops,
+            tok_embd: self.tok_embd,
+            tok_norm: self.tok_norm,
+            output: self.output,
+            output_norm: self.output_norm,
+            output_res_query: self.output_res_query,
+            ar,
+            abase: Cell::new(0),
+            dstart: Cell::new(0),
+            kv8,
+            kvb,
+            ba: Default::default(),
+            chunk,
             tensor: std::env::var("INK_NO_TENSOR").is_err(),
             hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(),
             sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
             tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
-            skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
-            last_out: Default::default(), last_mid: Default::default(),
-            max_ctx: self.max_ctx, n_vocab: self.n_vocab,
-            verify_keep: RefCell::new(None), verify_record: Cell::new(false),
+            skip: Default::default(),
+            stop: std::cell::Cell::new(usize::MAX),
+            done: std::cell::Cell::new(0),
+            last_out: Default::default(),
+            last_mid: Default::default(),
+            max_ctx: self.max_ctx,
+            n_vocab: self.n_vocab,
+            verify_keep: RefCell::new(None),
+            verify_record: Cell::new(false),
             block_pool,
             blocked_slab,
             loopcd_omega: Cell::new(0.0),
@@ -195,7 +270,9 @@ impl PreparedModel {
             eprintln!("[inky] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
             eng.hgemm = false;
         }
-        if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
+        if std::env::var("INK_NO_WARM").is_err() {
+            eng.warm();
+        }
         Ok(eng)
     }
 }
@@ -216,10 +293,17 @@ impl Engine {
         }
         let a = |k: &str| format!("inkling2_loop.{k}");
         for (name, expected) in [
-            ("embedding_length", E), ("block_count", N_PHYS), ("expert_count", NEXP),
-            ("expert_used_count", TOPK), ("loop.start", LOOP_START), ("loop.end", LOOP_END),
-            ("loop.count", N_PASS), ("attn_res.block_size", BLOCK), ("attention.sliding_window", EXT),
-            ("attention.relative_extent", EXT), ("vocab_size", N_VOCAB_PAD),
+            ("embedding_length", E),
+            ("block_count", N_PHYS),
+            ("expert_count", NEXP),
+            ("expert_used_count", TOPK),
+            ("loop.start", LOOP_START),
+            ("loop.end", LOOP_END),
+            ("loop.count", N_PASS),
+            ("attn_res.block_size", BLOCK),
+            ("attention.sliding_window", EXT),
+            ("attention.relative_extent", EXT),
+            ("vocab_size", N_VOCAB_PAD),
         ] {
             let value = g.uint(&a(name))?;
             if value != expected as u64 {
@@ -227,8 +311,11 @@ impl Engine {
             }
         }
         let swa_pat = match g.kv.get(&a("attention.sliding_window_pattern")) {
-            Some(Value::AB(v)) if v.len() == N_PHYS
-                && v.iter().copied().eq((0..N_PHYS).map(|i| !(i + 1).is_multiple_of(BLOCK))) => v,
+            Some(Value::AB(v))
+                if v.len() == N_PHYS && v.iter().copied().eq((0..N_PHYS).map(|i| !(i + 1).is_multiple_of(BLOCK))) =>
+            {
+                v
+            }
             _ => return Err(invalid_model("unexpected sliding-window attention pattern")),
         };
 
@@ -250,29 +337,28 @@ impl Engine {
         let mut layers = Vec::new();
         for (i, &swa) in swa_pat.iter().enumerate() {
             let n = |s: &str| format!("blk.{i}.{s}");
-            let (attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q, kconvp, vconvp) =
-                if swa {
-                    let query = n("attn_res_query.weight");
-                    let res_query = match g.opt(&query) {
-                        Some(t) => {
-                            let shape: &[usize] = if t.ne.len() == 2 { &[E, 1] } else { &[E] };
-                            pb.f32(&g, &query, shape)? as i32
-                        }
-                        None => -1,
-                    };
-                    (pb.f32(&g, &n("attn_norm.weight"), &[E])? as i32, -1, -1, -1, res_query, 1, None, None)
-                } else {
-                    (
-                        -1,
-                        pb.f32(&g, &n("attn_q_inp_norm.weight"), &[E])? as i32,
-                        pb.f32(&g, &n("attn_k_inp_norm.weight"), &[E])? as i32,
-                        pb.f32(&g, &n("attn_v_inp_norm.weight"), &[E])? as i32,
-                        pb.f32(&g, &n("attn_res_query.weight"), &[E, 3])? as i32,
-                        3,
-                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
-                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
-                    )
+            let (attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q, kconvp, vconvp) = if swa {
+                let query = n("attn_res_query.weight");
+                let res_query = match g.opt(&query) {
+                    Some(t) => {
+                        let shape: &[usize] = if t.ne.len() == 2 { &[E, 1] } else { &[E] };
+                        pb.f32(&g, &query, shape)? as i32
+                    }
+                    None => -1,
                 };
+                (pb.f32(&g, &n("attn_norm.weight"), &[E])? as i32, -1, -1, -1, res_query, 1, None, None)
+            } else {
+                (
+                    -1,
+                    pb.f32(&g, &n("attn_q_inp_norm.weight"), &[E])? as i32,
+                    pb.f32(&g, &n("attn_k_inp_norm.weight"), &[E])? as i32,
+                    pb.f32(&g, &n("attn_v_inp_norm.weight"), &[E])? as i32,
+                    pb.f32(&g, &n("attn_res_query.weight"), &[E, 3])? as i32,
+                    3,
+                    Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                    Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                )
+            };
             layers.push(Layer {
                 swa,
                 wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
@@ -282,8 +368,14 @@ impl Engine {
                 wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K, T_Q8_0])?,
                 wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K, T_Q8_0])?,
                 wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K, T_Q8_0])?,
-                kconvp, vconvp,
-                attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q,
+                kconvp,
+                vconvp,
+                attn_norm,
+                q_inp_norm,
+                k_inp_norm,
+                v_inp_norm,
+                attn_res_query,
+                n_attn_q,
                 ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight"), &[E])?,
                 ffn_norm: pb.f32(&g, &n("ffn_norm.weight"), &[E])?,
                 q_clip: pb.f32(&g, &n("attn_q_clip.weight"), &[HD, NH])?,
@@ -304,7 +396,9 @@ impl Engine {
             let n = |s: &str| format!("blk.{i}.{s}");
             let mut lw = LoopW {
                 msg_query: pb.f32(&g, &n("loop_msg_query.weight"), &[E, 4])?,
-                down: [0; 4], gain: [0; 4], forget: [0; 4],
+                down: [0; 4],
+                gain: [0; 4],
+                forget: [0; 4],
             };
             for (c, name) in ["q", "k", "v", "ffn"].into_iter().enumerate() {
                 lw.down[c] = pb.bf16(&g, &n(&format!("loop_{name}_ctrl_down.weight")), &[2 * E, CTRL_RANK])?;
@@ -321,14 +415,40 @@ impl Engine {
         let (mut n_swa, mut n_full) = (0usize, 0usize);
         for s in 0..N_SLOT {
             let phys = if s < N_PHYS { s } else { LOOP_START + (s - N_PHYS) % (LOOP_END - LOOP_START) };
-            if layers[phys].swa { slot_kind.push((true, n_swa)); n_swa += 1; } else { slot_kind.push((false, n_full)); n_full += 1; }
+            if layers[phys].swa {
+                slot_kind.push((true, n_swa));
+                n_swa += 1;
+            } else {
+                slot_kind.push((false, n_full));
+                n_full += 1;
+            }
         }
-        if n_full.saturating_mul(2).saturating_mul(NKV).saturating_mul(max_ctx).saturating_mul(HD) >= u32::MAX as usize {
+        if n_full.saturating_mul(2).saturating_mul(NKV).saturating_mul(max_ctx).saturating_mul(HD) >= u32::MAX as usize
+        {
             return Err(invalid_model("KV cache too large for 32-bit offsets"));
         }
         Ok(PreparedModel {
-            path: path.to_owned(), max_ctx, t0, g, pb, layers, loops, tok_embd, tok_norm, output, output_norm,
-            output_res_query, n_vocab, eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap, slot_kind,
+            path: path.to_owned(),
+            max_ctx,
+            t0,
+            g,
+            pb,
+            layers,
+            loops,
+            tok_embd,
+            tok_norm,
+            output,
+            output_norm,
+            output_res_query,
+            n_vocab,
+            eps,
+            log_alpha,
+            log_floor,
+            situ_beta,
+            situ_lbeta,
+            wscale,
+            softcap,
+            slot_kind,
         })
     }
 }
@@ -339,11 +459,10 @@ impl Engine {
             eprintln!("[inky] {err}");
             std::process::exit(2);
         });
-        Self::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), chunk)
-            .unwrap_or_else(|err| {
-                eprintln!("[inky] could not load {path}: {err}");
-                std::process::exit(1);
-            })
+        Self::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), chunk).unwrap_or_else(|err| {
+            eprintln!("[inky] could not load {path}: {err}");
+            std::process::exit(1);
+        })
     }
     /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
     fn load_with(path: &str, max_ctx: usize, kv8: bool, chunk: usize) -> io::Result<Engine> {

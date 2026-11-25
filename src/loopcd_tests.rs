@@ -67,15 +67,28 @@ fn loopcd_cli_first_token() {
     let ordinary_first = ordinary.prefill(&toks).unwrap();
     // Find a deterministic draw where changing only the weight changes the first emitted token.
     let sampler = |seed| Sampler::new(1.0, 64, 0.95, eng.softcap, seed);
-    let (seed, plain_draw, guided_draw) = (1..=128).find_map(|seed| {
-        let plain_draw = sampler(seed).sample_next(&eng.logits()).unwrap();
-        let guided_draw = sampler(seed).sample_next_with_ban_and_softcap(&guided, None, 0.0).unwrap();
-        (plain_draw != guided_draw && plain_draw != tk.eos && guided_draw != tk.eos)
-            .then_some((seed, plain_draw, guided_draw))
-    }).expect("fixture should distinguish an actual first output token");
+    let (seed, plain_draw, guided_draw) = (1..=128)
+        .find_map(|seed| {
+            let plain_draw = sampler(seed).sample_next(&eng.logits()).unwrap();
+            let guided_draw = sampler(seed).sample_next_with_ban_and_softcap(&guided, None, 0.0).unwrap();
+            (plain_draw != guided_draw && plain_draw != tk.eos && guided_draw != tk.eos).then_some((
+                seed,
+                plain_draw,
+                guided_draw,
+            ))
+        })
+        .expect("fixture should distinguish an actual first output token");
     let draw = |session: &mut Session<'_>, first| {
         let mut out = Vec::new();
-        assert_eq!(session.generate(first, 1, &mut sampler(seed), |token| { out.push(token); true }).unwrap(), 1);
+        assert_eq!(
+            session
+                .generate(first, 1, &mut sampler(seed), |token| {
+                    out.push(token);
+                    true
+                })
+                .unwrap(),
+            1
+        );
         out
     };
     assert_eq!(draw(&mut ordinary, ordinary_first), [plain_draw]);
@@ -87,7 +100,6 @@ fn loopcd_cli_first_token() {
     assert_eq!(eng.lane_hash(&session.lane), guided_state);
     assert_eq!(draw(&mut session, first), [guided_draw]);
     eprintln!("first-token reference: seed={seed} plain={plain_draw} guided={guided_draw}");
-
 }
 
 #[test]
@@ -127,15 +139,23 @@ fn loopcd_paged_mixed_lane_state() {
     final_row(&[&solo], &[0.0]);
     let solo_row = eng.span_logits(0).to_vec();
     final_row(&[&disabled, &enabled], &[0.0, OMEGA]);
-    assert!(same_row(&eng.span_logits(0), &solo_row), "LoopCD paged weak pass changed strong logits or state: disabled row");
+    assert!(
+        same_row(&eng.span_logits(0), &solo_row),
+        "LoopCD paged weak pass changed strong logits or state: disabled row"
+    );
     let pools = eng.block_pool().borrow();
     for lane in [&disabled, &enabled] {
-        assert!(eng.on(lane).get_cs() == eng.on(&solo).get_cs(), "LoopCD paged weak pass changed strong logits or state: recurrent state");
+        assert!(
+            eng.on(lane).get_cs() == eng.on(&solo).get_cs(),
+            "LoopCD paged weak pass changed strong logits or state: recurrent state"
+        );
         for kind in [BlockKind::Full, BlockKind::Window] {
             let slot_at = |l: &Lane| l.block_table().borrow().get(kind, BlockIndex::new(0)).unwrap().unwrap().slot();
             let pool = pools.of(kind);
-            assert!(pool.slot_bytes(slot_at(lane)).unwrap() == pool.slot_bytes(slot_at(&solo)).unwrap(),
-                    "LoopCD paged weak pass changed strong logits or state: {kind:?} cache");
+            assert!(
+                pool.slot_bytes(slot_at(lane)).unwrap() == pool.slot_bytes(slot_at(&solo)).unwrap(),
+                "LoopCD paged weak pass changed strong logits or state: {kind:?} cache"
+            );
         }
     }
     assert!(differs_from_plain(&eng.span_logits(1), &solo_row, eng.softcap));
@@ -202,8 +222,14 @@ fn loopcd_cached_prompt_first_token_and_mixed_tie_isolation() {
     complete(cb);
     let cached_plain_logits = eng.span_logits(0).to_vec();
     let cached_guided_logits = eng.span_logits(1).to_vec();
-    assert!(same_row(&cached_plain_logits, &cold_plain_logits), "cached omega=0 first-token logits differ from cold forced decode");
-    assert!(differs_from_plain(&cached_guided_logits, &cold_plain_logits, eng.softcap), "cached guided first-token skipped LoopCD");
+    assert!(
+        same_row(&cached_plain_logits, &cold_plain_logits),
+        "cached omega=0 first-token logits differ from cold forced decode"
+    );
+    assert!(
+        differs_from_plain(&cached_guided_logits, &cold_plain_logits, eng.softcap),
+        "cached guided first-token skipped LoopCD"
+    );
     assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
     assert_eq!(eng.effective_sampler_softcap(1), 0.0);
 

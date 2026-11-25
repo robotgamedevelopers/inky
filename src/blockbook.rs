@@ -54,23 +54,39 @@ pub struct Geometry {
 
 impl Geometry {
     pub fn production(context: u32) -> Geometry {
-        Geometry { block: crate::blocks::BLOCK as u32, window: crate::blocks::WINDOW as u32, every: 16,
-                   blocks: context.div_ceil(crate::blocks::BLOCK as u32) }
+        Geometry {
+            block: crate::blocks::BLOCK as u32,
+            window: crate::blocks::WINDOW as u32,
+            every: 16,
+            blocks: context.div_ceil(crate::blocks::BLOCK as u32),
+        }
     }
-    pub fn max_pos(&self) -> u32 { self.blocks * self.block }
+    pub fn max_pos(&self) -> u32 {
+        self.blocks * self.block
+    }
 
     /// Blocks holding positions `lo..=hi`, empty when `hi < lo`.
     fn span(&self, lo: u32, hi: u32) -> std::ops::Range<u32> {
-        if hi < lo { 0..0 } else { lo / self.block..hi / self.block + 1 }
+        if hi < lo {
+            0..0
+        } else {
+            lo / self.block..hi / self.block + 1
+        }
     }
     /// Window blocks covering the `window` positions before `n`.
     pub fn history(&self, n: u32) -> std::ops::Range<u32> {
-        if n == 0 { return 0..0; }
+        if n == 0 {
+            return 0..0;
+        }
         self.span(n.saturating_sub(self.window), n - 1)
     }
     /// Full blocks before `n`.
     pub fn full(&self, n: u32) -> std::ops::Range<u32> {
-        if n == 0 { 0..0 } else { self.span(0, n - 1) }
+        if n == 0 {
+            0..0
+        } else {
+            self.span(0, n - 1)
+        }
     }
     /// The blocks a start point at `n` holds.
     pub fn retained(&self, n: u32) -> impl Iterator<Item = (BlockKind, u32)> {
@@ -117,7 +133,9 @@ pub enum BookError {
 }
 
 impl From<BlockError> for BookError {
-    fn from(e: BlockError) -> Self { BookError::Block(e) }
+    fn from(e: BlockError) -> Self {
+        BookError::Block(e)
+    }
 }
 
 impl fmt::Display for BookError {
@@ -149,12 +167,22 @@ pub struct StartPoint {
 }
 
 impl StartPoint {
-    pub fn pos(&self) -> u32 { self.pos }
-    pub fn state(&self) -> StateId { self.state }
-    pub fn reasons(&self) -> u8 { self.reasons }
+    pub fn pos(&self) -> u32 {
+        self.pos
+    }
+    pub fn state(&self) -> StateId {
+        self.state
+    }
+    pub fn reasons(&self) -> u8 {
+        self.reasons
+    }
     /// The lane whose head this is, while it is one.
-    pub fn lane(&self) -> Option<usize> { self.lane }
-    pub fn table(&self) -> &BlockTable { &self.table }
+    pub fn lane(&self) -> Option<usize> {
+        self.lane
+    }
+    pub fn table(&self) -> &BlockTable {
+        &self.table
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -186,18 +214,40 @@ impl BlockBook {
         Ok(BlockBook { geo, pools: BlockPools::new(slots), lanes: vec![lane; lanes], starts: vec![None; max_starts] })
     }
 
-    pub fn geometry(&self) -> Geometry { self.geo }
-    pub fn pools(&self) -> &BlockPools { &self.pools }
-    pub fn lane_count(&self) -> usize { self.lanes.len() }
-    pub fn running(&self, lane: usize) -> bool { self.lanes.get(lane).is_some_and(|l| l.running) }
-    pub fn pos(&self, lane: usize) -> u32 { self.lanes.get(lane).map_or(0, |l| l.pos) }
-    pub fn prompt(&self, lane: usize) -> u32 { self.lanes.get(lane).map_or(0, |l| l.prompt) }
-    pub fn head(&self, lane: usize) -> Option<usize> { self.lanes.get(lane).and_then(|l| l.head) }
-    pub fn table(&self, lane: usize) -> Option<&BlockTable> { self.lanes.get(lane).map(|l| &l.table) }
-    pub fn start(&self, id: usize) -> Option<&StartPoint> { self.starts.get(id).and_then(|s| s.as_ref()) }
-    pub fn start_ids(&self) -> usize { self.starts.len() }
+    pub fn geometry(&self) -> Geometry {
+        self.geo
+    }
+    pub fn pools(&self) -> &BlockPools {
+        &self.pools
+    }
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+    pub fn running(&self, lane: usize) -> bool {
+        self.lanes.get(lane).is_some_and(|l| l.running)
+    }
+    pub fn pos(&self, lane: usize) -> u32 {
+        self.lanes.get(lane).map_or(0, |l| l.pos)
+    }
+    pub fn prompt(&self, lane: usize) -> u32 {
+        self.lanes.get(lane).map_or(0, |l| l.prompt)
+    }
+    pub fn head(&self, lane: usize) -> Option<usize> {
+        self.lanes.get(lane).and_then(|l| l.head)
+    }
+    pub fn table(&self, lane: usize) -> Option<&BlockTable> {
+        self.lanes.get(lane).map(|l| &l.table)
+    }
+    pub fn start(&self, id: usize) -> Option<&StartPoint> {
+        self.starts.get(id).and_then(|s| s.as_ref())
+    }
+    pub fn start_ids(&self) -> usize {
+        self.starts.len()
+    }
 
-    fn lane(&self, lane: usize) -> Result<&Lane, BookError> { self.lanes.get(lane).ok_or(BookError::NoLane) }
+    fn lane(&self, lane: usize) -> Result<&Lane, BookError> {
+        self.lanes.get(lane).ok_or(BookError::NoLane)
+    }
 
     fn hold(&mut self, e: BlockEntry) -> Result<(), BookError> {
         self.pools.of_mut(e.kind()).record_mut(e.slot())?.add_ref()?;
@@ -218,13 +268,19 @@ impl BlockBook {
 
     /// Start a request of `prompt` positions on `lane`, cold or from start point `from`.
     pub fn begin(&mut self, lane: usize, prompt: u32, from: Option<usize>) -> Result<(), BookError> {
-        if self.lane(lane)?.running { return Err(BookError::LaneBusy); }
-        if prompt == 0 || prompt > self.geo.max_pos() { return Err(BookError::Prompt); }
+        if self.lane(lane)?.running {
+            return Err(BookError::LaneBusy);
+        }
+        if prompt == 0 || prompt > self.geo.max_pos() {
+            return Err(BookError::Prompt);
+        }
         let (table, pos) = match from {
             None => (BlockTable::new(self.geo.blocks)?, 0),
             Some(id) => {
                 let s = self.start(id).ok_or(BookError::NoStart)?;
-                if s.pos >= prompt { return Err(BookError::StartPastPrompt); }
+                if s.pos >= prompt {
+                    return Err(BookError::StartPastPrompt);
+                }
                 (s.table.clone(), s.pos)
             }
         };
@@ -239,11 +295,17 @@ impl BlockBook {
     /// slot of its pool, zeroed. Neither is taken unless both can be.
     pub fn alloc(&mut self, lane: usize, block: u32, gpu: &mut impl GpuSide) -> Result<(), BookError> {
         let l = self.lane(lane)?;
-        if !l.running { return Err(BookError::LaneIdle); }
-        if block < l.pos / self.geo.block || block >= self.geo.blocks { return Err(BookError::NotAhead); }
+        if !l.running {
+            return Err(BookError::LaneIdle);
+        }
+        if block < l.pos / self.geo.block || block >= self.geo.blocks {
+            return Err(BookError::NotAhead);
+        }
         let b = BlockIndex::new(block);
         for kind in KINDS {
-            if l.table.get(kind, b)?.is_some() { return Err(BookError::NotAhead); }
+            if l.table.get(kind, b)?.is_some() {
+                return Err(BookError::NotAhead);
+            }
         }
         let mut taken = [None; 2];
         for (i, kind) in KINDS.into_iter().enumerate() {
@@ -268,7 +330,9 @@ impl BlockBook {
     pub fn reserve(&mut self, lane: usize, c: u32, gpu: &mut impl GpuSide) -> Result<(), BookError> {
         let l = self.lane(lane)?;
         let end = l.pos.checked_add(c).ok_or(BookError::Span)?;
-        if c == 0 || end > self.geo.max_pos() { return Err(BookError::Span); }
+        if c == 0 || end > self.geo.max_pos() {
+            return Err(BookError::Span);
+        }
         for block in self.geo.span(l.pos, end - 1) {
             if self.lanes[lane].table.get(BlockKind::Full, BlockIndex::new(block))?.is_none() {
                 self.alloc(lane, block, gpu)?;
@@ -283,30 +347,43 @@ impl BlockBook {
     pub fn step(&mut self, lane: usize, c: u32, gpu: &mut impl GpuSide) -> Result<Option<usize>, BookError> {
         let geo = self.geo;
         let l = self.lane(lane)?;
-        if !l.running { return Err(BookError::LaneIdle); }
+        if !l.running {
+            return Err(BookError::LaneIdle);
+        }
         let pos = l.pos;
         let n = pos.checked_add(c).ok_or(BookError::Span)?;
-        if c == 0 || n > geo.max_pos() { return Err(BookError::Span); }
+        if c == 0 || n > geo.max_pos() {
+            return Err(BookError::Span);
+        }
         let mut written = Vec::new();
         for block in geo.span(pos, n - 1) {
             for kind in KINDS {
                 let e = l.table.get(kind, BlockIndex::new(block))?.ok_or(BookError::Span)?;
                 let rec = self.pools.of(kind).record(e.slot())?;
-                if rec.length() != geo.seen(pos, block) { return Err(BookError::Span); }
+                if rec.length() != geo.seen(pos, block) {
+                    return Err(BookError::Span);
+                }
                 written.push((e, geo.seen(n, block)));
             }
         }
         for (e, len) in written {
             let rec = self.pools.of_mut(e.kind()).record_mut(e.slot())?;
             rec.set_length(len)?;
-            if len == geo.block { rec.seal(); }
+            if len == geo.block {
+                rec.seal();
+            }
         }
         self.lanes[lane].pos = n;
         let history = geo.history(n);
-        let pruned: Vec<(BlockIndex, BlockEntry)> = self.lanes[lane].table.entries()
+        let pruned: Vec<(BlockIndex, BlockEntry)> = self.lanes[lane]
+            .table
+            .entries()
             .filter(|(b, e)| e.kind() == BlockKind::Window && !history.contains(&b.get()) && b.get() * geo.block < n)
             .collect();
-        for (b, e) in pruned { self.lanes[lane].table.set(BlockKind::Window, b, None)?; self.release(e)?; }
+        for (b, e) in pruned {
+            self.lanes[lane].table.set(BlockKind::Window, b, None)?;
+            self.release(e)?;
+        }
         self.keep_start(lane, gpu)
     }
 
@@ -315,23 +392,39 @@ impl BlockBook {
         let l = &self.lanes[lane];
         let n = l.pos;
         let last = l.prompt / geo.block * geo.block;
-        if !n.is_multiple_of(geo.block) || n > last { return Ok(None); }
-        if l.head.and_then(|h| self.start(h)).is_some_and(|h| h.pos >= n) { return Ok(None); }
+        if !n.is_multiple_of(geo.block) || n > last {
+            return Ok(None);
+        }
+        if l.head.and_then(|h| self.start(h)).is_some_and(|h| h.pos >= n) {
+            return Ok(None);
+        }
         let head_dies = l.head.and_then(|h| self.start(h)).is_some_and(|h| h.reasons == HEAD);
-        if !head_dies && self.starts.iter().all(|s| s.is_some()) { return Ok(None); }
+        if !head_dies && self.starts.iter().all(|s| s.is_some()) {
+            return Ok(None);
+        }
         let mut table = BlockTable::new(geo.blocks)?;
         for (kind, block) in geo.retained(n) {
             let b = BlockIndex::new(block);
             let e = l.table.get(kind, b)?.ok_or(BookError::Unsealed)?;
-            if !self.pools.of(kind).record(e.slot())?.sealed() { return Err(BookError::Unsealed); }
+            if !self.pools.of(kind).record(e.slot())?.sealed() {
+                return Err(BookError::Unsealed);
+            }
             table.set(kind, b, Some(e))?;
         }
         let mut reasons = HEAD;
-        if n == last { reasons |= PROMPT; }
-        if (n / geo.block).is_multiple_of(geo.every) { reasons |= EVERY; }
-        if let Some(h) = self.lanes[lane].head.take() { self.drop_reason(h, gpu)?; }
+        if n == last {
+            reasons |= PROMPT;
+        }
+        if (n / geo.block).is_multiple_of(geo.every) {
+            reasons |= EVERY;
+        }
+        if let Some(h) = self.lanes[lane].head.take() {
+            self.drop_reason(h, gpu)?;
+        }
         let id = self.starts.iter().position(|s| s.is_none()).ok_or(BookError::NoStart)?;
-        for (_, e) in table.entries() { self.hold(e)?; }
+        for (_, e) in table.entries() {
+            self.hold(e)?;
+        }
         let state = gpu.save_state(lane);
         self.starts[id] = Some(StartPoint { pos: n, state, reasons, lane: Some(lane), table });
         self.lanes[lane].head = Some(id);
@@ -343,7 +436,9 @@ impl BlockBook {
         let s = self.starts.get_mut(id).and_then(|s| s.as_mut()).ok_or(BookError::NoStart)?;
         s.reasons &= !HEAD;
         s.lane = None;
-        if s.reasons == 0 { self.drop_start(id, gpu)?; }
+        if s.reasons == 0 {
+            self.drop_start(id, gpu)?;
+        }
         Ok(())
     }
 
@@ -356,10 +451,14 @@ impl BlockBook {
 
     /// The request on `lane` ended. Its tails are dropped with its table.
     pub fn finish(&mut self, lane: usize, gpu: &mut impl GpuSide) -> Result<(), BookError> {
-        if !self.lane(lane)?.running { return Err(BookError::LaneIdle); }
+        if !self.lane(lane)?.running {
+            return Err(BookError::LaneIdle);
+        }
         let table = std::mem::replace(&mut self.lanes[lane].table, BlockTable::new(self.geo.blocks)?);
         self.release_table(&table)?;
-        if let Some(h) = self.lanes[lane].head.take() { self.drop_reason(h, gpu)?; }
+        if let Some(h) = self.lanes[lane].head.take() {
+            self.drop_reason(h, gpu)?;
+        }
         let l = &mut self.lanes[lane];
         l.running = false;
         l.prompt = 0;
@@ -371,7 +470,9 @@ impl BlockBook {
     pub fn retire(&mut self, id: usize, gpu: &mut impl GpuSide) -> Result<(), BookError> {
         self.drop_start(id, gpu)?;
         for l in &mut self.lanes {
-            if l.head == Some(id) { l.head = None; }
+            if l.head == Some(id) {
+                l.head = None;
+            }
         }
         Ok(())
     }
@@ -380,7 +481,9 @@ impl BlockBook {
     /// none without an entry, otherwise only what the lane has written.
     pub fn visible(&self, lane: usize, kind: BlockKind, block: u32) -> Result<Option<u32>, BookError> {
         let l = self.lane(lane)?;
-        if l.table.get(kind, BlockIndex::new(block))?.is_none() { return Ok(None); }
+        if l.table.get(kind, BlockIndex::new(block))?.is_none() {
+            return Ok(None);
+        }
         let start = block * self.geo.block;
         Ok(Some(l.pos.saturating_sub(start).min(self.geo.block)))
     }
@@ -400,7 +503,9 @@ mod tests {
     }
 
     impl GpuSide for Fake {
-        fn zero(&mut self, kind: BlockKind, slot: Slot) { self.zeroed.push((kind, slot.get())); }
+        fn zero(&mut self, kind: BlockKind, slot: Slot) {
+            self.zeroed.push((kind, slot.get()));
+        }
         fn save_state(&mut self, lane: usize) -> StateId {
             self.next += 1;
             self.states.insert(self.next, lane);
@@ -411,7 +516,9 @@ mod tests {
         }
     }
 
-    fn small() -> Geometry { Geometry { block: 2, window: 2, every: 2, blocks: 4 } }
+    fn small() -> Geometry {
+        Geometry { block: 2, window: 2, every: 2, blocks: 4 }
+    }
 
     fn rec(book: &BlockBook, kind: BlockKind, slot: u32) -> crate::blocks::SlotRecord {
         *book.pools().of(kind).record(Slot::new(slot).unwrap()).unwrap()
@@ -460,8 +567,16 @@ mod tests {
         let p = book.start(s).unwrap();
         assert_eq!(p.pos(), 6);
         let kinds: Vec<_> = p.table().entries().map(|(b, e)| (e.kind(), b.get())).collect();
-        assert_eq!(kinds, vec![(BlockKind::Full, 0), (BlockKind::Full, 1), (BlockKind::Window, 1),
-                               (BlockKind::Full, 2), (BlockKind::Window, 2)]);
+        assert_eq!(
+            kinds,
+            vec![
+                (BlockKind::Full, 0),
+                (BlockKind::Full, 1),
+                (BlockKind::Window, 1),
+                (BlockKind::Full, 2),
+                (BlockKind::Window, 2)
+            ]
+        );
         assert!(p.table().entries().all(|(_, e)| rec(&book, e.kind(), e.slot().get()).sealed()));
         assert_eq!(gpu.states.get(&p.state()), Some(&0));
     }
@@ -485,7 +600,8 @@ mod tests {
         // Decode past the prompt keeps no point.
         assert_eq!(run(&mut book, &mut gpu, 0, 1), None);
         book.finish(0, &mut gpu).unwrap();
-        let live: Vec<_> = (0..book.start_ids()).filter_map(|i| book.start(i)).map(|p| (p.pos(), p.reasons(), p.lane())).collect();
+        let live: Vec<_> =
+            (0..book.start_ids()).filter_map(|i| book.start(i)).map(|p| (p.pos(), p.reasons(), p.lane())).collect();
         assert_eq!(live, vec![(4, EVERY, None), (8, EVERY | PROMPT, None)]);
         assert_eq!(gpu.states.len(), 2);
     }
@@ -499,13 +615,15 @@ mod tests {
         while book.pos(0) + 512 <= 2944 {
             run(&mut book, &mut gpu, 0, 512);
         }
-        let mut live: Vec<_> = (0..book.start_ids()).filter_map(|i| book.start(i)).map(|p| (p.pos(), p.reasons())).collect();
+        let mut live: Vec<_> =
+            (0..book.start_ids()).filter_map(|i| book.start(i)).map(|p| (p.pos(), p.reasons())).collect();
         live.sort();
         assert_eq!(live, vec![(1024, EVERY), (2048, EVERY), (2560, HEAD)]);
         let p = (0..book.start_ids()).filter_map(|i| book.start(i)).find(|p| p.pos() == 2048).unwrap();
         // 32 full blocks and the 16 window blocks of positions 1024..2047.
         assert_eq!(p.table().entries().filter(|(_, e)| e.kind() == BlockKind::Full).count(), 32);
-        let w: Vec<_> = p.table().entries().filter(|(_, e)| e.kind() == BlockKind::Window).map(|(b, _)| b.get()).collect();
+        let w: Vec<_> =
+            p.table().entries().filter(|(_, e)| e.kind() == BlockKind::Window).map(|(b, _)| b.get()).collect();
         assert_eq!(w, (16..32).collect::<Vec<_>>());
         // The prompt's last boundary, 2944, is a prompt point.
         let last = run(&mut book, &mut gpu, 0, 384).unwrap();
@@ -551,7 +669,10 @@ mod tests {
         assert_eq!((again.slot(), again.generation()), (tail.slot(), tail.generation() + 1));
         let r = rec(&book, BlockKind::Window, again.slot().get());
         assert_eq!((r.length(), r.sealed()), (0, false));
-        assert_eq!(gpu.zeroed, vec![(BlockKind::Full, 1), (BlockKind::Window, 1), (BlockKind::Full, 1), (BlockKind::Window, 1)]);
+        assert_eq!(
+            gpu.zeroed,
+            vec![(BlockKind::Full, 1), (BlockKind::Window, 1), (BlockKind::Full, 1), (BlockKind::Window, 1)]
+        );
     }
 
     #[test]

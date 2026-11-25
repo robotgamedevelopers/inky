@@ -10,11 +10,7 @@ thread_local! {
 }
 
 pub(super) fn snapshot(planner: &ServeStepPlanner, lanes: usize) -> Option<Vec<u32>> {
-    FRAMES.with_borrow(|frames| {
-        frames
-            .as_ref()
-            .map(|_| (0..lanes).map(|i| planner.wait_ticks(i)).collect())
-    })
+    FRAMES.with_borrow(|frames| frames.as_ref().map(|_| (0..lanes).map(|i| planner.wait_ticks(i)).collect()))
 }
 
 pub(super) fn record(
@@ -29,10 +25,7 @@ pub(super) fn record(
     let mut spans = vec![0; lanes];
     let mut starts = vec![0; lanes];
     let mut select = |i: usize, p0: usize, len: usize| {
-        assert!(
-            len > 0 && spans[i] == 0,
-            "invalid or duplicate span in the step"
-        );
+        assert!(len > 0 && spans[i] == 0, "invalid or duplicate span in the step");
         spans[i] = len;
         starts[i] = p0;
     };
@@ -68,10 +61,7 @@ fn capture(work: impl FnOnce()) -> Vec<String> {
     FRAMES.with_borrow_mut(|frames| assert!(frames.replace(Vec::new()).is_none()));
     work();
     let frames = FRAMES.with_borrow_mut(Option::take).unwrap();
-    assert!(
-        !frames.is_empty(),
-        "workload did not reach the serving planner"
-    );
+    assert!(!frames.is_empty(), "workload did not reach the serving planner");
     frames
 }
 
@@ -103,12 +93,7 @@ fn walk(mut seed: u64) -> Vec<String> {
     };
     capture(|| {
         let mut planner = ServeStepPlanner::new(LANES, SERVE_STEP_MAX_BYPASS);
-        let mut inputs = [ServeLaneInput {
-            runnable: true,
-            n_past: 0,
-            pf_end: 0,
-            has_pending_decode: true,
-        }; LANES];
+        let mut inputs = [ServeLaneInput { runnable: true, n_past: 0, pf_end: 0, has_pending_decode: true }; LANES];
         for (i, input) in inputs.iter_mut().enumerate() {
             planner.on_admit(i);
             if i >= 2 {
@@ -127,8 +112,7 @@ fn walk(mut seed: u64) -> Vec<String> {
                     lane.n_past = next() % ALIGN;
                     lane.pf_end = lane.n_past + 1 + next() % 256;
                 }
-                lane.has_pending_decode =
-                    lane.n_past >= lane.pf_end && (!random || next() % 4 != 0);
+                lane.has_pending_decode = lane.n_past >= lane.pf_end && (!random || next() % 4 != 0);
             }
             let budget = if random { next() % 160 } else { 128 };
             match plan(&mut planner, &inputs, budget, ALIGN) {
@@ -155,9 +139,7 @@ fn seeded_decisions_are_repeatable() {
         let frames = walk(seed);
         assert_eq!(frames.len(), 64);
         let burst = super::step::SERVE_STEP_MAX_BYPASS as usize;
-        assert!(frames[..burst]
-            .iter()
-            .all(|f| f.contains(r#""mode":"decode""#)));
+        assert!(frames[..burst].iter().all(|f| f.contains(r#""mode":"decode""#)));
         assert!(frames[burst].contains(r#""mode":"prefill""#));
         assert!(frames.last().unwrap().contains(r#""mode":"idle""#));
         assert_eq!(frames, walk(seed));

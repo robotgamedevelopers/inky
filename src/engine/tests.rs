@@ -108,8 +108,10 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
     private.prefill(&[(long, 0, long_tokens.len()), (short, prefix, append)]);
     let got = private.logits(1);
     assert_eq!(got.len(), want.len());
-    assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
-            "private multi-lane logits must match the independent paged lane");
+    assert!(
+        got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "private multi-lane logits must match the independent paged lane"
+    );
 
     // Inspect both K and V across all NKV=8 head groups (serving all NH=24 query heads)
     // after the final private sliding-window layer.
@@ -124,8 +126,10 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
             let live_end = first + append * row_bytes;
             let tile_end = live_end + 63 * row_bytes;
             assert!(bytes[first..live_end].iter().any(|&b| b != 0), "group {group} live rows empty");
-            assert!(bytes[live_end..tile_end].iter().all(|&b| b == 0),
-                    "group {group}: masked scratch rows still hold the previous private lane's values");
+            assert!(
+                bytes[live_end..tile_end].iter().all(|&b| b == 0),
+                "group {group}: masked scratch rows still hold the previous private lane's values"
+            );
         }
     }
 }
@@ -187,9 +191,9 @@ fn disk_tier_matches_resident_logits_across_32k_staging_resize_transition() {
             r.step(pos, true, false).wait(pos).unwrap();
             let lg = r.logits();
             assert!(lg.iter().all(|x| x.is_finite()), "non-finite logit at pos={pos} disk={use_disk}");
-            let h = lg.iter().fold(0xcbf29ce484222325u64, |acc, x| {
-                (acc ^ u64::from(x.to_bits())).wrapping_mul(0x100000001b3)
-            });
+            let h = lg
+                .iter()
+                .fold(0xcbf29ce484222325u64, |acc, x| (acc ^ u64::from(x.to_bits())).wrapping_mul(0x100000001b3));
             hashes.push(h);
         }
         let read_bytes = r.tier_io().0;
@@ -202,20 +206,16 @@ fn disk_tier_matches_resident_logits_across_32k_staging_resize_transition() {
     assert!(dsk_io > 0, "expected --kv-disk to read cold blocks across 32,756..=32,832");
     for (idx, (&hr, &hd)) in res_hashes.iter().zip(&dsk_hashes).enumerate() {
         let pos = pf_len + idx;
-        assert_eq!(
-            hd, hr,
-            "--kv-disk logit bits diverged from resident cache at pos={pos} ({hd:016x} != {hr:016x})"
-        );
+        assert_eq!(hd, hr, "--kv-disk logit bits diverged from resident cache at pos={pos} ({hd:016x} != {hr:016x})");
     }
 }
 
 #[test]
 fn projection_segments_preserve_q8_attention_geometry() {
-    let weights = QW { ty: T_Q8_0, k: E as u32, rows: (NH * HD) as u32,
-        row_bytes: (E / 32 * 34) as u32, ..Default::default() };
+    let weights =
+        QW { ty: T_Q8_0, k: E as u32, rows: (NH * HD) as u32, row_bytes: (E / 32 * 34) as u32, ..Default::default() };
     let seg = Engine::seg(&weights, 12, 34);
-    assert_eq!((seg.wtype, seg.k, seg.nrows, seg.row_bytes),
-               (T_Q8_0, weights.k, weights.rows, weights.row_bytes));
+    assert_eq!((seg.wtype, seg.k, seg.nrows, seg.row_bytes), (T_Q8_0, weights.k, weights.rows, weights.row_bytes));
 }
 
 #[test]
@@ -267,28 +267,17 @@ fn router_handles_nonfinite_scores() {
     ] {
         unsafe {
             let bias = std::slice::from_raw_parts_mut(pb.contents().as_ptr().cast::<f32>(), NEXP);
-            let scores = std::slice::from_raw_parts_mut(
-                act.contents().as_ptr().cast::<f32>().add(b.rlog as usize),
-                NEXP,
-            );
-            let sel = std::slice::from_raw_parts_mut(
-                act.contents().as_ptr().cast::<f32>().add(b.sel as usize),
-                2 * TOPK,
-            );
+            let scores =
+                std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>().add(b.rlog as usize), NEXP);
+            let sel =
+                std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK);
             bias.fill(bias_val);
             scores.fill(logit_val);
             sel.fill(-1.0);
         }
 
         // 1. Standalone batched top-k (`k_topk_b` via real `TopkBArgs`).
-        let ta = TopkBArgs {
-            logits_off: b.rlog,
-            bias_off: 0,
-            sel_off: b.sel,
-            t: 1,
-            wscale: 1.0,
-            pad: [0; 3],
-        };
+        let ta = TopkBArgs { logits_off: b.rlog, bias_off: 0, sel_off: b.sel, t: 1, wscale: 1.0, pad: [0; 3] };
         let cb = gpu.cmd();
         let e = Enc::new(&cb);
         e.buf(&pb, 0, 1);
@@ -300,9 +289,8 @@ fn router_handles_nonfinite_scores() {
         cb.commit();
         cb.waitUntilCompleted();
         Engine::assert_cmd_ok(&cb, "router_handles_nonfinite_scores(k_topk_b)");
-        let out = unsafe {
-            std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK) };
         for (i, &id) in out[..TOPK].iter().enumerate() {
             assert_eq!(id, i as f32, "k_topk_b id[{i}] on ({logit_val}, {bias_val})");
         }
@@ -339,16 +327,13 @@ fn router_handles_nonfinite_scores() {
         cb2.commit();
         cb2.waitUntilCompleted();
         Engine::assert_cmd_ok(&cb2, "router_handles_nonfinite_scores(k_moe_topk_route3)");
-        let out2 = unsafe {
-            std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK)
-        };
+        let out2 =
+            unsafe { std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK) };
         for (i, &id) in out2[..TOPK].iter().enumerate() {
             assert_eq!(id, i as f32, "k_moe_topk_route3 id[{i}] on ({logit_val}, {bias_val})");
         }
         assert_eq!(out2[TOPK..], [want_w; TOPK]);
-        let ind = unsafe {
-            std::slice::from_raw_parts(act.contents().as_ptr().cast::<u32>().add(b.ind as usize), 8)
-        };
+        let ind = unsafe { std::slice::from_raw_parts(act.contents().as_ptr().cast::<u32>().add(b.ind as usize), 8) };
         assert_eq!(ind[0], 0, "class 0 tile count must be 0 for t=1");
         assert_eq!(ind[4], TOPK as u32, "class 1 must emit 1 tile per distinct expert");
     }
@@ -357,7 +342,9 @@ fn router_handles_nonfinite_scores() {
 #[test]
 #[ignore = "requires Metal 4"]
 fn k_attn_b_and_blk_are_split_invariant_across_sliding_window() {
-    use crate::blocks::{key_row, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, BLOCK as KV_BLOCK, CLEARED_GPU_TABLE_ENTRY};
+    use crate::blocks::{
+        key_row, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, BLOCK as KV_BLOCK, CLEARED_GPU_TABLE_ENTRY,
+    };
 
     let src = format!("{}\n{}", include_str!("../kernels.metal"), include_str!("../prefill.metal"));
     let gpu = Gpu::new(&src, &["k_attn_b", "k_attn_b_blk"]);
@@ -413,18 +400,16 @@ fn k_attn_b_and_blk_are_split_invariant_across_sliding_window() {
 
     unsafe {
         let pb_f = std::slice::from_raw_parts_mut(pb.contents().as_ptr().cast::<f32>(), EXT * NREL);
-        for x in pb_f.iter_mut() { *x = rnd() * 0.25; }
+        for x in pb_f.iter_mut() {
+            *x = rnd() * 0.25;
+        }
 
-        let a_f = std::slice::from_raw_parts_mut(
-            act.contents().as_ptr().cast::<f32>(),
-            out_split_off + out_len,
-        );
-        for slot in a_f.iter_mut().take(gate_off + gate_len) { *slot = rnd(); }
+        let a_f = std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>(), out_split_off + out_len);
+        for slot in a_f.iter_mut().take(gate_off + gate_len) {
+            *slot = rnd();
+        }
 
-        let kv_h = std::slice::from_raw_parts_mut(
-            kv_lin.contents().as_ptr().cast::<u16>(),
-            2 * NKV * total * HD,
-        );
+        let kv_h = std::slice::from_raw_parts_mut(kv_lin.contents().as_ptr().cast::<u16>(), 2 * NKV * total * HD);
         let slabs = pools.window.gpu_slabs();
         for p in 0..total {
             let blk = p / KV_BLOCK;
@@ -452,10 +437,7 @@ fn k_attn_b_and_blk_are_split_invariant_across_sliding_window() {
 
     let run_linear = |ranges: &[(usize, usize)], out_base: usize| {
         unsafe {
-            let a_f = std::slice::from_raw_parts_mut(
-                act.contents().as_ptr().cast::<f32>().add(out_base),
-                out_len,
-            );
+            let a_f = std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>().add(out_base), out_len);
             a_f.fill(f32::NAN);
         }
         for &(p0, chunk_t) in ranges {
@@ -494,10 +476,7 @@ fn k_attn_b_and_blk_are_split_invariant_across_sliding_window() {
 
     let run_blocked = |ranges: &[(usize, usize)], out_base: usize, clear_expired: bool| {
         unsafe {
-            let a_f = std::slice::from_raw_parts_mut(
-                act.contents().as_ptr().cast::<f32>().add(out_base),
-                out_len,
-            );
+            let a_f = std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>().add(out_base), out_len);
             a_f.fill(f32::NAN);
         }
         let slabs = pools.window.gpu_slabs();
@@ -797,7 +776,10 @@ fn fixed_decode_split_grid_boundaries_and_max_ctx_scaling() {
     assert_eq!(decode_split_kps(false, 131_136), 1024);
     assert_eq!(decode_split_kps(false, 262_144), 1024);
 
-    for &pos in &[0usize, 1, 62, 63, 64, 65, 510, 511, 512, 513, 1022, 1023, 1024, 1025, 1086, 1087, 1088, 16_383, 16_384, 131_071] {
+    for &pos in &[
+        0usize, 1, 62, 63, 64, 65, 510, 511, 512, 513, 1022, 1023, 1024, 1025, 1086, 1087, 1088, 16_383, 16_384,
+        131_071,
+    ] {
         for &swa in &[true, false] {
             let (first_pos, kps, sp_lo, nsplit) = decode_split_grid(swa, pos, 131_072);
             assert!((1..=MAX_SPLIT).contains(&nsplit));
@@ -837,7 +819,10 @@ fn fixed_decode_split_grid_boundaries_and_max_ctx_scaling() {
 #[test]
 fn grouped_decode_layout_invariants_and_boundaries() {
     use std::collections::BTreeSet;
-    let check_invariants = |ranges: &[(usize, usize)], kps: usize, groups: &[DecAttnGroup], block_entry: &dyn Fn(usize, usize) -> Option<(u32, u32)>| {
+    let check_invariants = |ranges: &[(usize, usize)],
+                            kps: usize,
+                            groups: &[DecAttnGroup],
+                            block_entry: &dyn Fn(usize, usize) -> Option<(u32, u32)>| {
         let blks_per_split = kps / crate::blocks::BLOCK;
         let mut seen = BTreeSet::new();
         for g in groups {
@@ -854,7 +839,10 @@ fn grouped_decode_layout_invariants_and_boundaries() {
                 assert!(abs_sp >= first_pos / kps && abs_sp <= pos / kps);
                 if g.count > 1 {
                     // Grouped lanes MUST be strictly interior (no partial start, no p == pos)
-                    assert!(first_pos <= split_start && pos >= split_end, "non-interior lane grouped at abs_sp={abs_sp}");
+                    assert!(
+                        first_pos <= split_start && pos >= split_end,
+                        "non-interior lane grouped at abs_sp={abs_sp}"
+                    );
                     // AND MUST have identical Some((slot != 0, gen != 0)) across ALL blocks in the split.
                     for b in 0..blks_per_split {
                         let blk = abs_sp * blks_per_split + b;
@@ -880,10 +868,8 @@ fn grouped_decode_layout_invariants_and_boundaries() {
     let boundary_positions = [63usize, 64, 65, 511, 512, 513, 1023, 1024, 1025];
     let shared_all = |_si: usize, blk: usize| Some(((blk as u32) + 1, 7u32));
     for &(swa, kps) in &[(true, 64usize), (false, 512usize)] {
-        let ranges: Vec<(usize, usize)> = boundary_positions
-            .iter()
-            .map(|&p| (if swa { (p + 1).saturating_sub(EXT) } else { 0 }, p))
-            .collect();
+        let ranges: Vec<(usize, usize)> =
+            boundary_positions.iter().map(|&p| (if swa { (p + 1).saturating_sub(EXT) } else { 0 }, p)).collect();
         let grps = build_decode_groups(&ranges, kps, false, shared_all);
         check_invariants(&ranges, kps, &grps, &shared_all);
         let grps_off = build_decode_groups(&ranges, kps, true, shared_all);
@@ -919,7 +905,11 @@ fn grouped_decode_layout_invariants_and_boundaries() {
     let grps_div = build_decode_groups(&ranges_div, 512, false, div_blocks);
     check_invariants(&ranges_div, 512, &grps_div, &div_blocks);
     let sp0_grps: Vec<&DecAttnGroup> = grps_div.iter().filter(|g| g.abs_sp == 0).collect();
-    assert_eq!(sp0_grps.len(), 3, "only lanes 0 & 1 may group on split 0; lane 2 (blk3 diff) & lane 3 (gen diff) must be separate");
+    assert_eq!(
+        sp0_grps.len(),
+        3,
+        "only lanes 0 & 1 may group on split 0; lane 2 (blk3 diff) & lane 3 (gen diff) must be separate"
+    );
     assert!(sp0_grps.iter().any(|g| g.count == 2 && g.span_idx[0] == 0 && g.span_idx[1] == 1));
 
     // 3. 20 lanes sharing an 8192-token (16 full splits) prefix with staggered decode positions -> G_MAX = 8 packing!
@@ -1038,9 +1028,7 @@ fn metal_shader_declarations_and_compiler_validation() {
     // Validate every kernel listed in `KERNELS` is declared in the shader source.
     for &name in KERNELS {
         let decl = format!("kernel void {name}(");
-        let macro_decl = name.starts_with("k_mix_b_")
-            || name.starts_with("k_gemm_sg")
-            || name.starts_with("k_moe_sg");
+        let macro_decl = name.starts_with("k_mix_b_") || name.starts_with("k_gemm_sg") || name.starts_with("k_moe_sg");
         if !macro_decl {
             assert!(full_src.contains(&decl), "missing Metal kernel declaration `{decl}`");
         }
@@ -1073,16 +1061,12 @@ fn metal_shader_declarations_and_compiler_validation() {
     let stripped_kernels = kernels_src
         .replace("#include <metal_tensor>\n", "")
         .replace("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n", "");
-    let topk_route_start = prefill_src
-        .find("struct TopkRoute3Args")
-        .expect("TopkRoute3Args in prefill.metal");
+    let topk_route_start = prefill_src.find("struct TopkRoute3Args").expect("TopkRoute3Args in prefill.metal");
     let topk_route_end = prefill_src[topk_route_start..]
         .find("\n// ---- expert sum per token")
         .map(|rel| topk_route_start + rel)
         .unwrap_or(prefill_src.len());
-    let postconv_start = prefill_src
-        .find("struct PostConvDecArgs")
-        .expect("PostConvDecArgs in prefill.metal");
+    let postconv_start = prefill_src.find("struct PostConvDecArgs").expect("PostConvDecArgs in prefill.metal");
     let postconv_end = prefill_src[postconv_start..]
         .find("\n// ---- per-position conv state")
         .map(|rel| postconv_start + rel)
@@ -1296,7 +1280,9 @@ fn engine_slice_bounds_and_refcell_borrow_lifetime_guard() {
         let buf = dev.newBufferWithLength_options(64, MTLResourceOptions::StorageModeShared).unwrap();
         unsafe {
             let s = std::slice::from_raw_parts_mut(buf.contents().as_ptr().cast::<f32>(), 16);
-            for (i, v) in s.iter_mut().enumerate() { *v = (i + 1) as f32; }
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (i + 1) as f32;
+            }
         }
         let cell = RefCell::new(buf);
         {
@@ -1344,91 +1330,92 @@ fn loopcd_weak_buffer_sizing_and_budget_accounting() {
 
 #[test]
 fn wave2a_decode_dispatch_and_barrier_reduction_32_lanes() {
-    let count_step = |n_lanes: usize, hgemm: bool, logits: bool, argmax: bool, skip: u32, wave2a: bool| -> (usize, usize) {
-        let mut dispatches = 0usize;
-        let mut barriers = 0usize;
-        let add_go = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
-            if skip & (1 << cls) == 0 {
-                *d += count;
+    let count_step =
+        |n_lanes: usize, hgemm: bool, logits: bool, argmax: bool, skip: u32, wave2a: bool| -> (usize, usize) {
+            let mut dispatches = 0usize;
+            let mut barriers = 0usize;
+            let add_go = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
+                if skip & (1 << cls) == 0 {
+                    *d += count;
+                    *b += 1;
+                }
+            };
+            let add_tohalf = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
+                if skip & (1 << cls) == 0 {
+                    *d += count;
+                }
                 *b += 1;
-            }
-        };
-        let add_tohalf = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
-            if skip & (1 << cls) == 0 {
-                *d += count;
-            }
-            *b += 1;
-        };
-        add_go(&mut dispatches, &mut barriers, C_EMBED, 1);
+            };
+            add_go(&mut dispatches, &mut barriers, C_EMBED, 1);
 
-        let n_uncontrolled = LOOP_START + (LOOP_END - LOOP_START) + (N_PHYS - LOOP_END);
-        let n_controlled = (N_PASS - 1) * (LOOP_END - LOOP_START);
-        assert_eq!(n_uncontrolled + n_controlled, N_SLOT);
-        assert_eq!(n_uncontrolled, 24);
-        assert_eq!(n_controlled, 24);
+            let n_uncontrolled = LOOP_START + (LOOP_END - LOOP_START) + (N_PHYS - LOOP_END);
+            let n_controlled = (N_PASS - 1) * (LOOP_END - LOOP_START);
+            assert_eq!(n_uncontrolled + n_controlled, N_SLOT);
+            assert_eq!(n_uncontrolled, 24);
+            assert_eq!(n_controlled, 24);
 
-        for controlled in [false, true] {
-            let repeat = if controlled { n_controlled } else { n_uncontrolled };
-            for _ in 0..repeat {
-                if controlled {
-                    add_go(&mut dispatches, &mut barriers, C_MIXA, 2);
-                    let fuse_down = wave2a && ctrl_down_direct_half(skip);
-                    add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
-                    if !fuse_down {
-                        add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 3);
+            for controlled in [false, true] {
+                let repeat = if controlled { n_controlled } else { n_uncontrolled };
+                for _ in 0..repeat {
+                    if controlled {
+                        add_go(&mut dispatches, &mut barriers, C_MIXA, 2);
+                        let fuse_down = wave2a && ctrl_down_direct_half(skip);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
+                        if !fuse_down {
+                            add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 3);
+                        }
+                        add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
+                    } else {
+                        add_go(&mut dispatches, &mut barriers, C_MIXA, 1);
                     }
-                    add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
-                    add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
-                } else {
-                    add_go(&mut dispatches, &mut barriers, C_MIXA, 1);
-                }
-                add_go(&mut dispatches, &mut barriers, C_QKV, 1);
-                add_go(&mut dispatches, &mut barriers, C_ATTN, 1);
-                add_go(&mut dispatches, &mut barriers, C_COMB, 1);
-                let direct_half = wave2a && decode_combine_direct_half(hgemm, skip);
-                if !direct_half {
-                    add_tohalf(&mut dispatches, &mut barriers, C_WO, 1);
-                }
-                add_go(&mut dispatches, &mut barriers, C_WO, 1);
-                add_go(&mut dispatches, &mut barriers, C_WOPOST, 1);
-                add_go(&mut dispatches, &mut barriers, C_MIXF, 1);
-                if controlled {
-                    let fuse_down = wave2a && ctrl_down_direct_half(skip);
-                    add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
-                    if !fuse_down {
-                        add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                    add_go(&mut dispatches, &mut barriers, C_QKV, 1);
+                    add_go(&mut dispatches, &mut barriers, C_ATTN, 1);
+                    add_go(&mut dispatches, &mut barriers, C_COMB, 1);
+                    let direct_half = wave2a && decode_combine_direct_half(hgemm, skip);
+                    if !direct_half {
+                        add_tohalf(&mut dispatches, &mut barriers, C_WO, 1);
                     }
-                    add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
-                    add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
-                }
-                add_go(&mut dispatches, &mut barriers, C_ROUTER, 1);
-                if wave2a && use_fused_topk_route3(hgemm, n_lanes) {
-                    add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
-                } else {
-                    add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
-                    add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
-                }
-                add_tohalf(&mut dispatches, &mut barriers, C_GATHER, 1);
-                let cls_start = if wave2a { moe_class_start(n_lanes) } else { 0 };
-                let n_cls = MOE_CLS.len() - cls_start;
-                add_go(&mut dispatches, &mut barriers, C_GU, n_cls);
-                add_go(&mut dispatches, &mut barriers, C_DOWN, n_cls);
-                add_go(&mut dispatches, &mut barriers, C_COMB2, 1);
-                add_go(&mut dispatches, &mut barriers, C_FFNPOST, 1);
-            }
-        }
-        if logits {
-            add_go(&mut dispatches, &mut barriers, C_OMIX, 1);
-            add_go(&mut dispatches, &mut barriers, C_LMHEAD, 1);
-            if argmax {
-                for _ in 0..n_lanes {
-                    add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
-                    add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
+                    add_go(&mut dispatches, &mut barriers, C_WO, 1);
+                    add_go(&mut dispatches, &mut barriers, C_WOPOST, 1);
+                    add_go(&mut dispatches, &mut barriers, C_MIXF, 1);
+                    if controlled {
+                        let fuse_down = wave2a && ctrl_down_direct_half(skip);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
+                        if !fuse_down {
+                            add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                        }
+                        add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
+                    }
+                    add_go(&mut dispatches, &mut barriers, C_ROUTER, 1);
+                    if wave2a && use_fused_topk_route3(hgemm, n_lanes) {
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
+                    } else {
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
+                    }
+                    add_tohalf(&mut dispatches, &mut barriers, C_GATHER, 1);
+                    let cls_start = if wave2a { moe_class_start(n_lanes) } else { 0 };
+                    let n_cls = MOE_CLS.len() - cls_start;
+                    add_go(&mut dispatches, &mut barriers, C_GU, n_cls);
+                    add_go(&mut dispatches, &mut barriers, C_DOWN, n_cls);
+                    add_go(&mut dispatches, &mut barriers, C_COMB2, 1);
+                    add_go(&mut dispatches, &mut barriers, C_FFNPOST, 1);
                 }
             }
-        }
-        (dispatches, barriers)
-    };
+            if logits {
+                add_go(&mut dispatches, &mut barriers, C_OMIX, 1);
+                add_go(&mut dispatches, &mut barriers, C_LMHEAD, 1);
+                if argmax {
+                    for _ in 0..n_lanes {
+                        add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
+                        add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
+                    }
+                }
+            }
+            (dispatches, barriers)
+        };
 
     // 32-lane blocked decode (hgemm=true, logits=true, argmax=false, skip=0):
     //   Opt 1 (combine direct half):        -48 dispatches, -48 barriers
@@ -1583,8 +1570,7 @@ fn loopcd_blend_reference_identities_and_adaptive_schedule() {
     for v in 0..z3_orig.len() {
         for u in 0..z3_orig.len() {
             let lhs = log_p[v] - log_p[u];
-            let rhs = (1.0 + wt) * (cap(z3_orig[v]) - cap(z3_orig[u]))
-                - wt * (cap(z1_orig[v]) - cap(z1_orig[u]));
+            let rhs = (1.0 + wt) * (cap(z3_orig[v]) - cap(z3_orig[u])) - wt * (cap(z1_orig[v]) - cap(z1_orig[u]));
             assert!((lhs - rhs).abs() < 1e-4, "pair ({v},{u}): lhs={lhs} rhs={rhs}");
         }
     }
@@ -1612,8 +1598,12 @@ fn loopcd_parallel_top2_butterfly_matches_exact_sort() {
                 let mut v = tid;
                 while v < vals.len() {
                     let s = vals[v];
-                    if s >= m1[lane] { m2[lane] = m1[lane]; m1[lane] = s; }
-                    else if s > m2[lane] { m2[lane] = s; }
+                    if s >= m1[lane] {
+                        m2[lane] = m1[lane];
+                        m1[lane] = s;
+                    } else if s > m2[lane] {
+                        m2[lane] = s;
+                    }
                     v += 1024;
                 }
             }
@@ -1679,7 +1669,13 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
         let mut cur = 0usize;
         let mut max_live = 0usize;
 
-        let mut step_layer = |va: &mut VecAlloc, ip: usize, cur: usize, blocks: &mut Vec<usize>, pinned: &[usize], guard: &[usize]| -> usize {
+        let mut step_layer = |va: &mut VecAlloc,
+                              ip: usize,
+                              cur: usize,
+                              blocks: &mut Vec<usize>,
+                              pinned: &[usize],
+                              guard: &[usize]|
+         -> usize {
             let block_start = ip.is_multiple_of(BLOCK);
             let mut live: Vec<usize> = blocks.clone();
             live.push(cur);
@@ -1691,7 +1687,9 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
             let mid = va.alloc(&live);
             assert!(!guard.contains(&mid), "mid={mid} collided with protected slot {guard:?}");
             assert!(!live.contains(&mid));
-            if block_start { blocks.push(cur); }
+            if block_start {
+                blocks.push(cur);
+            }
 
             let mut live2: Vec<usize> = blocks.clone();
             live2.push(mid);
@@ -1715,8 +1713,18 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
         let mut bank = (0usize, 0usize);
 
         for pass in 0..N_PASS {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            if pass > 0 {
+                cur = prelude;
+                blocks = prelude_blocks.clone();
+            }
+            let pinned: Vec<usize> = {
+                let mut p = vec![prelude];
+                if pass > 0 {
+                    p.push(bank.0);
+                    p.push(bank.1);
+                }
+                p
+            };
             for ip in LOOP_START..LOOP_END {
                 cur = step_layer(&mut va, ip, cur, &mut blocks, &pinned, &pinned);
             }
@@ -1729,7 +1737,11 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
                 for ip in LOOP_END..N_PHYS {
                     cur_w = step_layer(&mut va, ip, cur_w, &mut blocks_w, &pinned_w, &pinned_w);
                 }
-                assert_eq!(blocks_w.len(), 4, "weak coda must produce all 4 depth-residual block states for output_res_query");
+                assert_eq!(
+                    blocks_w.len(),
+                    4,
+                    "weak coda must produce all 4 depth-residual block states for output_res_query"
+                );
                 assert_ne!(cur_w, prelude);
                 assert_ne!(cur_w, bank.0);
                 assert_ne!(cur_w, bank.1);
@@ -1739,7 +1751,11 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
             cur = step_layer(&mut va, ip, cur, &mut blocks, &[], &[]);
         }
         assert_eq!(blocks.len(), 4);
-        assert!(max_live < n_vec - 1, "peak non-zero live vectors ({max_live}) must fit within n_vec-1 ({})", n_vec - 1);
+        assert!(
+            max_live < n_vec - 1,
+            "peak non-zero live vectors ({max_live}) must fit within n_vec-1 ({})",
+            n_vec - 1
+        );
         assert_ne!(cur, 0);
     }
 }
@@ -1769,11 +1785,7 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
         prune: RefCell::new(None),
         block_table: RefCell::new(BlockTable::new(32).unwrap()),
         use_blocks: Cell::new(true),
-        blocked_slot: Some(BlockedSlot {
-            slab: slab.clone(),
-            slot_idx,
-            bt_blocks: 32,
-        }),
+        blocked_slot: Some(BlockedSlot { slab: slab.clone(), slot_idx, bt_blocks: 32 }),
     };
 
     let ensure_blocks = |pools: &mut BlockPools, lane: &Lane, p0: usize, t: usize| {
@@ -1838,8 +1850,16 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
             assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((1, 1)));
             assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((1, 1)));
         } else {
-            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), None, "pos={pos} must have clean Full table");
-            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), None, "pos={pos} must have clean Window table");
+            assert_eq!(
+                lane.block_table.borrow().dirty_range(BlockKind::Full),
+                None,
+                "pos={pos} must have clean Full table"
+            );
+            assert_eq!(
+                lane.block_table.borrow().dirty_range(BlockKind::Window),
+                None,
+                "pos={pos} must have clean Window table"
+            );
         }
         let written = sync_blocked_lane_table(&pools, &lane, pos, 1);
         if pos == 64 {
@@ -1853,10 +1873,7 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
     for swa in [false, true] {
         lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
             let dst = unsafe {
-                std::slice::from_raw_parts(
-                    (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
-                    cap_blk,
-                )
+                std::slice::from_raw_parts((bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64, cap_blk)
             };
             assert!(dst[2..32].iter().all(|&w| w == 0xDEAD_BEEF_CAFE_BABEu64));
         });
@@ -1932,9 +1949,7 @@ fn loopcd_mixed_batch_preserves_disabled_rows() {
     let strong = [a, next, 1.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0, f32::NAN, 4.0];
     let weak = [f32::NAN, 0.0, 3.0, -2.0, 0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, 2.0, f32::NAN];
     let omegas = [0.0f32, 0.5, 0.5, 0.5, 0.5];
-    let args = LoopCdArgs {
-        logits_off: 0, n: 2, stride: 2, pad0: 0, softcap: 30.0, pad1: 0, pad2: 0, pad3: 0,
-    };
+    let args = LoopCdArgs { logits_off: 0, n: 2, stride: 2, pad0: 0, softcap: 30.0, pad1: 0, pad2: 0, pad3: 0 };
     let gpu = Gpu::new(include_str!("../kernels.metal"), &["k_loopcd_blend"]);
     let strong_buf = gpu.buffer_with(&strong.map(f32::to_ne_bytes).concat());
     let weak_buf = gpu.buffer_with(&weak.map(f32::to_ne_bytes).concat());
@@ -2050,7 +2065,10 @@ fn blocked_slab_alloc_reuse_zero_fill_and_strided_growth() {
         let cs0 = sb.cs_f32_base(0) as usize;
         assert!(cs[cs0..cs0 + CS_STRIDE_F32].iter().all(|&x| x == 0.0), "reused cs_buf slice must be zeroed");
         let bt0 = sb.bt_u64_base(0, false);
-        assert!(bt[bt0..bt0 + 2 * sb.bt_stride_u64].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY), "reused bt_buf slice must be reset to CLEARED_GPU_TABLE_ENTRY");
+        assert!(
+            bt[bt0..bt0 + 2 * sb.bt_stride_u64].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY),
+            "reused bt_buf slice must be reset to CLEARED_GPU_TABLE_ENTRY"
+        );
         // Live slot 2 must remain completely intact!
         assert_eq!(cs[sb.cs_f32_base(2) as usize], 12.5);
     }
@@ -2075,7 +2093,10 @@ fn blocked_slab_alloc_reuse_zero_fill_and_strided_growth() {
                 let want = (3u64 << 40) | ((u64::from(swa)) << 32) | (b as u64 + 1);
                 assert_eq!(bt[base + b], want, "slot 2 swa={swa} b={b} lost across stride growth");
             }
-            assert!(bt[base + 32..base + 96].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY), "grown stride tail must be CLEARED_GPU_TABLE_ENTRY");
+            assert!(
+                bt[base + 32..base + 96].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY),
+                "grown stride tail must be CLEARED_GPU_TABLE_ENTRY"
+            );
         }
         // Recycled slot 1 must be completely zeroed across all `2 * 96` u64 entries!
         let bt1 = sb.bt_u64_base(1, false);
@@ -2288,7 +2309,11 @@ fn dspark_gpu_guards_and_rejection_sampling_gate() {
         z_q[id] = lq;
     }
     let softcap_fn = |x: f32| -> f32 {
-        if eng.softcap > 0.0 { eng.softcap * (x / eng.softcap).tanh() } else { x }
+        if eng.softcap > 0.0 {
+            eng.softcap * (x / eng.softcap).tanh()
+        } else {
+            x
+        }
     };
     let softmax = |z: &[f32]| -> Vec<f64> {
         let capped: Vec<f64> = z[..nv].iter().map(|&x| softcap_fn(x) as f64).collect();
@@ -2313,9 +2338,8 @@ fn dspark_gpu_guards_and_rejection_sampling_gate() {
         target_arena.extend_from_slice(&z_t);
         draft_arena.extend_from_slice(&z_q);
     }
-    let target_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(target_arena.as_ptr() as *const u8, target_arena.len() * 4)
-    };
+    let target_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(target_arena.as_ptr() as *const u8, target_arena.len() * 4) };
     let target_buf = eng.gpu.buffer_with(target_bytes);
 
     // Deterministic PCG/SplitMix64 sampler on host to propose `x ~ p_draft` for each trial:
@@ -2344,7 +2368,11 @@ fn dspark_gpu_guards_and_rejection_sampling_gate() {
             let tok = cdf_q.partition_point(|&c| c < u).min(nv - 1) as u32;
             draft_toks.push(tok);
             let trial_id = (w * batch + b_idx) as u64;
-            seeds.push((0xCAFE_F00D_0000_0000u64 ^ trial_id.wrapping_mul(0x9E37_79B9_7F4A_7C15), trial_id as u32, None));
+            seeds.push((
+                0xCAFE_F00D_0000_0000u64 ^ trial_id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                trial_id as u32,
+                None,
+            ));
         }
         let outs = eng
             .reject_sample_gpu(
@@ -2365,15 +2393,9 @@ fn dspark_gpu_guards_and_rejection_sampling_gate() {
             counts[o.emitted[0] as usize] += 1;
         }
     }
-    let emp_tvd: f64 = 0.5
-        * counts
-            .iter()
-            .zip(&p_t)
-            .map(|(&c, &pt)| ((c as f64) / (total_trials as f64) - pt).abs())
-            .sum::<f64>();
-    eprintln!(
-        "[dspark temp=1.0 gate] trials={total_trials} draft_tvd={draft_tvd:.4} empirical_tvd={emp_tvd:.4}"
-    );
+    let emp_tvd: f64 =
+        0.5 * counts.iter().zip(&p_t).map(|(&c, &pt)| ((c as f64) / (total_trials as f64) - pt).abs()).sum::<f64>();
+    eprintln!("[dspark temp=1.0 gate] trials={total_trials} draft_tvd={draft_tvd:.4} empirical_tvd={emp_tvd:.4}");
     assert!(
         emp_tvd < 0.025,
         "GPU rejection sampling empirical TVD ({emp_tvd:.4}) must match p_target closely (draft TVD was {draft_tvd:.4})"

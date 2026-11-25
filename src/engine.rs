@@ -58,7 +58,8 @@ struct Tier {
     file: std::fs::File,
     on: Cell<bool>,
     /// per kind [sliding-window, full]: oldest position the hot ring holds / positions below this are in the file
-    lo: [Cell<usize>; 2], cold: [Cell<usize>; 2],
+    lo: [Cell<usize>; 2],
+    cold: [Cell<usize>; 2],
     /// positions below this were written to the file earlier in this session (cached K/V never change, so a later tiering
     /// after a prefill only writes what is new)
     filed: [Cell<usize>; 2],
@@ -67,22 +68,54 @@ struct Tier {
     /// smallest context that is tiered
     min_n: usize,
     /// staging for the file reads, in two halves: the GPU works on one while the next reads land in the other
-    stg: RefCell<Buf>, half: Cell<usize>, pending: RefCell<[Option<CmdBuf>; 2]>,
+    stg: RefCell<Buf>,
+    half: Cell<usize>,
+    pending: RefCell<[Option<CmdBuf>; 2]>,
     /// this step's file reads in execution order, and the round (staging half fill) that is loaded
-    plan: RefCell<Vec<Chunk>>, execs: RefCell<Vec<ExecPlan>>, loaded: Cell<usize>,
-    pub read_bytes: Cell<u64>, pub read_time: Cell<std::time::Duration>, unaligned: Cell<bool>,
+    plan: RefCell<Vec<Chunk>>,
+    execs: RefCell<Vec<ExecPlan>>,
+    loaded: Cell<usize>,
+    pub read_bytes: Cell<u64>,
+    pub read_time: Cell<std::time::Duration>,
+    unaligned: Cell<bool>,
 }
 #[derive(Clone, Copy)]
-struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: usize, off: usize, sp0: usize, ns: usize, kps: usize, rel_split: bool }
+struct Chunk {
+    exec: usize,
+    kind: usize,
+    i: usize,
+    c0: usize,
+    c1: usize,
+    round: usize,
+    off: usize,
+    sp0: usize,
+    ns: usize,
+    kps: usize,
+    rel_split: bool,
+}
 /// how one layer execution's keys are divided: file chunks cover the splits before `b`, the hot ring the `ns` splits from `sp0`
 #[derive(Clone, Copy)]
-struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize, rel_split: bool }
+struct ExecPlan {
+    b: usize,
+    kps: usize,
+    nsplit: usize,
+    sp0: usize,
+    ns: usize,
+    rel_split: bool,
+}
 
 /// the encoder a decode step is being written to; with the disk tier a step spans several command buffers
-pub struct Cx { e: Enc, cb: Option<CmdBuf>, prior: Vec<CmdBuf> }
+pub struct Cx {
+    e: Enc,
+    cb: Option<CmdBuf>,
+    prior: Vec<CmdBuf>,
+}
 
 /// All submitted command buffers for a single decode step.
-pub struct DecodeStep { prior: Vec<CmdBuf>, last: CmdBuf }
+pub struct DecodeStep {
+    prior: Vec<CmdBuf>,
+    last: CmdBuf,
+}
 
 impl DecodeStep {
     pub fn wait(&self, pos: usize) -> Result<(), String> {
@@ -104,27 +137,144 @@ pub const DEC_GRP_MAX: usize = 8;
 pub const MAX_SWA_SPLIT: usize = EXT / crate::blocks::BLOCK + 1;
 
 /// kernel classes, for skip-mask profiling
-pub const CLS_NAMES: &[&str] = &["embed", "mix_attn", "qkv", "attn", "combine", "wo", "mix_ffn", "router", "moe_gu", "moe_down",
-                                 "ctrl_down", "ctrl_apply", "out_mix", "lm_head", "argmax",
-                                 "kvprep", "wo_post", "gather", "moe_comb", "ffn_post", "ctrl_norm", "topk_route"];
-const C_KVPREP: u32 = 15; const C_WOPOST: u32 = 16; const C_GATHER: u32 = 17; const C_COMB2: u32 = 18; const C_FFNPOST: u32 = 19;
-const C_CTRLN: u32 = 20; const C_TOPK: u32 = 21;
-const C_EMBED: u32 = 0; const C_MIXA: u32 = 1; const C_QKV: u32 = 2; const C_ATTN: u32 = 3; const C_COMB: u32 = 4; const C_WO: u32 = 5;
-const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOWN: u32 = 9; const C_CTRLD: u32 = 10; const C_CTRLA: u32 = 11;
-const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
+pub const CLS_NAMES: &[&str] = &[
+    "embed",
+    "mix_attn",
+    "qkv",
+    "attn",
+    "combine",
+    "wo",
+    "mix_ffn",
+    "router",
+    "moe_gu",
+    "moe_down",
+    "ctrl_down",
+    "ctrl_apply",
+    "out_mix",
+    "lm_head",
+    "argmax",
+    "kvprep",
+    "wo_post",
+    "gather",
+    "moe_comb",
+    "ffn_post",
+    "ctrl_norm",
+    "topk_route",
+];
+const C_KVPREP: u32 = 15;
+const C_WOPOST: u32 = 16;
+const C_GATHER: u32 = 17;
+const C_COMB2: u32 = 18;
+const C_FFNPOST: u32 = 19;
+const C_CTRLN: u32 = 20;
+const C_TOPK: u32 = 21;
+const C_EMBED: u32 = 0;
+const C_MIXA: u32 = 1;
+const C_QKV: u32 = 2;
+const C_ATTN: u32 = 3;
+const C_COMB: u32 = 4;
+const C_WO: u32 = 5;
+const C_MIXF: u32 = 6;
+const C_ROUTER: u32 = 7;
+const C_GU: u32 = 8;
+const C_DOWN: u32 = 9;
+const C_CTRLD: u32 = 10;
+const C_CTRLA: u32 = 11;
+const C_OMIX: u32 = 12;
+const C_LMHEAD: u32 = 13;
+const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_apply", "k_attn", "k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec", "k_attn_combine", "k_attn_combine_dec",
-    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend", "k_dspark_reject",
+    "k_embed",
+    "k_embed_dec",
+    "k_mix",
+    "k_mv",
+    "k_mvb",
+    "k_epi",
+    "k_ctrl_apply",
+    "k_attn",
+    "k_kvprep_dec",
+    "k_attn_dec_solo",
+    "k_attn_grp_dec",
+    "k_attn_combine",
+    "k_attn_combine_dec",
+    "k_moe_gu",
+    "k_moe_down",
+    "k_argmax1",
+    "k_argmax2",
+    "k_gumbel",
+    "k_loopcd_blend",
+    "k_dspark_reject",
     "k_topk",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_devcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm",
+    "k_moe_gemm",
+    "k_gemm_t",
+    "k_moe_gemm_t",
+    "k_topk_b",
+    "k_moe_route",
+    "k_moe_comb_b",
+    "k_postconv_b",
+    "k_postconv_state_dec",
+    "k_state_upd",
+    "k_state_keep",
+    "k_kvprep_b",
+    "k_kvprep_b_blk",
+    "k_attn_b",
+    "k_attn_b_blk",
+    "k_attn_bt",
+    "k_attn_bt_blk",
+    "k_ctrl_apply_b",
+    "k_tohalf",
+    "k_gemm_sg8",
+    "k_gemm_sg4",
+    "k_moe_sg8",
+    "k_moe_sg4",
+    "k_ctrl_gf",
+    "k_moe_route3",
+    "k_moe_topk_route3",
+    "k_moe_comb_h",
+    "k_attn_h",
+    "k_attn_h_blk",
+    "k_kvcopy",
+    "k_devcopy",
+    "k_zero",
+    "k_mix_b_1_1",
+    "k_mix_b_2_1",
+    "k_mix_b_3_1",
+    "k_mix_b_4_1",
+    "k_mix_b_5_1",
+    "k_mix_b_6_1",
+    "k_mix_b_1_3",
+    "k_mix_b_2_3",
+    "k_mix_b_3_3",
+    "k_mix_b_4_3",
+    "k_mix_b_5_3",
+    "k_mix_b_6_3",
+    "k_mix_b_1_4",
+    "k_mix_b_2_4",
+    "k_mix_b_3_4",
+    "k_mix_b_4_4",
+    "k_mix_b_5_4",
+    "k_mix_b_6_4",
+    "k_mix_b_id",
     "k_touch",
 ];
 
 // ----------------------------------------------------------------------------- kernel arg structs (mirror kernels.metal)
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct EmbedArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out0: u32, out1: u32, tok_index: u32, eps: f32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EmbedArgs {
+    emb_lo: u32,
+    emb_hi: u32,
+    row_bytes: u32,
+    norm_off: u32,
+    out0: u32,
+    out1: u32,
+    tok_index: u32,
+    eps: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct DecodeSpanDesc {
     tok_id: i32,
     pos: u32,
@@ -143,146 +293,584 @@ struct DecodeSpanDesc {
     swa_tau: f32,
     pad1: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32, hout: u32, pad: [u32; 3] }
-#[repr(C)] #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EmbedDecArgs {
+    emb_lo: u32,
+    emb_hi: u32,
+    row_bytes: u32,
+    norm_off: u32,
+    out_off: u32,
+    desc_off: u32,
+    eps: f32,
+    pad: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CombineDecArgs {
+    desc_off: u32,
+    gate_off: u32,
+    out_off: u32,
+    swa: u32,
+    hout: u32,
+    pad: [u32; 3],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct DecAttnGroup {
     pub abs_sp: u32,
     pub count: u32,
     pub span_idx: [u16; DEC_GRP_MAX],
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct KvPrepDecArgs {
-    desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
-    q_off: u32, k_off: u32, v_off: u32, r_off: u32,
-    qp_off: u32, rp_off: u32, kv_cur_off: u32, kdyn_off: i32,
-    vdyn_off: i32, kconv_w: u32, vconv_w: u32, qclip_w: u32,
-    relclip_w: u32, pad0: u32, pad1: u32, pad2: u32,
+    desc_off: u32,
+    pass_idx: u32,
+    cs_slot: u32,
+    swa: u32,
+    q_off: u32,
+    k_off: u32,
+    v_off: u32,
+    r_off: u32,
+    qp_off: u32,
+    rp_off: u32,
+    kv_cur_off: u32,
+    kdyn_off: i32,
+    vdyn_off: i32,
+    kconv_w: u32,
+    vconv_w: u32,
+    qclip_w: u32,
+    relclip_w: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct AttnGrpDecArgs {
-    desc_off: u32, grp_off: u32, qp_off: u32, rp_off: u32,
-    kv_cur_off: u32, sink_off: u32, relbias_w: u32, pass_idx: u32,
-    kps: u32, swa: u32, pad0: u32, pad1: u32,
+    desc_off: u32,
+    grp_off: u32,
+    qp_off: u32,
+    rp_off: u32,
+    kv_cur_off: u32,
+    sink_off: u32,
+    relbias_w: u32,
+    pass_idx: u32,
+    kps: u32,
+    swa: u32,
+    pad0: u32,
+    pad1: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct PostConvDecArgs { desc_off: u32, y_off: u32, res_off: u32, out_off: u32, cs_slot_off: u32, convw_off: u32, has_res: u32, no_state_write: u32 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PostConvDecArgs {
+    desc_off: u32,
+    y_off: u32,
+    res_off: u32,
+    out_off: u32,
+    cs_slot_off: u32,
+    convw_off: u32,
+    has_res: u32,
+    no_state_write: u32,
+}
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct MixJob { n_s: u32, n_q: u32, s_off: [u32; 6], q_off: i32, out_off: [u32; 4], norm_off: [i32; 4], eps: f32, tstride: u32, ncopy: [[i32; 3]; 4], ntok: u32,
-                 hcopy: [[i32; 3]; 4], hout: [i32; 4], hstride: u32, nof32: u32 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MixJob {
+    n_s: u32,
+    n_q: u32,
+    s_off: [u32; 6],
+    q_off: i32,
+    out_off: [u32; 4],
+    norm_off: [i32; 4],
+    eps: f32,
+    tstride: u32,
+    ncopy: [[i32; 3]; 4],
+    ntok: u32,
+    hcopy: [[i32; 3]; 4],
+    hout: [i32; 4],
+    hstride: u32,
+    nof32: u32,
+}
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct Seg {
-    w_lo: u32, w_hi: u32, row_bytes: u32, wtype: u32,
-    nrows: u32, k: u32, tg_start: u32, in_off: u32,
-    in2_off: i32, norm_off: i32, ss_off: i32, ss_n: i32,
-    out_off: u32, epi: u32, res_off: i32, cs_off: u32,
-    convw_off: u32, pad: [u32; 3],
+    w_lo: u32,
+    w_hi: u32,
+    row_bytes: u32,
+    wtype: u32,
+    nrows: u32,
+    k: u32,
+    tg_start: u32,
+    in_off: u32,
+    in2_off: i32,
+    norm_off: i32,
+    ss_off: i32,
+    ss_n: i32,
+    out_off: u32,
+    epi: u32,
+    res_off: i32,
+    cs_off: u32,
+    convw_off: u32,
+    pad: [u32; 3],
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct MvArgs { nseg: u32, eps: f32, post: u32, ctr: u32, bias_off: u32, sel_off: u32, wscale: f32, pad: u32, seg: [Seg; 12] }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MvArgs {
+    nseg: u32,
+    eps: f32,
+    post: u32,
+    ctr: u32,
+    bias_off: u32,
+    sel_off: u32,
+    wscale: f32,
+    pad: u32,
+    seg: [Seg; 12],
+}
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlJob { u_off: u32, m_off: u32, d_off: u32, out_off: u32, gain_off: u32, forget_off: u32, res_out: u32, ss_off: u32, norm_w: i32, ctr: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlArgs { n_c: u32, tstride: u32, pad: [u32; 2], job: [CtrlJob; 4] }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlJob {
+    u_off: u32,
+    m_off: u32,
+    d_off: u32,
+    out_off: u32,
+    gain_off: u32,
+    forget_off: u32,
+    res_out: u32,
+    ss_off: u32,
+    norm_w: i32,
+    ctr: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlArgs {
+    n_c: u32,
+    tstride: u32,
+    pad: [u32; 2],
+    job: [CtrlJob; 4],
+}
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct AttnArgs {
-    pos: u32, nkeys: u32, first_pos: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, cs_off: u32,
-    q_off: u32, k_off: u32, v_off: u32, r_off: u32, sink_off: u32, kdyn_off: i32, vdyn_off: i32, part_off: u32,
-    kconv_w: u32, vconv_w: u32, qclip_w: u32, relclip_w: u32, relbias_w: u32, tau: f32, kps: u32, nsplit: u32,
-    ctr: u32, gate_off: u32, out_off: u32, pad: u32,
-    sp0: u32, noown: u32, gstr: u32, istr: u32, idx0: u32, lastbias: f32,
+    pos: u32,
+    nkeys: u32,
+    first_pos: u32,
+    ring: u32,
+    cap: u32,
+    k_base: u32,
+    v_base: u32,
+    cs_off: u32,
+    q_off: u32,
+    k_off: u32,
+    v_off: u32,
+    r_off: u32,
+    sink_off: u32,
+    kdyn_off: i32,
+    vdyn_off: i32,
+    part_off: u32,
+    kconv_w: u32,
+    vconv_w: u32,
+    qclip_w: u32,
+    relclip_w: u32,
+    relbias_w: u32,
+    tau: f32,
+    kps: u32,
+    nsplit: u32,
+    ctr: u32,
+    gate_off: u32,
+    out_off: u32,
+    pad: u32,
+    sp0: u32,
+    noown: u32,
+    gstr: u32,
+    istr: u32,
+    idx0: u32,
+    lastbias: f32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct DevCopyArgs { src: u32, dst: u32, n: u32, pad: u32 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DevCopyArgs {
+    src: u32,
+    dst: u32,
+    n: u32,
+    pad: u32,
+}
 /// dev (key eviction experiments): the far keys of the full-attention slots replaced by a selection (`rows` per group,
 /// the last one a summary of the evicted keys with score bias `lastbias`); keys from position `r0` on are untouched
-pub struct Prune { bag: Buf, rows: usize, r0: usize, lastbias: f32, use_sum: bool }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CombineArgs { part_off: u32, nsplit: u32, gate_off: u32, out_off: u32, hout: u32, pad: [u32; 3] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct EpiArgs { out_off: u32, res_off: i32, cs_off: u32, convw_off: u32, n: u32, pad: [u32; 3] }
+pub struct Prune {
+    bag: Buf,
+    rows: usize,
+    r0: usize,
+    lastbias: f32,
+    use_sum: bool,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CombineArgs {
+    part_off: u32,
+    nsplit: u32,
+    gate_off: u32,
+    out_off: u32,
+    hout: u32,
+    pad: [u32; 3],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EpiArgs {
+    out_off: u32,
+    res_off: i32,
+    cs_off: u32,
+    convw_off: u32,
+    n: u32,
+    pad: [u32; 3],
+}
 
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct MoeArgs {
-    logits_off: u32, bias_off: u32, sel_off: u32, x_off: u32,
-    norm_off: i32, ss_off: i32, ss_n: i32, eps: f32,
-    gu_lo: u32, gu_hi: u32, gu_expert_bytes: u32, gu_row_bytes: u32,
-    act_off: u32, wscale: f32, beta: f32, lbeta: f32,
-    dn_lo: u32, dn_hi: u32, dn_expert_bytes: u32, dn_row_bytes: u32,
-    dn_type: u32, out_off: u32, res_off: i32, cs_off: u32,
-    convw_off: u32, gu_type: u32, gu_gs_lo: u32, gu_gs_hi: u32,
-    dn_gs_lo: u32, dn_gs_hi: u32, no_state_write: u32, pad1: u32,
+    logits_off: u32,
+    bias_off: u32,
+    sel_off: u32,
+    x_off: u32,
+    norm_off: i32,
+    ss_off: i32,
+    ss_n: i32,
+    eps: f32,
+    gu_lo: u32,
+    gu_hi: u32,
+    gu_expert_bytes: u32,
+    gu_row_bytes: u32,
+    act_off: u32,
+    wscale: f32,
+    beta: f32,
+    lbeta: f32,
+    dn_lo: u32,
+    dn_hi: u32,
+    dn_expert_bytes: u32,
+    dn_row_bytes: u32,
+    dn_type: u32,
+    out_off: u32,
+    res_off: i32,
+    cs_off: u32,
+    convw_off: u32,
+    gu_type: u32,
+    gu_gs_lo: u32,
+    gu_gs_hi: u32,
+    dn_gs_lo: u32,
+    dn_gs_hi: u32,
+    no_state_write: u32,
+    pad1: u32,
 }
 
 // ---- prefill arg structs (mirror prefill.metal)
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct GSeg { w_lo: u32, w_hi: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, tile_start: u32, in_off: u32, out_off: u32, ldo: u32, wsrc: u32, in2: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct ToHalfArgs { src_off: u32, dst_off: u32, k: u32, rows: u32, perm_off: u32, gather: u32, src_stride: u32, dst_stride: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct HSeg { w_lo: u32, w_hi: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, tile_start: u32, xh_off: u32, out_off: u32, ldo: u32, wsrc: u32, hout: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct GemmHArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [HSeg; 10] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GSeg {
+    w_lo: u32,
+    w_hi: u32,
+    row_bytes: u32,
+    wtype: u32,
+    nrows: u32,
+    k: u32,
+    tile_start: u32,
+    in_off: u32,
+    out_off: u32,
+    ldo: u32,
+    wsrc: u32,
+    in2: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ToHalfArgs {
+    src_off: u32,
+    dst_off: u32,
+    k: u32,
+    rows: u32,
+    perm_off: u32,
+    gather: u32,
+    src_stride: u32,
+    dst_stride: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct HSeg {
+    w_lo: u32,
+    w_hi: u32,
+    row_bytes: u32,
+    wtype: u32,
+    nrows: u32,
+    k: u32,
+    tile_start: u32,
+    xh_off: u32,
+    out_off: u32,
+    ldo: u32,
+    wsrc: u32,
+    hout: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemmHArgs {
+    nseg: u32,
+    t: u32,
+    pad: [u32; 2],
+    seg: [HSeg; 10],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct MoeGemmHArgs {
-    w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, xh_off: u32,
-    tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, aw_off: u32, beta: f32, lbeta: f32,
-    gs_lo: u32, gs_hi: u32, pad0: u32, pad1: u32,
+    w_lo: u32,
+    w_hi: u32,
+    expert_bytes: u32,
+    row_bytes: u32,
+    wtype: u32,
+    nrows: u32,
+    k: u32,
+    xh_off: u32,
+    tiles_off: u32,
+    ntiles_off: u32,
+    out_off: u32,
+    ldo: u32,
+    situ: u32,
+    aw_off: u32,
+    beta: f32,
+    lbeta: f32,
+    gs_lo: u32,
+    gs_hi: u32,
+    pad0: u32,
+    pad1: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlBJob { u_off: u32, m_off: u32, g_off: u32, f_off: u32, out_off: u32, norm_w: u32, h_off: i32, nof32: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlGfJob { gain_w: u32, forget_w: u32, gh_off: u32, u_off: u32, m_off: u32, raw_off: u32, pad: [u32; 2] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlGfArgs { t: u32, njobs: u32, pad: [u32; 2], job: [CtrlGfJob; 4] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct CtrlBArgs { n: u32, pad: [u32; 3], job: [CtrlBJob; 4] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct GemmArgs { nseg: u32, t: u32, pad: [u32; 2], seg: [GSeg; 10] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlBJob {
+    u_off: u32,
+    m_off: u32,
+    g_off: u32,
+    f_off: u32,
+    out_off: u32,
+    norm_w: u32,
+    h_off: i32,
+    nof32: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlGfJob {
+    gain_w: u32,
+    forget_w: u32,
+    gh_off: u32,
+    u_off: u32,
+    m_off: u32,
+    raw_off: u32,
+    pad: [u32; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlGfArgs {
+    t: u32,
+    njobs: u32,
+    pad: [u32; 2],
+    job: [CtrlGfJob; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CtrlBArgs {
+    n: u32,
+    pad: [u32; 3],
+    job: [CtrlBJob; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemmArgs {
+    nseg: u32,
+    t: u32,
+    pad: [u32; 2],
+    seg: [GSeg; 10],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct MoeGemmArgs {
-    w_lo: u32, w_hi: u32, expert_bytes: u32, row_bytes: u32, wtype: u32, nrows: u32, k: u32, x_off: u32,
-    gather: u32, perm_off: u32, tiles_off: u32, ntiles_off: u32, out_off: u32, ldo: u32, situ: u32, pad: u32,
-    beta: f32, lbeta: f32, gs_lo: u32, gs_hi: u32,
+    w_lo: u32,
+    w_hi: u32,
+    expert_bytes: u32,
+    row_bytes: u32,
+    wtype: u32,
+    nrows: u32,
+    k: u32,
+    x_off: u32,
+    gather: u32,
+    perm_off: u32,
+    tiles_off: u32,
+    ntiles_off: u32,
+    out_off: u32,
+    ldo: u32,
+    situ: u32,
+    pad: u32,
+    beta: f32,
+    lbeta: f32,
+    gs_lo: u32,
+    gs_hi: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct TopkBArgs { logits_off: u32, bias_off: u32, sel_off: u32, t: u32, wscale: f32, pad: [u32; 3] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct RouteArgs { sel_off: u32, t: u32, perm_off: u32, inv_off: u32, tiles_off: u32, ntiles_off: u32, tile: u32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct Route3Args { sel_off: u32, t: u32, perm_off: u32, inv_off: u32, aw_off: u32, ind_off: u32, gu_y: u32, dn_y: u32, tiles_off: [u32; NTC], pad: [u32; 2] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct TopkRoute3Args {
-    logits_off: u32, bias_off: u32, sel_off: u32, t: u32,
-    wscale: f32, perm_off: u32, inv_off: u32, aw_off: u32,
-    ind_off: u32, gu_y: u32, dn_y: u32, tiles_off: [u32; NTC],
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TopkBArgs {
+    logits_off: u32,
+    bias_off: u32,
+    sel_off: u32,
+    t: u32,
+    wscale: f32,
     pad: [u32; 3],
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct MoeCombArgs { yd_off: u32, inv_off: u32, sel_off: u32, out_off: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct ConvBArgs { y_off: u32, ldy: u32, res_off: u32, out_off: u32, cs_off: u32, convw_off: u32, has_res: u32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct StateArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, pad: [u32; 3] }
-#[repr(C)] #[derive(Clone, Copy)]
-struct StateKeepArgs { x_off: u32, ldx: u32, cs_off: u32, nch: u32, t: u32, snap_off: u32, stride: u32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct KvPrepArgs {
-    t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, cs_off: u32, q_off: u32,
-    k_off: u32, v_off: u32, r_off: u32, kdyn_off: i32, vdyn_off: i32, qp_off: u32, rp_off: u32, qhalf: u32,
-    kconv_w: u32, vconv_w: u32, qclip_w: u32, relclip_w: u32, log_alpha: f32, log_floor: f32, is_full: u32, kpos0: i32,
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RouteArgs {
+    sel_off: u32,
+    t: u32,
+    perm_off: u32,
+    inv_off: u32,
+    tiles_off: u32,
+    ntiles_off: u32,
+    tile: u32,
+    pad: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct AttnBArgs { t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, window: u32, qp_off: u32,
-                   rp_off: u32, sink_off: u32, gate_off: u32, out_off: u32, relbias_w: u32, ghalf: u32, kpos0: i32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_off: u32, sv_off: u32, scap: u32, kpos0: i32, to_ring: u32, pad: [u32; 2] }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Route3Args {
+    sel_off: u32,
+    t: u32,
+    perm_off: u32,
+    inv_off: u32,
+    aw_off: u32,
+    ind_off: u32,
+    gu_y: u32,
+    dn_y: u32,
+    tiles_off: [u32; NTC],
+    pad: [u32; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TopkRoute3Args {
+    logits_off: u32,
+    bias_off: u32,
+    sel_off: u32,
+    t: u32,
+    wscale: f32,
+    perm_off: u32,
+    inv_off: u32,
+    aw_off: u32,
+    ind_off: u32,
+    gu_y: u32,
+    dn_y: u32,
+    tiles_off: [u32; NTC],
+    pad: [u32; 3],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MoeCombArgs {
+    yd_off: u32,
+    inv_off: u32,
+    sel_off: u32,
+    out_off: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ConvBArgs {
+    y_off: u32,
+    ldy: u32,
+    res_off: u32,
+    out_off: u32,
+    cs_off: u32,
+    convw_off: u32,
+    has_res: u32,
+    pad: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct StateArgs {
+    x_off: u32,
+    ldx: u32,
+    cs_off: u32,
+    nch: u32,
+    t: u32,
+    pad: [u32; 3],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StateKeepArgs {
+    x_off: u32,
+    ldx: u32,
+    cs_off: u32,
+    nch: u32,
+    t: u32,
+    snap_off: u32,
+    stride: u32,
+    pad: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvPrepArgs {
+    t: u32,
+    p0: u32,
+    ring: u32,
+    cap: u32,
+    k_base: u32,
+    v_base: u32,
+    cs_off: u32,
+    q_off: u32,
+    k_off: u32,
+    v_off: u32,
+    r_off: u32,
+    kdyn_off: i32,
+    vdyn_off: i32,
+    qp_off: u32,
+    rp_off: u32,
+    qhalf: u32,
+    kconv_w: u32,
+    vconv_w: u32,
+    qclip_w: u32,
+    relclip_w: u32,
+    log_alpha: f32,
+    log_floor: f32,
+    is_full: u32,
+    kpos0: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AttnBArgs {
+    t: u32,
+    p0: u32,
+    ring: u32,
+    cap: u32,
+    k_base: u32,
+    v_base: u32,
+    window: u32,
+    qp_off: u32,
+    rp_off: u32,
+    sink_off: u32,
+    gate_off: u32,
+    out_off: u32,
+    relbias_w: u32,
+    ghalf: u32,
+    kpos0: i32,
+    pad: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvCopyArgs {
+    n: u32,
+    pos0: u32,
+    ring_k: u32,
+    ring_v: u32,
+    cap: u32,
+    sk_off: u32,
+    sv_off: u32,
+    scap: u32,
+    kpos0: i32,
+    to_ring: u32,
+    pad: [u32; 2],
+}
 
 /// batch (prefill) arena: per-token activation arrays [T][dim], f32 offsets into the same arena buffer
 #[derive(Clone, Copy, Default, Debug)]
@@ -291,12 +879,51 @@ pub struct BArena {
     /// A verify span uses `1 + k` of those rows, one per position. This is not one row per token.
     lg: u32,
     lg_rows: u32,
-    vec0: u32, q: u32, gate: u32, k: u32, v: u32, rel: u32, sink: u32, kdyn: u32, vdyn: u32, qp: u32, rp: u32, attn_g: u32,
-    inp: [u32; 3], msg: [u32; 4], cin: [u32; 3], fin: u32, finc: u32, ctrlg: [u32; 4],
-    cat_u: [u32; 4], cat_m: [u32; 4], gain_o: [u32; 4], forget_o: [u32; 4],
-    xh: [u32; 3], agh: u32, xgh: u32, acth: u32, cath: [u32; 4], gh: [u32; 4],
-    tl: [u32; NTC], ind: u32, aw: u32, fh: u32, sk: u32, sv: u32,
-    wo_y: u32, ffn_y: u32, rlog: u32, sel: u32, perm: u32, inv: u32, tiles: u32, ntiles: u32, act: u32, yd: u32, end: u32,
+    vec0: u32,
+    q: u32,
+    gate: u32,
+    k: u32,
+    v: u32,
+    rel: u32,
+    sink: u32,
+    kdyn: u32,
+    vdyn: u32,
+    qp: u32,
+    rp: u32,
+    attn_g: u32,
+    inp: [u32; 3],
+    msg: [u32; 4],
+    cin: [u32; 3],
+    fin: u32,
+    finc: u32,
+    ctrlg: [u32; 4],
+    cat_u: [u32; 4],
+    cat_m: [u32; 4],
+    gain_o: [u32; 4],
+    forget_o: [u32; 4],
+    xh: [u32; 3],
+    agh: u32,
+    xgh: u32,
+    acth: u32,
+    cath: [u32; 4],
+    gh: [u32; 4],
+    tl: [u32; NTC],
+    ind: u32,
+    aw: u32,
+    fh: u32,
+    sk: u32,
+    sv: u32,
+    wo_y: u32,
+    ffn_y: u32,
+    rlog: u32,
+    sel: u32,
+    perm: u32,
+    inv: u32,
+    tiles: u32,
+    ntiles: u32,
+    act: u32,
+    yd: u32,
+    end: u32,
     /// tokens this layout was sized for (0: no batch arena allocated)
     cap: usize,
 }
@@ -305,48 +932,120 @@ impl BArena {
     /// fallback kernels and keeps q / gate / the per-assignment outputs as half.
     fn new(start: u32, t: usize, lean: bool, kvb: usize, vocab_pad: usize) -> BArena {
         let mut o = start;
-        let mut take = |n: usize| { let r = o; o += (n.div_ceil(64) * 64) as u32; r };
-        let fb = |n: usize| if lean { 0 } else { n };      // only the fallback paths use it
-        let hf = |n: usize| if lean { n / 2 } else { n };  // half in the fp16 path
+        let mut take = |n: usize| {
+            let r = o;
+            o += (n.div_ceil(64) * 64) as u32;
+            r
+        };
+        let fb = |n: usize| if lean { 0 } else { n }; // only the fallback paths use it
+        let hf = |n: usize| if lean { n / 2 } else { n }; // half in the fp16 path
         let mut b = BArena { cap: t, ..Default::default() };
         b.vec0 = take(B_NVEC * t * E);
-        b.q = take(hf(t * NH * HD)); b.gate = take(hf(t * NH * HD)); b.k = take(t * NKV * HD); b.v = take(t * NKV * HD);
-        b.rel = take(t * NH * NREL); b.sink = take(t * NH); b.kdyn = take(t * 32); b.vdyn = take(t * 32);
-        b.qp = take(hf(t * NH * HD)); b.rp = take(t * NH * NREL); b.attn_g = take(fb(t * NH * HD));
-        for i in 0..3 { b.inp[i] = take(t * E); }
-        for i in 0..4 { b.msg[i] = take(t * E); }
-        for i in 0..3 { b.cin[i] = take(fb(t * E)); }
-        b.fin = take(t * E); b.finc = take(fb(t * E));
-        for i in 0..4 { b.cat_u[i] = take(fb(t * E)); b.cat_m[i] = take(fb(t * E)); b.gain_o[i] = take(t * E); b.forget_o[i] = take(fb(t * E)); }
-        for i in 0..3 { b.xh[i] = take(t * E / 2); }
+        b.q = take(hf(t * NH * HD));
+        b.gate = take(hf(t * NH * HD));
+        b.k = take(t * NKV * HD);
+        b.v = take(t * NKV * HD);
+        b.rel = take(t * NH * NREL);
+        b.sink = take(t * NH);
+        b.kdyn = take(t * 32);
+        b.vdyn = take(t * 32);
+        b.qp = take(hf(t * NH * HD));
+        b.rp = take(t * NH * NREL);
+        b.attn_g = take(fb(t * NH * HD));
+        for i in 0..3 {
+            b.inp[i] = take(t * E);
+        }
+        for i in 0..4 {
+            b.msg[i] = take(t * E);
+        }
+        for i in 0..3 {
+            b.cin[i] = take(fb(t * E));
+        }
+        b.fin = take(t * E);
+        b.finc = take(fb(t * E));
+        for i in 0..4 {
+            b.cat_u[i] = take(fb(t * E));
+            b.cat_m[i] = take(fb(t * E));
+            b.gain_o[i] = take(t * E);
+            b.forget_o[i] = take(fb(t * E));
+        }
+        for i in 0..3 {
+            b.xh[i] = take(t * E / 2);
+        }
         b.agh = take(t * NH * HD / 2);
         b.xgh = take(t * TOPK * E / 2);
         b.acth = take(t * TOPK * FF / 2);
-        for i in 0..4 { b.cath[i] = take(t * 2 * E / 2); b.gh[i] = take(t * 64 / 2); }
-        for i in 0..4 { b.ctrlg[i] = take(t * 64); }
-        b.wo_y = take(t * E); b.ffn_y = take(t * E);
-        b.rlog = take(t * NEXP); b.sel = take(t * 16);
+        for i in 0..4 {
+            b.cath[i] = take(t * 2 * E / 2);
+            b.gh[i] = take(t * 64 / 2);
+        }
+        for i in 0..4 {
+            b.ctrlg[i] = take(t * 64);
+        }
+        b.wo_y = take(t * E);
+        b.ffn_y = take(t * E);
+        b.rlog = take(t * NEXP);
+        b.sel = take(t * 16);
         b.tl = [take((t * TOPK / 128 + NEXP + 1) * 4), take((NEXP + 1) * 4)];
-        b.ind = take(64); b.aw = take(t * TOPK); b.fh = take(t * E / 2);
+        b.ind = take(64);
+        b.aw = take(t * TOPK);
+        b.fh = take(t * E / 2);
         // sliding-window K/V scratch of the batch: [guard | window history | batch keys | guard] per group, half
-        b.sk = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4); b.sv = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
+        b.sk = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
+        b.sv = take(NKV * (EXT + t + 2 * KGUARD) * HD * kvb / 4);
         // Not `t` rows. At chunk 4096 that would be 32× this buffer (128 rows today). A verify span reuses them.
         b.lg_rows = t.min(MAX_SPANS) as u32;
         b.lg = take(b.lg_rows as usize * vocab_pad);
-        b.perm = take(t * TOPK); b.inv = take(t * TOPK); b.tiles = take(fb((t * TOPK / 32 + NEXP + 1) * 4)); b.ntiles = take(64);
-        b.act = take(fb(t * TOPK * FF)); b.yd = take(hf(t * TOPK * E));
+        b.perm = take(t * TOPK);
+        b.inv = take(t * TOPK);
+        b.tiles = take(fb((t * TOPK / 32 + NEXP + 1) * 4));
+        b.ntiles = take(64);
+        b.act = take(fb(t * TOPK * FF));
+        b.yd = take(hf(t * TOPK * E));
         b.end = o;
         b
     }
-    fn vec(&self, i: usize) -> u32 { self.vec0 + (i * self.cap * E) as u32 }
+    fn vec(&self, i: usize) -> u32 {
+        self.vec0 + (i * self.cap * E) as u32
+    }
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, checked: u32, pad: [u32; 2] }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct LoopCdArgs { logits_off: u32, n: u32, stride: u32, pad0: u32, softcap: f32, pad1: u32, pad2: u32, pad3: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ArgmaxArgs {
+    logits_off: u32,
+    n: u32,
+    part_off: u32,
+    nparts: u32,
+    out_index: u32,
+    checked: u32,
+    pad: [u32; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SampArgs {
+    logits_off: u32,
+    n: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    pos: u32,
+    ban_tok: u32,
+    temp: f32,
+    softcap: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LoopCdArgs {
+    logits_off: u32,
+    n: u32,
+    stride: u32,
+    pad0: u32,
+    softcap: f32,
+    pad1: u32,
+    pad2: u32,
+    pad3: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct DSparkSpanDesc {
     target_off: u32,
     draft_lg_off: u32,
@@ -361,7 +1060,8 @@ struct DSparkSpanDesc {
     pad1: u32,
     pad2: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct DSparkRejectArgs {
     n_vocab: u32,
     target_stride: u32,
@@ -404,66 +1104,56 @@ pub struct DSparkRejectSpanParams {
     /// Per-span temperature (`< 1e-5` = greedy raw argmax, `>= 1e-5` = stochastic rejection sampling).
     pub temp: f32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct BenchArgs { w_lo: u32, w_hi: u32, row_bytes: u32, nrows: u32, k: u32, x_off: u32, out_off: u32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct TouchArgs { lo: u32, hi: u32, n16: u32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct DSparkSpanDesc {
-    target_off: u32,
-    draft_lg_off: u32,
-    draft_tok_off: u32,
-    out_off: u32,
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct BenchArgs {
+    w_lo: u32,
+    w_hi: u32,
+    row_bytes: u32,
+    nrows: u32,
     k: u32,
-    seed_lo: u32,
-    seed_hi: u32,
-    base_pos: u32,
-    ban_tok: u32,
-    temp: f32,
-    pad1: u32,
-    pad2: u32,
+    x_off: u32,
+    out_off: u32,
+    pad: u32,
 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct DSparkRejectArgs {
-    n_vocab: u32,
-    target_stride: u32,
-    draft_stride: u32,
-    temp: f32,
-    target_softcap: f32,
-    draft_softcap: f32,
-    pad0: u32,
-    pad1: u32,
-}
-
-/// Per-span input to [`Engine::verify_speculative_gpu`]: verifies `draft_toks` (length `k`) starting
-/// from the committed token already placed at `p0` (with `draft_toks` placed at `p0 + 1 .. p0 + 1 + k`).
-#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
-pub struct SpeculativeVerifySpan<'a> {
-    pub lane: &'a Lane,
-    pub p0: usize,
-    pub draft_toks: &'a [u32],
-    /// Contiguous `[k][draft_stride]` f32 draft logits when `temp > 0.0` (may be empty when `temp <= 0.0` or `k == 0`).
-    pub draft_logits: &'a [f32],
-    pub draft_stride: usize,
-    pub seed: u64,
-    pub ban_tok: Option<u32>,
-}
-
-/// Output of GPU speculative rejection sampling for one span: `n_accepted` (`0..=k`) accepted draft
-/// tokens, and `emitted` of length `n_accepted + 1` (`draft_toks[..n_accepted]` + resampled/bonus token).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpeculativeVerifyOut {
-    pub n_accepted: usize,
-    pub emitted: Vec<u32>,
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TouchArgs {
+    lo: u32,
+    hi: u32,
+    n16: u32,
+    pad: u32,
 }
 
 // ----------------------------------------------------------------------------- activation arena (f32 offsets)
-#[derive(Clone, Copy)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Arena {
-    pub q: u32, pub gate: u32, pub k: u32, pub v: u32, pub rel: u32, pub sink: u32, pub kdyn: u32, pub vdyn: u32,
-    pub attn_g: u32, pub inp: [u32; 3], pub msg: [u32; 4], pub cin: [u32; 3], pub ctrlg: [u32; 4], pub ssp: [u32; 4],
-    pub cat: [u32; 4], pub fin: u32, pub finc: u32, pub fout: u32, pub rlog: u32, pub sel: u32, pub sel_log: u32, pub act: u32, pub part: u32, pub logits: u32, pub amax: u32, pub total: u32,
+    pub q: u32,
+    pub gate: u32,
+    pub k: u32,
+    pub v: u32,
+    pub rel: u32,
+    pub sink: u32,
+    pub kdyn: u32,
+    pub vdyn: u32,
+    pub attn_g: u32,
+    pub inp: [u32; 3],
+    pub msg: [u32; 4],
+    pub cin: [u32; 3],
+    pub ctrlg: [u32; 4],
+    pub ssp: [u32; 4],
+    pub cat: [u32; 4],
+    pub fin: u32,
+    pub finc: u32,
+    pub fout: u32,
+    pub rlog: u32,
+    pub sel: u32,
+    pub sel_log: u32,
+    pub act: u32,
+    pub part: u32,
+    pub logits: u32,
+    pub amax: u32,
+    pub total: u32,
 }
 const N_VEC: usize = 16;
 /// hidden-state vectors of the batch arena: at most 4 block states + the current one + 3 pinned + the one being written
@@ -472,9 +1162,19 @@ const B_NVEC: usize = 10;
 impl Arena {
     fn new(max_split: usize, vocab_pad: usize) -> Arena {
         let mut o = (N_VEC * E) as u32;
-        let mut take = |n: usize| { let r = o; o += (n.div_ceil(64) * 64) as u32; r };
-        let q = take(NH * HD); let gate = take(NH * HD); let k = take(NKV * HD); let v = take(NKV * HD);
-        let rel = take(NH * NREL); let sink = take(NH); let kdyn = take(32); let vdyn = take(32);
+        let mut take = |n: usize| {
+            let r = o;
+            o += (n.div_ceil(64) * 64) as u32;
+            r
+        };
+        let q = take(NH * HD);
+        let gate = take(NH * HD);
+        let k = take(NKV * HD);
+        let v = take(NKV * HD);
+        let rel = take(NH * NREL);
+        let sink = take(NH);
+        let kdyn = take(32);
+        let vdyn = take(32);
         let attn_g = take(NH * HD);
         let inp = [take(E), take(E), take(E)];
         let msg = [take(E), take(E), take(E), take(E)];
@@ -482,33 +1182,103 @@ impl Arena {
         let ctrlg = [take(64), take(64), take(64), take(64)];
         let ssp = [take(128), take(128), take(128), take(128)];
         let cat = [take(2 * E), take(2 * E), take(2 * E), take(2 * E)];
-        let fin = take(E); let finc = take(E); let fout = take(E);
-        let rlog = take(NEXP); let sel = take(2 * TOPK); let sel_log = take(64 * 16); let act = take(TOPK * FF);
+        let fin = take(E);
+        let finc = take(E);
+        let fout = take(E);
+        let rlog = take(NEXP);
+        let sel = take(2 * TOPK);
+        let sel_log = take(64 * 16);
+        let act = take(TOPK * FF);
         let part = take(NH * max_split * (HD + 2));
         let logits = take(vocab_pad);
         let amax = take(2 * 256);
-        Arena { q, gate, k, v, rel, sink, kdyn, vdyn, attn_g, inp, msg, cin, ctrlg, ssp, cat, fin, finc, fout, rlog, sel, sel_log, act, part, logits, amax, total: o }
+        Arena {
+            q,
+            gate,
+            k,
+            v,
+            rel,
+            sink,
+            kdyn,
+            vdyn,
+            attn_g,
+            inp,
+            msg,
+            cin,
+            ctrlg,
+            ssp,
+            cat,
+            fin,
+            finc,
+            fout,
+            rlog,
+            sel,
+            sel_log,
+            act,
+            part,
+            logits,
+            amax,
+            total: o,
+        }
     }
-    pub fn vec(i: usize) -> u32 { (i * E) as u32 }
+    pub fn vec(i: usize) -> u32 {
+        (i * E) as u32
+    }
     /// the same layout starting `b` floats further into the activation buffer (a lane's own copy in a decode batch)
     fn shift(&self, b: u32) -> Arena {
         let mut a = *self;
-        for f in [&mut a.q, &mut a.gate, &mut a.k, &mut a.v, &mut a.rel, &mut a.sink, &mut a.kdyn, &mut a.vdyn, &mut a.attn_g, &mut a.fin, &mut a.finc,
-                  &mut a.fout, &mut a.rlog, &mut a.sel, &mut a.sel_log, &mut a.act, &mut a.part, &mut a.logits, &mut a.amax] { *f += b; }
-        for f in a.inp.iter_mut().chain(a.msg.iter_mut()).chain(a.cin.iter_mut()).chain(a.ctrlg.iter_mut()).chain(a.ssp.iter_mut()).chain(a.cat.iter_mut()) { *f += b; }
+        for f in [
+            &mut a.q,
+            &mut a.gate,
+            &mut a.k,
+            &mut a.v,
+            &mut a.rel,
+            &mut a.sink,
+            &mut a.kdyn,
+            &mut a.vdyn,
+            &mut a.attn_g,
+            &mut a.fin,
+            &mut a.finc,
+            &mut a.fout,
+            &mut a.rlog,
+            &mut a.sel,
+            &mut a.sel_log,
+            &mut a.act,
+            &mut a.part,
+            &mut a.logits,
+            &mut a.amax,
+        ] {
+            *f += b;
+        }
+        for f in a
+            .inp
+            .iter_mut()
+            .chain(a.msg.iter_mut())
+            .chain(a.cin.iter_mut())
+            .chain(a.ctrlg.iter_mut())
+            .chain(a.ssp.iter_mut())
+            .chain(a.cat.iter_mut())
+        {
+            *f += b;
+        }
         a
     }
 }
 
 // round-robin vector allocator that never hands out a live vector
 #[derive(Clone)]
-struct VecAlloc { next: usize, n: usize }
+struct VecAlloc {
+    next: usize,
+    n: usize,
+}
 impl VecAlloc {
     fn alloc(&mut self, live: &[usize]) -> usize {
         for _ in 0..self.n {
             let c = self.next;
             self.next = (self.next + 1) % self.n;
-            if c != 0 && !live.contains(&c) { return c; }
+            if c != 0 && !live.contains(&c) {
+                return c;
+            }
         }
         panic!("vector pool exhausted");
     }
@@ -517,7 +1287,8 @@ impl VecAlloc {
 pub struct Engine {
     // Drop all Metal buffers (including the no-copy weights buffer `w`) before `gpu` and `g` (which unmaps the file).
     w: Buf,
-    pub pb: Buf, ctr: Buf,
+    pub pb: Buf,
+    ctr: Buf,
     /// activations: the small decode arena, followed by the batch (prefill) arena while a prefill needs one
     act: std::cell::RefCell<Buf>,
     /// per slot: (is sliding-window, index among the slots of its kind)
@@ -526,20 +1297,40 @@ pub struct Engine {
     qcap: RefCell<Option<(Buf, usize)>>,
     pub layers: Vec<Layer>,
     loops: Vec<LoopW>,
-    tok_embd: QW, tok_norm: u32, output: QW, output_norm: u32, output_res_query: u32,
+    tok_embd: QW,
+    tok_norm: u32,
+    output: QW,
+    output_norm: u32,
+    output_res_query: u32,
     pub ar: Arena,
     /// where the decode path's arena starts in the activation buffer: 0, or a lane's copy during a decode batch
     abase: Cell<u32>,
     /// first float of the decode batch's lane arenas (see `ensure_dbatch`)
     dstart: Cell<u32>,
-    pub kv8: bool, kvb: usize, ba: std::cell::Cell<BArena>, pub chunk: usize, pub tensor: bool, pub hgemm: bool, sep_comb: bool, sep_topk: bool,
+    pub kv8: bool,
+    kvb: usize,
+    ba: std::cell::Cell<BArena>,
+    pub chunk: usize,
+    pub tensor: bool,
+    pub hgemm: bool,
+    sep_comb: bool,
+    sep_topk: bool,
     /// last-layer tail mode of the prefill (dev tools switch it off to profile full layers)
     pub tail: std::cell::Cell<bool>,
     pub skip: std::cell::Cell<u32>,
-    pub stop: std::cell::Cell<usize>, done: std::cell::Cell<usize>, pub last_out: std::cell::Cell<usize>, pub last_mid: std::cell::Cell<usize>,
+    pub stop: std::cell::Cell<usize>,
+    done: std::cell::Cell<usize>,
+    pub last_out: std::cell::Cell<usize>,
+    pub last_mid: std::cell::Cell<usize>,
     pub max_ctx: usize,
     pub n_vocab: usize,
-    eps: f32, log_alpha: f32, log_floor: f32, situ_beta: f32, situ_lbeta: f32, wscale: f32, pub softcap: f32,
+    eps: f32,
+    log_alpha: f32,
+    log_floor: f32,
+    situ_beta: f32,
+    situ_lbeta: f32,
+    wscale: f32,
+    pub softcap: f32,
     /// Convolution images for the verify span in flight, one per position, plus the K/V bytes that span overwrote.
     /// Not `cs_at_prompt`: a rejected tail must not become the next turn's resume point.
     verify_keep: RefCell<Option<VerifyKeep>>,
@@ -581,14 +1372,7 @@ struct BlockedSlab {
 impl BlockedSlab {
     fn new(default_blocks: usize) -> BlockedSlab {
         let bt_stride_u64 = default_blocks.max(1).div_ceil(BT_STRIDE_ALIGN_U64) * BT_STRIDE_ALIGN_U64;
-        BlockedSlab {
-            cs_buf: None,
-            bt_buf: None,
-            cap: 0,
-            used: 0,
-            bt_stride_u64,
-            free_slots: Vec::new(),
-        }
+        BlockedSlab { cs_buf: None, bt_buf: None, cap: 0, used: 0, bt_stride_u64, free_slots: Vec::new() }
     }
 
     fn next_cap(need: usize) -> usize {
@@ -677,7 +1461,8 @@ impl BlockedSlab {
         unsafe {
             let cs_ptr = (self.cs_buf.as_ref().unwrap().contents().as_ptr() as *mut u8).add(slot_idx * CS_STRIDE_BYTES);
             std::ptr::write_bytes(cs_ptr, 0, CS_STRIDE_BYTES);
-            let bt_ptr = (self.bt_buf.as_ref().unwrap().contents().as_ptr() as *mut u8).add(slot_idx * 2 * self.bt_stride_u64 * 8);
+            let bt_ptr = (self.bt_buf.as_ref().unwrap().contents().as_ptr() as *mut u8)
+                .add(slot_idx * 2 * self.bt_stride_u64 * 8);
             std::ptr::write_bytes(bt_ptr, 0xff, 2 * self.bt_stride_u64 * 8);
         }
         slot_idx
@@ -701,7 +1486,10 @@ impl Drop for BlockedSlot {
 pub struct Lane {
     /// K/V cache (fp16). Sliding-window layers keep exactly their window (a ring of EXT keys per slot), full-attention
     /// layers every key. Both buffers are sized to the context and grow with it.
-    kv_swa: RefCell<Buf>, kv_full: RefCell<Buf>, swa_cap: Cell<usize>, full_cap: Cell<usize>,
+    kv_swa: RefCell<Buf>,
+    kv_full: RefCell<Buf>,
+    swa_cap: Cell<usize>,
+    full_cap: Cell<usize>,
     /// causal-convolution rows of every slot for Layer 2 lanes (Layer 3 blocked lanes sub-allocate from `Engine::blocked_slab`)
     cs_own: Option<Buf>,
     /// the stream's tokens by position (greedy decoding writes each step's argmax here, GPU to GPU)
@@ -747,16 +1535,31 @@ struct DecBatchMeta {
 /// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
 /// `Run` reaches through Deref.
 #[derive(Clone, Copy)]
-pub struct Run<'a> { pub eng: &'a Engine, pub lane: &'a Lane }
-impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Engine { self.eng } }
+pub struct Run<'a> {
+    pub eng: &'a Engine,
+    pub lane: &'a Lane,
+}
+impl std::ops::Deref for Run<'_> {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        self.eng
+    }
+}
 
 /// One lane's part of a step: positions [p0, p0 + t) of that lane.
 #[derive(Clone, Copy)]
-pub struct Span<'a> { pub lane: &'a Lane, pub p0: usize, pub t: usize }
+pub struct Span<'a> {
+    pub lane: &'a Lane,
+    pub p0: usize,
+    pub t: usize,
+}
 
 /// K/V rows one verify or session-checkpoint position overwrote, copied before the span ran.
 #[derive(Clone)]
-pub(crate) struct KvUndo { pub(crate) pos: usize, pub(crate) rows: Vec<u8> }
+pub(crate) struct KvUndo {
+    pub(crate) pos: usize,
+    pub(crate) rows: Vec<u8>,
+}
 struct VerifySpan {
     lane: *const Lane,
     p0: usize,
@@ -784,11 +1587,7 @@ fn create_locked_kv_tier_file_at(path: &std::path::Path) -> std::io::Result<std:
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
+    opts.read(true).write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
     let file = opts.open(path)?;
     let fd = file.as_raw_fd();
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -807,10 +1606,8 @@ fn open_exclusive_kv_tier_file(dir: &std::path::Path) -> std::io::Result<std::fs
     let pid = std::process::id();
     for attempt in 0..64u64 {
         let seq = LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
         let mut z = nanos ^ ((pid as u64) << 32) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ attempt;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -825,18 +1622,24 @@ fn open_exclusive_kv_tier_file(dir: &std::path::Path) -> std::io::Result<std::fs
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "exhausted retries creating exclusive --kv-disk file",
-    ))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exhausted retries creating exclusive --kv-disk file"))
 }
 
-fn validate_snapshot_lengths(cs_len: usize, expected_cs_len: usize, swa_len: usize, dst_swa_len: usize) -> Result<(), String> {
+fn validate_snapshot_lengths(
+    cs_len: usize,
+    expected_cs_len: usize,
+    swa_len: usize,
+    dst_swa_len: usize,
+) -> Result<(), String> {
     if cs_len != expected_cs_len {
-        return Err(format!("snapshot conv-state byte length mismatch: snapshot has {cs_len}, lane expects {expected_cs_len}"));
+        return Err(format!(
+            "snapshot conv-state byte length mismatch: snapshot has {cs_len}, lane expects {expected_cs_len}"
+        ));
     }
     if swa_len != dst_swa_len {
-        return Err(format!("snapshot window K/V byte length mismatch: snapshot has {swa_len}, lane buffer has {dst_swa_len}"));
+        return Err(format!(
+            "snapshot window K/V byte length mismatch: snapshot has {swa_len}, lane buffer has {dst_swa_len}"
+        ));
     }
     Ok(())
 }
@@ -852,19 +1655,36 @@ impl Lane {
             assert!(!eng.kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
             let dir = std::env::var_os("INK_TIER_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
             let file = open_exclusive_kv_tier_file(&dir).expect("create exclusive K/V file");
-            Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
-                        min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
-                        stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
-                        plan: RefCell::new(Vec::new()), execs: RefCell::new(Vec::new()), loaded: Cell::new(usize::MAX),
-                        read_bytes: Cell::new(0), read_time: Cell::new(Default::default()), unaligned: Cell::new(false) })
-        } else { None };
+            Some(Tier {
+                file,
+                on: Cell::new(false),
+                lo: Default::default(),
+                cold: Default::default(),
+                filed: Default::default(),
+                next: Cell::new(0),
+                min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
+                stg: RefCell::new(gpu.buffer(16384)),
+                half: Cell::new(0),
+                pending: RefCell::new([None, None]),
+                plan: RefCell::new(Vec::new()),
+                execs: RefCell::new(Vec::new()),
+                loaded: Cell::new(usize::MAX),
+                read_bytes: Cell::new(0),
+                read_time: Cell::new(Default::default()),
+                unaligned: Cell::new(false),
+            })
+        } else {
+            None
+        };
         Lane {
             kv_swa: RefCell::new(gpu.buffer(n_swa * 2 * NKV * cap0 * HD * eng.kvb)),
             kv_full: RefCell::new(gpu.buffer(n_full * 2 * NKV * cap0 * HD * eng.kvb)),
-            swa_cap: Cell::new(cap0), full_cap: Cell::new(cap0),
+            swa_cap: Cell::new(cap0),
+            full_cap: Cell::new(cap0),
             cs_own: Some(gpu.buffer(CS_STRIDE_BYTES)),
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
-            tier, prune: RefCell::new(None),
+            tier,
+            prune: RefCell::new(None),
             block_table: std::cell::RefCell::new(crate::blocks::BlockTable::empty()),
             use_blocks: Cell::new(false),
             blocked_slot: None,
@@ -882,17 +1702,15 @@ impl Lane {
         Lane {
             kv_swa: RefCell::new(gpu.buffer(16)),
             kv_full: RefCell::new(gpu.buffer(16)),
-            swa_cap: Cell::new(0), full_cap: Cell::new(0),
+            swa_cap: Cell::new(0),
+            full_cap: Cell::new(0),
             cs_own: None,
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
-            tier: None, prune: RefCell::new(None),
+            tier: None,
+            prune: RefCell::new(None),
             block_table: RefCell::new(crate::blocks::BlockTable::new(blocks_u32).expect("block table")),
             use_blocks: Cell::new(true),
-            blocked_slot: Some(BlockedSlot {
-                slab: eng.blocked_slab.clone(),
-                slot_idx,
-                bt_blocks: blocks,
-            }),
+            blocked_slot: Some(BlockedSlot { slab: eng.blocked_slab.clone(), slot_idx, bt_blocks: blocks }),
         }
     }
 
@@ -921,22 +1739,34 @@ impl Lane {
 
     /// The lane's 64-bit paged block table (`Lane::new_blocked`), synced incrementally to GPU memory
     /// by [`Engine::sync_lane_block_table`] and read by `ServeBlockCache` and `Layer3Pool`.
-    pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
+    pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> {
+        &self.block_table
+    }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
-    if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) { ip } else { N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START) }
+    if pass == 0 || !(LOOP_START..LOOP_END).contains(&ip) {
+        ip
+    } else {
+        N_PHYS + (pass - 1) * (LOOP_END - LOOP_START) + (ip - LOOP_START)
+    }
 }
 
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
-    pub fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    pub fn vocab_pad(&self) -> usize {
+        (self.ar.amax - self.ar.logits) as usize
+    }
     /// Shared Layer 3 `Window` and `Full` GPU block pools (`init_serve_block_pools` sizes multi-slab pools for
     /// `inky serve` and `Layer3Pool`). Interior mutability: callers borrow through the `RefCell`.
-    pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
+    pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> {
+        &self.block_pool
+    }
 
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
-    pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
+    pub fn cs_image_bytes() -> usize {
+        N_SLOT * NCH * 3 * 4
+    }
     /// Byte range within a `get_cs()` image covering cache slots `slots` (e.g. `LOOP_END..N_PHYS` = `18..24`).
     pub fn cs_slot_byte_range(slots: std::ops::Range<usize>) -> std::ops::Range<usize> {
         assert!(slots.start <= slots.end && slots.end <= N_SLOT);
@@ -1009,39 +1839,64 @@ impl Engine {
     }
     /// dev: make `dst` a copy of `src` (cache and convolution rows); `dst` must have been reserved to the same capacity
     pub fn copy_lane(&self, src: &Lane, dst: &Lane) {
-        let cp = |a: &Buf, b: &Buf| { assert_eq!(a.length(), b.length()); unsafe { std::ptr::copy_nonoverlapping(a.contents().as_ptr() as *const u8, b.contents().as_ptr() as *mut u8, a.length()); } };
-        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow());
-        src.with_cs_buf(|sb, soff, slen| dst.with_cs_buf(|db, doff, dlen| {
-            assert_eq!(slen, dlen);
+        let cp = |a: &Buf, b: &Buf| {
+            assert_eq!(a.length(), b.length());
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    (sb.contents().as_ptr() as *const u8).add(soff),
-                    (db.contents().as_ptr() as *mut u8).add(doff),
-                    slen,
+                    a.contents().as_ptr() as *const u8,
+                    b.contents().as_ptr() as *mut u8,
+                    a.length(),
                 );
             }
-        }));
+        };
+        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow());
+        cp(&src.kv_full.borrow(), &dst.kv_full.borrow());
+        src.with_cs_buf(|sb, soff, slen| {
+            dst.with_cs_buf(|db, doff, dlen| {
+                assert_eq!(slen, dlen);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (sb.contents().as_ptr() as *const u8).add(soff),
+                        (db.contents().as_ptr() as *mut u8).add(doff),
+                        slen,
+                    );
+                }
+            })
+        });
     }
     /// dev: make `dst` hold `src`'s first `n` positions (cache rows of every slot, convolution rows); the two may have
     /// different capacities
     pub fn copy_lane_prefix(&self, src: &Lane, dst: &Lane, n: usize) {
-        for (sb, db, sc, dc, nk) in [(&src.kv_swa, &dst.kv_swa, src.swa_cap.get(), dst.swa_cap.get(), n.min(EXT)), (&src.kv_full, &dst.kv_full, src.full_cap.get(), dst.full_cap.get(), n)] {
+        for (sb, db, sc, dc, nk) in [
+            (&src.kv_swa, &dst.kv_swa, src.swa_cap.get(), dst.swa_cap.get(), n.min(EXT)),
+            (&src.kv_full, &dst.kv_full, src.full_cap.get(), dst.full_cap.get(), n),
+        ] {
             assert!(nk <= sc && nk <= dc);
             let (sp, dp) = (sb.borrow().contents().as_ptr() as *const u8, db.borrow().contents().as_ptr() as *mut u8);
             let rows = sb.borrow().length() / (sc * HD * self.kvb);
             assert_eq!(rows, db.borrow().length() / (dc * HD * self.kvb));
-            for r in 0..rows { unsafe { std::ptr::copy_nonoverlapping(sp.add(r * sc * HD * self.kvb), dp.add(r * dc * HD * self.kvb), nk * HD * self.kvb); } }
-        }
-        src.with_cs_buf(|sb, soff, slen| dst.with_cs_buf(|db, doff, dlen| {
-            assert_eq!(slen, dlen);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (sb.contents().as_ptr() as *const u8).add(soff),
-                    (db.contents().as_ptr() as *mut u8).add(doff),
-                    slen,
-                );
+            for r in 0..rows {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        sp.add(r * sc * HD * self.kvb),
+                        dp.add(r * dc * HD * self.kvb),
+                        nk * HD * self.kvb,
+                    );
+                }
             }
-        }));
+        }
+        src.with_cs_buf(|sb, soff, slen| {
+            dst.with_cs_buf(|db, doff, dlen| {
+                assert_eq!(slen, dlen);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (sb.contents().as_ptr() as *const u8).add(soff),
+                        (db.contents().as_ptr() as *mut u8).add(doff),
+                        slen,
+                    );
+                }
+            })
+        });
     }
     /// dev, the poisoned-pool gate (`src/poolgate.rs`): raw CPU views of a layer-2 lane's cache:
     /// its window buffer and its full buffer.
@@ -1061,7 +1916,9 @@ impl Engine {
     /// Called after `ensure_batch` and before lanes are created; never undercounts Metal's own
     /// reported device allocation.
     pub fn model_and_scratch_bytes(&self) -> u64 {
-        let buffers = self.w.length()
+        let buffers = self
+            .w
+            .length()
             .saturating_add(self.pb.length())
             .saturating_add(self.ctr.length())
             .saturating_add(self.act.borrow().length())
@@ -1071,7 +1928,13 @@ impl Engine {
     /// Pure worst-case per-lane GPU memory formula at `max_ctx`: full KV + sliding-window KV +
     /// convolution/recurrent state + per-lane token buffer + per-lane decode-batch arena slice.
     #[cfg(test)]
-    pub fn lane_worst_case_bytes_for(n_swa: usize, n_full: usize, max_ctx: usize, kvb: usize, arena_floats: usize) -> u64 {
+    pub fn lane_worst_case_bytes_for(
+        n_swa: usize,
+        n_full: usize,
+        max_ctx: usize,
+        kvb: usize,
+        arena_floats: usize,
+    ) -> u64 {
         let kv_row = 2usize.saturating_mul(NKV).saturating_mul(HD).saturating_mul(kvb);
         let swa_kv = n_swa.saturating_mul(max_ctx.min(EXT)).saturating_mul(kv_row);
         let full_kv = n_full.saturating_mul(max_ctx).saturating_mul(kv_row);
@@ -1110,19 +1973,14 @@ impl Engine {
         loopcd_enabled: bool,
     ) -> u64 {
         let n = lanes.max(1);
-        let dbatch_bytes = n
-            .saturating_mul(arena_floats)
-            .saturating_add(decode_batch_extra_floats(n))
-            .saturating_mul(4) as u64;
+        let dbatch_bytes =
+            n.saturating_mul(arena_floats).saturating_add(decode_batch_extra_floats(n)).saturating_mul(4) as u64;
         let blocks = max_ctx.div_ceil(crate::blocks::BLOCK).max(1);
         let slab_cs = (n as u64).saturating_mul(Self::cs_image_bytes() as u64);
         let slab_bt = (n as u64).saturating_mul(blocks as u64).saturating_mul(16);
         let toks_and_stubs = (n as u64).saturating_mul((max_ctx.saturating_add(8).saturating_mul(4) + 32) as u64);
-        let loopcd_bytes = if loopcd_enabled {
-            (n as u64).saturating_mul(vocab_padded as u64).saturating_mul(4)
-        } else {
-            0
-        };
+        let loopcd_bytes =
+            if loopcd_enabled { (n as u64).saturating_mul(vocab_padded as u64).saturating_mul(4) } else { 0 };
         dbatch_bytes
             .saturating_add(slab_cs)
             .saturating_add(slab_bt)
@@ -1145,11 +2003,8 @@ impl Engine {
         use crate::blocks::{span_bound, BLOCK, WINDOW};
         let eff_ctx = max_ctx.max(BLOCK);
         let min_full = eff_ctx.div_ceil(BLOCK).max(1);
-        let min_win = if eff_ctx <= WINDOW {
-            min_full
-        } else {
-            span_bound(chunk.min(eff_ctx)).max((WINDOW / BLOCK) + 2).max(32)
-        };
+        let min_win =
+            if eff_ctx <= WINDOW { min_full } else { span_bound(chunk.min(eff_ctx)).max((WINDOW / BLOCK) + 2).max(32) };
         (min_win, min_full)
     }
     /// Checked Layer 3 block-pool sizing for `serve`: returns `Err` when `kv_budget_bytes` (or
@@ -1247,18 +2102,11 @@ impl Engine {
         let blocks_per_lane = max_ctx.div_ceil(BLOCK).max(1) as u64;
         let win_per_lane = ((WINDOW / BLOCK) + 2) as u64;
         let active_span_win = span_bound(chunk.min(max_ctx.max(BLOCK))) as u64;
-        let useful_win = lanes
-            .saturating_mul(win_per_lane)
-            .saturating_mul(2)
-            .saturating_add(active_span_win)
-            .saturating_add(32);
-        let useful_full = lanes
-            .saturating_mul(blocks_per_lane)
-            .saturating_mul(2)
-            .saturating_add(64);
-        let useful_bytes = useful_win
-            .saturating_mul(win_stride)
-            .saturating_add(useful_full.saturating_mul(full_stride));
+        let useful_win =
+            lanes.saturating_mul(win_per_lane).saturating_mul(2).saturating_add(active_span_win).saturating_add(32);
+        let useful_full = lanes.saturating_mul(blocks_per_lane).saturating_mul(2).saturating_add(64);
+        let useful_bytes =
+            useful_win.saturating_mul(win_stride).saturating_add(useful_full.saturating_mul(full_stride));
         kv_budget_bytes.min(useful_bytes)
     }
     /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`,
@@ -1268,12 +2116,7 @@ impl Engine {
             if let Some((w_str, f_str)) = spec.trim().split_once(',') {
                 if let (Ok(nw), Ok(nf)) = (w_str.trim().parse::<usize>(), f_str.trim().parse::<usize>()) {
                     if nw >= 1 && nf >= 1 {
-                        let pools = crate::blocks::BlockPools::gpu(
-                            &self.gpu.dev,
-                            nw,
-                            nf,
-                            self.kvb as u32,
-                        );
+                        let pools = crate::blocks::BlockPools::gpu(&self.gpu.dev, nw, nf, self.kvb as u32);
                         *self.block_pool.borrow_mut() = pools;
                         return Ok((nw, nf));
                     }
@@ -1281,13 +2124,8 @@ impl Engine {
             }
         }
         let max_slab = self.gpu.dev.maxBufferLength() as u64;
-        let capped_budget = Self::capped_serve_kv_budget(
-            kv_budget_bytes,
-            self.kvb as u32,
-            self.chunk,
-            self.max_ctx,
-            max_lanes,
-        );
+        let capped_budget =
+            Self::capped_serve_kv_budget(kv_budget_bytes, self.kvb as u32, self.chunk, self.max_ctx, max_lanes);
         let (n_window, n_full) = Self::checked_serve_block_pool_counts(
             capped_budget,
             self.kvb as u32,
@@ -1355,14 +2193,20 @@ impl Engine {
         }
     }
     /// Current default adaptive LoopCD-Logits contrast weight (`0.0` = disabled).
-    pub fn loopcd_omega(&self) -> f32 { self.loopcd_omega.get() }
+    pub fn loopcd_omega(&self) -> f32 {
+        self.loopcd_omega.get()
+    }
     /// True iff output row `span_idx` of the most recent forward step ran `k_loopcd_blend` (`omega > 0.0`).
     pub fn span_loopcd(&self, span_idx: usize) -> bool {
         span_idx < u128::BITS as usize && (self.guided_logit_rows.get() & (1u128 << span_idx)) != 0
     }
     /// The sampler applies the model softcap only to raw rows of the last forward step.
     pub fn effective_sampler_softcap(&self, row: usize) -> f32 {
-        if self.span_loopcd(row) { 0.0 } else { self.softcap }
+        if self.span_loopcd(row) {
+            0.0
+        } else {
+            self.softcap
+        }
     }
     /// Alias for [`Engine::effective_sampler_softcap`] used by LoopCD invariance gates.
     pub fn span_effective_sampler_softcap(&self, span_idx: usize) -> f32 {
@@ -1390,7 +2234,18 @@ impl Engine {
         );
         buf.clone()
     }
-    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, row: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+    fn encode_gumbel_at(
+        &self,
+        cb: &CmdBuf,
+        logits_off: u32,
+        row: usize,
+        lane: &Lane,
+        out_index: usize,
+        seed: u64,
+        pos: usize,
+        temp: f32,
+        ban_tok: Option<u32>,
+    ) {
         assert!(out_index * 4 < lane.toks.length(), "encode_gumbel: out_index {out_index} out of bounds");
         let sa = SampArgs {
             logits_off,
@@ -1403,7 +2258,15 @@ impl Engine {
             softcap: self.effective_sampler_softcap(row),
         };
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
-        let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, checked: 1, pad: [0; 2] };
+        let am = ArgmaxArgs {
+            logits_off,
+            n: self.n_vocab as u32,
+            part_off: self.ar.part,
+            nparts,
+            out_index: out_index as u32,
+            checked: 1,
+            pad: [0; 2],
+        };
         let e = Enc::new(cb);
         self.bind_eng(&e);
         self.bind_lane(&e, lane);
@@ -1415,7 +2278,17 @@ impl Engine {
     /// GPU Gumbel-max sampling for a batch span's logits row (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky):
     /// transforms logits in-place with softcap + Gumbel noise (and optional `ban_tok` mask) and writes the drawn
     /// token ID into `lane.toks[out_index]`.
-    pub fn encode_gumbel_span(&self, cb: &CmdBuf, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+    pub fn encode_gumbel_span(
+        &self,
+        cb: &CmdBuf,
+        span_idx: usize,
+        lane: &Lane,
+        out_index: usize,
+        seed: u64,
+        pos: usize,
+        temp: f32,
+        ban_tok: Option<u32>,
+    ) {
         let b = self.ba.get();
         assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
         let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
@@ -1426,7 +2299,9 @@ impl Engine {
     /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
     /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item; called by `inky serve` batched sampling.
     pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
-        if items.is_empty() { return; }
+        if items.is_empty() {
+            return;
+        }
         let b = self.ba.get();
         let vp = self.vocab_pad();
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
@@ -1438,7 +2313,11 @@ impl Engine {
         );
         for item in items {
             assert!(item.span_idx < b.lg_rows as usize, "encode_gumbel_spans: row {} >= {}", item.span_idx, b.lg_rows);
-            assert!(item.out_index * 4 < item.lane.toks.length(), "encode_gumbel_spans: out_index {} out of bounds", item.out_index);
+            assert!(
+                item.out_index * 4 < item.lane.toks.length(),
+                "encode_gumbel_spans: out_index {} out of bounds",
+                item.out_index
+            );
         }
         let e = Enc::new(cb);
         self.bind_eng(&e);
@@ -1491,20 +2370,39 @@ impl Engine {
     /// GPU Gumbel-max sampling for a single-span prefill whose logits live in `ar.logits`.
     /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
     /// the exact same RNG/sampling kernel for bit-identical `temperature = 1.0` equivalence.
-    pub fn encode_gumbel_solo(&self, cb: &CmdBuf, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+    pub fn encode_gumbel_solo(
+        &self,
+        cb: &CmdBuf,
+        lane: &Lane,
+        out_index: usize,
+        seed: u64,
+        pos: usize,
+        temp: f32,
+        ban_tok: Option<u32>,
+    ) {
         self.encode_gumbel_at(cb, self.ar.logits, 0, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// the decode path's arena at the current base
-    fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
+    fn ar_at(&self) -> Arena {
+        self.ar.shift(self.abase.get())
+    }
     /// offset of residual vector `i` of the decode path at the current base
-    fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) }
-    fn decode_span_limit(&self) -> usize { MAX_SPANS.min(self.chunk).min(self.ba.get().cap / 2) }
+    fn v(&self, i: usize) -> u32 {
+        self.abase.get() + Arena::vec(i)
+    }
+    fn decode_span_limit(&self) -> usize {
+        MAX_SPANS.min(self.chunk).min(self.ba.get().cap / 2)
+    }
 
     /// The server builds a batch from every ready decoding lane. Check the eventual batch size and GPU path
     /// after the prefill arena is allocated and the device's fp16 layout has been probed.
     pub fn check_serve_decode(&self, lanes: usize) -> Result<(), String> {
-        if !self.hgemm { return Err("serve needs the fp16 tensor path for batched decode, which is unavailable".into()); }
-        if !self.sep_comb { return Err("serve needs separate split attention combines; unset INK_FUSE_COMB".into()); }
+        if !self.hgemm {
+            return Err("serve needs the fp16 tensor path for batched decode, which is unavailable".into());
+        }
+        if !self.sep_comb {
+            return Err("serve needs separate split attention combines; unset INK_FUSE_COMB".into());
+        }
         let limit = self.decode_span_limit();
         if lanes > limit {
             return Err(format!("--lanes {lanes} exceeds the decode batch capacity of {limit} for the selected context and prefill chunk"));
@@ -1513,10 +2411,14 @@ impl Engine {
     }
 
     /// Toggle grouped shared-KV decode (`true` forces `count = 1` groups, matching `INK_NO_GRP_DEC=1`).
-    pub fn set_no_grp_dec(&self, no_grp: bool) { self.no_grp_dec.set(no_grp); }
+    pub fn set_no_grp_dec(&self, no_grp: bool) {
+        self.no_grp_dec.set(no_grp);
+    }
     /// Whether grouped shared-KV decode is currently disabled (`count = 1` forced).
     #[allow(dead_code)]
-    pub fn no_grp_dec(&self) -> bool { self.no_grp_dec.get() }
+    pub fn no_grp_dec(&self) -> bool {
+        self.no_grp_dec.get()
+    }
 
     /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, followed by Layer 3
     /// batched-decode scratch (`DecodeSpanDesc`, `kv_cur`, and `DecAttnGroup` lists), after everything else
@@ -1528,7 +2430,13 @@ impl Engine {
         self.dstart.set(start);
         if self.act.borrow().length() < need {
             let nb = self.gpu.buffer(need);
-            unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.act.borrow().length()); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.act.borrow().contents().as_ptr() as *const u8,
+                    nb.contents().as_ptr() as *mut u8,
+                    self.act.borrow().length(),
+                );
+            }
             *self.act.borrow_mut() = nb;
         }
         if n > 0 {
@@ -1549,24 +2457,36 @@ impl Engine {
         self.borrow_act_slice(off, self.n_vocab, "Engine::dbatch_logits")
     }
     /// the engine working on `lane`
-    pub fn on<'a>(&'a self, lane: &'a Lane) -> Run<'a> { Run { eng: self, lane } }
+    pub fn on<'a>(&'a self, lane: &'a Lane) -> Run<'a> {
+        Run { eng: self, lane }
+    }
     /// Allocate (or enlarge) the batch arena for a prefill of `t` tokens. Nothing may be in flight on the GPU.
     pub fn ensure_batch(&self, t: usize) {
         let t = t.div_ceil(64) * 64;
-        if t <= self.ba.get().cap { return; }
+        if t <= self.ba.get().cap {
+            return;
+        }
         let nb = BArena::new(self.ar.total, t, self.hgemm, self.kvb, self.vocab_pad());
         self.realloc_act(nb.end as usize * 4);
         self.ba.set(nb);
     }
     /// Give the batch arena back (the decode arena and the last logits stay). Nothing may be in flight on the GPU.
     pub fn release_batch(&self) {
-        if self.ba.get().cap == 0 { return; }
+        if self.ba.get().cap == 0 {
+            return;
+        }
         self.realloc_act(self.ar.total as usize * 4);
         self.ba.set(BArena::default());
     }
     fn realloc_act(&self, bytes: usize) {
         let nb = self.gpu.buffer(bytes);
-        unsafe { std::ptr::copy_nonoverlapping(self.act.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8, self.ar.total as usize * 4); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.act.borrow().contents().as_ptr() as *const u8,
+                nb.contents().as_ptr() as *mut u8,
+                self.ar.total as usize * 4,
+            );
+        }
         *self.act.borrow_mut() = nb;
     }
     // ======================================================================== dev: key eviction experiments
@@ -1587,7 +2507,15 @@ impl Engine {
     /// expert ids chosen by each of the 48 layer executions of the last decode step
     pub fn routes(&self) -> Vec<[u8; TOPK]> {
         let v = self.arena(self.ar.sel_log, 48 * 16);
-        (0..48).map(|l| { let mut r = [0u8; TOPK]; for k in 0..TOPK { r[k] = v[l * 16 + k] as u8; } r }).collect()
+        (0..48)
+            .map(|l| {
+                let mut r = [0u8; TOPK];
+                for k in 0..TOPK {
+                    r[k] = v[l * 16 + k] as u8;
+                }
+                r
+            })
+            .collect()
     }
     /// dev: MoE tiles of the last prefilled layer: per width class (128, 64, 32) the per-tile token counts
     pub fn moe_tiles(&self) -> [Vec<u32>; NTC] {
@@ -1597,7 +2525,11 @@ impl Engine {
             let ind = self.borrow_act_slice::<u32>(b.ind as usize + c * 4, 1, "Engine::moe_tiles(ind)");
             let n = ind[0] as usize;
             drop(ind);
-            let tiles = self.borrow_act_slice::<u32>(b.tl[c] as usize, n.checked_mul(4).expect("moe_tiles overflow"), "Engine::moe_tiles(tl)");
+            let tiles = self.borrow_act_slice::<u32>(
+                b.tl[c] as usize,
+                n.checked_mul(4).expect("moe_tiles overflow"),
+                "Engine::moe_tiles(tl)",
+            );
             (0..n).map(|i| tiles[i * 4 + 2]).collect::<Vec<u32>>()
         };
         [cls(0), cls(1)]
@@ -1610,19 +2542,32 @@ impl Engine {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
             self.bind_eng(&e);
-            e.pso(&self.gpu.pso("k_layout_sg")); e.bytes(&out_off, 5);
+            e.pso(&self.gpu.pso("k_layout_sg"));
+            e.bytes(&out_off, 5);
             e.dispatch((1, 1, 1), 32);
-            e.end(); cb.commit(); cb.waitUntilCompleted();
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "layout_ok(k_layout_sg)");
             let o = self.borrow_act_slice::<i32>(out_off as usize, 32 * 64, "Engine::layout_ok(sg)");
             for t in 0..32 {
-                if o[t * 64 + 63] != 32 { return false; }
+                if o[t * 64 + 63] != 32 {
+                    return false;
+                }
                 let rt = |i: usize| (o[t * 64 + i] >> 16, o[t * 64 + i] & 0xffff);
                 for q in 0..8 {
                     let (r0, t0) = rt(4 * q);
-                    if o[t * 64 + 4 * q] < 0 || r0 % 4 != 0 || t0 >= 16 { return false; }
-                    for e in 1..4 { if rt(4 * q + e) != (r0 + e as i32, t0) { return false; } }
-                    if q < 4 && (r0 >= 32 || rt(4 * q + 16) != (r0 + 32, t0)) { return false; }
+                    if o[t * 64 + 4 * q] < 0 || r0 % 4 != 0 || t0 >= 16 {
+                        return false;
+                    }
+                    for e in 1..4 {
+                        if rt(4 * q + e) != (r0 + e as i32, t0) {
+                            return false;
+                        }
+                    }
+                    if q < 4 && (r0 >= 32 || rt(4 * q + 16) != (r0 + 32, t0)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1632,17 +2577,28 @@ impl Engine {
             let cb = self.gpu.cmd();
             let e = Enc::new(&cb);
             self.bind_eng(&e);
-            e.pso(&self.gpu.pso("k_layout_att")); e.bytes(&out_off, 5);
+            e.pso(&self.gpu.pso("k_layout_att"));
+            e.bytes(&out_off, 5);
             e.dispatch((1, 1, 1), 256);
-            e.end(); cb.commit(); cb.waitUntilCompleted();
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "layout_ok(k_layout_att)");
             let o = self.borrow_act_slice::<i32>(out_off as usize, 256 * 64, "Engine::layout_ok(att)");
             for t in 0..256 {
-                if o[t * 64 + 63] != 16 { return false; }
+                if o[t * 64 + 63] != 16 {
+                    return false;
+                }
                 for q in 0..4 {
                     let (d0, r0) = (o[t * 64 + 4 * q] >> 16, o[t * 64 + 4 * q] & 0xffff);
-                    if o[t * 64 + 4 * q] < 0 || d0 % 4 != 0 { return false; }
-                    for e in 1..4 { if o[t * 64 + 4 * q + e] != ((d0 + e as i32) << 16 | r0) { return false; } }
+                    if o[t * 64 + 4 * q] < 0 || d0 % 4 != 0 {
+                        return false;
+                    }
+                    for e in 1..4 {
+                        if o[t * 64 + 4 * q + e] != ((d0 + e as i32) << 16 | r0) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -1666,8 +2622,16 @@ impl Engine {
                 for chunk in 0..4 {
                     let gu = &self.layers[l].gu;
                     let off = gu.off + ((rep * 4 + chunk) % 16) as u64 * 8 * gu.expert_bytes;
-                    let a = BenchArgs { w_lo: off as u32, w_hi: (off >> 32) as u32, row_bytes: gu.row_bytes, nrows: rows as u32, k: E as u32,
-                                        x_off: Arena::vec(1), out_off: self.ar.logits, pad: 0 };
+                    let a = BenchArgs {
+                        w_lo: off as u32,
+                        w_hi: (off >> 32) as u32,
+                        row_bytes: gu.row_bytes,
+                        nrows: rows as u32,
+                        k: E as u32,
+                        x_off: Arena::vec(1),
+                        out_off: self.ar.logits,
+                        pad: 0,
+                    };
                     e.bytes(&a, 5);
                     e.dispatch((rows / (nr * nsg), 1, 1), 32 * nsg);
                     e.barrier();
@@ -1679,7 +2643,9 @@ impl Engine {
             cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench");
             let t = cb.GPUEndTime() - cb.GPUStartTime();
-            if rep > 0 { best = best.min(bytes as f64 / t / 1e9); }
+            if rep > 0 {
+                best = best.min(bytes as f64 / t / 1e9);
+            }
         }
         best
     }
@@ -1691,8 +2657,12 @@ impl Engine {
         // synthetic act + selection
         let a = self.act.borrow().contents().as_ptr() as *mut f32;
         unsafe {
-            for i in 0..TOPK * FF { *a.add(ar.act as usize + i) = ((i * 7919) % 1000) as f32 / 1000.0 - 0.5; }
-            for k in 0..TOPK { *a.add(ar.sel as usize + TOPK + k) = 0.125; }
+            for i in 0..TOPK * FF {
+                *a.add(ar.act as usize + i) = ((i * 7919) % 1000) as f32 / 1000.0 - 0.5;
+            }
+            for k in 0..TOPK {
+                *a.add(ar.sel as usize + TOPK + k) = 0.125;
+            }
         }
         let mut best = f64::MAX;
         for rep in 0..4 {
@@ -1703,13 +2673,25 @@ impl Engine {
             let mut bytes = 0usize;
             let mut sels = Vec::new();
             for l in 0..N_PHYS {
-                if only_type != 0 && self.layers[l].dn.ty != only_type { continue; }
+                if only_type != 0 && self.layers[l].dn.ty != only_type {
+                    continue;
+                }
                 for it in 0..4 {
                     let dn = &self.layers[l].dn;
-                    let ma = MoeArgs { sel_off: ar.logits + 100000 + ((l * 4 + it) as u32 % 32) * 16, act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
-                                       dn_lo: dn.off as u32, dn_hi: (dn.off >> 32) as u32, dn_expert_bytes: dn.expert_bytes as u32,
-                                       dn_row_bytes: dn.row_bytes, dn_type: dn.ty,
-                                       dn_gs_lo: dn.gs as u32, dn_gs_hi: (dn.gs >> 32) as u32, ..Default::default() };
+                    let ma = MoeArgs {
+                        sel_off: ar.logits + 100000 + ((l * 4 + it) as u32 % 32) * 16,
+                        act_off: ar.act,
+                        out_off: Arena::vec(2),
+                        res_off: Arena::vec(3) as i32,
+                        dn_lo: dn.off as u32,
+                        dn_hi: (dn.off >> 32) as u32,
+                        dn_expert_bytes: dn.expert_bytes as u32,
+                        dn_row_bytes: dn.row_bytes,
+                        dn_type: dn.ty,
+                        dn_gs_lo: dn.gs as u32,
+                        dn_gs_hi: (dn.gs >> 32) as u32,
+                        ..Default::default()
+                    };
                     sels.push(ma.sel_off);
                     e.pso(&self.gpu.pso(name));
                     e.bytes(&ma, 5);
@@ -1720,7 +2702,10 @@ impl Engine {
             }
             unsafe {
                 for (j, &so) in sels.iter().enumerate() {
-                    for k in 0..TOPK { *a.add(so as usize + k) = (((j * 37 + k * 13 + rep * 5) % 128) as f32).max(0.0); *a.add(so as usize + TOPK + k) = 0.125; }
+                    for k in 0..TOPK {
+                        *a.add(so as usize + k) = (((j * 37 + k * 13 + rep * 5) % 128) as f32).max(0.0);
+                        *a.add(so as usize + TOPK + k) = 0.125;
+                    }
                 }
             }
             e.end();
@@ -1728,7 +2713,9 @@ impl Engine {
             cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench_down");
             let t = cb.GPUEndTime() - cb.GPUStartTime();
-            if rep > 0 { best = best.min(bytes as f64 / t / 1e9); }
+            if rep > 0 {
+                best = best.min(bytes as f64 / t / 1e9);
+            }
         }
         best
     }
@@ -1740,17 +2727,25 @@ impl Engine {
         let chunk = 1usize << 30;
         let mut off = 0usize;
         let cb = self.gpu.cmd();
-        let e = Enc::new(&cb); self.bind_eng(&e);
+        let e = Enc::new(&cb);
+        self.bind_eng(&e);
         e.pso(&self.gpu.pso("k_touch"));
         while off < self.g.file_len() {
             let n = chunk.min(self.g.file_len() - off) / 16;
             let ta = TouchArgs { lo: off as u32, hi: (off >> 32) as u32, n16: n as u32, pad: 0 };
-            e.bytes(&ta, 5); e.dispatch((4096, 1, 1), 256);
+            e.bytes(&ta, 5);
+            e.dispatch((4096, 1, 1), 256);
             off += chunk;
         }
-        e.end(); cb.commit(); cb.waitUntilCompleted();
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
         Self::assert_cmd_ok(&cb, "warm");
-        eprintln!("[inky] warmed {:.1} GiB of weights in {:.0?}", self.g.file_len() as f64 / (1u64 << 30) as f64, t0.elapsed());
+        eprintln!(
+            "[inky] warmed {:.1} GiB of weights in {:.0?}",
+            self.g.file_len() as f64 / (1u64 << 30) as f64,
+            t0.elapsed()
+        );
     }
 
     /// raw GPU read bandwidth over the mapped weights
@@ -1760,10 +2755,15 @@ impl Engine {
             for rep in 0..3 {
                 let off = (1u64 << 30) + rep as u64 * (1u64 << 28);
                 let cb = self.gpu.cmd();
-                let e = Enc::new(&cb); self.bind_eng(&e);
+                let e = Enc::new(&cb);
+                self.bind_eng(&e);
                 let ta = TouchArgs { lo: off as u32, hi: (off >> 32) as u32, n16: ((gb << 30) / 16) as u32, pad: 0 };
-                e.pso(&self.gpu.pso("k_touch")); e.bytes(&ta, 5); e.dispatch((tgs, 1, 1), 256);
-                e.end(); cb.commit(); cb.waitUntilCompleted();
+                e.pso(&self.gpu.pso("k_touch"));
+                e.bytes(&ta, 5);
+                e.dispatch((tgs, 1, 1), 256);
+                e.end();
+                cb.commit();
+                cb.waitUntilCompleted();
                 Self::assert_cmd_ok(&cb, "bw_weights");
                 best = best.max((gb << 30) as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e9);
             }
@@ -1786,28 +2786,54 @@ impl Engine {
             for l in 0..N_PHYS {
                 for it in 0..2 {
                     let sel = ar.logits + 100000 + ((l * 2 + it) as u32) * 16;
-                    unsafe { for k in 0..TOPK {
-                        *a.add(sel as usize + k) = (((l * 2 + it) * 53 + k * 17 + rep * 29) % 128) as f32;
-                        *a.add(sel as usize + TOPK + k) = 0.125; } }
+                    unsafe {
+                        for k in 0..TOPK {
+                            *a.add(sel as usize + k) = (((l * 2 + it) * 53 + k * 17 + rep * 29) % 128) as f32;
+                            *a.add(sel as usize + TOPK + k) = 0.125;
+                        }
+                    }
                     let ld = &self.layers[l];
-                    let ma = MoeArgs { sel_off: sel, x_off: Arena::vec(1), act_off: ar.act, out_off: Arena::vec(2), res_off: Arena::vec(3) as i32,
-                        gu_lo: ld.gu.off as u32, gu_hi: (ld.gu.off >> 32) as u32, gu_expert_bytes: ld.gu.expert_bytes as u32, gu_row_bytes: ld.gu.row_bytes,
-                        gu_type: ld.gu.ty, gu_gs_lo: ld.gu.gs as u32, gu_gs_hi: (ld.gu.gs >> 32) as u32,
-                        dn_lo: ld.dn.off as u32, dn_hi: (ld.dn.off >> 32) as u32, dn_expert_bytes: ld.dn.expert_bytes as u32, dn_row_bytes: ld.dn.row_bytes,
-                        dn_type: ld.dn.ty, dn_gs_lo: ld.dn.gs as u32, dn_gs_hi: (ld.dn.gs >> 32) as u32,
-                        beta: 4.0, lbeta: 25.0, cs_off: 0, convw_off: ld.ffn_post_conv, ..Default::default() };
+                    let ma = MoeArgs {
+                        sel_off: sel,
+                        x_off: Arena::vec(1),
+                        act_off: ar.act,
+                        out_off: Arena::vec(2),
+                        res_off: Arena::vec(3) as i32,
+                        gu_lo: ld.gu.off as u32,
+                        gu_hi: (ld.gu.off >> 32) as u32,
+                        gu_expert_bytes: ld.gu.expert_bytes as u32,
+                        gu_row_bytes: ld.gu.row_bytes,
+                        gu_type: ld.gu.ty,
+                        gu_gs_lo: ld.gu.gs as u32,
+                        gu_gs_hi: (ld.gu.gs >> 32) as u32,
+                        dn_lo: ld.dn.off as u32,
+                        dn_hi: (ld.dn.off >> 32) as u32,
+                        dn_expert_bytes: ld.dn.expert_bytes as u32,
+                        dn_row_bytes: ld.dn.row_bytes,
+                        dn_type: ld.dn.ty,
+                        dn_gs_lo: ld.dn.gs as u32,
+                        dn_gs_hi: (ld.dn.gs >> 32) as u32,
+                        beta: 4.0,
+                        lbeta: 25.0,
+                        cs_off: 0,
+                        convw_off: ld.ffn_post_conv,
+                        ..Default::default()
+                    };
                     e.pso(&self.gpu.pso(which));
                     e.bytes(&ma, 5);
                     e.dispatch((grid.0, grid.1, 1), tgs);
                     e.barrier();
-                    bytes += TOPK * if which.contains("gu") { ld.gu.expert_bytes as usize } else { ld.dn.expert_bytes as usize };
+                    bytes += TOPK
+                        * if which.contains("gu") { ld.gu.expert_bytes as usize } else { ld.dn.expert_bytes as usize };
                 }
             }
             e.end();
             cb.commit();
             cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench_moe");
-            if rep > 0 { best = best.max(bytes as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e9); }
+            if rep > 0 {
+                best = best.max(bytes as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e9);
+            }
         }
         best
     }
@@ -1818,17 +2844,29 @@ impl Engine {
         let b = self.ba.get();
         let a = self.act.borrow().contents().as_ptr() as *mut f32;
         let half_x = name.ends_with("_3") || name.starts_with("kgb") || name.starts_with("kgs");
-        let nsg: usize = if name.starts_with("kgb") || name.starts_with("kgs") { name.rsplit('_').next().unwrap().parse().unwrap() } else { 4 };
+        let nsg: usize = if name.starts_with("kgb") || name.starts_with("kgs") {
+            name.rsplit('_').next().unwrap().parse().unwrap()
+        } else {
+            4
+        };
         let swap = name.starts_with("kgs");
         unsafe {
             for i in 0..t * E {
                 let v = ((i * 7919) % 1000) as f32 / 500.0 - 1.0;
                 if half_x {
                     // f32 -> f16 bits (simple round-to-nearest for normal range)
-                    let bits = v.to_bits(); let sign = (bits >> 16) & 0x8000; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-                    let h: u16 = if v == 0.0 || exp <= 0 { sign as u16 } else { (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16 };
+                    let bits = v.to_bits();
+                    let sign = (bits >> 16) & 0x8000;
+                    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+                    let h: u16 = if v == 0.0 || exp <= 0 {
+                        sign as u16
+                    } else {
+                        (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16
+                    };
                     *(a.add(b.inp[0] as usize) as *mut u16).add(i) = h;
-                } else { *a.add(b.inp[0] as usize + i) = v; }
+                } else {
+                    *a.add(b.inp[0] as usize + i) = v;
+                }
             }
         }
         let mut best = 0.0f64;
@@ -1840,17 +2878,34 @@ impl Engine {
             let mut flops = 0.0;
             for l in &self.layers {
                 let w = &l.wq;
-                let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                in_off: b.inp[0], out_off: b.gain_o[0], ldo: w.rows, ..Default::default() };
-                e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
+                let sg = GSeg {
+                    w_lo: w.off as u32,
+                    w_hi: (w.off >> 32) as u32,
+                    row_bytes: w.row_bytes,
+                    wtype: w.ty,
+                    nrows: w.rows,
+                    k: w.k,
+                    in_off: b.inp[0],
+                    out_off: b.gain_o[0],
+                    ldo: w.rows,
+                    ..Default::default()
+                };
+                e.pso(&self.gpu.pso(name));
+                e.bytes(&sg, 5);
+                e.bytes(&tt, 9);
                 {
-                if swap { e.dispatch((t.div_ceil(bn), (w.rows as usize).div_ceil(bm), 1), 32 * nsg); }
-                else { e.dispatch(((w.rows as usize).div_ceil(bm), t.div_ceil(bn), 1), 32 * nsg); }
-                e.barrier();
-                flops += 2.0 * t as f64 * w.rows as f64 * w.k as f64;
+                    if swap {
+                        e.dispatch((t.div_ceil(bn), (w.rows as usize).div_ceil(bm), 1), 32 * nsg);
+                    } else {
+                        e.dispatch(((w.rows as usize).div_ceil(bm), t.div_ceil(bn), 1), 32 * nsg);
+                    }
+                    e.barrier();
+                    flops += 2.0 * t as f64 * w.rows as f64 * w.k as f64;
                 }
             }
-            e.end(); cb.commit(); cb.waitUntilCompleted();
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench_gemm");
             best = best.max(flops / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
         }
@@ -1869,25 +2924,68 @@ impl Engine {
                 self.bind_eng(&e);
                 for l in &self.layers {
                     for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
-                        let g = if which == 0 { MoeGemmHArgs {
-                            w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
-                            wtype: l.gu.ty, nrows: (2 * FF) as u32, k: E as u32, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                            out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
-                            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
-                        } } else { MoeGemmHArgs {
-                            w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
-                            wtype: l.dn.ty, nrows: E as u32, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                            out_off: b.yd, ldo: E as u32, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
-                            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
-                        } };
-                        e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
+                        let g = if which == 0 {
+                            MoeGemmHArgs {
+                                w_lo: l.gu.off as u32,
+                                w_hi: (l.gu.off >> 32) as u32,
+                                expert_bytes: l.gu.expert_bytes as u32,
+                                row_bytes: l.gu.row_bytes,
+                                wtype: l.gu.ty,
+                                nrows: (2 * FF) as u32,
+                                k: E as u32,
+                                xh_off: b.xgh,
+                                tiles_off: b.tl[c],
+                                ntiles_off: b.ind + (c * 4) as u32,
+                                out_off: b.acth,
+                                ldo: FF as u32,
+                                situ: 1,
+                                aw_off: b.aw,
+                                beta: self.situ_beta,
+                                lbeta: self.situ_lbeta,
+                                gs_lo: l.gu.gs as u32,
+                                gs_hi: (l.gu.gs >> 32) as u32,
+                                pad0: 0,
+                                pad1: 0,
+                            }
+                        } else {
+                            MoeGemmHArgs {
+                                w_lo: l.dn.off as u32,
+                                w_hi: (l.dn.off >> 32) as u32,
+                                expert_bytes: l.dn.expert_bytes as u32,
+                                row_bytes: l.dn.row_bytes,
+                                wtype: l.dn.ty,
+                                nrows: E as u32,
+                                k: FF as u32,
+                                xh_off: b.acth,
+                                tiles_off: b.tl[c],
+                                ntiles_off: b.ind + (c * 4) as u32,
+                                out_off: b.yd,
+                                ldo: E as u32,
+                                situ: 0,
+                                aw_off: 0,
+                                beta: 0.0,
+                                lbeta: 0.0,
+                                gs_lo: l.dn.gs as u32,
+                                gs_hi: (l.dn.gs >> 32) as u32,
+                                pad0: 0,
+                                pad1: 0,
+                            }
+                        };
+                        e.pso(&self.gpu.pso(name));
+                        e.bytes(&g, 5);
                         e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + which * 4 * NTC + c * 4) * 4, *tg);
                     }
                     e.barrier();
                 }
-                e.end(); cb.commit(); cb.waitUntilCompleted();
+                e.end();
+                cb.commit();
+                cb.waitUntilCompleted();
                 Self::assert_cmd_ok(&cb, "kbench_moe_pf");
-                let flops = self.layers.len() as f64 * (t * TOPK) as f64 * 2.0 * (E * FF) as f64 * if which == 0 { 2.0 } else { 1.0 };
+                let flops = self.layers.len() as f64
+                    * (t * TOPK) as f64
+                    * 2.0
+                    * (E * FF) as f64
+                    * if which == 0 { 2.0 } else { 1.0 };
                 *slot_res = slot_res.max(flops / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
             }
         }
@@ -1900,7 +2998,11 @@ impl Engine {
         self.ensure_batch(self.chunk);
         let b = self.ba.get();
         let h = self.act.borrow().contents().as_ptr() as *mut u16;
-        unsafe { for i in 0..t * E { *h.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16; } }
+        unsafe {
+            for i in 0..t * E {
+                *h.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16;
+            }
+        }
         let rows = 3072usize;
         let mut best = 0.0f64;
         for _ in 0..3 {
@@ -1909,12 +3011,23 @@ impl Engine {
             self.bind_eng(&e);
             let tt = t as u32;
             for _ in 0..8 {
-                let sg = GSeg { k: E as u32, in_off: b.inp[0], out_off: b.gain_o[0], ldo: rows as u32, nrows: rows as u32, ..Default::default() };
-                e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
+                let sg = GSeg {
+                    k: E as u32,
+                    in_off: b.inp[0],
+                    out_off: b.gain_o[0],
+                    ldo: rows as u32,
+                    nrows: rows as u32,
+                    ..Default::default()
+                };
+                e.pso(&self.gpu.pso(name));
+                e.bytes(&sg, 5);
+                e.bytes(&tt, 9);
                 e.dispatch((t / (16 * nsg), rows / 64, 1), 32 * nsg);
                 e.barrier();
             }
-            e.end(); cb.commit(); cb.waitUntilCompleted();
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench_peak");
             best = best.max(8.0 * 2.0 * (t * rows * E) as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
         }
@@ -1927,11 +3040,29 @@ impl Engine {
         let a = self.act.borrow().contents().as_ptr() as *mut f32;
         let h = self.act.borrow().contents().as_ptr() as *mut u16;
         // x ~ unit-variance pseudo-normal values, as fp16
-        let f16 = |v: f32| -> u16 { let bits = v.to_bits(); let sign = (bits >> 16) & 0x8000; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-            if v == 0.0 || exp <= 0 { sign as u16 } else { (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16 } };
+        let f16 = |v: f32| -> u16 {
+            let bits = v.to_bits();
+            let sign = (bits >> 16) & 0x8000;
+            let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            if v == 0.0 || exp <= 0 {
+                sign as u16
+            } else {
+                (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16
+            }
+        };
         let mut st = 0x9E3779B97F4A7C15u64;
-        let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 40) as f32 / (1u64 << 24) as f32 };
-        unsafe { for i in 0..t * E { let v = rnd() + rnd() + rnd() + rnd() - 2.0; *h.add(b.inp[0] as usize * 2 + i) = f16(v * 1.7); } }
+        let mut rnd = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / (1u64 << 24) as f32
+        };
+        unsafe {
+            for i in 0..t * E {
+                let v = rnd() + rnd() + rnd() + rnd() - 2.0;
+                *h.add(b.inp[0] as usize * 2 + i) = f16(v * 1.7);
+            }
+        }
         let w = &self.layers[0].wq;
         let run = |nm: &str, out: u32| -> f64 {
             let mut best = 0.0f64;
@@ -1941,15 +3072,31 @@ impl Engine {
                 self.bind_eng(&e);
                 let tt = t as u32;
                 for _ in 0..8 {
-                    let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                    in_off: b.inp[0], out_off: out, ldo: w.rows, ..Default::default() };
-                    e.pso(&self.gpu.pso(nm)); e.bytes(&sg, 5); e.bytes(&tt, 9);
+                    let sg = GSeg {
+                        w_lo: w.off as u32,
+                        w_hi: (w.off >> 32) as u32,
+                        row_bytes: w.row_bytes,
+                        wtype: w.ty,
+                        nrows: w.rows,
+                        k: w.k,
+                        in_off: b.inp[0],
+                        out_off: out,
+                        ldo: w.rows,
+                        ..Default::default()
+                    };
+                    e.pso(&self.gpu.pso(nm));
+                    e.bytes(&sg, 5);
+                    e.bytes(&tt, 9);
                     e.dispatch((t / 128, w.rows as usize / 64, 1), 256);
                     e.barrier();
                 }
-                e.end(); cb.commit(); cb.waitUntilCompleted();
+                e.end();
+                cb.commit();
+                cb.waitUntilCompleted();
                 Self::assert_cmd_ok(&cb, "kbench_mode");
-                best = best.max(8.0 * 2.0 * t as f64 * w.rows as f64 * w.k as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
+                best = best.max(
+                    8.0 * 2.0 * t as f64 * w.rows as f64 * w.k as f64 / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12,
+                );
             }
             best
         };
@@ -1957,14 +3104,25 @@ impl Engine {
         let tf = run(name, b.gate);
         let n = t * w.rows as usize;
         let (mut se, mut sr, mut mx) = (0.0f64, 0.0f64, 0.0f64);
-        unsafe { for i in 0..n { let (x, y) = (*a.add(b.gate as usize + i) as f64, *a.add(b.q as usize + i) as f64); se += (x - y) * (x - y); sr += y * y; mx = mx.max((x - y).abs()); } }
+        unsafe {
+            for i in 0..n {
+                let (x, y) = (*a.add(b.gate as usize + i) as f64, *a.add(b.q as usize + i) as f64);
+                se += (x - y) * (x - y);
+                sr += y * y;
+                mx = mx.max((x - y).abs());
+            }
+        }
         (tf, (se / sr).sqrt(), mx / (sr / n as f64).sqrt())
     }
     pub fn kbench_sgn(&self, name: &str, nsg: usize, nact: usize, t: usize) -> f64 {
         self.ensure_batch(self.chunk);
         let b = self.ba.get();
         let a = self.act.borrow().contents().as_ptr() as *mut u16;
-        unsafe { for i in 0..t * E { *a.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16; } }
+        unsafe {
+            for i in 0..t * E {
+                *a.add(b.inp[0] as usize * 2 + i) = 0x3800 + ((i * 7919) % 512) as u16;
+            }
+        }
         let mut best = 0.0f64;
         for _ in 0..3 {
             let cb = self.gpu.cmd();
@@ -1974,14 +3132,28 @@ impl Engine {
             let mut flops = 0.0;
             for l in &self.layers {
                 let w = &l.wq;
-                let sg = GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-                                in_off: b.inp[0], out_off: b.gain_o[0], ldo: w.rows, ..Default::default() };
-                e.pso(&self.gpu.pso(name)); e.bytes(&sg, 5); e.bytes(&tt, 9);
+                let sg = GSeg {
+                    w_lo: w.off as u32,
+                    w_hi: (w.off >> 32) as u32,
+                    row_bytes: w.row_bytes,
+                    wtype: w.ty,
+                    nrows: w.rows,
+                    k: w.k,
+                    in_off: b.inp[0],
+                    out_off: b.gain_o[0],
+                    ldo: w.rows,
+                    ..Default::default()
+                };
+                e.pso(&self.gpu.pso(name));
+                e.bytes(&sg, 5);
+                e.bytes(&tt, 9);
                 e.dispatch((t / (16 * nsg), w.rows as usize / 64, 1), 32 * nsg);
                 e.barrier();
                 flops += 2.0 * (t * nact / nsg) as f64 * w.rows as f64 * w.k as f64;
             }
-            e.end(); cb.commit(); cb.waitUntilCompleted();
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
             Self::assert_cmd_ok(&cb, "kbench_sgn");
             best = best.max(flops / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
         }
@@ -1990,14 +3162,22 @@ impl Engine {
 
     /// dev: overwrite the scratch arenas (decode and batch) with NaN in both f32 and fp16 readings, so a result that still
     /// depends on what a previous step left there shows. The counters are not touched: their kernels leave them at zero.
-    pub fn arena_map(&self) -> String { format!("{:?}\nbatch {:?}", self.ar, self.ba.get()) }
+    pub fn arena_map(&self) -> String {
+        format!("{:?}\nbatch {:?}", self.ar, self.ba.get())
+    }
     pub fn poison_scratch(&self) {
         let a = self.act.borrow();
         let p = a.contents().as_ptr() as *mut u32;
         // dev: INK_POISON_RANGE=lo,hi poisons only words [lo, hi), to find a region that is read before it is written
-        let (lo, hi) = std::env::var("INK_POISON_RANGE").ok().and_then(|v| v.split_once(',').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())))
+        let (lo, hi) = std::env::var("INK_POISON_RANGE")
+            .ok()
+            .and_then(|v| v.split_once(',').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())))
             .unwrap_or((0usize, usize::MAX));
-        for i in lo..hi.min(a.length() / 4) { unsafe { *p.add(i) = 0x7fc0_7fc0; } }
+        for i in lo..hi.min(a.length() / 4) {
+            unsafe {
+                *p.add(i) = 0x7fc0_7fc0;
+            }
+        }
     }
     /// bind a lane's cache (sliding-window buffer), convolution rows and tokens
     fn bind_lane(&self, e: &Enc, lane: &Lane) {
@@ -2032,33 +3212,69 @@ impl Engine {
     }
     /// bind the engine's buffers: weights, parameters, scratch arenas, counters
     fn bind_eng(&self, e: &Enc) {
-        e.buf(&self.w, 0, 0); e.buf(&self.pb, 0, 1); e.buf(&self.act.borrow(), 0, 2); e.buf(&self.ctr, 0, 7);
+        e.buf(&self.w, 0, 0);
+        e.buf(&self.pb, 0, 1);
+        e.buf(&self.act.borrow(), 0, 2);
+        e.buf(&self.ctr, 0, 7);
     }
 
     fn seg(w: &QW, in_off: u32, out_off: u32) -> Seg {
         debug_assert!(matches!(w.ty, T_Q4_K | T_Q6_K | T_Q8_0));
-        Seg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-              in_off, in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0, out_off, ..Default::default() }
+        Seg {
+            w_lo: w.off as u32,
+            w_hi: (w.off >> 32) as u32,
+            row_bytes: w.row_bytes,
+            wtype: w.ty,
+            nrows: w.rows,
+            k: w.k,
+            in_off,
+            in2_off: -1,
+            norm_off: -1,
+            ss_off: -1,
+            ss_n: 0,
+            out_off,
+            ..Default::default()
+        }
     }
     fn seg_pb(off: u32, rows: u32, k: u32, in_off: u32, out_off: u32) -> Seg {
-        Seg { w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, in_off, in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0, out_off, ..Default::default() }
+        Seg {
+            w_lo: off,
+            w_hi: 0,
+            row_bytes: k * 2,
+            wtype: T_BF16,
+            nrows: rows,
+            k,
+            in_off,
+            in2_off: -1,
+            norm_off: -1,
+            ss_off: -1,
+            ss_n: 0,
+            out_off,
+            ..Default::default()
+        }
     }
     #[inline]
     /// `go` without the barrier: for dispatches that do not depend on each other (one per lane), followed by one barrier
     fn go_nb<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
-        if self.skip.get() & (1 << cls) != 0 { return; }
+        if self.skip.get() & (1 << cls) != 0 {
+            return;
+        }
         e.pso(&self.gpu.pso(pso));
         e.bytes(args, 5);
         e.dispatch(grid, tg);
     }
     fn go<T>(&self, e: &Enc, cls: u32, pso: &str, args: &T, grid: (usize, usize, usize), tg: usize) {
-        if self.skip.get() & (1 << cls) != 0 { return; }
+        if self.skip.get() & (1 << cls) != 0 {
+            return;
+        }
         e.pso(&self.gpu.pso(pso));
         e.bytes(args, 5);
         e.dispatch(grid, tg);
         e.barrier();
     }
-    fn mv(&self, e: &Enc, cls: u32, segs: &[Seg]) { self.mv_post(e, cls, segs, MvArgs::default()); }
+    fn mv(&self, e: &Enc, cls: u32, segs: &[Seg]) {
+        self.mv_post(e, cls, segs, MvArgs::default());
+    }
     fn mv_post(&self, e: &Enc, cls: u32, segs: &[Seg], post: MvArgs) {
         let mut a = MvArgs { nseg: segs.len() as u32, eps: self.eps, ..post };
         let mut tg = 0u32;
@@ -2071,10 +3287,17 @@ impl Engine {
     }
     /// k_mv for the `n` lanes of a decode batch (segments at lane 0's offsets; lane j's are `j * ar.total` further)
     fn mvb(&self, e: &Enc, cls: u32, segs: &[Seg], post: MvArgs, n: usize) {
-        if self.skip.get() & (1 << cls) != 0 { return; }
+        if self.skip.get() & (1 << cls) != 0 {
+            return;
+        }
         let mut a = MvArgs { nseg: segs.len() as u32, eps: self.eps, ..post };
         let mut tg = 0u32;
-        for (i, s) in segs.iter().enumerate() { assert!(s.epi == 0); a.seg[i] = *s; a.seg[i].tg_start = tg; tg += s.nrows.div_ceil(8); }
+        for (i, s) in segs.iter().enumerate() {
+            assert!(s.epi == 0);
+            a.seg[i] = *s;
+            a.seg[i].tg_start = tg;
+            tg += s.nrows.div_ceil(8);
+        }
         e.pso(&self.gpu.pso("k_mvb"));
         e.bytes(&a, 5);
         e.bytes(&[n as u32, self.ar.total], 8);
@@ -2082,12 +3305,18 @@ impl Engine {
         e.barrier();
     }
     /// decode: one token, the decode arena's layout
-    fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) { self.mix_impl(e, cls, jobs, 1, false); }
+    fn mix(&self, e: &Enc, cls: u32, jobs: &[MixJob]) {
+        self.mix_impl(e, cls, jobs, 1, false);
+    }
     /// prefill: `t` tokens in the batch arena's layout. A batch of one token is still a batch: its jobs carry the batch
     /// layout (token stride, fp16 outputs), which the decode kernel does not read.
-    fn mix_t(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize) { self.mix_impl(e, cls, jobs, t, true); }
+    fn mix_t(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize) {
+        self.mix_impl(e, cls, jobs, t, true);
+    }
     fn mix_impl(&self, e: &Enc, cls: u32, jobs: &[MixJob], t: usize, batch: bool) {
-        if self.skip.get() & (1 << cls) != 0 { return; }
+        if self.skip.get() & (1 << cls) != 0 {
+            return;
+        }
         if batch && std::env::var("INK_OLD_MIXB").is_err() {
             // independent jobs run concurrently (no barrier between them)
             for j in jobs {
@@ -2112,11 +3341,22 @@ impl Engine {
     fn mix_job_off(&self, states: &[u32], q_off: i32, n_q: u32, outs: &[u32], norms: &[i32], tstride: u32) -> MixJob {
         let mut j = MixJob { n_s: states.len() as u32, n_q, q_off, eps: self.eps, tstride, ..Default::default() };
         assert!(states.len() <= 6);
-        for (i, &s) in states.iter().enumerate() { j.s_off[i] = s; }
-        for i in 0..4 { j.norm_off[i] = -1; j.ncopy[i] = [-1; 3]; j.hcopy[i] = [-1; 3]; j.hout[i] = -1; }
+        for (i, &s) in states.iter().enumerate() {
+            j.s_off[i] = s;
+        }
+        for i in 0..4 {
+            j.norm_off[i] = -1;
+            j.ncopy[i] = [-1; 3];
+            j.hcopy[i] = [-1; 3];
+            j.hout[i] = -1;
+        }
         j.hstride = (2 * E) as u32;
-        for (i, &o) in outs.iter().enumerate() { j.out_off[i] = o; }
-        for (i, &n) in norms.iter().enumerate() { j.norm_off[i] = n; }
+        for (i, &o) in outs.iter().enumerate() {
+            j.out_off[i] = o;
+        }
+        for (i, &n) in norms.iter().enumerate() {
+            j.norm_off[i] = n;
+        }
         j
     }
     /// loop controllers, then RMSNorm of each controlled vector (norm weight w, written to out)
@@ -2124,20 +3364,29 @@ impl Engine {
     /// with the RMSNorm fused into the last threadgroup of each controller
     fn ctrl_dec(&self, e: &Enc, jobs: &[CtrlJob]) {
         let ar = self.ar_at();
-        let segs: Vec<Seg> = jobs.iter().map(|j| {
-            let c = ar.ctrlg.iter().position(|&o| o == j.out_off).unwrap();
-            Self::seg_pb(j.d_off, 64, (2 * E) as u32, ar.cat[c], j.out_off)
-        }).collect();
+        let segs: Vec<Seg> = jobs
+            .iter()
+            .map(|j| {
+                let c = ar.ctrlg.iter().position(|&o| o == j.out_off).unwrap();
+                Self::seg_pb(j.d_off, 64, (2 * E) as u32, ar.cat[c], j.out_off)
+            })
+            .collect();
         self.mv(e, C_CTRLD, &segs);
         let mut a = CtrlArgs { n_c: jobs.len() as u32, ..Default::default() };
-        for (i, j) in jobs.iter().enumerate() { a.job[i] = *j; }
+        for (i, j) in jobs.iter().enumerate() {
+            a.job[i] = *j;
+        }
         self.go(e, C_CTRLA, "k_ctrl_apply", &a, (E / 32, jobs.len(), 1), 256);
     }
 
     fn gemm(&self, e: &Enc, cls: u32, segs: &[GSeg], t: usize) {
         let mut a = GemmArgs { nseg: segs.len() as u32, t: t as u32, ..Default::default() };
         let mut tiles = 0u32;
-        for (i, sg) in segs.iter().enumerate() { a.seg[i] = *sg; a.seg[i].tile_start = tiles; tiles += sg.nrows.div_ceil(64); }
+        for (i, sg) in segs.iter().enumerate() {
+            a.seg[i] = *sg;
+            a.seg[i].tile_start = tiles;
+            tiles += sg.nrows.div_ceil(64);
+        }
         self.go(e, cls, if self.tensor { "k_gemm_t" } else { "k_gemm" }, &a, (tiles as usize, t.div_ceil(32), 1), 128);
     }
     /// batched loop controllers as GEMMs: g = D.[u^;m^] (split-input GEMM over the mix kernel's normalized copies),
@@ -2148,33 +3397,61 @@ impl Engine {
     fn ctrl_b(&self, e: &Enc, lw: &LoopW, jobs: &[(usize, u32, u32, u32, u32)], t: usize, hout: &[(u32, bool)]) {
         let b = self.ba.get();
         let pb = |off: u32, rows: u32, k: u32, in_off: u32, in2: u32, out: u32| GSeg {
-            w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, in_off, out_off: out, ldo: rows, wsrc: 1, in2, ..Default::default() };
+            w_lo: off,
+            w_hi: 0,
+            row_bytes: k * 2,
+            wtype: T_BF16,
+            nrows: rows,
+            k,
+            in_off,
+            out_off: out,
+            ldo: rows,
+            wsrc: 1,
+            in2,
+            ..Default::default()
+        };
         if self.hgemm {
             let fuse_down_half = ctrl_down_direct_half(self.skip.get());
-            let down: Vec<HSeg> = jobs.iter().map(|&(c, _, _, _, _)| {
-                let mut sg = Self::hseg_pb(
-                    lw.down[c],
-                    64,
-                    (2 * E) as u32,
-                    b.cath[c],
-                    if fuse_down_half { b.gh[c] } else { b.ctrlg[c] },
-                );
-                sg.hout = fuse_down_half as u32;
-                sg
-            }).collect();
+            let down: Vec<HSeg> = jobs
+                .iter()
+                .map(|&(c, _, _, _, _)| {
+                    let mut sg = Self::hseg_pb(
+                        lw.down[c],
+                        64,
+                        (2 * E) as u32,
+                        b.cath[c],
+                        if fuse_down_half { b.gh[c] } else { b.ctrlg[c] },
+                    );
+                    sg.hout = fuse_down_half as u32;
+                    sg
+                })
+                .collect();
             self.gemm_h(e, C_CTRLD, &down, t);
             if !fuse_down_half {
-                for &(c, _, _, _, _) in jobs { self.tohalf(e, C_CTRLA, b.ctrlg[c], 64, b.gh[c], 64, 64, t, None); }
+                for &(c, _, _, _, _) in jobs {
+                    self.tohalf(e, C_CTRLA, b.ctrlg[c], 64, b.gh[c], 64, 64, t, None);
+                }
                 e.barrier();
             }
             // gain/forget GEMM with the apply fused into its epilogue: raw (un-normalized) outputs land in gain_o
             let mut ga = CtrlGfArgs { t: t as u32, njobs: jobs.len() as u32, ..Default::default() };
             for (i, &(c, u, m, _, _)) in jobs.iter().enumerate() {
-                ga.job[i] = CtrlGfJob { gain_w: lw.gain[c], forget_w: lw.forget[c], gh_off: b.gh[c], u_off: u, m_off: m, raw_off: b.gain_o[c], pad: [0; 2] };
+                ga.job[i] = CtrlGfJob {
+                    gain_w: lw.gain[c],
+                    forget_w: lw.forget[c],
+                    gh_off: b.gh[c],
+                    u_off: u,
+                    m_off: m,
+                    raw_off: b.gain_o[c],
+                    pad: [0; 2],
+                };
             }
             self.go(e, C_CTRLA, "k_ctrl_gf", &ga, (t.div_ceil(128), jobs.len() * (E / 32), 1), 256);
         } else {
-            let down: Vec<GSeg> = jobs.iter().map(|&(c, _, _, _, _)| pb(lw.down[c], 64, (2 * E) as u32, b.cat_u[c], b.cat_m[c], b.ctrlg[c])).collect();
+            let down: Vec<GSeg> = jobs
+                .iter()
+                .map(|&(c, _, _, _, _)| pb(lw.down[c], 64, (2 * E) as u32, b.cat_u[c], b.cat_m[c], b.ctrlg[c]))
+                .collect();
             self.gemm(e, C_CTRLD, &down, t);
             let mut gf = Vec::new();
             for &(c, _, _, _, _) in jobs {
@@ -2186,45 +3463,140 @@ impl Engine {
         let mut a = CtrlBArgs { n: jobs.len() as u32, ..Default::default() };
         for (i, &(c, u, m, out, nw)) in jobs.iter().enumerate() {
             let (h, nof) = hout.get(i).map(|&(h, n)| (h as i32, n as u32)).unwrap_or((-1, 0));
-            a.job[i] = if self.hgemm { CtrlBJob { u_off: b.gain_o[c], m_off: u32::MAX, g_off: 0, f_off: 0, out_off: out, norm_w: nw, h_off: h, nof32: nof } }
-                       else { CtrlBJob { u_off: u, m_off: m, g_off: b.gain_o[c], f_off: b.forget_o[c], out_off: out, norm_w: nw, h_off: h, nof32: nof } };
+            a.job[i] = if self.hgemm {
+                CtrlBJob {
+                    u_off: b.gain_o[c],
+                    m_off: u32::MAX,
+                    g_off: 0,
+                    f_off: 0,
+                    out_off: out,
+                    norm_w: nw,
+                    h_off: h,
+                    nof32: nof,
+                }
+            } else {
+                CtrlBJob {
+                    u_off: u,
+                    m_off: m,
+                    g_off: b.gain_o[c],
+                    f_off: b.forget_o[c],
+                    out_off: out,
+                    norm_w: nw,
+                    h_off: h,
+                    nof32: nof,
+                }
+            };
         }
         self.go(e, C_CTRLN, "k_ctrl_apply_b", &a, (t, jobs.len(), 1), 256);
     }
 
     /// f32 [rows][k] (row stride src_stride, optional row gather) -> half [rows][dst_stride] at dst
     #[allow(clippy::too_many_arguments)]
-    fn tohalf(&self, e: &Enc, cls: u32, src: u32, src_stride: usize, dst: u32, dst_stride: usize, k: usize, rows: usize, perm: Option<u32>) {
+    fn tohalf(
+        &self,
+        e: &Enc,
+        cls: u32,
+        src: u32,
+        src_stride: usize,
+        dst: u32,
+        dst_stride: usize,
+        k: usize,
+        rows: usize,
+        perm: Option<u32>,
+    ) {
         self.tohalf_x(e, cls, src, src_stride, dst, dst_stride, k, rows, perm, false)
     }
     /// `half_src`: the source is already half (row stride in halves): a plain (gathered) copy
     #[allow(clippy::too_many_arguments)]
-    fn tohalf_x(&self, e: &Enc, cls: u32, src: u32, src_stride: usize, dst: u32, dst_stride: usize, k: usize, rows: usize, perm: Option<u32>, half_src: bool) {
-        let a = ToHalfArgs { src_off: src, dst_off: dst, k: k as u32, rows: rows as u32, perm_off: perm.unwrap_or(0), gather: perm.is_some() as u32 | (half_src as u32) << 1,
-                             src_stride: src_stride as u32, dst_stride: dst_stride as u32 };
-        if self.skip.get() & (1 << cls) != 0 { return; }
-        e.pso(&self.gpu.pso("k_tohalf")); e.bytes(&a, 5); e.dispatch((k.div_ceil(1024), rows, 1), 256);
+    fn tohalf_x(
+        &self,
+        e: &Enc,
+        cls: u32,
+        src: u32,
+        src_stride: usize,
+        dst: u32,
+        dst_stride: usize,
+        k: usize,
+        rows: usize,
+        perm: Option<u32>,
+        half_src: bool,
+    ) {
+        let a = ToHalfArgs {
+            src_off: src,
+            dst_off: dst,
+            k: k as u32,
+            rows: rows as u32,
+            perm_off: perm.unwrap_or(0),
+            gather: perm.is_some() as u32 | (half_src as u32) << 1,
+            src_stride: src_stride as u32,
+            dst_stride: dst_stride as u32,
+        };
+        if self.skip.get() & (1 << cls) != 0 {
+            return;
+        }
+        e.pso(&self.gpu.pso("k_tohalf"));
+        e.bytes(&a, 5);
+        e.dispatch((k.div_ceil(1024), rows, 1), 256);
     }
     /// fp16-activation tensor GEMM over segments (weight, wsrc, half input, output, ldo); barrier after
     fn gemm_h(&self, e: &Enc, cls: u32, segs: &[HSeg], t: usize) {
         let mut a = GemmHArgs { nseg: segs.len() as u32, t: t as u32, ..Default::default() };
         let mut tiles = 0u32;
-        for (i, sg) in segs.iter().enumerate() { a.seg[i] = *sg; a.seg[i].tile_start = tiles; tiles += sg.nrows.div_ceil(64); }
-        if t > 64 { self.go(e, cls, "k_gemm_sg8", &a, (t.div_ceil(128), tiles as usize, 1), 256); }
-        else { self.go(e, cls, "k_gemm_sg4", &a, (1, tiles as usize, 1), 128); }
+        for (i, sg) in segs.iter().enumerate() {
+            a.seg[i] = *sg;
+            a.seg[i].tile_start = tiles;
+            tiles += sg.nrows.div_ceil(64);
+        }
+        if t > 64 {
+            self.go(e, cls, "k_gemm_sg8", &a, (t.div_ceil(128), tiles as usize, 1), 256);
+        } else {
+            self.go(e, cls, "k_gemm_sg4", &a, (1, tiles as usize, 1), 128);
+        }
     }
     fn hseg(w: &QW, xh: u32, out: u32) -> HSeg {
-        HSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k, xh_off: xh, out_off: out, ldo: w.rows, ..Default::default() }
+        HSeg {
+            w_lo: w.off as u32,
+            w_hi: (w.off >> 32) as u32,
+            row_bytes: w.row_bytes,
+            wtype: w.ty,
+            nrows: w.rows,
+            k: w.k,
+            xh_off: xh,
+            out_off: out,
+            ldo: w.rows,
+            ..Default::default()
+        }
     }
     fn hseg_pb(off: u32, rows: u32, k: u32, xh: u32, out: u32) -> HSeg {
-        HSeg { w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, xh_off: xh, out_off: out, ldo: rows, wsrc: 1, ..Default::default() }
+        HSeg {
+            w_lo: off,
+            w_hi: 0,
+            row_bytes: k * 2,
+            wtype: T_BF16,
+            nrows: rows,
+            k,
+            xh_off: xh,
+            out_off: out,
+            ldo: rows,
+            wsrc: 1,
+            ..Default::default()
+        }
     }
 
     fn gseg(w: &QW, in_off: u32, out_off: u32) -> GSeg {
-        GSeg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
-               in_off, out_off, ldo: w.rows, ..Default::default() }
+        GSeg {
+            w_lo: w.off as u32,
+            w_hi: (w.off >> 32) as u32,
+            row_bytes: w.row_bytes,
+            wtype: w.ty,
+            nrows: w.rows,
+            k: w.k,
+            in_off,
+            out_off,
+            ldo: w.rows,
+            ..Default::default()
+        }
     }
-
 
     /// Encode one decode step for each of `lanes` (lane, position of the token it decodes) in one command buffer, through
     /// the decode path: every lane runs today's single-stream kernels on its own copy of the decode arena with its own
@@ -2238,23 +3610,49 @@ impl Engine {
         let lane_ptrs: Vec<usize> = lanes.iter().map(|&(l, _)| std::ptr::from_ref(l) as usize).collect();
         check_distinct_lane_ptrs(&lane_ptrs).unwrap_or_else(|err| panic!("{err}"));
         let (start, tot) = (self.dstart.get(), self.ar.total);
-        assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
-                "decode batch arenas: call ensure_dbatch() after ensure_batch()");
-        for (l, pos) in lanes { assert!(l.tier.is_none() && l.prune.borrow().is_none() && *pos < self.on(l).kv_capacity(), "K/V capacity: call reserve() first"); }
+        assert!(
+            n >= 1
+                && start >= self.ar.total
+                && start >= self.ba.get().end
+                && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
+            "decode batch arenas: call ensure_dbatch() after ensure_batch()"
+        );
+        for (l, pos) in lanes {
+            assert!(
+                l.tier.is_none() && l.prune.borrow().is_none() && *pos < self.on(l).kv_capacity(),
+                "K/V capacity: call reserve() first"
+            );
+        }
         let base = |j: usize| start + j as u32 * tot;
         let mut cx = Cx { e: Enc::new(cb), cb: None, prior: Vec::new() };
         self.bind_eng(&cx.e);
         for (j, (l, pos)) in lanes.iter().enumerate() {
             self.abase.set(base(j));
             self.bind_lane(&cx.e, l);
-            let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                                 norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: *pos as u32, eps: self.eps };
+            let ea = EmbedArgs {
+                emb_lo: self.tok_embd.off as u32,
+                emb_hi: (self.tok_embd.off >> 32) as u32,
+                row_bytes: self.tok_embd.row_bytes,
+                norm_off: self.tok_norm,
+                out0: self.v(0),
+                out1: self.v(0),
+                tok_index: *pos as u32,
+                eps: self.eps,
+            };
             self.go(&cx.e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
         }
         // the residual bookkeeping is the same for every lane: run it once per layer, and every lane's layer from it
-        let (mut cur, mut blocks, mut va, mut exec) = (0usize, Vec::<usize>::new(), VecAlloc { next: 1, n: N_VEC }, 0usize);
+        let (mut cur, mut blocks, mut va, mut exec) =
+            (0usize, Vec::<usize>::new(), VecAlloc { next: 1, n: N_VEC }, 0usize);
         let stage_a = std::env::var("INK_DBATCH_A").is_ok();
-        let mut layer_all = |cx: &mut Cx, cur: &mut usize, blocks: &mut Vec<usize>, va: &mut VecAlloc, slot: usize, ip: usize, msg: Option<(usize, usize)>, pinned: &[usize]| {
+        let mut layer_all = |cx: &mut Cx,
+                             cur: &mut usize,
+                             blocks: &mut Vec<usize>,
+                             va: &mut VecAlloc,
+                             slot: usize,
+                             ip: usize,
+                             msg: Option<(usize, usize)>,
+                             pinned: &[usize]| {
             if !stage_a {
                 *cur = self.layer_db(&cx.e, lanes, start, exec, slot, ip, *cur, blocks, msg, va, pinned);
                 exec += 1;
@@ -2270,24 +3668,44 @@ impl Engine {
                 after = Some((c2, b2, v2));
             }
             let (c2, b2, v2) = after.unwrap();
-            *cur = c2; *blocks = b2; *va = v2; exec += 1;
+            *cur = c2;
+            *blocks = b2;
+            *va = v2;
+            exec += 1;
         };
-        for ip in 0..LOOP_START { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        for ip in 0..LOOP_START {
+            layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]);
+        }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
         for pass in 0..N_PASS {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            if pass > 0 {
+                cur = prelude;
+                blocks = prelude_blocks.clone();
+            }
             let msg = if pass > 0 { Some(bank) } else { None };
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, slot_of(pass, ip), ip, msg, &pinned); }
+            let pinned: Vec<usize> = {
+                let mut p = vec![prelude];
+                if pass > 0 {
+                    p.push(bank.0);
+                    p.push(bank.1);
+                }
+                p
+            };
+            for ip in LOOP_START..LOOP_END {
+                layer_all(&mut cx, &mut cur, &mut blocks, &mut va, slot_of(pass, ip), ip, msg, &pinned);
+            }
             bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
         }
-        for ip in LOOP_END..N_PHYS { layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]); }
+        for ip in LOOP_END..N_PHYS {
+            layer_all(&mut cx, &mut cur, &mut blocks, &mut va, ip, ip, None, &[]);
+        }
         if logits {
             self.abase.set(base(0));
             let ar = self.ar_at();
-            let mut st = blocks.clone(); st.push(cur);
+            let mut st = blocks.clone();
+            st.push(cur);
             let mut jb = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
             jb.tstride = tot;
             self.mix_impl(&cx.e, C_OMIX, &[jb], n, false);
@@ -2301,29 +3719,52 @@ impl Engine {
     /// projections, output projection, router) run once over all lanes and the rest per lane. Each lane's arithmetic is
     /// the decode path's, so its numbers are exactly what it gets decoding alone.
     #[allow(clippy::too_many_arguments)]
-    fn layer_db(&self, e: &Enc, lanes: &[(&Lane, usize)], start: u32, exec: usize, slot: usize, ip: usize, cur: usize,
-                blocks: &mut Vec<usize>, msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
+    fn layer_db(
+        &self,
+        e: &Enc,
+        lanes: &[(&Lane, usize)],
+        start: u32,
+        exec: usize,
+        slot: usize,
+        ip: usize,
+        cur: usize,
+        blocks: &mut Vec<usize>,
+        msg: Option<(usize, usize)>,
+        va: &mut VecAlloc,
+        pinned: &[usize],
+    ) -> usize {
         let n = lanes.len();
         let tot = self.ar.total;
         let at = |j: usize| self.abase.set(start + j as u32 * tot);
         let l = &self.layers[ip];
         let ctl = msg.map(|_| &self.loops[ip - LOOP_START]);
         let cs_slot = (slot * NCH * 3) as u32;
-        let ts = |mut j: MixJob| { j.tstride = tot; j };
+        let ts = |mut j: MixJob| {
+            j.tstride = tot;
+            j
+        };
         at(0);
         let ar = self.ar_at();
         // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
         let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
-        let mut st = blocks.clone(); st.push(cur);
+        let mut st = blocks.clone();
+        st.push(cur);
         let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
         let xin: [u32; 3];
         if let Some(lw) = ctl {
             let (b0, b1) = msg.unwrap();
             let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
-            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
-            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
+            if l.swa {
+                ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32];
+            } else {
+                for j in 0..3 {
+                    ja.ncopy[j][0] = ar.cat[j] as i32;
+                }
+            }
             let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
-            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
+            for j in 0..4 {
+                jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32;
+            }
             self.mix_impl(e, C_MIXA, &[ts(ja), ts(jm)], n, false);
             for jl in 0..n {
                 at(jl);
@@ -2331,8 +3772,18 @@ impl Engine {
                 let mut cj = Vec::new();
                 for (j, &norm_w) in norms.iter().enumerate() {
                     let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
-                    cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
-                                      forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w, ctr: 8 + j as u32 });
+                    cj.push(CtrlJob {
+                        u_off: u,
+                        m_off: ar.msg[j],
+                        d_off: lw.down[j],
+                        out_off: ar.ctrlg[j],
+                        gain_off: lw.gain[j],
+                        forget_off: lw.forget[j],
+                        res_out: ar.cin[j],
+                        ss_off: ar.ssp[j],
+                        norm_w,
+                        ctr: 8 + j as u32,
+                    });
                 }
                 self.ctrl_dec(e, &cj);
             }
@@ -2340,13 +3791,28 @@ impl Engine {
             xin = ar.cin;
         } else {
             let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
-            self.mix_impl(e, C_MIXA, &[ts(self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn))], n, false);
+            self.mix_impl(
+                e,
+                C_MIXA,
+                &[ts(self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &nn))],
+                n,
+                false,
+            );
             xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
         }
         // ---- fused projections, once for every lane
-        let mut segs = vec![Engine::seg(&l.wq, xin[0], ar.q), Engine::seg(&l.wgate, xin[0], ar.gate), Engine::seg(&l.wrel, xin[0], ar.rel),
-                            Engine::seg(&l.wsink, xin[0], ar.sink), Engine::seg(&l.wk, xin[1], ar.k), Engine::seg(&l.wv, xin[2], ar.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::seg(kp, xin[1], ar.kdyn)); segs.push(Engine::seg(vp, xin[2], ar.vdyn)); }
+        let mut segs = vec![
+            Engine::seg(&l.wq, xin[0], ar.q),
+            Engine::seg(&l.wgate, xin[0], ar.gate),
+            Engine::seg(&l.wrel, xin[0], ar.rel),
+            Engine::seg(&l.wsink, xin[0], ar.sink),
+            Engine::seg(&l.wk, xin[1], ar.k),
+            Engine::seg(&l.wv, xin[2], ar.v),
+        ];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) {
+            segs.push(Engine::seg(kp, xin[1], ar.kdyn));
+            segs.push(Engine::seg(vp, xin[2], ar.vdyn));
+        }
         self.mvb(e, C_QKV, &segs, MvArgs::default(), n);
         // ---- attention (split-K, fused K/V conv and cache write) per lane, on the lane's cache and state
         for (jl, (lane, pos)) in lanes.iter().enumerate() {
@@ -2356,42 +3822,88 @@ impl Engine {
             self.bind_lane(e, lane);
             let pos = *pos;
             let (kb, vb, kcap) = run.kv_slot(slot);
-            let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+            let tau =
+                if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
             let base = AttnArgs {
-                pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
-                q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
-                kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
-                kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
-                ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
+                pos: pos as u32,
+                cap: kcap,
+                k_base: kb,
+                v_base: vb,
+                cs_off: cs_slot,
+                q_off: ar.q,
+                k_off: ar.k,
+                v_off: ar.v,
+                r_off: ar.rel,
+                sink_off: ar.sink,
+                kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 },
+                vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 },
+                part_off: ar.part,
+                kconv_w: l.k_conv,
+                vconv_w: l.v_conv,
+                qclip_w: l.q_clip,
+                relclip_w: l.rel_clip,
+                relbias_w: l.rel_bias,
+                tau,
+                ctr: 0,
+                gate_off: ar.gate,
+                out_off: ar.attn_g,
+                gstr: kcap * HD as u32,
+                istr: HD as u32,
+                ..Default::default()
             };
             run.bind_kv(e, l.swa);
             let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
             let nkeys = pos + 1 - first_pos;
-            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                pad: self.sep_comb as u32, ..base };
+            let aa = AttnArgs {
+                nkeys: nkeys as u32,
+                first_pos: first_pos as u32,
+                ring: l.swa as u32,
+                kps: kps as u32,
+                nsplit: nsplit as u32,
+                pad: self.sep_comb as u32,
+                ..base
+            };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
             if self.sep_comb {
-                let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g, hout: 0, pad: [0; 3] };
+                let ca = CombineArgs {
+                    part_off: ar.part,
+                    nsplit: nsplit as u32,
+                    gate_off: ar.gate,
+                    out_off: ar.attn_g,
+                    hout: 0,
+                    pad: [0; 3],
+                };
                 self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
             }
         }
         at(0);
         // ---- output projection once for every lane, then each lane's post-conv (+ residual) on its own state
         let block_start = ip.is_multiple_of(BLOCK);
-        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(cur);
+        live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         self.mvb(e, C_WO, &[Engine::seg(&l.wo, ar.attn_g, self.v(mid))], MvArgs::default(), n);
         for (jl, (lane, _)) in lanes.iter().enumerate() {
             at(jl);
             self.bind_lane(e, lane);
-            let ea = EpiArgs { out_off: self.v(mid), res_off: if block_start { -1 } else { self.v(cur) as i32 }, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
-                               convw_off: l.attn_post_conv, n: E as u32, pad: [0; 3] };
+            let ea = EpiArgs {
+                out_off: self.v(mid),
+                res_off: if block_start { -1 } else { self.v(cur) as i32 },
+                cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                convw_off: l.attn_post_conv,
+                n: E as u32,
+                pad: [0; 3],
+            };
             self.go(e, C_WO, "k_epi", &ea, (E.div_ceil(256), 1, 1), 256);
         }
         at(0);
-        if block_start { blocks.push(cur); }
+        if block_start {
+            blocks.push(cur);
+        }
         // ---- FFN input: depth mix (+ control) -> normalized
-        let mut st = blocks.clone(); st.push(mid);
+        let mut st = blocks.clone();
+        st.push(mid);
         let x_off = if let Some(lw) = ctl {
             let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
             jf.ncopy[0][0] = ar.cat[3] as i32;
@@ -2399,21 +3911,43 @@ impl Engine {
             for jl in 0..n {
                 at(jl);
                 let ar = self.ar_at();
-                self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
-                                             forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
+                self.ctrl_dec(
+                    e,
+                    &[CtrlJob {
+                        u_off: ar.fin,
+                        m_off: ar.msg[3],
+                        d_off: lw.down[3],
+                        out_off: ar.ctrlg[3],
+                        gain_off: lw.gain[3],
+                        forget_off: lw.forget[3],
+                        res_out: ar.finc,
+                        ss_off: ar.ssp[3],
+                        norm_w: l.ffn_norm as i32,
+                        ctr: 11,
+                    }],
+                );
             }
             at(0);
             ar.finc
         } else {
-            self.mix_impl(e, C_MIXF, &[ts(self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32]))], n, false);
+            self.mix_impl(
+                e,
+                C_MIXF,
+                &[ts(self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32]))],
+                n,
+                false,
+            );
             ar.fin
         };
         // ---- router with fused top-k, once for every lane
         assert!(!self.sep_topk);
         let sel = ar.sel_log + (exec * 16) as u32;
-        let rpost = MvArgs { post: 1, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        let rpost =
+            MvArgs { post: 1, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
         self.mvb(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost, n);
-        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(mid);
+        live.extend_from_slice(pinned);
         let out = va.alloc(&live);
         // ---- experts per lane (the down projection's epilogue updates the lane's state)
         for (jl, (lane, _)) in lanes.iter().enumerate() {
@@ -2423,14 +3957,38 @@ impl Engine {
             let sel = ar.sel_log + (exec * 16) as u32;
             let x = if ctl.is_some() { ar.finc } else { ar.fin };
             let ma = MoeArgs {
-                logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off: x,
-                norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
-                gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
-                act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
-                dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
-                dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
-                dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, no_state_write: 0, pad1: 0,
+                logits_off: ar.rlog,
+                bias_off: l.exp_bias,
+                sel_off: sel,
+                x_off: x,
+                norm_off: -1,
+                ss_off: -1,
+                ss_n: 0,
+                eps: self.eps,
+                gu_lo: l.gu.off as u32,
+                gu_hi: (l.gu.off >> 32) as u32,
+                gu_expert_bytes: l.gu.expert_bytes as u32,
+                gu_row_bytes: l.gu.row_bytes,
+                act_off: ar.act,
+                wscale: self.wscale,
+                beta: self.situ_beta,
+                lbeta: self.situ_lbeta,
+                dn_lo: l.dn.off as u32,
+                dn_hi: (l.dn.off >> 32) as u32,
+                dn_expert_bytes: l.dn.expert_bytes as u32,
+                dn_row_bytes: l.dn.row_bytes,
+                dn_type: l.dn.ty,
+                out_off: self.v(out),
+                res_off: self.v(mid) as i32,
+                cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                convw_off: l.ffn_post_conv,
+                gu_type: l.gu.ty,
+                gu_gs_lo: l.gu.gs as u32,
+                gu_gs_hi: (l.gu.gs >> 32) as u32,
+                dn_gs_lo: l.dn.gs as u32,
+                dn_gs_hi: (l.dn.gs >> 32) as u32,
+                no_state_write: 0,
+                pad1: 0,
             };
             self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
             self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
@@ -2464,12 +4022,9 @@ impl Engine {
         if n_spans > MAX_SPANS {
             return Err(format!("verify span count {n_spans} exceeds MAX_SPANS ({MAX_SPANS})"));
         }
-        let step_len = 1usize
-            .checked_add(k)
-            .ok_or_else(|| "verify 1 + k overflowed usize".to_string())?;
-        let total_rows = n_spans
-            .checked_mul(step_len)
-            .ok_or_else(|| "verify total_rows overflowed usize".to_string())?;
+        let step_len = 1usize.checked_add(k).ok_or_else(|| "verify 1 + k overflowed usize".to_string())?;
+        let total_rows =
+            n_spans.checked_mul(step_len).ok_or_else(|| "verify total_rows overflowed usize".to_string())?;
         let b = self.ba.get();
         if total_rows > self.chunk || total_rows > b.cap {
             return Err(format!(
@@ -2523,7 +4078,9 @@ impl Engine {
         }
         let stride = N_SLOT * NCH * 3;
         let cs = self.gpu.buffer(spans.len() * t * stride * 4);
-        unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
+        unsafe {
+            std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4);
+        }
         let mut kept = Vec::with_capacity(spans.len());
         for sp in spans {
             let mut paged_lengths_before = Vec::new();
@@ -2618,8 +4175,7 @@ impl Engine {
         for (si, s) in spans.iter().enumerate() {
             let span_target_off = base_target_off
                 .checked_add(
-                    u32::try_from(si * (1 + k) * target_stride)
-                        .map_err(|_| "target_off overflow".to_string())?,
+                    u32::try_from(si * (1 + k) * target_stride).map_err(|_| "target_off overflow".to_string())?,
                 )
                 .ok_or_else(|| "target_off overflow".to_string())?;
             descs.push(DSparkSpanDesc {
@@ -2648,22 +4204,19 @@ impl Engine {
             pad1: 0,
         };
         let desc_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                descs.as_ptr() as *const u8,
-                descs.len() * std::mem::size_of::<DSparkSpanDesc>(),
-            )
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, descs.len() * std::mem::size_of::<DSparkSpanDesc>())
         };
-        let dtok_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(draft_toks_flat.as_ptr() as *const u8, draft_toks_flat.len() * 4)
-        };
-        let dlg_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(draft_logits_flat.as_ptr() as *const u8, draft_logits_flat.len() * 4)
-        };
+        let dtok_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(draft_toks_flat.as_ptr() as *const u8, draft_toks_flat.len() * 4) };
+        let dlg_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(draft_logits_flat.as_ptr() as *const u8, draft_logits_flat.len() * 4) };
         let desc_buf = self.gpu.buffer_with(desc_bytes);
         let dtok_buf = self.gpu.buffer_with(dtok_bytes);
         let dlg_buf = self.gpu.buffer_with(dlg_bytes);
         let out_buf = self.gpu.buffer(n_spans * out_stride * 4);
-        unsafe { std::ptr::write_bytes(out_buf.contents().as_ptr() as *mut u8, 0, n_spans * out_stride * 4); }
+        unsafe {
+            std::ptr::write_bytes(out_buf.contents().as_ptr() as *mut u8, 0, n_spans * out_stride * 4);
+        }
 
         let cb = self.gpu.cmd();
         let e = Enc::new(&cb);
@@ -2682,9 +4235,8 @@ impl Engine {
             return Err(format!("k_dspark_reject GPU command buffer failed: {:?}", cb.status()));
         }
 
-        let raw_out = unsafe {
-            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u32, n_spans * out_stride)
-        };
+        let raw_out =
+            unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u32, n_spans * out_stride) };
         let mut results = Vec::with_capacity(n_spans);
         for si in 0..n_spans {
             let base = si * out_stride;
@@ -2732,7 +4284,8 @@ impl Engine {
     }
 
     /// Execute `k_dspark_reject` on the GPU over pre-populated target logits (`target_buf`) with shared temperature.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn reject_sample_gpu(
         &self,
         target_buf: &Buf,
@@ -2749,12 +4302,7 @@ impl Engine {
     ) -> Result<Vec<SpeculativeVerifyOut>, String> {
         let span_params: Vec<DSparkRejectSpanParams> = seeds_and_pos
             .iter()
-            .map(|&(seed, base_pos, ban_tok)| DSparkRejectSpanParams {
-                seed,
-                base_pos,
-                ban_tok,
-                temp,
-            })
+            .map(|&(seed, base_pos, ban_tok)| DSparkRejectSpanParams { seed, base_pos, ban_tok, temp })
             .collect();
         self.reject_sample_gpu_spans(
             target_buf,
@@ -2805,10 +4353,7 @@ impl Engine {
                 return Err(format!("span {si}: draft token out of vocabulary range (n_vocab={})", self.n_vocab));
             }
         }
-        let spans: Vec<Span<'_>> = reqs
-            .iter()
-            .map(|r| Span { lane: r.lane, p0: r.p0, t: 1 + k })
-            .collect();
+        let spans: Vec<Span<'_>> = reqs.iter().map(|r| Span { lane: r.lane, p0: r.p0, t: 1 + k }).collect();
         let cb = self.gpu.cmd();
         self.try_encode_verify(&cb, &spans, k)?;
         for r in reqs {
@@ -2886,7 +4431,9 @@ impl Engine {
             let end = p0 + n_keep;
             rec.accepted_end = Some(end);
             assert!(end <= p0 + t);
-            if n_keep < t { assert!(end < p0 + t, "a rejected tail is not sealed"); }
+            if n_keep < t {
+                assert!(end < p0 + t, "a rejected tail is not sealed");
+            }
             let bytes = stride * 4;
             let cs_before_opt = if n_keep == 0 {
                 Some(rec.cs_before.clone())
@@ -2895,7 +4442,11 @@ impl Engine {
                     assert_eq!(bytes, dst_len);
                     unsafe {
                         let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
-                        std::ptr::copy_nonoverlapping(src, (dst_buf.contents().as_ptr() as *mut u8).add(dst_off), bytes);
+                        std::ptr::copy_nonoverlapping(
+                            src,
+                            (dst_buf.contents().as_ptr() as *mut u8).add(dst_off),
+                            bytes,
+                        );
                     }
                 });
                 None
@@ -2952,7 +4503,9 @@ impl Engine {
                 for ip in 0..N_PHYS {
                     let (swa, pass_idx) = self.slot_kind[ip];
                     let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
-                    let entry = tbl.get(kind, bi).expect("paged block in range")
+                    let entry = tbl
+                        .get(kind, bi)
+                        .expect("paged block in range")
                         .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
                     let slot_slice = pools.of(kind).slot_bytes(entry.slot()).expect("paged slot bytes");
                     for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
@@ -2964,7 +4517,8 @@ impl Engine {
                                 plane,
                                 h,
                                 pos as u32,
-                            ).expect("in-slot offset") as usize;
+                            )
+                            .expect("in-slot offset") as usize;
                             rows.extend_from_slice(&slot_slice[off..off + row]);
                         }
                     }
@@ -3009,19 +4563,16 @@ impl Engine {
             for ip in 0..N_PHYS {
                 let (swa, pass_idx) = self.slot_kind[ip];
                 let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
-                let entry = tbl.get(kind, bi).expect("paged block in range")
+                let entry = tbl
+                    .get(kind, bi)
+                    .expect("paged block in range")
                     .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
                 let slot_slice = pools.of_mut(kind).slot_bytes_mut(entry.slot()).expect("paged slot bytes mut");
                 for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
                     for h in 0..NKV as u32 {
-                        let off = crate::blocks::metal_in_slot_byte_offset(
-                            kind,
-                            kvb,
-                            pass_idx as u32,
-                            plane,
-                            h,
-                            pos as u32,
-                        ).expect("in-slot offset") as usize;
+                        let off =
+                            crate::blocks::metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32)
+                                .expect("in-slot offset") as usize;
                         slot_slice[off..off + row].copy_from_slice(&undo.rows[at..at + row]);
                         at += row;
                     }
@@ -3041,7 +4592,9 @@ impl Engine {
                 let b0 = k0 + which * NKV * cap * HD * eb;
                 for g in 0..NKV {
                     let off = b0 + (g * cap + idx) * row;
-                    unsafe { std::ptr::copy_nonoverlapping(undo.rows.as_ptr().add(at), base.add(off), row); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(undo.rows.as_ptr().add(at), base.add(off), row);
+                    }
                     at += row;
                 }
             }
@@ -3073,12 +4626,16 @@ impl Engine {
                             for d in live_swa_len..cap {
                                 let idx = (from_pos - live_swa_len + d) % cap;
                                 let off = b0 + (g * cap + idx) * row;
-                                unsafe { std::ptr::write_bytes(base.add(off), 0, row); }
+                                unsafe {
+                                    std::ptr::write_bytes(base.add(off), 0, row);
+                                }
                             }
                         }
                     } else if from_pos < cap {
                         let off = b0 + (g * cap + from_pos) * row;
-                        unsafe { std::ptr::write_bytes(base.add(off), 0, (cap - from_pos) * row); }
+                        unsafe {
+                            std::ptr::write_bytes(base.add(off), 0, (cap - from_pos) * row);
+                        }
                     }
                 }
             }
@@ -3087,13 +4644,21 @@ impl Engine {
     /// Write this conv site's state after every prefix of the span. Runs only while a verify span is recording,
     /// and only before `k_state_upd` overwrites `cs` with the state at the end.
     fn keep_state(&self, e: &Enc, si: usize, su: &StateArgs, cls: u32, grid: (usize, usize, usize)) {
-        if !self.verify_record.get() { return; }
+        if !self.verify_record.get() {
+            return;
+        }
         let (sk, buf) = {
             let slot = self.verify_keep.borrow();
             let g = slot.as_ref().expect("verify recording without convolution images");
             let sk = StateKeepArgs {
-                x_off: su.x_off, ldx: su.ldx, cs_off: su.cs_off, nch: su.nch, t: su.t,
-                snap_off: (si * g.t * g.stride) as u32, stride: g.stride as u32, pad: 0,
+                x_off: su.x_off,
+                ldx: su.ldx,
+                cs_off: su.cs_off,
+                nch: su.nch,
+                t: su.t,
+                snap_off: (si * g.t * g.stride) as u32,
+                stride: g.stride as u32,
+                pad: 0,
             };
             (sk, g.cs.clone())
         };
@@ -3154,26 +4719,47 @@ impl Engine {
         let run_loopcd = dec && logits && lane_omegas.iter().any(|&w| w > 0.0);
         let t: usize = spans.iter().map(|s| s.t).sum();
         let blocked = spans[0].lane.use_blocks.get();
-        assert!(spans.iter().all(|s| s.lane.use_blocks.get() == blocked), "cannot mix Layer 2 and Layer 3 lanes in one step");
+        assert!(
+            spans.iter().all(|s| s.lane.use_blocks.get() == blocked),
+            "cannot mix Layer 2 and Layer 3 lanes in one step"
+        );
         if blocked {
-            for sp in spans { self.sync_lane_block_table(sp.lane, sp.p0, sp.t); }
+            for sp in spans {
+                self.sync_lane_block_table(sp.lane, sp.p0, sp.t);
+            }
         } else {
-            for sp in spans { assert!(sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(), "K/V capacity: call reserve() first"); }
+            for sp in spans {
+                assert!(
+                    sp.t >= 1 && sp.p0 + sp.t <= self.on(sp.lane).kv_capacity(),
+                    "K/V capacity: call reserve() first"
+                );
+            }
         }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
-        assert!(!dec || (self.hgemm && spans.len() <= self.decode_span_limit()), "a decode step needs the fp16 path and room for f32 queries");
+        assert!(
+            !dec || (self.hgemm && spans.len() <= self.decode_span_limit()),
+            "a decode step needs the fp16 path and room for f32 queries"
+        );
         assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize + decode_batch_extra_floats(spans.len())) * 4),
                 "a decode step keeps each lane's split partials and descriptors in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         if let Some(k) = verify_k {
             assert!(!dec && !argmax, "verify is not a decode step, and argmax would overwrite toks[p0 + t]");
             let need = spans.len() * (1 + k);
-            assert!(need <= self.ba.get().lg_rows as usize,
-                    "verify needs {need} vocabulary rows and this batch has {}; lg is not grown to one row per token",
-                    self.ba.get().lg_rows);
+            assert!(
+                need <= self.ba.get().lg_rows as usize,
+                "verify needs {need} vocabulary rows and this batch has {}; lg is not grown to one row per token",
+                self.ba.get().lg_rows
+            );
         }
         let mut row0 = Vec::with_capacity(spans.len());
-        { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
+        {
+            let mut r = 0;
+            for sp in spans {
+                row0.push(r);
+                r += sp.t;
+            }
+        }
         let e = Enc::new(cb);
         if blocked {
             // Clear any reused GPU block-pool slots that will NOT be completely overwritten
@@ -3254,8 +4840,10 @@ impl Engine {
                         tok_id,
                         pos: pos as u32,
                         cs_base: slab.cs_f32_base(slot.slot_idx),
-                        bt_full_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, false)).expect("bt_full_base fits u32"),
-                        bt_win_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, true)).expect("bt_win_base fits u32"),
+                        bt_full_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, false))
+                            .expect("bt_full_base fits u32"),
+                        bt_win_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, true))
+                            .expect("bt_win_base fits u32"),
                         part_off: self.dstart.get() + si as u32 * self.ar.total + self.ar.part,
                         swa_nkeys: swa_nkeys as u32,
                         swa_first_pos: swa_first_pos as u32,
@@ -3292,13 +4880,18 @@ impl Engine {
             debug_assert!(full_groups.len() <= n * MAX_SPLIT);
             let partition_copy = |groups: &[DecAttnGroup], base_off: u32| -> (u32, usize, u32, usize) {
                 let mut n_solo = 0usize;
-                for g in groups { if g.count == 1 { n_solo += 1; } }
+                for g in groups {
+                    if g.count == 1 {
+                        n_solo += 1;
+                    }
+                }
                 let n_shared = groups.len() - n_solo;
                 let shared_off = base_off + (n_solo * grp_floats) as u32;
                 let act = self.act.borrow();
                 unsafe {
                     let dst_solo = (act.contents().as_ptr() as *mut f32).add(base_off as usize) as *mut DecAttnGroup;
-                    let dst_shared = (act.contents().as_ptr() as *mut f32).add(shared_off as usize) as *mut DecAttnGroup;
+                    let dst_shared =
+                        (act.contents().as_ptr() as *mut f32).add(shared_off as usize) as *mut DecAttnGroup;
                     let (mut is, mut ig) = (0usize, 0usize);
                     for &g in groups {
                         if g.count == 1 {
@@ -3313,7 +4906,8 @@ impl Engine {
                 (base_off, n_solo, shared_off, n_shared)
             };
             let (swa_solo_off, n_swa_solo, swa_shared_off, n_swa_shared) = partition_copy(&swa_groups, swa_grp_off);
-            let (full_solo_off, n_full_solo, full_shared_off, n_full_shared) = partition_copy(&full_groups, full_grp_off);
+            let (full_solo_off, n_full_solo, full_shared_off, n_full_shared) =
+                partition_copy(&full_groups, full_grp_off);
             drop(tables);
             // Bind shared blocked `CS` (buffer 4) and `BT` (buffer 8) ONCE for the entire decode step.
             e.buf(slab.cs_buf.as_ref().expect("blocked slab missing cs_buf"), 0, 4);
@@ -3349,13 +4943,23 @@ impl Engine {
             if !dec && !blocked {
                 let bz = self.ba.get();
                 let zr = prefill_scratch_zero_range(&bz);
-                e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
+                e.pso(&self.gpu.pso("k_zero"));
+                e.bytes(&zr, 5);
+                e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
                 e.barrier();
             }
             for (si, sp) in spans.iter().enumerate() {
                 let r0 = (row0[si] * E) as u32;
-                let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                                     norm_off: self.tok_norm, out0: b.vec(0) + r0, out1: b.vec(0) + r0, tok_index: sp.p0 as u32, eps: self.eps };
+                let ea = EmbedArgs {
+                    emb_lo: self.tok_embd.off as u32,
+                    emb_hi: (self.tok_embd.off >> 32) as u32,
+                    row_bytes: self.tok_embd.row_bytes,
+                    norm_off: self.tok_norm,
+                    out0: b.vec(0) + r0,
+                    out1: b.vec(0) + r0,
+                    tok_index: sp.p0 as u32,
+                    eps: self.eps,
+                };
                 e.buf(&sp.lane.toks, 0, 6);
                 self.go_nb(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
             }
@@ -3367,12 +4971,34 @@ impl Engine {
         // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
         let mut trim = [0usize; N_PHYS];
         // Verify needs every row's logits, so it does not take the last-layer tail trim (single span, t > 16).
-        if verify_k.is_none() && spans.len() == 1 && self.hgemm && self.tail.get() && t > 16 { trim[N_PHYS - 1] = t - 8; }
+        if verify_k.is_none() && spans.len() == 1 && self.hgemm && self.tail.get() && t > 16 {
+            trim[N_PHYS - 1] = t - 8;
+        }
         let mut va = VecAlloc { next: 1, n: B_NVEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
-        if verify_k.is_some() { self.verify_record.set(true); }
-        for (ip, &tr) in trim.iter().enumerate().take(LOOP_START) { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], tr, false); }
+        if verify_k.is_some() {
+            self.verify_record.set(true);
+        }
+        for (ip, &tr) in trim.iter().enumerate().take(LOOP_START) {
+            cur = self.layer_b_ex(
+                &e,
+                spans,
+                &row0,
+                t,
+                dec,
+                dec_meta,
+                ip,
+                ip,
+                cur,
+                &mut blocks,
+                None,
+                &mut va,
+                &[],
+                tr,
+                false,
+            );
+        }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
@@ -3382,10 +5008,38 @@ impl Engine {
         // The test binary can plant a weak-pass state write to verify the model gate.
         let dry_weak_state = !cfg!(test) || std::env::var_os("INKY_TEST_LOOPCD_WRITE_WEAK_STATE").is_none();
         for pass in 0..n_passes {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            if pass > 0 {
+                cur = prelude;
+                blocks = prelude_blocks.clone();
+            }
             let msg = if pass > 0 { Some(bank) } else { None };
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0, false); }
+            let pinned: Vec<usize> = {
+                let mut p = vec![prelude];
+                if pass > 0 {
+                    p.push(bank.0);
+                    p.push(bank.1);
+                }
+                p
+            };
+            for ip in LOOP_START..LOOP_END {
+                cur = self.layer_b_ex(
+                    &e,
+                    spans,
+                    &row0,
+                    t,
+                    dec,
+                    dec_meta,
+                    slot_of(pass, ip),
+                    ip,
+                    cur,
+                    &mut blocks,
+                    msg,
+                    &mut va,
+                    &pinned,
+                    0,
+                    false,
+                );
+            }
             bank = (blocks[prelude_blocks.len() + 1], cur);
             if pass == 0 && run_loopcd && one_pass_dry.is_none() {
                 // Exact dry-state weak reference pass (z_1) immediately after pass 0, while CS[18..24] and
@@ -3394,12 +5048,36 @@ impl Engine {
                 let mut blocks_w = blocks.clone();
                 let pinned_w = [prelude, bank.0, bank.1];
                 for ip in LOOP_END..N_PHYS {
-                    cur_w = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, 0, dry_weak_state);
+                    cur_w = self.layer_b_ex(
+                        &e,
+                        spans,
+                        &row0,
+                        t,
+                        dec,
+                        dec_meta,
+                        ip,
+                        ip,
+                        cur_w,
+                        &mut blocks_w,
+                        None,
+                        &mut va,
+                        &pinned_w,
+                        0,
+                        dry_weak_state,
+                    );
                 }
                 let n = spans.len();
                 let st_w: Vec<u32> = blocks_w.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur_w))).collect();
-                let mut j = self.mix_job_off(&st_w, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
-                j.hout[0] = b.xh[0] as i32; j.nof32 = 1;
+                let mut j = self.mix_job_off(
+                    &st_w,
+                    self.output_res_query as i32,
+                    1,
+                    &[b.fin],
+                    &[self.output_norm as i32],
+                    E as u32,
+                );
+                j.hout[0] = b.xh[0] as i32;
+                j.nof32 = 1;
                 self.mix_t(&e, C_OMIX, &[j], n);
                 let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
                 hs.ldo = self.vocab_pad() as u32;
@@ -3413,7 +5091,25 @@ impl Engine {
                 lg_weak_buf = Some(weak_buf);
             }
         }
-        for (ip, &tr) in trim.iter().enumerate().take(N_PHYS).skip(LOOP_END) { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], tr, coda_dry); }
+        for (ip, &tr) in trim.iter().enumerate().take(N_PHYS).skip(LOOP_END) {
+            cur = self.layer_b_ex(
+                &e,
+                spans,
+                &row0,
+                t,
+                dec,
+                dec_meta,
+                ip,
+                ip,
+                cur,
+                &mut blocks,
+                None,
+                &mut va,
+                &[],
+                tr,
+                coda_dry,
+            );
+        }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -3428,7 +5124,14 @@ impl Engine {
                     let lg = b.lg + ((si * rows + r) * vp) as u32;
                     let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + row).collect();
                     st.push(b.vec(cur) + row);
-                    let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
+                    let j = self.mix_job_off(
+                        &st,
+                        self.output_res_query as i32,
+                        1,
+                        &[ar.fout],
+                        &[self.output_norm as i32],
+                        0,
+                    );
                     self.mix(&e, C_OMIX, &[j]);
                     self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
                 }
@@ -3439,8 +5142,10 @@ impl Engine {
             let ar = self.ar;
             let n = spans.len();
             let st: Vec<u32> = blocks.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur))).collect();
-            let mut j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
-            j.hout[0] = b.xh[0] as i32; j.nof32 = 1;
+            let mut j =
+                self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
+            j.hout[0] = b.xh[0] as i32;
+            j.nof32 = 1;
             self.mix_t(&e, C_OMIX, &[j], n);
             let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
             hs.ldo = self.vocab_pad() as u32;
@@ -3464,7 +5169,15 @@ impl Engine {
             if argmax {
                 for (si, sp) in spans.iter().enumerate() {
                     let nparts = 128u32;
-                    let am = ArgmaxArgs { logits_off: b.lg + (si * self.vocab_pad()) as u32, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + 1) as u32, checked: 0, pad: [0; 2] };
+                    let am = ArgmaxArgs {
+                        logits_off: b.lg + (si * self.vocab_pad()) as u32,
+                        n: self.n_vocab as u32,
+                        part_off: ar.amax,
+                        nparts,
+                        out_index: (sp.p0 + 1) as u32,
+                        checked: 0,
+                        pad: [0; 2],
+                    };
                     e.buf(&sp.lane.toks, 0, 6);
                     self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
                     self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
@@ -3473,17 +5186,28 @@ impl Engine {
         } else if logits {
             let ar = self.ar;
             for (si, sp) in spans.iter().enumerate() {
-                if !prefill_span_reads_logits(logits, span_logits_mask, si) { continue; }
+                if !prefill_span_reads_logits(logits, span_logits_mask, si) {
+                    continue;
+                }
                 let last = ((row0[si] + sp.t - 1) * E) as u32;
                 let lg = if spans.len() == 1 { ar.logits } else { b.lg + (si * self.vocab_pad()) as u32 };
                 let mut st: Vec<u32> = blocks.iter().map(|&v| b.vec(v) + last).collect();
                 st.push(b.vec(cur) + last);
-                let j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
+                let j =
+                    self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
                 self.mix(&e, C_OMIX, &[j]);
                 self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
                 if argmax {
                     let nparts = 128u32;
-                    let am = ArgmaxArgs { logits_off: lg, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + sp.t) as u32, checked: 0, pad: [0; 2] };
+                    let am = ArgmaxArgs {
+                        logits_off: lg,
+                        n: self.n_vocab as u32,
+                        part_off: ar.amax,
+                        nparts,
+                        out_index: (sp.p0 + sp.t) as u32,
+                        checked: 0,
+                        pad: [0; 2],
+                    };
                     e.buf(&sp.lane.toks, 0, 6);
                     self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
                     self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
@@ -3494,8 +5218,24 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_b_ex(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, dec_meta: Option<DecBatchMeta>, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-                  msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize, dry_state: bool) -> usize {
+    fn layer_b_ex(
+        &self,
+        e: &Enc,
+        spans: &[Span],
+        row0: &[usize],
+        t: usize,
+        dec: bool,
+        dec_meta: Option<DecBatchMeta>,
+        slot: usize,
+        ip: usize,
+        cur: usize,
+        blocks: &mut Vec<usize>,
+        msg: Option<(usize, usize)>,
+        va: &mut VecAlloc,
+        pinned: &[usize],
+        ts: usize,
+        dry_state: bool,
+    ) -> usize {
         let l = &self.layers[ip];
         let b = self.ba.get();
         let vo = |i: usize| b.vec(i);
@@ -3503,7 +5243,7 @@ impl Engine {
         let cs_slot = (slot * NCH * 3) as u32;
         let tt = t as u32;
         let es = E as u32;
-        let hatt = self.hgemm;      // fp16 path: k_attn_h, half q / gate, router on the fp16 FFN input
+        let hatt = self.hgemm; // fp16 path: k_attn_h, half q / gate, router on the fp16 FFN input
         let (qgh, rth) = (hatt, hatt);
         // the query side (queries, attention, output projection, FFN) covers rows [ts, t); the key side always all rows
         assert!(ts == 0 || (ctl.is_none() && hatt));
@@ -3512,7 +5252,8 @@ impl Engine {
         let sh = |off: u32, dim: usize| off + (ts * dim) as u32;
         // ---- attention inputs
         let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
-        let mut st: Vec<u32> = blocks.iter().map(|&v| vo(v)).collect(); st.push(vo(cur));
+        let mut st: Vec<u32> = blocks.iter().map(|&v| vo(v)).collect();
+        st.push(vo(cur));
         let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
         let xin: [u32; 3];
         if let Some(lw) = ctl {
@@ -3521,44 +5262,89 @@ impl Engine {
             let mut jm = self.mix_job_off(&[vo(b0), vo(b1)], lw.msg_query as i32, 4, &b.msg, &[], es);
             if self.hgemm {
                 // normalized copies straight into the controllers' fp16 inputs [u^ | m^]
-                if l.swa { ja.hcopy[0] = [b.cath[0] as i32, b.cath[1] as i32, b.cath[2] as i32]; }
-                else { for j in 0..3 { ja.hcopy[j][0] = b.cath[j] as i32; } }
-                for j in 0..4 { jm.hcopy[j][0] = (b.cath[j] + (E / 2) as u32) as i32; }
+                if l.swa {
+                    ja.hcopy[0] = [b.cath[0] as i32, b.cath[1] as i32, b.cath[2] as i32];
+                } else {
+                    for j in 0..3 {
+                        ja.hcopy[j][0] = b.cath[j] as i32;
+                    }
+                }
+                for j in 0..4 {
+                    jm.hcopy[j][0] = (b.cath[j] + (E / 2) as u32) as i32;
+                }
             } else {
-                if l.swa { ja.ncopy[0] = [b.cat_u[0] as i32, b.cat_u[1] as i32, b.cat_u[2] as i32]; }
-                else { for j in 0..3 { ja.ncopy[j][0] = b.cat_u[j] as i32; } }
-                for j in 0..4 { jm.ncopy[j][0] = b.cat_m[j] as i32; }
+                if l.swa {
+                    ja.ncopy[0] = [b.cat_u[0] as i32, b.cat_u[1] as i32, b.cat_u[2] as i32];
+                } else {
+                    for j in 0..3 {
+                        ja.ncopy[j][0] = b.cat_u[j] as i32;
+                    }
+                }
+                for j in 0..4 {
+                    jm.ncopy[j][0] = b.cat_m[j] as i32;
+                }
             }
             self.mix_t(e, C_MIXA, &[ja, jm], t);
-            let jobs: Vec<(usize, u32, u32, u32, u32)> = (0..3).map(|j| (j, if l.swa { b.inp[0] } else { b.inp[j] }, b.msg[j], b.cin[j], norms[j] as u32)).collect();
+            let jobs: Vec<(usize, u32, u32, u32, u32)> = (0..3)
+                .map(|j| (j, if l.swa { b.inp[0] } else { b.inp[j] }, b.msg[j], b.cin[j], norms[j] as u32))
+                .collect();
             let ho: Vec<(u32, bool)> = if self.hgemm { (0..3).map(|j| (b.xh[j], true)).collect() } else { vec![] };
             self.ctrl_b(e, lw, &jobs, t, &ho);
             xin = b.cin;
         } else {
             let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
             let mut ja = self.mix_job_off(&st, l.attn_res_query, nq, &b.inp[..nq as usize], &nn, es);
-            if self.hgemm { for q in 0..nq as usize { ja.hout[q] = b.xh[q] as i32; } ja.nof32 = 0xF; }
+            if self.hgemm {
+                for q in 0..nq as usize {
+                    ja.hout[q] = b.xh[q] as i32;
+                }
+                ja.nof32 = 0xF;
+            }
             self.mix_t(e, C_MIXA, &[ja], t);
             xin = if l.swa { [b.inp[0]; 3] } else { [b.inp[0], b.inp[1], b.inp[2]] };
         }
         // ---- projections (one batched GEMM over all segments)
-        let mut segs = vec![Engine::gseg(&l.wq, xin[0], b.q), Engine::gseg(&l.wgate, xin[0], b.gate), Engine::gseg(&l.wrel, xin[0], b.rel),
-                            Engine::gseg(&l.wsink, xin[0], b.sink), Engine::gseg(&l.wk, xin[1], b.k), Engine::gseg(&l.wv, xin[2], b.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::gseg(kp, xin[1], b.kdyn)); segs.push(Engine::gseg(vp, xin[2], b.vdyn)); }
+        let mut segs = vec![
+            Engine::gseg(&l.wq, xin[0], b.q),
+            Engine::gseg(&l.wgate, xin[0], b.gate),
+            Engine::gseg(&l.wrel, xin[0], b.rel),
+            Engine::gseg(&l.wsink, xin[0], b.sink),
+            Engine::gseg(&l.wk, xin[1], b.k),
+            Engine::gseg(&l.wv, xin[2], b.v),
+        ];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) {
+            segs.push(Engine::gseg(kp, xin[1], b.kdyn));
+            segs.push(Engine::gseg(vp, xin[2], b.vdyn));
+        }
         if self.hgemm {
             // the fp16 inputs b.xh[..] were written by the mix / controller kernels: one shared input in an uncontrolled
             // sliding-window layer, separate q / k / v inputs otherwise
             let xi: [usize; 3] = if ctl.is_some() || !l.swa { [0, 1, 2] } else { [0, 0, 0] };
-            let mut hq = vec![Engine::hseg(&l.wq, b.xh[xi[0]], b.q), Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate), Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
-                              Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink)];
+            let mut hq = vec![
+                Engine::hseg(&l.wq, b.xh[xi[0]], b.q),
+                Engine::hseg(&l.wgate, b.xh[xi[0]], b.gate),
+                Engine::hseg(&l.wrel, b.xh[xi[0]], b.rel),
+                Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink),
+            ];
             // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
-            if hatt && qgh && !dec { hq[0].hout = 1; hq[1].hout = 1; }     // a decode step keeps them f32 for k_attn
+            if hatt && qgh && !dec {
+                hq[0].hout = 1;
+                hq[1].hout = 1;
+            } // a decode step keeps them f32 for k_attn
             let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
-            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn)); hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn)); }
-            if ts == 0 { hq.extend_from_slice(&hs); self.gemm_h(e, C_QKV, &hq, t); }
-            else {
+            if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) {
+                hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn));
+                hs.push(Engine::hseg(vp, b.xh[xi[2]], b.vdyn));
+            }
+            if ts == 0 {
+                hq.extend_from_slice(&hs);
+                self.gemm_h(e, C_QKV, &hq, t);
+            } else {
                 // query-side projections for the tail rows only (the two GEMMs are independent)
-                for sg in hq.iter_mut() { sg.xh_off = sh(sg.xh_off, E / 2); sg.out_off = sh(sg.out_off, sg.nrows as usize / (1 + sg.hout as usize)); }
+                for sg in hq.iter_mut() {
+                    sg.xh_off = sh(sg.xh_off, E / 2);
+                    sg.out_off = sh(sg.out_off, sg.nrows as usize / (1 + sg.hout as usize));
+                }
                 self.gemm_h(e, C_QKV, &hs, t);
                 self.gemm_h(e, C_QKV, &hq, n);
             }
@@ -3667,31 +5453,69 @@ impl Engine {
             for (si, sp) in spans.iter().enumerate() {
                 let run = self.on(sp.lane);
                 let (pos, r0) = (sp.p0, row0[si]);
-                let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
+                let tau = if l.swa {
+                    1.0
+                } else {
+                    1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln()
+                };
                 let ar = self.ar;
                 self.bind_lane(e, sp.lane);
                 run.bind_kv(e, l.swa);
                 let (kb, vb, kcap) = run.kv_slot(slot);
                 let base = AttnArgs {
-                    pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
-                    q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
-                    r_off: b.rel + (r0 * NH * NREL) as u32, sink_off: b.sink + (r0 * NH) as u32,
-                    kdyn_off: if l.swa { -1 } else { (b.kdyn + (r0 * 32) as u32) as i32 }, vdyn_off: if l.swa { -1 } else { (b.vdyn + (r0 * 32) as u32) as i32 },
-                    part_off: self.dstart.get() + si as u32 * ar.total + ar.part, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
-                    ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
+                    pos: pos as u32,
+                    cap: kcap,
+                    k_base: kb,
+                    v_base: vb,
+                    cs_off: cs_slot,
+                    q_off: b.q + (r0 * NH * HD) as u32,
+                    k_off: b.k + (r0 * NKV * HD) as u32,
+                    v_off: b.v + (r0 * NKV * HD) as u32,
+                    r_off: b.rel + (r0 * NH * NREL) as u32,
+                    sink_off: b.sink + (r0 * NH) as u32,
+                    kdyn_off: if l.swa { -1 } else { (b.kdyn + (r0 * 32) as u32) as i32 },
+                    vdyn_off: if l.swa { -1 } else { (b.vdyn + (r0 * 32) as u32) as i32 },
+                    part_off: self.dstart.get() + si as u32 * ar.total + ar.part,
+                    kconv_w: l.k_conv,
+                    vconv_w: l.v_conv,
+                    qclip_w: l.q_clip,
+                    relclip_w: l.rel_clip,
+                    relbias_w: l.rel_bias,
+                    tau,
+                    ctr: 0,
+                    gate_off: b.gate + (r0 * NH * HD) as u32,
+                    out_off: b.qp + (r0 * NH * HD) as u32,
+                    gstr: kcap * HD as u32,
+                    istr: HD as u32,
                     ..Default::default()
                 };
                 let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
                 let nkeys = pos + 1 - first_pos;
-                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                    pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
+                let aa = AttnArgs {
+                    nkeys: nkeys as u32,
+                    first_pos: first_pos as u32,
+                    ring: l.swa as u32,
+                    kps: kps as u32,
+                    nsplit: nsplit as u32,
+                    pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                    ..base
+                };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
                 self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
                 let comb_out = if direct_half { b.agh + (r0 * (NH * HD / 2)) as u32 } else { aa.out_off };
-                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: comb_out, hout: direct_half as u32, pad: [0; 3] });
+                combs.push(CombineArgs {
+                    part_off: aa.part_off,
+                    nsplit: nsplit as u32,
+                    gate_off: aa.gate_off,
+                    out_off: comb_out,
+                    hout: direct_half as u32,
+                    pad: [0; 3],
+                });
             }
             e.barrier();
-            for ca in &combs { self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128); }
+            for ca in &combs {
+                self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128);
+            }
             e.barrier();
             e.buf(&self.act.borrow(), 0, 3);
             if !direct_half {
@@ -3700,121 +5524,301 @@ impl Engine {
                 e.barrier();
             }
         }
-        if !dec && blocked { self.bind_pool_slabs(e, l.swa); }
+        if !dec && blocked {
+            self.bind_pool_slabs(e, l.swa);
+        }
         for (si, sp) in spans.iter().enumerate() {
-        if dec { break; }
-        let run = self.on(sp.lane);
-        let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
-        let tt = t as u32;
-        // a row-major region shifted to this span's first row
-        let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
-        let (n, nn_) = (t - ts, (t - ts) as u32);
-        let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
-        sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-        let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
-        let qpd = if hatt { NH * HD / 2 } else { NH * HD };
-        if blocked {
-            Self::bind_lane_bt(e, sp.lane, l.swa);
-            let ka = KvPrepArgs {
-                t: tt, p0: p0 as u32, ring: 0, cap: 0, k_base: pass_idx, v_base: 0, cs_off: cs_slot, q_off: rs(b.q, qd),
-                k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
-                kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
-                qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
-                log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0: 0,
+            if dec {
+                break;
+            }
+            let run = self.on(sp.lane);
+            let (p0, t, r0) = (sp.p0, sp.t, row0[si]);
+            let tt = t as u32;
+            // a row-major region shifted to this span's first row
+            let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
+            let (n, nn_) = (t - ts, (t - ts) as u32);
+            let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
+            sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+            let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
+            let qpd = if hatt { NH * HD / 2 } else { NH * HD };
+            if blocked {
+                Self::bind_lane_bt(e, sp.lane, l.swa);
+                let ka = KvPrepArgs {
+                    t: tt,
+                    p0: p0 as u32,
+                    ring: 0,
+                    cap: 0,
+                    k_base: pass_idx,
+                    v_base: 0,
+                    cs_off: cs_slot,
+                    q_off: rs(b.q, qd),
+                    k_off: rs(b.k, NKV * HD),
+                    v_off: rs(b.v, NKV * HD),
+                    r_off: rs(b.rel, NH * NREL),
+                    kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 },
+                    vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
+                    qp_off: rs(b.qp, qpd),
+                    rp_off: rs(b.rp, NH * NREL),
+                    qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1,
+                    kconv_w: l.k_conv,
+                    vconv_w: l.v_conv,
+                    qclip_w: l.q_clip,
+                    relclip_w: l.rel_clip,
+                    log_alpha: self.log_alpha,
+                    log_floor: self.log_floor,
+                    is_full: (!l.swa) as u32,
+                    kpos0: 0,
+                };
+                self.go(e, C_KVPREP, "k_kvprep_b_blk", &ka, (t, NKV, 1), 128);
+                if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
+                    assert!(
+                        spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap,
+                        "query capture needs one span, the fp16 attention path, no tail trimming and room"
+                    );
+                    let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
+                    e.buf(qc, 0, 3);
+                    let a = DevCopyArgs {
+                        src: b.qp,
+                        dst: (fi * per + p0 * (NH * HD / 2)) as u32,
+                        n: (t * NH * HD / 2) as u32,
+                        pad: 0,
+                    };
+                    self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
+                    let a = DevCopyArgs {
+                        src: b.sink,
+                        dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32,
+                        n: (t * NH) as u32,
+                        pad: 0,
+                    };
+                    self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
+                    self.bind_pool_slabs(e, l.swa);
+                }
+                let su = StateArgs {
+                    x_off: rs(b.k, NKV * HD),
+                    ldx: (NKV * HD) as u32,
+                    cs_off: cs_slot,
+                    nch: (NKV * HD) as u32,
+                    t: tt,
+                    pad: [0; 3],
+                };
+                self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+                self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+                let su = StateArgs {
+                    x_off: rs(b.v, NKV * HD),
+                    ldx: (NKV * HD) as u32,
+                    cs_off: cs_slot + (NKV * HD * 3) as u32,
+                    nch: (NKV * HD) as u32,
+                    t: tt,
+                    pad: [0; 3],
+                };
+                self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
+                self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+                let aa = AttnBArgs {
+                    t: tt,
+                    p0: p0 as u32,
+                    ring: 0,
+                    cap: 0,
+                    k_base: pass_idx,
+                    v_base: 0,
+                    window: if l.swa { EXT as u32 } else { 0 },
+                    qp_off: rs(b.qp, qpd),
+                    rp_off: rs(b.rp, NH * NREL),
+                    sink_off: rs(b.sink, NH),
+                    gate_off: rs(b.gate, gd),
+                    out_off: rs(b.attn_g, NH * HD),
+                    relbias_w: l.rel_bias,
+                    ghalf: 0,
+                    kpos0: 0,
+                    pad: 0,
+                };
+                if hatt {
+                    let ah = AttnBArgs {
+                        t: nn_,
+                        p0: (p0 + ts) as u32,
+                        qp_off: shs(b.qp, NH * HD / 2),
+                        rp_off: shs(b.rp, NH * NREL),
+                        sink_off: shs(b.sink, NH),
+                        gate_off: shs(b.gate, gd),
+                        out_off: shs(b.agh, NH * HD / 2),
+                        ghalf: qgh as u32,
+                        ..aa
+                    };
+                    self.go(e, C_ATTN, "k_attn_h_blk", &ah, (n.div_ceil(32), NH, 1), 256);
+                } else if self.tensor {
+                    self.go(e, C_ATTN, "k_attn_bt_blk", &aa, (t.div_ceil(32), NH, 1), 256);
+                } else {
+                    self.go(e, C_ATTN, "k_attn_b_blk", &aa, (t.div_ceil(8), NKV, 1), 128);
+                }
+                continue;
+            }
+            let (kb, vb, kcap) = run.kv_slot(slot);
+            let (pk, pv, cap, kpos0) = if l.swa {
+                (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32)
+            } else {
+                (kb, vb, kcap, 0)
             };
-            self.go(e, C_KVPREP, "k_kvprep_b_blk", &ka, (t, NKV, 1), 128);
+            let kcopy = |n: usize, pos0: usize, to_ring: u32| {
+                let a = KvCopyArgs {
+                    n: n as u32,
+                    pos0: pos0 as u32,
+                    ring_k: kb,
+                    ring_v: vb,
+                    cap: kcap,
+                    sk_off: b.sk,
+                    sv_off: b.sv,
+                    scap,
+                    kpos0,
+                    to_ring,
+                    pad: [0; 2],
+                };
+                e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
+                self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
+                e.buf(&self.act.borrow(), 0, 3);
+            };
+            if l.swa {
+                if p0 > 0 {
+                    kcopy(p0.min(EXT), p0 - p0.min(EXT), 0);
+                }
+                e.buf(&self.act.borrow(), 0, 3);
+            } else {
+                e.buf(&sp.lane.kv_full.borrow(), 0, 3);
+            }
+            let ka = KvPrepArgs {
+                t: tt,
+                p0: p0 as u32,
+                ring: 0,
+                cap,
+                k_base: pk,
+                v_base: pv,
+                cs_off: cs_slot,
+                q_off: rs(b.q, qd),
+                k_off: rs(b.k, NKV * HD),
+                v_off: rs(b.v, NKV * HD),
+                r_off: rs(b.rel, NH * NREL),
+                kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 },
+                vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
+                qp_off: rs(b.qp, qpd),
+                rp_off: rs(b.rp, NH * NREL),
+                qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1,
+                kconv_w: l.k_conv,
+                vconv_w: l.v_conv,
+                qclip_w: l.q_clip,
+                relclip_w: l.rel_clip,
+                log_alpha: self.log_alpha,
+                log_floor: self.log_floor,
+                is_full: (!l.swa) as u32,
+                kpos0,
+            };
+            self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
             if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
-                assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
+                assert!(
+                    spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap,
+                    "query capture needs one span, the fp16 attention path, no tail trimming and room"
+                );
                 let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
                 e.buf(qc, 0, 3);
-                let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
+                let a = DevCopyArgs {
+                    src: b.qp,
+                    dst: (fi * per + p0 * (NH * HD / 2)) as u32,
+                    n: (t * NH * HD / 2) as u32,
+                    pad: 0,
+                };
                 self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
-                let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
+                let a = DevCopyArgs {
+                    src: b.sink,
+                    dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32,
+                    n: (t * NH) as u32,
+                    pad: 0,
+                };
                 self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
-                self.bind_pool_slabs(e, l.swa);
+                e.buf(&sp.lane.kv_full.borrow(), 0, 3);
             }
-            let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            if l.swa {
+                kcopy(t.min(EXT), p0 + t - t.min(EXT), 1);
+            }
+            // k_attn_h reads keys in whole tiles of ATT_AK positions, so the span's last tile runs past its last key to the
+            // next multiple of ATT_AK. Those scratch rows are masked with a zero weight, which does not cancel a NaN or an
+            // infinity, and k_zero cleared them only at the start of the step: an earlier span of this layer (or a longer span of the
+            // layer before) may have written another lane's keys there since. Zero them for this span.
+            // (specs/ScratchTail.tla; one span alone never leaves them dirty)
+            if l.swa && spans.len() > 1 {
+                let (end, tail) = (p0 + t, (p0 + t).next_multiple_of(ATT_AK) - (p0 + t));
+                if tail > 0 {
+                    kcopy(tail, end, 2);
+                }
+            }
+            let su = StateArgs {
+                x_off: rs(b.k, NKV * HD),
+                ldx: (NKV * HD) as u32,
+                cs_off: cs_slot,
+                nch: (NKV * HD) as u32,
+                t: tt,
+                pad: [0; 3],
+            };
             self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
             self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-            let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
+            let su = StateArgs {
+                x_off: rs(b.v, NKV * HD),
+                ldx: (NKV * HD) as u32,
+                cs_off: cs_slot + (NKV * HD * 3) as u32,
+                nch: (NKV * HD) as u32,
+                t: tt,
+                pad: [0; 3],
+            };
             self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
             self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-            let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap: 0, k_base: pass_idx, v_base: 0,
-                                 window: if l.swa { EXT as u32 } else { 0 }, qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), sink_off: rs(b.sink, NH), gate_off: rs(b.gate, gd),
-                                 out_off: rs(b.attn_g, NH * HD), relbias_w: l.rel_bias, ghalf: 0, kpos0: 0, pad: 0 };
+            // ---- attention (causal, query-tiled)
+            let aa = AttnBArgs {
+                t: tt,
+                p0: p0 as u32,
+                ring: 0,
+                cap,
+                k_base: pk,
+                v_base: pv,
+                window: if l.swa { EXT as u32 } else { 0 },
+                qp_off: rs(b.qp, qpd),
+                rp_off: rs(b.rp, NH * NREL),
+                sink_off: rs(b.sink, NH),
+                gate_off: rs(b.gate, gd),
+                out_off: rs(b.attn_g, NH * HD),
+                relbias_w: l.rel_bias,
+                ghalf: 0,
+                kpos0,
+                pad: 0,
+            };
             if hatt {
-                let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: shs(b.qp, NH * HD / 2), rp_off: shs(b.rp, NH * NREL), sink_off: shs(b.sink, NH),
-                                     gate_off: shs(b.gate, gd), out_off: shs(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
-                self.go(e, C_ATTN, "k_attn_h_blk", &ah, (n.div_ceil(32), NH, 1), 256);
+                let ah = AttnBArgs {
+                    t: nn_,
+                    p0: (p0 + ts) as u32,
+                    qp_off: shs(b.qp, NH * HD / 2),
+                    rp_off: shs(b.rp, NH * NREL),
+                    sink_off: shs(b.sink, NH),
+                    gate_off: shs(b.gate, gd),
+                    out_off: shs(b.agh, NH * HD / 2),
+                    ghalf: qgh as u32,
+                    ..aa
+                };
+                self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
+            } else if self.tensor {
+                self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256);
+            } else {
+                self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128);
             }
-            else if self.tensor { self.go(e, C_ATTN, "k_attn_bt_blk", &aa, (t.div_ceil(32), NH, 1), 256); }
-            else { self.go(e, C_ATTN, "k_attn_b_blk", &aa, (t.div_ceil(8), NKV, 1), 128); }
-            continue;
-        }
-        let (kb, vb, kcap) = run.kv_slot(slot);
-        let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
-        let kcopy = |n: usize, pos0: usize, to_ring: u32| {
-            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
-            e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
-            self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
-            e.buf(&self.act.borrow(), 0, 3);
-        };
-        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
-        let ka = KvPrepArgs {
-            t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qd),
-            k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
-            kdyn_off: if l.swa { -1 } else { rs(b.kdyn, 32) as i32 }, vdyn_off: if l.swa { -1 } else { rs(b.vdyn, 32) as i32 },
-            qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), qhalf: hatt as u32 | ((hatt && qgh) as u32) << 1, kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip,
-            log_alpha: self.log_alpha, log_floor: self.log_floor, is_full: (!l.swa) as u32, kpos0,
-        };
-        self.go(e, C_KVPREP, "k_kvprep_b", &ka, (t, NKV, 1), 128);
-        if let (false, Some((qc, ncap))) = (l.swa, self.qcap.borrow().as_ref()) {
-            assert!(spans.len() == 1 && hatt && ts == 0 && p0 + t <= *ncap, "query capture needs one span, the fp16 attention path, no tail trimming and room");
-            let (fi, per) = (self.slot_kind[slot].1, ncap * (NH * HD / 2 + NH));
-            e.buf(qc, 0, 3);
-            let a = DevCopyArgs { src: b.qp, dst: (fi * per + p0 * (NH * HD / 2)) as u32, n: (t * NH * HD / 2) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH * HD / 2).div_ceil(1024), 1, 1), 1024);
-            let a = DevCopyArgs { src: b.sink, dst: (fi * per + ncap * (NH * HD / 2) + p0 * NH) as u32, n: (t * NH) as u32, pad: 0 };
-            self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
-            e.buf(&sp.lane.kv_full.borrow(), 0, 3);
-        }
-        if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
-        // k_attn_h reads keys in whole tiles of ATT_AK positions, so the span's last tile runs past its last key to the
-        // next multiple of ATT_AK. Those scratch rows are masked with a zero weight, which does not cancel a NaN or an
-        // infinity, and k_zero cleared them only at the start of the step: an earlier span of this layer (or a longer span of the
-        // layer before) may have written another lane's keys there since. Zero them for this span.
-        // (specs/ScratchTail.tla; one span alone never leaves them dirty)
-        if l.swa && spans.len() > 1 {
-            let (end, tail) = (p0 + t, (p0 + t).next_multiple_of(ATT_AK) - (p0 + t));
-            if tail > 0 { kcopy(tail, end, 2); }
-        }
-        let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        let su = StateArgs { x_off: rs(b.v, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot + (NKV * HD * 3) as u32, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
-        self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
-        self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-        // ---- attention (causal, query-tiled)
-        let aa = AttnBArgs { t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv,
-                             window: if l.swa { EXT as u32 } else { 0 }, qp_off: rs(b.qp, qpd), rp_off: rs(b.rp, NH * NREL), sink_off: rs(b.sink, NH), gate_off: rs(b.gate, gd),
-                             out_off: rs(b.attn_g, NH * HD), relbias_w: l.rel_bias, ghalf: 0, kpos0, pad: 0 };
-        if hatt {
-            let ah = AttnBArgs { t: nn_, p0: (p0 + ts) as u32, qp_off: shs(b.qp, NH * HD / 2), rp_off: shs(b.rp, NH * NREL), sink_off: shs(b.sink, NH),
-                                 gate_off: shs(b.gate, gd), out_off: shs(b.agh, NH * HD / 2), ghalf: qgh as u32, ..aa };
-            self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
-        }
-        else if self.tensor { self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256); }
-        else { self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128); }
         }
         // ---- output projection + post-conv (+ residual)
         if self.hgemm {
-            if !hatt { self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None); e.barrier(); }
+            if !hatt {
+                self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+                e.barrier();
+            }
             self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
         } else {
             self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
         }
         let block_start = ip.is_multiple_of(BLOCK);
-        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(cur);
+        live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
         // post-conv and its state: fused single 2D dispatch for Layer 3 decode, span by span otherwise.
@@ -3835,42 +5839,81 @@ impl Engine {
             for (si, sp) in spans.iter().enumerate() {
                 let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
                 sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                let cv = ConvBArgs { y_off: b.wo_y + q0, ldy: es, res_off: vo(cur) + q0, out_off: vo(mid) + q0, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
-                                     convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
+                let cv = ConvBArgs {
+                    y_off: b.wo_y + q0,
+                    ldy: es,
+                    res_off: vo(cur) + q0,
+                    out_off: vo(mid) + q0,
+                    cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                    convw_off: l.attn_post_conv,
+                    has_res: (!block_start) as u32,
+                    pad: 0,
+                };
                 self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
             }
             e.barrier();
             if !dry_state {
                 for (si, sp) in spans.iter().enumerate() {
                     sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                    let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                    let su = StateArgs {
+                        x_off: b.wo_y + (row0[si] * E) as u32,
+                        ldx: es,
+                        cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                        nch: es,
+                        t: sp.t as u32,
+                        pad: [0; 3],
+                    };
                     self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
                     self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
                 }
                 e.barrier();
             }
         }
-        if block_start { blocks.push(cur); }
+        if block_start {
+            blocks.push(cur);
+        }
         // ---- FFN input
-        let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect(); st.push(sh(vo(mid), E));
+        let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect();
+        st.push(sh(vo(mid), E));
         let x = if let Some(lw) = ctl {
             let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[b.fin], &[], es);
-            if self.hgemm { jf.hcopy[0][0] = b.cath[3] as i32; } else { jf.ncopy[0][0] = b.cat_u[3] as i32; }
+            if self.hgemm {
+                jf.hcopy[0][0] = b.cath[3] as i32;
+            } else {
+                jf.ncopy[0][0] = b.cat_u[3] as i32;
+            }
             self.mix_t(e, C_MIXF, &[jf], t);
             let ho: Vec<(u32, bool)> = if self.hgemm { vec![(b.fh, rth)] } else { vec![] };
             self.ctrl_b(e, lw, &[(3, b.fin, b.msg[3], b.finc, l.ffn_norm)], t, &ho);
             b.finc
         } else {
             let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[sh(b.fin, E)], &[l.ffn_norm as i32], es);
-            if self.hgemm { jf.hout[0] = sh(b.fh, E / 2) as i32; jf.nof32 = rth as u32; }
+            if self.hgemm {
+                jf.hout[0] = sh(b.fh, E / 2) as i32;
+                jf.nof32 = rth as u32;
+            }
             self.mix_t(e, C_MIXF, &[jf], n);
             b.fin
         };
         // ---- router + top-k + expert grouping
-        let rs = GSeg { w_lo: l.router, w_hi: 0, row_bytes: es * 2, wtype: T_BF16, nrows: NEXP as u32, k: es, in_off: sh(x, E), out_off: b.rlog,
-                        ldo: NEXP as u32, wsrc: 1, ..Default::default() };
-        if rth { self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
-        else { self.gemm(e, C_ROUTER, &[rs], n); }
+        let rs = GSeg {
+            w_lo: l.router,
+            w_hi: 0,
+            row_bytes: es * 2,
+            wtype: T_BF16,
+            nrows: NEXP as u32,
+            k: es,
+            in_off: sh(x, E),
+            out_off: b.rlog,
+            ldo: NEXP as u32,
+            wsrc: 1,
+            ..Default::default()
+        };
+        if rth {
+            self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n);
+        } else {
+            self.gemm(e, C_ROUTER, &[rs], n);
+        }
         let tile = 32usize;
         if use_fused_topk_route3(self.hgemm, n) {
             let tra = TopkRoute3Args {
@@ -3890,23 +5933,65 @@ impl Engine {
             };
             self.go(e, C_TOPK, "k_moe_topk_route3", &tra, (1, 1, 1), 1024);
         } else {
-            let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
+            let ta = TopkBArgs {
+                logits_off: b.rlog,
+                bias_off: l.exp_bias,
+                sel_off: b.sel,
+                t: nn_,
+                wscale: self.wscale,
+                pad: [0; 3],
+            };
             self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
             if self.hgemm {
-                let ra = Route3Args { sel_off: b.sel, t: nn_, perm_off: b.perm, inv_off: b.inv, aw_off: b.aw, ind_off: b.ind, gu_y: (FF / 32) as u32,
-                                      dn_y: (E / 64) as u32, tiles_off: b.tl, pad: [0; 2] };
+                let ra = Route3Args {
+                    sel_off: b.sel,
+                    t: nn_,
+                    perm_off: b.perm,
+                    inv_off: b.inv,
+                    aw_off: b.aw,
+                    ind_off: b.ind,
+                    gu_y: (FF / 32) as u32,
+                    dn_y: (E / 64) as u32,
+                    tiles_off: b.tl,
+                    pad: [0; 2],
+                };
                 self.go(e, C_TOPK, "k_moe_route3", &ra, (1, 1, 1), 1024);
             } else {
-                let ra = RouteArgs { sel_off: b.sel, t: tt, perm_off: b.perm, inv_off: b.inv, tiles_off: b.tiles, ntiles_off: b.ntiles, tile: tile as u32, pad: 0 };
+                let ra = RouteArgs {
+                    sel_off: b.sel,
+                    t: tt,
+                    perm_off: b.perm,
+                    inv_off: b.inv,
+                    tiles_off: b.tiles,
+                    ntiles_off: b.ntiles,
+                    tile: tile as u32,
+                    pad: 0,
+                };
                 self.go(e, C_ROUTER, "k_moe_route", &ra, (1, 1, 1), 1024);
             }
         }
         let max_tiles = (t * TOPK).div_ceil(tile) + NEXP;
         let gu = MoeGemmArgs {
-            w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
-            wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, x_off: x, gather: 1, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.act, ldo: FF as u32, situ: 1, pad: 0, beta: self.situ_beta, lbeta: self.situ_lbeta,
-            gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32,
+            w_lo: l.gu.off as u32,
+            w_hi: (l.gu.off >> 32) as u32,
+            expert_bytes: l.gu.expert_bytes as u32,
+            row_bytes: l.gu.row_bytes,
+            wtype: l.gu.ty,
+            nrows: (2 * FF) as u32,
+            k: es,
+            x_off: x,
+            gather: 1,
+            perm_off: b.perm,
+            tiles_off: b.tiles,
+            ntiles_off: b.ntiles,
+            out_off: b.act,
+            ldo: FF as u32,
+            situ: 1,
+            pad: 0,
+            beta: self.situ_beta,
+            lbeta: self.situ_lbeta,
+            gs_lo: l.gu.gs as u32,
+            gs_hi: (l.gu.gs >> 32) as u32,
         };
         let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
         if self.hgemm {
@@ -3919,12 +6004,29 @@ impl Engine {
             if self.skip.get() & (1 << C_GU) == 0 {
                 for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
                     let g = MoeGemmHArgs {
-                        w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
-                        wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.acth, ldo: FF as u32, situ: 1, aw_off: b.aw, beta: self.situ_beta, lbeta: self.situ_lbeta,
-                        gs_lo: l.gu.gs as u32, gs_hi: (l.gu.gs >> 32) as u32, pad0: 0, pad1: 0,
+                        w_lo: l.gu.off as u32,
+                        w_hi: (l.gu.off >> 32) as u32,
+                        expert_bytes: l.gu.expert_bytes as u32,
+                        row_bytes: l.gu.row_bytes,
+                        wtype: l.gu.ty,
+                        nrows: (2 * FF) as u32,
+                        k: es,
+                        xh_off: b.xgh,
+                        tiles_off: b.tl[c],
+                        ntiles_off: b.ind + (c * 4) as u32,
+                        out_off: b.acth,
+                        ldo: FF as u32,
+                        situ: 1,
+                        aw_off: b.aw,
+                        beta: self.situ_beta,
+                        lbeta: self.situ_lbeta,
+                        gs_lo: l.gu.gs as u32,
+                        gs_hi: (l.gu.gs >> 32) as u32,
+                        pad0: 0,
+                        pad1: 0,
                     };
-                    e.pso(&self.gpu.pso(name)); e.bytes(&g, 5);
+                    e.pso(&self.gpu.pso(name));
+                    e.bytes(&g, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
                 }
                 e.barrier();
@@ -3932,30 +6034,68 @@ impl Engine {
             if self.skip.get() & (1 << C_DOWN) == 0 {
                 for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
                     let d = MoeGemmHArgs {
-                        w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
-                        wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.yd, ldo: es, situ: 0, aw_off: 0, beta: 0.0, lbeta: 0.0,
-                        gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
+                        w_lo: l.dn.off as u32,
+                        w_hi: (l.dn.off >> 32) as u32,
+                        expert_bytes: l.dn.expert_bytes as u32,
+                        row_bytes: l.dn.row_bytes,
+                        wtype: l.dn.ty,
+                        nrows: es,
+                        k: FF as u32,
+                        xh_off: b.acth,
+                        tiles_off: b.tl[c],
+                        ntiles_off: b.ind + (c * 4) as u32,
+                        out_off: b.yd,
+                        ldo: es,
+                        situ: 0,
+                        aw_off: 0,
+                        beta: 0.0,
+                        lbeta: 0.0,
+                        gs_lo: l.dn.gs as u32,
+                        gs_hi: (l.dn.gs >> 32) as u32,
+                        pad0: 0,
+                        pad1: 0,
                     };
-                    e.pso(&self.gpu.pso(name)); e.bytes(&d, 5);
+                    e.pso(&self.gpu.pso(name));
+                    e.bytes(&d, 5);
                     e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
                 }
                 e.barrier();
             }
         } else {
-        self.go(e, C_GU, mg, &gu, (FF / 32, max_tiles, 1), 128);
-        let dn = MoeGemmArgs {
-            w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
-            wtype: l.dn.ty, nrows: es, k: FF as u32, x_off: b.act, gather: 0, perm_off: b.perm, tiles_off: b.tiles, ntiles_off: b.ntiles,
-            out_off: b.yd, ldo: es, situ: 0, pad: 0, beta: 0.0, lbeta: 0.0,
-            gs_lo: l.dn.gs as u32, gs_hi: (l.dn.gs >> 32) as u32,
-        };
-        self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
+            self.go(e, C_GU, mg, &gu, (FF / 32, max_tiles, 1), 128);
+            let dn = MoeGemmArgs {
+                w_lo: l.dn.off as u32,
+                w_hi: (l.dn.off >> 32) as u32,
+                expert_bytes: l.dn.expert_bytes as u32,
+                row_bytes: l.dn.row_bytes,
+                wtype: l.dn.ty,
+                nrows: es,
+                k: FF as u32,
+                x_off: b.act,
+                gather: 0,
+                perm_off: b.perm,
+                tiles_off: b.tiles,
+                ntiles_off: b.ntiles,
+                out_off: b.yd,
+                ldo: es,
+                situ: 0,
+                pad: 0,
+                beta: 0.0,
+                lbeta: 0.0,
+                gs_lo: l.dn.gs as u32,
+                gs_hi: (l.dn.gs >> 32) as u32,
+            };
+            self.go(e, C_DOWN, mg, &dn, (E / 64, max_tiles, 1), 128);
         }
         let ca = MoeCombArgs { yd_off: b.yd, inv_off: b.inv, sel_off: b.sel, out_off: sh(b.ffn_y, E) };
-        if self.hgemm { self.go(e, C_COMB2, "k_moe_comb_h", &ca, (n, E.div_ceil(1024), 1), 256); }
-        else { self.go(e, C_DOWN, "k_moe_comb_b", &ca, (E / 256, t, 1), 256); }
-        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        if self.hgemm {
+            self.go(e, C_COMB2, "k_moe_comb_h", &ca, (n, E.div_ceil(1024), 1), 256);
+        } else {
+            self.go(e, C_DOWN, "k_moe_comb_b", &ca, (E / 256, t, 1), 256);
+        }
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(mid);
+        live.extend_from_slice(pinned);
         let out = va.alloc(&live);
         if let Some(dm) = dec_meta {
             debug_assert!(ts == 0 && !self.verify_record.get());
@@ -3974,15 +6114,30 @@ impl Engine {
             for (si, sp) in spans.iter().enumerate() {
                 let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
                 sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                let cv = ConvBArgs { y_off: b.ffn_y + q0, ldy: es, res_off: vo(mid) + q0, out_off: vo(out) + q0, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                                     convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
+                let cv = ConvBArgs {
+                    y_off: b.ffn_y + q0,
+                    ldy: es,
+                    res_off: vo(mid) + q0,
+                    out_off: vo(out) + q0,
+                    cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                    convw_off: l.ffn_post_conv,
+                    has_res: 1,
+                    pad: 0,
+                };
                 self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
             }
             e.barrier();
             if !dry_state {
                 for (si, sp) in spans.iter().enumerate() {
                     sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                    let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                    let su = StateArgs {
+                        x_off: b.ffn_y + (row0[si] * E) as u32,
+                        ldx: es,
+                        cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                        nch: es,
+                        t: sp.t as u32,
+                        pad: [0; 3],
+                    };
                     self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
                     self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
                 }
@@ -3991,7 +6146,6 @@ impl Engine {
         }
         out
     }
-
 }
 
 /// The engine working on one lane: every method that reads or writes a stream's state (its K/V cache, convolution
@@ -4011,7 +6165,13 @@ impl<'a> Run<'a> {
         ((i * 2 * NKV * cap * HD) as u32, ((i * 2 + 1) * NKV * cap * HD) as u32, cap as u32)
     }
     /// bind the K/V buffer a layer's kernels address through buffer 3
-    fn bind_kv(&self, e: &Enc, swa: bool) { if swa { e.buf(&self.lane.kv_swa.borrow(), 0, 3); } else { e.buf(&self.lane.kv_full.borrow(), 0, 3); } }
+    fn bind_kv(&self, e: &Enc, swa: bool) {
+        if swa {
+            e.buf(&self.lane.kv_swa.borrow(), 0, 3);
+        } else {
+            e.buf(&self.lane.kv_full.borrow(), 0, 3);
+        }
+    }
     /// positions the K/V cache can hold right now
     pub fn kv_capacity(&self) -> usize {
         if self.lane.use_blocks.get() {
@@ -4024,35 +6184,57 @@ impl<'a> Run<'a> {
     }
     /// first position a generation loop must call `gen_reserve` for (with an idle GPU) before it may run that step
     pub fn gen_capacity(&self) -> usize {
-        match &self.lane.tier { Some(t) if t.on.get() => t.next.get(), Some(t) => self.kv_capacity().min(t.min_n), None => self.kv_capacity() }
+        match &self.lane.tier {
+            Some(t) if t.on.get() => t.next.get(),
+            Some(t) => self.kv_capacity().min(t.min_n),
+            None => self.kv_capacity(),
+        }
     }
     /// bytes of K/V cache held in memory (with the disk tier: the hot rings and the read staging)
     pub fn kv_bytes(&self) -> usize {
-        self.lane.kv_swa.borrow().length() + self.lane.kv_full.borrow().length() + self.lane.tier.as_ref().map_or(0, |t| if t.on.get() { t.stg.borrow().length() } else { 0 })
+        self.lane.kv_swa.borrow().length()
+            + self.lane.kv_full.borrow().length()
+            + self.lane.tier.as_ref().map_or(0, |t| if t.on.get() { t.stg.borrow().length() } else { 0 })
     }
     /// Make room for `n` positions in the K/V cache (no-op if they fit). Nothing may be in flight on the GPU.
     /// Sliding-window layers keep one window (their ring is linear until the context reaches it, so it can grow like the
     /// full-attention rows); `headroom` adds slack for the tokens about to be generated so growth stays rare.
     pub fn reserve(&self, n: usize, headroom: bool) {
         assert!(n <= self.max_ctx, "context full ({} tokens)", self.max_ctx);
-        if self.lane.use_blocks.get() { return; }
-        let grow = |buf: &std::cell::RefCell<Buf>, capc: &std::cell::Cell<usize>, need: usize, limit: usize, nslots: usize| {
-            let old = capc.get();
-            if need <= old { return; }
-            // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
-            let (hd, hm) = std::env::var("INK_HEADROOM").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))).unwrap_or((16, 0));
-            let want = if headroom { need + (need / hd).max(hm) } else { need };
-            let cap = (want.div_ceil(64) * 64).min(limit);
-            let eb = self.kvb;
-            let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
-            // every (slot, K|V, group) row block moves to its place in the larger layout
-            unsafe {
-                let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for blk in 0..nslots * 2 * NKV { std::ptr::copy_nonoverlapping(src.add(blk * old * HD * eb), dst.add(blk * cap * HD * eb), old * HD * eb); }
-            }
-            *buf.borrow_mut() = nb;
-            capc.set(cap);
-        };
+        if self.lane.use_blocks.get() {
+            return;
+        }
+        let grow =
+            |buf: &std::cell::RefCell<Buf>, capc: &std::cell::Cell<usize>, need: usize, limit: usize, nslots: usize| {
+                let old = capc.get();
+                if need <= old {
+                    return;
+                }
+                // slack for the tokens about to be generated: INK_HEADROOM=a,b -> need/a (at least b positions)
+                let (hd, hm) = std::env::var("INK_HEADROOM")
+                    .ok()
+                    .and_then(|v| {
+                        v.split_once(',').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))
+                    })
+                    .unwrap_or((16, 0));
+                let want = if headroom { need + (need / hd).max(hm) } else { need };
+                let cap = (want.div_ceil(64) * 64).min(limit);
+                let eb = self.kvb;
+                let nb = self.gpu.buffer(nslots * 2 * NKV * cap * HD * eb);
+                // every (slot, K|V, group) row block moves to its place in the larger layout
+                unsafe {
+                    let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
+                    for blk in 0..nslots * 2 * NKV {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(blk * old * HD * eb),
+                            dst.add(blk * cap * HD * eb),
+                            old * HD * eb,
+                        );
+                    }
+                }
+                *buf.borrow_mut() = nb;
+                capc.set(cap);
+            };
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         grow(&self.lane.kv_swa, &self.lane.swa_cap, n.min(EXT), EXT, n_swa);
         grow(&self.lane.kv_full, &self.lane.full_cap, n, self.max_ctx, N_SLOT - n_swa);
@@ -4068,22 +6250,46 @@ impl<'a> Run<'a> {
         self.bind(&e);
         // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
         let b = self.ba.get();
-        let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
-                             kpos0: 0, to_ring: 0, pad: [0; 2] };
-        e.pso(&self.gpu.pso("k_kvcopy")); e.bytes(&a, 5);
-        self.bind_kv(&e, true); e.dispatch((1, 1, 1), 32);
+        let a = KvCopyArgs {
+            n: 1,
+            pos0: 0,
+            ring_k: 0,
+            ring_v: 0,
+            cap: 64,
+            sk_off: b.sk,
+            sv_off: b.sv,
+            scap: (EXT + b.cap + 2 * KGUARD) as u32,
+            kpos0: 0,
+            to_ring: 0,
+            pad: [0; 2],
+        };
+        e.pso(&self.gpu.pso("k_kvcopy"));
+        e.bytes(&a, 5);
+        self.bind_kv(&e, true);
+        e.dispatch((1, 1, 1), 32);
         e.barrier();
-        self.bind_kv(&e, false); e.dispatch((1, 1, 1), 32);
-        e.end(); cb.commit(); cb.waitUntilCompleted();
+        self.bind_kv(&e, false);
+        e.dispatch((1, 1, 1), 32);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
     }
     /// bytes of GPU working memory besides the weights: (K/V cache, activations incl. the batch arena if allocated)
-    pub fn mem(&self) -> (usize, usize) { (self.kv_bytes(), self.act.borrow().length()) }
+    pub fn mem(&self) -> (usize, usize) {
+        (self.kv_bytes(), self.act.borrow().length())
+    }
 
     // ======================================================================== disk tier of the K/V cache (--kv-disk)
-    pub fn tier_on(&self) -> bool { self.lane.tier.as_ref().is_some_and(|t| t.on.get()) }
+    pub fn tier_on(&self) -> bool {
+        self.lane.tier.as_ref().is_some_and(|t| t.on.get())
+    }
     fn kind_bufs(&self, kind: usize) -> (&RefCell<Buf>, &Cell<usize>, usize) {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        if kind == 0 { (&self.lane.kv_swa, &self.lane.swa_cap, n_swa) } else { (&self.lane.kv_full, &self.lane.full_cap, N_SLOT - n_swa) }
+        if kind == 0 {
+            (&self.lane.kv_swa, &self.lane.swa_cap, n_swa)
+        } else {
+            (&self.lane.kv_full, &self.lane.full_cap, N_SLOT - n_swa)
+        }
     }
     /// what the cache would hold in memory for `n` positions without the tier, bytes
     pub fn kv_exact_bytes(&self, n: usize) -> usize {
@@ -4093,18 +6299,24 @@ impl<'a> Run<'a> {
     /// bytes of the cache that are on disk only (read back for every token)
     pub fn kv_disk_bytes(&self, n: usize) -> usize {
         let Some(t) = &self.lane.tier else { return 0 };
-        if !t.on.get() { return 0; }
+        if !t.on.get() {
+            return 0;
+        }
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         let cold = |kind: usize, w0: usize| t.lo[kind].get().saturating_sub(w0);
         (n_swa * cold(0, n.saturating_sub(EXT)) + (N_SLOT - n_swa) * cold(1, 0)) * REC
     }
     /// (bytes read from the K/V file, time spent reading) since the engine was loaded
-    pub fn tier_io(&self) -> (u64, std::time::Duration) { self.lane.tier.as_ref().map_or((0, Default::default()), |t| (t.read_bytes.get(), t.read_time.get())) }
+    pub fn tier_io(&self) -> (u64, std::time::Duration) {
+        self.lane.tier.as_ref().map_or((0, Default::default()), |t| (t.read_bytes.get(), t.read_time.get()))
+    }
     /// hot ring sizes (positions) and staging bytes for a context of `n` positions: together at most half of what the
     /// cache would take in memory
     fn tier_targets(&self, n: usize) -> (usize, usize, usize) {
         // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
-        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
+        if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return (h, h, 2 << 20);
+        }
         let c = self.kv_exact_bytes(n);
         // staging: two halves, each at least one split of the longest attention (see `step`),
         // and each hot ring at least `kps + 64` so a split boundary always lies in the shared overlap (`b <= pos - 32`).
@@ -4135,22 +6347,54 @@ impl<'a> Run<'a> {
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
         let mut v = Vec::new();
         let mut p = a;
-        while p < b { let e = if kind == 0 { b.min((p / EXT + 1) * EXT) } else { b }; v.push((self.tier_foff(kind, i, p), e - p)); p = e; }
+        while p < b {
+            let e = if kind == 0 { b.min((p / EXT + 1) * EXT) } else { b };
+            v.push((self.tier_foff(kind, i, p), e - p));
+            p = e;
+        }
         v
     }
     /// copy one position (16 rows of 128 fp16) between two cache buffers / between a cache buffer and a file record
-    unsafe fn rows_copy(src: *const u8, i: usize, cap_s: usize, idx_s: usize, dst: *mut u8, cap_d: usize, idx_d: usize) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap_s + idx_s) * HD * 2), dst.add(((i * 2 * NKV + r) * cap_d + idx_d) * HD * 2), HD * 2); }
+    unsafe fn rows_copy(
+        src: *const u8,
+        i: usize,
+        cap_s: usize,
+        idx_s: usize,
+        dst: *mut u8,
+        cap_d: usize,
+        idx_d: usize,
+    ) {
+        for r in 0..2 * NKV {
+            std::ptr::copy_nonoverlapping(
+                src.add(((i * 2 * NKV + r) * cap_s + idx_s) * HD * 2),
+                dst.add(((i * 2 * NKV + r) * cap_d + idx_d) * HD * 2),
+                HD * 2,
+            );
+        }
     }
     unsafe fn rows_to_rec(src: *const u8, i: usize, cap: usize, idx: usize, rec: *mut u8) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(src.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), rec.add(r * HD * 2), HD * 2); }
+        for r in 0..2 * NKV {
+            std::ptr::copy_nonoverlapping(
+                src.add(((i * 2 * NKV + r) * cap + idx) * HD * 2),
+                rec.add(r * HD * 2),
+                HD * 2,
+            );
+        }
     }
     unsafe fn rec_to_rows(rec: *const u8, dst: *mut u8, i: usize, cap: usize, idx: usize) {
-        for r in 0..2 * NKV { std::ptr::copy_nonoverlapping(rec.add(r * HD * 2), dst.add(((i * 2 * NKV + r) * cap + idx) * HD * 2), HD * 2); }
+        for r in 0..2 * NKV {
+            std::ptr::copy_nonoverlapping(
+                rec.add(r * HD * 2),
+                dst.add(((i * 2 * NKV + r) * cap + idx) * HD * 2),
+                HD * 2,
+            );
+        }
     }
     /// write positions [a, b) of every slot of a kind to the file; `idx(p)` is where position p sits in the kind's buffer now
     fn tier_write(&self, kind: usize, a: usize, b: usize, idx: impl Fn(usize) -> usize) {
-        if a >= b { return; }
+        if a >= b {
+            return;
+        }
         let t = self.lane.tier.as_ref().unwrap();
         let (buf, capc, nsl) = self.kind_bufs(kind);
         let (src, cap) = (buf.borrow().contents().as_ptr() as *const u8, capc.get());
@@ -4159,9 +6403,16 @@ impl<'a> Run<'a> {
             let mut p = a;
             while p < b {
                 let e = b.min(p + 2048);
-                for q in p..e { unsafe { Self::rows_to_rec(src, i, cap, idx(q), recs.as_mut_ptr().add((q - p) * REC)); } }
+                for q in p..e {
+                    unsafe {
+                        Self::rows_to_rec(src, i, cap, idx(q), recs.as_mut_ptr().add((q - p) * REC));
+                    }
+                }
                 let mut o = 0;
-                for (off, n) in self.tier_pieces(kind, i, p, e) { t.file.write_all_at(&recs[o..o + n * REC], off).expect("write the K/V file"); o += n * REC; }
+                for (off, n) in self.tier_pieces(kind, i, p, e) {
+                    t.file.write_all_at(&recs[o..o + n * REC], off).expect("write the K/V file");
+                    o += n * REC;
+                }
                 p = e;
             }
         }
@@ -4170,12 +6421,17 @@ impl<'a> Run<'a> {
     fn tier_read(&self, jobs: &[(u64, usize, *mut u8)]) {
         let t = self.lane.tier.as_ref().unwrap();
         let t0 = std::time::Instant::now();
-        let piece: usize = std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4) << 20;
+        let piece: usize =
+            std::env::var("INK_TIER_PIECE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4) << 20;
         let nthreads: usize = std::env::var("INK_TIER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
-        let mut parts: Vec<(u64, usize, usize)> = Vec::new();        // (file offset, bytes, destination address)
+        let mut parts: Vec<(u64, usize, usize)> = Vec::new(); // (file offset, bytes, destination address)
         for &(off, bytes, dst) in jobs {
             let mut o = 0;
-            while o < bytes { let n = (bytes - o).min(piece); parts.push((off + o as u64, n, dst as usize + o)); o += n; }
+            while o < bytes {
+                let n = (bytes - o).min(piece);
+                parts.push((off + o as u64, n, dst as usize + o));
+                o += n;
+            }
         }
         let total: usize = parts.iter().map(|p| p.1).sum();
         let file = &t.file;
@@ -4183,15 +6439,18 @@ impl<'a> Run<'a> {
             let sl = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, n) };
             file.read_exact_at(sl, off).expect("read the K/V file");
         };
-        if parts.len() <= 1 { parts.iter().for_each(read); }
-        else {
+        if parts.len() <= 1 {
+            parts.iter().for_each(read);
+        } else {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let (parts, next, read) = (&parts, &next, &read);
             std::thread::scope(|sc| {
                 for _ in 0..parts.len().min(nthreads) {
                     sc.spawn(move || loop {
                         let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if k >= parts.len() { break; }
+                        if k >= parts.len() {
+                            break;
+                        }
                         read(&parts[k]);
                     });
                 }
@@ -4202,12 +6461,18 @@ impl<'a> Run<'a> {
     }
     fn tier_wait(&self) {
         let t = self.lane.tier.as_ref().unwrap();
-        for p in t.pending.borrow_mut().iter_mut() { if let Some(cb) = p.take() { cb.waitUntilCompleted(); } }
+        for p in t.pending.borrow_mut().iter_mut() {
+            if let Some(cb) = p.take() {
+                cb.waitUntilCompleted();
+            }
+        }
     }
     /// Start keeping only the newest positions in memory: `n` positions are cached, in the normal layout. GPU idle.
     fn tier_enter(&self, n: usize) {
         let t = self.lane.tier.as_ref().unwrap();
-        if t.on.get() || n < t.min_n { return; }
+        if t.on.get() || n < t.min_n {
+            return;
+        }
         let (hs, hf, s) = self.tier_targets(n);
         for (kind, h) in [(0usize, hs), (1usize, hf)] {
             let (buf, capc, nsl) = self.kind_bufs(kind);
@@ -4222,27 +6487,39 @@ impl<'a> Run<'a> {
             let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
             unsafe {
                 let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for i in 0..nsl { for p in lo.max(first)..n { Self::rows_copy(src, i, old_cap, idx_old(p), dst, h, p % h); } }
+                for i in 0..nsl {
+                    for p in lo.max(first)..n {
+                        Self::rows_copy(src, i, old_cap, idx_old(p), dst, h, p % h);
+                    }
+                }
             }
             *buf.borrow_mut() = nb;
             capc.set(h);
-            t.lo[kind].set(lo); t.cold[kind].set(cold);
+            t.lo[kind].set(lo);
+            t.cold[kind].set(cold);
         }
         *t.stg.borrow_mut() = self.gpu.buffer(s);
-        t.half.set(0); t.loaded.set(usize::MAX);
+        t.half.set(0);
+        t.loaded.set(usize::MAX);
         t.on.set(true);
         t.next.set(n + 64);
     }
     /// Bring the whole cache back into memory in the normal layout (a prefill attends through it directly). GPU idle.
     pub fn tier_leave(&self, n: usize) {
         let Some(t) = &self.lane.tier else { return };
-        if !t.on.get() { return; }
+        if !t.on.get() {
+            return;
+        }
         self.tier_wait();
         for kind in 0..2 {
             let (buf, capc, nsl) = self.kind_bufs(kind);
             let (h, lo) = (capc.get(), t.lo[kind].get());
             let first = if kind == 0 { n.saturating_sub(EXT) } else { 0 };
-            let cap = if kind == 0 { (n.min(EXT).div_ceil(64) * 64).clamp(KV_CAP0, EXT) } else { (n.div_ceil(64) * 64).clamp(KV_CAP0, self.max_ctx) };
+            let cap = if kind == 0 {
+                (n.min(EXT).div_ceil(64) * 64).clamp(KV_CAP0, EXT)
+            } else {
+                (n.div_ceil(64) * 64).clamp(KV_CAP0, self.max_ctx)
+            };
             let idx_new = |p: usize| if kind == 0 { p % cap } else { p };
             let nb = self.gpu.buffer(nsl * 2 * NKV * cap * HD * 2);
             let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
@@ -4255,12 +6532,23 @@ impl<'a> Run<'a> {
                     let e = cold_end.min(p + 2048);
                     let mut o = 0;
                     let mut jobs: Vec<(u64, usize, *mut u8)> = Vec::new();
-                    for (off, k) in self.tier_pieces(kind, i, p, e) { jobs.push((off, k * REC, unsafe { rp.add(o) })); o += k * REC; }
+                    for (off, k) in self.tier_pieces(kind, i, p, e) {
+                        jobs.push((off, k * REC, unsafe { rp.add(o) }));
+                        o += k * REC;
+                    }
                     self.tier_read(&jobs);
-                    for q in p..e { unsafe { Self::rec_to_rows(rp.add((q - p) * REC), dst, i, cap, idx_new(q)); } }
+                    for q in p..e {
+                        unsafe {
+                            Self::rec_to_rows(rp.add((q - p) * REC), dst, i, cap, idx_new(q));
+                        }
+                    }
                     p = e;
                 }
-                for q in cold_end..n { unsafe { Self::rows_copy(src, i, h, q % h, dst, cap, idx_new(q)); } }
+                for q in cold_end..n {
+                    unsafe {
+                        Self::rows_copy(src, i, h, q % h, dst, cap, idx_new(q));
+                    }
+                }
             }
             drop(recs);
             *buf.borrow_mut() = nb;
@@ -4272,8 +6560,11 @@ impl<'a> Run<'a> {
     /// forget the cache (a new session)
     fn tier_reset(&self) {
         let Some(t) = &self.lane.tier else { return };
-        t.filed[0].set(0); t.filed[1].set(0);
-        if !t.on.get() { return; }
+        t.filed[0].set(0);
+        t.filed[1].set(0);
+        if !t.on.get() {
+            return;
+        }
         self.tier_wait();
         for kind in 0..2 {
             let (buf, capc, nsl) = self.kind_bufs(kind);
@@ -4285,25 +6576,42 @@ impl<'a> Run<'a> {
     }
     /// Make room for the step at `pos` (positions 0..pos are cached). Nothing may be in flight on the GPU.
     pub fn gen_reserve(&self, pos: usize) {
-        let Some(t) = &self.lane.tier else { self.reserve(pos + 1, true); return };
-        if !t.on.get() { self.tier_enter(pos); }
-        if !t.on.get() { self.reserve(pos + 1, true); return; }
+        let Some(t) = &self.lane.tier else {
+            self.reserve(pos + 1, true);
+            return;
+        };
+        if !t.on.get() {
+            self.tier_enter(pos);
+        }
+        if !t.on.get() {
+            self.reserve(pos + 1, true);
+            return;
+        }
         // the hot rings follow the context so memory stays at half of the cache
         self.tier_wait();
         let (hs, hf, s) = self.tier_targets(pos + 1);
         for (kind, h) in [(0usize, hs), (1usize, hf)] {
             let (buf, capc, nsl) = self.kind_bufs(kind);
             let cap = capc.get();
-            if h < cap + 64 { continue; }
+            if h < cap + 64 {
+                continue;
+            }
             let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
             unsafe {
                 let (src, dst) = (buf.borrow().contents().as_ptr() as *const u8, nb.contents().as_ptr() as *mut u8);
-                for i in 0..nsl { for p in t.lo[kind].get()..pos { Self::rows_copy(src, i, cap, p % cap, dst, h, p % h); } }
+                for i in 0..nsl {
+                    for p in t.lo[kind].get()..pos {
+                        Self::rows_copy(src, i, cap, p % cap, dst, h, p % h);
+                    }
+                }
             }
             *buf.borrow_mut() = nb;
             capc.set(h);
         }
-        if s > t.stg.borrow().length() { *t.stg.borrow_mut() = self.gpu.buffer(s); t.half.set(0); }
+        if s > t.stg.borrow().length() {
+            *t.stg.borrow_mut() = self.gpu.buffer(s);
+            t.half.set(0);
+        }
         t.next.set(pos + 64);
     }
     /// Commit one decode step. Tiered decoding can submit several command buffers per step.
@@ -4341,7 +6649,11 @@ impl<'a> Run<'a> {
         let (mut plan, mut execs) = (Vec::new(), Vec::new());
         let (mut round, mut room) = (0usize, half_recs);
         let mut order: Vec<usize> = (0..LOOP_START).collect();
-        for pass in 0..N_PASS { for ip in LOOP_START..LOOP_END { order.push(slot_of(pass, ip)); } }
+        for pass in 0..N_PASS {
+            for ip in LOOP_START..LOOP_END {
+                order.push(slot_of(pass, ip));
+            }
+        }
         order.extend(LOOP_END..N_PHYS);
         for (exec, &slot) in order.iter().enumerate() {
             let (swa, i) = self.slot_kind[slot];
@@ -4355,14 +6667,29 @@ impl<'a> Run<'a> {
                 while sp < sp_end {
                     let next_boundary = (c / kps + 1) * kps;
                     let first_len = next_boundary - c;
-                    if room < first_len { round += 1; room = half_recs; }
+                    if room < first_len {
+                        round += 1;
+                        room = half_recs;
+                    }
                     let mut ns = 1usize;
                     let mut c1 = next_boundary;
                     while sp + ns < sp_end && (c1 - c) + kps <= room {
                         c1 += kps;
                         ns += 1;
                     }
-                    plan.push(Chunk { exec, kind, i, c0: c, c1, round, off: (half_recs - room) * REC, sp0: sp, ns, kps, rel_split: false });
+                    plan.push(Chunk {
+                        exec,
+                        kind,
+                        i,
+                        c0: c,
+                        c1,
+                        round,
+                        off: (half_recs - room) * REC,
+                        sp0: sp,
+                        ns,
+                        kps,
+                        rel_split: false,
+                    });
                     room -= c1 - c;
                     c = c1;
                     sp += ns;
@@ -4372,15 +6699,37 @@ impl<'a> Run<'a> {
             } else {
                 // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
                 // keys, summed in a different grouping
-                if lo > w0 && !t.unaligned.replace(true) { eprintln!("[inky] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path"); }
-                let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+                if lo > w0 && !t.unaligned.replace(true) {
+                    eprintln!("[inky] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path");
+                }
+                let spl = |nk: usize| {
+                    let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target());
+                    (kps, nk.div_ceil(kps))
+                };
                 let (mut c, mut sp) = (w0, 0usize);
                 while c < lo {
-                    if room < (lo - c).min(64) { round += 1; room = half_recs; }
+                    if room < (lo - c).min(64) {
+                        round += 1;
+                        room = half_recs;
+                    }
                     let n = room.min(lo - c);
                     let (kps, ns) = spl(n);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps, rel_split: true });
-                    c += n; sp += ns; room -= n;
+                    plan.push(Chunk {
+                        exec,
+                        kind,
+                        i,
+                        c0: c,
+                        c1: c + n,
+                        round,
+                        off: (half_recs - room) * REC,
+                        sp0: sp,
+                        ns,
+                        kps,
+                        rel_split: true,
+                    });
+                    c += n;
+                    sp += ns;
+                    room -= n;
                 }
                 let (kps, ns) = spl(pos + 1 - lo);
                 assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
@@ -4407,7 +6756,9 @@ impl<'a> Run<'a> {
         let t = self.lane.tier.as_ref().unwrap();
         let plan = t.plan.borrow();
         let round = plan[k].round;
-        if t.loaded.get() == round { return; }
+        if t.loaded.get() == round {
+            return;
+        }
         if round > 0 {
             // hand the commands written so far to the GPU; they keep reading the half we are leaving
             let ncb = self.gpu.cmd();
@@ -4424,13 +6775,18 @@ impl<'a> Run<'a> {
         // whatever last used this half must be finished before it is overwritten
         let h = t.half.get();
         let prev = t.pending.borrow_mut()[h].take();
-        if let Some(cb) = prev { cb.waitUntilCompleted(); }
+        if let Some(cb) = prev {
+            cb.waitUntilCompleted();
+        }
         let stg = t.stg.borrow();
         let base = unsafe { (stg.contents().as_ptr() as *mut u8).add(h * (stg.length() / 2)) };
         let mut jobs = Vec::new();
         for c in plan.iter().filter(|c| c.round == round) {
             let mut o = c.off;
-            for (off, n) in self.tier_pieces(c.kind, c.i, c.c0, c.c1) { jobs.push((off, n * REC, unsafe { base.add(o) })); o += n * REC; }
+            for (off, n) in self.tier_pieces(c.kind, c.i, c.c0, c.c1) {
+                jobs.push((off, n * REC, unsafe { base.add(o) }));
+                o += n * REC;
+            }
         }
         self.tier_read(&jobs);
         t.loaded.set(round);
@@ -4438,17 +6794,21 @@ impl<'a> Run<'a> {
 
     /// conv state and sliding-window rings, to rerun the same decode steps
     pub fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
-        let g = |b: &Buf| unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()).to_vec() };
+        let g =
+            |b: &Buf| unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()).to_vec() };
         (self.get_cs(), g(&self.lane.kv_swa.borrow()))
     }
     pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
         let swa_dst_len = self.lane.kv_swa.borrow().length();
         let cs_dst_len = self.lane.with_cs_buf(|_, _, len| len);
-        validate_snapshot_lengths(s.0.len(), cs_dst_len, s.1.len(), swa_dst_len)
-            .unwrap_or_else(|e| panic!("{e}"));
+        validate_snapshot_lengths(s.0.len(), cs_dst_len, s.1.len(), swa_dst_len).unwrap_or_else(|e| panic!("{e}"));
         self.set_cs(&s.0);
         unsafe {
-            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8, swa_dst_len);
+            std::ptr::copy_nonoverlapping(
+                s.1.as_ptr(),
+                self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8,
+                swa_dst_len,
+            );
         }
     }
     /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received
@@ -4463,13 +6823,43 @@ impl<'a> Run<'a> {
         let rows = f + 1;
         let nf = self.slot_kind.iter().filter(|k| !k.0).count();
         let bag = self.gpu.buffer(nf * 2 * NKV * rows * HD * 2);
-        let lut: Vec<f32> = (0..65536u32).map(|h| { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else if e == 31 { 0.0 } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } }).collect();
-        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-            if v == 0.0 || exp <= 0 { sign } else { let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
-                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 }; if h >= 0x7c00 { h = 0x7bff; } sign | h as u16 } };
+        let lut: Vec<f32> = (0..65536u32)
+            .map(|h| {
+                let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+                let e = ((h >> 10) & 31) as i32;
+                let m = (h & 1023) as f32;
+                if e == 0 {
+                    sg * m * 2f32.powi(-24)
+                } else if e == 31 {
+                    0.0
+                } else {
+                    sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+                }
+            })
+            .collect();
+        let f2h = |v: f32| -> u16 {
+            let bits = v.to_bits();
+            let sign = ((bits >> 16) & 0x8000) as u16;
+            let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            if v == 0.0 || exp <= 0 {
+                sign
+            } else {
+                let mant = (bits >> 13) & 0x3ff;
+                let rem = bits & 0x1fff;
+                let mut h =
+                    ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 };
+                if h >= 0x7c00 {
+                    h = 0x7bff;
+                }
+                sign | h as u16
+            }
+        };
         let cap = self.lane.full_cap.get();
-        let (kvp, qp, bp) = (self.lane.kv_full.borrow().contents().as_ptr() as usize, qbuf.contents().as_ptr() as usize, bag.contents().as_ptr() as usize);
+        let (kvp, qp, bp) = (
+            self.lane.kv_full.borrow().contents().as_ptr() as usize,
+            qbuf.contents().as_ptr() as usize,
+            bag.contents().as_ptr() as usize,
+        );
         let per = ncap * (NH * HD / 2 + NH) * 4;
         // sampled query positions: spread over the context, denser at the end
         let mut qpos: Vec<usize> = (0..nq).map(|i| (n - 1) - i * (n - 1) / nq.max(1)).collect();
@@ -4478,53 +6868,116 @@ impl<'a> Run<'a> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (lut, qpos, tasks, f2h) = (&lut, &qpos, &tasks, &f2h);
         std::thread::scope(|sc| {
-            for _ in 0..8 { sc.spawn(|| loop {
-                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if k >= tasks.len() { break; }
-                let (fi, g) = tasks[k];
-                let row = |kv: usize, j: usize| unsafe { std::slice::from_raw_parts((kvp as *const u16).add(((fi * 2 + kv) * NKV + g) * cap * HD + j * HD), HD) };
-                let keys: Vec<f32> = (0..n).flat_map(|j| row(0, j).iter().map(|&h| lut[h as usize])).collect();
-                let mut imp = vec![0f32; n];
-                let mut sc_ = vec![0f32; n];
-                for &t in qpos.iter() { for hh in 0..3 {
-                    let h = g * 3 + hh;
-                    let q: Vec<f32> = unsafe { std::slice::from_raw_parts((qp + fi * per) as *const u16, ncap * NH * HD) }[(t * NH + h) * HD..(t * NH + h + 1) * HD].iter().map(|&x| lut[x as usize]).collect();
-                    let sink = unsafe { *((qp + fi * per + ncap * NH * HD * 2) as *const f32).add(t * NH + h) };
-                    let mut m = sink;
-                    for j in 0..=t {
-                        let kr = &keys[j * HD..(j + 1) * HD];
-                        let mut a = [0f32; 8];
-                        for c in (0..HD).step_by(8) { for u in 0..8 { a[u] += q[c + u] * kr[c + u]; } }
-                        let s = a.iter().sum::<f32>();
-                        sc_[j] = s; if s > m { m = s; }
+            for _ in 0..8 {
+                sc.spawn(|| loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= tasks.len() {
+                        break;
                     }
-                    let mut z = (sink - m).exp();
-                    for sc in sc_.iter_mut().take(t + 1) { *sc = (*sc - m).exp(); z += *sc; }
-                    match mode {
-                        "max" => for j in 0..=t { let p = sc_[j] / z; if p > imp[j] { imp[j] = p; } },
-                        // only what a key received while it was inside one window of the query / only from further away
-                        "near" => for j in t.saturating_sub(EXT - 1)..=t { imp[j] += sc_[j] / z; },
-                        "far" => for j in 0..=t.saturating_sub(EXT) { imp[j] += sc_[j] / z; },
-                        _ => for j in 0..=t { imp[j] += sc_[j] / z; },
+                    let (fi, g) = tasks[k];
+                    let row = |kv: usize, j: usize| unsafe {
+                        std::slice::from_raw_parts(
+                            (kvp as *const u16).add(((fi * 2 + kv) * NKV + g) * cap * HD + j * HD),
+                            HD,
+                        )
+                    };
+                    let keys: Vec<f32> = (0..n).flat_map(|j| row(0, j).iter().map(|&h| lut[h as usize])).collect();
+                    let mut imp = vec![0f32; n];
+                    let mut sc_ = vec![0f32; n];
+                    for &t in qpos.iter() {
+                        for hh in 0..3 {
+                            let h = g * 3 + hh;
+                            let q: Vec<f32> =
+                                unsafe { std::slice::from_raw_parts((qp + fi * per) as *const u16, ncap * NH * HD) }
+                                    [(t * NH + h) * HD..(t * NH + h + 1) * HD]
+                                    .iter()
+                                    .map(|&x| lut[x as usize])
+                                    .collect();
+                            let sink = unsafe { *((qp + fi * per + ncap * NH * HD * 2) as *const f32).add(t * NH + h) };
+                            let mut m = sink;
+                            for j in 0..=t {
+                                let kr = &keys[j * HD..(j + 1) * HD];
+                                let mut a = [0f32; 8];
+                                for c in (0..HD).step_by(8) {
+                                    for u in 0..8 {
+                                        a[u] += q[c + u] * kr[c + u];
+                                    }
+                                }
+                                let s = a.iter().sum::<f32>();
+                                sc_[j] = s;
+                                if s > m {
+                                    m = s;
+                                }
+                            }
+                            let mut z = (sink - m).exp();
+                            for sc in sc_.iter_mut().take(t + 1) {
+                                *sc = (*sc - m).exp();
+                                z += *sc;
+                            }
+                            match mode {
+                                "max" => {
+                                    for j in 0..=t {
+                                        let p = sc_[j] / z;
+                                        if p > imp[j] {
+                                            imp[j] = p;
+                                        }
+                                    }
+                                }
+                                // only what a key received while it was inside one window of the query / only from further away
+                                "near" => {
+                                    for j in t.saturating_sub(EXT - 1)..=t {
+                                        imp[j] += sc_[j] / z;
+                                    }
+                                }
+                                "far" => {
+                                    for j in 0..=t.saturating_sub(EXT) {
+                                        imp[j] += sc_[j] / z;
+                                    }
+                                }
+                                _ => {
+                                    for j in 0..=t {
+                                        imp[j] += sc_[j] / z;
+                                    }
+                                }
+                            }
+                        }
                     }
-                } }
-                if mode == "rand" { for (j, x) in imp.iter_mut().enumerate() { *x = ((j as u64 * 0x9E3779B97F4A7C15 + (k as u64) * 0xD1B54A32D192ED03) >> 40) as f32; } }
-                let mut order: Vec<usize> = (0..r0).collect();
-                order.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
-                let mut kept: Vec<usize> = order[..f].to_vec();
-                kept.sort();
-                let out = |kv: usize, r: usize| unsafe { std::slice::from_raw_parts_mut((bp as *mut u16).add(((fi * 2 + kv) * NKV + g) * rows * HD + r * HD), HD) };
-                for kv in 0..2 {
-                    for (r, &j) in kept.iter().enumerate() { out(kv, r).copy_from_slice(row(kv, j)); }
-                    let mut mean = vec![0f64; HD];
-                    for &j in &order[f..] { for (mm, &h) in mean.iter_mut().zip(row(kv, j)) { *mm += lut[h as usize] as f64; } }
-                    let cnt = (r0 - f).max(1) as f64;
-                    for (o, mm) in out(kv, f).iter_mut().zip(&mean) { *o = f2h((*mm / cnt) as f32); }
-                }
-            }); }
+                    if mode == "rand" {
+                        for (j, x) in imp.iter_mut().enumerate() {
+                            *x = ((j as u64 * 0x9E3779B97F4A7C15 + (k as u64) * 0xD1B54A32D192ED03) >> 40) as f32;
+                        }
+                    }
+                    let mut order: Vec<usize> = (0..r0).collect();
+                    order.sort_by(|&a, &b| imp[b].partial_cmp(&imp[a]).unwrap());
+                    let mut kept: Vec<usize> = order[..f].to_vec();
+                    kept.sort();
+                    let out = |kv: usize, r: usize| unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (bp as *mut u16).add(((fi * 2 + kv) * NKV + g) * rows * HD + r * HD),
+                            HD,
+                        )
+                    };
+                    for kv in 0..2 {
+                        for (r, &j) in kept.iter().enumerate() {
+                            out(kv, r).copy_from_slice(row(kv, j));
+                        }
+                        let mut mean = vec![0f64; HD];
+                        for &j in &order[f..] {
+                            for (mm, &h) in mean.iter_mut().zip(row(kv, j)) {
+                                *mm += lut[h as usize] as f64;
+                            }
+                        }
+                        let cnt = (r0 - f).max(1) as f64;
+                        for (o, mm) in out(kv, f).iter_mut().zip(&mean) {
+                            *o = f2h((*mm / cnt) as f32);
+                        }
+                    }
+                });
+            }
         });
         drop(qc);
-        *self.lane.prune.borrow_mut() = Some(Prune { bag, rows, r0, lastbias: ((r0 - f).max(1) as f32).ln(), use_sum: use_sum && r0 > f });
+        *self.lane.prune.borrow_mut() =
+            Some(Prune { bag, rows, r0, lastbias: ((r0 - f).max(1) as f32).ln(), use_sum: use_sum && r0 > f });
         (r0, f)
     }
     /// dev: how peaked is full attention? After a prefill of `n` tokens (tail mode off) the arena still holds the last layer's
@@ -4537,8 +6990,16 @@ impl<'a> Run<'a> {
         let slot = N_PHYS - 1;
         assert!(!self.slot_kind[slot].0, "last layer is expected to be a full-attention layer");
         let (kb, _, cap) = self.kv_slot(slot);
-        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
+        let h2f = |h: u16| -> f32 {
+            let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+            let e = ((h >> 10) & 31) as i32;
+            let m = (h & 1023) as f32;
+            if e == 0 {
+                sg * m * 2f32.powi(-24)
+            } else {
+                sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+            }
+        };
         let kv = self.lane.kv_full.borrow();
         let kp = kv.contents().as_ptr() as *const u16;
         let act = self.act.borrow();
@@ -4548,18 +7009,27 @@ impl<'a> Run<'a> {
         let mut cnt = 0usize;
         for g in 0..NKV {
             // keys of this group as f32
-            let keys: Vec<f32> = (0..n * HD).map(|i| h2f(unsafe { *kp.add(kb as usize + g * cap as usize * HD + i) })).collect();
-            for t in n - nq..n { for hh in 0..3 {
-                let h = g * 3 + hh;
-                let q: Vec<f32> = (0..HD).map(|d| h2f(unsafe { *qp.add((t * NH + h) * HD + d) })).collect();
-                let sc: Vec<f32> = (0..=t).map(|j| { let k = &keys[j * HD..(j + 1) * HD]; q.iter().zip(k).map(|(a, c)| a * c).sum::<f32>() }).collect();
-                let m = sc.iter().cloned().fold(unsafe { *sink.add(t * NH + h) }, f32::max);
-                for (i, &mg) in margins.iter().enumerate() {
-                    let f = sc.iter().filter(|&&x| x > m - mg).count() as f64 / sc.len() as f64;
-                    within[i].0 += f; within[i].1 = within[i].1.max(f);
+            let keys: Vec<f32> =
+                (0..n * HD).map(|i| h2f(unsafe { *kp.add(kb as usize + g * cap as usize * HD + i) })).collect();
+            for t in n - nq..n {
+                for hh in 0..3 {
+                    let h = g * 3 + hh;
+                    let q: Vec<f32> = (0..HD).map(|d| h2f(unsafe { *qp.add((t * NH + h) * HD + d) })).collect();
+                    let sc: Vec<f32> = (0..=t)
+                        .map(|j| {
+                            let k = &keys[j * HD..(j + 1) * HD];
+                            q.iter().zip(k).map(|(a, c)| a * c).sum::<f32>()
+                        })
+                        .collect();
+                    let m = sc.iter().cloned().fold(unsafe { *sink.add(t * NH + h) }, f32::max);
+                    for (i, &mg) in margins.iter().enumerate() {
+                        let f = sc.iter().filter(|&&x| x > m - mg).count() as f64 / sc.len() as f64;
+                        within[i].0 += f;
+                        within[i].1 = within[i].1.max(f);
+                    }
+                    cnt += 1;
                 }
-                cnt += 1;
-            } }
+            }
         }
         margins.iter().zip(within).map(|(&m, (s, w))| (m, s / cnt as f64, w)).collect()
     }
@@ -4567,45 +7037,80 @@ impl<'a> Run<'a> {
     /// [from, to) in place to a per-vector linear grid (the storage stays fp16; nothing gets smaller). kbits / vbits = 0: untouched.
     pub fn kv_quant_sim(&self, from: usize, to: usize, kbits: u32, vbits: u32) {
         assert!(!self.kv8, "this dev tool reads the fp16 cache");
-        let h2f = |h: u16| -> f32 { let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }; let e = ((h >> 10) & 31) as i32; let m = (h & 1023) as f32;
-            if e == 0 { sg * m * 2f32.powi(-24) } else { sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15) } };
-        let f2h = |v: f32| -> u16 { let bits = v.to_bits(); let sign = ((bits >> 16) & 0x8000) as u16; let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-            if v == 0.0 || exp <= 0 { sign } else {
-                let mant = (bits >> 13) & 0x3ff; let rem = bits & 0x1fff;
-                let mut h = ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 };
-                if h >= 0x7c00 { h = 0x7bff; }
-                sign | h as u16 } };
+        let h2f = |h: u16| -> f32 {
+            let sg = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+            let e = ((h >> 10) & 31) as i32;
+            let m = (h & 1023) as f32;
+            if e == 0 {
+                sg * m * 2f32.powi(-24)
+            } else {
+                sg * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+            }
+        };
+        let f2h = |v: f32| -> u16 {
+            let bits = v.to_bits();
+            let sign = ((bits >> 16) & 0x8000) as u16;
+            let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            if v == 0.0 || exp <= 0 {
+                sign
+            } else {
+                let mant = (bits >> 13) & 0x3ff;
+                let rem = bits & 0x1fff;
+                let mut h =
+                    ((exp as u32) << 10 | mant) + if rem > 0x1000 || (rem == 0x1000 && mant & 1 == 1) { 1 } else { 0 };
+                if h >= 0x7c00 {
+                    h = 0x7bff;
+                }
+                sign | h as u16
+            }
+        };
         for slot in 0..N_SLOT {
             let (is_swa, _) = self.slot_kind[slot];
             let (kb, vb, cap) = self.kv_slot(slot);
             let buf = if is_swa { self.lane.kv_swa.borrow() } else { self.lane.kv_full.borrow() };
             let base = buf.contents().as_ptr() as *mut u16;
             for (b, bits) in [(kb, kbits), (vb, vbits)] {
-                if bits == 0 { continue; }
+                if bits == 0 {
+                    continue;
+                }
                 let lv = ((1u32 << (bits - 1)) - 1) as f32;
-                for g in 0..NKV { for pos in from.max(if is_swa { to.saturating_sub(EXT) } else { 0 })..to {
-                    let idx = if is_swa { pos % cap as usize } else { pos };
-                    let row = unsafe { std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD) };
-                    let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
-                    if bits >= 100 {
-                        // floating formats: 100 + m = round every value to m mantissa bits; 200 + m = the same with a 3-bit exponent
-                        // (binades [0.25, 32), fixed step 2^-(m+2) below)
-                        let (m, lim) = ((bits % 100) as i32, bits >= 200);
-                        for (r, &x) in row.iter_mut().zip(&v) {
-                            if x == 0.0 { continue; }
-                            let mut e = x.abs().log2().floor() as i32;
-                            if lim { e = e.clamp(-2, 4); }
-                            let q = 2f32.powi(e - m);
-                            let mut y = (x / q).round() * q;
-                            if lim { y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q); }
-                            *r = f2h(y);
+                for g in 0..NKV {
+                    for pos in from.max(if is_swa { to.saturating_sub(EXT) } else { 0 })..to {
+                        let idx = if is_swa { pos % cap as usize } else { pos };
+                        let row = unsafe {
+                            std::slice::from_raw_parts_mut(base.add(b as usize + (g * cap as usize + idx) * HD), HD)
+                        };
+                        let v: Vec<f32> = row.iter().map(|&h| h2f(h)).collect();
+                        if bits >= 100 {
+                            // floating formats: 100 + m = round every value to m mantissa bits; 200 + m = the same with a 3-bit exponent
+                            // (binades [0.25, 32), fixed step 2^-(m+2) below)
+                            let (m, lim) = ((bits % 100) as i32, bits >= 200);
+                            for (r, &x) in row.iter_mut().zip(&v) {
+                                if x == 0.0 {
+                                    continue;
+                                }
+                                let mut e = x.abs().log2().floor() as i32;
+                                if lim {
+                                    e = e.clamp(-2, 4);
+                                }
+                                let q = 2f32.powi(e - m);
+                                let mut y = (x / q).round() * q;
+                                if lim {
+                                    y = y.clamp(-(2f32.powi(5) - q), 2f32.powi(5) - q);
+                                }
+                                *r = f2h(y);
+                            }
+                            continue;
                         }
-                        continue;
+                        let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+                        if mx == 0.0 {
+                            continue;
+                        }
+                        for (r, x) in row.iter_mut().zip(&v) {
+                            *r = f2h((x / mx * lv).round() * mx / lv);
+                        }
                     }
-                    let mx = v.iter().fold(0f32, |a, x| a.max(x.abs()));
-                    if mx == 0.0 { continue; }
-                    for (r, x) in row.iter_mut().zip(&v) { *r = f2h((x / mx * lv).round() * mx / lv); }
-                } }
+                }
             }
         }
     }
@@ -4619,10 +7124,18 @@ impl<'a> Run<'a> {
             let buf = if is_swa { self.lane.kv_swa.borrow() } else { self.lane.kv_full.borrow() };
             let base = buf.contents().as_ptr() as *const u8;
             let rows = if is_swa { n.min(EXT) } else { n };
-            for b in [kb, vb] { for g in 0..NKV {
-                let sl = unsafe { std::slice::from_raw_parts(base.add((b as usize + g * cap as usize * HD) * 2), rows * HD * 2) };
-                if is_swa { swa.extend_from_slice(sl); } else { full.extend_from_slice(sl); }
-            } }
+            for b in [kb, vb] {
+                for g in 0..NKV {
+                    let sl = unsafe {
+                        std::slice::from_raw_parts(base.add((b as usize + g * cap as usize * HD) * 2), rows * HD * 2)
+                    };
+                    if is_swa {
+                        swa.extend_from_slice(sl);
+                    } else {
+                        full.extend_from_slice(sl);
+                    }
+                }
+            }
         }
         (swa, full)
     }
@@ -4637,7 +7150,9 @@ impl<'a> Run<'a> {
     pub fn set_cs(&self, v: &[u8]) {
         self.lane.with_cs_buf(|b, off, len| {
             assert_eq!(v.len(), len);
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), (b.contents().as_ptr() as *mut u8).add(off), len); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr(), (b.contents().as_ptr() as *mut u8).add(off), len);
+            }
         });
     }
     pub fn reset(&self) {
@@ -4656,7 +7171,9 @@ impl<'a> Run<'a> {
         let limit = self.n_vocab.min(self.tok_embd.rows as usize).min(i32::MAX as usize + 1);
         validate_token_write(start, toks, capacity, limit)?;
         let p = self.lane.toks.contents().as_ptr().cast::<u32>();
-        unsafe { std::ptr::copy_nonoverlapping(toks.as_ptr(), p.add(start), toks.len()); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(toks.as_ptr(), p.add(start), toks.len());
+        }
         Ok(())
     }
     pub fn token_at(&self, i: usize) -> u32 {
@@ -4667,7 +7184,11 @@ impl<'a> Run<'a> {
     /// Read a checked GPU sample after its command buffer completed.
     pub fn sampled_token_at(&self, pos: usize) -> Result<u32, &'static str> {
         let tok = self.token_at(pos);
-        if tok == u32::MAX { Err("model returned invalid sampling logits") } else { Ok(tok) }
+        if tok == u32::MAX {
+            Err("model returned invalid sampling logits")
+        } else {
+            Ok(tok)
+        }
     }
     /// Encode one full decode step for token at `pos` (input token read from toks[pos]).
     /// If `logits` is set, also computes lm_head and writes argmax to toks[pos+1].
@@ -4687,23 +7208,43 @@ impl<'a> Run<'a> {
         self.bind(e);
         let ar = self.ar_at();
         // embedding -> vec 0 (x0)
-        let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                             norm_off: self.tok_norm, out0: self.v(0), out1: self.v(0), tok_index: pos as u32, eps: self.eps };
+        let ea = EmbedArgs {
+            emb_lo: self.tok_embd.off as u32,
+            emb_hi: (self.tok_embd.off >> 32) as u32,
+            row_bytes: self.tok_embd.row_bytes,
+            norm_off: self.tok_norm,
+            out0: self.v(0),
+            out1: self.v(0),
+            tok_index: pos as u32,
+            eps: self.eps,
+        };
         self.go(e, C_EMBED, "k_embed", &ea, (1, 1, 1), 256);
 
         self.done.set(0);
         let mut va = VecAlloc { next: 1, n: N_VEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
-        for ip in 0..LOOP_START { cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false); }
+        for ip in 0..LOOP_START {
+            cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false);
+        }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
         let mut lg_weak_buf: Option<Buf> = None;
         for pass in 0..N_PASS {
-            if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+            if pass > 0 {
+                cur = prelude;
+                blocks = prelude_blocks.clone();
+            }
             let msg = if pass > 0 { Some(bank) } else { None };
-            let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+            let pinned: Vec<usize> = {
+                let mut p = vec![prelude];
+                if pass > 0 {
+                    p.push(bank.0);
+                    p.push(bank.1);
+                }
+                p
+            };
             for ip in LOOP_START..LOOP_END {
                 cur = self.layer_ex(cx, pos, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, false);
             }
@@ -4718,7 +7259,8 @@ impl<'a> Run<'a> {
                     cur_w = self.layer_ex(cx, pos, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, true);
                 }
                 let e = &cx.e;
-                let mut st_w = blocks_w.clone(); st_w.push(cur_w);
+                let mut st_w = blocks_w.clone();
+                st_w.push(cur_w);
                 let j = self.mix_job(&st_w, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
                 self.mix(e, C_OMIX, &[j]);
                 self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
@@ -4731,11 +7273,14 @@ impl<'a> Run<'a> {
                 lg_weak_buf = Some(weak_buf);
             }
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false); }
+        for ip in LOOP_END..N_PHYS {
+            cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false);
+        }
 
         let e = &cx.e;
         if logits {
-            let mut st = blocks.clone(); st.push(cur);
+            let mut st = blocks.clone();
+            st.push(cur);
             let j = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
             self.mix(e, C_OMIX, &[j]);
             self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
@@ -4759,23 +7304,54 @@ impl<'a> Run<'a> {
         }
         if logits && argmax {
             let nparts = 128u32;
-            let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: pos as u32 + 1, checked: 0, pad: [0; 2] };
+            let am = ArgmaxArgs {
+                logits_off: ar.logits,
+                n: self.n_vocab as u32,
+                part_off: ar.amax,
+                nparts,
+                out_index: pos as u32 + 1,
+                checked: 0,
+                pad: [0; 2],
+            };
             self.go(e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
             self.go(e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-             msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
+    fn layer(
+        &self,
+        cx: &mut Cx,
+        pos: usize,
+        slot: usize,
+        ip: usize,
+        cur: usize,
+        blocks: &mut Vec<usize>,
+        msg: Option<(usize, usize)>,
+        va: &mut VecAlloc,
+        pinned: &[usize],
+    ) -> usize {
         self.layer_ex(cx, pos, slot, ip, cur, blocks, msg, va, pinned, false)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_ex(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-                msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], dry_state: bool) -> usize {
+    fn layer_ex(
+        &self,
+        cx: &mut Cx,
+        pos: usize,
+        slot: usize,
+        ip: usize,
+        cur: usize,
+        blocks: &mut Vec<usize>,
+        msg: Option<(usize, usize)>,
+        va: &mut VecAlloc,
+        pinned: &[usize],
+        dry_state: bool,
+    ) -> usize {
         if !dry_state {
-            if self.done.get() >= self.stop.get() { return cur; }
+            if self.done.get() >= self.stop.get() {
+                return cur;
+            }
             self.done.set(self.done.get() + 1);
         }
         let e = &cx.e;
@@ -4786,23 +7362,41 @@ impl<'a> Run<'a> {
 
         // ---- attention inputs: depth mix (+ loop control) -> normalized q/k/v inputs
         let norms: [i32; 3] = if l.swa { [l.attn_norm; 3] } else { [l.q_inp_norm, l.k_inp_norm, l.v_inp_norm] };
-        let mut st = blocks.clone(); st.push(cur);
+        let mut st = blocks.clone();
+        st.push(cur);
         let nq = if l.attn_res_query >= 0 { l.n_attn_q } else { 1 };
         let xin: [u32; 3];
         if let Some(lw) = ctl {
             let (b0, b1) = msg.unwrap();
             // raw mixed inputs u_j -> inp[j]; RMSNorm'd copies -> cat[j][0:E]; messages m_j -> msg[j], normalized -> cat[j][E:2E]
             let mut ja = self.mix_job(&st, l.attn_res_query, nq, &ar.inp[..nq as usize], &[]);
-            if l.swa { ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32]; }
-            else { for j in 0..3 { ja.ncopy[j][0] = ar.cat[j] as i32; } }
+            if l.swa {
+                ja.ncopy[0] = [ar.cat[0] as i32, ar.cat[1] as i32, ar.cat[2] as i32];
+            } else {
+                for j in 0..3 {
+                    ja.ncopy[j][0] = ar.cat[j] as i32;
+                }
+            }
             let mut jm = self.mix_job(&[b0, b1], lw.msg_query as i32, 4, &ar.msg, &[]);
-            for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
+            for j in 0..4 {
+                jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32;
+            }
             self.mix(e, C_MIXA, &[ja, jm]);
             let mut cj = Vec::new();
             for (j, &norm_w) in norms.iter().enumerate() {
                 let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
-                cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
-                                  forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w, ctr: 8 + j as u32 });
+                cj.push(CtrlJob {
+                    u_off: u,
+                    m_off: ar.msg[j],
+                    d_off: lw.down[j],
+                    out_off: ar.ctrlg[j],
+                    gain_off: lw.gain[j],
+                    forget_off: lw.forget[j],
+                    res_out: ar.cin[j],
+                    ss_off: ar.ssp[j],
+                    norm_w,
+                    ctr: 8 + j as u32,
+                });
             }
             self.ctrl_dec(e, &cj);
             xin = ar.cin;
@@ -4812,19 +7406,48 @@ impl<'a> Run<'a> {
             xin = if l.swa { [ar.inp[0]; 3] } else { [ar.inp[0], ar.inp[1], ar.inp[2]] };
         }
         // ---- fused projections (one dispatch)
-        let mut segs = vec![Engine::seg(&l.wq, xin[0], ar.q), Engine::seg(&l.wgate, xin[0], ar.gate), Engine::seg(&l.wrel, xin[0], ar.rel),
-                            Engine::seg(&l.wsink, xin[0], ar.sink), Engine::seg(&l.wk, xin[1], ar.k), Engine::seg(&l.wv, xin[2], ar.v)];
-        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) { segs.push(Engine::seg(kp, xin[1], ar.kdyn)); segs.push(Engine::seg(vp, xin[2], ar.vdyn)); }
+        let mut segs = vec![
+            Engine::seg(&l.wq, xin[0], ar.q),
+            Engine::seg(&l.wgate, xin[0], ar.gate),
+            Engine::seg(&l.wrel, xin[0], ar.rel),
+            Engine::seg(&l.wsink, xin[0], ar.sink),
+            Engine::seg(&l.wk, xin[1], ar.k),
+            Engine::seg(&l.wv, xin[2], ar.v),
+        ];
+        if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) {
+            segs.push(Engine::seg(kp, xin[1], ar.kdyn));
+            segs.push(Engine::seg(vp, xin[2], ar.vdyn));
+        }
         self.mv(e, C_QKV, &segs);
         // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
         let (kb, vb, kcap) = self.kv_slot(slot);
         let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
         let base = AttnArgs {
-            pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
-            q_off: ar.q, k_off: ar.k, v_off: ar.v, r_off: ar.rel, sink_off: ar.sink,
-            kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 }, vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 }, part_off: ar.part,
-            kconv_w: l.k_conv, vconv_w: l.v_conv, qclip_w: l.q_clip, relclip_w: l.rel_clip, relbias_w: l.rel_bias, tau,
-            ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
+            pos: pos as u32,
+            cap: kcap,
+            k_base: kb,
+            v_base: vb,
+            cs_off: cs_slot,
+            q_off: ar.q,
+            k_off: ar.k,
+            v_off: ar.v,
+            r_off: ar.rel,
+            sink_off: ar.sink,
+            kdyn_off: if l.swa { -1 } else { ar.kdyn as i32 },
+            vdyn_off: if l.swa { -1 } else { ar.vdyn as i32 },
+            part_off: ar.part,
+            kconv_w: l.k_conv,
+            vconv_w: l.v_conv,
+            qclip_w: l.q_clip,
+            relclip_w: l.rel_clip,
+            relbias_w: l.rel_bias,
+            tau,
+            ctr: 0,
+            gate_off: ar.gate,
+            out_off: ar.attn_g,
+            gstr: kcap * HD as u32,
+            istr: HD as u32,
+            ..Default::default()
         };
         let nsplit;
         if self.tier_on() {
@@ -4833,20 +7456,42 @@ impl<'a> Run<'a> {
             let t = self.lane.tier.as_ref().unwrap();
             let exec = self.done.get() - 1;
             let x = t.execs.borrow()[exec];
-            let chunks: Vec<(usize, Chunk)> = t.plan.borrow().iter().cloned().enumerate().filter(|(_, c)| c.exec == exec).collect();
+            let chunks: Vec<(usize, Chunk)> =
+                t.plan.borrow().iter().cloned().enumerate().filter(|(_, c)| c.exec == exec).collect();
             for (k, c) in chunks {
                 self.tier_load(cx, k);
                 let e = &cx.e;
-                let off = ((t.half.get() * (t.stg.borrow().length() / 2) + c.off) / 2) as u32;       // in fp16 elements
-                let a = AttnArgs { nkeys: (c.c1 - c.c0) as u32, first_pos: c.c0 as u32, ring: 0, idx0: c.c0 as u32, k_base: off, v_base: off + (NKV * HD) as u32,
-                                   gstr: HD as u32, istr: (2 * NKV * HD) as u32, kps: c.kps as u32, nsplit: x.nsplit as u32, sp0: c.sp0 as u32, noown: 1,
-                                   pad: 1 | if c.rel_split { 4 } else { 0 }, ..base };
+                let off = ((t.half.get() * (t.stg.borrow().length() / 2) + c.off) / 2) as u32; // in fp16 elements
+                let a = AttnArgs {
+                    nkeys: (c.c1 - c.c0) as u32,
+                    first_pos: c.c0 as u32,
+                    ring: 0,
+                    idx0: c.c0 as u32,
+                    k_base: off,
+                    v_base: off + (NKV * HD) as u32,
+                    gstr: HD as u32,
+                    istr: (2 * NKV * HD) as u32,
+                    kps: c.kps as u32,
+                    nsplit: x.nsplit as u32,
+                    sp0: c.sp0 as u32,
+                    noown: 1,
+                    pad: 1 | if c.rel_split { 4 } else { 0 },
+                    ..base
+                };
                 e.buf(&t.stg.borrow(), 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (c.ns, NKV, 1), 128);
             }
             let e = &cx.e;
-            let a = AttnArgs { nkeys: (pos + 1 - x.b) as u32, first_pos: x.b as u32, ring: 1, kps: x.kps as u32, nsplit: x.nsplit as u32, sp0: x.sp0 as u32,
-                               pad: 1 | if x.rel_split { 4 } else { 0 }, ..base };
+            let a = AttnArgs {
+                nkeys: (pos + 1 - x.b) as u32,
+                first_pos: x.b as u32,
+                ring: 1,
+                kps: x.kps as u32,
+                nsplit: x.nsplit as u32,
+                sp0: x.sp0 as u32,
+                pad: 1 | if x.rel_split { 4 } else { 0 },
+                ..base
+            };
             self.bind_kv(e, l.swa);
             self.go(e, C_ATTN, "k_attn", &a, (x.ns, NKV, 1), 128);
             let total = x.nsplit;
@@ -4854,18 +7499,43 @@ impl<'a> Run<'a> {
         } else if let (false, Some(pr)) = (l.swa, self.lane.prune.borrow().as_ref()) {
             // dev: far keys from the selection, recent keys from the cache
             let fi = self.slot_kind[slot].1;
-            let spl = |nk: usize| { let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()); (kps, nk.div_ceil(kps)) };
+            let spl = |nk: usize| {
+                let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target());
+                (kps, nk.div_ceil(kps))
+            };
             let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
             let ((k1, n1), (k2, n2)) = (if nb > 0 { spl(nb) } else { (32, 0) }, spl(pos + 1 - pr.r0));
             if nb > 0 {
                 let kb2 = (fi * 2 * NKV * pr.rows * HD) as u32;
-                let a = AttnArgs { nkeys: nb as u32, first_pos: 0, ring: 0, cap: pr.rows as u32, k_base: kb2, v_base: kb2 + (NKV * pr.rows * HD) as u32,
-                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1 | 4,
-                                   lastbias: if pr.use_sum { pr.lastbias } else { 0.0 }, ..base };
+                let a = AttnArgs {
+                    nkeys: nb as u32,
+                    first_pos: 0,
+                    ring: 0,
+                    cap: pr.rows as u32,
+                    k_base: kb2,
+                    v_base: kb2 + (NKV * pr.rows * HD) as u32,
+                    gstr: (pr.rows * HD) as u32,
+                    kps: k1 as u32,
+                    nsplit: (n1 + n2) as u32,
+                    sp0: 0,
+                    noown: 1,
+                    pad: 1 | 4,
+                    lastbias: if pr.use_sum { pr.lastbias } else { 0.0 },
+                    ..base
+                };
                 e.buf(&pr.bag, 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
             }
-            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1 | 4 | ((dry_state as u32) << 1), ..base };
+            let a = AttnArgs {
+                nkeys: (pos + 1 - pr.r0) as u32,
+                first_pos: pr.r0 as u32,
+                ring: 0,
+                kps: k2 as u32,
+                nsplit: (n1 + n2) as u32,
+                sp0: n1 as u32,
+                pad: 1 | 4 | ((dry_state as u32) << 1),
+                ..base
+            };
             self.bind_kv(e, false);
             self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
             nsplit = n1 + n2;
@@ -4875,32 +7545,66 @@ impl<'a> Run<'a> {
             let (first_pos, kps, _sp_lo, nsplit_val) = decode_split_grid(l.swa, pos, self.max_ctx);
             let nkeys = pos + 1 - first_pos;
             nsplit = nsplit_val;
-            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
+            let aa = AttnArgs {
+                nkeys: nkeys as u32,
+                first_pos: first_pos as u32,
+                ring: l.swa as u32,
+                kps: kps as u32,
+                nsplit: nsplit as u32,
+                pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                ..base
+            };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
         }
         let e = &cx.e;
         if self.sep_comb || self.tier_on() || self.lane.prune.borrow().is_some() {
-            let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g, hout: 0, pad: [0; 3] };
+            let ca = CombineArgs {
+                part_off: ar.part,
+                nsplit: nsplit as u32,
+                gate_off: ar.gate,
+                out_off: ar.attn_g,
+                hout: 0,
+                pad: [0; 3],
+            };
             self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
         }
         // ---- output projection + post-conv (+ residual unless this layer starts a new block)
         let block_start = ip.is_multiple_of(BLOCK);
-        let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(cur);
+        live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         let mut so = Engine::seg(&l.wo, ar.attn_g, self.v(mid));
-        so.epi = if dry_state { 2 } else { 1 }; so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
-        so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
+        so.epi = if dry_state { 2 } else { 1 };
+        so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
+        so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32;
+        so.convw_off = l.attn_post_conv;
         self.mv(e, C_WO, &[so]);
-        if block_start { blocks.push(cur); }
+        if block_start {
+            blocks.push(cur);
+        }
         // ---- FFN input: depth mix (+ control) -> normalized
-        let mut st = blocks.clone(); st.push(mid);
+        let mut st = blocks.clone();
+        st.push(mid);
         let x_off = if let Some(lw) = ctl {
             let mut jf = self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[]);
             jf.ncopy[0][0] = ar.cat[3] as i32;
             self.mix(e, C_MIXF, &[jf]);
-            self.ctrl_dec(e, &[CtrlJob { u_off: ar.fin, m_off: ar.msg[3], d_off: lw.down[3], out_off: ar.ctrlg[3], gain_off: lw.gain[3],
-                                         forget_off: lw.forget[3], res_out: ar.finc, ss_off: ar.ssp[3], norm_w: l.ffn_norm as i32, ctr: 11 }]);
+            self.ctrl_dec(
+                e,
+                &[CtrlJob {
+                    u_off: ar.fin,
+                    m_off: ar.msg[3],
+                    d_off: lw.down[3],
+                    out_off: ar.ctrlg[3],
+                    gain_off: lw.gain[3],
+                    forget_off: lw.forget[3],
+                    res_out: ar.finc,
+                    ss_off: ar.ssp[3],
+                    norm_w: l.ffn_norm as i32,
+                    ctr: 11,
+                }],
+            );
             ar.finc
         } else {
             self.mix(e, C_MIXF, &[self.mix_job(&st, l.ffn_res_query as i32, 1, &[ar.fin], &[l.ffn_norm as i32])]);
@@ -4908,27 +7612,69 @@ impl<'a> Run<'a> {
         };
         // ---- router with fused top-k (last threadgroup)
         let sel = if dry_state { ar.sel } else { ar.sel_log + ((self.done.get() - 1) * 16) as u32 };
-        let rpost = MvArgs { post: (!self.sep_topk) as u32, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
+        let rpost = MvArgs {
+            post: (!self.sep_topk) as u32,
+            ctr: 12,
+            bias_off: l.exp_bias,
+            sel_off: sel,
+            wscale: self.wscale,
+            ..Default::default()
+        };
         self.mv_post(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost);
-        let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
+        let mut live: Vec<usize> = blocks.clone();
+        live.push(mid);
+        live.extend_from_slice(pinned);
         let out = va.alloc(&live);
-        let topk_args = MoeArgs { logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
-        if self.sep_topk { self.go(e, C_ROUTER, "k_topk", &topk_args, (1, 1, 1), 32); }
+        let topk_args = MoeArgs {
+            logits_off: ar.rlog,
+            bias_off: l.exp_bias,
+            sel_off: sel,
+            wscale: self.wscale,
+            ..Default::default()
+        };
+        if self.sep_topk {
+            self.go(e, C_ROUTER, "k_topk", &topk_args, (1, 1, 1), 32);
+        }
         let ma = MoeArgs {
-            logits_off: ar.rlog, bias_off: l.exp_bias, sel_off: sel, x_off,
-            norm_off: -1, ss_off: -1, ss_n: 0, eps: self.eps,
-            gu_lo: l.gu.off as u32, gu_hi: (l.gu.off >> 32) as u32, gu_expert_bytes: l.gu.expert_bytes as u32, gu_row_bytes: l.gu.row_bytes,
-            act_off: ar.act, wscale: self.wscale, beta: self.situ_beta, lbeta: self.situ_lbeta,
-            dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
-            dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-            convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
-            dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, no_state_write: dry_state as u32, pad1: 0,
+            logits_off: ar.rlog,
+            bias_off: l.exp_bias,
+            sel_off: sel,
+            x_off,
+            norm_off: -1,
+            ss_off: -1,
+            ss_n: 0,
+            eps: self.eps,
+            gu_lo: l.gu.off as u32,
+            gu_hi: (l.gu.off >> 32) as u32,
+            gu_expert_bytes: l.gu.expert_bytes as u32,
+            gu_row_bytes: l.gu.row_bytes,
+            act_off: ar.act,
+            wscale: self.wscale,
+            beta: self.situ_beta,
+            lbeta: self.situ_lbeta,
+            dn_lo: l.dn.off as u32,
+            dn_hi: (l.dn.off >> 32) as u32,
+            dn_expert_bytes: l.dn.expert_bytes as u32,
+            dn_row_bytes: l.dn.row_bytes,
+            dn_type: l.dn.ty,
+            out_off: self.v(out),
+            res_off: self.v(mid) as i32,
+            cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+            convw_off: l.ffn_post_conv,
+            gu_type: l.gu.ty,
+            gu_gs_lo: l.gu.gs as u32,
+            gu_gs_hi: (l.gu.gs >> 32) as u32,
+            dn_gs_lo: l.dn.gs as u32,
+            dn_gs_hi: (l.dn.gs >> 32) as u32,
+            no_state_write: dry_state as u32,
+            pad1: 0,
         };
         // ---- experts
         self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
         self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
         if !dry_state {
-            self.last_out.set(out); self.last_mid.set(mid);
+            self.last_out.set(out);
+            self.last_mid.set(mid);
         }
         out
     }
@@ -4959,7 +7705,13 @@ fn validate_token_write(start: usize, toks: &[u32], capacity: usize, limit: usiz
     Ok(())
 }
 
-fn checked_byte_end(off_elems: usize, len_elems: usize, elem_bytes: usize, buf_bytes: usize, who: &str) -> Result<usize, String> {
+fn checked_byte_end(
+    off_elems: usize,
+    len_elems: usize,
+    elem_bytes: usize,
+    buf_bytes: usize,
+    who: &str,
+) -> Result<usize, String> {
     let end = off_elems
         .checked_add(len_elems)
         .and_then(|elems| elems.checked_mul(elem_bytes))
@@ -4972,7 +7724,12 @@ fn checked_byte_end(off_elems: usize, len_elems: usize, elem_bytes: usize, buf_b
     Ok(end)
 }
 
-fn borrow_buf_slice<'a, T>(cell: &'a RefCell<Buf>, off_elems: usize, len_elems: usize, who: &str) -> std::cell::Ref<'a, [T]> {
+fn borrow_buf_slice<'a, T>(
+    cell: &'a RefCell<Buf>,
+    off_elems: usize,
+    len_elems: usize,
+    who: &str,
+) -> std::cell::Ref<'a, [T]> {
     std::cell::Ref::map(cell.borrow(), |buf| {
         checked_byte_end(off_elems, len_elems, std::mem::size_of::<T>(), buf.length(), who)
             .unwrap_or_else(|err| panic!("{err}"));
@@ -5011,9 +7768,7 @@ fn configured_split_target(value: Result<String, std::env::VarError>) -> Result<
         Ok(v) => v.parse::<usize>().ok(),
         Err(std::env::VarError::NotUnicode(_)) => None,
     };
-    target
-        .filter(|&n| (1..=MAX_SPLIT).contains(&n))
-        .ok_or("INK_SPLITS must be an integer between 1 and 256")
+    target.filter(|&n| (1..=MAX_SPLIT).contains(&n)).ok_or("INK_SPLITS must be an integer between 1 and 256")
 }
 
 /// Exact `[start_f32_word, count_f32_words]` range of `BArena`'s Layer 2 sliding-window K/V scratch (`sk` + `sv`),
@@ -5128,7 +7883,11 @@ pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {
 #[cfg_attr(not(test), allow(dead_code))]
 pub const fn split_scratch_slots(max_ctx: usize) -> usize {
     let need = max_ctx.div_ceil(256) + 1;
-    if need > MAX_SPLIT { need } else { MAX_SPLIT }
+    if need > MAX_SPLIT {
+        need
+    } else {
+        MAX_SPLIT
+    }
 }
 
 /// `(nsplit_stride, max_rows_per_batch)` for a span ending at `span_end = p0 + t` (`specs/SplitArena.tla`
@@ -5297,7 +8056,11 @@ fn ctrl_down_direct_half(skip: u32) -> bool {
 /// receives at most 64 tokens and class 0 (`65..128` tokens, `k_moe_sg8`) is guaranteed to have 0 tiles.
 #[inline]
 fn moe_class_start(n: usize) -> usize {
-    if n <= 64 { 1 } else { 0 }
+    if n <= 64 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Use fused 1-TG `k_moe_topk_route3` on the fp16 path whenever `n <= 64`.
@@ -5325,9 +8088,9 @@ fn sync_blocked_lane_table(pools: &crate::blocks::BlockPools, lane: &Lane, p0: u
                         n_blk,
                     )
                 };
-                table.sync_dirty_to_slice(kind, pool, dst).unwrap_or_else(|err| {
-                    panic!("Layer 3 {kind:?} dirty block-table sync failed: {err}")
-                })
+                table
+                    .sync_dirty_to_slice(kind, pool, dst)
+                    .unwrap_or_else(|err| panic!("Layer 3 {kind:?} dirty block-table sync failed: {err}"))
             });
             if kind == BlockKind::Window {
                 win_written = written;
@@ -5340,7 +8103,9 @@ fn sync_blocked_lane_table(pools: &crate::blocks::BlockPools, lane: &Lane, p0: u
 }
 
 fn guided_rows(omegas: &[f32]) -> u128 {
-    const { assert!(MAX_SPANS <= u128::BITS as usize); }
+    const {
+        assert!(MAX_SPANS <= u128::BITS as usize);
+    }
     let mut mask = 0u128;
     for (i, &w) in omegas.iter().enumerate() {
         if w > 0.0 {

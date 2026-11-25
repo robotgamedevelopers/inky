@@ -10,9 +10,7 @@ struct ScratchTestDir {
 
 impl ScratchTestDir {
     fn new(label: &str) -> Self {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("spill-tests");
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("spill-tests");
         fs::create_dir_all(&base).expect("create target/spill-tests");
         #[cfg(unix)]
         let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
@@ -21,8 +19,7 @@ impl ScratchTestDir {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create scratch test dir");
         #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .expect("chmod 0700 scratch test dir");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod 0700 scratch test dir");
         Self { path }
     }
 
@@ -94,7 +91,8 @@ fn one_process_owns_the_spill_directory_until_drop() {
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "spill::tests::one_process_owns_the_spill_directory_until_drop"])
         .env(CHILD_DIR, dir)
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout));
     drop(owner);
 
@@ -134,24 +132,15 @@ fn deterministic_state(key: SpillKey, len: usize) -> Vec<u8> {
 #[test]
 fn sha256_matches_nist_vectors() {
     let h_empty = Sha256::new().finalize();
-    assert_eq!(
-        hex(&h_empty),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
+    assert_eq!(hex(&h_empty), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
     let mut h_abc = Sha256::new();
     h_abc.update(b"abc");
-    assert_eq!(
-        hex(&h_abc.finalize()),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
+    assert_eq!(hex(&h_abc.finalize()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 
     let mut h_448 = Sha256::new();
     h_448.update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
-    assert_eq!(
-        hex(&h_448.finalize()),
-        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-    );
+    assert_eq!(hex(&h_448.finalize()), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
 
     // Streaming chunked equivalence on 128 KiB payload.
     let payload = deterministic_kv(SpillKey::full(42), 131_072);
@@ -256,10 +245,7 @@ fn lazy_lru_spill_never_writes_eagerly_and_evicts_strict_lru_under_pressure() {
     assert_eq!(restored.full_slots.len(), 1);
     let (rk, rslot) = restored.full_slots[0];
     assert_eq!(rk, SpillKey::full(2));
-    assert_eq!(
-        mgr.pool().read_slot_bytes(rslot).unwrap(),
-        deterministic_kv(SpillKey::full(2), full_stride).as_slice()
-    );
+    assert_eq!(mgr.pool().read_slot_bytes(rslot).unwrap(), deterministic_kv(SpillKey::full(2), full_stride).as_slice());
     assert_eq!(
         restored.recurrent_states.get(&SpillKey::full(2)).map(Vec::as_slice),
         Some(deterministic_state(SpillKey::full(2), 1024).as_slice())
@@ -378,17 +364,9 @@ fn disk_budget_enforces_max_spill_bytes_with_lru_gc() {
         let kv = deterministic_kv(key, kv_len);
         let (out, _evicted) = store.write_block(key, 1, &kv, None, &HashSet::new()).unwrap();
         assert_eq!(out, WriteOutcome::Written { on_disk_bytes: one_file });
-        assert!(
-            store.used_bytes() <= max_bytes,
-            "used_bytes {} exceeded max_bytes {}",
-            store.used_bytes(),
-            max_bytes
-        );
+        assert!(store.used_bytes() <= max_bytes, "used_bytes {} exceeded max_bytes {}", store.used_bytes(), max_bytes);
         // Verify actual on-disk bytes across all files in --spill-dir also respect budget.
-        let actual_bytes: u64 = fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().metadata().unwrap().len())
-            .sum();
+        let actual_bytes: u64 = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
         assert!(actual_bytes <= max_bytes);
     }
 
@@ -396,10 +374,7 @@ fn disk_budget_enforces_max_spill_bytes_with_lru_gc() {
     assert_eq!(store.stats().disk_gc_evictions, 5);
     // Oldest 0..5 evicted; newest 5, 6, 7 survive and verify bit-identically.
     for id in 0..5u64 {
-        assert!(matches!(
-            store.read_block(SpillKey::full(id), Some(kv_len)),
-            ReadOutcome::Miss(MissReason::NotFound)
-        ));
+        assert!(matches!(store.read_block(SpillKey::full(id), Some(kv_len)), ReadOutcome::Miss(MissReason::NotFound)));
     }
     for id in 5..8u64 {
         let key = SpillKey::full(id);
@@ -415,9 +390,7 @@ fn disk_budget_enforces_max_spill_bytes_with_lru_gc() {
     let _ = store.read_block(SpillKey::full(5), Some(kv_len));
     // Writing block 8 must evict block 6 (LRU), keeping 5, 7, 8!
     let k8 = SpillKey::full(8);
-    store
-        .write_block(k8, 1, &deterministic_kv(k8, kv_len), None, &HashSet::new())
-        .unwrap();
+    store.write_block(k8, 1, &deterministic_kv(k8, kv_len), None, &HashSet::new()).unwrap();
     assert!(!store.contains(SpillKey::full(6)));
     assert!(store.contains(SpillKey::full(5)));
     assert!(store.contains(SpillKey::full(7)));
@@ -469,10 +442,7 @@ fn atomic_working_set_reservation_prevents_partial_restore_thrashing() {
     mgr.register_sealed_block(cold_f, sf, None).unwrap();
 
     // Request exceeding capacity returns ExceedsCapacity with zero mutations.
-    assert!(matches!(
-        mgr.reserve_working_set(5, 1),
-        Err(ReserveError::ExceedsCapacity { .. })
-    ));
+    assert!(matches!(mgr.reserve_working_set(5, 1), Err(ReserveError::ExceedsCapacity { .. })));
     assert_eq!(mgr.tier(cold_f), BlockTier::Memory);
 
     // Lane A reserves (3 full, 2 window) atomically -> succeeds!
@@ -605,10 +575,9 @@ fn spill_file_names_require_canonical_lowercase_hex_fields() {
     for name in ["blk-f-00000000000000AB.blk", "blk-f-+000000000000001.blk"] {
         assert_eq!(SpillKey::parse_blk_filename(name), None, "{name}");
     }
-    for name in [
-        "blk-f-0000000000000001.tmp.0000000A.0000000000000001",
-        "blk-f-0000000000000001.tmp.00000001.000000000000000A",
-    ] {
+    for name in
+        ["blk-f-0000000000000001.tmp.0000000A.0000000000000001", "blk-f-0000000000000001.tmp.00000001.000000000000000A"]
+    {
         assert_eq!(SpillKey::parse_tmp_filename(name), None, "{name}");
     }
 }
@@ -693,8 +662,8 @@ fn corrupt_torn_bitflip_zero_and_orphan_files_cause_clean_cache_miss_never_corru
         (12, MissReason::BadBlockKind),
         (14, MissReason::KvbMismatch),
         (16, MissReason::MetadataMismatch),
-        (24, MissReason::ChecksumMismatch), // generation bit-flip
-        (48, MissReason::ChecksumMismatch), // sha256 byte flip
+        (24, MissReason::ChecksumMismatch),               // generation bit-flip
+        (48, MissReason::ChecksumMismatch),               // sha256 byte flip
         (SPILL_HEADER_LEN, MissReason::ChecksumMismatch), // first K/V byte
         (SPILL_HEADER_LEN + kv_len / 2, MissReason::ChecksumMismatch), // mid K/V byte
         (SPILL_HEADER_LEN + kv_len - 1, MissReason::ChecksumMismatch), // last K/V byte
@@ -769,18 +738,11 @@ fn kill9_writer_helper() {
     let Ok(dir) = std::env::var("INKY_SPILL_KILL9_DIR") else {
         return;
     };
-    let round: u64 = std::env::var("INKY_SPILL_KILL9_ROUND")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let kv_len: usize = std::env::var("INKY_SPILL_KILL9_KV_LEN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256 * 1024);
-    let state_len: usize = std::env::var("INKY_SPILL_KILL9_STATE_LEN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024);
+    let round: u64 = std::env::var("INKY_SPILL_KILL9_ROUND").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let kv_len: usize =
+        std::env::var("INKY_SPILL_KILL9_KV_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024);
+    let state_len: usize =
+        std::env::var("INKY_SPILL_KILL9_STATE_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(32 * 1024);
 
     let mut store = SpillStore::open(&dir, 512 * 1024 * 1024).expect("child open spill store");
     let empty = HashSet::new();
@@ -789,18 +751,10 @@ fn kill9_writer_helper() {
     let mut seq = 0u64;
     loop {
         let id = (round << 32) | seq;
-        let kind = if seq.is_multiple_of(4) {
-            SpillBlockKind::Window
-        } else {
-            SpillBlockKind::Full
-        };
+        let kind = if seq.is_multiple_of(4) { SpillBlockKind::Window } else { SpillBlockKind::Full };
         let key = SpillKey::new(kind, id);
         let kv = deterministic_kv(key, kv_len);
-        let st = if seq.is_multiple_of(3) {
-            Some(deterministic_state(key, state_len))
-        } else {
-            None
-        };
+        let st = if seq.is_multiple_of(3) { Some(deterministic_state(key, state_len)) } else { None };
         let _ = store.write_block(key, seq + 1, &kv, st.as_deref(), &empty);
         if seq == 0 {
             println!("READY");
@@ -848,12 +802,7 @@ fn kill9_mid_write_loses_cache_never_correctness() {
         prepare_spill_dir(&dir).unwrap();
 
         let mut child = Command::new(&exe)
-            .args([
-                "--exact",
-                "spill::tests::kill9_writer_helper",
-                "--ignored",
-                "--nocapture",
-            ])
+            .args(["--exact", "spill::tests::kill9_writer_helper", "--ignored", "--nocapture"])
             .env("INKY_SPILL_KILL9_DIR", &dir)
             .env("INKY_SPILL_KILL9_ROUND", round.to_string())
             .env("INKY_SPILL_KILL9_KV_LEN", kv_len.to_string())
@@ -929,33 +878,18 @@ fn kill9_mid_write_loses_cache_never_correctness() {
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_str().and_then(SpillKey::parse_tmp_filename).is_some())
             .collect();
-        assert!(
-            remaining_tmps.is_empty(),
-            "round {round}: orphan tmp files remained after open(): {remaining_tmps:?}"
-        );
+        assert!(remaining_tmps.is_empty(), "round {round}: orphan tmp files remained after open(): {remaining_tmps:?}");
 
         // Check every block ID in the range 0..max_seen+8 (including in-flight/unwritten tail).
-        let max_id = store
-            .keys()
-            .map(|k| k.id & 0xffff_ffff)
-            .max()
-            .unwrap_or(0);
+        let max_id = store.keys().map(|k| k.id & 0xffff_ffff).max().unwrap_or(0);
         let check_limit = (max_id + 8).min(500);
 
         for seq in 0..=check_limit {
             let id = (round << 32) | seq;
-            let kind = if seq % 4 == 0 {
-                SpillBlockKind::Window
-            } else {
-                SpillBlockKind::Full
-            };
+            let kind = if seq % 4 == 0 { SpillBlockKind::Window } else { SpillBlockKind::Full };
             let key = SpillKey::new(kind, id);
             let expected_kv = deterministic_kv(key, kv_len);
-            let expected_state = if seq % 3 == 0 {
-                Some(deterministic_state(key, state_len))
-            } else {
-                None
-            };
+            let expected_state = if seq % 3 == 0 { Some(deterministic_state(key, state_len)) } else { None };
 
             let (recovered_kv, recovered_state) = match store.read_block(key, Some(kv_len)) {
                 ReadOutcome::Hit(blk) => {
@@ -969,10 +903,7 @@ fn kill9_mid_write_loses_cache_never_correctness() {
                 }
             };
 
-            assert_eq!(
-                recovered_kv, expected_kv,
-                "round {round} seq {seq}: K/V bytes must be bit-identical"
-            );
+            assert_eq!(recovered_kv, expected_kv, "round {round} seq {seq}: K/V bytes must be bit-identical");
             assert_eq!(
                 recovered_state, expected_state,
                 "round {round} seq {seq}: recurrent state must be bit-identical"
@@ -1028,10 +959,7 @@ fn pending_restore_blocks_are_protected_from_disk_gc() {
     // Lane A executes its restore of k1 cleanly with zero miss!
     let res_a = mgr.execute_working_set_restore(prep_a).unwrap();
     assert_eq!(res_a.full_slots.len(), 1);
-    assert_eq!(
-        mgr.pool().read_slot_bytes(res_a.full_slots[0].1).unwrap(),
-        deterministic_kv(k1, stride).as_slice()
-    );
+    assert_eq!(mgr.pool().read_slot_bytes(res_a.full_slots[0].1).unwrap(), deterministic_kv(k1, stride).as_slice());
 }
 
 #[test]
@@ -1042,9 +970,7 @@ fn concurrent_restores_of_shared_disk_block_deduplicate_without_slot_leak() {
     let mut store = SpillStore::open(&dir, 64 * 1024 * 1024).unwrap();
     let shared = SpillKey::full(77);
     let state = deterministic_state(shared, 512);
-    store
-        .write_block(shared, 1, &deterministic_kv(shared, stride), Some(&state), &HashSet::new())
-        .unwrap();
+    store.write_block(shared, 1, &deterministic_kv(shared, stride), Some(&state), &HashSet::new()).unwrap();
 
     // Pool has 2 Full slots so two lanes can both reserve concurrently.
     let pool = HostBlockPoolBackend::new(2, 1, stride, stride);
@@ -1086,16 +1012,9 @@ fn full_scale_block_and_recurrent_state_roundtrip() {
     let kv = deterministic_kv(key, FULL_STRIDE);
     let st = deterministic_state(key, cs_bytes);
 
-    let (out, evicted) = store
-        .write_block(key, 9, &kv, Some(&st), &HashSet::new())
-        .unwrap();
+    let (out, evicted) = store.write_block(key, 9, &kv, Some(&st), &HashSet::new()).unwrap();
     assert!(evicted.is_empty());
-    assert_eq!(
-        out,
-        WriteOutcome::Written {
-            on_disk_bytes: (SPILL_HEADER_LEN + FULL_STRIDE + cs_bytes) as u64
-        }
-    );
+    assert_eq!(out, WriteOutcome::Written { on_disk_bytes: (SPILL_HEADER_LEN + FULL_STRIDE + cs_bytes) as u64 });
 
     match store.read_block(key, Some(FULL_STRIDE)) {
         ReadOutcome::Hit(blk) => {
@@ -1126,12 +1045,8 @@ fn kvb_mismatch_between_kv8_and_fp16_is_rejected_without_exposing_bytes() {
     {
         let mut kv8_store = SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 1).unwrap();
         assert_eq!(kv8_store.kvb(), 1);
-        kv8_store
-            .write_block(k_kv8, 1, &deterministic_kv(k_kv8, kv_len), None, &HashSet::new())
-            .unwrap();
-        kv8_store
-            .write_block(k_cs_kv8, 1, &[], Some(&deterministic_state(k_cs_kv8, cs_len)), &HashSet::new())
-            .unwrap();
+        kv8_store.write_block(k_kv8, 1, &deterministic_kv(k_kv8, kv_len), None, &HashSet::new()).unwrap();
+        kv8_store.write_block(k_cs_kv8, 1, &[], Some(&deterministic_state(k_cs_kv8, cs_len)), &HashSet::new()).unwrap();
         assert!(matches!(kv8_store.read_block(k_kv8, Some(kv_len)), ReadOutcome::Hit(_)));
         assert!(matches!(kv8_store.read_block(k_cs_kv8, Some(0)), ReadOutcome::Hit(_)));
     }
@@ -1147,9 +1062,7 @@ fn kvb_mismatch_between_kv8_and_fp16_is_rejected_without_exposing_bytes() {
 
         // Write an fp16 block (kvb=2) now.
         let k_fp16 = SpillKey::window(88);
-        fp16_store
-            .write_block(k_fp16, 2, &deterministic_kv(k_fp16, kv_len), None, &HashSet::new())
-            .unwrap();
+        fp16_store.write_block(k_fp16, 2, &deterministic_kv(k_fp16, kv_len), None, &HashSet::new()).unwrap();
     }
 
     // 3. Reopen as --kv8 (kvb=1): must reject the fp16 block!

@@ -16,12 +16,17 @@ use crate::gguf::{Gguf, Value, T_BF16, T_F32, T_Q8_0};
 use crate::sampler::Sampler;
 use crate::verify::{DraftProducer, NgramDraftProducer};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs::File;
+#[cfg(test)]
 use std::io::{self, Write};
 use std::path::Path;
 
+#[cfg(test)]
 const GGUF_MAGIC: u32 = 0x4655_4747;
+#[cfg(test)]
 const GGUF_VERSION: u32 = 3;
+#[cfg(test)]
 const GGUF_ALIGN: usize = 32;
 
 /// Validated metadata for a loaded DSpark/MTP GGUF file.
@@ -98,14 +103,11 @@ impl DsparkDrafter {
         fallback_tok: u32,
     ) -> Result<Self, String> {
         let path = path.as_ref();
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| format!("--dspark {}: path must be valid UTF-8", path.display()))?;
+        let path_str = path.to_str().ok_or_else(|| format!("--dspark {}: path must be valid UTF-8", path.display()))?;
         let g = Gguf::open(path_str).map_err(|e| format!("--dspark {}: {e}", path.display()))?;
         let arch = kv_str(&g, "general.architecture");
         let has_inkserve = g.kv.contains_key("inkserve.mtp");
-        let draft_mode =
-            kv_str(&g, "dflash.draft_mode").or_else(|| kv_str(&g, "inkserve.mtp.mode"));
+        let draft_mode = kv_str(&g, "dflash.draft_mode").or_else(|| kv_str(&g, "inkserve.mtp.mode"));
 
         if draft_mode == Some("suffix") {
             let file_vocab = kv_usize(&g, "dflash.vocab_size")
@@ -152,13 +154,7 @@ impl DsparkDrafter {
         }
 
         if arch == Some("dflash") {
-            return Self::load_dflash_mainline(
-                path,
-                g,
-                expected_vocab,
-                expected_embd,
-                fallback_tok,
-            );
+            return Self::load_dflash_mainline(path, g, expected_vocab, expected_embd, fallback_tok);
         }
 
         Err(format!(
@@ -169,9 +165,7 @@ impl DsparkDrafter {
     }
 
     fn read_f32_tensor(g: &Gguf, name: &str, expected_len: usize) -> Result<Vec<f32>, String> {
-        let t = g
-            .tensor(name, &[expected_len], &[T_F32])
-            .map_err(|e| e.to_string())?;
+        let t = g.tensor(name, &[expected_len], &[T_F32]).map_err(|e| e.to_string())?;
         let raw = g.bytes(t);
         let (chunks, _) = raw.as_chunks::<4>();
         let mut out = Vec::with_capacity(expected_len);
@@ -189,66 +183,35 @@ impl DsparkDrafter {
         fallback_tok: u32,
     ) -> Result<Self, String> {
         let err = |msg: String| format!("--dspark {}: {msg}", path.display());
-        let alpha = g
-            .opt("mtp.alpha")
-            .ok_or_else(|| err("missing tensor mtp.alpha".into()))?;
+        let alpha = g.opt("mtp.alpha").ok_or_else(|| err("missing tensor mtp.alpha".into()))?;
         if alpha.ne.len() != 2 || alpha.ne[0] < 2 || alpha.ne[1] < 2 || alpha.ty != T_F32 {
-            return Err(err(format!(
-                "mtp.alpha has invalid shape {:?} / type {}",
-                alpha.ne, alpha.ty
-            )));
+            return Err(err(format!("mtp.alpha has invalid shape {:?} / type {}", alpha.ne, alpha.ty)));
         }
         let n_layers = alpha.ne[1] - 1;
-        g.tensor("mtp.mask_embed", &[expected_embd], &[T_F32])
-            .map_err(|e| err(e.to_string()))?;
-        g.tensor("mtp.norm", &[expected_embd], &[T_F32])
-            .map_err(|e| err(e.to_string()))?;
-        g.tensor("mtp.markov.ctx_norm", &[expected_embd], &[T_F32])
-            .map_err(|e| err(e.to_string()))?;
-        let w1 = g
-            .opt("mtp.markov.w1")
-            .ok_or_else(|| err("missing tensor mtp.markov.w1".into()))?;
+        g.tensor("mtp.mask_embed", &[expected_embd], &[T_F32]).map_err(|e| err(e.to_string()))?;
+        g.tensor("mtp.norm", &[expected_embd], &[T_F32]).map_err(|e| err(e.to_string()))?;
+        g.tensor("mtp.markov.ctx_norm", &[expected_embd], &[T_F32]).map_err(|e| err(e.to_string()))?;
+        let w1 = g.opt("mtp.markov.w1").ok_or_else(|| err("missing tensor mtp.markov.w1".into()))?;
         if w1.ne.len() != 2 || w1.ne[1] != expected_vocab {
-            return Err(err(format!(
-                "mtp.markov.w1 shape {:?} does not match target vocab {expected_vocab}",
-                w1.ne
-            )));
+            return Err(err(format!("mtp.markov.w1 shape {:?} does not match target vocab {expected_vocab}", w1.ne)));
         }
         let rank = w1.ne[0];
-        g.tensor(
-            "mtp.markov.fold_w",
-            &[rank, expected_vocab],
-            &[T_Q8_0, T_BF16, T_F32],
-        )
-        .map_err(|e| err(e.to_string()))?;
-        g.tensor("mtp.markov.fold_b", &[expected_vocab], &[T_F32])
+        g.tensor("mtp.markov.fold_w", &[rank, expected_vocab], &[T_Q8_0, T_BF16, T_F32])
             .map_err(|e| err(e.to_string()))?;
-        g.tensor(
-            "mtp.markov.rnn",
-            &[2 * rank + 2 * expected_embd, 3 * rank],
-            &[T_BF16, T_F32, T_Q8_0],
-        )
-        .map_err(|e| err(e.to_string()))?;
-        g.tensor("mtp.markov.rnn_bias", &[3 * rank], &[T_F32])
+        g.tensor("mtp.markov.fold_b", &[expected_vocab], &[T_F32]).map_err(|e| err(e.to_string()))?;
+        g.tensor("mtp.markov.rnn", &[2 * rank + 2 * expected_embd, 3 * rank], &[T_BF16, T_F32, T_Q8_0])
             .map_err(|e| err(e.to_string()))?;
+        g.tensor("mtp.markov.rnn_bias", &[3 * rank], &[T_F32]).map_err(|e| err(e.to_string()))?;
         for l in 0..n_layers {
             for suffix in ["attn_norm", "ffn_norm", "ctx_norm"] {
                 let name = format!("mtp.{l}.{suffix}");
-                g.tensor(&name, &[expected_embd], &[T_F32])
-                    .map_err(|e| err(e.to_string()))?;
+                g.tensor(&name, &[expected_embd], &[T_F32]).map_err(|e| err(e.to_string()))?;
             }
-            for suffix in [
-                "wq", "wk", "wv", "wk_ctx", "wv_ctx", "wo", "gate", "up", "down",
-            ] {
+            for suffix in ["wq", "wk", "wv", "wk_ctx", "wv_ctx", "wo", "gate", "up", "down"] {
                 let name = format!("mtp.{l}.{suffix}");
-                let t = g
-                    .opt(&name)
-                    .ok_or_else(|| err(format!("missing tensor {name}")))?;
+                let t = g.opt(&name).ok_or_else(|| err(format!("missing tensor {name}")))?;
                 if t.ne.len() != 2 || !matches!(t.ty, T_Q8_0 | T_BF16 | T_F32) {
-                    return Err(err(format!(
-                        "tensor {name} has unsupported shape {:?} / type {}",
-                        t.ne, t.ty
-                    )));
+                    return Err(err(format!("tensor {name} has unsupported shape {:?} / type {}", t.ne, t.ty)));
                 }
             }
         }
@@ -284,39 +247,26 @@ impl DsparkDrafter {
         let err = |msg: String| format!("--dspark {}: {msg}", path.display());
         let n_embd = kv_usize(&g, "dflash.embedding_length").unwrap_or(expected_embd);
         if n_embd != expected_embd {
-            return Err(err(format!(
-                "dflash.embedding_length {n_embd} != target {expected_embd}"
-            )));
+            return Err(err(format!("dflash.embedding_length {n_embd} != target {expected_embd}")));
         }
         let n_layers = kv_usize(&g, "dflash.block_count").unwrap_or(3);
         let block_size = kv_usize(&g, "dflash.block_size").unwrap_or(8).clamp(2, 16);
-        let w1 = g
-            .opt("markov_w1.weight")
-            .ok_or_else(|| err("missing tensor markov_w1.weight".into()))?;
+        let w1 = g.opt("markov_w1.weight").ok_or_else(|| err("missing tensor markov_w1.weight".into()))?;
         if w1.ne.len() != 2 || w1.ne[1] > expected_vocab || w1.ne[1] == 0 {
             return Err(err(format!(
                 "markov_w1.weight shape {:?} incompatible with target vocab {expected_vocab}",
                 w1.ne
             )));
         }
-        for req in [
-            "markov_w2.weight",
-            "joint_proj.weight",
-            "mask_embd.weight",
-            "output_norm.weight",
-        ] {
+        for req in ["markov_w2.weight", "joint_proj.weight", "mask_embd.weight", "output_norm.weight"] {
             if g.opt(req).is_none() {
                 return Err(err(format!("missing tensor {req}")));
             }
         }
         for l in 0..n_layers {
-            for suffix in [
-                "attn_norm.weight",
-                "ffn_norm.weight",
-                "attn_q.weight",
-                "attn_k.weight",
-                "attn_output.weight",
-            ] {
+            for suffix in
+                ["attn_norm.weight", "ffn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_output.weight"]
+            {
                 let name = format!("blk.{l}.{suffix}");
                 if g.opt(&name).is_none() {
                     return Err(err(format!("missing tensor {name}")));
@@ -326,10 +276,7 @@ impl DsparkDrafter {
         let (markov_bias, top_prior_toks) = if let Some(bt) = g.opt("markov_w2.bias") {
             let blen = bt.ne.first().copied().unwrap_or(0);
             if bt.ne.len() != 1 || bt.ty != T_F32 || blen == 0 || blen > expected_vocab {
-                return Err(err(format!(
-                    "markov_w2.bias has invalid shape {:?} / type {}",
-                    bt.ne, bt.ty
-                )));
+                return Err(err(format!("markov_w2.bias has invalid shape {:?} / type {}", bt.ne, bt.ty)));
             }
             let mut b = Self::read_f32_tensor(&g, "markov_w2.bias", blen).map_err(&err)?;
             if b.iter().any(|x| !x.is_finite()) {
@@ -381,10 +328,7 @@ impl DsparkDrafter {
         draft_sampler: &mut Sampler,
     ) -> DraftProposal {
         if k == 0 {
-            return DraftProposal {
-                tokens: Vec::new(),
-                logits: Vec::new(),
-            };
+            return DraftProposal { tokens: Vec::new(), logits: Vec::new() };
         }
         let nv = self.meta.n_vocab;
         let fallback = self.safe_fallback(ban_tok);
@@ -397,10 +341,7 @@ impl DsparkDrafter {
                 }
             }
             toks.resize(k, fallback);
-            return DraftProposal {
-                tokens: toks,
-                logits: Vec::new(),
-            };
+            return DraftProposal { tokens: toks, logits: Vec::new() };
         }
 
         // Stochastic path: build calibrated per-step draft logits `z_q` and draw from `draft_sampler`.
@@ -409,10 +350,7 @@ impl DsparkDrafter {
         let mut logits = Vec::with_capacity(k * nv);
         for _step in 0..k {
             let row = self.build_stochastic_row(&rolled, ban_tok, fallback);
-            let drawn = draft_sampler
-                .sample_next_with_ban(&row, ban_tok)
-                .unwrap_or(fallback)
-                .min((nv - 1) as u32);
+            let drawn = draft_sampler.sample_next_with_ban(&row, ban_tok).unwrap_or(fallback).min((nv - 1) as u32);
             tokens.push(drawn);
             rolled.push(drawn);
             logits.extend_from_slice(&row);
@@ -432,18 +370,9 @@ impl DsparkDrafter {
         }
     }
 
-    fn build_stochastic_row(
-        &self,
-        history: &[u32],
-        ban_tok: Option<u32>,
-        fallback: u32,
-    ) -> Vec<f32> {
+    fn build_stochastic_row(&self, history: &[u32], ban_tok: Option<u32>, fallback: u32) -> Vec<f32> {
         let nv = self.meta.n_vocab;
-        let mut row = if let Some(bias) = &self.markov_bias {
-            bias[..nv].to_vec()
-        } else {
-            vec![-10.0f32; nv]
-        };
+        let mut row = if let Some(bias) = &self.markov_bias { bias[..nv].to_vec() } else { vec![-10.0f32; nv] };
         let mut scores: HashMap<u32, f32> = HashMap::new();
         let max_n = self.meta.max_order.min(history.len().saturating_sub(1));
         for order in (1..=max_n).rev() {
@@ -491,12 +420,8 @@ impl DsparkDrafter {
 }
 
 fn extract_top_prior(bias: &[f32], limit: usize) -> Vec<(u32, f32)> {
-    let mut best: Vec<(u32, f32)> = bias
-        .iter()
-        .enumerate()
-        .filter(|&(_, &v)| v.is_finite())
-        .map(|(i, &v)| (i as u32, v))
-        .collect();
+    let mut best: Vec<(u32, f32)> =
+        bias.iter().enumerate().filter(|&(_, &v)| v.is_finite()).map(|(i, &v)| (i as u32, v)).collect();
     if best.len() > limit {
         best.select_nth_unstable_by(limit - 1, |a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         best.truncate(limit);
@@ -563,13 +488,7 @@ pub fn write_suffix_dspark_gguf(
 mod tests {
     use super::*;
 
-    fn write_synthetic_inkserve_mtp(
-        path: &Path,
-        n_layers: usize,
-        embd: usize,
-        vocab: usize,
-        rank: usize,
-    ) {
+    fn write_synthetic_inkserve_mtp(path: &Path, n_layers: usize, embd: usize, vocab: usize, rank: usize) {
         let mut buf = Vec::new();
         let push_str = |b: &mut Vec<u8>, s: &str| {
             b.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -587,59 +506,28 @@ mod tests {
             for v in vals {
                 data.extend_from_slice(&v.to_le_bytes());
             }
-            specs.push(TSpec {
-                name,
-                dims,
-                ty: T_F32,
-                data,
-            });
+            specs.push(TSpec { name, dims, ty: T_F32, data });
         };
         for l in 0..n_layers {
             for s in ["attn_norm", "ffn_norm", "ctx_norm"] {
                 add_f32(format!("mtp.{l}.{s}"), vec![embd as u64], vec![1.0; embd]);
             }
-            for s in [
-                "wq", "wk", "wv", "wk_ctx", "wv_ctx", "wo", "gate", "up", "down",
-            ] {
-                add_f32(
-                    format!("mtp.{l}.{s}"),
-                    vec![embd as u64, embd as u64],
-                    vec![0.0; embd * embd],
-                );
+            for s in ["wq", "wk", "wv", "wk_ctx", "wv_ctx", "wo", "gate", "up", "down"] {
+                add_f32(format!("mtp.{l}.{s}"), vec![embd as u64, embd as u64], vec![0.0; embd * embd]);
             }
         }
         add_f32("mtp.mask_embed".into(), vec![embd as u64], vec![0.0; embd]);
         add_f32("mtp.norm".into(), vec![embd as u64], vec![1.0; embd]);
-        add_f32(
-            "mtp.markov.ctx_norm".into(),
-            vec![embd as u64],
-            vec![1.0; embd],
-        );
-        add_f32(
-            "mtp.markov.rnn_bias".into(),
-            vec![(3 * rank) as u64],
-            vec![0.0; 3 * rank],
-        );
-        add_f32(
-            "mtp.alpha".into(),
-            vec![4, (n_layers + 1) as u64],
-            vec![0.25; 4 * (n_layers + 1)],
-        );
-        add_f32(
-            "mtp.markov.w1".into(),
-            vec![rank as u64, vocab as u64],
-            vec![0.0; rank * vocab],
-        );
+        add_f32("mtp.markov.ctx_norm".into(), vec![embd as u64], vec![1.0; embd]);
+        add_f32("mtp.markov.rnn_bias".into(), vec![(3 * rank) as u64], vec![0.0; 3 * rank]);
+        add_f32("mtp.alpha".into(), vec![4, (n_layers + 1) as u64], vec![0.25; 4 * (n_layers + 1)]);
+        add_f32("mtp.markov.w1".into(), vec![rank as u64, vocab as u64], vec![0.0; rank * vocab]);
         add_f32(
             "mtp.markov.rnn".into(),
             vec![(2 * rank + 2 * embd) as u64, (3 * rank) as u64],
             vec![0.0; (2 * rank + 2 * embd) * 3 * rank],
         );
-        add_f32(
-            "mtp.markov.fold_w".into(),
-            vec![rank as u64, vocab as u64],
-            vec![0.0; rank * vocab],
-        );
+        add_f32("mtp.markov.fold_w".into(), vec![rank as u64, vocab as u64], vec![0.0; rank * vocab]);
         let mut fb = vec![-1.0f32; vocab];
         fb[7] = 3.5;
         add_f32("mtp.markov.fold_b".into(), vec![vocab as u64], fb);
@@ -706,10 +594,7 @@ mod tests {
         assert_eq!(p1.tokens, p2.tokens);
         assert_eq!(p1.logits.len(), 3 * 256);
         assert!(p1.logits.iter().all(|x| x.is_finite()));
-        assert!(
-            !p1.tokens.contains(&40),
-            "banned token must not be proposed"
-        );
+        assert!(!p1.tokens.contains(&40), "banned token must not be proposed");
 
         // Full synthetic inkserve.mtp neural GGUF validates all tensors and reads fold_b prior.
         let mtp_path = dir.join("inkserve_mtp.gguf");

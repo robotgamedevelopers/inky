@@ -31,7 +31,9 @@ impl Sampler {
         Sampler { temp, top_k, top_p, softcap, state: seed ^ 0x9E37_79B9_7F4A_7C15, cand: Vec::with_capacity(256) }
     }
 
-    pub fn greedy(&self) -> bool { self.temp <= 0.0 }
+    pub fn greedy(&self) -> bool {
+        self.temp <= 0.0
+    }
 
     /// Whether this sampler can use GPU Gumbel-max sampling (`top_k == 0 && top_p >= 1.0`, chadlyb/erisinky).
     pub fn uses_gpu_gumbel(&self) -> bool {
@@ -92,14 +94,20 @@ impl Sampler {
         allow: F,
     ) -> Result<u32, &'static str> {
         let total = self.prepare_row_filtered(logits, ban, softcap, allow)?;
-        if self.temp < 1e-5 { return Ok(self.cand[0].1); }
+        if self.temp < 1e-5 {
+            return Ok(self.cand[0].1);
+        }
         let mut r = self.next_f32() * total;
         let mut last = self.cand[0].1;
         for &(mass, token) in &self.cand {
-            if mass == 0.0 { continue; }
+            if mass == 0.0 {
+                continue;
+            }
             last = token;
             r -= mass;
-            if r <= 0.0 { return Ok(token); }
+            if r <= 0.0 {
+                return Ok(token);
+            }
         }
         Ok(last)
     }
@@ -117,13 +125,21 @@ impl Sampler {
         softcap: f32,
         mut allow: F,
     ) -> Result<f32, &'static str> {
-        if logits.is_empty() { return Err("model returned no logits"); }
-        if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
+        if logits.is_empty() {
+            return Err("model returned no logits");
+        }
+        if !self.temp.is_finite() {
+            return Err("invalid sampling temperature");
+        }
         let mut best: Option<(f32, u32)> = None;
         for (i, &x) in logits.iter().enumerate() {
-            if !x.is_finite() { return Err("model returned non-finite logits"); }
+            if !x.is_finite() {
+                return Err("model returned non-finite logits");
+            }
             let tok = i as u32;
-            if Some(tok) == ban { continue; }
+            if Some(tok) == ban {
+                continue;
+            }
             if best.is_none_or(|(b, _)| x > b) && allow(tok) {
                 best = Some((x, tok));
             }
@@ -152,7 +168,11 @@ impl Sampler {
             } else {
                 c * (y / c).atanh()
             };
-            if rc.is_finite() { rc - 1e-3 * rc.abs() - 1e-3 } else { f32::NEG_INFINITY }
+            if rc.is_finite() {
+                rc - 1e-3 * rc.abs() - 1e-3
+            } else {
+                f32::NEG_INFINITY
+            }
         } else {
             f32::NEG_INFINITY
         };
@@ -173,7 +193,9 @@ impl Sampler {
             *mass = centered.exp();
             sum += *mass;
         }
-        if !sum.is_finite() || sum <= 0.0 { return Err("model returned invalid sampling probabilities"); }
+        if !sum.is_finite() || sum <= 0.0 {
+            return Err("model returned invalid sampling probabilities");
+        }
         let mut total = 0.0;
         let mut keep = self.cand.len();
         for (i, (mass, _)) in self.cand.iter_mut().enumerate() {
@@ -209,7 +231,9 @@ impl Sampler {
         for i in 0..draft_rows.len() {
             let (tok, accepted) = self.reject_at(draft_tokens[i], target_rows[i], draft_rows[i]);
             out.push(tok);
-            if !accepted { return out; }
+            if !accepted {
+                return out;
+            }
         }
         out.push(self.sample(target_rows[draft_rows.len()]));
         out
@@ -223,11 +247,15 @@ impl Sampler {
         let qx = prob_of(&masses, x, false);
         // p >= q accepts without a draw; the uniform is only the case that can reject
         let accept = qx > 0.0 && (px >= qx || self.next_f32() < px / qx);
-        if accept { return (x, true); }
+        if accept {
+            return (x, true);
+        }
         let mut resid: Vec<(u32, f32)> = Vec::new();
         for m in &masses {
             let r = m.p - m.q;
-            if r > 0.0 { resid.push((m.token, r)); }
+            if r > 0.0 {
+                resid.push((m.token, r));
+            }
         }
         if resid.is_empty() {
             let p: Vec<(u32, f32)> = masses.iter().filter(|m| m.p > 0.0).map(|m| (m.token, m.p)).collect();
@@ -242,7 +270,9 @@ impl Sampler {
         let mut r = self.next_f32() * total;
         for &(tok, p) in dist {
             r -= p;
-            if r <= 0.0 { return tok; }
+            if r <= 0.0 {
+                return tok;
+            }
         }
         last_tok
     }
@@ -269,7 +299,11 @@ impl Sampler {
 /// Mixed into the request seed once, for the draft sampler only.
 pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
-struct Mass { token: u32, p: f32, q: f32 }
+struct Mass {
+    token: u32,
+    p: f32,
+    q: f32,
+}
 #[inline]
 fn cmp_cand(a: &(f32, u32), b: &(f32, u32)) -> std::cmp::Ordering {
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
@@ -284,7 +318,13 @@ fn truncate_and_sort_top_k(cand: &mut Vec<(f32, u32)>, top_k: usize) {
 }
 fn prob_of(masses: &[Mass], token: u32, target_side: bool) -> f32 {
     match masses.iter().find(|m| m.token == token) {
-        Some(m) => if target_side { m.p } else { m.q },
+        Some(m) => {
+            if target_side {
+                m.p
+            } else {
+                m.q
+            }
+        }
         None => 0.0,
     }
 }
@@ -328,9 +368,13 @@ mod tests {
     fn logits() -> (Vec<f32>, Vec<f32>) {
         let mut target = vec![-50.0f32; 200];
         let mut draft = vec![-50.0f32; 200];
-        for (i, d) in draft.iter_mut().enumerate().take(64) { *d = 6.0 - i as f32 * 0.01; }
+        for (i, d) in draft.iter_mut().enumerate().take(64) {
+            *d = 6.0 - i as f32 * 0.01;
+        }
         target[100] = 5.0;
-        for (i, t) in target.iter_mut().enumerate().take(73).skip(10) { *t = 4.0 - (i as f32 - 10.0) * 0.01; }
+        for (i, t) in target.iter_mut().enumerate().take(73).skip(10) {
+            *t = 4.0 - (i as f32 - 10.0) * 0.01;
+        }
         (target, draft)
     }
 
@@ -340,19 +384,27 @@ mod tests {
         let mut order: Vec<u32> = (0..logits.len() as u32).collect();
         order.sort_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]).then(a.cmp(&b)));
         order.truncate(k.min(logits.len()));
-        let scaled: Vec<f32> = order.iter().map(|&i| {
-            let x = logits[i as usize];
-            (if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x }) / temp
-        }).collect();
+        let scaled: Vec<f32> = order
+            .iter()
+            .map(|&i| {
+                let x = logits[i as usize];
+                (if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x }) / temp
+            })
+            .collect();
         let m = scaled[0];
         let mut pr: Vec<f32> = scaled.iter().map(|&x| (x - m).exp()).collect();
         let sum: f32 = pr.iter().sum();
-        for v in pr.iter_mut() { *v /= sum; }
+        for v in pr.iter_mut() {
+            *v /= sum;
+        }
         let mut cum = 0.0;
         let mut n = pr.len();
         for (i, &v) in pr.iter().enumerate() {
             cum += v;
-            if cum >= top_p { n = i + 1; break; }
+            if cum >= top_p {
+                n = i + 1;
+                break;
+            }
         }
         let total: f32 = pr[..n].iter().sum();
         order.into_iter().zip(pr).take(n).filter(|&(_, p)| p > 0.0).map(|(t, p)| (t, p / total)).collect()
@@ -379,8 +431,12 @@ mod tests {
         assert!(exp_p.len() < K && exp_q.len() < K, "top-p cuts both sides on this draw");
         let p_of = |tok: u32| masses.iter().find(|m| m.token == tok).map(|m| m.p).unwrap_or(0.0);
         let q_of = |tok: u32| masses.iter().find(|m| m.token == tok).map(|m| m.q).unwrap_or(0.0);
-        for &(tok, p) in &exp_p { assert!((p_of(tok) - p).abs() < 1e-6, "p({tok})"); }
-        for &(tok, q) in &exp_q { assert!((q_of(tok) - q).abs() < 1e-6, "q({tok})"); }
+        for &(tok, p) in &exp_p {
+            assert!((p_of(tok) - p).abs() < 1e-6, "p({tok})");
+        }
+        for &(tok, q) in &exp_q {
+            assert!((q_of(tok) - q).abs() < 1e-6, "q({tok})");
+        }
         assert!(masses.iter().all(|m| exp_p.iter().any(|e| e.0 == m.token) || m.p == 0.0));
         assert!(masses.iter().all(|m| exp_q.iter().any(|e| e.0 == m.token) || m.q == 0.0));
         assert_eq!(q_of(argmax), 0.0, "a token the draft dropped has q=0 and is not renormed away");
@@ -413,7 +469,9 @@ mod tests {
             max_abs = max_abs.max((freq - p).abs());
         }
         for (tok, &c) in counts.iter().enumerate() {
-            if c > 0 { assert!(exp_p.iter().any(|e| e.0 == tok as u32), "emitted {tok} is not in p"); }
+            if c > 0 {
+                assert!(exp_p.iter().any(|e| e.0 == tok as u32), "emitted {tok} is not in p");
+            }
         }
         assert!(max_abs < 0.012, "emitted distribution max |freq-p| {max_abs} over {n} draws");
     }
@@ -566,7 +624,14 @@ mod tests {
             out
         }
 
-        fn sample_full_sort_ref(logits: &[f32], temp: f32, top_k: usize, top_p: f32, softcap: f32, state: &mut u64) -> u32 {
+        fn sample_full_sort_ref(
+            logits: &[f32],
+            temp: f32,
+            top_k: usize,
+            top_p: f32,
+            softcap: f32,
+            state: &mut u64,
+        ) -> u32 {
             let best_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let best_tok = logits.iter().position(|&x| x == best_val).unwrap() as u32;
             let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
@@ -574,21 +639,39 @@ mod tests {
             let scaled_max = max_cap / temp;
             let raw_cut = {
                 let y = temp * (scaled_max - 30.0);
-                let rc = if softcap <= 0.0 { y } else if y <= -softcap { f32::NEG_INFINITY } else { softcap * (y / softcap).atanh() };
-                if rc.is_finite() { rc - 1e-3 * rc.abs() - 1e-3 } else { f32::NEG_INFINITY }
+                let rc = if softcap <= 0.0 {
+                    y
+                } else if y <= -softcap {
+                    f32::NEG_INFINITY
+                } else {
+                    softcap * (y / softcap).atanh()
+                };
+                if rc.is_finite() {
+                    rc - 1e-3 * rc.abs() - 1e-3
+                } else {
+                    f32::NEG_INFINITY
+                }
             };
-            let mut cand: Vec<(f32, u32)> = logits.iter().enumerate()
-                .filter(|&(_, &x)| x >= raw_cut)
-                .map(|(i, &x)| (x, i as u32))
-                .collect();
-            if cand.is_empty() { cand.push((best_val, best_tok)); }
+            let mut cand: Vec<(f32, u32)> =
+                logits.iter().enumerate().filter(|&(_, &x)| x >= raw_cut).map(|(i, &x)| (x, i as u32)).collect();
+            if cand.is_empty() {
+                cand.push((best_val, best_tok));
+            }
             cand = full_sort_ref(&cand, top_k);
             let mut p: Vec<f32> = cand.iter().map(|&(x, _)| (capped(x) / temp - scaled_max).exp()).collect();
             let sum: f32 = p.iter().sum();
-            for v in &mut p { *v /= sum; }
+            for v in &mut p {
+                *v /= sum;
+            }
             let mut cum = 0.0;
             let mut n = p.len();
-            for (i, &v) in p.iter().enumerate() { cum += v; if cum >= top_p { n = i + 1; break; } }
+            for (i, &v) in p.iter().enumerate() {
+                cum += v;
+                if cum >= top_p {
+                    n = i + 1;
+                    break;
+                }
+            }
             let total: f32 = p[..n].iter().sum();
             *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = *state;
@@ -598,10 +681,14 @@ mod tests {
             let mut r = ((z >> 40) as f32 / (1u64 << 24) as f32) * total;
             let mut last = 0;
             for (i, &mass) in p[..n].iter().enumerate() {
-                if mass == 0.0 { continue; }
+                if mass == 0.0 {
+                    continue;
+                }
                 last = i;
                 r -= mass;
-                if r <= 0.0 { return cand[i].1; }
+                if r <= 0.0 {
+                    return cand[i].1;
+                }
             }
             cand[last].1
         }
@@ -660,12 +747,7 @@ mod tests {
     fn checked_sampling_rejects_invalid_rows_without_advancing_rng() {
         let mut sampler = Sampler::new(0.5, 64, 1.0, 0.0, 7);
         let before = sampler.state;
-        for row in [
-            &[][..],
-            &[1.0, f32::NAN],
-            &[f32::INFINITY, 2.0],
-            &[2.0, f32::NEG_INFINITY],
-        ] {
+        for row in [&[][..], &[1.0, f32::NAN], &[f32::INFINITY, 2.0], &[2.0, f32::NEG_INFINITY]] {
             assert!(checked_argmax(row).is_err());
             assert!(sampler.sample_next(row).is_err());
             assert_eq!(sampler.state, before);
@@ -692,11 +774,7 @@ mod tests {
             let d = direct_s.sample_next(&target_tied).unwrap() as usize;
             direct_tied[d] += 1;
             let proposed = draft_s.sample_next(&draft_adversarial).unwrap();
-            let accepted = verify_s.verify_round(
-                &[proposed],
-                &[&target_tied, &target_tied],
-                &[&draft_adversarial],
-            );
+            let accepted = verify_s.verify_round(&[proposed], &[&target_tied, &target_tied], &[&draft_adversarial]);
             spec_tied[accepted[0] as usize] += 1;
         }
         for excluded in [0usize, 4, 5] {
@@ -720,11 +798,7 @@ mod tests {
         for _ in 0..DRAWS {
             direct_untied[direct_s.sample_next(&target_untied).unwrap() as usize] += 1;
             let proposed = draft_s.sample_next(&draft_adversarial).unwrap();
-            let accepted = verify_s.verify_round(
-                &[proposed],
-                &[&target_untied, &target_untied],
-                &[&draft_adversarial],
-            );
+            let accepted = verify_s.verify_round(&[proposed], &[&target_untied, &target_untied], &[&draft_adversarial]);
             spec_untied[accepted[0] as usize] += 1;
         }
         for excluded in [0usize, 4, 5] {
@@ -744,10 +818,7 @@ mod tests {
         //    lowest token ID wins deterministically across direct sampling, greedy verify, and near-zero verify_round.
         let mut z_direct = Sampler::new(0.0, 3, 1.0, SOFTCAP, 42);
         let mut nz_verify = Sampler::new(1e-6, 3, 1.0, SOFTCAP, 99);
-        for (row, want_winner) in [
-            (&[0.0f32, 2.0, 2.0, 2.0][..], 1u32),
-            (&[0.0f32, 1.0, 3.0, 2.0][..], 2u32),
-        ] {
+        for (row, want_winner) in [(&[0.0f32, 2.0, 2.0, 2.0][..], 1u32), (&[0.0f32, 1.0, 3.0, 2.0][..], 2u32)] {
             assert_eq!(checked_argmax(row), Ok(want_winner));
             assert_eq!(z_direct.sample_next(row), Ok(want_winner));
             for cand_draft in 0..4u32 {

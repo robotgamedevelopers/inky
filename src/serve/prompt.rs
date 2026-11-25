@@ -4,7 +4,11 @@ use super::{Specials, Tokenizer};
 use serde_json::{json, Value};
 
 fn format_effort_num(v: f64) -> String {
-    if v == 0.0 { "0".into() } else { format!("{v}") }
+    if v == 0.0 {
+        "0".into()
+    } else {
+        format!("{v}")
+    }
 }
 
 pub fn validate_effort(e: &str) -> Result<String, String> {
@@ -87,24 +91,41 @@ pub(super) enum RenderError {
 }
 
 impl From<String> for RenderError {
-    fn from(message: String) -> Self { Self::Invalid(message) }
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
 }
 
 impl From<&str> for RenderError {
-    fn from(message: &str) -> Self { Self::Invalid(message.into()) }
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
 }
 
 /// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
 /// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
-pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize, continued_assistants: &[usize]) -> Result<Vec<u32>, RenderError> {
+pub(super) fn render_limited(
+    tk: &Tokenizer,
+    sp: &Specials,
+    req: &Value,
+    default_effort: &str,
+    limit: usize,
+    continued_assistants: &[usize],
+) -> Result<Vec<u32>, RenderError> {
     if !req.is_object() {
         return Err("request body must be a JSON object".into());
     }
     let text = |t: &mut Vec<u32>, s: &str| {
-        if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
+        if tk.encode_plain_limited(s, t, limit) {
+            Ok(())
+        } else {
+            Err(RenderError::TooLong)
+        }
     };
     let marks = |t: &mut Vec<u32>, tokens: &[u32]| {
-        if tokens.len() > limit.saturating_sub(t.len()) { return Err(RenderError::TooLong); }
+        if tokens.len() > limit.saturating_sub(t.len()) {
+            return Err(RenderError::TooLong);
+        }
         t.extend_from_slice(tokens);
         Ok(())
     };
@@ -124,7 +145,8 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
                     Some(Value::Object(fo)) => fo,
                     Some(_) => return Err("tool.function must be an object".into()),
                 };
-                let name = f.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool without a name")?;
+                let name =
+                    f.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool without a name")?;
                 let desc = match f.get("description") {
                     None | Some(Value::Null) => "",
                     Some(Value::String(d)) => d.as_str(),
@@ -157,7 +179,10 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
         let m_obj = m.as_object().ok_or("each message must be an object")?;
         let role = m_obj.get("role").and_then(Value::as_str).ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
-        if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
+        if !effort_done && role != "system" {
+            emit_effort(&mut t)?;
+            effort_done = true;
+        }
         if role == "assistant" {
             if let Some(tcs) = m_obj.get("tool_calls").and_then(Value::as_array) {
                 for tc in tcs {
@@ -186,13 +211,17 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(_) => return Err("tool message name must be a string".into()),
                 }
-                .or_else(|| m_obj.get("tool_call_id").and_then(Value::as_str).and_then(|id| call_names.get(id).cloned()))
+                .or_else(|| {
+                    m_obj.get("tool_call_id").and_then(Value::as_str).and_then(|id| call_names.get(id).cloned())
+                })
                 .unwrap_or_default();
                 let mut parts = match m_obj.get("content") {
                     None | Some(Value::Null) => vec![""],
                     Some(c) => try_content_parts(c, true)?,
                 };
-                if parts.is_empty() { parts.push(""); }
+                if parts.is_empty() {
+                    parts.push("");
+                }
                 let is_error = match m_obj.get("is_error") {
                     None | Some(Value::Null) => false,
                     Some(Value::Bool(b)) => *b,
@@ -223,7 +252,9 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
                 };
                 let model_part = |tokens: &mut Vec<u32>, kind, body: &str| {
                     marks(tokens, &[sp.msg_model])?;
-                    if let Some(name) = asst_name { text(tokens, name)?; }
+                    if let Some(name) = asst_name {
+                        text(tokens, name)?;
+                    }
                     marks(tokens, &[kind])?;
                     text(tokens, body)?;
                     marks(tokens, &[sp.end])
@@ -239,7 +270,9 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
                 match m_obj.get("content") {
                     None | Some(Value::Null) => {
                         if calls.is_empty() && reasoning.is_none() {
-                            return Err("assistant message must include content, reasoning_content, or tool_calls".into());
+                            return Err(
+                                "assistant message must include content, reasoning_content, or tool_calls".into()
+                            );
                         }
                     }
                     Some(Value::String(s)) => {
@@ -257,12 +290,21 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
                 }
                 for tc in calls {
                     let tc_obj = tc.as_object().ok_or("each tool call must be an object")?;
-                    let fn_obj = tc_obj.get("function").and_then(Value::as_object).ok_or("tool call function must be an object")?;
-                    let name = fn_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool call without a name")?;
+                    let fn_obj = tc_obj
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .ok_or("tool call function must be an object")?;
+                    let name = fn_obj
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or("tool call without a name")?;
                     let args: Value = match fn_obj.get("arguments") {
                         None | Some(Value::Null) => json!({}),
                         Some(Value::String(s)) if s.trim().is_empty() => json!({}),
-                        Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?,
+                        Some(Value::String(s)) => {
+                            serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?
+                        }
                         Some(v) => v.clone(),
                     };
                     marks(&mut t, &[sp.msg_model])?;
@@ -278,11 +320,18 @@ pub(super) fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default
             r => return Err(format!("unknown role {r}").into()),
         }
     }
-    if !effort_done { emit_effort(&mut t)?; }
+    if !effort_done {
+        emit_effort(&mut t)?;
+    }
     Ok(t)
 }
 
 #[cfg(test)]
-pub(super) fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, RenderError> {
+pub(super) fn render(
+    tk: &Tokenizer,
+    sp: &Specials,
+    req: &Value,
+    default_effort: &str,
+) -> Result<Vec<u32>, RenderError> {
     render_limited(tk, sp, req, default_effort, usize::MAX, &[])
 }

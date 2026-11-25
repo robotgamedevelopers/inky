@@ -37,7 +37,10 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 
 /// The helper's state (MemMode.tla): the limit it found when it raised it, and how many clients are connected.
 #[derive(Default)]
-pub struct Mode { pub saved: Option<u64>, pub clients: usize }
+pub struct Mode {
+    pub saved: Option<u64>,
+    pub clients: usize,
+}
 
 impl Mode {
     /// A client connected: the first one raises the limit to `target` when the current limit is below `target`,
@@ -47,7 +50,13 @@ impl Mode {
     /// before failing is rolled back to the limit found; the save (in memory and on disk) is forgotten once the limit
     /// is confirmed back where it was, and kept only while the limit is still moved, so the helper's exit paths can
     /// still restore it.
-    pub fn connect(&mut self, target: u64, get: impl Fn() -> Option<u64>, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Result<(), String> {
+    pub fn connect(
+        &mut self,
+        target: u64,
+        get: impl Fn() -> Option<u64>,
+        set: impl Fn(u64) -> Result<(), String>,
+        keep: impl Fn(Option<u64>) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.clients == 0 {
             if self.saved.is_none() {
                 let found = get().ok_or("the current limit cannot be read; not raising it")?;
@@ -60,10 +69,14 @@ impl Mode {
             }
             let found = self.saved.unwrap();
             if let Err(e) = set(target) {
-                if get() != Some(found) { let _ = set(found); }     // the raise moved the limit before failing: put it back
+                if get() != Some(found) {
+                    let _ = set(found);
+                } // the raise moved the limit before failing: put it back
                 if get() == Some(found) {
                     self.saved = None;
-                    if let Err(ke) = keep(None) { eprintln!("[inky memd] the unraised limit {found} could not be forgotten on disk: {ke}"); }
+                    if let Err(ke) = keep(None) {
+                        eprintln!("[inky memd] the unraised limit {found} could not be forgotten on disk: {ke}");
+                    }
                 }
                 return Err(format!("the limit could not be raised: {e}"));
             }
@@ -76,7 +89,12 @@ impl Mode {
     /// nothing in here retries on its own. Once the restore is confirmed by reading the limit back, the in-memory
     /// save is cleared even if forgetting the file fails — the stale file is overwritten by the next connect's
     /// fresh save — so the next session always reads the owner's current limit.
-    pub fn close(&mut self, get: impl Fn() -> Option<u64>, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) {
+    pub fn close(
+        &mut self,
+        get: impl Fn() -> Option<u64>,
+        set: impl Fn(u64) -> Result<(), String>,
+        keep: impl Fn(Option<u64>) -> Result<(), String>,
+    ) {
         assert!(self.clients > 0);
         self.clients -= 1;
         if self.clients == 0 {
@@ -94,14 +112,28 @@ impl Mode {
     }
 }
 
-fn get_limit() -> Option<u64> { crate::tuning::sysctl_u64(LIMIT) }
+fn get_limit() -> Option<u64> {
+    crate::tuning::sysctl_u64(LIMIT)
+}
 /// Sets the limit, reporting failure. Success is confirmed by reading the limit back.
 fn set_limit(v: u64) -> Result<(), String> {
     let Ok(mut x) = u32::try_from(v) else { return Err(format!("{v} does not fit {LIMIT}; not set")) };
     let n = std::ffi::CString::new(LIMIT).unwrap();
-    let r = unsafe { libc::sysctlbyname(n.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut x as *mut u32 as *mut libc::c_void, 4) };
-    if r != 0 { return Err(format!("setting {LIMIT}={v} failed: {}", std::io::Error::last_os_error())); }
-    if get_limit() != Some(v) { return Err(format!("setting {LIMIT}={v} was not confirmed by reading it back")); }
+    let r = unsafe {
+        libc::sysctlbyname(
+            n.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut x as *mut u32 as *mut libc::c_void,
+            4,
+        )
+    };
+    if r != 0 {
+        return Err(format!("setting {LIMIT}={v} failed: {}", std::io::Error::last_os_error()));
+    }
+    if get_limit() != Some(v) {
+        return Err(format!("setting {LIMIT}={v} was not confirmed by reading it back"));
+    }
     eprintln!("[inky memd] {LIMIT} = {v}");
     Ok(())
 }
@@ -184,18 +216,28 @@ pub(super) fn write_saved_atomic(path: &str, value: u64, boot: Option<&str>) -> 
     .map_err(|e| format!("could not record the saved limit in {path}: {e}"))
 }
 
-pub(super) fn restore_on_startup(saved_path: &str, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Result<Mode, String> {
+pub(super) fn restore_on_startup(
+    saved_path: &str,
+    set: impl Fn(u64) -> Result<(), String>,
+    keep: impl Fn(Option<u64>) -> Result<(), String>,
+) -> Result<Mode, String> {
     let mut seed = None;
     match read_saved_record(saved_path, None)? {
         SavedRecord::Absent | SavedRecord::StaleBoot(_, _) => {}
         SavedRecord::Unparsable(reason) => {
             eprintln!("[inky memd] ignoring unparsable saved limit in {saved_path} ({reason}); clearing corrupt file");
-            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            if let Err(e) = keep(None) {
+                eprintln!("[inky memd] {e}");
+            }
         }
         SavedRecord::Current(v) => {
             eprintln!("[inky memd] the previous helper stopped while the limit was raised: restoring {v}");
             match set(v) {
-                Ok(()) => { if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); } }
+                Ok(()) => {
+                    if let Err(e) = keep(None) {
+                        eprintln!("[inky memd] {e}");
+                    }
+                }
                 Err(e) => {
                     eprintln!("[inky memd] restoring {v} failed: {e}; keeping the saved limit in {saved_path}");
                     seed = Some(v);
@@ -216,12 +258,16 @@ pub(super) fn restore_on_startup_for_boot(
         SavedRecord::Absent => Ok(Mode::default()),
         SavedRecord::StaleBoot(old_boot, old_val) => {
             eprintln!("[inky memd] ignoring stale saved limit {old_val} from earlier boot {old_boot}");
-            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            if let Err(e) = keep(None) {
+                eprintln!("[inky memd] {e}");
+            }
             Ok(Mode::default())
         }
         SavedRecord::Unparsable(reason) => {
             eprintln!("[inky memd] ignoring unparsable saved limit in {saved_path} ({reason}); clearing corrupt file");
-            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            if let Err(e) = keep(None) {
+                eprintln!("[inky memd] {e}");
+            }
             Ok(Mode::default())
         }
         SavedRecord::Current(_) => restore_on_startup(saved_path, set, keep),
@@ -229,12 +275,14 @@ pub(super) fn restore_on_startup_for_boot(
 }
 
 fn checked_directory(path: &Path, uid: u32) -> Result<Metadata, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("could not inspect directory {}: {e}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| format!("could not inspect directory {}: {e}", path.display()))?;
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
         return Err(format!("{} must be a real directory writable only by UID {uid}", path.display()));
     }
-    if uid == 0 { require_no_acl(path)?; }
+    if uid == 0 {
+        require_no_acl(path)?;
+    }
     Ok(metadata)
 }
 
@@ -249,17 +297,22 @@ fn require_no_acl(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("invalid directory path {}: {e}", path.display()))?;
     let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
     if !acl.is_null() {
-        unsafe { acl_free(acl); }
+        unsafe {
+            acl_free(acl);
+        }
         return Err(format!("{} has an extended access control list", path.display()));
     }
     let e = io::Error::last_os_error();
     // The directory was verified above. Darwin reports ENOENT when its ACL is absent.
-    if e.kind() == io::ErrorKind::NotFound { return Ok(()); }
+    if e.kind() == io::ErrorKind::NotFound {
+        return Ok(());
+    }
     Err(format!("could not inspect the access control list for {}: {e}", path.display()))
 }
 
 fn socket_directory(path: &Path) -> Result<&Path, String> {
-    path.parent().filter(|dir| !dir.as_os_str().is_empty())
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
         .ok_or_else(|| format!("{} needs a socket directory", path.display()))
 }
 
@@ -275,8 +328,7 @@ fn check_system_socket_ancestors(dir: &Path) -> Result<(), String> {
 fn prepare_socket_directory(dir: &Path, uid: u32, fake: bool) -> Result<(), String> {
     if fake {
         if let Some(parent) = dir.parent().filter(|path| !path.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("could not create directory {}: {e}", parent.display()))?;
         }
     } else {
         check_system_socket_ancestors(dir)?;
@@ -313,8 +365,7 @@ fn remove_socket(path: &Path) -> Result<(), String> {
 }
 
 fn check_socket(path: &Path, owner: u32) -> Result<(), String> {
-    let md = fs::symlink_metadata(path)
-        .map_err(|e| format!("could not inspect socket {}: {e}", path.display()))?;
+    let md = fs::symlink_metadata(path).map_err(|e| format!("could not inspect socket {}: {e}", path.display()))?;
     if !md.file_type().is_socket() || md.uid() != owner || md.mode() & 0o7777 != 0o600 {
         return Err(format!("{} must be a socket with owner UID {owner} and mode 600", path.display()));
     }
@@ -326,7 +377,9 @@ fn bind_socket(path: &Path, owner: u32, directory_uid: u32, fake: bool) -> Resul
     remove_socket(path)?;
     let old_mask = unsafe { libc::umask(0o177) };
     let listener = UnixListener::bind(path);
-    unsafe { libc::umask(old_mask); }
+    unsafe {
+        libc::umask(old_mask);
+    }
     let listener = listener.map_err(|e| format!("could not bind {}: {e}", path.display()))?;
     // With the private mode already in place, give the account access to the socket only.
     if !fake {
@@ -387,10 +440,7 @@ fn wait_for_disconnect<R: Read>(r: &mut R) {
 }
 
 fn sanitize_reason(msg: &str) -> String {
-    let clean: String = msg
-        .chars()
-        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
-        .collect();
+    let clean: String = msg.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
     let trimmed = clean.trim();
     if trimmed.is_empty() {
         "request refused".to_string()
@@ -411,9 +461,7 @@ pub enum LeaseOutcome {
 fn parse_enter_reply(line: &str) -> Result<u64, String> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if let Some(rest) = trimmed.strip_prefix("ok ") {
-        rest.trim()
-            .parse::<u64>()
-            .map_err(|_| format!("invalid limit in helper reply: {trimmed}"))
+        rest.trim().parse::<u64>().map_err(|_| format!("invalid limit in helper reply: {trimmed}"))
     } else if let Some(reason) = trimmed.strip_prefix("err ") {
         Err(sanitize_reason(reason))
     } else if trimmed == "err" {
@@ -495,13 +543,7 @@ fn boot_session_id() -> Option<String> {
     let mut buf = [0u8; 64];
     let mut len = buf.len();
     let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
+        libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0)
     };
     if rc != 0 || len == 0 || len > buf.len() {
         return None;
@@ -524,11 +566,7 @@ pub(crate) fn raise_and_clamp_max_conns(desired: usize, reserve_fds: usize) -> u
         return desired.min(192);
     }
     let target = TARGET_SOFT_NOFILE as libc::rlim_t;
-    let ceiling = if rlim.rlim_max == libc::RLIM_INFINITY {
-        target
-    } else {
-        rlim.rlim_max.min(target)
-    };
+    let ceiling = if rlim.rlim_max == libc::RLIM_INFINITY { target } else { rlim.rlim_max.min(target) };
     if rlim.rlim_cur < ceiling {
         let raised = libc::rlimit { rlim_cur: ceiling, rlim_max: rlim.rlim_max };
         let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) };
@@ -572,7 +610,10 @@ impl AcceptBackoff {
             self.suppressed = 0;
             self.last_log = Some(now);
             if sup > 0 {
-                Some(format!("[{}] accept error: {err} (suppressed {sup} earlier accept errors); backing off {} ms", self.label, self.delay_ms))
+                Some(format!(
+                    "[{}] accept error: {err} (suppressed {sup} earlier accept errors); backing off {} ms",
+                    self.label, self.delay_ms
+                ))
             } else {
                 Some(format!("[{}] accept error: {err}; backing off {} ms", self.label, self.delay_ms))
             }
@@ -597,7 +638,9 @@ impl AcceptBackoff {
 fn read_bounded_line<R: BufRead>(r: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
     let mut line = String::new();
     let n = r.by_ref().take((max_bytes + 1) as u64).read_line(&mut line)?;
-    if n == 0 { return Ok(None); }
+    if n == 0 {
+        return Ok(None);
+    }
     if line.len() > max_bytes {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "memd line too long"));
     }
@@ -610,7 +653,9 @@ impl ClientGuard {
     fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         let mut cur = active.load(Ordering::Acquire);
         loop {
-            if cur >= limit { return None; }
+            if cur >= limit {
+                return None;
+            }
             match active.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Some(Self(active.clone())),
                 Err(next) => cur = next,
@@ -620,7 +665,9 @@ impl ClientGuard {
 }
 
 impl Drop for ClientGuard {
-    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
@@ -638,20 +685,30 @@ pub fn daemon(args: &[String]) {
 }
 
 fn daemon_target(args: &[String], fake: bool, tuned_mb: u64) -> Result<u64, String> {
-    let Some(index) = args.iter().position(|arg| arg == "--fake-target-mb") else { return Ok(tuned_mb); };
-    if !fake { return Err("--fake-target-mb requires --fake".into()); }
-    args.get(index + 1).and_then(|v| v.parse::<u32>().ok()).map(u64::from)
+    let Some(index) = args.iter().position(|arg| arg == "--fake-target-mb") else {
+        return Ok(tuned_mb);
+    };
+    if !fake {
+        return Err("--fake-target-mb requires --fake".into());
+    }
+    args.get(index + 1)
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(u64::from)
         .ok_or_else(|| "--fake-target-mb requires a wired limit in MB (unsigned 32-bit integer)".into())
 }
 
 fn run_daemon(args: &[String]) -> Result<(), String> {
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1));
-    let owner: u32 = arg("--owner").and_then(|v| v.parse().ok())
-        .filter(|&uid| uid != libc::uid_t::MAX).ok_or("memd requires --owner UID")?;
+    let owner: u32 = arg("--owner")
+        .and_then(|v| v.parse().ok())
+        .filter(|&uid| uid != libc::uid_t::MAX)
+        .ok_or("memd requires --owner UID")?;
     let fake = args.iter().any(|a| a == "--fake");
     let uid = unsafe { libc::geteuid() };
     let path = if fake {
-        if uid == 0 || uid != owner { return Err("fake memd requires the current unprivileged UID".into()); }
+        if uid == 0 || uid != owner {
+            return Err("fake memd requires the current unprivileged UID".into());
+        }
         arg("--socket").ok_or("fake memd requires --socket PATH")?.as_str()
     } else {
         if uid != 0 || args.iter().any(|a| a == "--socket") {
@@ -665,8 +722,17 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let target = daemon_target(args, fake, tuning.wired_limit_mb)?;
     let fake_limit = Arc::new(Mutex::new(0u64));
     let (fl1, fl2) = (fake_limit.clone(), fake_limit.clone());
-    let get: Arc<dyn Fn() -> Option<u64> + Send + Sync> = if fake { Arc::new(move || Some(*fl1.lock().unwrap())) } else { Arc::new(get_limit) };
-    let set: Arc<dyn Fn(u64) -> Result<(), String> + Send + Sync> = if fake { Arc::new(move |v| { *fl2.lock().unwrap() = v; eprintln!("[inky memd] (fake) limit = {v}"); Ok(()) }) } else { Arc::new(set_limit) };
+    let get: Arc<dyn Fn() -> Option<u64> + Send + Sync> =
+        if fake { Arc::new(move || Some(*fl1.lock().unwrap())) } else { Arc::new(get_limit) };
+    let set: Arc<dyn Fn(u64) -> Result<(), String> + Send + Sync> = if fake {
+        Arc::new(move |v| {
+            *fl2.lock().unwrap() = v;
+            eprintln!("[inky memd] (fake) limit = {v}");
+            Ok(())
+        })
+    } else {
+        Arc::new(set_limit)
+    };
     // the saved limit on disk (beside the socket with --fake, so tests need no root)
     let saved_path = if fake { format!("{path}.saved") } else { SAVED.to_string() };
     let boot_id = boot_session_id();
@@ -674,13 +740,18 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let sp = saved_path.clone();
     let keep: Arc<dyn Fn(Option<u64>) -> Result<(), String> + Send + Sync> = Arc::new(move |v| match v {
         Some(v) => write_saved_atomic(&sp, v, boot_for_keep.as_deref()),
-        None => match std::fs::remove_file(&sp) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(format!("could not forget the saved limit in {sp}: {e}")) },
+        None => match std::fs::remove_file(&sp) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("could not forget the saved limit in {sp}: {e}")),
+        },
     });
     // a helper that died while the limit was raised left the limit it found on disk: put it back first (`set`
     // confirms by reading back, so its Ok is the confirmation). If the restore fails, the file is kept and Mode is
     // seeded from it below, so the first connect restores that limit instead of reading the still-raised limit
     // as the found one and overwriting the file with it. Saved files from an earlier macOS boot are ignored.
-    let mode = Arc::new(Mutex::new(restore_on_startup_for_boot(&saved_path, boot_id.as_deref(), |v| set(v), |v| keep(v))?));
+    let mode =
+        Arc::new(Mutex::new(restore_on_startup_for_boot(&saved_path, boot_id.as_deref(), |v| set(v), |v| keep(v))?));
     // SIGTERM (launchctl bootout) and SIGINT: give the memory back, then exit (`set` confirms by reading back,
     // so its Ok is the confirmation; Mode::close keeps its own read-back because its `set` is injected)
     {
@@ -690,13 +761,17 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
             libc::sigaddset(&mut sigs, libc::SIGTERM);
             libc::sigaddset(&mut sigs, libc::SIGINT);
             let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &sigs, std::ptr::null_mut());
-            if rc != 0 { return Err(format!("could not block shutdown signals: {}", io::Error::from_raw_os_error(rc))); }
+            if rc != 0 {
+                return Err(format!("could not block shutdown signals: {}", io::Error::from_raw_os_error(rc)));
+            }
         }
         let (mode, set, keep) = (mode.clone(), set.clone(), keep.clone());
         std::thread::spawn(move || {
             let mut sig = 0;
             let rc = unsafe { libc::sigwait(&sigs, &mut sig) };
-            if rc != 0 { eprintln!("[inky memd] could not wait for a shutdown signal: {}", io::Error::from_raw_os_error(rc)); }
+            if rc != 0 {
+                eprintln!("[inky memd] could not wait for a shutdown signal: {}", io::Error::from_raw_os_error(rc));
+            }
             let m = mode.lock().unwrap();
             if let Some(v) = m.saved {
                 if let Err(e) = set(v).and_then(|()| keep(None)) {
@@ -711,7 +786,10 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let listener = bind_socket(Path::new(path), owner, uid, fake)?;
     let active_clients = Arc::new(AtomicUsize::new(0));
     let mut backoff = AcceptBackoff::new("inky memd");
-    eprintln!("[inky memd] tuning {} ({chip}, {} GB): inky mode raises {LIMIT} to {target}; listening on {path}", tuning.name, tuning.memory_gb);
+    eprintln!(
+        "[inky memd] tuning {} ({chip}, {} GB): inky mode raises {LIMIT} to {target}; listening on {path}",
+        tuning.name, tuning.memory_gb
+    );
     for incoming in listener.incoming() {
         let s = match incoming {
             Ok(s) => {
@@ -805,7 +883,9 @@ pub struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         let _ = self.stop.shutdown(std::net::Shutdown::Both);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -823,11 +903,15 @@ fn maintain_lease(path: String, initial: Option<UnixStream>, stop: UnixStream) {
         let timeout = if connection.is_some() { -1 } else { retry_ms };
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
             let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted { continue; }
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             eprintln!("[inky] cannot monitor memory-helper connection: {err}");
             return;
         }
-        if fds[0].revents != 0 { return; }
+        if fds[0].revents != 0 {
+            return;
+        }
         if connection.take().is_some() {
             eprintln!("[inky] lost memory-helper connection; retrying");
             retry_ms = 100;
@@ -897,8 +981,10 @@ pub fn enter_persistent(path: &str) -> Option<Lease> {
     };
     let (stop, monitor) = UnixStream::pair().ok()?;
     let path = path.to_owned();
-    let worker = std::thread::Builder::new().name("inky-memd-lease".into())
-        .spawn(move || maintain_lease(path, stream, monitor)).ok()?;
+    let worker = std::thread::Builder::new()
+        .name("inky-memd-lease".into())
+        .spawn(move || maintain_lease(path, stream, monitor))
+        .ok()?;
     Some(Lease { initial_limit, stop, worker: Some(worker) })
 }
 
@@ -920,7 +1006,9 @@ pub fn install(args: &[String]) {
 }
 
 fn service_is_loaded() -> Result<bool, String> {
-    let out = Command::new(LAUNCHCTL).args(["print", &format!("system/{LABEL}")]).output()
+    let out = Command::new(LAUNCHCTL)
+        .args(["print", &format!("system/{LABEL}")])
+        .output()
         .map_err(|e| format!("could not run launchctl print: {e}"))?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -930,15 +1018,23 @@ fn service_is_loaded() -> Result<bool, String> {
 }
 
 fn require_service_absent() -> Result<(), String> {
-    if service_is_loaded()? { return Err(format!("launchd still has service {LABEL}")); }
+    if service_is_loaded()? {
+        return Err(format!("launchd still has service {LABEL}"));
+    }
     Ok(())
 }
 
 fn stop_helper() -> Result<(), String> {
-    if !service_is_loaded()? { return Ok(()); }
-    let status = Command::new(LAUNCHCTL).args(["bootout", &format!("system/{LABEL}")]).status()
+    if !service_is_loaded()? {
+        return Ok(());
+    }
+    let status = Command::new(LAUNCHCTL)
+        .args(["bootout", &format!("system/{LABEL}")])
+        .status()
         .map_err(|e| format!("could not run launchctl bootout: {e}"))?;
-    if !status.success() { return Err(format!("launchctl bootout failed ({status})")); }
+    if !status.success() {
+        return Err(format!("launchctl bootout failed ({status})"));
+    }
     require_service_absent()
 }
 
@@ -1023,7 +1119,9 @@ fn uninstall_helper() -> Result<(), String> {
     checked_directory(Path::new("/Library"), 0)?;
     for dir in [Path::new(HELPER_DIR), Path::new(PLIST).parent().unwrap()] {
         match fs::symlink_metadata(dir) {
-            Ok(_) => { checked_directory(dir, 0)?; }
+            Ok(_) => {
+                checked_directory(dir, 0)?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("could not inspect {}: {e}", dir.display())),
         }
@@ -1040,7 +1138,9 @@ fn uninstall_helper() -> Result<(), String> {
     retire_legacy_socket(Path::new(OLD_SOCKET_DIR))?;
     remove_legacy_helper(Path::new(OLD_HELPER))?;
     let files = [SAVED_TEMP, HELPER_TEMP, PLIST_TEMP, PLIST, HELPER];
-    for file in files { remove_file_if_present(Path::new(file))?; }
+    for file in files {
+        remove_file_if_present(Path::new(file))?;
+    }
     for path in [dir, Path::new(OLD_SOCKET_DIR), Path::new(SAVED)].into_iter().chain(files.into_iter().map(Path::new)) {
         require_absent(path)?;
     }
@@ -1058,8 +1158,11 @@ fn check_installed_helper() -> Result<(), String> {
 }
 
 fn install_helper() -> Result<(), String> {
-    let owner: u32 = std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok())
-        .filter(|&uid| uid != libc::uid_t::MAX).ok_or("run it with sudo from the owner's account")?;
+    let owner: u32 = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&uid| uid != libc::uid_t::MAX)
+        .ok_or("run it with sudo from the owner's account")?;
     checked_directory(Path::new("/Library"), 0)?;
     match fs::DirBuilder::new().mode(0o755).create(HELPER_DIR) {
         Ok(()) => {}
@@ -1099,12 +1202,18 @@ fn install_helper() -> Result<(), String> {
         fs::rename(PLIST_TEMP, PLIST)
     };
     write_plist().map_err(|e| format!("could not write {PLIST}: {e}"))?;
-    let status = Command::new(LAUNCHCTL).args(["bootstrap", "system", PLIST]).status()
+    let status = Command::new(LAUNCHCTL)
+        .args(["bootstrap", "system", PLIST])
+        .status()
         .map_err(|e| format!("could not run launchctl bootstrap: {e}"))?;
-    if !status.success() { return Err(format!("launchctl bootstrap failed ({status})")); }
+    if !status.success() {
+        return Err(format!("launchctl bootstrap failed ({status})"));
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     while let Err(e) = check_socket(socket, owner) {
-        if Instant::now() >= deadline { return Err(format!("the helper did not publish its socket: {e}")); }
+        if Instant::now() >= deadline {
+            return Err(format!("the helper did not publish its socket: {e}"));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     check_installed_helper()?;
@@ -1158,7 +1267,9 @@ mod tests {
     }
 
     impl Drop for SocketTestDir {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -1187,19 +1298,69 @@ mod tests {
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
     }
 
-    #[test] fn raised_while_connected_and_restored_after_the_last() {
+    #[test]
+    fn raised_while_connected_and_restored_after_the_last() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap();
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(disk.get(), Some(50000), "the limit found is on disk before the raise");
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap();
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(lim.get(), 118000);
-        m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
         assert_eq!(lim.get(), 118000, "still one client: still raised");
-        m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
-        assert_eq!((lim.get(), m.saved, disk.get()), (50000, None, None), "the limit found, not the default; nothing left on disk");
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            (lim.get(), m.saved, disk.get()),
+            (50000, None, None),
+            "the limit found, not the default; nothing left on disk"
+        );
     }
-    #[test] fn owner_higher_or_equal_limit_is_never_lowered_or_saved() {
+    #[test]
+    fn owner_higher_or_equal_limit_is_never_lowered_or_saved() {
         for initial in [118_000u64, 130_000u64] {
             let lim = Cell::new(initial);
             let mut m = Mode::default();
@@ -1208,14 +1369,16 @@ mod tests {
                 || Some(lim.get()),
                 |_| panic!("set must not be called when current limit {initial} >= target"),
                 |_| panic!("keep must not be called when current limit {initial} >= target"),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!((lim.get(), m.clients, m.saved), (initial, 1, None));
             m.connect(
                 118_000,
                 || panic!("get must not be called while clients > 0"),
                 |_| panic!("set must not be called while clients > 0"),
                 |_| panic!("keep must not be called while clients > 0"),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!((lim.get(), m.clients, m.saved), (initial, 2, None));
             m.close(
                 || panic!("get must not be called on non-final close"),
@@ -1230,63 +1393,255 @@ mod tests {
             assert_eq!((lim.get(), m.clients, m.saved), (initial, 0, None));
         }
     }
-    #[test] fn a_second_session_saves_afresh() {
+    #[test]
+    fn a_second_session_saves_afresh() {
         let (lim, disk) = (Cell::new(0u64), Cell::new(None));
         let mut m = Mode::default();
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap(); m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
-        lim.set(70000);     // the owner changes it between sessions
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap(); m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
+        lim.set(70000); // the owner changes it between sessions
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
         assert_eq!(lim.get(), 70000);
     }
-    #[test] fn an_unreadable_limit_is_never_raised() {
+    #[test]
+    fn an_unreadable_limit_is_never_raised() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
-        assert!(m.connect(118000, || None, |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).is_err());
+        assert!(m
+            .connect(
+                118000,
+                || None,
+                |v| {
+                    lim.set(v);
+                    Ok(())
+                },
+                |v| {
+                    disk.set(v);
+                    Ok(())
+                }
+            )
+            .is_err());
         assert_eq!((lim.get(), m.clients, disk.get()), (50000, 0, None));
     }
-    #[test] fn a_failed_saved_write_refuses_the_raise() {
+    #[test]
+    fn a_failed_saved_write_refuses_the_raise() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None::<u64>));
         let mut m = Mode::default();
-        assert!(m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |_| Err("the saved file cannot be written".to_string())).is_err());
-        assert_eq!((lim.get(), m.clients, m.saved, disk.get()), (50000, 0, None, None), "no raise and no client when the saved limit cannot be written");
+        assert!(m
+            .connect(
+                118000,
+                || Some(lim.get()),
+                |v| {
+                    lim.set(v);
+                    Ok(())
+                },
+                |_| Err("the saved file cannot be written".to_string())
+            )
+            .is_err());
+        assert_eq!(
+            (lim.get(), m.clients, m.saved, disk.get()),
+            (50000, 0, None, None),
+            "no raise and no client when the saved limit cannot be written"
+        );
     }
-    #[test] fn a_failed_raise_is_refused() {
+    #[test]
+    fn a_failed_raise_is_refused() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
-        assert!(m.connect(118000, || Some(lim.get()), |_| Err("the limit cannot be set".to_string()), |v| { disk.set(v); Ok(()) }).is_err());
-        assert_eq!((lim.get(), m.clients, m.saved, disk.get()), (50000, 0, None, None), "no client and nothing saved when the raise itself fails and the limit never moved");
+        assert!(m
+            .connect(
+                118000,
+                || Some(lim.get()),
+                |_| Err("the limit cannot be set".to_string()),
+                |v| {
+                    disk.set(v);
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert_eq!(
+            (lim.get(), m.clients, m.saved, disk.get()),
+            (50000, 0, None, None),
+            "no client and nothing saved when the raise itself fails and the limit never moved"
+        );
     }
-    #[test] fn a_raise_that_moves_the_limit_then_fails_is_rolled_back() {
+    #[test]
+    fn a_raise_that_moves_the_limit_then_fails_is_rolled_back() {
         let (lim, disk, calls) = (Cell::new(50000u64), Cell::new(None), Cell::new(0u32));
         let mut m = Mode::default();
         // the first set moves the limit and then reports failure (its read-back differs); the rollback set succeeds
-        let set = |v: u64| { calls.set(calls.get() + 1); lim.set(v); if calls.get() == 1 { Err("setting was not confirmed by reading it back".to_string()) } else { Ok(()) } };
-        assert!(m.connect(118000, || Some(lim.get()), set, |v| { disk.set(v); Ok(()) }).is_err());
-        assert_eq!((lim.get(), m.clients, m.saved, disk.get()), (50000, 0, None, None), "a refused connect leaves the limit where it found it and saves nothing");
+        let set = |v: u64| {
+            calls.set(calls.get() + 1);
+            lim.set(v);
+            if calls.get() == 1 {
+                Err("setting was not confirmed by reading it back".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(m
+            .connect(
+                118000,
+                || Some(lim.get()),
+                set,
+                |v| {
+                    disk.set(v);
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert_eq!(
+            (lim.get(), m.clients, m.saved, disk.get()),
+            (50000, 0, None, None),
+            "a refused connect leaves the limit where it found it and saves nothing"
+        );
     }
-    #[test] fn a_seeded_saved_limit_is_not_overwritten_by_the_raised_limit() {
+    #[test]
+    fn a_seeded_saved_limit_is_not_overwritten_by_the_raised_limit() {
         // the daemon restarted after a failed startup restore: Mode is seeded from the saved file while the
         // limit is still raised, so the first connect must not read the raised limit as the found limit
         let (lim, disk) = (Cell::new(118000u64), Cell::new(Some(50000u64)));
         let mut m = Mode { saved: Some(50000), clients: 0 };
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap();
-        m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
-        assert_eq!((lim.get(), m.saved, disk.get()), (50000, None, None), "the seeded limit, not the raised one, is restored");
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            (lim.get(), m.saved, disk.get()),
+            (50000, None, None),
+            "the seeded limit, not the raised one, is restored"
+        );
     }
-    #[test] fn a_confirmed_restore_with_a_failed_forget_saves_afresh_next_time() {
+    #[test]
+    fn a_confirmed_restore_with_a_failed_forget_saves_afresh_next_time() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
         // keep records the save but cannot forget it on disk
-        let keep = |v: Option<u64>| if v.is_none() { Err("the saved file cannot be removed".to_string()) } else { disk.set(v); Ok(()) };
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, keep).unwrap();
-        m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, keep);
-        assert_eq!((lim.get(), m.saved, disk.get()), (50000, None, Some(50000)), "the restore stands and the in-memory save is cleared even though the file could not be forgotten");
-        lim.set(70000);     // the owner changes it between sessions
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap();
-        m.close(|| Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) });
+        let keep = |v: Option<u64>| {
+            if v.is_none() {
+                Err("the saved file cannot be removed".to_string())
+            } else {
+                disk.set(v);
+                Ok(())
+            }
+        };
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            keep,
+        )
+        .unwrap();
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            keep,
+        );
+        assert_eq!(
+            (lim.get(), m.saved, disk.get()),
+            (50000, None, Some(50000)),
+            "the restore stands and the in-memory save is cleared even though the file could not be forgotten"
+        );
+        lim.set(70000); // the owner changes it between sessions
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        m.close(
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
         assert_eq!(lim.get(), 70000, "the next session saves the owner's newer limit afresh");
     }
-    #[test] fn the_socket_directory_must_be_a_real_directory() {
+    #[test]
+    fn the_socket_directory_must_be_a_real_directory() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = scratch_dir("dirtest");
         let _ = std::fs::remove_dir_all(&base);
@@ -1317,27 +1672,35 @@ mod tests {
         let path = base.join("saved");
         let name = path.to_str().unwrap();
         let set_never = |_| panic!("startup tried to restore an unusable saved limit");
-        assert!(restore_on_startup(name, set_never, |_| panic!("absent save should not call keep")).unwrap().saved.is_none());
+        assert!(restore_on_startup(name, set_never, |_| panic!("absent save should not call keep"))
+            .unwrap()
+            .saved
+            .is_none());
 
-        for bytes in [b"".as_slice(), b"malformed", b"4294967296", b"\xff", b"0:50000", b"-5:50000", b"1700000000:notanumber"] {
+        for bytes in
+            [b"".as_slice(), b"malformed", b"4294967296", b"\xff", b"0:50000", b"-5:50000", b"1700000000:notanumber"]
+        {
             fs::write(&path, bytes).unwrap();
             let cleared = Cell::new(false);
             let mode = restore_on_startup(name, set_never, |v| {
                 assert_eq!(v, None);
                 cleared.set(true);
                 fs::remove_file(&path).map_err(|e| e.to_string())
-            }).expect("helper startup must survive an unparsable saved file");
+            })
+            .expect("helper startup must survive an unparsable saved file");
             assert!(mode.saved.is_none());
             assert!(cleared.get(), "corrupt saved file should be cleared via keep(None)");
             assert!(!path.exists());
 
             fs::write(&path, bytes).unwrap();
             let cleared_boot = Cell::new(false);
-            let mode_boot = restore_on_startup_for_boot(name, Some("00112233-4455-6677-8899-AABBCCDDEEFF"), set_never, |v| {
-                assert_eq!(v, None);
-                cleared_boot.set(true);
-                fs::remove_file(&path).map_err(|e| e.to_string())
-            }).expect("boot-tagged startup must survive an unparsable saved file");
+            let mode_boot =
+                restore_on_startup_for_boot(name, Some("00112233-4455-6677-8899-AABBCCDDEEFF"), set_never, |v| {
+                    assert_eq!(v, None);
+                    cleared_boot.set(true);
+                    fs::remove_file(&path).map_err(|e| e.to_string())
+                })
+                .expect("boot-tagged startup must survive an unparsable saved file");
             assert!(mode_boot.saved.is_none());
             assert!(cleared_boot.get());
             assert!(!path.exists());
@@ -1362,12 +1725,20 @@ mod tests {
         const CHILD: &str = "INKY_TEST_MEMD_BIND_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid"])
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid",
+                ])
                 .env(CHILD, "1")
-                .output().unwrap();
+                .output()
+                .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.status.success() && stdout.contains("1 passed;"),
-                "isolated socket check failed: {stdout} {}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "isolated socket check failed: {stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1419,16 +1790,43 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"retained");
         fs::remove_dir_all(&base).unwrap();
     }
-    #[test] fn an_unconfirmed_restore_keeps_the_saved_limit() {
+    #[test]
+    fn an_unconfirmed_restore_keeps_the_saved_limit() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
-        m.connect(118000, || Some(lim.get()), |v| { lim.set(v); Ok(()) }, |v| { disk.set(v); Ok(()) }).unwrap();
+        m.connect(
+            118000,
+            || Some(lim.get()),
+            |v| {
+                lim.set(v);
+                Ok(())
+            },
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        )
+        .unwrap();
         // a set that reports failure: the restore is not confirmed, so the saved limit is kept
-        m.close(|| Some(lim.get()), |_| Err("the limit cannot be set".to_string()), |v| { disk.set(v); Ok(()) });
+        m.close(
+            || Some(lim.get()),
+            |_| Err("the limit cannot be set".to_string()),
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
         assert_eq!((lim.get(), m.saved, disk.get()), (118000, Some(50000), Some(50000)));
         // a set that claims success but does not move the limit: reading it back does not confirm, so it is still kept
         m.clients = 1;
-        m.close(|| Some(lim.get()), |_| Ok(()), |v| { disk.set(v); Ok(()) });
+        m.close(
+            || Some(lim.get()),
+            |_| Ok(()),
+            |v| {
+                disk.set(v);
+                Ok(())
+            },
+        );
         assert_eq!((lim.get(), m.saved, disk.get()), (118000, Some(50000), Some(50000)));
     }
     #[test]
@@ -1482,7 +1880,10 @@ mod tests {
             118_000,
             || Some(lim2.get()),
             |_| Err("sysctl Operation not permitted".into()),
-            |v| { disk2.set(v); Ok(()) },
+            |v| {
+                disk2.set(v);
+                Ok(())
+            },
         );
         let refused_line = String::from_utf8(refused_out).unwrap();
         assert_eq!(
@@ -1528,10 +1929,7 @@ mod tests {
         }
         let mut timeout_handshake_out = Vec::new();
         serve_client_stream(
-            ScriptedReader {
-                steps: vec![Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))],
-                idx: 0,
-            },
+            ScriptedReader { steps: vec![Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))], idx: 0 },
             &mut timeout_handshake_out,
             &mode,
             118_000,
@@ -1539,11 +1937,9 @@ mod tests {
             |_| panic!("set must not run after handshake timeout"),
             |_| panic!("keep must not run after handshake timeout"),
         );
-        assert!(
-            parse_enter_reply(&String::from_utf8(timeout_handshake_out).unwrap())
-                .unwrap_err()
-                .contains("handshake timed out")
-        );
+        assert!(parse_enter_reply(&String::from_utf8(timeout_handshake_out).unwrap())
+            .unwrap_err()
+            .contains("handshake timed out"));
 
         let lim3 = Cell::new(50_000u64);
         let disk3 = Cell::new(None);
@@ -1563,9 +1959,15 @@ mod tests {
                 }
                 if self.timeouts_left > 0 {
                     self.timeouts_left -= 1;
-                    unsafe { (*self.observed).set((*self.observed).get() + 1); }
+                    unsafe {
+                        (*self.observed).set((*self.observed).get() + 1);
+                    }
                     return Err(io::Error::new(
-                        if self.timeouts_left.is_multiple_of(2) { io::ErrorKind::TimedOut } else { io::ErrorKind::WouldBlock },
+                        if self.timeouts_left.is_multiple_of(2) {
+                            io::ErrorKind::TimedOut
+                        } else {
+                            io::ErrorKind::WouldBlock
+                        },
                         "periodic hold timeout",
                     ));
                 }
@@ -1574,17 +1976,19 @@ mod tests {
         }
         let mut hold_out = Vec::new();
         serve_client_stream(
-            CountingHoldReader {
-                sent_handshake: false,
-                timeouts_left: 3,
-                observed: &timeouts_observed,
-            },
+            CountingHoldReader { sent_handshake: false, timeouts_left: 3, observed: &timeouts_observed },
             &mut hold_out,
             &mode,
             118_000,
             || Some(lim3.get()),
-            |v| { lim3.set(v); Ok(()) },
-            |v| { disk3.set(v); Ok(()) },
+            |v| {
+                lim3.set(v);
+                Ok(())
+            },
+            |v| {
+                disk3.set(v);
+                Ok(())
+            },
         );
         assert_eq!(String::from_utf8(hold_out).unwrap(), "ok 118000\n");
         assert_eq!(timeouts_observed.get(), 3, "periodic read timeouts must not drop held connection early");
@@ -1609,8 +2013,12 @@ mod tests {
             assert!(MAX_MEMD_CLIENTS * 4 <= PLIST_SOFT_NOFILE && PLIST_SOFT_NOFILE < PLIST_HARD_NOFILE);
         };
         let xml = render_plist(501);
-        assert!(xml.contains(&format!("<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_SOFT_NOFILE}</integer></dict>")));
-        assert!(xml.contains(&format!("<key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_HARD_NOFILE}</integer></dict>")));
+        assert!(xml.contains(&format!(
+            "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_SOFT_NOFILE}</integer></dict>"
+        )));
+        assert!(xml.contains(&format!(
+            "<key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>{PLIST_HARD_NOFILE}</integer></dict>"
+        )));
     }
     #[test]
     fn boot_tagged_saved_limit_ignores_prior_boot_and_syncs_atomically() {
@@ -1625,10 +2033,7 @@ mod tests {
         let boot2 = "00112233-4455-6677-8899-AABBCCDDEEFF";
         write_saved_atomic(name, 50000, Some(boot1)).unwrap();
         assert_eq!(read_saved_record(name, Some(boot1)), Ok(SavedRecord::Current(50000)));
-        assert_eq!(
-            read_saved_record(name, Some(boot2)),
-            Ok(SavedRecord::StaleBoot(boot1.to_string(), 50000))
-        );
+        assert_eq!(read_saved_record(name, Some(boot2)), Ok(SavedRecord::StaleBoot(boot1.to_string(), 50000)));
 
         // Stale boot record is ignored (no set() call) and cleaned up via keep(None).
         let removed = Cell::new(false);
@@ -1636,8 +2041,14 @@ mod tests {
             name,
             Some(boot2),
             |_| panic!("stale pre-reboot saved limit must not be restored"),
-            |v| { assert_eq!(v, None); removed.set(true); let _ = fs::remove_file(name); Ok(()) },
-        ).unwrap();
+            |v| {
+                assert_eq!(v, None);
+                removed.set(true);
+                let _ = fs::remove_file(name);
+                Ok(())
+            },
+        )
+        .unwrap();
         assert!(removed.get());
         assert_eq!(mode.saved, None);
         assert!(!path.exists());
@@ -1648,9 +2059,16 @@ mod tests {
         let mode2 = restore_on_startup_for_boot(
             name,
             Some(boot2),
-            |v| { restored.set(Some(v)); Ok(()) },
-            |v| { assert_eq!(v, None); fs::remove_file(name).map_err(|e| e.to_string()) },
-        ).unwrap();
+            |v| {
+                restored.set(Some(v));
+                Ok(())
+            },
+            |v| {
+                assert_eq!(v, None);
+                fs::remove_file(name).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
         assert_eq!(restored.get(), Some(50000));
         assert_eq!(mode2.saved, None);
 

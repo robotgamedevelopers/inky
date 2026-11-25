@@ -15,8 +15,8 @@ mod trace;
 // Standalone TLC driver and reference tests consume these exports.
 #[allow(unused_imports)]
 pub use trace::{
-    render_cache_scheduler_tla_bundle, walk_scheduler_trace, walk_scheduler_trace_opts,
-    SchedulerTrace, TraceAction, TraceStep, WalkStats,
+    render_cache_scheduler_tla_bundle, walk_scheduler_trace, walk_scheduler_trace_opts, SchedulerTrace, TraceAction,
+    TraceStep, WalkStats,
 };
 
 /// Explicit Layer 4 lane lifecycle (`docs/ROADMAP.md:129`, `specs/CacheScheduler.tla`).
@@ -118,16 +118,8 @@ impl BlockTier {
 /// Canonical block identifier matching `TreeIds` and `PrivIds` in `specs/CacheScheduler.tla`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BlockId {
-    Tree {
-        prefix: String,
-        kind: BlockKind,
-        idx: u32,
-    },
-    Priv {
-        lane: usize,
-        kind: BlockKind,
-        idx: u32,
-    },
+    Tree { prefix: String, kind: BlockKind, idx: u32 },
+    Priv { lane: usize, kind: BlockKind, idx: u32 },
 }
 
 /// Metadata for a single logical cache block.
@@ -165,12 +157,7 @@ pub struct StartPoint {
 
 impl Default for StartPoint {
     fn default() -> Self {
-        Self {
-            kept: false,
-            state_tier: BlockTier::None,
-            full: BTreeSet::new(),
-            win: BTreeSet::new(),
-        }
+        Self { kept: false, state_tier: BlockTier::None, full: BTreeSet::new(), win: BTreeSet::new() }
     }
 }
 
@@ -500,10 +487,7 @@ impl Scheduler {
         !self.step_active
             && self.step_io.is_empty()
             && self.queue_seq.is_empty()
-            && self
-                .lanes
-                .iter()
-                .all(|l| l.state.is_terminal_or_idle() && l.restore_io_block.is_none())
+            && self.lanes.iter().all(|l| l.state.is_terminal_or_idle() && l.restore_io_block.is_none())
     }
 
     // ---- Queries ----------------------------------------------------------------------------
@@ -530,23 +514,15 @@ impl Scheduler {
     }
 
     pub fn state_mem_used(&self) -> u32 {
-        self.start_points
-            .values()
-            .filter(|sp| sp.kept && sp.state_tier.in_memory())
-            .count() as u32
+        self.start_points.values().filter(|sp| sp.kept && sp.state_tier.in_memory()).count() as u32
     }
 
     pub fn state_disk_used(&self) -> u32 {
-        self.start_points
-            .values()
-            .filter(|sp| sp.kept && sp.state_tier.on_disk())
-            .count() as u32
+        self.start_points.values().filter(|sp| sp.kept && sp.state_tier.on_disk()).count() as u32
     }
 
     pub fn state_in_mem(&self, prefix: &str, boundary: u32) -> bool {
-        self.start_points
-            .get(&(prefix.to_string(), boundary))
-            .is_some_and(|sp| sp.kept && sp.state_tier.in_memory())
+        self.start_points.get(&(prefix.to_string(), boundary)).is_some_and(|sp| sp.kept && sp.state_tier.in_memory())
     }
 
     pub fn start_state_ready(&self, l: usize) -> bool {
@@ -580,19 +556,11 @@ impl Scheduler {
     }
 
     pub fn reserved_total(&self) -> u32 {
-        self.lanes
-            .iter()
-            .filter(|l| l.state.is_mem_holding())
-            .map(|l| l.reservation)
-            .sum()
+        self.lanes.iter().filter(|l| l.state.is_mem_holding()).map(|l| l.reservation).sum()
     }
 
     pub fn admitted_total(&self) -> u32 {
-        self.lanes
-            .iter()
-            .filter(|l| l.state.is_admitted())
-            .map(|l| l.admit_budget)
-            .sum()
+        self.lanes.iter().filter(|l| l.state.is_admitted()).map(|l| l.admit_budget).sum()
     }
 
     pub fn lane_block_set(&self, l: usize) -> BTreeSet<BlockId> {
@@ -611,18 +579,12 @@ impl Scheduler {
     fn lane_referrers(&self, id: &BlockId) -> usize {
         self.lanes
             .iter()
-            .filter(|l| {
-                l.state.is_admitted()
-                    && (l.full.values().any(|b| b == id) || l.win.values().any(|b| b == id))
-            })
+            .filter(|l| l.state.is_admitted() && (l.full.values().any(|b| b == id) || l.win.values().any(|b| b == id)))
             .count()
     }
 
     fn start_referrers(&self, id: &BlockId) -> usize {
-        self.start_points
-            .values()
-            .filter(|sp| sp.kept && (sp.full.contains(id) || sp.win.contains(id)))
-            .count()
+        self.start_points.values().filter(|sp| sp.kept && (sp.full.contains(id) || sp.win.contains(id))).count()
     }
 
     fn sync_ref_counts(&mut self) {
@@ -693,11 +655,7 @@ impl Scheduler {
         let slot = &self.lanes[l];
         let bsz = self.cfg.block_size;
         let hi = (slot.pos + c - 1) / bsz;
-        let lo = if slot.pos > 0 && slot.full.len() == (slot.pos / bsz) as usize {
-            slot.pos / bsz
-        } else {
-            0
-        };
+        let lo = if slot.pos > 0 && slot.full.len() == (slot.pos / bsz) as usize { slot.pos / bsz } else { 0 };
         (lo..=hi).filter(|bi| !slot.full.contains_key(bi)).collect()
     }
 
@@ -718,10 +676,7 @@ impl Scheduler {
         } else {
             let slot = &self.lanes[l];
             let pe = prompt_end(slot.target, self.cfg.block_size);
-            self.cfg
-                .max_span
-                .min(self.cfg.step_token_budget)
-                .min(pe.saturating_sub(slot.pos))
+            self.cfg.max_span.min(self.cfg.step_token_budget).min(pe.saturating_sub(slot.pos))
         }
     }
 
@@ -768,10 +723,7 @@ impl Scheduler {
             return 0;
         }
         let c = self.max_legal_span(l);
-        self.new_boundaries_in_span(l, c)
-            .into_iter()
-            .filter(|(p, k)| !self.state_in_mem(p, *k))
-            .count() as u32
+        self.new_boundaries_in_span(l, c).into_iter().filter(|(p, k)| !self.state_in_mem(p, *k)).count() as u32
     }
 
     pub fn current_working_set(&self, l: usize) -> u32 {
@@ -802,9 +754,7 @@ impl Scheduler {
         let owned = self.all_lane_referred_blocks();
         self.blocks
             .iter()
-            .filter(|(id, rec)| {
-                rec.tier.in_memory() && !owned.contains(*id) && !self.step_io.contains(*id)
-            })
+            .filter(|(id, rec)| rec.tier.in_memory() && !owned.contains(*id) && !self.step_io.contains(*id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -813,9 +763,7 @@ impl Scheduler {
         let owned = self.all_lane_referred_blocks();
         self.blocks
             .iter()
-            .filter(|(id, rec)| {
-                rec.tier.on_disk() && !owned.contains(*id) && !self.step_io.contains(*id)
-            })
+            .filter(|(id, rec)| rec.tier.on_disk() && !owned.contains(*id) && !self.step_io.contains(*id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -827,15 +775,10 @@ impl Scheduler {
         let restore_blocked = self.mem_used() >= self.cfg.mem_budget
             && (0..self.lanes.len()).any(|l| {
                 self.lanes[l].state == LaneState::Restoring
-                    && self
-                        .lane_block_set(l)
-                        .iter()
-                        .any(|b| !self.block_tier(b).in_memory())
+                    && self.lane_block_set(l).iter().any(|b| !self.block_tier(b).in_memory())
             });
-        let steppable_need: u32 = (0..self.lanes.len())
-            .filter(|&l| self.is_steppable_ready(l))
-            .map(|l| self.max_span_alloc(l))
-            .sum();
+        let steppable_need: u32 =
+            (0..self.lanes.len()).filter(|&l| self.is_steppable_ready(l)).map(|l| self.max_span_alloc(l)).sum();
         let ready_blocked = (0..self.lanes.len()).any(|l| self.is_steppable_ready(l))
             && self.mem_used() + steppable_need > self.cfg.mem_budget;
         restore_blocked || ready_blocked
@@ -854,10 +797,8 @@ impl Scheduler {
                         .get(&(self.lanes[l].prefix.clone(), self.lanes[l].pos))
                         .is_some_and(|sp| sp.state_tier == BlockTier::Disk)
             });
-        let steppable_need: u32 = (0..self.lanes.len())
-            .filter(|&l| self.is_steppable_ready(l))
-            .map(|l| self.new_state_mem_need(l))
-            .sum();
+        let steppable_need: u32 =
+            (0..self.lanes.len()).filter(|&l| self.is_steppable_ready(l)).map(|l| self.new_state_mem_need(l)).sum();
         let ready_blocked = (0..self.lanes.len()).any(|l| self.is_steppable_ready(l))
             && self.state_mem_used() + steppable_need > self.state_mem_budget();
         restore_blocked || ready_blocked
@@ -911,13 +852,8 @@ impl Scheduler {
         if self.lanes[l].state != LaneState::Restoring {
             return false;
         }
-        let all_in_mem = self
-            .lane_block_set(l)
-            .iter()
-            .all(|b| self.block_tier(b).in_memory());
-        let blk_ok = all_in_mem
-            || self.mem_used() < self.cfg.mem_budget
-            || !self.cold_mem_blocks().is_empty();
+        let all_in_mem = self.lane_block_set(l).iter().all(|b| self.block_tier(b).in_memory());
+        let blk_ok = all_in_mem || self.mem_used() < self.cfg.mem_budget || !self.cold_mem_blocks().is_empty();
         let st_ok = self.start_state_ready(l)
             || self.state_mem_used() < self.state_mem_budget()
             || !self.cold_mem_states().is_empty();
@@ -928,10 +864,7 @@ impl Scheduler {
         if self.lanes[r].state != LaneState::Restoring {
             return false;
         }
-        let need_blk = self
-            .lane_block_set(r)
-            .iter()
-            .any(|rb| self.block_tier(rb) == BlockTier::Disk);
+        let need_blk = self.lane_block_set(r).iter().any(|rb| self.block_tier(rb) == BlockTier::Disk);
         let need_st = self.lanes[r].pos > 0
             && self
                 .start_points
@@ -957,10 +890,7 @@ impl Scheduler {
     }
 
     pub fn step_bypassed(&self, chosen: &BTreeSet<usize>) -> BTreeSet<usize> {
-        self.actionable_waiting()
-            .difference(chosen)
-            .copied()
-            .collect()
+        self.actionable_waiting().difference(chosen).copied().collect()
     }
 
     fn check_lane_idx(&self, l: usize) -> Result<(), SchedError> {
@@ -975,12 +905,7 @@ impl Scheduler {
 
     /// Atomic request arrival: enqueue (`Queued`), direct-admit (`Admitted`) when queue is
     /// full and no older queued lane can fit or reached `W`, or refuse (`Refused`, HTTP 429).
-    pub fn arrive(
-        &mut self,
-        lane: usize,
-        prefix: &str,
-        target: u32,
-    ) -> Result<ArriveOutcome, SchedError> {
+    pub fn arrive(&mut self, lane: usize, prefix: &str, target: u32) -> Result<ArriveOutcome, SchedError> {
         self.check_lane_idx(lane)?;
         if !self.lanes[lane].state.is_terminal_or_idle() {
             return Err(SchedError::InvalidState {
@@ -1002,9 +927,7 @@ impl Scheduler {
         let can_direct_admit = wc <= self.cfg.mem_budget
             && queued_cnt == self.cfg.max_queue
             && self.can_fit_request(target)
-            && self.queue_seq.iter().all(|&q| {
-                !self.can_fit_admit(q) && self.lanes[q].wait_ticks < self.cfg.max_bypass
-            });
+            && self.queue_seq.iter().all(|&q| !self.can_fit_admit(q) && self.lanes[q].wait_ticks < self.cfg.max_bypass);
 
         if can_enqueue {
             let slot = &mut self.lanes[lane];
@@ -1064,27 +987,16 @@ impl Scheduler {
     pub fn admit(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Queued {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Queued",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Queued", actual: self.lanes[lane].state });
         }
         if !self.can_admit_now(lane) {
             return Err(SchedError::Precondition("lane is not eligible to admit now"));
         }
         let wc = self.worst_case(self.lanes[lane].target);
-        let older_queued: Vec<usize> = self
-            .queue_seq
-            .iter()
-            .copied()
-            .filter(|&q| q != lane && self.older_queued(q, lane))
-            .collect();
-        let bypassed: Vec<usize> = older_queued
-            .iter()
-            .copied()
-            .filter(|&q| self.lanes[q].wait_ticks < self.cfg.max_bypass)
-            .collect();
+        let older_queued: Vec<usize> =
+            self.queue_seq.iter().copied().filter(|&q| q != lane && self.older_queued(q, lane)).collect();
+        let bypassed: Vec<usize> =
+            older_queued.iter().copied().filter(|&q| self.lanes[q].wait_ticks < self.cfg.max_bypass).collect();
         self.lanes[lane].state = LaneState::Admitted;
         self.lanes[lane].admit_budget = wc;
         for q in bypassed {
@@ -1099,11 +1011,7 @@ impl Scheduler {
 
     /// Pick and admit the highest-priority eligible queued lane, if any.
     pub fn admit_next(&mut self) -> Result<Option<usize>, SchedError> {
-        let candidate = self
-            .queue_seq
-            .iter()
-            .copied()
-            .find(|&q| self.can_admit_now(q));
+        let candidate = self.queue_seq.iter().copied().find(|&q| self.can_admit_now(q));
         if let Some(l) = candidate {
             self.admit(l)?;
             Ok(Some(l))
@@ -1116,11 +1024,7 @@ impl Scheduler {
     pub fn begin_restore(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Admitted {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Admitted",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Admitted", actual: self.lanes[lane].state });
         }
         let prefix = self.lanes[lane].prefix.clone();
         let target = self.lanes[lane].target;
@@ -1161,11 +1065,7 @@ impl Scheduler {
     pub fn restore_block(&mut self, lane: usize, block: &BlockId) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Restoring {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Restoring",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Restoring", actual: self.lanes[lane].state });
         }
         if !self.lane_block_set(lane).contains(block) {
             return Err(SchedError::Precondition("block not owned by restoring lane"));
@@ -1198,11 +1098,7 @@ impl Scheduler {
     pub fn restore_start_state(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Restoring {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Restoring",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Restoring", actual: self.lanes[lane].state });
         }
         if self.lanes[lane].restore_io_block.is_some() {
             return Err(SchedError::Precondition("restore I/O already in flight for lane"));
@@ -1242,11 +1138,7 @@ impl Scheduler {
     pub fn begin_restore_io(&mut self, lane: usize, block: &BlockId) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Restoring {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Restoring",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Restoring", actual: self.lanes[lane].state });
         }
         if self.lanes[lane].restore_io_block.is_some() {
             return Err(SchedError::Precondition("restore I/O already in flight for lane"));
@@ -1302,11 +1194,7 @@ impl Scheduler {
                 self.release_lane_to(lane, LaneState::Cancelled);
                 Ok(LaneState::Cancelled)
             }
-            other => Err(SchedError::InvalidState {
-                lane,
-                expected: "Restoring|Cancelling",
-                actual: other,
-            }),
+            other => Err(SchedError::InvalidState { lane, expected: "Restoring|Cancelling", actual: other }),
         }
     }
 
@@ -1315,20 +1203,12 @@ impl Scheduler {
     pub fn finish_restore(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Restoring {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Restoring",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Restoring", actual: self.lanes[lane].state });
         }
         if self.lanes[lane].restore_io_block.is_some() {
             return Err(SchedError::Precondition("restore disk I/O still in flight"));
         }
-        if !self
-            .lane_block_set(lane)
-            .iter()
-            .all(|b| self.block_tier(b).in_memory())
-        {
+        if !self.lane_block_set(lane).iter().all(|b| self.block_tier(b).in_memory()) {
             return Err(SchedError::Precondition("not all lane blocks are in memory"));
         }
         if !self.start_state_ready(lane) {
@@ -1348,7 +1228,8 @@ impl Scheduler {
     }
 
     fn violates_bypass_ceiling(&self, bypassed: &BTreeSet<usize>) -> bool {
-        bypassed.iter().any(|&w| self.lanes[w].wait_ticks >= self.cfg.max_bypass) // MUTANT_ANCHOR_BYPASS_CEILING
+        bypassed.iter().any(|&w| self.lanes[w].wait_ticks >= self.cfg.max_bypass)
+        // MUTANT_ANCHOR_BYPASS_CEILING
     }
 
     fn count_new_state_mem(&self, spans: &BTreeMap<usize, u32>) -> u32 {
@@ -1375,9 +1256,7 @@ impl Scheduler {
         if self.step_active || !self.step_io.is_empty() {
             return Ok(None);
         }
-        let steppable: Vec<usize> = (0..self.lanes.len())
-            .filter(|&l| self.is_steppable_ready(l))
-            .collect();
+        let steppable: Vec<usize> = (0..self.lanes.len()).filter(|&l| self.is_steppable_ready(l)).collect();
         if steppable.is_empty() {
             return Ok(None);
         }
@@ -1386,16 +1265,10 @@ impl Scheduler {
         let mem_budget = self.cfg.mem_budget;
         let st_mem_used = self.state_mem_used();
         let st_mem_budget = self.state_mem_budget();
-        let max_w = steppable
-            .iter()
-            .map(|&l| self.lanes[l].wait_ticks)
-            .max()
-            .unwrap_or(0);
+        let max_w = steppable.iter().map(|&l| self.lanes[l].wait_ticks).max().unwrap_or(0);
 
         let has_max_decoder = steppable.iter().any(|&l| {
-            self.is_decoding(l)
-                && self.lanes[l].wait_ticks == max_w
-                && mem_used + self.need_alloc(l) <= mem_budget
+            self.is_decoding(l) && self.lanes[l].wait_ticks == max_w && mem_used + self.need_alloc(l) <= mem_budget
         });
 
         // 1. Leader: longest-waiting fitting pruned Ready lane (decoder preferred on tie at max_w).
@@ -1437,13 +1310,7 @@ impl Scheduler {
             .copied()
             .filter(|&l| l != leader && self.lanes[l].wait_ticks >= self.cfg.max_bypass)
             .collect();
-        ceiling_ready.sort_by_key(|&l| {
-            (
-                std::cmp::Reverse(self.lanes[l].wait_ticks),
-                !self.is_decoding(l),
-                l,
-            )
-        });
+        ceiling_ready.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), !self.is_decoding(l), l));
         for l in ceiling_ready {
             if !self.window_pruned(l) {
                 return Ok(None);
@@ -1465,11 +1332,8 @@ impl Scheduler {
         }
 
         // 3. Active 1-token decoding lanes (descending wait_ticks, then lane index).
-        let mut decoders: Vec<usize> = steppable
-            .iter()
-            .copied()
-            .filter(|&l| !chosen_set.contains(&l) && self.is_decoding(l))
-            .collect();
+        let mut decoders: Vec<usize> =
+            steppable.iter().copied().filter(|&l| !chosen_set.contains(&l) && self.is_decoding(l)).collect();
         decoders.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
         for d in decoders {
             if !self.window_pruned(d) {
@@ -1479,9 +1343,7 @@ impl Scheduler {
                 continue;
             }
             let need = self.need_alloc(d);
-            if used_tokens < self.cfg.step_token_budget
-                && mem_used + alloc_cnt + need <= mem_budget
-            {
+            if used_tokens < self.cfg.step_token_budget && mem_used + alloc_cnt + need <= mem_budget {
                 chosen_set.insert(d);
                 chosen_order.push(d);
                 spans.insert(d, 1);
@@ -1492,9 +1354,7 @@ impl Scheduler {
 
         // Check if any fitting decoder remained unchosen due to token budget saturation.
         let any_fit_unchosen_decoder = steppable.iter().any(|&d| {
-            !chosen_set.contains(&d)
-                && self.is_decoding(d)
-                && mem_used + alloc_cnt + self.need_alloc(d) <= mem_budget
+            !chosen_set.contains(&d) && self.is_decoding(d) && mem_used + alloc_cnt + self.need_alloc(d) <= mem_budget
         });
 
         // 4. Prefill chunks sliced up to step_token_budget (only when no fitting decoder is starved).
@@ -1524,9 +1384,7 @@ impl Scheduler {
             let mut prefillers: Vec<usize> = steppable
                 .iter()
                 .copied()
-                .filter(|&l| {
-                    !chosen_set.contains(&l) && self.is_prefilling(l) && self.window_pruned(l)
-                })
+                .filter(|&l| !chosen_set.contains(&l) && self.is_prefilling(l) && self.window_pruned(l))
                 .collect();
             prefillers.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
             for p in prefillers {
@@ -1641,12 +1499,7 @@ impl Scheduler {
         self.step_pins = all_pins.clone();
         self.gpu_done = false;
 
-        Ok(Some(BuiltStep {
-            lanes: chosen_order,
-            spans,
-            total_tokens: used_tokens,
-            pins: all_pins,
-        }))
+        Ok(Some(BuiltStep { lanes: chosen_order, spans, total_tokens: used_tokens, pins: all_pins }))
     }
 
     /// Execute the GPU work of the active step across single- or multi-block spans (`U56`).
@@ -1665,14 +1518,9 @@ impl Scheduler {
             let end_pos = pos + span - 1;
             for bi in window_indices(pos, end_pos, bsz) {
                 let lo_in_blk = if bi == pos / bsz { (pos % bsz) as usize } else { 0 };
-                let hi_excl = if bi == end_pos / bsz {
-                    ((end_pos % bsz) + 1) as usize
-                } else {
-                    bsz as usize
-                };
-                for bid in [self.lanes[l].full.get(&bi).cloned(), self.lanes[l].win.get(&bi).cloned()]
-                    .into_iter()
-                    .flatten()
+                let hi_excl = if bi == end_pos / bsz { ((end_pos % bsz) + 1) as usize } else { bsz as usize };
+                for bid in
+                    [self.lanes[l].full.get(&bi).cloned(), self.lanes[l].win.get(&bi).cloned()].into_iter().flatten()
                 {
                     if let Some(rec) = self.blocks.get_mut(&bid) {
                         if rec.tier.is_present() && !rec.sealed {
@@ -1702,11 +1550,7 @@ impl Scheduler {
             let has_lane_ref = self.lane_referrers(&id) > 0;
             if let Some(rec) = self.blocks.get_mut(&id) {
                 if rec.tier == BlockTier::Memory {
-                    rec.tier = if has_lane_ref {
-                        BlockTier::Both
-                    } else {
-                        BlockTier::Disk
-                    };
+                    rec.tier = if has_lane_ref { BlockTier::Both } else { BlockTier::Disk };
                 }
             }
         }
@@ -1727,16 +1571,10 @@ impl Scheduler {
         let bsz = self.cfg.block_size;
         let wsz = self.cfg.window_size;
         let step_lanes: Vec<usize> = self.step_lanes.iter().copied().collect();
-        let surviving: Vec<usize> = step_lanes
-            .iter()
-            .copied()
-            .filter(|&l| self.lanes[l].state == LaneState::InStep)
-            .collect();
-        let cancelling: Vec<usize> = step_lanes
-            .iter()
-            .copied()
-            .filter(|&l| self.lanes[l].state == LaneState::Cancelling)
-            .collect();
+        let surviving: Vec<usize> =
+            step_lanes.iter().copied().filter(|&l| self.lanes[l].state == LaneState::InStep).collect();
+        let cancelling: Vec<usize> =
+            step_lanes.iter().copied().filter(|&l| self.lanes[l].state == LaneState::Cancelling).collect();
 
         let num_blks = self.cfg.num_blocks();
         let mut sealed_per_lane: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
@@ -1787,11 +1625,7 @@ impl Scheduler {
                 _ => unreachable!(),
             };
             let prev_tier = self.block_tier(id);
-            let next_tier = if prev_tier.on_disk() {
-                BlockTier::Both
-            } else {
-                BlockTier::Memory
-            };
+            let next_tier = if prev_tier.on_disk() { BlockTier::Both } else { BlockTier::Memory };
             self.blocks.insert(
                 id.clone(),
                 BlockRecord {
@@ -1812,14 +1646,8 @@ impl Scheduler {
             let pfx = self.lanes[l].prefix.clone();
             self.lanes[l].pos = npos;
             for &bi in &sealed_per_lane[&l] {
-                self.lanes[l].full.insert(
-                    bi,
-                    BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi },
-                );
-                self.lanes[l].win.insert(
-                    bi,
-                    BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: bi },
-                );
+                self.lanes[l].full.insert(bi, BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi });
+                self.lanes[l].win.insert(bi, BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: bi });
             }
             self.lanes[l].state = LaneState::Ready;
         }
@@ -1833,15 +1661,8 @@ impl Scheduler {
                 continue;
             }
             let pfx = self.lanes[l].prefix.clone();
-            let prev_st = self
-                .start_points
-                .get(&(pfx.clone(), bnd))
-                .map_or(BlockTier::None, |sp| sp.state_tier);
-            let next_st = if prev_st.on_disk() {
-                BlockTier::Both
-            } else {
-                BlockTier::Memory
-            };
+            let prev_st = self.start_points.get(&(pfx.clone(), bnd)).map_or(BlockTier::None, |sp| sp.state_tier);
+            let next_st = if prev_st.on_disk() { BlockTier::Both } else { BlockTier::Memory };
             let full = full_indices(bnd, bsz)
                 .into_iter()
                 .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: i })
@@ -1850,10 +1671,7 @@ impl Scheduler {
                 .into_iter()
                 .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: i })
                 .collect();
-            self.start_points.insert(
-                (pfx, bnd),
-                StartPoint { kept: true, state_tier: next_st, full, win },
-            );
+            self.start_points.insert((pfx, bnd), StartPoint { kept: true, state_tier: next_st, full, win });
         }
 
         // Release cancelling lanes now that GPU work and step I/O are complete.
@@ -1881,11 +1699,7 @@ impl Scheduler {
         self.gpu_done = false;
         self.sync_ref_counts();
 
-        Ok(CompletedStep {
-            survived: surviving,
-            cancelled: cancelling,
-            sealed_boundaries: boundary_lanes,
-        })
+        Ok(CompletedStep { survived: surviving, cancelled: cancelling, sealed_boundaries: boundary_lanes })
     }
 
     /// Cancel a lane.
@@ -1925,11 +1739,7 @@ impl Scheduler {
     pub fn finish_ready(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Ready {
-            return Err(SchedError::InvalidState {
-                lane,
-                expected: "Ready",
-                actual: self.lanes[lane].state,
-            });
+            return Err(SchedError::InvalidState { lane, expected: "Ready", actual: self.lanes[lane].state });
         }
         if self.lanes[lane].pos != self.lanes[lane].target {
             return Err(SchedError::Precondition("lane has not reached target length"));
@@ -2002,10 +1812,7 @@ impl Scheduler {
         if !self.state_mem_pressure() {
             return None;
         }
-        let pk = self
-            .cold_mem_states()
-            .into_iter()
-            .find(|pk| self.start_points[pk].state_tier.on_disk())?;
+        let pk = self.cold_mem_states().into_iter().find(|pk| self.start_points[pk].state_tier.on_disk())?;
         if let Some(sp) = self.start_points.get_mut(&pk) {
             sp.state_tier = BlockTier::Disk;
         }
@@ -2016,17 +1823,11 @@ impl Scheduler {
         if !self.state_mem_pressure() {
             return None;
         }
-        let has_clean = self
-            .cold_mem_states()
-            .iter()
-            .any(|pk| self.start_points[pk].state_tier.on_disk());
+        let has_clean = self.cold_mem_states().iter().any(|pk| self.start_points[pk].state_tier.on_disk());
         if has_clean || self.state_disk_used() >= self.state_disk_budget() {
             return None;
         }
-        let pk = self
-            .cold_mem_states()
-            .into_iter()
-            .find(|pk| self.start_points[pk].state_tier == BlockTier::Memory)?;
+        let pk = self.cold_mem_states().into_iter().find(|pk| self.start_points[pk].state_tier == BlockTier::Memory)?;
         if let Some(sp) = self.start_points.get_mut(&pk) {
             sp.state_tier = BlockTier::Disk;
         }
@@ -2056,11 +1857,7 @@ impl Scheduler {
                         sp.kept
                             && !need_start.contains(*pk)
                             && sp.full.iter().chain(&sp.win).all(|b| !self.step_io.contains(b))
-                            && sp
-                                .full
-                                .iter()
-                                .chain(&sp.win)
-                                .any(|b| cold_disk_set.contains(b) || cold_mem.contains(b))
+                            && sp.full.iter().chain(&sp.win).any(|b| cold_disk_set.contains(b) || cold_mem.contains(b))
                     })
                     .map(|(pk, _)| pk.clone());
                 if let Some(pk) = victim_pk {
@@ -2071,8 +1868,7 @@ impl Scheduler {
             }
         }
         if self.state_disk_used() >= self.state_disk_budget() && self.state_mem_pressure() {
-            let mut cands: BTreeSet<(String, u32)> =
-                self.cold_disk_states().into_iter().collect();
+            let mut cands: BTreeSet<(String, u32)> = self.cold_disk_states().into_iter().collect();
             cands.extend(self.cold_mem_states());
             if let Some(pk) = cands.into_iter().find(|pk| {
                 self.start_points
@@ -2091,11 +1887,7 @@ impl Scheduler {
         let Some(rec) = self.blocks.get(id) else {
             return false;
         };
-        if !rec.tier.is_present()
-            || rec.ref_count != 0
-            || self.step_pins.contains(id)
-            || self.step_io.contains(id)
-        {
+        if !rec.tier.is_present() || rec.ref_count != 0 || self.step_pins.contains(id) || self.step_io.contains(id) {
             return false;
         }
         self.blocks.remove(id);
@@ -2106,11 +1898,7 @@ impl Scheduler {
         if lane >= self.lanes.len() || self.lanes[lane].state != LaneState::Ready {
             return false;
         }
-        let keep = history_indices(
-            self.lanes[lane].pos,
-            self.cfg.window_size,
-            self.cfg.block_size,
-        );
+        let keep = history_indices(self.lanes[lane].pos, self.cfg.window_size, self.cfg.block_size);
         let before = self.lanes[lane].win.len();
         self.lanes[lane].win.retain(|bi, _| keep.contains(bi));
         if self.lanes[lane].win.len() != before {
@@ -2135,11 +1923,7 @@ impl Scheduler {
             return Err(format!("DiskUsed {} > DiskBudget {}", self.disk_used(), self.cfg.disk_budget));
         }
         if self.state_mem_used() > self.state_mem_budget() {
-            return Err(format!(
-                "StateMemUsed {} > StateMemBudget {}",
-                self.state_mem_used(),
-                self.state_mem_budget()
-            ));
+            return Err(format!("StateMemUsed {} > StateMemBudget {}", self.state_mem_used(), self.state_mem_budget()));
         }
         if self.state_disk_used() > self.state_disk_budget() {
             return Err(format!(
@@ -2149,20 +1933,9 @@ impl Scheduler {
             ));
         }
         if self.reserved_total() > self.cfg.mem_budget {
-            return Err(format!(
-                "ReservedTotal {} > MemBudget {}",
-                self.reserved_total(),
-                self.cfg.mem_budget
-            ));
+            return Err(format!("ReservedTotal {} > MemBudget {}", self.reserved_total(), self.cfg.mem_budget));
         }
-        let max_pf_bnd = self
-            .cfg
-            .request_lengths
-            .iter()
-            .copied()
-            .map(|r| prompt_end(r, bsz))
-            .max()
-            .unwrap_or(0);
+        let max_pf_bnd = self.cfg.request_lengths.iter().copied().map(|r| prompt_end(r, bsz)).max().unwrap_or(0);
         for ((pfx, bnd), sp) in &self.start_points {
             if sp.kept {
                 if !sp.state_tier.is_present() {
@@ -2187,18 +1960,14 @@ impl Scheduler {
                     || !self.lane_block_set(i).contains(bio)
                     || !self.block_tier(bio).is_present()
                 {
-                    return Err(format!(
-                        "lane {i} restore_io_block {bio:?} orphaned in state {:?}",
-                        slot.state
-                    ));
+                    return Err(format!("lane {i} restore_io_block {bio:?} orphaned in state {:?}", slot.state));
                 }
             }
             if slot.state.is_mem_holding() {
                 let dec_bi = prompt_end(slot.target, bsz) / bsz;
                 for (&bi, bid) in slot.full.iter().chain(&slot.win) {
                     if bi >= dec_bi
-                        && (!matches!(bid, BlockId::Priv { .. })
-                            || self.blocks.get(bid).is_some_and(|r| r.sealed))
+                        && (!matches!(bid, BlockId::Priv { .. }) || self.blocks.get(bid).is_some_and(|r| r.sealed))
                     {
                         return Err(format!("lane {i} decode block {bi} ({bid:?}) sealed"));
                     }
@@ -2207,10 +1976,7 @@ impl Scheduler {
             if matches!(slot.state, LaneState::Restoring | LaneState::Ready | LaneState::InStep) {
                 let ws = self.current_working_set(i);
                 if slot.reservation < ws {
-                    return Err(format!(
-                        "lane {i} reservation {} < current_working_set {}",
-                        slot.reservation, ws
-                    ));
+                    return Err(format!("lane {i} reservation {} < current_working_set {}", slot.reservation, ws));
                 }
                 for bi in full_indices(slot.pos, bsz) {
                     let Some(bid) = slot.full.get(&bi) else {
@@ -2232,11 +1998,7 @@ impl Scheduler {
         }
 
         // 3. QueueBounded
-        let queued_cnt = self
-            .lanes
-            .iter()
-            .filter(|l| l.state == LaneState::Queued)
-            .count();
+        let queued_cnt = self.lanes.iter().filter(|l| l.state == LaneState::Queued).count();
         if queued_cnt != self.queue_seq.len() || queued_cnt > self.cfg.max_queue {
             return Err(format!(
                 "queue invariant broken: queued={queued_cnt}, seq={}, max={}",
@@ -2249,10 +2011,7 @@ impl Scheduler {
         if self.step_active {
             let total_tokens: u32 = self.step_lanes.iter().map(|&l| self.step_span[l]).sum();
             if total_tokens > self.cfg.step_token_budget {
-                return Err(format!(
-                    "step tokens {} > step_token_budget {}",
-                    total_tokens, self.cfg.step_token_budget
-                ));
+                return Err(format!("step tokens {} > step_token_budget {}", total_tokens, self.cfg.step_token_budget));
             }
             for &l in &self.step_lanes {
                 let st = self.lanes[l].state;
@@ -2265,19 +2024,15 @@ impl Scheduler {
                     return Err(format!("decoding lane {l} has span {sp} != 1"));
                 }
                 for bi in full_indices(pos + sp, bsz) {
-                    let bid = self.lanes[l]
-                        .full
-                        .get(&bi)
-                        .ok_or_else(|| format!("step lane {l} missing full block {bi}"))?;
+                    let bid =
+                        self.lanes[l].full.get(&bi).ok_or_else(|| format!("step lane {l} missing full block {bi}"))?;
                     if !self.step_pins.contains(bid) {
                         return Err(format!("step lane {l} full block {bi} not pinned"));
                     }
                 }
                 for bi in span_window_indices(pos, sp, wsz, bsz) {
-                    let bid = self.lanes[l]
-                        .win
-                        .get(&bi)
-                        .ok_or_else(|| format!("step lane {l} missing window block {bi}"))?;
+                    let bid =
+                        self.lanes[l].win.get(&bi).ok_or_else(|| format!("step lane {l} missing window block {bi}"))?;
                     if !self.step_pins.contains(bid) {
                         return Err(format!("step lane {l} window block {bi} not pinned"));
                     }
@@ -2312,10 +2067,7 @@ impl Scheduler {
         for (id, rec) in &self.blocks {
             let expected_refs = expected_counts.get(id).copied().unwrap_or(0);
             if rec.ref_count != expected_refs {
-                return Err(format!(
-                    "block {id:?} ref_count {} != expected {expected_refs}",
-                    rec.ref_count
-                ));
+                return Err(format!("block {id:?} ref_count {} != expected {expected_refs}", rec.ref_count));
             }
             if !rec.sealed {
                 if !matches!(id, BlockId::Priv { .. }) {
@@ -2377,12 +2129,7 @@ pub struct ServeStepPlanner {
 impl ServeStepPlanner {
     pub fn new(nlanes: usize, max_bypass: u32) -> Self {
         assert!(max_bypass >= 1, "max_bypass (W) must be >= 1");
-        Self {
-            states: vec![LaneState::Idle; nlanes],
-            wait_ticks: vec![0; nlanes],
-            in_step: Vec::new(),
-            max_bypass,
-        }
+        Self { states: vec![LaneState::Idle; nlanes], wait_ticks: vec![0; nlanes], in_step: Vec::new(), max_bypass }
     }
 
     pub fn state(&self, lane: usize) -> LaneState {
@@ -2517,10 +2264,13 @@ impl ServeStepPlanner {
                 let max_for_this = budget.saturating_sub(rem_ceiling_after).max(1);
                 let raw_t = (inp.pf_end - inp.n_past).min(max_for_this);
                 // Keep 64-token start-point alignment when chunk does not finish the prompt.
-                let t = if block_align > 0 && inp.n_past + raw_t < inp.pf_end && raw_t > block_align
-                {
+                let t = if block_align > 0 && inp.n_past + raw_t < inp.pf_end && raw_t > block_align {
                     let aligned = raw_t - ((inp.n_past + raw_t) % block_align);
-                    if aligned > 0 { aligned } else { raw_t }
+                    if aligned > 0 {
+                        aligned
+                    } else {
+                        raw_t
+                    }
                 } else {
                     raw_t
                 };

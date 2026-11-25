@@ -340,7 +340,7 @@ The remaining low findings, grouped so that one small change set can close each 
 | feature | done |
 |---|:---:|
 | Release tags are protected, the crates.io publish fails loudly without its token, and the token is scoped to release tags ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) | ✅ |
-| Merged branches are deleted, open fix branches land or close, and no run on main is cancelled without a verdict | ❌ |
+| Merged branches are deleted, open fix branches land or close, and no run on main is cancelled without a verdict | ✅ |
 | Every workflow pins actions by SHA and the Rust toolchain by version, and builds with --locked ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) | ✅ |
 | CI test steps fail on zero matched tests, and every ignored test runs in a tier or is ledgered ([#119](https://github.com/robotgamedevelopers/inky/pull/119)) | ✅ |
 | A job with no M5 runner online fails with a message instead of waiting in the queue ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) | ✅ |
@@ -399,7 +399,7 @@ The remaining low findings, grouped so that one small change set can close each 
 | The production tokenizer's pre-splitter and Unicode tables have tests against known pieces ([#119](https://github.com/robotgamedevelopers/inky/pull/119)) | ✅ |
 | A cleared GPU block-table entry is distinct from slot 1, and release builds validate every block of a span ([#115](https://github.com/robotgamedevelopers/inky/pull/115)) | ✅ |
 | Each evaluation measurement row names the job or recorded run that produced it ([#125](https://github.com/robotgamedevelopers/inky/pull/125)) | ✅ |
-| complete | 98% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -633,7 +633,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | feature | done |
 |---|:---:|
 | The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ❌ |
-| Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ❌ |
+| Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ✅ |
 | One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
 | Shared-prefix design and measured overlap on four concurrent cards (later) | ✅ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) (later) | ✅ |
-| complete | 61% |
+| complete | 63% |
 
 [Source data](roadmap.sexp)
 

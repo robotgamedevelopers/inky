@@ -33,11 +33,7 @@ fn handle(entry: BlockEntry) -> String {
 }
 
 fn entry_row(index: BlockIndex, entry: BlockEntry) -> String {
-    tuple([
-        kind_number(entry.kind()).to_string(),
-        index.get().to_string(),
-        handle(entry),
-    ])
+    tuple([kind_number(entry.kind()).to_string(), index.get().to_string(), handle(entry)])
 }
 
 #[derive(Default)]
@@ -70,27 +66,16 @@ impl Trace {
             let pool = self.pools.of(kind);
             tuple((1..=pool.len()).map(|slot| {
                 let rec = pool.record(Slot::new(slot as u32).unwrap()).unwrap();
-                tuple([
-                    rec.generation(),
-                    rec.length(),
-                    rec.refs(),
-                    if rec.sealed() { 1 } else { 0 },
-                ])
+                tuple([rec.generation(), rec.length(), rec.refs(), if rec.sealed() { 1 } else { 0 }])
             }))
         }));
         let lanes = tuple(self.lanes.iter().zip(&self.tables).map(|(lane, table)| {
             tuple([
                 lane.state.written.to_string(),
                 lane.state.prompt_len.to_string(),
-                tuple(
-                    lane.prompt
-                        .chunks_exact(BLOCK)
-                        .map(|block| block[BLOCK - 1]),
-                ),
+                tuple(lane.prompt.chunks_exact(BLOCK).map(|block| block[BLOCK - 1])),
                 tuple(lane.state.sealed.iter().copied().map(id_number)),
-                set(table
-                    .entries()
-                    .map(|(index, entry)| entry_row(index, entry))),
+                set(table.entries().map(|(index, entry)| entry_row(index, entry))),
             ])
         }));
         let tree = set(self.cache.tree.entries().into_iter().map(|(id, handles)| {
@@ -111,10 +96,7 @@ impl Trace {
                 start.pos.to_string(),
                 start.reasons.to_string(),
                 decode_cs(&start.cs).to_string(),
-                set(start
-                    .entries
-                    .iter()
-                    .map(|&(_, index, entry)| entry_row(index, entry))),
+                set(start.entries.iter().map(|&(_, index, entry)| entry_row(index, entry))),
             ])
         }));
         self.rows.push(format!(
@@ -132,12 +114,7 @@ impl Trace {
             .flat_map(|&tag| (0..63).chain(std::iter::once(tag)))
             .chain(std::iter::repeat_n(999, tail))
             .collect();
-        let hit = self.cache.match_and_bind(
-            &mut self.pools,
-            &mut self.tables[i],
-            &mut lane.state,
-            &lane.prompt,
-        );
+        let hit = self.cache.match_and_bind(&mut self.pools, &mut self.tables[i], &mut lane.state, &lane.prompt);
         let (pos, cs) = hit.map_or((0, 0), |(pos, cs)| (pos, decode_cs(&cs)));
         self.row("bind", i, pos as u64, cs);
     }
@@ -145,9 +122,7 @@ impl Trace {
     fn prefill(&mut self, i: usize, end: usize) {
         let lane = &mut self.lanes[i];
         let start = lane.state.written;
-        self.cache
-            .ensure_span_blocks(&mut self.pools, &mut self.tables[i], start, end - start)
-            .unwrap();
+        self.cache.ensure_span_blocks(&mut self.pools, &mut self.tables[i], start, end - start).unwrap();
         self.cache.finish_prefill_span(
             &mut self.pools,
             &mut self.tables[i],
@@ -163,18 +138,14 @@ impl Trace {
     fn decode(&mut self, i: usize) {
         let lane = &mut self.lanes[i];
         let pos = lane.state.written;
-        self.cache
-            .ensure_span_blocks(&mut self.pools, &mut self.tables[i], pos, 1)
-            .unwrap();
-        self.cache
-            .finish_decode_span(&mut self.pools, &mut self.tables[i], &mut lane.state, pos);
+        self.cache.ensure_span_blocks(&mut self.pools, &mut self.tables[i], pos, 1).unwrap();
+        self.cache.finish_decode_span(&mut self.pools, &mut self.tables[i], &mut lane.state, pos);
         self.row("decode", i, (pos + 1) as u64, 0);
     }
 
     fn release(&mut self, i: usize) {
         let lane = &mut self.lanes[i];
-        self.cache
-            .release_lane(&mut self.pools, &mut self.tables[i], &mut lane.state);
+        self.cache.release_lane(&mut self.pools, &mut self.tables[i], &mut lane.state);
         lane.prompt.clear();
         self.row("release", i, 0, 0);
     }

@@ -87,20 +87,14 @@ impl RunningServer {
             }
         });
 
-        let addr = addr_rx
-            .recv_timeout(Duration::from_secs(90))
-            .unwrap_or_else(|_| {
-                let _ = child.kill();
-                let _ = child.wait();
-                let dump = lines.lock().unwrap().join("\n");
-                panic!("inky serve did not bind within 90s; stderr:\n{dump}");
-            });
+        let addr = addr_rx.recv_timeout(Duration::from_secs(90)).unwrap_or_else(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            let dump = lines.lock().unwrap().join("\n");
+            panic!("inky serve did not bind within 90s; stderr:\n{dump}");
+        });
 
-        let srv = Self {
-            child,
-            addr,
-            stderr_lines: lines,
-        };
+        let srv = Self { child, addr, stderr_lines: lines };
         srv.wait_healthy(Duration::from_secs(30));
         srv
     }
@@ -140,14 +134,9 @@ impl RunningServer {
     }
 
     fn http_request(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, Value), String> {
-        let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_secs(10))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(120)))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| e.to_string())?;
+        let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_secs(10)).map_err(|e| e.to_string())?;
+        stream.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
+        stream.set_write_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
         let payload = body.unwrap_or("");
         write!(
             stream,
@@ -161,17 +150,16 @@ impl RunningServer {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&raw);
-        let (head, resp_body) = text
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| format!("malformed HTTP response: {text}"))?;
+        let (head, resp_body) =
+            text.split_once("\r\n\r\n").ok_or_else(|| format!("malformed HTTP response: {text}"))?;
         let status_line = head.lines().next().unwrap_or("");
         let code: u16 = status_line
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| format!("bad status line: {status_line}"))?;
-        let parsed: Value = serde_json::from_str(resp_body)
-            .map_err(|e| format!("JSON parse error ({e}) on body: {resp_body}"))?;
+        let parsed: Value =
+            serde_json::from_str(resp_body).map_err(|e| format!("JSON parse error ({e}) on body: {resp_body}"))?;
         Ok((code, parsed))
     }
 
@@ -228,16 +216,11 @@ fn send_chat_greedy(srv: &RunningServer, messages: Value, max_tokens: u64) -> Ch
 #[test]
 #[ignore = "requires Apple M5 Metal GPU and local Inkling-2-Mini GGUF"]
 fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
-    let bin = std::env::var_os("INKY_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inky")));
-    let model = std::env::var_os("INKY_TEST_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf",
-            )
-        });
+    let bin =
+        std::env::var_os("INKY_BIN").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inky")));
+    let model = std::env::var_os("INKY_TEST_MODEL").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf")
+    });
     assert!(bin.exists(), "inky binary not found at {}", bin.display());
     assert!(model.exists(), "model not found at {}", model.display());
 
@@ -301,10 +284,8 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
             let base = if pass % 2 == 0 { &filler_a_msgs } else { &filler_b_msgs };
             let mut msgs = base.as_array().unwrap().clone();
             msgs[0]["content"] = json!(format!("Unrelated flush workload #{id}-{pass}: catalog indexing."));
-            msgs[1]["content"] = json!(format!(
-                "Epoch {id} pass {pass}: {}",
-                msgs[1]["content"].as_str().unwrap_or("")
-            ));
+            msgs[1]["content"] =
+                json!(format!("Epoch {id} pass {pass}: {}", msgs[1]["content"].as_str().unwrap_or("")));
             let _ = send_chat_greedy(srv, Value::Array(msgs), 4);
         }
         let _ = srv.wait_drained(Duration::from_secs(15));
@@ -401,7 +382,11 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
     );
     assert!(restored_1 >= 1, "expected spill_starts_restored >= 1, health={h_after_restore1}");
     assert!(restore_ms_1 > 0.0, "expected positive spill_last_restore_ms, health={h_after_restore1}");
-    assert_eq!(s1_cont, ChatResult { cached_tokens: s1_cont.cached_tokens, ..cold_cont.clone() }, "SSD-restored continuation after RAM eviction must match cold 100%");
+    assert_eq!(
+        s1_cont,
+        ChatResult { cached_tokens: s1_cont.cached_tokens, ..cold_cont.clone() },
+        "SSD-restored continuation after RAM eviction must match cold 100%"
+    );
 
     // Flush back to SSD so the checkpoint is persisted on disk in `spill-index.bin` before stopping Server #1.
     flush_ram(&spill_srv1);
@@ -415,10 +400,7 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
     let spill_srv2 = RunningServer::spawn(&bin, &model, Some(&spill_dir), pool_slots);
     let h_boot2 = spill_srv2.wait_drained(Duration::from_secs(15));
     let boot_indexed = h_boot2["spill_spilled_starts_indexed"].as_u64().unwrap_or(0);
-    assert!(
-        boot_indexed >= 1,
-        "Restarted server must reload spilled starts from spill-index.bin, health={h_boot2}"
-    );
+    assert!(boot_indexed >= 1, "Restarted server must reload spilled starts from spill-index.bin, health={h_boot2}");
     assert_eq!(h_boot2["spill_starts_restored"].as_u64(), Some(0));
 
     let s2_cont = send_chat_greedy(&spill_srv2, turn2_cont_msgs.clone(), 48);
@@ -430,12 +412,20 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
         s2_cont.cached_tokens
     );
     assert!(h_after_restart_cont["spill_starts_restored"].as_u64().unwrap_or(0) >= 1);
-    assert_eq!(s2_cont, ChatResult { cached_tokens: s2_cont.cached_tokens, ..cold_cont.clone() }, "Post-restart SSD-restored continuation must match cold 100%");
+    assert_eq!(
+        s2_cont,
+        ChatResult { cached_tokens: s2_cont.cached_tokens, ..cold_cont.clone() },
+        "Post-restart SSD-restored continuation must match cold 100%"
+    );
 
     // Early diverging branch (`branching`) sharing the early blocks of the SSD-restored checkpoint
     // whose early Window blocks had expired past EXT = 1024!
     let s2_branch = send_chat_greedy(&spill_srv2, branch_msgs.clone(), 48);
-    assert_eq!(s2_branch, ChatResult { cached_tokens: s2_branch.cached_tokens, ..cold_branch.clone() }, "Early diverging branch after SSD restore must match cold 100%");
+    assert_eq!(
+        s2_branch,
+        ChatResult { cached_tokens: s2_branch.cached_tokens, ..cold_branch.clone() },
+        "Early diverging branch after SSD restore must match cold 100%"
+    );
 
     // =========================================================================
     // Phase 4: Corrupt Spilled `.blk` File -> Clean Cache Miss & 100% Cold Parity
@@ -463,7 +453,10 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
     let h_after_corrupt = spill_srv2.wait_drained(Duration::from_secs(15));
     let fallbacks = h_after_corrupt["spill_corrupt_fallbacks"].as_u64().unwrap_or(0);
     let removed = h_after_corrupt["spill_corrupt_files_removed"].as_u64().unwrap_or(0);
-    assert_eq!(s2_corrupt.cached_tokens, 0, "Corrupted .blk must cleanly fall back to cold prefill (cached_tokens == 0)");
+    assert_eq!(
+        s2_corrupt.cached_tokens, 0,
+        "Corrupted .blk must cleanly fall back to cold prefill (cached_tokens == 0)"
+    );
     assert!(fallbacks >= 1, "expected spill_corrupt_fallbacks >= 1, health={h_after_corrupt}");
     assert!(removed >= 1, "expected spill_corrupt_files_removed >= 1, health={h_after_corrupt}");
     assert_eq!(s2_corrupt, cold_cont, "Corrupt .blk fallback must still match cold server 100%");
@@ -490,13 +483,9 @@ fn m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs() {
         .or_else(|| std::env::var_os("INKY_TEST_BIN"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inky")));
-    let model = std::env::var_os("INKY_TEST_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf",
-            )
-        });
+    let model = std::env::var_os("INKY_TEST_MODEL").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf")
+    });
     assert!(bin.exists(), "inky binary not found at {}", bin.display());
     assert!(model.exists(), "model not found at {}", model.display());
 
@@ -613,7 +602,11 @@ fn m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs() {
 
     let wait_deadline = Instant::now() + Duration::from_secs(30);
     while !marker_path.exists() {
-        assert!(Instant::now() < wait_deadline, "timed out waiting for mid-spill-write marker {}", marker_path.display());
+        assert!(
+            Instant::now() < wait_deadline,
+            "timed out waiting for mid-spill-write marker {}",
+            marker_path.display()
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     // Deliver hard SIGKILL (`kill -9`) while the `.tmp` spill block write is mid-flight!
@@ -633,7 +626,11 @@ fn m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains(".tmp."))
         .collect();
-    assert!(!stranded_tmps.is_empty(), "expected stranded .tmp file(s) after mid-write SIGKILL in {}", spill_dir.display());
+    assert!(
+        !stranded_tmps.is_empty(),
+        "expected stranded .tmp file(s) after mid-write SIGKILL in {}",
+        spill_dir.display()
+    );
 
     // 4. Server #3: restart cleanly on `--spill-dir`; verify orphan `.tmp` sweep, surviving `turn2_a`
     // SSD cache hit, clean cold prefill for unsealed `turn2_b`, and 100% bit-identical outputs!
@@ -666,8 +663,14 @@ fn m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs() {
     );
 
     let post_kill_b2 = send_chat_greedy(&srv3, turn2_b, 48);
-    assert_eq!(post_kill_b2.cached_tokens, 0, "interrupted mid-write spill B must lose only cache, never serve partial data");
-    assert_eq!(post_kill_b2, cold_b2, "unsealed prompt B after mid-write SIGKILL must match cold reference bit-for-bit");
+    assert_eq!(
+        post_kill_b2.cached_tokens, 0,
+        "interrupted mid-write spill B must lose only cache, never serve partial data"
+    );
+    assert_eq!(
+        post_kill_b2, cold_b2,
+        "unsealed prompt B after mid-write SIGKILL must match cold reference bit-for-bit"
+    );
 
     srv3.stop();
     let _ = std::fs::remove_file(&marker_path);

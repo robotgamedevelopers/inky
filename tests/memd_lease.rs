@@ -25,7 +25,9 @@ impl Scratch {
 }
 
 impl Drop for Scratch {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 struct Process(Child);
@@ -38,31 +40,43 @@ impl Drop for Process {
 }
 
 fn spawn_inky(args: &[&str], socket: &Path, log: &Path) -> Process {
-    Process(Command::new(env!("CARGO_BIN_EXE_inky")).args(args)
-        .env("INKY_MEMD_SOCKET", socket)
-        .stdout(Stdio::null()).stderr(fs::File::create(log).unwrap())
-        .spawn().unwrap())
+    Process(
+        Command::new(env!("CARGO_BIN_EXE_inky"))
+            .args(args)
+            .env("INKY_MEMD_SOCKET", socket)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(log).unwrap())
+            .spawn()
+            .unwrap(),
+    )
 }
 
 fn wait_for(log: &Path, condition: impl Fn(&str) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = fs::read_to_string(log).unwrap_or_default();
-        if condition(&output) { return; }
+        if condition(&output) {
+            return;
+        }
         assert!(Instant::now() < deadline, "timed out waiting for {}:\n{output}", log.display());
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 fn fake_limits(log: &str) -> Vec<u64> {
-    log.lines().filter_map(|line| line.strip_prefix("[inky memd] (fake) limit = "))
-        .map(|value| value.parse().unwrap()).collect()
+    log.lines()
+        .filter_map(|line| line.strip_prefix("[inky memd] (fake) limit = "))
+        .map(|value| value.parse().unwrap())
+        .collect()
 }
 
 #[test]
 fn surviving_mode_client_reacquires_lease_after_fake_helper_restart() {
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 { eprintln!("fake memd requires an unprivileged test account"); return; }
+    if uid == 0 {
+        eprintln!("fake memd requires an unprivileged test account");
+        return;
+    }
     let scratch = Scratch::new();
     let dir = &scratch.0;
     let (socket, saved) = (dir.join("memd.sock"), dir.join("memd.sock.saved"));
@@ -94,7 +108,10 @@ fn surviving_mode_client_reacquires_lease_after_fake_helper_restart() {
 #[test]
 fn persistent_serve_lease_establishes_after_late_helper_start_and_survives_socket_dir_reinstall() {
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 { eprintln!("fake memd requires an unprivileged test account"); return; }
+    if uid == 0 {
+        eprintln!("fake memd requires an unprivileged test account");
+        return;
+    }
     let scratch = Scratch::new();
     let root = &scratch.0;
     let sock_dir = root.join("run");
@@ -109,10 +126,13 @@ fn persistent_serve_lease_establishes_after_late_helper_start_and_survives_socke
 
     // 2. Install/start helper #1 (`8192` MB) and verify running client establishes lease automatically.
     fs::DirBuilder::new().mode(0o700).create(&sock_dir).unwrap();
-    let daemon1 = ["memd", "--fake", "--owner", &uid_str, "--socket", socket.to_str().unwrap(), "--fake-target-mb", "8192"];
+    let daemon1 =
+        ["memd", "--fake", "--owner", &uid_str, "--socket", socket.to_str().unwrap(), "--fake-target-mb", "8192"];
     let first = spawn_inky(&daemon1, &socket, &first_log);
     wait_for(&first_log, |s| s.contains("listening on"));
-    wait_for(&client_log, |s| s.contains("memory-helper connection established; GPU wired limit 8192 MB") && saved.is_file());
+    wait_for(&client_log, |s| {
+        s.contains("memory-helper connection established; GPU wired limit 8192 MB") && saved.is_file()
+    });
     assert_eq!(fake_limits(&fs::read_to_string(&first_log).unwrap()), [8192]);
 
     // 3. Simulate `sudo inky tune-memory` reinstall: stop daemon #1, remove and recreate the socket
@@ -120,10 +140,13 @@ fn persistent_serve_lease_establishes_after_late_helper_start_and_survives_socke
     drop(first);
     fs::remove_dir_all(&sock_dir).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&sock_dir).unwrap();
-    let daemon2 = ["memd", "--fake", "--owner", &uid_str, "--socket", socket.to_str().unwrap(), "--fake-target-mb", "12288"];
+    let daemon2 =
+        ["memd", "--fake", "--owner", &uid_str, "--socket", socket.to_str().unwrap(), "--fake-target-mb", "12288"];
     let _second = spawn_inky(&daemon2, &socket, &second_log);
     wait_for(&second_log, |s| s.contains("listening on"));
-    wait_for(&client_log, |s| s.contains("memory-helper connection restored; GPU wired limit 12288 MB") && saved.is_file());
+    wait_for(&client_log, |s| {
+        s.contains("memory-helper connection restored; GPU wired limit 12288 MB") && saved.is_file()
+    });
     assert_eq!(fake_limits(&fs::read_to_string(&second_log).unwrap()), [12288]);
 
     // 4. Stopping the client restores the limit to 0 and removes the saved record on daemon #2.

@@ -5,9 +5,7 @@ use crate::blocks::{BlockIndex, BlockKind, BlockPools, BLOCK, WINDOW};
 use crate::engine::{Engine, Lane, Span};
 use crate::metal::wait_completed;
 use crate::sampler::{checked_argmax, Sampler};
-use crate::scheduler::{
-    accept_greedy, logit_hash, plan_verify, SpecEmitState, VerifyCand,
-};
+use crate::scheduler::{accept_greedy, logit_hash, plan_verify, SpecEmitState, VerifyCand};
 use objc2_metal::MTLCommandBuffer;
 
 /// Pluggable draft token producer for speculative verification (`t-audit-pr42-port`).
@@ -39,10 +37,7 @@ pub struct NgramDraftProducer {
 
 impl NgramDraftProducer {
     pub fn new(max_order: usize, fallback_tok: u32) -> Self {
-        Self {
-            max_order: max_order.max(1),
-            fallback_tok,
-        }
+        Self { max_order: max_order.max(1), fallback_tok }
     }
 }
 
@@ -114,20 +109,11 @@ pub struct VerifyKept {
 /// Execute one greedy (`temp == 0`) speculative verification step over Layer 2 contiguous or
 /// Layer 3 paged lanes (`spans * (1 + k) <= eng.verify_row_capacity()`, checking `wait_completed`
 /// and rolling back `n_keep = 0` on any Metal failure).
-pub fn verify_step(
-    eng: &Engine,
-    lanes: &[VerifyIn<'_>],
-    stop: &[u32],
-) -> Vec<Option<Result<VerifyKept, String>>> {
+pub fn verify_step(eng: &Engine, lanes: &[VerifyIn<'_>], stop: &[u32]) -> Vec<Option<Result<VerifyKept, String>>> {
     let cands: Vec<VerifyCand> = lanes
         .iter()
         .enumerate()
-        .map(|(i, v)| VerifyCand {
-            lane: i,
-            p0: v.p0,
-            k: v.drafts.len(),
-            kv_cap: eng.on(v.lane).kv_capacity(),
-        })
+        .map(|(i, v)| VerifyCand { lane: i, p0: v.p0, k: v.drafts.len(), kv_cap: eng.on(v.lane).kv_capacity() })
         .collect();
     let plans = plan_verify(&cands, eng.verify_row_capacity(), eng.hgemm);
     let mut out = vec![None; lanes.len()];
@@ -135,14 +121,7 @@ pub fn verify_step(
         return out;
     }
     let k = plans[0].k;
-    let spans: Vec<Span<'_>> = plans
-        .iter()
-        .map(|p| Span {
-            lane: lanes[p.lane].lane,
-            p0: p.p0,
-            t: 1 + k,
-        })
-        .collect();
+    let spans: Vec<Span<'_>> = plans.iter().map(|p| Span { lane: lanes[p.lane].lane, p0: p.p0, t: 1 + k }).collect();
     let cb = eng.gpu.cmd();
     // Snapshot lane KV + CS + tokens BEFORE staging draft tokens and pre-p0 CS into shared buffers.
     eng.encode_verify(&cb, &spans, k);
@@ -160,10 +139,8 @@ pub fn verify_step(
         let result = gpu.clone().and_then(|()| {
             let base = si * (1 + k);
             let logits: Vec<Vec<f32>> = (0..=k).map(|r| eng.span_logits(base + r).to_vec()).collect();
-            let argmaxes: Result<Vec<u32>, String> = logits
-                .iter()
-                .map(|row| checked_argmax(row).map_err(String::from))
-                .collect();
+            let argmaxes: Result<Vec<u32>, String> =
+                logits.iter().map(|row| checked_argmax(row).map_err(String::from)).collect();
             let keep = accept_greedy(&lanes[p.lane].drafts[..k], &argmaxes?, stop);
             let hashes = keep.rows.iter().map(|&r| logit_hash(&logits[r])).collect();
             Ok(VerifyKept {
@@ -176,11 +153,7 @@ pub fn verify_step(
                 bonus: keep.bonus,
             })
         });
-        eng.rollback_verify(
-            lanes[p.lane].lane,
-            si,
-            result.as_ref().map_or(0, |kept| kept.n_keep),
-        );
+        eng.rollback_verify(lanes[p.lane].lane, si, result.as_ref().map_or(0, |kept| kept.n_keep));
         out[p.lane] = Some(result);
     }
     out
@@ -197,12 +170,7 @@ pub fn verify_step_sampled(
     stop: &[u32],
 ) -> Result<Option<VerifyKept>, String> {
     assert_eq!(draft_logits.len(), v.drafts.len());
-    let cands = [VerifyCand {
-        lane: 0,
-        p0: v.p0,
-        k: v.drafts.len(),
-        kv_cap: eng.on(v.lane).kv_capacity(),
-    }];
+    let cands = [VerifyCand { lane: 0, p0: v.p0, k: v.drafts.len(), kv_cap: eng.on(v.lane).kv_capacity() }];
     let plans = plan_verify(&cands, eng.verify_row_capacity(), eng.hgemm);
     let Some(p) = plans.first().copied() else {
         return Ok(None);
@@ -221,10 +189,8 @@ pub fn verify_step_sampled(
         return Err(err);
     }
     let logits: Vec<Vec<f32>> = (0..=k).map(|r| eng.span_logits(r).to_vec()).collect();
-    let argmaxes: Result<Vec<u32>, String> = logits
-        .iter()
-        .map(|row| checked_argmax(row).map_err(String::from))
-        .collect();
+    let argmaxes: Result<Vec<u32>, String> =
+        logits.iter().map(|row| checked_argmax(row).map_err(String::from)).collect();
     let argmaxes = argmaxes?;
     if sampler.greedy() {
         let keep = accept_greedy(&v.drafts[..k], &argmaxes, stop);
@@ -257,27 +223,11 @@ pub fn verify_step_sampled(
             break;
         }
     }
-    let n_keep = if stopped_in_drafts {
-        1 + emitted.len()
-    } else {
-        emitted.len()
-    };
-    let bonus = if stopped_in_drafts {
-        None
-    } else {
-        emitted.last().copied()
-    };
+    let n_keep = if stopped_in_drafts { 1 + emitted.len() } else { emitted.len() };
+    let bonus = if stopped_in_drafts { None } else { emitted.last().copied() };
     let hashes = rows.iter().map(|&r| logit_hash(&logits[r])).collect();
     eng.rollback_verify(v.lane, 0, n_keep);
-    Ok(Some(VerifyKept {
-        p0: p.p0,
-        k,
-        emitted,
-        n_keep,
-        finished,
-        hashes,
-        bonus,
-    }))
+    Ok(Some(VerifyKept { p0: p.p0, k, emitted, n_keep, finished, hashes, bonus }))
 }
 
 /// Layer 3 paged lane wrapper for speculative verification + rollback across `Window`, `Full`,
@@ -295,11 +245,7 @@ pub struct PagedVerifyLane<'a> {
 impl<'a> PagedVerifyLane<'a> {
     pub fn new(eng: &'a Engine, cap: usize) -> Self {
         let lane = Lane::new_blocked(eng, cap);
-        Self {
-            eng,
-            lane,
-            written: 0,
-        }
+        Self { eng, lane, written: 0 }
     }
 
     fn take_slot(pools: &mut BlockPools, kind: BlockKind) -> (crate::blocks::Slot, u32) {
@@ -330,8 +276,7 @@ impl<'a> PagedVerifyLane<'a> {
                     assert!(!rec.sealed(), "verify/step must never write into a sealed {kind:?} block");
                 } else {
                     let (slot, gen) = Self::take_slot(&mut pools, kind);
-                    tbl.fill(pools.of_mut(kind), bi, slot, gen)
-                        .expect("fill newly allocated verify block");
+                    tbl.fill(pools.of_mut(kind), bi, slot, gen).expect("fill newly allocated verify block");
                     allocated.push((kind, bi));
                 }
             }
@@ -344,8 +289,7 @@ impl<'a> PagedVerifyLane<'a> {
     pub fn step_one(&mut self, pos: usize, logits: bool) -> Result<(), String> {
         let _ = self.ensure_span_blocks(pos, 1);
         let cb = self.eng.gpu.cmd();
-        self.eng
-            .encode_spans(&cb, &[Span { lane: &self.lane, p0: pos, t: 1 }], logits, false);
+        self.eng.encode_spans(&cb, &[Span { lane: &self.lane, p0: pos, t: 1 }], logits, false);
         cb.commit();
         wait_completed(&cb, "paged step1", pos)?;
         let end = pos + 1;
@@ -358,12 +302,7 @@ impl<'a> PagedVerifyLane<'a> {
             let mut pools = self.eng.block_pool().borrow_mut();
             for kind in [BlockKind::Full, BlockKind::Window] {
                 let e = tbl.get(kind, bi).unwrap().expect("active block entry");
-                pools
-                    .of_mut(kind)
-                    .record_mut(e.slot())
-                    .unwrap()
-                    .set_length(block_len)
-                    .expect("set block length");
+                pools.of_mut(kind).record_mut(e.slot()).unwrap().set_length(block_len).expect("set block length");
             }
         }
         self.prune_expired_window(end);
@@ -380,11 +319,7 @@ impl<'a> PagedVerifyLane<'a> {
         pre_written: usize,
         accepted_end: usize,
     ) {
-        let target_end = if accepted_end == 0 {
-            pre_written
-        } else {
-            accepted_end
-        };
+        let target_end = if accepted_end == 0 { pre_written } else { accepted_end };
         {
             let mut pools = self.eng.block_pool().borrow_mut();
             let mut tbl = self.lane.block_table().borrow_mut();
@@ -413,8 +348,7 @@ impl<'a> PagedVerifyLane<'a> {
         self.written = target_end;
         // Sync any cleared draft-block GPU table entries back to `CLEARED_GPU_TABLE_ENTRY` (`u64::MAX`).
         if target_end > 0 {
-            self.eng
-                .sync_lane_block_table(&self.lane, target_end - 1, 1);
+            self.eng.sync_lane_block_table(&self.lane, target_end - 1, 1);
         }
         self.prune_expired_window(target_end);
     }
@@ -439,11 +373,7 @@ impl<'a> PagedVerifyLane<'a> {
 
     pub fn release(self) {
         let mut pools = self.eng.block_pool().borrow_mut();
-        self.lane
-            .block_table()
-            .borrow_mut()
-            .clear_entries(&mut pools)
-            .unwrap();
+        self.lane.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
     }
 }
 
@@ -484,19 +414,10 @@ pub fn run_speculative_loop(
     loop {
         let k_max = emit_state.clamp_draft_count(k_target);
         let drafts = drafter.propose(&history, k_max);
-        let res = verify_step(
-            eng,
-            &[VerifyIn {
-                lane: &lane,
-                p0,
-                cs_before: &cs_before,
-                drafts: &drafts,
-            }],
-            stop,
-        )
-        .pop()
-        .unwrap()
-        .ok_or_else(|| String::from("verify planner made no progress"))??;
+        let res = verify_step(eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs_before, drafts: &drafts }], stop)
+            .pop()
+            .unwrap()
+            .ok_or_else(|| String::from("verify planner made no progress"))??;
         emit_state.emit_q.extend(res.emitted.iter().copied());
         if let Some(reason) = emit_state.drain_queue(stop, |tok| {
             delivered.push(tok);
