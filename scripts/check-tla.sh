@@ -22,7 +22,7 @@ parts='memmode blocks grouped layout-nightly scheduler traces'
 # These trace-conformance scripts run in parallel. Both the trace and tier checks
 # reject a check-*-traces.sh file that does not appear in this inventory.
 trace_scripts='memmode blockbook cache scheduler poisongate serve-step serve-cache serve-ownership'
-grouped_modules=GroupedLayout,PoisonGate,ScratchTail
+grouped_modules=GroupedLayout,PoisonGate,ScratchTail,SplitArena
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 if command -v zsh >/dev/null 2>&1; then
@@ -63,9 +63,9 @@ UnfairRestart EventuallyRestored temporal'
 
 layout_sel() {
     case $1 in
-        blocks) echo "TLC_NIGHTLY= INKY_TLC_NIGHTLY= TLC_NIGHTLY_ONLY= TLC_EXCEPT=$grouped_modules" ;;
-        grouped) echo "TLC_NIGHTLY= INKY_TLC_NIGHTLY= TLC_NIGHTLY_ONLY= TLC_ONLY=$grouped_modules" ;;
-        layout-nightly) echo "TLC_NIGHTLY_ONLY=1 TLC_ONLY= TLC_EXCEPT=" ;;
+        blocks) echo "TLA_NIGHTLY=0 TLC_NIGHTLY= TLC_NIGHTLY_ONLY= TLC_EXCEPT=$grouped_modules" ;;
+        grouped) echo "TLA_NIGHTLY=0 TLC_NIGHTLY= TLC_NIGHTLY_ONLY= TLC_ONLY=$grouped_modules" ;;
+        layout-nightly) echo "TLA_NIGHTLY=1 TLC_NIGHTLY_ONLY=1 TLC_ONLY= TLC_EXCEPT=" ;;
     esac
 }
 
@@ -215,6 +215,7 @@ for p in blocks grouped; do
     want "$p" && [ -f "$root/specs/BlockLayout.tla" ] || continue
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
     if command -v rustc >/dev/null 2>&1; then (cd "$root" && rustc --version >/dev/null); fi
+    sh "$root/tests/check-layout-coverage.sh" --self-test
     env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" bash "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout-$p" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1

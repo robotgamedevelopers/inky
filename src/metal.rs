@@ -39,8 +39,42 @@ pub fn wait_or_drain<T>(
     Ok(())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static INJECTED_WAIT_FAILURE: std::cell::Cell<Option<(&'static str, usize)>> = const { std::cell::Cell::new(None) };
+    static WAIT_STAGE_CALLS: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+pub fn inject_wait_failure(stage: &'static str, failing_call_index: usize) {
+    WAIT_STAGE_CALLS.with(|m| m.borrow_mut().clear());
+    INJECTED_WAIT_FAILURE.with(|f| f.set(Some((stage, failing_call_index))));
+}
+
+#[cfg(test)]
+pub fn clear_wait_failure() {
+    WAIT_STAGE_CALLS.with(|m| m.borrow_mut().clear());
+    INJECTED_WAIT_FAILURE.with(|f| f.set(None));
+}
+
 pub fn wait_completed(cb: &CmdBuf, stage: &str, pos: usize) -> Result<(), String> {
     cb.waitUntilCompleted();
+    #[cfg(test)]
+    if let Some((want_stage, want_idx)) = INJECTED_WAIT_FAILURE.with(|f| f.get()) {
+        if stage == want_stage {
+            let idx = WAIT_STAGE_CALLS.with(|m| {
+                let mut map = m.borrow_mut();
+                let c = map.entry(stage.to_string()).or_insert(0);
+                let cur = *c;
+                *c += 1;
+                cur
+            });
+            if idx == want_idx {
+                INJECTED_WAIT_FAILURE.with(|f| f.set(None));
+                return Err(format!("Metal {stage} at token {pos} failed (InjectedTestError)"));
+            }
+        }
+    }
     let status = cb.status();
     if status == MTLCommandBufferStatus::Completed { return Ok(()); }
     let detail = cb.error().map(|err| format!(": {}", err.localizedDescription())).unwrap_or_default();

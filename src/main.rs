@@ -20,6 +20,7 @@ mod stream_text;
 mod tuning;
 mod tokenizer;
 mod unicode_tables;
+mod verify;
 
 use engine::{Engine, Lane};
 use objc2_metal::{MTLBuffer, MTLCommandBuffer};
@@ -99,6 +100,13 @@ fn cli_error(error: String) -> ! {
 fn report_cli_result(command: &str, result: Result<(), String>) {
     if let Err(err) = result {
         eprintln!("{command}: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn wait_gate(cb: &metal::CmdBuf, stage: &str, pos: usize) {
+    if let Err(err) = metal::wait_completed(cb, stage, pos) {
+        eprintln!("[gate] {err}");
         std::process::exit(1);
     }
 }
@@ -187,8 +195,8 @@ fn is_known_cli_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "help" | "-h" | "--help"
-            | "check" | "rows" | "rollback" | "binv" | "crosspath" | "lanes" | "spans" | "xcopy" | "poolgate"
-            | "loopcdgate" | "blockedinv" | "temp1"
+            | "check" | "rows" | "rollback" | "verify" | "binv" | "crosspath" | "lanes" | "spans" | "xcopy" | "poolgate"
+            | "loopcdgate" | "blockedinv" | "temp1" | "prefixbench"
             | "lanebench" | "dbatch" | "sharedkv" | "maxctx" | "debug" | "prof" | "routes" | "vcost" | "prof_pf"
             | "kmoe" | "kgemm" | "kmoepf" | "ksg" | "qclip" | "lazytest" | "kvprune" | "kvscreen" | "kvdump"
             | "kpeak" | "kmode" | "bw" | "kbench" | "run" | "chat" | "bench"
@@ -664,13 +672,15 @@ fn chat(o: &Opts) -> Result<(), String> {
         let before = sess.stats;
         let toks = tk.encode(&text, true);
         if sess.ctx_left() < toks.len() + 64 { eprintln!("[context full: /reset]"); continue; }
-        let first = sess.prefill(&toks)?;
-        has_turn = true;
-        let mut r = Renderer::new(!o.hide_thinking, o.raw);
-        let max = o.n.min(sess.ctx_left().saturating_sub(4));
-        let generated = sess.generate(first, max, &mut sampler, |t| { r.push(&tk, t, &mut out); true });
-        r.end(&mut out);
-        generated?;
+        match sess.run_chat_turn(&toks, o.n, !o.hide_thinking, o.raw, &mut sampler, &mut out) {
+            Ok(_) => {
+                has_turn = true;
+            }
+            Err(err) => {
+                eprintln!("\n[error: {err}]");
+                continue;
+            }
+        }
         let s = sess.stats;
         let (pt, gt) = (s.prompt_tokens - before.prompt_tokens, s.gen_tokens - before.gen_tokens);
         eprintln!("\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
@@ -959,7 +969,7 @@ fn rows(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_gate(&cb, "rows step1", pos);
     };
     let lane_r = fresh();
     let mut expect: Vec<Vec<f32>> = Vec::with_capacity(1 + k);
@@ -976,7 +986,7 @@ fn rows(o: &Opts) {
     let cb = eng.gpu.cmd();
     eng.encode_verify(&cb, &[Span { lane: &lane, p0: p - 1, t: 1 + k }], k);
     cb.commit();
-    cb.waitUntilCompleted();
+    wait_gate(&cb, "rows verify", p - 1);
     let mut ok = true;
     for (r, exp) in expect.iter().enumerate().take(1 + k) {
         let got = eng.span_logits(r);
@@ -1011,7 +1021,7 @@ fn rollback(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_gate(&cb, "rollback step1", pos);
     };
     let mut ok = true;
     for (name, n_keep) in [("middle", k.div_ceil(2)), ("last", k)] {
@@ -1047,7 +1057,7 @@ fn rollback(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_gate(&cb, "rollback verify", p0);
         let logits_same = &*eng.span_logits(n_keep - 1) == ref_logits.as_slice();
         eng.rollback_verify(&lane, 0, n_keep);
         let pref_ok = eng.lane_hash(&lane) == hash_pref;
@@ -1065,6 +1075,418 @@ fn rollback(o: &Opts) {
     }
     println!("{}", if ok { "rollback lane_hash matches encode_spans of t=1" } else { "ROLLBACK LANE_HASH DIFFERS" });
     if !ok { std::process::exit(1); }
+}
+
+/// Speculative scheduler verification & rollback gate (`PR #42` / `PR #80` / `t-audit-pr42-port`):
+/// - Layer 2 single-lane & batched two-lane `verify_step` vs 1-token `encode_spans(t=1)` (tokens + logit hashes).
+/// - `n_keep = 0` full span abort restoring cache, convolution state, and saved tokens.
+/// - Forced middle and last draft rejects restoring `lane_hash` before and after correction token.
+/// - Stop token in the middle of accepted drafts emitting only the prefix (`bonus = None`).
+/// - Context-boundary `k` clamping (`p0 = 60, cap = 64, k = 7 -> 3`) and 2-token `reply_budget` emission.
+/// - Layer 3 paged (`Lane::new_blocked` + `BlockPools` + `BlockTable`) verification and rollback across
+///   both a 64-token block boundary (`62..66`) and the 1024-token sliding-window boundary (`1022..1026`),
+///   proving `Window`, `Full`, and recurrent `cs` state match 1-token paged execution bit-for-bit.
+/// - Multi-step speculative generation driven by `NgramDraftProducer`, plus stochastic `verify_step_sampled`.
+fn verify(o: &Opts) {
+    use engine::Span;
+    use sampler::checked_argmax;
+    use scheduler::logit_hash;
+    use verify::{
+        run_speculative_loop, verify_step, verify_step_sampled, NgramDraftProducer,
+        PagedVerifyLane, VerifyIn,
+    };
+
+    let sabotage = std::env::var("INK_VERIFY_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let k = 3usize;
+    let ctx = 1152usize;
+    println!("verify gate: Layer 2 + Layer 3 paged + drafter, ctx {ctx}");
+    let eng = Engine::load(&o.model, ctx);
+    eng.ensure_batch(eng.chunk);
+    let prompt: Vec<u32> = (0..8).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+    let p0 = prompt.len() - 1;
+    let step1 = |lane: &Lane, pos: usize, logits: bool| {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
+        cb.commit();
+        wait_gate(&cb, "verify reference", pos);
+    };
+
+    // Baseline: `encode_spans` of `t = 1`, one position at a time.
+    let base = Lane::new(&eng);
+    eng.on(&base).set_tokens(0, &prompt);
+    for pos in 0..p0 {
+        step1(&base, pos, false);
+    }
+    let mut gen_toks = Vec::new();
+    let mut gen_hash = Vec::new();
+    let mut hash_after = Vec::new();
+    for i in 0..=k {
+        let pos = p0 + i;
+        if i > 0 {
+            eng.on(&base).set_tokens(pos, &[gen_toks[i - 1]]);
+        }
+        step1(&base, pos, true);
+        let lg = eng.logits().to_vec();
+        gen_hash.push(logit_hash(&lg));
+        gen_toks.push(checked_argmax(&lg).expect("reference logits"));
+        hash_after.push(eng.lane_hash(&base));
+    }
+
+    let prep = |toks: &[u32]| {
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.set_tokens(0, toks);
+        for pos in 0..toks.len() - 1 {
+            step1(&lane, pos, false);
+        }
+        let cs = run.get_cs();
+        step1(&lane, toks.len() - 1, false);
+        (lane, cs)
+    };
+    let mut ok = true;
+
+    // 1. Full accept on Layer 2.
+    {
+        let (lane, cs) = prep(&prompt);
+        let drafts = gen_toks[..k].to_vec();
+        let kept = verify_step(
+            &eng,
+            &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
+            &[],
+        )
+        .pop()
+        .unwrap()
+        .transpose()
+        .expect("verify step");
+        if let Some(mut kept) = kept {
+            if sabotage {
+                println!("INK_VERIFY_SABOTAGE: perturbing verified logit hash");
+                kept.hashes[0] ^= 1;
+            }
+            let same_tok = kept.emitted == gen_toks[..=k];
+            let same_hash = kept.hashes == gen_hash[..=k];
+            ok &= same_tok && same_hash;
+            println!(
+                "match kept {} logit hashes {}",
+                if same_tok { "same" } else { "DIFFERENT" },
+                if same_hash { "same" } else { "DIFFERENT" }
+            );
+        } else {
+            ok = false;
+        }
+    }
+
+    // 2. Two-lane batched verify on Layer 2.
+    if eng.hgemm && !sabotage {
+        let (left, left_cs) = prep(&prompt);
+        let mut other = prompt.clone();
+        other[p0] += 1;
+        let (right, right_cs) = prep(&other);
+        let reference = Lane::new(&eng);
+        eng.on(&reference).set_tokens(0, &other);
+        for pos in 0..p0 {
+            step1(&reference, pos, false);
+        }
+        let mut right_toks = Vec::new();
+        let mut right_hashes = Vec::new();
+        for i in 0..=k {
+            let pos = p0 + i;
+            if i > 0 {
+                eng.on(&reference).set_tokens(pos, &[right_toks[i - 1]]);
+            }
+            step1(&reference, pos, true);
+            let row = eng.logits();
+            right_toks.push(checked_argmax(&row).expect("reference logits"));
+            right_hashes.push(logit_hash(&row));
+        }
+        let input = [
+            VerifyIn { lane: &left, p0, cs_before: &left_cs, drafts: &gen_toks[..k] },
+            VerifyIn { lane: &right, p0, cs_before: &right_cs, drafts: &right_toks[..k] },
+        ];
+        let kept = verify_step(&eng, &input, &[]);
+        let same = kept
+            .into_iter()
+            .zip([(&gen_toks, &gen_hash), (&right_toks, &right_hashes)])
+            .all(|(kept, (toks, hashes))| {
+                kept.transpose()
+                    .expect("batched verify step")
+                    .is_some_and(|kept| &kept.emitted == toks && &kept.hashes == hashes)
+            });
+        ok &= same;
+        println!("two-lane verify tokens and logit hashes {}", if same { "same" } else { "DIFFERENT" });
+    }
+
+    // 3. Full `n_keep = 0` abort rollback + middle/last rejects + stop-in-middle + boundary clamp.
+    if !sabotage {
+        {
+            let (lane, cs_before_anchor) = prep(&prompt);
+            let run = eng.on(&lane);
+            let saved_tokens = [41u32, 42, 43];
+            run.set_tokens(p0 + 1, &saved_tokens);
+            let before = eng.lane_hash(&lane);
+            let cb = eng.gpu.cmd();
+            eng.encode_verify(&cb, &[Span { lane: &lane, p0, t: 1 + k }], k);
+            run.set_cs(&cs_before_anchor);
+            run.set_tokens(p0 + 1, &gen_toks[..k]);
+            cb.commit();
+            wait_gate(&cb, "verify abort probe", p0);
+            eng.rollback_verify(&lane, 0, 0);
+            let same = eng.lane_hash(&lane) == before
+                && saved_tokens
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &tok)| run.token_at(p0 + 1 + i) == tok);
+            ok &= same;
+            println!(
+                "full verify rollback {}",
+                if same { "restored cache, convolution state and tokens" } else { "DIFFERENT" }
+            );
+        }
+
+        for (name, at) in [("middle", 1usize), ("last", k - 1)] {
+            let (lane, cs) = prep(&prompt);
+            let mut drafts = gen_toks[..k].to_vec();
+            drafts[at] = (drafts[at] + 1) % eng.n_vocab as u32;
+            let kept = verify_step(
+                &eng,
+                &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
+                &[],
+            )
+            .pop()
+            .unwrap()
+            .transpose()
+            .expect("verify reject")
+            .expect("verify ran");
+            let next_ok = kept.bonus == Some(gen_toks[at]);
+            let pos = kept.p0 + kept.n_keep;
+            eng.on(&lane).set_tokens(pos, &[gen_toks[at]]);
+            step1(&lane, pos, false);
+            let hash_ok = eng.lane_hash(&lane) == hash_after[at + 1];
+            ok &= next_ok && hash_ok;
+            println!(
+                "reject {name} next token {} lane_hash {}",
+                if next_ok { "same" } else { "DIFFERENT" },
+                if hash_ok { "same" } else { "DIFFERENT" }
+            );
+        }
+
+        {
+            let stop_tok = gen_toks[1];
+            let (lane, cs) = prep(&prompt);
+            let drafts = gen_toks[..k].to_vec();
+            let kept = verify_step(
+                &eng,
+                &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
+                &[stop_tok],
+            )
+            .pop()
+            .unwrap()
+            .transpose()
+            .expect("verify stop")
+            .expect("verify ran");
+            let expect: Vec<u32> = drafts
+                .iter()
+                .copied()
+                .scan(false, |done, tok| {
+                    if *done {
+                        None
+                    } else {
+                        if tok == stop_tok {
+                            *done = true;
+                        }
+                        Some(tok)
+                    }
+                })
+                .collect();
+            let prefix_ok = kept.emitted == expect && kept.finished && kept.bonus.is_none();
+            ok &= prefix_ok;
+            println!(
+                "stop in the middle emitted {:?} {}",
+                kept.emitted,
+                if prefix_ok { "prefix only" } else { "DIFFERENT" }
+            );
+        }
+
+        // Boundary clamp on a 64-cap lane (`p0 = 60, cap = 64, want = 7 -> k = 3`).
+        {
+            let n = 61usize;
+            let toks: Vec<u32> = (0..n).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
+            let lane = Lane::new(&eng);
+            let run = eng.on(&lane);
+            let cap = run.kv_capacity();
+            assert_eq!(cap, 64);
+            run.set_tokens(0, &toks);
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &lane, p0: 0, t: n - 1 }], false, false);
+            cb.commit();
+            wait_gate(&cb, "verify boundary pf", 0);
+            let cs = run.get_cs();
+            step1(&lane, n - 1, false);
+            let p0b = n - 1;
+            let want = 7usize;
+            let drafts = vec![1u32; want];
+            let kept = verify_step(
+                &eng,
+                &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }],
+                &[],
+            )
+            .pop()
+            .unwrap()
+            .transpose()
+            .expect("boundary verify")
+            .expect("boundary ran");
+            let clamped = kept.k < want && p0b + 1 + kept.k <= cap;
+            ok &= clamped;
+            println!(
+                "boundary k clamped {want} -> {}, p0 {p0b} cap {cap}, {}",
+                kept.k,
+                if clamped { "no capacity assert" } else { "NOT CLAMPED" }
+            );
+        }
+
+        // 4. Layer 3 paged verification & rollback across BOTH 64-token block boundary (`p0=62, k=3`)
+        //    and 1024-token sliding-window boundary (`p0=1022, k=3`, proving rejected drafts past 1024
+        //    keep `Window` block 0 intact and match 1-token paged `lane_hash` across Full + Window + CS!).
+        for (bname, anchor_p0) in [("block-boundary-62", 62usize), ("window-boundary-1022", 1022usize)] {
+            let stream: Vec<u32> = (0..anchor_p0 + k + 4).map(|i| ((i * 23 + 7) % 1000) as u32).collect();
+            // Paged 1-token reference stopping after rejecting middle draft (`n_keep = 2`, then correction token).
+            let mut ref_paged = PagedVerifyLane::new(&eng, anchor_p0 + k + 8);
+            eng.on(&ref_paged.lane).set_tokens(0, &stream);
+            if anchor_p0 > 1 {
+                let _ = ref_paged.ensure_span_blocks(0, anchor_p0);
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, &[Span { lane: &ref_paged.lane, p0: 0, t: anchor_p0 }], false, false);
+                cb.commit();
+                wait_gate(&cb, "paged ref prefill", 0);
+                for b in 0..=(anchor_p0 - 1) / blocks::BLOCK {
+                    let bi = blocks::BlockIndex::new(b as u32);
+                    let blen = (anchor_p0 - b * blocks::BLOCK).min(blocks::BLOCK) as u32;
+                    let tbl = ref_paged.lane.block_table().borrow();
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for kind in [blocks::BlockKind::Full, blocks::BlockKind::Window] {
+                        let e = tbl.get(kind, bi).unwrap().unwrap();
+                        pools.of_mut(kind).record_mut(e.slot()).unwrap().set_length(blen).unwrap();
+                    }
+                }
+                ref_paged.written = anchor_p0;
+                ref_paged.prune_expired_window(anchor_p0);
+            }
+            let cs_anchor = eng.on(&ref_paged.lane).get_cs();
+            ref_paged.step_one(anchor_p0, true).unwrap();
+            let d0 = checked_argmax(&eng.logits()).unwrap();
+            eng.on(&ref_paged.lane).set_tokens(anchor_p0 + 1, &[d0]);
+            ref_paged.step_one(anchor_p0 + 1, true).unwrap();
+            let corr = checked_argmax(&eng.logits()).unwrap();
+            let want_pref_hash = eng.lane_hash(&ref_paged.lane);
+            eng.on(&ref_paged.lane).set_tokens(anchor_p0 + 2, &[corr]);
+            ref_paged.step_one(anchor_p0 + 2, false).unwrap();
+            let want_corr_hash = eng.lane_hash(&ref_paged.lane);
+
+            // Paged verify candidate: draft 0 matches (`d0`), draft 1 mismatches (`corr + 1`), draft 2 crosses boundary!
+            let mut cand_paged = PagedVerifyLane::new(&eng, anchor_p0 + k + 8);
+            eng.on(&cand_paged.lane).set_tokens(0, &stream);
+            if anchor_p0 > 1 {
+                let _ = cand_paged.ensure_span_blocks(0, anchor_p0);
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, &[Span { lane: &cand_paged.lane, p0: 0, t: anchor_p0 }], false, false);
+                cb.commit();
+                wait_gate(&cb, "paged cand prefill", 0);
+                for b in 0..=(anchor_p0 - 1) / blocks::BLOCK {
+                    let bi = blocks::BlockIndex::new(b as u32);
+                    let blen = (anchor_p0 - b * blocks::BLOCK).min(blocks::BLOCK) as u32;
+                    let tbl = cand_paged.lane.block_table().borrow();
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for kind in [blocks::BlockKind::Full, blocks::BlockKind::Window] {
+                        let e = tbl.get(kind, bi).unwrap().unwrap();
+                        pools.of_mut(kind).record_mut(e.slot()).unwrap().set_length(blen).unwrap();
+                    }
+                }
+                cand_paged.written = anchor_p0;
+                cand_paged.prune_expired_window(anchor_p0);
+            }
+            let cs_cand = eng.on(&cand_paged.lane).get_cs();
+            assert_eq!(cs_cand, cs_anchor);
+            cand_paged.step_one(anchor_p0, false).unwrap();
+            let pre_written = cand_paged.written;
+            let allocated = cand_paged.ensure_span_blocks(anchor_p0, 1 + k);
+            let bad_drafts = [d0, (corr + 1) % eng.n_vocab as u32, (corr + 2) % eng.n_vocab as u32];
+            let kept = verify_step(
+                &eng,
+                &[VerifyIn { lane: &cand_paged.lane, p0: anchor_p0, cs_before: &cs_cand, drafts: &bad_drafts }],
+                &[],
+            )
+            .pop()
+            .unwrap()
+            .transpose()
+            .expect("paged verify")
+            .expect("paged verify ran");
+            assert_eq!(kept.n_keep, 2);
+            cand_paged.finish_verify_rollback(&allocated, pre_written, anchor_p0 + kept.n_keep);
+            let pref_same = eng.lane_hash(&cand_paged.lane) == want_pref_hash && kept.bonus == Some(corr);
+            eng.on(&cand_paged.lane).set_tokens(anchor_p0 + 2, &[corr]);
+            cand_paged.step_one(anchor_p0 + 2, false).unwrap();
+            let corr_same = eng.lane_hash(&cand_paged.lane) == want_corr_hash;
+            ok &= pref_same && corr_same;
+            println!(
+                "paged {bname} (n_keep=2): prefix Full+Window+CS {} correction Full+Window+CS {}",
+                if pref_same { "same" } else { "DIFFERENT" },
+                if corr_same { "same" } else { "DIFFERENT" }
+            );
+            ref_paged.release();
+            cand_paged.release();
+        }
+
+        // 5. Multi-step `NgramDraftProducer` loop + stochastic `verify_step_sampled` (`temp = 0.8`).
+        {
+            let mut drafter = NgramDraftProducer::new(3, gen_toks[0]);
+            let (spec_out, reason) =
+                run_speculative_loop(&eng, &prompt, k + 1, 128, 3, &[], &mut drafter)
+                    .expect("ngram speculative loop");
+            let loop_same = spec_out == gen_toks[..=k] && reason == "length";
+            ok &= loop_same;
+            println!(
+                "ngram drafter multi-step loop ({} tokens, reason={reason}): {}",
+                spec_out.len(),
+                if loop_same { "matches t=1" } else { "DIFFERENT" }
+            );
+
+            let (slane, scs) = prep(&prompt);
+            let mut draft_s = Sampler::draft(0.8, 64, 0.95, eng.softcap, 2026);
+            let mut target_s = Sampler::new(0.8, 64, 0.95, eng.softcap, 2026);
+            let dummy_q = vec![0.0f32; eng.n_vocab];
+            let s_drafts = [draft_s.sample_next(&dummy_q).unwrap(), draft_s.sample_next(&dummy_q).unwrap()];
+            let skpt = verify_step_sampled(
+                &eng,
+                &VerifyIn { lane: &slane, p0, cs_before: &scs, drafts: &s_drafts },
+                &[&dummy_q, &dummy_q],
+                &mut target_s,
+                &[],
+            )
+            .expect("stochastic verify step")
+            .expect("stochastic verify ran");
+            let samp_ok = !skpt.emitted.is_empty()
+                && skpt.emitted.iter().all(|&t| (t as usize) < eng.n_vocab)
+                && skpt.n_keep == skpt.emitted.len();
+            ok &= samp_ok;
+            println!(
+                "stochastic verify (temp=0.8, top_k=64): emitted {} valid tokens (n_keep={})",
+                skpt.emitted.len(),
+                skpt.n_keep
+            );
+        }
+    }
+
+    println!(
+        "{}",
+        if ok {
+            "verify gate matches encode_spans of t=1"
+        } else {
+            "VERIFY GATE FAILED"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
@@ -1283,7 +1705,7 @@ fn lanes(o: &Opts) {
         if poison { run.poison_scratch(); }
         let cb = run.gpu.cmd();
         if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
-        cb.commit(); cb.waitUntilCompleted();
+        cb.commit(); wait_gate(&cb, "lanes step", p0);
         for &x in &*run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
     };
     // per-step hashes, to name the first step where two runs part
@@ -1363,7 +1785,7 @@ fn spans(o: &Opts) {
         let l = fresh(i);
         let mut hs = Vec::new();
         for &(p0, t) in &work {
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); wait_gate(&cb, "spans alone", p0);
             hs.push(fnv(&eng.logits()));
         }
         alone.push((hs, eng.lane_hash(&l)));
@@ -1392,7 +1814,7 @@ fn spans(o: &Opts) {
                 }
                 if w_sp_slice.iter().any(|x| x.t > 1) && w_sp_slice.iter().any(|x| x.t == 1) { mixed += 1; }
                 nsteps += 1;
-                let cb = eng.gpu.cmd(); eng.encode_spans(&cb, w_sp_slice, true, false); cb.commit(); cb.waitUntilCompleted();
+                let cb = eng.gpu.cmd(); eng.encode_spans(&cb, w_sp_slice, true, false); cb.commit(); wait_gate(&cb, "spans batch", w_sp_slice[0].p0);
                 for (k, &i) in w_who.iter().enumerate() { hs[i].push(fnv(&(if w_sp_slice.len() == 1 { eng.logits() } else { eng.span_logits(k) }))); }
             }
         }
@@ -1508,7 +1930,7 @@ fn xcopy(o: &Opts) {
         eng.poison_scratch();
         let cb = eng.gpu.cmd();
         if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
-        cb.commit(); cb.waitUntilCompleted();
+        cb.commit(); wait_gate(&cb, "xcopy step", p0);
         fnv(&(if dec { eng.span_logits(0) } else { eng.logits() }))
     };
     let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
@@ -2387,10 +2809,83 @@ fn sharedkv(o: &Opts) {
         (best_nogrp, best_grp, attn_nogrp, attn_grp)
     };
 
+    let sabotage = std::env::var("INK_SHAREDKV_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
     let mut all_ok = true;
+    // Boundary-end parity check (`docs/SHARED-PREFIX.md` §4 & `t-later-prefix-reads`):
+    // ends at 63/64/65, 255/256/257, and 1023/1024/1025 comparing grouped `k_attn_grp_dec` against
+    // private fixed-split Layer 2 `encode_decode` AND Layer 3 `INK_NO_GRP_DEC=1` bit-for-bit!
+    if prefix_len >= 1024 {
+        eng.ensure_batch(eng.chunk);
+        eng.ensure_dbatch(4);
+        let boundary_ends = [63usize, 64, 65, 255, 256, 257, 1023, 1024, 1025];
+        for &end in &boundary_ends {
+            let pos = end - 1;
+            let shared_b = (pos / 64) * 64;
+            let b_toks_a: Vec<u32> = (0..=pos).map(|q| base[q % base.len()]).collect();
+            let mut b_toks_b = b_toks_a.clone();
+            if pos >= shared_b && pos > 0 && shared_b < pos {
+                b_toks_b[pos] = base[(pos + 37) % base.len()];
+            }
+            // Private Layer 2 fixed-split reference on lane A and lane B.
+            let priv_hash = |toks: &[u32]| -> u64 {
+                let l = Lane::new(&eng);
+                let r = eng.on(&l);
+                r.reserve(end + 4, false);
+                r.set_tokens(0, toks);
+                if pos > 0 {
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans(&cb, &[engine::Span { lane: &l, p0: 0, t: pos }], false, false);
+                    cb.commit();
+                    wait_gate(&cb, "sharedkv boundary l2 pf", 0);
+                }
+                let cb = eng.gpu.cmd();
+                eng.encode_decode(&cb, &[engine::Span { lane: &l, p0: pos, t: 1 }], true, false);
+                cb.commit();
+                wait_gate(&cb, "sharedkv boundary l2 dec", pos);
+                fnv(&eng.span_logits(0))
+            };
+            let want_a = priv_hash(&b_toks_a);
+            let want_b = priv_hash(&b_toks_b);
+
+            for no_grp in [true, false] {
+                eng.set_no_grp_dec(no_grp);
+                let pool = Layer3Pool::with_persistent_starts(&eng, 3);
+                if shared_b >= 64 {
+                    let (donor, _) = pool.new_lane_matched(&b_toks_a[..shared_b], ctx);
+                    pool.prefill(&[(donor, 0, shared_b)]);
+                    pool.end_lane(donor);
+                }
+                let (la, ma) = pool.new_lane_matched(&b_toks_a, ctx);
+                let (lb, mb) = pool.new_lane_matched(&b_toks_b, ctx);
+                if pos > ma {
+                    pool.prefill(&[(la, ma, pos - ma)]);
+                }
+                if pos > mb {
+                    pool.prefill(&[(lb, mb, pos - mb)]);
+                }
+                pool.decode(&[(la, pos), (lb, pos)]);
+                let mut got_a = fnv(&pool.logits(0));
+                let got_b = fnv(&pool.logits(1));
+                if sabotage && !no_grp && end == 1025 {
+                    println!("INK_SHAREDKV_SABOTAGE: perturbing grouped boundary hash at end={end}");
+                    got_a ^= 1;
+                }
+                if got_a != want_a || got_b != want_b {
+                    println!("boundary end={end} no_grp={no_grp}: DIFFERS from private Layer 2 fixed-split");
+                    all_ok = false;
+                }
+                pool.shutdown();
+            }
+        }
+        println!("boundary ends {boundary_ends:?}: grouped and solo Layer 3 match private Layer 2 fixed-split bit-for-bit");
+    }
     for &n in &counts {
         let (h_nogrp, _, _) = run_mode(n, true);
-        let (h_grp, _, _) = run_mode(n, false);
+        let (mut h_grp, _, _) = run_mode(n, false);
+        if sabotage && prefix_len < 1024 && !h_grp.is_empty() && !h_grp[0].is_empty() {
+            println!("INK_SHAREDKV_SABOTAGE: perturbing grouped lane 0 step 0 hash");
+            h_grp[0][0] ^= 1;
+        }
         let bad: Vec<usize> = (0..n).filter(|&j| h_grp[j] != h_nogrp[j]).collect();
         let (gpu_nogrp, gpu_grp, attn_nogrp, attn_grp) = bench_ab(n);
         let speedup = gpu_nogrp / gpu_grp;
@@ -2406,6 +2901,225 @@ fn sharedkv(o: &Opts) {
         println!("sharedkv exact: every grouped lane and step is 100% bit-for-bit identical to INK_NO_GRP_DEC=1");
     } else {
         println!("SHAREDKV PARITY FAILED");
+        std::process::exit(1);
+    }
+}
+
+/// Matched shared-prefix replay gate & benchmark (`t-later-prefix-gate` & `docs/SHARED-PREFIX.md` §5):
+/// Compares private unshared execution (`Layer3Pool::new` + `INK_NO_GRP_DEC=1`) against shared-prefix
+/// execution (`Layer3Pool::with_persistent_starts` + `PrefixTree` block deduplication + `k_attn_grp_dec`)
+/// across singleton, unrelated cold lanes, staggered same-card turns, and 4/8/16 concurrent 8K shared-head
+/// lanes, reporting live K/V pool MiB, peak Metal allocation, end-to-end step time, decode GPU ms/step,
+/// aggregate decode tok/s, and verifying 100% bit-for-bit logit parity.
+fn prefixbench(o: &Opts) {
+    use poolgate::{Layer3Pool, StepPath};
+
+    let prefix_len: usize = std::env::var("INK_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    assert!(prefix_len >= 64 && prefix_len.is_multiple_of(64), "INK_PREFIX must be a multiple of 64");
+    let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let ctx = o.ctx.max((prefix_len.max(2048) + 512 + nd + 64).div_ceil(64) * 64);
+    let eng = Engine::load(&o.model, ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(16);
+    let base = load_gate_tokens(&eng, o);
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i as u32).unwrap_or(0);
+    let mib = |b: usize| b as f64 / 1048576.0;
+
+    #[derive(Clone)]
+    struct Case {
+        name: &'static str,
+        prompts: Vec<Vec<u32>>,
+        shared_prefix_toks: usize,
+    }
+
+    let shared_head: Vec<u32> = (0..prefix_len).map(|i| base[i % base.len()]).collect();
+    let card_head_len = 2048usize.min(prefix_len);
+    let card_head: Vec<u32> = shared_head[..card_head_len].to_vec();
+
+    let mut cases = vec![
+        Case {
+            name: "singleton-1x8k",
+            prompts: vec![{
+                let mut v = shared_head.clone();
+                v.extend((0..128).map(|k| base[(31 + k) % base.len()]));
+                v
+            }],
+            shared_prefix_toks: 0,
+        },
+        Case {
+            name: "unrelated-4x2k",
+            prompts: (0..4)
+                .map(|i| (0..2176).map(|k| base[(199 * (i + 1) + k) % base.len()]).collect())
+                .collect(),
+            shared_prefix_toks: 0,
+        },
+        Case {
+            name: "staggered-card-4x2k",
+            prompts: (0..4)
+                .map(|i| {
+                    let mut v = card_head.clone();
+                    let extra = 64 * (i + 1) + 24;
+                    v.extend((0..extra).map(|k| base[(73 + k) % base.len()]));
+                    v
+                })
+                .collect(),
+            shared_prefix_toks: card_head_len,
+        },
+    ];
+    for &n in &[4usize, 8, 16] {
+        cases.push(Case {
+            name: match n {
+                4 => "shared-head-4x8k",
+                8 => "shared-head-8x8k",
+                _ => "shared-head-16x8k",
+            },
+            prompts: (0..n)
+                .map(|i| {
+                    let mut v = shared_head.clone();
+                    let sfx = 32 + (i * 19) % 192;
+                    v.extend((0..sfx).map(|k| base[(97 * (i + 1) + k) % base.len()]));
+                    v
+                })
+                .collect(),
+            shared_prefix_toks: prefix_len,
+        });
+    }
+
+    println!(
+        "{:<20} {:>5} {:>11} {:>11} {:>10} {:>11} {:>11} {:>11} {:>10} {:>8}",
+        "case", "lanes", "priv KV MiB", "shrd KV MiB", "peak MiB", "e2e priv ms", "e2e shrd ms", "dec ms(p->s)", "dec tok/s", "parity"
+    );
+
+    let mut all_ok = true;
+    for case in &cases {
+        let n = case.prompts.len();
+        eng.ensure_dbatch(n);
+
+        // 1. Private unshared run (`Layer3Pool::new` + `no_grp_dec = true`).
+        let (priv_hashes, priv_kv_bytes, priv_e2e_ms, priv_dec_ms) = {
+            eng.set_no_grp_dec(true);
+            let pool = Layer3Pool::new(&eng, n);
+            let t_e2e = std::time::Instant::now();
+            let mut lids = Vec::with_capacity(n);
+            let mut cur_pos = Vec::with_capacity(n);
+            for prompt in &case.prompts {
+                let lid = pool.new_lane(prompt, ctx);
+                let mut p = 0usize;
+                while p < prompt.len() {
+                    let c = (prompt.len() - p).min(eng.chunk);
+                    pool.prefill(&[(lid, p, c)]);
+                    p += c;
+                }
+                let first = argmax(&pool.logits(0));
+                pool.set_token(lid, prompt.len(), first);
+                lids.push(lid);
+                cur_pos.push(prompt.len());
+            }
+            let (full_b, win_b, _) = pool.kv_memory_bytes();
+            let mut hashes = vec![Vec::with_capacity(nd); n];
+            let mut dec_times = Vec::with_capacity(nd);
+            for _ in 0..nd {
+                let sp: Vec<(usize, usize)> = lids.iter().copied().zip(cur_pos.iter().copied()).collect();
+                dec_times.push(pool.decode_timed(&sp));
+                for j in 0..n {
+                    let lg = pool.logits(j);
+                    hashes[j].push(fnv(&lg));
+                    let tok = argmax(&lg);
+                    cur_pos[j] += 1;
+                    pool.set_token(lids[j], cur_pos[j], tok);
+                }
+            }
+            let e2e = t_e2e.elapsed().as_secs_f64() * 1e3;
+            dec_times.sort_by(|a, b| a.total_cmp(b));
+            let med_dec = dec_times[dec_times.len() / 2];
+            pool.shutdown();
+            (hashes, full_b + win_b, e2e, med_dec)
+        };
+
+        // 2. Shared-prefix run (`Layer3Pool::with_persistent_starts` + `no_grp_dec = false`).
+        let (shrd_hashes, shrd_kv_bytes, peak_gpu_bytes, shrd_e2e_ms, shrd_dec_ms) = {
+            eng.set_no_grp_dec(false);
+            let pool = Layer3Pool::with_persistent_starts(&eng, n + 1);
+            let t_e2e = std::time::Instant::now();
+            if case.shared_prefix_toks >= 64 {
+                let seed = &case.prompts[0][..case.shared_prefix_toks];
+                let (donor, _) = pool.new_lane_matched(seed, ctx);
+                let mut p = 0usize;
+                while p < seed.len() {
+                    let c = (seed.len() - p).min(eng.chunk);
+                    pool.prefill(&[(donor, p, c)]);
+                    p += c;
+                }
+                pool.end_lane(donor);
+            }
+            let mut lids = Vec::with_capacity(n);
+            let mut cur_pos = Vec::with_capacity(n);
+            for prompt in &case.prompts {
+                let (lid, matched) = pool.new_lane_matched(prompt, ctx);
+                let mut p = matched;
+                while p < prompt.len() {
+                    let c = (prompt.len() - p).min(eng.chunk);
+                    pool.prefill(&[(lid, p, c)]);
+                    p += c;
+                }
+                let first = argmax(&pool.logits(0));
+                pool.set_token(lid, prompt.len(), first);
+                lids.push(lid);
+                cur_pos.push(prompt.len());
+            }
+            let (full_b, win_b, _) = pool.kv_memory_bytes();
+            let peak_alloc = eng.gpu_mem().0;
+            let mut hashes = vec![Vec::with_capacity(nd); n];
+            let mut dec_times = Vec::with_capacity(nd);
+            for _ in 0..nd {
+                let sp: Vec<(usize, usize)> = lids.iter().copied().zip(cur_pos.iter().copied()).collect();
+                dec_times.push(pool.decode_timed(&sp));
+                for j in 0..n {
+                    let lg = pool.logits(j);
+                    hashes[j].push(fnv(&lg));
+                    let tok = argmax(&lg);
+                    cur_pos[j] += 1;
+                    pool.set_token(lids[j], cur_pos[j], tok);
+                }
+            }
+            let e2e = t_e2e.elapsed().as_secs_f64() * 1e3;
+            dec_times.sort_by(|a, b| a.total_cmp(b));
+            let med_dec = dec_times[dec_times.len() / 2];
+            pool.shutdown();
+            (hashes, full_b + win_b, peak_alloc, e2e, med_dec)
+        };
+
+        let same = priv_hashes == shrd_hashes;
+        if case.shared_prefix_toks >= 64 && n >= 2 {
+            assert!(
+                shrd_kv_bytes < priv_kv_bytes,
+                "{}: shared KV ({shrd_kv_bytes}) did not save physical memory vs private ({priv_kv_bytes})",
+                case.name
+            );
+        }
+        all_ok &= same;
+        let agg_tok_s = (n as f64) * 1e3 / shrd_dec_ms;
+        println!(
+            "{:<20} {:>5} {:>11.1} {:>11.1} {:>10.1} {:>11.1} {:>11.1} {:>5.1}->{:<5.1} {:>10.1} {:>8}",
+            case.name,
+            n,
+            mib(priv_kv_bytes),
+            mib(shrd_kv_bytes),
+            mib(peak_gpu_bytes),
+            priv_e2e_ms,
+            shrd_e2e_ms,
+            priv_dec_ms,
+            shrd_dec_ms,
+            agg_tok_s,
+            if same { "exact" } else { "DIFF" }
+        );
+    }
+    eng.set_no_grp_dec(false);
+    if all_ok {
+        println!("prefixbench exact: shared-prefix KV bytes, peak allocation, and step times recorded with 100% bitwise parity");
+    } else {
+        println!("PREFIXBENCH PARITY FAILED");
         std::process::exit(1);
     }
 }
@@ -3428,6 +4142,7 @@ fn main() {
         "check" => report_cli_result(&cmd, check(&o)),
         "rows" => rows(&o),
         "rollback" => rollback(&o),
+        "verify" => verify(&o),
         "binv" => report_cli_result(&cmd, binv(&o)),
         "crosspath" => crosspath(&o),
         "lanes" => lanes(&o),
@@ -3440,6 +4155,7 @@ fn main() {
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "sharedkv" => sharedkv(&o),
+        "prefixbench" => prefixbench(&o),
         "maxctx" => maxctx(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),

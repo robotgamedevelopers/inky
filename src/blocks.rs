@@ -256,6 +256,111 @@ pub fn span_window_blocks(pos: usize, len: usize) -> Result<Vec<BlockIndex>, Blo
     span_window_blocks_at(pos, len, BLOCK, WINDOW)
 }
 
+/// One visited `(pos, (block, owner_row_1based), split)` key in [`GroupedTileState`].
+pub type GroupedVisit = (usize, (usize, usize), usize);
+
+/// Snapshot of one state in the grouped shared-prefix tile traversal (`specs/GroupedLayout.tla`,
+/// `t-later-prefix-traces`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GroupedTileState {
+    pub lengths: [usize; 2],
+    pub shared: usize,
+    pub windowed: bool,
+    pub tile: usize,
+    /// Sorted deduplicated `(block, owner_row_1based)` slots already staged in the current `tile`.
+    pub loaded: Vec<(usize, usize)>,
+    /// Ordered history of `(tile, (block, owner_row_1based))` physical tile loads.
+    pub staged: Vec<(usize, (usize, usize))>,
+    /// Per-row visited `(pos, (block, owner_row_1based), split)` tuples.
+    pub visits: [Vec<GroupedVisit>; 2],
+    /// Per-row emitted `(split, last_visible_pos_in_split)` partials.
+    pub partials: [Vec<(usize, usize)>; 2],
+}
+
+/// Deterministic grouped shared-prefix tile walker matching `specs/GroupedLayout.tla` and
+/// `Engine::build_decode_groups` / `k_attn_grp_dec`:
+/// - Stages each distinct physical `(block, owner)` slot once per tile, serving both rows when
+///   `b < shared` (`count == 2` group) and each row privately when `b >= shared` (`count == 1`).
+/// - Intersects each row's own visible range `[first_r, lengths[r])` with `[tile_start, tile_stop)`.
+/// - Emits a split partial ONLY when `stop == lengths[r]` or `stop == (split + 1) * split_size`
+///   (never at an internal tile boundary inside a split).
+pub fn walk_grouped_tiles(
+    lengths: [usize; 2],
+    shared: usize,
+    windowed: bool,
+    block_size: usize,
+    tile_size: usize,
+    split_size: usize,
+    window_size: usize,
+) -> Vec<GroupedTileState> {
+    assert!(block_size > 0 && tile_size > 0 && split_size >= tile_size && split_size.is_multiple_of(tile_size));
+    assert!(lengths[0] >= 1 && lengths[1] >= 1);
+    assert!(shared <= lengths[0].min(lengths[1]) / block_size);
+
+    let slot_of = |r: usize, b: usize| -> (usize, usize) {
+        (b, if b < shared { 1 } else { r + 1 })
+    };
+    let mask_start = |r: usize| -> usize {
+        let first_r = if windowed { lengths[r].saturating_sub(window_size) } else { 0 }; // MUTANT_ANCHOR_GRP_MASK_START
+        first_r
+    };
+    let max_len = lengths[0].max(lengths[1]);
+    let tile_count = max_len.div_ceil(tile_size);
+
+    let mut cur = GroupedTileState {
+        lengths,
+        shared,
+        windowed,
+        tile: 0,
+        loaded: Vec::new(),
+        staged: Vec::new(),
+        visits: [Vec::new(), Vec::new()],
+        partials: [Vec::new(), Vec::new()],
+    };
+    let mut trace = vec![cur.clone()];
+
+    while cur.tile < tile_count {
+        let tile_start = cur.tile * tile_size;
+        let split = tile_start / split_size;
+        let blk = tile_start / block_size;
+        let mut requests: Vec<(usize, usize)> = Vec::new();
+        for (r, &row_len) in lengths.iter().enumerate() {
+            let start = tile_start.max(mask_start(r));
+            let stop = (tile_start + tile_size).min(row_len);
+            if start < stop {
+                let s = slot_of(r, blk);
+                if !requests.contains(&s) {
+                    requests.push(s);
+                }
+            }
+        }
+        requests.sort_unstable();
+        for s in requests {
+            for (r, &row_len) in lengths.iter().enumerate() {
+                let start = tile_start.max(mask_start(r));
+                let stop = (tile_start + tile_size).min(row_len);
+                if start < stop && slot_of(r, blk) == s {
+                    for p in start..stop {
+                        cur.visits[r].push((p, s, split));
+                    }
+                    let emit_partial = stop == row_len || stop == (split + 1) * split_size; // MUTANT_ANCHOR_GRP_PARTIAL_BOUNDARY
+                    if emit_partial {
+                        cur.partials[r].push((split, stop - 1));
+                    }
+                }
+            }
+            cur.loaded.push(s);
+            cur.loaded.sort_unstable();
+            cur.staged.push((cur.tile, s));
+            trace.push(cur.clone());
+        }
+        cur.tile += 1;
+        cur.loaded.clear();
+        trace.push(cur.clone());
+    }
+    trace
+}
+
 /// KV layout constants and shader invariants extracted directly from `src/kernels.metal`
 /// and `src/prefill.metal` (`U63` & `U18`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2367,6 +2472,48 @@ mod tests {
                 assert_eq!(word, 0, "slab 0 Slot(1) encodes as 0");
             }
             assert_ne!(word, CLEARED_GPU_TABLE_ENTRY);
+        }
+    }
+
+    #[test]
+    fn grouped_tile_walker_matches_private_key_and_partial_references_and_decode_groups() {
+        // Scaled model bounds (GroupedLayout.tla: BlockSize=2, TileSize=2, SplitSize=4, WindowSize=3, Capacity=4)
+        for l1 in 1..=8usize {
+            for l2 in 1..=8usize {
+                let max_shared = l1.min(l2) / 2;
+                for shared in 0..=max_shared {
+                    let mut resident = std::collections::BTreeSet::new();
+                    for b in 0..=((l1 - 1) / 2) {
+                        resident.insert((b, 1usize));
+                    }
+                    for b in 0..=((l2 - 1) / 2) {
+                        resident.insert((b, if b < shared { 1 } else { 2 }));
+                    }
+                    if resident.len() > 4 {
+                        continue;
+                    }
+                    for windowed in [false, true] {
+                        let trace = walk_grouped_tiles([l1, l2], shared, windowed, 2, 2, 4, 3);
+                        let last = trace.last().unwrap();
+                        for (r, &len) in [l1, l2].iter().enumerate() {
+                            let first = if windowed { len.saturating_sub(3) } else { 0 };
+                            let want_visits: Vec<_> = (first..len)
+                                .map(|p| {
+                                    let b = p / 2;
+                                    (p, (b, if b < shared { 1 } else { r + 1 }), p / 4)
+                                })
+                                .collect();
+                            assert_eq!(last.visits[r], want_visits);
+                            let sp_a = first / 4;
+                            let sp_b = (len - 1) / 4;
+                            let want_partials: Vec<_> = (sp_a..=sp_b)
+                                .map(|s| (s, ((s + 1) * 4).min(len) - 1))
+                                .collect();
+                            assert_eq!(last.partials[r], want_partials);
+                        }
+                    }
+                }
+            }
         }
     }
 }

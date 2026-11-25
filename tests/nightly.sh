@@ -60,4 +60,17 @@ else
     fail=1
 fi
 print -r -- "$spill_kill_out"
+# Verify M5 native Q8 debug decode, 32K disk-vs-resident split-resize parity, and CLI session error recovery.
+for m5_test in \
+    engine::tests::debug_single_token_decode_native_checkpoint \
+    engine::tests::disk_tier_matches_resident_logits_across_32k_staging_resize_transition \
+    session::tests::cli_session_recovers_from_injected_prefill_and_decode_failures; do
+    if m5_out=$(cargo test --locked --release --bin inky "$m5_test" -- --ignored --exact --nocapture 2>&1); then
+        grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$m5_out" || { echo "FAIL: $m5_test did not match 1 passed; 0 failed" >&2; fail=1; }
+    else
+        echo "FAIL: $m5_test" >&2
+        fail=1
+    fi
+    print -r -- "$m5_out"
+done
 exit $fail

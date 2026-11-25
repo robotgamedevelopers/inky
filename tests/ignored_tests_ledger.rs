@@ -92,6 +92,18 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/engine/tests.rs",
+            "debug_single_token_decode_native_checkpoint",
+            "tests/nightly.sh",
+            "engine::tests::debug_single_token_decode_native_checkpoint",
+        ),
+        (
+            "src/engine/tests.rs",
+            "disk_tier_matches_resident_logits_across_32k_staging_resize_transition",
+            "tests/nightly.sh",
+            "engine::tests::disk_tier_matches_resident_logits_across_32k_staging_resize_transition",
+        ),
+        (
+            "src/engine/tests.rs",
             "engine_encode_decode_64_positions_syncs_once_then_63_zero_steps",
             ".github/workflows/ci.yml",
             "engine::tests::engine_encode_decode_64_positions_syncs_once_then_63_zero_steps",
@@ -119,6 +131,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "router_handles_nonfinite_scores",
             ".github/workflows/ci.yml",
             "engine::tests::router_handles_nonfinite_scores",
+        ),
+        (
+            "src/loopcd_tests.rs",
+            "loopcd_cached_prompt_first_token_and_mixed_tie_isolation",
+            "tests/loopcd-gate.sh",
+            "loopcd_tests::loopcd_cached_prompt_first_token_and_mixed_tie_isolation",
         ),
         (
             "src/loopcd_tests.rs",
@@ -173,6 +191,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "dump",
             ".github/workflows/ci.yml",
             "serve::scheduler_trace::dump",
+        ),
+        (
+            "src/session.rs",
+            "cli_session_recovers_from_injected_prefill_and_decode_failures",
+            "tests/nightly.sh",
+            "session::tests::cli_session_recovers_from_injected_prefill_and_decode_failures",
         ),
         (
             "src/spill/tests.rs",

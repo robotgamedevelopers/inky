@@ -58,7 +58,7 @@ check_production() {
         cat "$dir/walk.log" >&2
         return 1
     fi
-    local bpids=() bnames=(cs bl_base0 bl_high_fp16 bl_high_kv8 sp_512)
+    local bpids=() bnames=(cs bl_base0 bl_high_fp16 bl_high_kv8 sp_512 gl_4)
     run_tlc_bundle "$dir/cs" "$root/specs/CacheScheduler.tla" 2 c2 &
     bpids+=($!)
     for b in bl_base0 bl_high_fp16 bl_high_kv8; do
@@ -66,6 +66,8 @@ check_production() {
         bpids+=($!)
     done
     run_tlc_bundle "$dir/sp_512" "$root/specs/SpanPins.tla" 1 fast &
+    bpids+=($!)
+    run_tlc_bundle "$dir/gl_4" "$root/specs/GroupedLayout.tla" 1 fast &
     bpids+=($!)
 
     local brc=0
@@ -81,7 +83,7 @@ check_production() {
     done
     [[ $brc = 0 ]] || return 1
     {
-        for b in bl_base0 bl_high_fp16 bl_high_kv8 cs sp_512; do
+        for b in bl_base0 bl_high_fp16 bl_high_kv8 cs sp_512 gl_4; do
             echo "$b: $(grep -Em1 '^[0-9,]+ states generated' "$dir/$b/tlc.log")"
         done
         cat "$dir/walk.log"
@@ -220,6 +222,18 @@ start cap17-span-pins check_mutant cap17-span-pins \
     'Invariant Covered is violated.' blocks.rs sp_512 SpanPins.tla \
     '    Ok((lo_blk..=hi_blk).map(BlockIndex::new).collect()) // MUTANT_ANCHOR_SPAN_WIN_BLOCKS' \
     '    Ok((lo_blk..=hi_blk.min(16)).map(BlockIndex::new).collect())'
+
+# 11. Grouped tile walker emitting a split partial at internal tile boundaries (`t-later-prefix-traces`) -> StepConforms
+start corrupt-partial-boundary check_mutant corrupt-partial-boundary \
+    'Action property StepConforms is violated.' blocks.rs gl_4 GroupedLayout.tla \
+    '                    let emit_partial = stop == row_len || stop == (split + 1) * split_size; // MUTANT_ANCHOR_GRP_PARTIAL_BOUNDARY' \
+    '                    let emit_partial = true;'
+
+# 12. Grouped tile walker using donor row 0 window mask for row 1 (`donorWindow` witness) -> StepConforms
+start corrupt-donor-window check_mutant corrupt-donor-window \
+    'Action property StepConforms is violated.' blocks.rs gl_4 GroupedLayout.tla \
+    '        let first_r = if windowed { lengths[r].saturating_sub(window_size) } else { 0 }; // MUTANT_ANCHOR_GRP_MASK_START' \
+    '        let first_r = if windowed { lengths[0].saturating_sub(window_size) } else { 0 };'
 
 failed=0
 for i in "${!pids[@]}"; do

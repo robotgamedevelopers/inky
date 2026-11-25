@@ -44,7 +44,7 @@ check_production() {
     mkdir -p "$dir"
     cp "$orig_sched" "$dir/scheduler.rs"
     mkdir -p "$dir/scheduler"
-    cp "$root/src/scheduler/trace.rs" "$dir/scheduler/"
+    cp "$root/src/scheduler/trace.rs" "$root/src/scheduler/verify.rs" "$dir/scheduler/"
     cp "$driver" "$dir/main.rs"
     rustc --edition=2021 -D warnings -C debug-assertions=on -C debuginfo=0 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
         cat "$dir/rustc.log" >&2
@@ -78,7 +78,7 @@ check_mutant() {
     local dir=$work/$name status
     mkdir -p "$dir"
     mkdir -p "$dir/scheduler"
-    cp "$root/src/scheduler/trace.rs" "$dir/scheduler/"
+    cp "$root/src/scheduler/trace.rs" "$root/src/scheduler/verify.rs" "$dir/scheduler/"
     cp "$driver" "$dir/main.rs"
     python3 - "$orig_sched" "$dir/scheduler.rs" "$old" "$new" <<'PY'
 import pathlib, sys

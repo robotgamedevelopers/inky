@@ -29,15 +29,15 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Measure cold SSD restore latency and keep unrelated decoding responsive ([#112](https://github.com/robotgamedevelopers/inky/pull/112)) | ✅ |
 | Bound prefix metadata by peak occupancy and preserve stale-handle rejection ([#78](https://github.com/robotgamedevelopers/inky/pull/78)) | ✅ |
 | Visit each expired window block once per lane ([#78](https://github.com/robotgamedevelopers/inky/pull/78)) | ✅ |
-| Replay live scheduler burst and preemption decisions against their own specification ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
+| Replay live scheduler burst and preemption decisions against their own specification ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ✅ |
 | Replay live paged-cache ownership through binds, releases, SSD restore and rollback ([#124](https://github.com/robotgamedevelopers/inky/pull/124)) | ✅ |
-| Require a nonempty layout-model run on hosts without zsh ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
-| Run a tractable branching PrefixTree model and account for every scheduled check ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
-| Model per-node pins separately from validity of a complete matched path ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
+| Require a nonempty layout-model run on hosts without zsh ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ✅ |
+| Run a tractable branching PrefixTree model and account for every scheduled check ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ✅ |
+| Model per-node pins separately from validity of a complete matched path ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ✅ |
 | Compare SSD-restored and cold generation on an M5 across eviction, restart and branching ([#78](https://github.com/robotgamedevelopers/inky/pull/78), [#112](https://github.com/robotgamedevelopers/inky/pull/112)) | ✅ |
 | Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure | ✅ |
 | Wake a pool-deferred lane when the holder can make progress, including before the first window prune ([#112](https://github.com/robotgamedevelopers/inky/pull/112)) | ✅ |
-| complete | 78% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -49,7 +49,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 
 | feature | done |
 |---|:---:|
-| Allow Q8 attention in debug decoding ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
+| Allow Q8 attention in debug decoding ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Keep assistant text parts separate in the model prompt ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
 | Require complete source and destination tensors ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Preserve the previous model if conversion fails ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
@@ -57,21 +57,21 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Reject unrecognized expert row layouts ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Qualify a converted official native checkpoint on M5 | ❌ |
 | Record the pinned tokenizer and GGUF geometry controls | ✅ |
-| Isolate LoopCD transforms by sampling lane ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
-| Apply LoopCD to the first output token ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
-| Propagate nonfinite GPU sampling rows as job errors ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
-| Match CPU sampling at very small positive temperatures ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
-| Check every CLI Metal step before accepting its result ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ❌ |
+| Isolate LoopCD transforms by sampling lane ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
+| Apply LoopCD to the first output token ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
+| Propagate nonfinite GPU sampling rows as job errors ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
+| Match CPU sampling at very small positive temperatures ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
+| Check every CLI Metal step before accepting its result ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ✅ |
 | Preserve valid CLI output after malformed bytes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ✅ |
-| Use identical top-k tie handling in direct and draft sampling ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
+| Use identical top-k tie handling in direct and draft sampling ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
 | Record fused routing agreement with the original kernels | ✅ |
 | Record batched attention and dry-pass state agreement | ✅ |
 | Record the 32-lane dispatch-count comparison | ✅ |
-| Keep disk and resident attention reductions aligned across staging resizes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ❌ |
+| Keep disk and resident attention reductions aligned across staging resizes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ✅ |
 | Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Name both decode-dispatch counters in the v0.2.2 note ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Tie the 63/64 dirty-range claim to a real decode step ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 59% |
+| complete | 95% |
 
 [Source data](roadmap.sexp)
 
@@ -135,13 +135,13 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 |---|:---:|
 | PR #37 — Port fixed-split attention to current main ([#88](https://github.com/robotgamedevelopers/inky/pull/88)) | ❌ |
 | PR #60 — Qualify chip goldens on integrated arithmetic | ❌ |
-| PR #42 — Port speculative scheduler verification ([#80](https://github.com/robotgamedevelopers/inky/pull/80)) | ❌ |
-| PR #51 — Port CI scheduling while retaining main gates | ❌ |
-| PR #51 — Make TLA coverage inventory prove execution ([#89](https://github.com/robotgamedevelopers/inky/pull/89)) | ❌ |
-| PR #53 — Extract and qualify fold changes | ❌ |
-| PR #76 — Review and qualify GPU completion checks ([#76](https://github.com/robotgamedevelopers/inky/pull/76)) | ❌ |
-| PR #59 — Port private sliding-window scratch isolation ([#81](https://github.com/robotgamedevelopers/inky/pull/81)) | ❌ |
-| complete | 0% |
+| PR #42 — Port speculative scheduler verification ([#80](https://github.com/robotgamedevelopers/inky/pull/80)) | ✅ |
+| PR #51 — Port CI scheduling while retaining main gates | ✅ |
+| PR #51 — Make TLA coverage inventory prove execution ([#89](https://github.com/robotgamedevelopers/inky/pull/89)) | ✅ |
+| PR #53 — Extract and qualify fold changes | ✅ |
+| PR #76 — Review and qualify GPU completion checks ([#76](https://github.com/robotgamedevelopers/inky/pull/76)) | ✅ |
+| PR #59 — Port private sliding-window scratch isolation ([#81](https://github.com/robotgamedevelopers/inky/pull/81)) | ✅ |
+| complete | 75% |
 
 [Source data](roadmap.sexp)
 
@@ -511,9 +511,9 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | A request matches the deepest start point in a prefix tree of sealed blocks | ✅ |
 | Start points: state, full blocks and the window blocks before them, kept at prompt ends and every 2048/4096-token checkpoint in serve | ✅ |
 | Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ✅ |
-| Gate: the engine's traces are behaviours of both models, checked in CI | ❌ |
+| Gate: the engine's traces are behaviours of both models, checked in CI | ✅ |
 | Gate: outputs identical to layer 2 with poisoned pool slots | ✅ |
-| complete | 88% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -637,11 +637,11 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
 | Shared-prefix design and measured overlap on four concurrent cards (later) | ✅ |
-| Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails (later) | ❌ |
-| Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks (later) | ❌ |
-| Grouped prefix reads match private fixed-split logits and goldens bit for bit (later) | ❌ |
-| Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries (later) | ❌ |
-| Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time (later) | ❌ |
+| Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails (later) | ✅ |
+| Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks (later) | ✅ |
+| Grouped prefix reads match private fixed-split logits and goldens bit for bit (later) | ✅ |
+| Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries (later) | ✅ |
+| Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time (later) | ✅ |
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |
 | The 8-bit cache, behind the quality replay (later) | ❌ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) (later) | ✅ |
-| complete | 47% |
+| complete | 61% |
 
 [Source data](roadmap.sexp)
 

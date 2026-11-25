@@ -413,6 +413,153 @@ fn gen_cs_mutant(out_root: &Path, name: &str, target: &str) {
     }
 }
 
+fn gen_gl(out_root: &Path, name: &str, strict: bool) {
+    // Replay every valid Capacity=4 `(lengths, shared, windowed)` walk from `blocks::walk_grouped_tiles`
+    // against `specs/GroupedLayout.tla` (`t-later-prefix-traces` & `t-audit-pr53-port`).
+    // Covers unequal positions, two distinct windows, internal tile boundaries inside 4-key splits,
+    // and splits crossing the shared-to-private divergence boundary.
+    let mut trace_entries = Vec::new();
+    let mut shared_cross_split = 0usize;
+    let mut two_windows = 0usize;
+    for l1 in 1..=8usize {
+        for l2 in 1..=8usize {
+            let max_shared = l1.min(l2) / 2;
+            for shared in 0..=max_shared {
+                let mut resident = std::collections::BTreeSet::new();
+                for b in 0..=((l1 - 1) / 2) {
+                    resident.insert((b, 1usize));
+                }
+                for b in 0..=((l2 - 1) / 2) {
+                    resident.insert((b, if b < shared { 1 } else { 2 }));
+                }
+                if resident.len() > 4 {
+                    continue;
+                }
+                for windowed in [false, true] {
+                    if shared == 1 && l1 >= 4 && l2 >= 4 {
+                        shared_cross_split += 1;
+                    }
+                    if windowed && l1.saturating_sub(3) != l2.saturating_sub(3) {
+                        two_windows += 1;
+                    }
+                    let states = blocks::walk_grouped_tiles([l1, l2], shared, windowed, 2, 2, 4, 3);
+                    let fmt_slot = |(b, r): (usize, usize)| format!("<<{b}, {r}>>");
+                    let rendered_states: Vec<String> = states
+                        .iter()
+                        .map(|st| {
+                            let loaded_s = st
+                                .loaded
+                                .iter()
+                                .copied()
+                                .map(fmt_slot)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let staged_s = st
+                                .staged
+                                .iter()
+                                .map(|&(t, s)| format!("<<{t}, {}>>", fmt_slot(s)))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let fmt_visits = |v: &[(usize, (usize, usize), usize)]| {
+                                v.iter()
+                                    .map(|&(p, s, sp)| format!("<<{p}, {}, {sp}>>", fmt_slot(s)))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            let fmt_partials = |p: &[(usize, usize)]| {
+                                p.iter()
+                                    .map(|&(sp, stop)| format!("<<{sp}, {stop}>>"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            let win_tla = if st.windowed { "TRUE" } else { "FALSE" };
+                            format!(
+                                "[lengths |-> <<{}, {}>>, shared |-> {}, windowed |-> {}, tile |-> {}, loaded |-> {{{}}}, staged |-> <<{}>>, visits |-> <<<<{}>>, <<{}>>>>, partials |-> <<<<{}>>, <<{}>>>>]",
+                                st.lengths[0],
+                                st.lengths[1],
+                                st.shared,
+                                win_tla,
+                                st.tile,
+                                loaded_s,
+                                staged_s,
+                                fmt_visits(&st.visits[0]),
+                                fmt_visits(&st.visits[1]),
+                                fmt_partials(&st.partials[0]),
+                                fmt_partials(&st.partials[1]),
+                            )
+                        })
+                        .collect();
+                    trace_entries.push(format!("  <<{}>>", rendered_states.join(", ")));
+                }
+            }
+        }
+    }
+    if trace_entries.is_empty() || shared_cross_split == 0 || two_windows == 0 {
+        eprintln!(
+            "COVERAGE GAP {name}: traces={} shared_cross_split={shared_cross_split} two_windows={two_windows}",
+            trace_entries.len()
+        );
+        if strict {
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!(
+            "{name}: {} walks, shared_cross_split={shared_cross_split}, two_windows={two_windows}",
+            trace_entries.len()
+        );
+    }
+    let data = format!(
+        "---- MODULE TraceData ----\nTraces == <<\n{}\n>>\n====\n",
+        trace_entries.join(",\n")
+    );
+    let check = String::from(
+        "---- MODULE TraceCheck ----\n\
+         EXTENDS GroupedLayout, TraceData, Sequences\n\
+         VARIABLES traceIdx, stepIdx\n\
+         Apply(s) ==\n\
+           /\\ lengths = s.lengths\n\
+           /\\ shared = s.shared\n\
+           /\\ windowed = s.windowed\n\
+           /\\ tile = s.tile\n\
+           /\\ loaded = s.loaded\n\
+           /\\ staged = s.staged\n\
+           /\\ visits = s.visits\n\
+           /\\ partials = s.partials\n\
+         ApplyNext(s) ==\n\
+           /\\ lengths' = s.lengths\n\
+           /\\ shared' = s.shared\n\
+           /\\ windowed' = s.windowed\n\
+           /\\ tile' = s.tile\n\
+           /\\ loaded' = s.loaded\n\
+           /\\ staged' = s.staged\n\
+           /\\ visits' = s.visits\n\
+           /\\ partials' = s.partials\n\
+         ReplayInit == traceIdx \\in 1..Len(Traces) /\\ stepIdx = 1 /\\ Apply(Traces[traceIdx][1])\n\
+         ReplayNext == stepIdx < Len(Traces[traceIdx]) /\\ UNCHANGED traceIdx /\\ stepIdx' = stepIdx + 1 /\\ ApplyNext(Traces[traceIdx][stepIdx + 1])\n\
+         ReplayDone == stepIdx = Len(Traces[traceIdx]) /\\ UNCHANGED <<vars, traceIdx, stepIdx>>\n\
+         ReplayStep == ReplayNext \\/ ReplayDone\n\
+         ReplaySpec == ReplayInit /\\ [][ReplayStep]_<<vars, traceIdx, stepIdx>>\n\
+         InitConforms == (stepIdx = 1) => Init\n\
+         StepConforms == [][Next]_vars\n\
+         ====\n",
+    );
+    let cfg = String::from(
+        "SPECIFICATION ReplaySpec\n\
+         CHECK_DEADLOCK FALSE\n\
+         CONSTANTS\n\
+          Capacity = 4\n\
+          Bug = \"none\"\n\
+         INVARIANTS\n\
+          InitConforms\n\
+          StagedOnce\n\
+          VisitedKeys\n\
+          OrderedPartials\n\
+         PROPERTIES\n\
+          StepConforms\n",
+    );
+    write_bundle(&out_root.join(name), (data, check, cfg));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let out_root = Path::new(args.get(1).map(String::as_str).unwrap_or("."));
@@ -432,12 +579,15 @@ fn main() {
         "cs_mutant" => gen_cs_mutant(out_root, "cs", third),
         "sp_512" => gen_sp(out_root, "sp_512", strict),
         "sp_512_mutant" => gen_sp(out_root, "sp_512", false),
+        "gl_4" => gen_gl(out_root, "gl_4", strict),
+        "gl_4_mutant" => gen_gl(out_root, "gl_4", false),
         "all" => {
             gen_bl(out_root, "bl_base0", 0, 2, strict);
             gen_bl(out_root, "bl_high_fp16", 2048, 2, strict);
             gen_bl(out_root, "bl_high_kv8", 4096, 1, strict);
             gen_cs(out_root, "cs", strict);
             gen_sp(out_root, "sp_512", strict);
+            gen_gl(out_root, "gl_4", strict);
         }
         other => panic!("unknown cache-traces mode {other:?}"),
     }

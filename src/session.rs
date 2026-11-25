@@ -26,6 +26,17 @@ pub struct Stats { pub prompt_tokens: usize, pub prompt_time: Duration, pub gen_
                    /// largest activation buffer (decode arena + prefill arena) any prefill needed, bytes
                    pub peak_scratch: usize }
 
+/// Snapshot of a [`Session`] before an interactive CLI turn (`t-audit-engine-cli-step-status`),
+/// allowing a failed prefill chunk or decode step to roll back K/V, convolution state, `n_past`,
+/// `pending`, and `stats` cleanly for the next turn.
+pub struct TurnCheckpoint {
+    n_past: usize,
+    pending: Option<u32>,
+    stats: Stats,
+    cs: Vec<u8>,
+    window_kv: Vec<crate::engine::KvUndo>,
+}
+
 impl<'a> Session<'a> {
     pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> { Self::with_lane(eng, tk, Lane::new(eng)) }
     /// a new session on an existing lane: its buffers are kept (no regrowth), its contents forgotten
@@ -39,6 +50,78 @@ impl<'a> Session<'a> {
     pub fn run(&self) -> Run<'_> { self.eng.on(&self.lane) }
 
     pub fn ctx_left(&self) -> usize { self.eng.max_ctx.saturating_sub(self.n_past + 1) }
+
+    /// Snapshot valid session context (`0..n_past`) before a chat turn so a failed Metal command
+    /// buffer leaves the session state intact for the next turn.
+    pub fn checkpoint(&self) -> TurnCheckpoint {
+        let win_lo = self.n_past.saturating_sub(crate::blocks::WINDOW);
+        let win_cnt = self.n_past - win_lo;
+        let window_kv = if win_cnt > 0 && !self.run().tier_on() {
+            self.eng.snapshot_kv_positions(&self.lane, win_lo, win_cnt)
+        } else {
+            Vec::new()
+        };
+        TurnCheckpoint {
+            n_past: self.n_past,
+            pending: self.pending,
+            stats: self.stats,
+            cs: self.run().get_cs(),
+            window_kv,
+        }
+    }
+
+    /// Restore `self` to `ckpt` after a failed turn. When `ckpt.n_past == 0` (or `--kv-disk` is
+    /// active, where file blocks cannot be un-staged cheaply), resets the lane cleanly when at 0;
+    /// otherwise restores `cs` and the live sliding-window K/V rows (`0..ckpt.n_past` in `kv_full`
+    /// is never overwritten by writes at `>= ckpt.n_past`).
+    pub fn rollback(&mut self, ckpt: TurnCheckpoint) {
+        if ckpt.n_past == 0 {
+            self.run().reset();
+        } else {
+            self.run().set_cs(&ckpt.cs);
+            for undo in &ckpt.window_kv {
+                self.eng.restore_kv_pos(&self.lane, undo);
+            }
+            self.eng.clear_kv_tail(&self.lane, ckpt.n_past);
+        }
+        self.n_past = ckpt.n_past;
+        self.pending = ckpt.pending;
+        self.stats = ckpt.stats;
+    }
+
+    /// Execute one complete chat turn (`prefill` + `generate` + `Renderer::end`), rolling back
+    /// session state and closing any open ANSI styling if any Metal step or sample fails.
+    pub fn run_chat_turn(
+        &mut self,
+        toks: &[u32],
+        max_gen: usize,
+        show_thinking: bool,
+        raw: bool,
+        sampler: &mut Sampler,
+        out: &mut impl std::io::Write,
+    ) -> Result<usize, String> {
+        let ckpt = self.checkpoint();
+        let first = match self.prefill(toks) {
+            Ok(tok) => tok,
+            Err(err) => {
+                self.rollback(ckpt);
+                return Err(err);
+            }
+        };
+        let mut r = Renderer::new(show_thinking, raw);
+        let max = max_gen.min(self.ctx_left().saturating_sub(4));
+        let tk = self.tk;
+        let res = self.generate(first, max, sampler, |t| {
+            r.push(tk, t, out);
+            true
+        });
+        r.end(out);
+        if let Err(err) = res {
+            self.rollback(ckpt);
+            return Err(err);
+        }
+        res
+    }
 
     /// Feed `toks` (preceded by any pending sampled token) through the model in prefill chunks.
     /// Returns the greedy next token (argmax of the last position); logits stay available in the engine.
@@ -306,5 +389,88 @@ mod tests {
         r2.emit(&[0xC3], &mut out2);
         r2.end(&mut out2);
         assert_eq!(String::from_utf8(out2).unwrap(), "🦀\u{FFFD}kept after truncated sequence\u{FFFD}");
+    }
+
+    #[test]
+    #[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+    fn cli_session_recovers_from_injected_prefill_and_decode_failures() {
+        use crate::metal::{clear_wait_failure, inject_wait_failure};
+
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+        let mut eng = Engine::load(&model, 256);
+        eng.chunk = 32;
+        let tk = Tokenizer::load(&eng.g);
+
+        let turn1 = tk.encode("<|message_user|><|content_text|>Count to three.<|end_message|><|message_model|>", true);
+        // Make a 48-token turn-2 prompt so prefill splits into an early chunk (32) + final chunk (16 + 1 pending).
+        let mut turn2 = tk.encode("<|message_user|><|content_text|>", true);
+        while turn2.len() < 46 {
+            turn2.extend(tk.encode(" apple banana cherry", false));
+        }
+        turn2.extend(tk.encode("<|end_message|><|message_model|>", true));
+        assert!(turn2.len() > eng.chunk, "turn2 ({}) must span at least 2 prefill chunks ({})", turn2.len(), eng.chunk);
+
+        // Reference clean 2-turn greedy run AND clean 2-turn sampled run.
+        let run_clean = |temp: f32| -> (usize, u64, Vec<u8>) {
+            let mut sess = Session::new(&eng, &tk);
+            let mut s1 = Sampler::new(temp, 64, 0.95, eng.softcap, 12345);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1, 4, true, true, &mut s1, &mut out1).unwrap();
+            let mut s2 = Sampler::new(temp, 64, 0.95, eng.softcap, 67890);
+            let mut out2 = Vec::new();
+            sess.run_chat_turn(&turn2, 4, true, true, &mut s2, &mut out2).unwrap();
+            (sess.n_past, eng.lane_hash(&sess.lane), out2)
+        };
+        let (clean_greedy_npast, clean_greedy_hash, clean_greedy_out2) = run_clean(0.0);
+        let (clean_samp_npast, clean_samp_hash, clean_samp_out2) = run_clean(0.8);
+
+        // Exercise all 4 required failure points on turn 2 after turn 1 has already populated context:
+        //  (1) early prefill chunk (`prefill`, call 0)
+        //  (2) final prefill chunk (`prefill`, call 1)
+        //  (3) greedy decode step (`decode`, call 0 — drains pipelined step 1 without consuming!)
+        //  (4) sampled decode step (`decode`, call 0)
+        for (label, temp, stage, call_idx, want_npast, want_hash, want_out2) in [
+            ("early prefill chunk", 0.0f32, "prefill", 0usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
+            ("final prefill chunk", 0.0f32, "prefill", 1usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
+            ("greedy decode step", 0.0f32, "decode", 0usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
+            ("sampled decode step", 0.8f32, "decode", 0usize, clean_samp_npast, clean_samp_hash, &clean_samp_out2),
+        ] {
+            let mut sess = Session::new(&eng, &tk);
+            let mut s1 = Sampler::new(temp, 64, 0.95, eng.softcap, 12345);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1, 4, true, true, &mut s1, &mut out1).unwrap();
+            let turn1_npast = sess.n_past;
+            let turn1_cs = sess.run().get_cs();
+            let turn1_kv: Vec<Vec<u8>> = eng
+                .snapshot_kv_positions(&sess.lane, 0, turn1_npast)
+                .into_iter()
+                .map(|u| u.rows)
+                .collect();
+
+            // Inject device/command-buffer failure on turn 2: must return Err and leave session at turn 1 state!
+            inject_wait_failure(stage, call_idx);
+            let mut s_fail = Sampler::new(temp, 64, 0.95, eng.softcap, 67890);
+            let mut fail_out = Vec::new();
+            let err = sess.run_chat_turn(&turn2, 4, true, true, &mut s_fail, &mut fail_out);
+            clear_wait_failure();
+            assert!(err.is_err(), "{label}: injected {stage}[{call_idx}] failure was not reported");
+            assert!(std::str::from_utf8(&fail_out).is_ok(), "{label}: output left invalid UTF-8");
+            assert_eq!(sess.n_past, turn1_npast, "{label}: n_past mutated after failed turn");
+            assert_eq!(sess.run().get_cs(), turn1_cs, "{label}: CS corrupted after failed turn");
+            let after_kv: Vec<Vec<u8>> = eng
+                .snapshot_kv_positions(&sess.lane, 0, turn1_npast)
+                .into_iter()
+                .map(|u| u.rows)
+                .collect();
+            assert_eq!(after_kv, turn1_kv, "{label}: committed KV[0..turn1_npast) corrupted after failed turn");
+
+            // Retry turn 2 on the same session: must match the clean 2-turn session bit-for-bit!
+            let mut s2 = Sampler::new(temp, 64, 0.95, eng.softcap, 67890);
+            let mut retry_out = Vec::new();
+            sess.run_chat_turn(&turn2, 4, true, true, &mut s2, &mut retry_out).unwrap();
+            assert_eq!(sess.n_past, want_npast, "{label}: retry n_past mismatch");
+            assert_eq!(eng.lane_hash(&sess.lane), want_hash, "{label}: retry lane_hash mismatch");
+            assert_eq!(&retry_out, want_out2, "{label}: retry output mismatch");
+        }
     }
 }

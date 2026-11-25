@@ -1811,4 +1811,50 @@ mod tests {
         assert!(miss.ids.is_empty() && miss.ids.capacity() == 0);
         assert!(miss.blocks.is_empty() && miss.blocks.capacity() == 0);
     }
+
+    #[test]
+    fn pinned_child_with_generation_bumped_unpinned_ancestor_preserves_node_ref_and_truncates_seek() {
+        // Models `t-audit-cache-prefix-pins` (`HeldNeverStale`, `PinnedPathLive`, `NoStaleAfterSeek`):
+        // Chain `b0 (0..64) -> b1 (64..128) -> b2 (128..192)` with retained starts at `b0` and `b2`.
+        // `b2` is pinned (protecting `b2`'s own slots), while ancestor `b1` is unpinned and its
+        // slot is reused at generation 2 by another owner (refcount = 1 at gen 2).
+        let mut live = LiveTree::new(FakeRecords::default());
+        let id0 = live.insert(None, 0, &block(10), handles_win(1, 1, 1, 1)).unwrap();
+        let id1 = live.insert(Some(id0), BLOCK, &block(20), handles_win(2, 1, 2, 1)).unwrap();
+        let id2 = live.insert(Some(id1), 2 * BLOCK, &block(30), handles_win(3, 1, 3, 1)).unwrap();
+        live.retain_start(id0).unwrap();
+        live.retain_start(id2).unwrap();
+
+        let s2 = Slot::new(2).unwrap();
+        let s3 = Slot::new(3).unwrap();
+
+        // Pin `id2` ONLY (`id0` and `id1` remain unpinned in `LiveTree`).
+        assert!(live.pin(id2).unwrap());
+        assert_eq!(live.records.refs(s3, BlockKind::Full), 1);
+        assert_eq!(live.records.refs(s2, BlockKind::Full), 0);
+
+        // Unpinned ancestor `id1`'s slot 2 advances to generation 2 and is taken by a new owner.
+        live.records.reuse(s2, BlockKind::Full);
+        live.records.add_ref(s2, BlockKind::Full, 2).unwrap();
+        live.records.reuse(s2, BlockKind::Window);
+        live.records.add_ref(s2, BlockKind::Window, 2).unwrap();
+
+        // Node safety (`HeldNeverStale`): `id2`'s own slot 3 stays at generation 1 with refcount 1.
+        assert_eq!(live.records.generation(s3, BlockKind::Full), Some(1));
+        assert_eq!(live.records.refs(s3, BlockKind::Full), 1);
+
+        // Full-path validation on seek (`PinnedPathLive` & `NoStaleAfterSeek`):
+        // Seeking `[block(10), block(20), block(30), block(40)]` must NOT match `id2` across
+        // stale ancestor `id1`; it must evict `id1` (and subtree `id2`, dropping `id2`'s gen-1 ref
+        // while leaving `id1`'s reused gen-2 refcount untouched at 1!) and fall back to live `id0`.
+        let req = [block(10), block(20), block(30), block(40)].concat();
+        let m = live.deepest_start(&req).unwrap();
+        assert_eq!(m.at, BLOCK);
+        assert_eq!(m.start, Some(id0));
+        assert_eq!(m.ids, vec![id0]);
+        assert_eq!(live.records.refs(s3, BlockKind::Full), 0, "evicted pinned child dropped its own gen-1 ref");
+        assert_eq!(live.records.refs(s3, BlockKind::Window), 0);
+        assert_eq!(live.records.refs(s2, BlockKind::Full), 1, "reused ancestor slot at gen 2 kept its new owner's ref");
+        assert_eq!(live.records.refs(s2, BlockKind::Window), 1);
+    }
 }
