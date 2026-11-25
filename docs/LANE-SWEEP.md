@@ -69,7 +69,6 @@ The historical aggregates leave the 20-second p95 TTFT target unverified. On a n
 
 At 64 lanes the budget projection was 60.52 GiB. Actual process footprint and available system memory were unmeasured in this run. With a server exposing `process_footprint_bytes` through `/health`, replay reports the largest sampled process footprint in `peak_memory_bytes` and the largest admission-budget estimate in `peak_budget_estimate_bytes`. Sampling can miss peaks between polls.
 
-The chosen default lane count **`64`** is set in:
-- [`src/main.rs`](../src/main.rs) (`DEFAULT_SERVE_LANES = 64`, `SERVE_USAGE`)
-- [`tunings/m5-max-128gb.tuning`](../tunings/m5-max-128gb.tuning) (`default_lanes = 64`) & [`src/tuning.rs`](../src/tuning.rs) (`tunings/m5-pro-64gb.tuning` sets `default_lanes = 32` for 64 GB M5 Pro)
-- [`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) (`INKY_LANES=${INKY_LANES:-64}`)
+When `inky serve` starts without `--lanes`, it uses the machine profile. M5 Max 128 GB requests 64 lanes, M5 Pro 64 GB requests 32, and unmatched machines request 64. An explicit `--lanes` overrides the profile. The memory budget can reduce the effective lane count. [Machine profiles](../src/tuning.rs)
+
+The fleet wrapper passes `--lanes` explicitly. Its default of 64 matches the M5 Max profile. Set `INKY_LANES=32` to use the M5 Pro 64 GB lane count with this wrapper. [Fleet launcher](../scripts/inky-fleet-serve.sh)
