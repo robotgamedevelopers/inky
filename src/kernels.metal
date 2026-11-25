@@ -1158,7 +1158,7 @@ kernel void k_gumbel(device float * A [[buffer(2)]], constant SampArgs & a [[buf
 // top-2 probabilities (p_{3,(1)}, p_{3,(2)}) of softmax(s3), adaptive weight
 //   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
 // and overwrites Z3[v] <- s3(v) + omega_t * (s3(v) - s1(v)) in-place.
-// The sampler skips its softcap only for rows with omega_max > 0.
+// Downstream k_gumbel / CPU Sampler skips softcap only for rows with omega_max > 0.
 // Grid: (1, n_lanes, 1), 1024 threads (32 simdgroups).
 struct LoopCdArgs { uint logits_off, n, stride, pad0; float softcap; uint pad1, pad2, pad3; };
 inline void top2_merge(thread float & m1, thread float & m2, float b1, float b2) {
@@ -1184,7 +1184,8 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
     threadgroup float sm1[32], sm2[32], ssum[32];
     threadgroup float g_shared[3];
 
-    // An unguided lane keeps the same raw logits it receives when decoding alone.
+    // Disabled lanes (omega_max <= 0) keep exact raw logits untouched so mixed batches
+    // never alter an unguided lane's arithmetic relative to standalone omega == 0 decode.
     if (omega_max <= 0.0f) return;
 
     // Pass 1: exact global top-2 of softcapped strong logits s3 across all 1024 threads.

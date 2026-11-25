@@ -8,7 +8,7 @@ With **inky**, you can:
 
 * Run Thinking Machines' Inkling 2 Mini on an M5 Mac, from the LM Studio GGUF
 * Decode about 1.9x and prefill about 5.8x faster than LM Studio's runtime
-* Get the same answers as llama.cpp, checked position by position in CI
+* Match llama.cpp argmaxes (worst KL <= 0.01) across CI's checked reference positions: 58/58 on short-prompt decode, 24/24 after a 2380-token long-prompt prefill, and 58/58 on short-prompt decode steps
 * Run many coding-agent tasks served at once from one process, each its own lane. The [design](docs/DESIGN.md) and the [roadmap](docs/ROADMAP.md) say how.
 
 This is a fork of [erisinky](https://github.com/Eriskii/erisinky) by Eris.

@@ -324,7 +324,7 @@ mod cli_tests {
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
-    loopcd_omega: f32, kv8: bool, kv_disk: bool,
+    loopcd_omega: f32, kv8: bool, kv_disk: bool, allow_mismatch: bool,
 }
 
 fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
@@ -333,7 +333,8 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
     let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
                        temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false,
-                       loopcd_omega: 0.0, kv8: false, kv_disk: false };
+                       loopcd_omega: 0.0, kv8: false, kv_disk: false,
+                       allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0") };
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| format!("missing value for {a}"));
         match a {
@@ -348,6 +349,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--raw" => o.raw = true,
             "--kv8" => o.kv8 = true,
             "--kv-disk" => o.kv_disk = true,
+            "--allow-mismatch" => o.allow_mismatch = true,
             "--effort" => o.effort = v()?.into(),
             "--system" => o.system = v()?.into(),
             "--temp" => o.temp = v()?.parse().map_err(|_| format!("{a} requires a number"))?,
@@ -552,6 +554,18 @@ fn compare_logits(lg: &[f32], r: &[f32]) -> Option<(usize, usize, f32, f32)> {
     }
 }
 
+fn check_agreement_gate(agree: usize, compared: usize, allow_mismatch: bool) -> Result<(), String> {
+    if compared == 0 {
+        return Err("no reference positions were compared".into());
+    }
+    if agree < compared && !allow_mismatch {
+        return Err(format!(
+            "argmax mismatch: {agree}/{compared} positions agreed with reference (pass --allow-mismatch for exploratory runs)"
+        ));
+    }
+    Ok(())
+}
+
 fn check(o: &Opts) -> Result<(), String> {
     if o.reference.is_empty() {
         return Err("expected --ref PREFIX".into());
@@ -640,12 +654,24 @@ fn check(o: &Opts) -> Result<(), String> {
         eprintln!("disk tier: {:.1} MiB in memory, {:.1} MiB on disk only (all in memory: {:.1} MiB); read {:.0} MiB in {:.0} ms",
                   eng.mem().0 as f64 / 1048576.0, eng.kv_disk_bytes(n) as f64 / 1048576.0, eng.kv_exact_bytes(n) as f64 / 1048576.0, rb as f64 / 1048576.0, rt.as_secs_f64() * 1e3);
     }
-    Ok(())
+    check_agreement_gate(agree, compared, o.allow_mismatch)
 }
 
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+
+    #[test]
+    fn check_agreement_gate_fails_on_argmax_miss_unless_explicitly_overridden() {
+        assert_eq!(check_agreement_gate(58, 58, false), Ok(()));
+        assert!(check_agreement_gate(57, 58, false).unwrap_err().contains("57/58"));
+        assert_eq!(check_agreement_gate(57, 58, true), Ok(()));
+        assert!(check_agreement_gate(0, 0, true).is_err());
+        let (_, opts_default) = parse_cli_args(&["check".into(), "--ref".into(), "p".into()]).unwrap();
+        assert!(!opts_default.allow_mismatch);
+        let (_, opts_override) = parse_cli_args(&["check".into(), "--ref".into(), "p".into(), "--allow-mismatch".into()]).unwrap();
+        assert!(opts_override.allow_mismatch);
+    }
 
     #[test]
     fn reference_tokens_require_a_nonempty_sequence_that_fits() {
@@ -1666,6 +1692,698 @@ fn sharedkv(o: &Opts) {
     }
 }
 
+fn load_gate_tokens(eng: &Engine, o: &Opts) -> Vec<u32> {
+    if !o.reference.is_empty() {
+        let path = if std::path::Path::new(&o.reference).exists() {
+            o.reference.clone()
+        } else {
+            format!("{}.tokens", o.reference)
+        };
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read token file {path}: {e}"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().parse().expect("valid token id"))
+            .collect()
+    } else {
+        let tk = Tokenizer::load(&eng.g);
+        tk.encode(&first_turn(o, &o.prompt), true)
+    }
+}
+
+/// Independent `f64` CPU reference for `k_loopcd_blend` (Liu et al. 2026, Eqs. 3-4 & Appendix A.1-A.3):
+/// computes softcapped `s3`, `s1`, exact top-2 probabilities `(p1, p2)` of `softmax(s3)`, adaptive
+/// `omega_t = omega_max * clamp(1 - (p1 - p2), 0, 1)`, and `s3 + omega_t * (s3 - s1)`.
+fn cpu_loopcd_reference(z3_raw: &[f32], z1_raw: &[f32], softcap: f32, omega_max: f32) -> (Vec<f32>, f32) {
+    assert_eq!(z3_raw.len(), z1_raw.len());
+    if omega_max <= 0.0 {
+        return (z3_raw.to_vec(), 0.0);
+    }
+    let c = softcap as f64;
+    let cap = |x: f32| -> f64 {
+        let xd = x as f64;
+        if c > 0.0 { c * (xd / c).tanh() } else { xd }
+    };
+    let mut max1 = f64::NEG_INFINITY;
+    let mut max2 = f64::NEG_INFINITY;
+    for &x in z3_raw {
+        let s = cap(x);
+        if s >= max1 {
+            max2 = max1;
+            max1 = s;
+        } else if s > max2 {
+            max2 = s;
+        }
+    }
+    let z: f64 = z3_raw.iter().map(|&x| (cap(x) - max1).exp()).sum();
+    let p1 = 1.0 / z;
+    let p2 = if max2.is_finite() { (max2 - max1).exp() / z } else { 0.0 };
+    let omega_t = (omega_max as f64) * (1.0 - (p1 - p2)).clamp(0.0, 1.0);
+    let out: Vec<f32> = z3_raw
+        .iter()
+        .zip(z1_raw.iter())
+        .map(|(&r3, &r1)| {
+            let s3 = cap(r3);
+            let s1 = cap(r1);
+            (s3 + omega_t * (s3 - s1)) as f32
+        })
+        .collect();
+    (out, omega_t as f32)
+}
+
+/// GPU gate for Adaptive `LoopCD-Logits` (`t-au-loopcd-gpu-gate` / `U19`):
+/// 1. Runs `encode_decode_with_omegas` on a 4-lane Layer 3 blocked batch with mixed omegas `[0.0, 0.35, 0.0, 0.5]`
+///    (lanes 0 & 1 sharing a sealed 64-token prefix block for `k_attn_grp_dec`, lanes 2 & 3 private for `k_attn_dec_solo`).
+/// 2. Snapshots `CS[18..24]` and `KV` coda blocks (`18..24`) around an isolated dry weak pass (`encode_decode_one_pass(..., true)`),
+///    proving 0 bytes mutated, AND verifies post-step `CS` + `Window`/`Full` `BlockPool` slots after the full
+///    `encode_decode_with_omegas` step match standalone `omega = 0.0` decode bit-for-bit.
+/// 3. Proves every `omega == 0.0` lane in the mixed batch keeps raw/unblended logits bit-identical to standalone `omega = 0.0`.
+/// 4. Proves every `omega > 0.0` lane matches an independent `f64` CPU `LoopCD` reference over standalone strong (`z3`)
+///    and 1-pass weak (`z1`) logits within `< 1e-4` across the full vocabulary, with active contrast (`omega_t > 0`).
+/// 5. `INK_LOOPCDGATE_SABOTAGE=1` perturbs one lane's blended/dry-pass logit, printing `LOOPCD GATE DIFFERS` and exiting `1`.
+fn loopcdgate(o: &Opts) {
+    use blocks::{BlockIndex, BlockKind, BLOCK};
+    use engine::{Span, LOOP_END, N_PHYS};
+
+    let omegas = [0.0f32, 0.35, 0.0, 0.5];
+    let n_lanes = omegas.len();
+    let prefill_len = 72usize; // 1 sealed 64-token block + 8 tokens in active block 1
+    let need_toks = prefill_len + 4;
+    let ctx = o.ctx.max(256);
+    let eng = Engine::load(&o.model, ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(n_lanes);
+    let sabotage = std::env::var("INK_LOOPCDGATE_SABOTAGE")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0");
+
+    let base = load_gate_tokens(&eng, o);
+    // Build 4 token streams: lanes 0 & 1 share block 0 (`[0..64)`) + identical `[64..need_toks)` at different omegas;
+    // lanes 2 & 3 have distinct streams so both grouped and solo blocked decode paths run together.
+    // Also append a short creative stem at the end so the decoded position has genuine next-token entropy (`omega_t > 0`).
+    let tk = Tokenizer::load(&eng.g);
+    let stem = tk.encode("In the quiet morning light, the old sailor looked out across the", false);
+    let stream = |i: usize| -> Vec<u32> {
+        let rot = if i < 2 { 0 } else { 37 * i + 11 };
+        let mut v: Vec<u32> = (0..need_toks).map(|q| base[(rot + q) % base.len()]).collect();
+        let copy_len = stem.len().min(8);
+        let tail_start = prefill_len + 1 - copy_len;
+        v[tail_start..prefill_len + 1].copy_from_slice(&stem[..copy_len]);
+        v
+    };
+    let streams: Vec<Vec<u32>> = (0..n_lanes).map(stream).collect();
+
+    // Helper: create `n_lanes` fresh blocked lanes prefilled through `prefill_len` (`[0..64)` then `[64..72)`),
+    // sharing block 0 between lanes 0 and 1 when `share_b0` is true.
+    let setup_blocked_lanes = |share_b0: bool| -> Vec<Lane> {
+        let lanes: Vec<Lane> = (0..n_lanes)
+            .map(|i| {
+                let l = Lane::new_blocked(&eng, need_toks + 8);
+                eng.on(&l).set_tokens(0, &streams[i]);
+                l
+            })
+            .collect();
+        {
+            let mut pools = eng.block_pool().borrow_mut();
+            let mut shared_b0: Option<[(blocks::Slot, u32); 2]> = None;
+            for (i, l) in lanes.iter().enumerate() {
+                let mut tbl = l.block_table().borrow_mut();
+                for b in 0..=prefill_len / BLOCK {
+                    let bi = BlockIndex::new(b as u32);
+                    if share_b0 && b == 0 && i == 1 {
+                        let [(sf, gf), (sw, gw)] = shared_b0.expect("lane 0 block 0 allocated");
+                        tbl.fill(&mut pools.full, bi, sf, gf).unwrap();
+                        tbl.fill(&mut pools.window, bi, sw, gw).unwrap();
+                        continue;
+                    }
+                    let (sf, _) = match pools.full.lowest_free() {
+                        Some(s) => (s, pools.full.take(s).unwrap()),
+                        None => { let s = pools.full.grow().unwrap(); (s, pools.full.take(s).unwrap()) }
+                    };
+                    let gf = pools.full.record(sf).unwrap().generation();
+                    let (sw, _) = match pools.window.lowest_free() {
+                        Some(s) => (s, pools.window.take(s).unwrap()),
+                        None => { let s = pools.window.grow().unwrap(); (s, pools.window.take(s).unwrap()) }
+                    };
+                    let gw = pools.window.record(sw).unwrap().generation();
+                    tbl.fill(&mut pools.full, bi, sf, gf).unwrap();
+                    tbl.fill(&mut pools.window, bi, sw, gw).unwrap();
+                    if share_b0 && b == 0 && i == 0 {
+                        shared_b0 = Some([(sf, gf), (sw, gw)]);
+                    }
+                }
+            }
+        }
+        // Prefill block 0 (`0..64`) on lanes 0, 2, 3 (lane 1 shares lane 0's block 0 KV and copies CS at 64!),
+        // then prefill `[64..72)` across all 4 lanes.
+        {
+            let pf0_idx: Vec<usize> = if share_b0 { vec![0, 2, 3] } else { vec![0, 1, 2, 3] };
+            let sp0: Vec<Span> = pf0_idx.iter().map(|&i| Span { lane: &lanes[i], p0: 0, t: 64 }).collect();
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &sp0, false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            if share_b0 {
+                let cs0 = eng.on(&lanes[0]).get_cs();
+                eng.on(&lanes[1]).set_cs(&cs0);
+            }
+            let sp1: Vec<Span> = lanes.iter().map(|l| Span { lane: l, p0: 64, t: prefill_len - 64 }).collect();
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &sp1, false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        lanes
+    };
+
+    let release_lanes = |lanes: Vec<Lane>| {
+        let mut pools = eng.block_pool().borrow_mut();
+        for l in lanes {
+            l.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
+        }
+    };
+
+    let snapshot_lane_kv = |l: &Lane| -> Vec<(BlockKind, u32, Vec<u8>)> {
+        let pools = eng.block_pool().borrow();
+        let tbl = l.block_table().borrow();
+        let mut out = Vec::new();
+        for kind in [BlockKind::Full, BlockKind::Window] {
+            for b in 0..=prefill_len / BLOCK {
+                let e = tbl.get(kind, BlockIndex::new(b as u32)).unwrap().unwrap();
+                out.push((kind, b as u32, pools.of(kind).slot_bytes(e.slot()).unwrap().to_vec()));
+            }
+        }
+        out
+    };
+
+    let snapshot_coda_kv = |l: &Lane| -> Vec<u8> {
+        // Extract exact bytes of coda slots `LOOP_END..N_PHYS` (`18..24`) in active block 1.
+        let pools = eng.block_pool().borrow();
+        let tbl = l.block_table().borrow();
+        let b = (prefill_len / BLOCK) as u32;
+        let mut bytes = Vec::new();
+        for ip in LOOP_END..N_PHYS {
+            let (is_swa, pass_idx) = eng.slot_kind_pass(ip);
+            let kind = if is_swa { BlockKind::Window } else { BlockKind::Full };
+            let e = tbl.get(kind, BlockIndex::new(b)).unwrap().unwrap();
+            let slot_slice = pools.of(kind).slot_bytes(e.slot()).unwrap();
+            let n_passes = if is_swa { blocks::WINDOW_PASSES } else { blocks::FULL_PASSES };
+            let pass_bytes = slot_slice.len() / n_passes;
+            bytes.extend_from_slice(&slot_slice[pass_idx * pass_bytes..(pass_idx + 1) * pass_bytes]);
+        }
+        bytes
+    };
+
+    let mut bad: Vec<String> = Vec::new();
+    let coda_cs_range = Engine::cs_slot_byte_range(LOOP_END..N_PHYS);
+
+    // 1. Isolated dry weak pass check (`encode_decode_one_pass(..., true)`):
+    //    `CS[18..24]` and `KV[18..24]` must mutate ZERO bytes during the dry weak pass itself!
+    let dry_probe_lanes = setup_blocked_lanes(true);
+    let pre_coda_cs: Vec<Vec<u8>> = dry_probe_lanes.iter().map(|l| eng.on(l).get_cs()[coda_cs_range.clone()].to_vec()).collect();
+    let pre_coda_kv: Vec<Vec<u8>> = dry_probe_lanes.iter().map(snapshot_coda_kv).collect();
+    {
+        let sp: Vec<Span> = dry_probe_lanes.iter().map(|l| Span { lane: l, p0: prefill_len, t: 1 }).collect();
+        let cb = eng.gpu.cmd();
+        eng.encode_decode_one_pass(&cb, &sp, true);
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    let dry_weak_probe_logits: Vec<Vec<f32>> = (0..n_lanes).map(|i| eng.span_logits(i).to_vec()).collect();
+    for i in 0..n_lanes {
+        let post_cs = &eng.on(&dry_probe_lanes[i]).get_cs()[coda_cs_range.clone()];
+        if post_cs != pre_coda_cs[i].as_slice() {
+            let diff = post_cs.iter().zip(&pre_coda_cs[i]).filter(|(a, b)| a != b).count();
+            bad.push(format!("lane {i}: dry weak pass mutated {diff} bytes of CS[18..24]"));
+        }
+        let post_kv = snapshot_coda_kv(&dry_probe_lanes[i]);
+        if post_kv != pre_coda_kv[i] {
+            let diff = post_kv.iter().zip(&pre_coda_kv[i]).filter(|(a, b)| a != b).count();
+            bad.push(format!("lane {i}: dry weak pass mutated {diff} bytes of KV[18..24]"));
+        }
+    }
+    release_lanes(dry_probe_lanes);
+
+    // 2. Standalone 1-pass stateful reference (`dry_coda = false`) for `z_1` and standalone solo 3-pass `omega = 0.0` reference for `z_3`, `CS`, and `KV`.
+    let ref1_lanes = setup_blocked_lanes(false);
+    let z1_ref: Vec<Vec<f32>> = (0..n_lanes)
+        .map(|i| {
+            let cb = eng.gpu.cmd();
+            eng.encode_decode_one_pass(&cb, &[Span { lane: &ref1_lanes[i], p0: prefill_len, t: 1 }], false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            eng.span_logits(0).to_vec()
+        })
+        .collect();
+    release_lanes(ref1_lanes);
+
+    let solo0_lanes = setup_blocked_lanes(false);
+    let mut z3_solo: Vec<Vec<f32>> = Vec::with_capacity(n_lanes);
+    let mut cs_solo: Vec<Vec<u8>> = Vec::with_capacity(n_lanes);
+    let mut kv_solo: Vec<Vec<(BlockKind, u32, Vec<u8>)>> = Vec::with_capacity(n_lanes);
+    for i in 0..n_lanes {
+        let cb = eng.gpu.cmd();
+        eng.encode_decode(&cb, &[Span { lane: &solo0_lanes[i], p0: prefill_len, t: 1 }], true, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+        z3_solo.push(eng.span_logits(0).to_vec());
+        cs_solo.push(eng.on(&solo0_lanes[i]).get_cs());
+        kv_solo.push(snapshot_lane_kv(&solo0_lanes[i]));
+    }
+    release_lanes(solo0_lanes);
+
+    // 3. Mixed-omega multi-lane Layer 3 blocked batch (`[0.0, 0.35, 0.0, 0.5]`).
+    let cand_lanes = setup_blocked_lanes(true);
+    {
+        let sp: Vec<Span> = cand_lanes.iter().map(|l| Span { lane: l, p0: prefill_len, t: 1 }).collect();
+        let cb = eng.gpu.cmd();
+        eng.encode_decode_with_omegas(&cb, &sp, true, false, &omegas);
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    let mut cand_logits: Vec<Vec<f32>> = (0..n_lanes).map(|i| eng.span_logits(i).to_vec()).collect();
+    let cand_weak_logits: Vec<Vec<f32>> = (0..n_lanes).map(|i| eng.span_weak_logits(i).to_vec()).collect();
+
+    if let Some(ref mode) = sabotage {
+        println!("INK_LOOPCDGATE_SABOTAGE={mode}: perturbing lane 1 blended logit at token 0 by +0.25");
+        cand_logits[1][0] += 0.25;
+    }
+
+    let mut max_guided_err = 0.0f32;
+    let mut max_contrast_shift = 0.0f32;
+    for i in 0..n_lanes {
+        // (b) Full-step CS (including 18..24) and KV blocks match standalone non-LoopCD decode bit-for-bit.
+        let got_cs = eng.on(&cand_lanes[i]).get_cs();
+        if got_cs[coda_cs_range.clone()] != cs_solo[i][coda_cs_range.clone()] {
+            bad.push(format!("lane {i}: post-step CS[18..24] differs from standalone omega=0 decode"));
+        }
+        if got_cs != cs_solo[i] {
+            bad.push(format!("lane {i}: post-step full CS differs from standalone omega=0 decode"));
+        }
+        let got_kv = snapshot_lane_kv(&cand_lanes[i]);
+        if got_kv != kv_solo[i] {
+            bad.push(format!("lane {i}: post-step KV blocks differ from standalone omega=0 decode"));
+        }
+        // Verify captured `lg_weak` matches both isolated dry probe and standalone 1-pass reference.
+        if cand_weak_logits[i] != dry_weak_probe_logits[i] || cand_weak_logits[i] != z1_ref[i] {
+            let wd = cand_weak_logits[i]
+                .iter()
+                .zip(&z1_ref[i])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            if wd > 1e-6 {
+                bad.push(format!("lane {i}: dry weak logits differ from standalone 1-pass reference (max_diff={wd:.6e})"));
+            }
+        }
+
+        if omegas[i] == 0.0 {
+            // (c) Disabled lane in mixed batch must leave raw logits untouched and report `span_loopcd == false`.
+            if eng.span_loopcd(i) || eng.span_effective_sampler_softcap(i) != eng.softcap {
+                bad.push(format!("lane {i} (omega=0): span_loopcd={} softcap={}", eng.span_loopcd(i), eng.span_effective_sampler_softcap(i)));
+            }
+            let same_bits = cand_logits[i]
+                .iter()
+                .zip(&z3_solo[i])
+                .all(|(a, b)| a.is_finite() && a.to_bits() == b.to_bits());
+            if !same_bits {
+                let d = cand_logits[i].iter().zip(&z3_solo[i]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                bad.push(format!("lane {i} (omega=0): logits differ from standalone omega=0 step (max_diff={d:.6e})"));
+            }
+            println!("lane {i} (omega={:.2}): raw logits bit-identical to standalone omega=0, CS/KV bit-identical", omegas[i]);
+        } else {
+            // (d) Guided lane must match independent `f64` CPU LoopCD formula within `< 1e-4`.
+            if !eng.span_loopcd(i) || eng.span_effective_sampler_softcap(i) != 0.0 {
+                bad.push(format!("lane {i} (omega={}): span_loopcd={} softcap={}", omegas[i], eng.span_loopcd(i), eng.span_effective_sampler_softcap(i)));
+            }
+            let (want_blended, omega_t) = cpu_loopcd_reference(&z3_solo[i], &z1_ref[i], eng.softcap, omegas[i]);
+            let (worst_tok, worst_diff) = cand_logits[i]
+                .iter()
+                .zip(&want_blended)
+                .enumerate()
+                .fold((0usize, 0.0f32), |(bi, bd), (v, (&a, &b))| {
+                    let d = if a.is_finite() && b.is_finite() { (a - b).abs() } else { f32::INFINITY };
+                    if d > bd { (v, d) } else { (bi, bd) }
+                });
+            max_guided_err = max_guided_err.max(worst_diff);
+            let shift_vs_plain = cand_logits[i]
+                .iter()
+                .zip(&z3_solo[i])
+                .map(|(&g, &r3)| (g - softcap(r3, eng.softcap)).abs())
+                .fold(0.0f32, f32::max);
+            max_contrast_shift = max_contrast_shift.max(shift_vs_plain);
+            println!(
+                "lane {i} (omega_max={:.2}, omega_t={omega_t:.4}): max_diff vs CPU ref = {worst_diff:.3e} (tok {worst_tok}), max |guided - softcap(z3)| = {shift_vs_plain:.4}",
+                omegas[i]
+            );
+            if !(worst_diff < 1e-4) {
+                bad.push(format!(
+                    "lane {i} (omega_max={}): blended logits differ from CPU reference at token {worst_tok} by {worst_diff:.6e} (>= 1e-4)",
+                    omegas[i]
+                ));
+            }
+        }
+    }
+    if max_contrast_shift <= 1e-4 {
+        bad.push(format!("LoopCD contrast shift was vacuous (max |guided - softcap(z3)| = {max_contrast_shift:.6e})"));
+    }
+    release_lanes(cand_lanes);
+
+    if bad.is_empty() {
+        println!(
+            "loopcd gate exact: {n_lanes} blocked lanes {:?}, dry weak pass mutated 0 CS/KV bytes, omega=0 bit-identical, guided max_err={max_guided_err:.2e} (< 1e-4)",
+            omegas
+        );
+    } else {
+        for b in &bad {
+            println!("{b}");
+        }
+        println!("LOOPCD GATE DIFFERS");
+        std::process::exit(1);
+    }
+}
+
+/// Blocked Layer 3 batch-invariance gate (`t-au-blocked-invariance` / `U79` & live `t-audit-engine-dirty-range`):
+/// 1. Verifies on a real loaded `Engine` that 64 consecutive blocked GPU decode steps (`pos = 64..128`) write `(1, 1)`
+///    block-table words at `pos = 64` and `(0, 0)` words with `dirty_range == None` across all 63 steps `pos = 65..128`.
+/// 2. Full-size span (`t = INK_FULL_SPAN`, default `eng.chunk = 4096`) blocked split invariance (`use_blocks = true`):
+///    one `4096`-token span + decode steps vs multi-split `[37, 219, 768, 1025, 2047]` (crossing `1024` and `4096`) + decode steps.
+/// 3. Multi-lane (`INK_LANES`, default `20 > 17`) blocked prefill + multi-query grouped decode (`k_attn_grp_dec` + `k_attn_dec_solo`)
+///    past `1024` positions (`INK_PF = 1120`, `INK_DECODE = 6`, crossing `EXT = 1024` SWA window pruning!) against cold solo
+///    blocked execution (`1` lane per `Layer3Pool`, `1` span per step) — every step's logits, greedy tokens, and final `CS` bit-identical!
+/// 4. `INK_BLOCKEDINV_SABOTAGE=1` binds one span to another lane's blocked state, printing `BLOCKED NOT INVARIANT` and exiting `1`.
+fn blockedinv(o: &Opts) {
+    use blocks::{BlockIndex, BlockKind};
+    use engine::Span;
+    use poolgate::{Layer3Pool, StepPath};
+
+    let sabotage = std::env::var("INK_BLOCKEDINV_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let n_lanes: usize = std::env::var("INK_LANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if sabotage { 4 } else { 20 });
+    let pf_len: usize = std::env::var("INK_PF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if sabotage { 192 } else { 1120 });
+    let ndec: usize = std::env::var("INK_DECODE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if sabotage { 2 } else { 6 });
+    let full_span_req: usize = std::env::var("INK_FULL_SPAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if sabotage { 0 } else { 4096 });
+
+    let needed_ctx = full_span_req
+        .max(pf_len + ndec + 16)
+        .max(192)
+        .div_ceil(64)
+        * 64
+        + 64;
+    let eng = Engine::load(&o.model, o.ctx.max(needed_ctx));
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(n_lanes.max(4));
+    let base = load_gate_tokens(&eng, o);
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32;
+
+    let mut bad: Vec<String> = Vec::new();
+
+    if !sabotage {
+        // Part 1: Live 64-position `Engine::sync_lane_block_table_counts` + `Engine::encode_decode` check (`pos = 64..128`).
+        let lane64 = Lane::new_blocked(&eng, 192);
+        let toks128: Vec<u32> = (0..130).map(|q| base[q % base.len()]).collect();
+        eng.on(&lane64).set_tokens(0, &toks128);
+        let alloc_blk = |b: u32| {
+            let mut pools = eng.block_pool().borrow_mut();
+            let mut tbl = lane64.block_table().borrow_mut();
+            let bi = BlockIndex::new(b);
+            for kind in [BlockKind::Full, BlockKind::Window] {
+                let pool = pools.of_mut(kind);
+                let s = match pool.lowest_free() {
+                    Some(s) => s,
+                    None => pool.grow().unwrap(),
+                };
+                let _ = pool.take(s).unwrap();
+                let gen = pool.record(s).unwrap().generation();
+                tbl.fill(pool, bi, s, gen).unwrap();
+            }
+        };
+        alloc_blk(0);
+        {
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &lane64, p0: 0, t: 64 }], false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        alloc_blk(1);
+        let mut clean_steps = 0usize;
+        for pos in 64..128 {
+            let (df, dw) = {
+                let tbl = lane64.block_table().borrow();
+                (tbl.dirty_range(BlockKind::Full), tbl.dirty_range(BlockKind::Window))
+            };
+            let synced = eng.sync_lane_block_table_counts(&lane64, pos, 1);
+            if pos == 64 {
+                if df != Some((1, 1)) || dw != Some((1, 1)) || synced != (1, 1) {
+                    bad.push(format!("dirty-range gate at pos=64: dirty=({df:?},{dw:?}) synced={synced:?}"));
+                }
+            } else if df.is_some() || dw.is_some() || synced != (0, 0) {
+                bad.push(format!("dirty-range gate at pos={pos}: dirty=({df:?},{dw:?}) synced={synced:?}"));
+            } else {
+                clean_steps += 1;
+            }
+            let cb = eng.gpu.cmd();
+            eng.encode_decode(&cb, &[Span { lane: &lane64, p0: pos, t: 1 }], false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        {
+            let mut pools = eng.block_pool().borrow_mut();
+            lane64.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
+        }
+        println!("dirty-range live decode: pos=64 wrote (1, 1) table words; {clean_steps}/63 steady-state steps wrote (0, 0) words");
+
+        // Part 2: Full-size span (`t = full_span`, default 4096) blocked split invariance past 1024.
+        let full_span = full_span_req.min(eng.chunk);
+        if full_span > 0 {
+            let full_toks: Vec<u32> = (0..full_span + 4).map(|q| base[(q * 3 + 7) % base.len()]).collect();
+            let run_blocked_splits = |chunks: &[usize]| -> (Vec<u64>, Vec<u32>) {
+                let pool = Layer3Pool::new(&eng, 1);
+                let lid = pool.new_lane(&full_toks[..full_span], full_span + 4);
+                let mut p = 0usize;
+                for &c in chunks {
+                    pool.prefill(&[(lid, p, c)]);
+                    p += c;
+                }
+                assert_eq!(p, full_span);
+                let mut hashes = vec![fnv(&pool.logits(0))];
+                let mut tok = argmax(&pool.logits(0));
+                let mut toks_out = vec![tok];
+                pool.set_token(lid, full_span, tok);
+                for d in 0..2 {
+                    let pos = full_span + d;
+                    pool.decode(&[(lid, pos)]);
+                    let lg = pool.logits(0);
+                    hashes.push(fnv(&lg));
+                    tok = argmax(&lg);
+                    toks_out.push(tok);
+                    pool.set_token(lid, pos + 1, tok);
+                }
+                pool.end_lane(lid);
+                pool.shutdown();
+                (hashes, toks_out)
+            };
+            let split_plan: Vec<usize> = if full_span == 4096 {
+                vec![37, 219, 768, 1025, 2047]
+            } else {
+                let a = full_span / 5;
+                let b = full_span / 3;
+                vec![a, b, full_span - a - b]
+            };
+            let (h_one, t_one) = run_blocked_splits(&[full_span]);
+            let (h_split, t_split) = run_blocked_splits(&split_plan);
+            if h_one != h_split || t_one != t_split {
+                bad.push(format!(
+                    "full-size blocked span ({full_span}) differs from split {split_plan:?}: one={h_one:x?} vs split={h_split:x?}"
+                ));
+            } else {
+                println!(
+                    "full-size blocked span ({full_span} tokens vs {split_plan:?} + 2 decode steps): 100% bit-identical ({:016x})",
+                    h_one[0]
+                );
+            }
+        }
+    }
+
+    // Part 3: Multi-lane (`n_lanes`, default 20 > 17) blocked prefill + shared-KV grouped decode past 1024 positions.
+    // Lanes `0..(n_lanes * 3 / 4)` share a sealed prefix (`shared_head`, 1024 when `pf_len > 1024`) to exercise
+    // multiple `G_MAX = 8` groups + remainder in `k_attn_grp_dec`; remaining lanes run cold distinct streams (`k_attn_dec_solo`).
+    let shared_head = if pf_len > 1024 { 1024 } else { (pf_len / 2 / 64) * 64 };
+    let shared_count = (n_lanes * 3 / 4).max(2).min(n_lanes);
+    let prompts: Vec<Vec<u32>> = (0..n_lanes)
+        .map(|i| {
+            if i < shared_count && shared_head > 0 {
+                let mut v: Vec<u32> = (0..shared_head).map(|q| base[q % base.len()]).collect();
+                v.extend((0..pf_len - shared_head).map(|q| base[(97 * (i + 1) + q) % base.len()]));
+                v
+            } else {
+                (0..pf_len).map(|q| base[(131 * (i + 1) + q) % base.len()]).collect()
+            }
+        })
+        .collect();
+
+    // Cold solo blocked reference: each lane runs completely alone on a fresh `Layer3Pool` (`1` span per step).
+    let mut solo_hashes: Vec<Vec<u64>> = Vec::with_capacity(n_lanes);
+    let mut solo_tokens: Vec<Vec<u32>> = Vec::with_capacity(n_lanes);
+    for i in 0..n_lanes {
+        let pool = Layer3Pool::new(&eng, 1);
+        let lid = pool.new_lane(&prompts[i], pf_len + ndec + 4);
+        let mut p = 0usize;
+        while p < pf_len {
+            let c = eng.chunk.min(pf_len - p);
+            pool.prefill(&[(lid, p, c)]);
+            p += c;
+        }
+        let lg0 = pool.logits(0);
+        let mut hs = vec![fnv(&lg0)];
+        let mut tok = argmax(&lg0);
+        let mut ts = vec![tok];
+        pool.set_token(lid, pf_len, tok);
+        for d in 0..ndec {
+            let pos = pf_len + d;
+            pool.decode(&[(lid, pos)]);
+            let lg = pool.logits(0);
+            hs.push(fnv(&lg));
+            tok = argmax(&lg);
+            ts.push(tok);
+            pool.set_token(lid, pos + 1, tok);
+        }
+        pool.end_lane(lid);
+        pool.shutdown();
+        solo_hashes.push(hs);
+        solo_tokens.push(ts);
+    }
+
+    // Batched blocked candidate (`Layer3Pool::with_persistent_starts` so shared-prefix lanes match `EVERY@1024` / `PROMPT`
+    // start points and share `Window` + `Full` blocks across `> 17` concurrent lanes!).
+    let pool = Layer3Pool::with_persistent_starts(&eng, n_lanes);
+    if shared_head > 0 {
+        // Seed the shared prefix into `PrefixTree` (`0..shared_head`, plus 1 tail token so prompt-end / EVERY@1024 saves).
+        let mut seed_prompt = prompts[0][..shared_head].to_vec();
+        seed_prompt.push(base[0]);
+        let (slid, _) = pool.new_lane_matched(&seed_prompt, shared_head + 8);
+        let mut sp = 0usize;
+        for &ch in &[320usize, 704] {
+            if sp < shared_head {
+                let step = ch.min(shared_head - sp);
+                pool.prefill(&[(slid, sp, step)]);
+                sp += step;
+            }
+        }
+        while sp < seed_prompt.len() {
+            let step = (seed_prompt.len() - sp).min(64);
+            pool.prefill(&[(slid, sp, step)]);
+            sp += step;
+        }
+        pool.end_lane(slid);
+    }
+
+    let mut lids = Vec::with_capacity(n_lanes);
+    let mut pos_cur = Vec::with_capacity(n_lanes);
+    for i in 0..n_lanes {
+        let (lid, matched) = pool.new_lane_matched(&prompts[i], pf_len + ndec + 4);
+        lids.push(lid);
+        pos_cur.push(matched);
+    }
+
+    // Batched multi-span blocked prefill in staggered chunks (crossing block and 1024 boundaries) until all lanes reach `pf_len`.
+    let chunk_sizes = [193usize, 320, 513, 256];
+    let mut c_idx = 0usize;
+    let mut batch_hashes: Vec<Vec<u64>> = vec![Vec::new(); n_lanes];
+    let mut batch_tokens: Vec<Vec<u32>> = vec![Vec::new(); n_lanes];
+    let mut sabotaged = false;
+    while pos_cur.iter().any(|&p| p < pf_len) {
+        let step_cap = chunk_sizes[c_idx % chunk_sizes.len()];
+        c_idx += 1;
+        let mut spans = Vec::new();
+        let mut who = Vec::new();
+        let mut total_t = 0usize;
+        for i in 0..n_lanes {
+            if pos_cur[i] < pf_len {
+                let rem = pf_len - pos_cur[i];
+                let t = rem.min(step_cap).min(eng.chunk.saturating_sub(total_t));
+                if t == 0 {
+                    break;
+                }
+                spans.push((lids[i], pos_cur[i], t));
+                who.push(i);
+                total_t += t;
+            }
+        }
+        if sabotage && !sabotaged && spans.len() >= 2 {
+            // Planted bug: bind lane 0's prefill span to another lane's handle at the same offset if valid, or corrupt token.
+            println!("INK_BLOCKEDINV_SABOTAGE: corrupting token at pos {} on blocked lane {}", spans[0].1, who[0]);
+            pool.set_token(spans[0].0, spans[0].1, prompts[who[0]][spans[0].1].wrapping_add(1) % 1000);
+            sabotaged = true;
+        }
+        pool.prefill(&spans);
+        for (row, &i) in who.iter().enumerate() {
+            pos_cur[i] += spans[row].2;
+            if pos_cur[i] == pf_len {
+                let lg = pool.logits(row);
+                batch_hashes[i].push(fnv(&lg));
+                let tok = argmax(&lg);
+                batch_tokens[i].push(tok);
+                pool.set_token(lids[i], pf_len, tok);
+            }
+        }
+    }
+
+    // Batched `n_lanes`-wide blocked decode steps past `1024` (`pf_len..pf_len + ndec`).
+    for d in 0..ndec {
+        let pos = pf_len + d;
+        if sabotage && !sabotaged {
+            println!("INK_BLOCKEDINV_SABOTAGE: corrupting decode token at pos {pos} on blocked lane 0");
+            pool.set_token(lids[0], pos, batch_tokens[0][d].wrapping_add(1) % 1000);
+            sabotaged = true;
+        }
+        let dec_spans: Vec<(usize, usize)> = lids.iter().map(|&lid| (lid, pos)).collect();
+        pool.decode(&dec_spans);
+        for i in 0..n_lanes {
+            let lg = pool.logits(i);
+            batch_hashes[i].push(fnv(&lg));
+            let tok = argmax(&lg);
+            batch_tokens[i].push(tok);
+            pool.set_token(lids[i], pos + 1, tok);
+        }
+    }
+    let st = pool.stats();
+    pool.shutdown();
+
+    for i in 0..n_lanes {
+        if batch_hashes[i] != solo_hashes[i] || batch_tokens[i] != solo_tokens[i] {
+            let first_step = batch_hashes[i].iter().zip(&solo_hashes[i]).position(|(a, b)| a != b);
+            bad.push(format!("blocked lane {i}: differs from solo blocked reference at step {first_step:?}"));
+        }
+    }
+
+    if bad.is_empty() {
+        println!(
+            "blockedinv exact: {n_lanes} blocked lanes at pf={pf_len} + dec={ndec} (matches={}, window_pruned={}, full_span={}) 100% bit-identical to solo blocked execution",
+            st.start_matches,
+            st.window_pruned,
+            full_span_req.min(eng.chunk)
+        );
+    } else {
+        for b in &bad {
+            println!("{b}");
+        }
+        println!("BLOCKED NOT INVARIANT");
+        std::process::exit(1);
+    }
+}
+
 /// dev, the max-context eval: one lane prefills the --file text (real code) to the engine's limit, timing each stretch of
 /// prefill; at each checkpoint (INK_CKPTS) one stream decodes on the decode path, then as many lanes as fit a budget of
 /// INK_LANE_GIB GiB (copies of the prefilled cache, each decoding its own tokens) decode together. Timing only.
@@ -1960,6 +2678,8 @@ fn main() {
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
         "poolgate" => poolgate(&o),
+        "loopcdgate" => loopcdgate(&o),
+        "blockedinv" => blockedinv(&o),
         "temp1" => temp1(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),

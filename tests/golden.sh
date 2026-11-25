@@ -8,6 +8,7 @@ B=${1:-./target/release/inky}
 D=$(mktemp -d); trap 'rm -rf $D' EXIT
 nv=200058
 # a reference of one zero logit row: check then hashes every step and compares only the last position (ignored here)
+export INK_ALLOW_MISMATCH=1
 for f in haiku long; do cp ref/$f.tokens $D/$f.tokens; head -c $((nv * 4)) /dev/zero > $D/$f.logits; done
 h() { grep -o 'hash [0-9a-f]*' | sed 's/hash //'; }
 value=$($B check --ref $D/haiku -c 4096 2>&1 | h)
