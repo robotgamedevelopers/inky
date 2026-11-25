@@ -15,6 +15,8 @@ import (
 // GGUF v3, only as much as this tool needs: the key-value section is kept as raw bytes (and can be appended to),
 // tensors are described by name, dims, type and offset.
 
+const conversionKey = "inkserve.experts"
+
 const ggufAlign = 32 // general.alignment's default; the Inkling files don't set it
 
 // GGML type ids. NV4 and MX8 are private to inkserve's erisinky branch; llama.cpp can't load them.
@@ -156,7 +158,9 @@ func (g *gguf) parse() error {
 	}
 	g.nKV = hdr.NKV
 	kvStart := cr.n
+	var provenanceStart, provenanceEnd int64
 	for i := uint64(0); i < hdr.NKV; i++ {
+		entryStart := cr.n
 		key, err := readString(cr)
 		if err != nil {
 			return err
@@ -171,11 +175,22 @@ func (g *gguf) parse() error {
 		if err := skipValue(cr, typ); err != nil {
 			return fmt.Errorf("key %s: %w", key, err)
 		}
+		if key == conversionKey {
+			if provenanceEnd != 0 {
+				return fmt.Errorf("duplicate metadata key %s", key)
+			}
+			provenanceStart, provenanceEnd = entryStart-kvStart, cr.n-kvStart
+		}
 	}
 	kvEnd := cr.n
 	g.kvRaw = make([]byte, kvEnd-kvStart)
 	if _, err := g.f.ReadAt(g.kvRaw, kvStart); err != nil {
 		return err
+	}
+	// A new conversion writes its own provenance. Keep every other metadata record byte-for-byte.
+	if provenanceEnd != 0 {
+		g.kvRaw = append(g.kvRaw[:provenanceStart], g.kvRaw[provenanceEnd:]...)
+		g.nKV--
 	}
 	for i := uint64(0); i < hdr.NT; i++ {
 		name, err := readString(cr)
@@ -317,6 +332,44 @@ type ggufWriter struct {
 	end     uint64
 }
 
+func outputDestination(path string) (string, os.FileInfo, error) {
+	// Resolve the parent before interpreting a relative final symlink. Atomic rename
+	// must publish at the target even when that target has not been created yet.
+	for hops := 0; ; hops++ {
+		parent, leaf := filepath.Split(path)
+		if parent == "" {
+			parent = "."
+		}
+		parent, err := filepath.EvalSymlinks(parent)
+		if err != nil {
+			return "", nil, err
+		}
+		path = filepath.Join(parent, leaf)
+		linkInfo, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return path, nil, nil
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if linkInfo.Mode()&os.ModeSymlink == 0 {
+			return path, linkInfo, nil
+		}
+		if hops >= 40 {
+			return "", nil, fmt.Errorf("too many symlinks resolving output %s", path)
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", nil, err
+		}
+		path = target
+		if !filepath.IsAbs(target) {
+			// Preserve any intermediate symlink/.. until EvalSymlinks resolves it.
+			path = parent + string(filepath.Separator) + target
+		}
+	}
+}
+
 func createGGUF(path string, nKV uint64, kvRaw []byte, tensors []tensorInfo, inputs ...*os.File) (*ggufWriter, error) {
 	off := uint64(0)
 	for i := range tensors {
@@ -330,8 +383,8 @@ func createGGUF(path string, nKV uint64, kvRaw []byte, tensors []tensorInfo, inp
 		}
 		off = (off + sz + ggufAlign - 1) / ggufAlign * ggufAlign
 	}
-	info, err := os.Stat(path)
-	if err != nil && !os.IsNotExist(err) {
+	path, info, err := outputDestination(path)
+	if err != nil {
 		return nil, err
 	}
 	if info != nil {
@@ -346,11 +399,6 @@ func createGGUF(path string, nKV uint64, kvRaw []byte, tensors []tensorInfo, inp
 			if os.SameFile(info, src) {
 				return nil, fmt.Errorf("%s: output aliases input %s", path, input.Name())
 			}
-		}
-		// Preserve an existing symlink to an unrelated destination.
-		path, err = filepath.EvalSymlinks(path)
-		if err != nil {
-			return nil, err
 		}
 	}
 	temp := filepath.Join(filepath.Dir(path), ".inkconvert-"+rand.Text())
