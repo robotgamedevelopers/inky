@@ -2609,9 +2609,31 @@ impl ServeStepPlanner {
         self.max_bypass
     }
 
-    pub fn on_admit(&mut self, lane: usize) {
-        self.states[lane] = LaneState::Ready;
+    /// Assign queued work to a free physical lane.
+    pub fn admit_queued(&mut self, lane: usize, queued: LaneState) {
+        assert!(self.states[lane].is_terminal_or_idle());
+        assert_eq!(queued, LaneState::Queued);
+        self.states[lane] = LaneState::Admitted;
         self.wait_ticks[lane] = 0;
+    }
+
+    /// Begin preparing the context, by binding a resident or spilled checkpoint
+    /// when possible, or initializing a cold context.
+    pub fn start_restore(&mut self, lane: usize) {
+        assert_eq!(self.states[lane], LaneState::Admitted);
+        self.states[lane] = LaneState::Restoring;
+    }
+
+    pub fn finish_restore(&mut self, lane: usize) {
+        assert_eq!(self.states[lane], LaneState::Restoring);
+        self.states[lane] = LaneState::Ready;
+    }
+
+    /// Register a prebuilt lane in the standalone planner tests and pool gate.
+    pub fn on_admit(&mut self, lane: usize) {
+        self.admit_queued(lane, LaneState::Queued);
+        self.start_restore(lane);
+        self.finish_restore(lane);
     }
 
     pub fn on_finish(&mut self, lane: usize) {
@@ -2655,13 +2677,13 @@ impl ServeStepPlanner {
         let need_dec: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_decode())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_decode())
             .map(|(i, _)| i)
             .collect();
         let need_pf: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_prefill())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_prefill())
             .map(|(i, _)| i)
             .collect();
 

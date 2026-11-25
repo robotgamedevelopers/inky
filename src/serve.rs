@@ -723,9 +723,20 @@ impl Drop for JobEvents {
     }
 }
 
-fn discard_cancelled_jobs(queue: &mut VecDeque<Job>) -> usize {
+struct QueuedJob {
+    job: Job,
+    state: crate::scheduler::LaneState,
+}
+
+impl QueuedJob {
+    fn new(job: Job) -> Self {
+        Self { job, state: crate::scheduler::LaneState::Queued }
+    }
+}
+
+fn discard_cancelled_jobs(queue: &mut VecDeque<QueuedJob>) -> usize {
     let before = queue.len();
-    queue.retain(|job| !job.out.cancelled());
+    queue.retain(|queued| !queued.job.out.cancelled());
     before - queue.len()
 }
 
@@ -863,7 +874,7 @@ fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
 ///    without touching `eng`, `pools`, `BlockTable`, `Lane` Metal buffers, or logits.
 fn overlap_host_work_step<'a>(
     rx: &Receiver<Job>,
-    queue: &mut VecDeque<Job>,
+    queue: &mut VecDeque<QueuedJob>,
     lane_jobs: impl IntoIterator<Item = (usize, Option<&'a Active>)>,
     planner: &mut crate::scheduler::ServeStepPlanner,
     cache: &mut ServeBlockCache,
@@ -871,7 +882,7 @@ fn overlap_host_work_step<'a>(
 ) -> Vec<usize> {
     loop {
         match rx.try_recv() {
-            Ok(j) => queue.push_back(j),
+            Ok(j) => queue.push_back(QueuedJob::new(j)),
             // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
@@ -909,7 +920,7 @@ fn overlap_host_work_step<'a>(
 
 fn overlap_host_work_during_gpu(
     rx: &Receiver<Job>,
-    queue: &mut VecDeque<Job>,
+    queue: &mut VecDeque<QueuedJob>,
     lanes: &[LaneS],
     planner: &mut crate::scheduler::ServeStepPlanner,
     cache: &mut ServeBlockCache,
@@ -998,6 +1009,7 @@ fn scheduler(
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
     spill_store: Option<crate::spill::SpillStore>,
+    #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
         .enumerate()
@@ -1013,7 +1025,7 @@ fn scheduler(
         None => ServeBlockCache::new(),
     };
     let mut tick_seq = nlanes as u64;
-    let mut queue: VecDeque<Job> = VecDeque::new();
+    let mut queue: VecDeque<QueuedJob> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
     let (context, window_slots) = {
@@ -1042,7 +1054,7 @@ fn scheduler(
         let busy = busy_count > 0;
         if !busy && queue.is_empty() {
             match rx.recv() {
-                Ok(j) => queue.push_back(j),
+                Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(_) => {
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
@@ -1051,7 +1063,7 @@ fn scheduler(
         }
         loop {
             match rx.try_recv() {
-                Ok(j) => queue.push_back(j),
+                Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
@@ -1073,7 +1085,8 @@ fn scheduler(
         }
         // Admit queued jobs onto free Layer 3 lanes with zero-copy prefix matching via EntryTree
         // + BlockPools, guarded by pool-pressure headroom (always allowing >= 1 active lane).
-        while let Some(j) = queue.front() {
+        while let Some(queued) = queue.front() {
+            let j = &queued.job;
             let Some(i) = lanes
                 .iter()
                 .enumerate()
@@ -1090,7 +1103,7 @@ fn scheduler(
                 continue;
             }
             if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap();
+                let j = queue.pop_front().unwrap().job;
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
@@ -1121,10 +1134,16 @@ fn scheduler(
                     break;
                 }
             }
-            let j = queue.pop_front().unwrap();
+            let QueuedJob { job: j, state } = queue.pop_front().unwrap();
+            planner.admit_queued(i, state);
+            #[cfg(test)]
+            let admitted = planner.state(i);
             // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
             let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
             let prep_began = Instant::now();
+            planner.start_restore(i);
+            #[cfg(test)]
+            let restoring = planner.state(i);
             let start = {
                 let l = &mut lanes[i];
                 let mut pools = eng.block_pool().borrow_mut();
@@ -1162,7 +1181,11 @@ fn scheduler(
                 job: j,
             });
             pool_deferred[i] = false;
-            planner.on_admit(i);
+            planner.finish_restore(i);
+            #[cfg(test)]
+            if let Some(admissions) = admissions.as_mut() {
+                admissions.push([state, admitted, restoring, planner.state(i)]);
+            }
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
         // Rebind eligible untouched followers whenever the prior prefill step sealed new checkpoints.
@@ -1486,7 +1509,7 @@ fn scheduler(
                 // Recheck consumption and cancellation shortly, waking sooner for another request.
                 if lanes.iter().any(|l| l.job.is_some()) {
                     match rx.recv_timeout(Duration::from_millis(2)) {
-                        Ok(job) => queue.push_back(job),
+                        Ok(job) => queue.push_back(QueuedJob::new(job)),
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
                             cleanup_scheduler(eng, &mut lanes, &mut cache);
@@ -2932,7 +2955,11 @@ pub fn serve(o: ServeOpts) {
             }
         }
     });
-    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
+    scheduler(
+        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
+        #[cfg(test)]
+        None,
+    );
 }
 
 fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
@@ -3112,8 +3139,8 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(cx.admission.try_acquire().is_none(), "the timed-out job still occupies the channel");
 
-        let mut queue = VecDeque::from([jobs.try_recv().unwrap()]);
-        assert!(queue[0].out.cancelled(), "the failed socket write signals cancellation");
+        let mut queue = VecDeque::from([QueuedJob::new(jobs.try_recv().unwrap())]);
+        assert!(queue[0].job.out.cancelled(), "the failed socket write signals cancellation");
         let mut response = Vec::new();
         chat(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"), "the timed-out job still occupies the queue");
@@ -5350,9 +5377,12 @@ mod tests {
             (turn2, turn3, t1_out, t2_out, t3_out)
         });
 
+        use crate::scheduler::LaneState::{Admitted, Queued, Ready, Restoring};
+        let mut admissions = Vec::new();
         scheduler_trace::capture_if_requested(|| {
-            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None)
+            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None, Some(&mut admissions))
         });
+        assert_eq!(admissions, [[Queued, Admitted, Restoring, Ready]; 3]);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
 
         // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!
@@ -5364,6 +5394,34 @@ mod tests {
         assert_eq!(t3_out, cold3, "Turn 3 cached greedy tokens must match cold uncached solo token-for-token");
     }
 
+
+    #[test]
+    fn serve_lane_is_not_runnable_before_restore_finishes() {
+        use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        let mut planner = ServeStepPlanner::new(1, 16);
+        let inputs = [ServeLaneInput {
+            runnable: true,
+            n_past: 0,
+            pf_end: 64,
+            has_pending_decode: false,
+        }];
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.admit_queued(0, LaneState::Queued);
+        assert_eq!(planner.state(0), LaneState::Admitted);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.start_restore(0);
+        assert_eq!(planner.state(0), LaneState::Restoring);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.finish_restore(0);
+        assert_eq!(planner.state(0), LaneState::Ready);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), Some(ServeStepPlan::Prefill(vec![(0, 0, 64)])));
+        assert_eq!(planner.state(0), LaneState::InStep);
+        assert!(!planner.request_cancel(0));
+        assert_eq!(planner.state(0), LaneState::Cancelling);
+        assert_eq!(planner.complete_step(), vec![0]);
+        assert_eq!(planner.state(0), LaneState::Cancelled);
+    }
 
     #[test] fn serve_step_max_bypass_bursts_sixteen_decodes_before_prefill() {
         assert_eq!(SERVE_STEP_MAX_BYPASS, 16);
@@ -5602,7 +5660,8 @@ mod tests {
 
         // 1. Live arrived job drained into queue; cancelled arrived job dropped & metrics.queued updated.
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().seq, 10);
+        assert_eq!(queue.front().unwrap().job.seq, 10);
+        assert_eq!(queue.front().unwrap().state, LaneState::Queued);
         assert_eq!(metrics.lock().unwrap().queued, 1);
 
         // 2. CancelInStep: lane 0 transitioned InStep -> Cancelling (NOT Cancelled!),

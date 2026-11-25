@@ -38,6 +38,22 @@ fn lane<'a>(
 }
 
 #[test]
+fn bimodal_2k_64k_requests_serialize_when_the_full_pool_only_fits_one() {
+    const SHORT: usize = 2 * 1024;
+    const LONG: usize = 64 * 1024;
+    let pools = BlockPools::with_capacities(LONG / BLOCK, 128, 2).unwrap();
+    let mut cache = ServeBlockCache::new();
+    let short = vec![1; SHORT];
+    let long = vec![2; LONG];
+
+    assert_eq!(crate::serve::pooled_context(LONG + 3, pools.full.len(), pools.window.len()), LONG + 3);
+    assert!(cache.can_admit(&pools, &[], 0, &short, 1, SHORT));
+    assert!(!cache.can_admit(&pools, &[lane(0, &short, 0, 1)], 1, &long, 1, SHORT));
+    assert!(cache.can_admit(&pools, &[], 1, &long, 1, SHORT));
+    assert!(!cache.can_admit(&pools, &[lane(1, &long, 0, 1)], 0, &short, 1, SHORT));
+}
+
+#[test]
 fn matching_retained_full_blocks_reduces_admission_headroom() {
     let mut pools = BlockPools::with_capacities(24, 128, 2).unwrap();
     let mut cache = ServeBlockCache::new();
