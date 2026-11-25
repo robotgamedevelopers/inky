@@ -20,7 +20,7 @@ All hardware measurements in this document were collected on a single target sys
 | Metric | `llama-server` / Ungrouped | **inky** (Apple M5 Max, 128 GB) | Speedup / Savings |
 |---|---:|---:|---:|
 | 1-lane decode (short context) | `41 tok/s` (`llama-server`) | **`95.3–106 tok/s`** (`inky bench`) | **`2.33x – 2.59x`** |
-| 1-lane prefill (2.4K–2.7K prompt) | *~5.4x–5.8x slower in `llama.cpp` / LM Studio* | **`4,186–4,531 tok/s`** (`0.65 s` @ 2.7K) | **`4.2K–4.5K tok/s`** |
+| 1-lane prefill (2.4K–2.7K prompt) | — (not timed on M5 Max) | **`4,186–4,531 tok/s`** (`0.65 s` @ 2.7K) | **`4,186–4,531 tok/s`** (`0.65 s` @ 2.7K) |
 | 64-lane pure decode (`2K` context) | `215 tok/s` (`llama-server`, `3.6 tok/s/lane`) | **`529.7–578 tok/s`** (`541.5 tok/s` `--kv8`) | **`2.46x – 2.69x`** |
 | 64-lane `inky serve` (mixed 16K tool cards, streamed) | *(below `215 tok/s` short-prompt ceiling)* | **`540.8 tok/s`** (`7,132 cards/hr`, `2.26 s` p95 TTFT) | **`2.52x`** vs. pure-decode ceiling |
 | Expert-grouped MoE decode (`64` lanes A/B) | `153.8 tok/s` (`379.9 ms` GPU) | **`435.4 tok/s`** (`104.8 ms` GPU) | **`2.83x` wall (`3.63x` GPU)**, `0`-bit diff |
