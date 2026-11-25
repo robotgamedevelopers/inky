@@ -226,3 +226,40 @@ func TestParseAnthropicSSEAndOpenAIUsageStream(t *testing.T) {
 		t.Fatalf("expected missing final usage chunk to fail")
 	}
 }
+
+func TestWindowReuseRequiresBaseProvenanceAndColdAgreement(t *testing.T) {
+	sample := func(prompt, generated, cached int) replySample {
+		s := replySample{
+			message: replyMessage{Role: "assistant", Content: "five steps"},
+			finish:  "length",
+			usage:   replyUsage{Prompt: prompt, Generated: generated},
+		}
+		s.usage.Details.Cached = intPtr(cached)
+		return s
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(cold, base, next *replySample)
+		want string
+	}{
+		{"fresh reference and isolated warm-up", nil, ""},
+		{"already-warm reference", func(c, b, n *replySample) { c.usage.Details.Cached = intPtr(1024) }, "cold reference"},
+		{"already-warm base", func(c, b, n *replySample) { b.usage.Details.Cached = intPtr(1024) }, "warm-up base"},
+		{"base did not exercise decode", func(c, b, n *replySample) { b.usage.Generated = 1 }, "did not overwrite"},
+		{"absent cache accounting", func(c, b, n *replySample) { n.usage.Details.Cached = nil }, "omitted cached_tokens"},
+		{"cold fallback", func(c, b, n *replySample) { n.usage.Details.Cached = intPtr(0) }, "sealed 64-token blocks"},
+		{"checkpoint beyond the base", func(c, b, n *replySample) { n.usage.Details.Cached = intPtr(1088) }, "sealed 64-token blocks"},
+		{"changed sampled reply", func(c, b, n *replySample) { n.message.Content = "four steps" }, "differs from cold"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cold, base, next := sample(1111, 32, 0), sample(1065, 32, 0), sample(1111, 32, 1024)
+			if tc.edit != nil {
+				tc.edit(&cold, &base, &next)
+			}
+			err := verifyWindowReuse(cold, base, next)
+			if (tc.want == "" && err != nil) || (tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want))) {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
