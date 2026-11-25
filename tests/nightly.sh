@@ -19,4 +19,12 @@ if ! INKY_SCHED_TRACE_OUT="$trace_work/serve.jsonl" cargo test --locked --releas
     echo "FAIL: three-turn serve trace"
     fail=1
 fi
+# Verify a real SSD restore and early prefix fork against both sets of cold model logits.
+spill_test=serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits
+if spill_result=$(cargo test --locked --release --bin inky "$spill_test" -- --ignored --exact --nocapture 2>&1); then
+    grep -Fq 'test result: ok. 1 passed;' <<< "$spill_result" || fail=1
+else
+    fail=1
+fi
+print -r -- "$spill_result"
 exit $fail
