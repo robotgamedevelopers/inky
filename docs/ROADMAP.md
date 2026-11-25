@@ -200,8 +200,8 @@ Defects in the server, the root helper, the CLI and the tools that are still ope
 
 | feature | done |
 |---|:---:|
-| Every connection has a deadline for the whole request and each peer a connection cap, so slow or idle clients cannot hold every slot | ❌ |
-| count_tokens bounds its input in tokens and memory, and never starves generation of preprocess permits | ❌ |
+| Each peer has a connection cap, and the entire request upload has a deadline ([#100](https://github.com/robotgamedevelopers/inky/pull/100)) | ✅ |
+| count_tokens limits request bytes and rendered tokens and uses its own preprocessing permit ([#100](https://github.com/robotgamedevelopers/inky/pull/100)) | ✅ |
 | Admission checks shared prefixes in time linear in the prefilling lanes, with no all-pairs rescans while the GPU waits | ❌ |
 | inky serve refuses a bind address that is neither loopback nor private, so the binding rule the server and fleet rows state holds | ❌ |
 | The recorder queue is bounded in bytes and holds no copy of refused requests | ❌ |
@@ -212,7 +212,7 @@ Defects in the server, the root helper, the CLI and the tools that are still ope
 | A streaming client that reads too slowly is cut off by a total write deadline and frees its lane | ❌ |
 | The accept loop backs off and logs on errors, and the connection cap sits below the descriptor limit | ❌ |
 | An allocation that eviction cannot satisfy fails without emptying the cache, and a rolled-back span leaves the cache as it was | ❌ |
-| complete | 0% |
+| complete | 16% |
 
 [Source data](roadmap.sexp)
 
@@ -226,8 +226,8 @@ TLA+ models, trace checks and layout models that do not yet reach the code `inky
 
 | feature | done |
 |---|:---:|
-| StartTails is bound by trace to the start-point, window-hold and prune rules in ServeBlockCache | ❌ |
-| PrefixTreeTrace and its mutants drive the EntryTree path inky serve uses, including handle refresh and pruning | ❌ |
+| Replay ServeBlockCache start-point retention, window holds and pruning against the StartTails rules | ✅ |
+| Replay and mutate the EntryTree path used by serve, including handle refresh and pruning | ✅ |
 | The trace-gate mutants are planted in code inky serve computes with, and each turns its gate red | ❌ |
 | The models keep the window rule the server prunes by, and the WindowOffByOne witness reports a real off-by-one | ❌ |
 | CacheScheduler models spans that cross block boundaries, as every production prefill chunk does | ❌ |
@@ -241,7 +241,7 @@ TLA+ models, trace checks and layout models that do not yet reach the code `inky
 | The kv-disk tier, the sliding-window ring and prefill scratch, rollback_verify and VecAlloc each have a state or layout model | ❌ |
 | BlockedSlab slot reuse, stride growth and the packed block-table upload have a layout model run at capacity 3 or 4 | ❌ |
 | The slab-packed GPU block-table word has a layout model and a multi-slab test of packing, shader decode and bind order | ❌ |
-| complete | 0% |
+| complete | 13% |
 
 [Source data](roadmap.sexp)
 
@@ -255,7 +255,7 @@ Gates that do not run, that test a different path from the one served, or that p
 
 | feature | done |
 |---|:---:|
-| Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ❌ |
+| Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ✅ |
 | A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
 | The replay set is real fleet card traffic, and the lane-count knee is derived from it | ❌ |
 | Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans | ❌ |
@@ -266,7 +266,7 @@ Gates that do not run, that test a different path from the one served, or that p
 | The full-disk and kill steps read the record files back and fail on a torn line | ❌ |
 | The soak and fault gates run in a blocking nightly, and the soak fails on 429s under capacity and on a wired limit that never moved | ❌ |
 | Every GPU gate in ci.sh has a planted-bug control that CI requires to fail | ❌ |
-| complete | 0% |
+| complete | 9% |
 
 [Source data](roadmap.sexp)
 
@@ -577,11 +577,11 @@ Measure the curve and pick the lane count where adding lanes stops paying.
 
 | feature | done |
 |---|:---:|
-| Real card traffic recorded as a replay set | ✅ |
+| Real card traffic recorded as a replay set | ❌ |
 | Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ❌ |
 | Each candidate machine measured: memory bandwidth, single-stream decode, prefill | ✅ |
 | Measure the lane-count knee against streamed first-token latency and observed memory, then apply each machine profile | ❌ |
-| complete | 50% |
+| complete | 25% |
 
 [Source data](roadmap.sexp)
 
@@ -653,8 +653,8 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
 | Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
 | Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
-| Split the largest core files (engine.rs, serve.rs, scheduler.rs, cache_scheduler.rs, spill.rs) behind the TLA trace checks, so each change stays reviewable (later) | ❌ |
-| Dependency hygiene in CI: cargo audit and Dependabot, so a vulnerable crate is caught without a human noticing (later) | ❌ |
+| Split the largest core files (engine.rs, serve.rs, scheduler.rs, cache_scheduler.rs, spill.rs) behind the TLA trace checks, so each change stays reviewable (later) | ✅ |
+| Dependency hygiene in CI: cargo audit and Dependabot, so a vulnerable crate is caught without a human noticing (later) | ✅ |
 | Unauthenticated serving is loopback-only: warn loudly or refuse a non-loopback bind with no API key set (later) | ✅ |
 | Fuzz the GGUF loader, so a malformed model file cannot panic or corrupt the engine (later) | ❌ |
 | Request paths return errors instead of unwrapping, so bad input cannot abort the server (about 1546 unwrap and expect sites at the audit) (later) | ❌ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check (later) | ❌ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model (later) | ❌ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve (later) | ❌ |
-| complete | 5% |
+| complete | 11% |
 
 [Source data](roadmap.sexp)
 

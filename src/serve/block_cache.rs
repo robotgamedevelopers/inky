@@ -13,6 +13,10 @@ use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, PrefixTree, SealedId};
 use crate::spill::{ReadOutcome, SpillBlockKind, SpillKey, SpillStore, WriteOutcome};
 use std::collections::{HashMap, HashSet};
 
+#[cfg(standalone_blocks)]
+#[path = "block_cache/trace.rs"]
+pub(crate) mod trace;
+
 pub const KINDS: [BlockKind; 2] = [BlockKind::Window, BlockKind::Full];
 
 /// Periodic checkpoint stride for the first `EARLY_EVERY_LIMIT` tokens so shared system+tools

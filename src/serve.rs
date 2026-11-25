@@ -15,15 +15,18 @@ use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod block_cache;
+mod messages;
+mod prompt;
+mod reply;
 // Keep the trace command attached to the live planner. The older fake-engine
 // driver in serve/scheduler_trace.rs depends on the retired per-lane cache API.
 #[cfg(test)]
@@ -34,6 +37,16 @@ mod timing;
 use block_cache::{
     effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
     ServeBlockCache,
+};
+use messages::translate_messages;
+#[cfg(test)]
+use prompt::render;
+use prompt::{render_limited, RenderError};
+#[cfg(test)]
+use reply::tool_use_id;
+use reply::{
+    anthropic_content, anthropic_stop_reason, anthropic_usage, parse, sse_text,
+    streaming_delta_usage, take_stream_text, BlockStream,
 };
 use step::SERVE_STEP_MAX_BYPASS;
 use timing::{Counters, RequestTiming, TimingSnapshot};
@@ -67,415 +80,6 @@ fn special(tk: &Tokenizer, s: &str) -> u32 {
     v[0]
 }
 
-fn effort_num(e: &str) -> String {
-    let v = match e.trim() {
-        "none" => 0.0, "minimal" => 0.1, "low" => 0.2, "medium" => 0.7, "high" => 0.9, "xhigh" | "max" => 0.99,
-        x => match x.parse::<f64>() {
-            Ok(f) if f.is_finite() => f.clamp(0.0, 0.99),
-            _ => 0.9,
-        },
-    };
-    if v == 0.0 { "0".into() } else { format!("{v}") }
-}
-
-fn request_effort(req: &Value, default_effort: &str) -> String {
-    let raw = req.get("reasoning_effort")
-        .filter(|v| !v.is_null())
-        .or_else(|| req.get("chat_template_kwargs").and_then(|k| k.get("reasoning_effort")).filter(|v| !v.is_null()));
-    match raw {
-        Some(Value::String(s)) => effort_num(s),
-        Some(Value::Number(n)) => match n.as_f64() {
-            Some(f) if f.is_finite() => {
-                let v = f.clamp(0.0, 0.99);
-                if v == 0.0 { "0".into() } else { format!("{v}") }
-            }
-            _ => effort_num(default_effort),
-        },
-        _ => effort_num(default_effort),
-    }
-}
-
-fn content_parts(v: &Value) -> Vec<&str> {
-    match v {
-        Value::String(s) => vec![s],
-        Value::Array(a) => a.iter().filter_map(|p| match p {
-            Value::String(s) => Some(s.as_str()),
-            Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
-                None | Some("text") | Some("input_text") => Some(o.get("text").and_then(|t| t.as_str()).unwrap_or("")),
-                _ => None,
-            },
-            _ => None,
-        }).collect(),
-        _ => vec![],
-    }
-}
-
-#[derive(Debug)]
-enum RenderError {
-    Invalid(String),
-    TooLong,
-}
-
-impl From<String> for RenderError {
-    fn from(message: String) -> Self { Self::Invalid(message) }
-}
-
-impl From<&str> for RenderError {
-    fn from(message: &str) -> Self { Self::Invalid(message.into()) }
-}
-
-/// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
-/// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
-fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize, continued_assistants: &[usize]) -> Result<Vec<u32>, RenderError> {
-    let text = |t: &mut Vec<u32>, s: &str| {
-        if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
-    };
-    let marks = |t: &mut Vec<u32>, tokens: &[u32]| {
-        if tokens.len() > limit.saturating_sub(t.len()) { return Err(RenderError::TooLong); }
-        t.extend_from_slice(tokens);
-        Ok(())
-    };
-    let mut t = Vec::new();
-    let msgs = req["messages"].as_array().ok_or("messages missing")?;
-    if let Some(tools) = req["tools"].as_array().filter(|a| !a.is_empty()) {
-        let specs: Vec<Value> = tools.iter().map(|tool| {
-            let f = tool.get("function").unwrap_or(tool);
-            json!({"description": f.get("description").and_then(|d| d.as_str()).unwrap_or(""), "name": f["name"],
-                   "parameters": f.get("parameters").cloned().unwrap_or(json!({})), "type": tool.get("type").and_then(|d| d.as_str()).unwrap_or("function")})
-        }).collect();
-        marks(&mut t, &[sp.msg_system])?;
-        text(&mut t, "tool_declare")?;
-        marks(&mut t, &[sp.c_xml])?;
-        text(&mut t, &Value::Array(specs).to_string())?;
-        marks(&mut t, &[sp.end])?;
-    }
-    let effort = request_effort(req, default_effort);
-    let emit_effort = |t: &mut Vec<u32>| {
-        marks(t, &[sp.msg_system, sp.c_text])?;
-        text(t, &format!("Thinking effort level: {effort}"))?;
-        marks(t, &[sp.end])
-    };
-    let mut effort_done = false;
-    let mut call_names = std::collections::HashMap::new();
-    for (message_index, m) in msgs.iter().enumerate() {
-        let role = m["role"].as_str().ok_or("message without role")?;
-        let role = if role == "developer" { "system" } else { role };
-        if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
-        if role == "assistant" {
-            for call in m["tool_calls"].as_array().into_iter().flatten() {
-                if let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str()) {
-                    call_names.insert(id, name);
-                }
-            }
-        }
-        match role {
-            "system" | "user" => {
-                let h = if role == "system" { sp.msg_system } else { sp.msg_user };
-                for p in content_parts(&m["content"]) {
-                    marks(&mut t, &[h, sp.c_text])?;
-                    text(&mut t, p)?;
-                    marks(&mut t, &[sp.end])?;
-                }
-            }
-            "tool" => {
-                let name = m["name"].as_str().or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).copied())).unwrap_or_default();
-                let mut parts = content_parts(&m["content"]);
-                if parts.is_empty() { parts.push(""); }
-                let is_error = m["is_error"].as_bool().unwrap_or(false);
-                for (i, p) in parts.iter().enumerate() {
-                    marks(&mut t, &[sp.msg_tool])?;
-                    text(&mut t, name)?;
-                    marks(&mut t, &[sp.c_text])?;
-                    if is_error && i == 0 { text(&mut t, "Error: ")?; }
-                    text(&mut t, p)?;
-                    marks(&mut t, &[sp.end])?;
-                }
-            }
-            "assistant" => {
-                let asst_name = m["name"].as_str().filter(|n| !n.is_empty());
-                let reasoning = m["reasoning_content"].as_str().filter(|r| !r.is_empty());
-                let model_part = |tokens: &mut Vec<u32>, kind, body: &str| {
-                    marks(tokens, &[sp.msg_model])?;
-                    if let Some(name) = asst_name { text(tokens, name)?; }
-                    marks(tokens, &[kind])?;
-                    text(tokens, body)?;
-                    marks(tokens, &[sp.end])
-                };
-                if let Some(r) = reasoning { model_part(&mut t, sp.c_think, r)?; }
-                let calls: Vec<&Value> = m["tool_calls"].as_array().into_iter().flatten().collect();
-                match &m["content"] {
-                    Value::Null => {}
-                    Value::String(s) => {
-                        if !s.is_empty() || (calls.is_empty() && reasoning.is_none()) {
-                            model_part(&mut t, sp.c_text, s)?;
-                        }
-                    }
-                    Value::Array(parts) => {
-                        for part in parts {
-                            let value = if let Some(s) = part.as_str() { s } else {
-                                if let Some(kind) = part.get("type") {
-                                    if !matches!(kind.as_str(), Some("text" | "input_text")) {
-                                        return Err(format!("unsupported assistant content part type {kind}").into());
-                                    }
-                                }
-                                part["text"].as_str().unwrap_or("")
-                            };
-                            model_part(&mut t, sp.c_text, value)?;
-                        }
-                    }
-                    _ => return Err("assistant content must be a string, array or null".into()),
-                }
-                for tc in calls {
-                    let name = tc["function"]["name"].as_str().ok_or("tool call without a name")?;
-                    let args: Value = match &tc["function"]["arguments"] {
-                        Value::String(s) if s.trim().is_empty() => json!({}),
-                        Value::String(s) => serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?,
-                        Value::Null => json!({}), v => v.clone(),
-                    };
-                    marks(&mut t, &[sp.msg_model])?;
-                    text(&mut t, name)?;
-                    marks(&mut t, &[sp.c_tool])?;
-                    text(&mut t, &format!("{{\"name\":{},\"args\":{}}}", Value::String(name.into()), args))?;
-                    marks(&mut t, &[sp.end])?;
-                }
-                if continued_assistants.binary_search(&message_index).is_err() {
-                    marks(&mut t, &[sp.end_sampling])?;
-                }
-            }
-            r => return Err(format!("unknown role {r}").into()),
-        }
-    }
-    if !effort_done { emit_effort(&mut t)?; }
-    Ok(t)
-}
-
-#[cfg(test)]
-fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, RenderError> {
-    render_limited(tk, sp, req, default_effort, usize::MAX, &[])
-}
-
-enum ReplyPart { Text(String), Thinking(String), Tool(String, Value) }
-
-fn parse_tool_call(header: &[u8], body: &[u8]) -> (String, Value) {
-    let s = String::from_utf8_lossy(body);
-    let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-    let name = v["name"].as_str().map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(header).into_owned());
-    let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
-    (name, args)
-}
-
-/// Visit complete blocks in generation order. Final text is retained on length stops;
-/// a truncated tool body must never become a call.
-fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut(ReplyPart)) {
-    #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
-    let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
-    for &t in toks {
-        let ends = t == sp.end || t == sp.end_sampling || t == tk.eos;
-        if t == sp.msg_model || t == sp.c_think || t == sp.c_text || t == sp.c_tool || ends {
-            if t == sp.c_text && mode == M::Text { continue; }
-            match mode {
-                M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
-                M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
-                M::Tool if ends => {
-                    let (name, args) = parse_tool_call(&header, &cur);
-                    emit(ReplyPart::Tool(name, args));
-                }
-                _ => {}
-            }
-            cur.clear();
-            mode = if t == sp.msg_model { header.clear(); M::Header }
-                else if t == sp.c_think { M::Think } else if t == sp.c_text { M::Text }
-                else if t == sp.c_tool { M::Tool } else { M::None };
-        } else {
-            match mode { M::Header => header.extend(tk.decode_bytes(t)), M::None => {}, _ => cur.extend(tk.decode_bytes(t)) }
-        }
-    }
-    match mode {
-        M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
-        M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
-        _ => {}
-    }
-}
-
-/// Chat represents text, reasoning and tool calls in separate fields.
-struct Parsed { text: String, thinking: String, calls: Vec<(String, Value)> }
-fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
-    let mut p = Parsed { text: String::new(), thinking: String::new(), calls: Vec::new() };
-    visit_reply(tk, sp, toks, |part| match part {
-        ReplyPart::Text(s) => p.text.push_str(&s),
-        ReplyPart::Thinking(s) => p.thinking.push_str(&s),
-        ReplyPart::Tool(name, args) => p.calls.push((name, args)),
-    });
-    p
-}
-
-// ------------------------------------------------------------------------------------------------- Anthropic Messages
-// `POST /v1/messages` speaks the Anthropic Messages API over the same lanes. A request is translated
-// to the OpenAI shape above and rendered by the same `render`, so an Anthropic conversation and the
-// equivalent chat conversation are the same token stream and a lane's kept prompt is reused across
-// either API (decision 4). Thinking has no block in either direction here: a reply's thinking is
-// dropped, and thinking blocks in a sent history are dropped with it.
-
-/// An Anthropic request as the OpenAI request the chat path renders: `system` becomes leading
-/// system messages, a `system` role inside `messages[]` (Claude Code 2.1.330) becomes a system
-/// message in place so its order is kept, text blocks keep their order and their per-block
-/// rendering, a user message's tool results become tool messages in place, and an assistant
-/// message's tool uses and text retain their order. Chat renders text before tool calls, so a text
-/// block after a tool starts a new group in the same turn. The caller suppresses the intermediate
-/// end-of-sampling markers at the returned (ascending) group indices.
-fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), String> {
-    let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
-    if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
-    let mut msgs: Vec<Value> = Vec::new();
-    let mut continued_assistants = Vec::new();
-    match &req["system"] {
-        Value::Null => {}
-        Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
-        Value::Array(blocks) => {
-            let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
-                t => Err(format!("unsupported system block type {}", t.unwrap_or("none"))),
-            }).collect::<Result<_, _>>()?;
-            if !parts.is_empty() { msgs.push(json!({"role": "system", "content": parts})); }
-        }
-        _ => return Err("system must be a string or an array of text blocks".into()),
-    }
-    for m in msgs_in {
-        let role = m["role"].as_str().ok_or("message without role")?;
-        match (role, &m["content"]) {
-            ("system", Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
-            ("system", Value::Array(blocks)) => {
-                let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                    Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
-                    t => Err(format!("unsupported content block type {} in a system message", t.unwrap_or("none"))),
-                }).collect::<Result<_, _>>()?;
-                msgs.push(json!({"role": "system", "content": parts}));
-            }
-            ("user", Value::String(s)) => msgs.push(json!({"role": "user", "content": s})),
-            ("assistant", Value::String(s)) => msgs.push(json!({"role": "assistant", "content": s})),
-            ("user", Value::Array(blocks)) => {
-                let mut texts: Vec<Value> = Vec::new();
-                for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => texts.push(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
-                        Some("image") => texts.push(json!({"type": "text", "text": "[image]"})),
-                        Some("tool_result") => {
-                            if !texts.is_empty() { msgs.push(json!({"role": "user", "content": std::mem::take(&mut texts)})); }
-                            let id = b["tool_use_id"].as_str().ok_or("tool_result without tool_use_id")?;
-                            let c = match &b["content"] {
-                                Value::Null => json!(""),
-                                Value::String(s) => json!(s),
-                                Value::Array(parts) => {
-                                    let ps: Vec<Value> = parts.iter().map(|p| match p["type"].as_str() {
-                                        Some("text") => Ok(json!({"type": "text", "text": p["text"].as_str().unwrap_or("")})),
-                                        Some("image") => Ok(json!({"type": "text", "text": "[image]"})),
-                                        t => Err(format!("unsupported tool_result content type {}", t.unwrap_or("none"))),
-                                    }).collect::<Result<_, _>>()?;
-                                    Value::Array(ps)
-                                }
-                                _ => return Err("tool_result content must be a string or an array of text blocks".into()),
-                            };
-                            let mut tool_msg = json!({"role": "tool", "tool_call_id": id, "content": c});
-                            if b["is_error"].as_bool().unwrap_or(false) { tool_msg["is_error"] = json!(true); }
-                            msgs.push(tool_msg);
-                        }
-                        t => return Err(format!("unsupported content block type {} in a user message", t.unwrap_or("none"))),
-                    }
-                }
-                if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
-            }
-            ("assistant", Value::Array(blocks)) => {
-                let mut texts = Vec::new();
-                let mut calls: Vec<Value> = Vec::new();
-                for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => {
-                            if !calls.is_empty() {
-                                continued_assistants.push(msgs.len());
-                                msgs.push(json!({"role": "assistant", "content": std::mem::take(&mut texts), "tool_calls": std::mem::take(&mut calls)}));
-                            }
-                            texts.push(b["text"].as_str().unwrap_or(""));
-                        }
-                        Some("tool_use") => {
-                            let id = b["id"].as_str().ok_or("tool_use without id")?;
-                            let name = b["name"].as_str().ok_or("tool_use without a name")?;
-                            let input = if b["input"].is_null() { json!({}) } else { b["input"].clone() };
-                            calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": input}}));
-                        }
-                        Some("thinking") | Some("redacted_thinking") => {}
-                        t => return Err(format!("unsupported content block type {} in an assistant message", t.unwrap_or("none"))),
-                    }
-                }
-                let mut msg = json!({"role": "assistant", "content": texts});
-                if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
-                msgs.push(msg);
-            }
-            ("user" | "assistant" | "system", _) => return Err("message content must be a string or an array of blocks".into()),
-            (r, _) => return Err(format!("unknown role {r}")),
-        }
-    }
-    let mut out = json!({"messages": msgs});
-    if let Some(e) = anthropic_effort(req)? { out["reasoning_effort"] = json!(e); }
-    if let Some(tools) = req.get("tools").filter(|t| !t.is_null()) {
-        let tools = tools.as_array().ok_or("tools must be an array")?;
-        if !tools.is_empty() {
-            let mapped: Vec<Value> = tools.iter().map(|t| {
-                let name = t["name"].as_str().ok_or("tool without a name")?;
-                Ok(json!({"type": "function", "function": {"name": name, "description": t["description"].as_str().unwrap_or(""),
-                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({}))}}))
-            }).collect::<Result<_, String>>()?;
-            out["tools"] = json!(mapped);
-        }
-    }
-    Ok((out, continued_assistants))
-}
-
-/// The thinking effort a Messages request asks for, as the `reasoning_effort`
-/// the chat path renders through `effort_num` — or none, when the request
-/// leaves the serve default standing. An explicit effort field wins (top
-/// level, `output_config`, or inside `thinking`); then `thinking` itself:
-/// disabled is none, an enabled budget maps by size (1024–4095 low,
-/// 4096–16383 medium, else high), and adaptive — or no thinking at all —
-/// decides for itself, so it sets nothing. Anything malformed refuses
-/// (the caller answers 400): no silent fallback may turn an unknown
-/// effort into 0.9 or drop a budget on the floor.
-fn anthropic_effort(req: &Value) -> Result<Option<String>, String> {
-    // an effort field that is present must be a known level (or a number in
-    // effort_num's range): an unknown string would otherwise reach effort_num
-    // and silently become 0.9, and a non-string would silently vanish
-    let field = |v: &Value| -> Result<String, String> {
-        let s = v.as_str().ok_or("effort must be a string")?.trim();
-        let known = matches!(s, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-            || s.parse::<f64>().is_ok_and(|n| n.is_finite() && (0.0..=0.99).contains(&n));
-        if known { Ok(s.to_string()) } else { Err(format!("unknown effort level {s:?}")) }
-    };
-    if let Some(v) = req.get("output_config").and_then(|o| o.get("effort")).filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
-    if let Some(v) = req.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
-    let Some(th) = req.get("thinking").filter(|v| !v.is_null()) else { return Ok(None) };
-    if let Some(v) = th.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
-    match th["type"].as_str() {
-        Some("disabled") => Ok(Some("none".into())),
-        Some("adaptive") => Ok(None),
-        Some("enabled") => {
-            let b = th.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
-            let b = b.as_u64().ok_or("thinking budget_tokens must be a non-negative integer")?;
-            match b {
-                0 => Ok(Some("none".into())),
-                1..=1023 => Err(format!("thinking budget_tokens {b} is under Anthropic's 1024 minimum")),
-                1024..=4095 => Ok(Some("low".into())),
-                4096..=16383 => Ok(Some("medium".into())),
-                _ => Ok(Some("high".into())),
-            }
-        }
-        t => Err(format!("unknown thinking type {}", t.unwrap_or("none"))),
-    }
-}
-
-/// The reply's stop reason: a tool call outranks the length stop, as the chat path's finish reason does.
-fn anthropic_stop_reason(has_calls: bool, reason: &str) -> &'static str {
-    if has_calls { "tool_use" } else if reason == "length" { "max_tokens" } else { "end_turn" }
-}
-
 /// A random startup nonce for tool and anonymous recording IDs across restarts.
 /// Reads `/dev/urandom` with a time-and-pid fallback.
 pub(crate) fn startup_nonce() -> String {
@@ -488,126 +92,6 @@ pub(crate) fn startup_nonce() -> String {
     }
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-
-fn tool_use_id(nonce: &str, seq: u64, i: usize) -> String { format!("toolu_{nonce}_{seq}_{i}") }
-
-/// Messages represents each visible text or tool block in generation order.
-fn anthropic_content(tk: &Tokenizer, sp: &Specials, toks: &[u32], nonce: &str, seq: u64) -> Vec<Value> {
-    let mut content = Vec::new();
-    let mut calls = 0;
-    visit_reply(tk, sp, toks, |part| match part {
-        ReplyPart::Text(text) => content.push(json!({"type": "text", "text": text})),
-        ReplyPart::Tool(name, args) => {
-            content.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, calls), "name": name, "input": args}));
-            calls += 1;
-        }
-        ReplyPart::Thinking(_) => {}
-    });
-    content
-}
-
-/// Usage in Anthropic's split: `input_tokens` is the part of the prompt no lane reused,
-/// `cache_read_input_tokens` the part it did, so the two sum to the prompt.
-fn anthropic_usage(prompt: usize, cached: usize, gen: usize) -> Value {
-    json!({"input_tokens": prompt.saturating_sub(cached), "output_tokens": gen,
-           "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached})
-}
-
-/// The final streaming usage, carried by `message_delta`: the same split as a
-/// non-streaming reply. `message_start` is sent before the lane's reuse is known and
-/// provisionally reports the whole prompt as `input_tokens`; the delta's split
-/// supersedes it, so the client's final accounting sums to the prompt, not to the
-/// prompt plus its cached part a second time.
-fn streaming_delta_usage(prompt: usize, cached: usize, gen: usize) -> Value { anthropic_usage(prompt, cached, gen) }
-
-fn sse_text(event: &str, data: &Value) -> String { format!("event: {event}\ndata: {data}\n\n") }
-
-fn take_stream_text(pend: &mut Vec<u8>, end: bool) -> String {
-    let mut text = String::new();
-    crate::stream_text::stream_text(pend, end, |s| text.push_str(s));
-    text
-}
-
-/// A streamed reply as content blocks, fed one generated token at a time. Text streams as it
-/// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
-/// the block must stream on their own. Thinking tokens open no block.
-struct BlockStream { nonce: String, seq: u64, next: usize, calls: usize, text_index: usize, open_text: bool,
-                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool }
-impl BlockStream {
-    fn new(nonce: &str, seq: u64) -> BlockStream {
-        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
-    }
-    fn flush_text(&mut self, out: &mut Vec<String>) {
-        if !self.open_text { self.pend.clear(); return; }
-        let text = take_stream_text(&mut self.pend, false);
-        if !text.is_empty() {
-            out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
-                "delta": {"type": "text_delta", "text": text}})));
-        }
-    }
-    fn close_text(&mut self, out: &mut Vec<String>) {
-        if self.open_text {
-            let text = take_stream_text(&mut self.pend, true);
-            if !text.is_empty() {
-                out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
-                    "delta": {"type": "text_delta", "text": text}})));
-            }
-            out.push(sse_text("content_block_stop", &json!({"type": "content_block_stop", "index": self.text_index})));
-            self.open_text = false;
-        }
-        self.pend.clear();
-    }
-    fn emit_tool(&mut self, out: &mut Vec<String>) {
-        let (name, args) = parse_tool_call(&self.header, &self.tool);
-        let index = self.next; self.next += 1;
-        let id = tool_use_id(&self.nonce, self.seq, self.calls); self.calls += 1;
-        out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": index,
-            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})));
-        out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": index,
-            "delta": {"type": "input_json_delta", "partial_json": args.to_string()}})));
-        out.push(sse_text("content_block_stop", &json!({"type": "content_block_stop", "index": index})));
-        self.tool.clear();
-    }
-    fn on_token(&mut self, tk: &Tokenizer, sp: &Specials, t: u32) -> Vec<String> {
-        let mut out = Vec::new();
-        if t == sp.msg_model { self.close_text(&mut out); self.mode = 0; self.in_header = true; self.header.clear(); return out; }
-        if t == sp.c_think { self.close_text(&mut out); self.mode = 1; self.in_header = false; return out; }
-        if t == sp.c_text {
-            if !self.open_text {
-                self.text_index = self.next; self.next += 1; self.open_text = true;
-                out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": self.text_index,
-                    "content_block": {"type": "text", "text": ""}})));
-            }
-            self.mode = 2; self.in_header = false; return out;
-        }
-        if t == sp.c_tool { self.close_text(&mut out); self.mode = 3; self.in_header = false; self.tool.clear(); return out; }
-        if t == sp.end || t == sp.end_sampling || t == tk.eos {
-            if self.mode == 3 { self.emit_tool(&mut out); }
-            self.close_text(&mut out);
-            self.mode = 0; self.in_header = false; return out;
-        }
-        let b = tk.decode_bytes(t);
-        match self.mode {
-            2 => { self.pend.extend(&b); self.flush_text(&mut out); }
-            3 => self.tool.extend(&b),
-            _ if self.in_header => self.header.extend(&b),
-            _ => {}
-        }
-        out
-    }
-    /// whatever block is still open when the reply ends. A tool call still open here was
-    /// cut short (a length stop sends no end token): it is dropped, never emitted as a
-    /// tool_use, exactly as `parse` drops a trailing call with no end. `calls` therefore
-    /// counts completed calls only, and the stop reason derives from it alone.
-    fn close_all(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.mode == 3 { self.tool.clear(); self.mode = 0; }
-        self.close_text(&mut out);
-        out
-    }
-}
-
-// ------------------------------------------------------------------------------------------------- scheduler
 
 struct Job {
     seq: u64,
@@ -723,9 +207,20 @@ impl Drop for JobEvents {
     }
 }
 
-fn discard_cancelled_jobs(queue: &mut VecDeque<Job>) -> usize {
+struct QueuedJob {
+    job: Job,
+    state: crate::scheduler::LaneState,
+}
+
+impl QueuedJob {
+    fn new(job: Job) -> Self {
+        Self { job, state: crate::scheduler::LaneState::Queued }
+    }
+}
+
+fn discard_cancelled_jobs(queue: &mut VecDeque<QueuedJob>) -> usize {
     let before = queue.len();
-    queue.retain(|job| !job.out.cancelled());
+    queue.retain(|queued| !queued.job.out.cancelled());
     before - queue.len()
 }
 
@@ -863,7 +358,7 @@ fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
 ///    without touching `eng`, `pools`, `BlockTable`, `Lane` Metal buffers, or logits.
 fn overlap_host_work_step<'a>(
     rx: &Receiver<Job>,
-    queue: &mut VecDeque<Job>,
+    queue: &mut VecDeque<QueuedJob>,
     lane_jobs: impl IntoIterator<Item = (usize, Option<&'a Active>)>,
     planner: &mut crate::scheduler::ServeStepPlanner,
     cache: &mut ServeBlockCache,
@@ -871,7 +366,7 @@ fn overlap_host_work_step<'a>(
 ) -> Vec<usize> {
     loop {
         match rx.try_recv() {
-            Ok(j) => queue.push_back(j),
+            Ok(j) => queue.push_back(QueuedJob::new(j)),
             // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
@@ -909,7 +404,7 @@ fn overlap_host_work_step<'a>(
 
 fn overlap_host_work_during_gpu(
     rx: &Receiver<Job>,
-    queue: &mut VecDeque<Job>,
+    queue: &mut VecDeque<QueuedJob>,
     lanes: &[LaneS],
     planner: &mut crate::scheduler::ServeStepPlanner,
     cache: &mut ServeBlockCache,
@@ -998,6 +493,7 @@ fn scheduler(
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
     spill_store: Option<crate::spill::SpillStore>,
+    #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
         .enumerate()
@@ -1013,7 +509,7 @@ fn scheduler(
         None => ServeBlockCache::new(),
     };
     let mut tick_seq = nlanes as u64;
-    let mut queue: VecDeque<Job> = VecDeque::new();
+    let mut queue: VecDeque<QueuedJob> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
     let (context, window_slots) = {
@@ -1042,7 +538,7 @@ fn scheduler(
         let busy = busy_count > 0;
         if !busy && queue.is_empty() {
             match rx.recv() {
-                Ok(j) => queue.push_back(j),
+                Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(_) => {
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
@@ -1051,7 +547,7 @@ fn scheduler(
         }
         loop {
             match rx.try_recv() {
-                Ok(j) => queue.push_back(j),
+                Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
@@ -1073,7 +569,8 @@ fn scheduler(
         }
         // Admit queued jobs onto free Layer 3 lanes with zero-copy prefix matching via EntryTree
         // + BlockPools, guarded by pool-pressure headroom (always allowing >= 1 active lane).
-        while let Some(j) = queue.front() {
+        while let Some(queued) = queue.front() {
+            let j = &queued.job;
             let Some(i) = lanes
                 .iter()
                 .enumerate()
@@ -1090,7 +587,7 @@ fn scheduler(
                 continue;
             }
             if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap();
+                let j = queue.pop_front().unwrap().job;
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
@@ -1121,10 +618,16 @@ fn scheduler(
                     break;
                 }
             }
-            let j = queue.pop_front().unwrap();
+            let QueuedJob { job: j, state } = queue.pop_front().unwrap();
+            planner.admit_queued(i, state);
+            #[cfg(test)]
+            let admitted = planner.state(i);
             // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
             let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
             let prep_began = Instant::now();
+            planner.start_restore(i);
+            #[cfg(test)]
+            let restoring = planner.state(i);
             let start = {
                 let l = &mut lanes[i];
                 let mut pools = eng.block_pool().borrow_mut();
@@ -1162,7 +665,11 @@ fn scheduler(
                 job: j,
             });
             pool_deferred[i] = false;
-            planner.on_admit(i);
+            planner.finish_restore(i);
+            #[cfg(test)]
+            if let Some(admissions) = admissions.as_mut() {
+                admissions.push([state, admitted, restoring, planner.state(i)]);
+            }
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
         // Rebind eligible untouched followers whenever the prior prefill step sealed new checkpoints.
@@ -1486,7 +993,7 @@ fn scheduler(
                 // Recheck consumption and cancellation shortly, waking sooner for another request.
                 if lanes.iter().any(|l| l.job.is_some()) {
                     match rx.recv_timeout(Duration::from_millis(2)) {
-                        Ok(job) => queue.push_back(job),
+                        Ok(job) => queue.push_back(QueuedJob::new(job)),
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
                             cleanup_scheduler(eng, &mut lanes, &mut cache);
@@ -1571,11 +1078,15 @@ fn models_body() -> String {
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
+// Counting can accept prompts larger than the lane context. Cap the JSON before
+// allocating or translating it, since the token limit alone does not bound BPE scratch.
+const MAX_COUNT_BODY: usize = 1 << 20;
+const MAX_COUNT_TOKENS: usize = 256 << 10;
 // Cap buffered body capacity and the input represented by live decoded requests.
 const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
 /// rather than resetting a timeout on every read syscall.
@@ -1807,14 +1318,14 @@ fn route(method: &str, path: &str) -> Route {
 /// Decide header-only rejections before allocating or reading the request body.
 /// A chunked body has no length to check here: its cap is enforced chunk by
 /// chunk in `read_chunked`, after this gate and after the key check.
-fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, String)> {
+fn check_headers(h: &Head, path: &str, key: Option<&str>, body_limit: usize) -> Result<(), (u16, String)> {
     if let Some(k) = key {
         let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
         if path != "/health" && !authed {
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
         }
     }
-    if !h.chunked && h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
+    if !h.chunked && h.len > body_limit { return Err((413, format!("the body is over {body_limit} bytes"))); }
     Ok(())
 }
 
@@ -2093,15 +1604,62 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              admission: AdmissionGate,
              /// Automatic Metal working-set memory budget measured at startup.
              budget: MemoryBudget,
-             /// Translation and rendering capacity shared with count_tokens.
+             /// Generation translation and rendering capacity.
              preprocess: PermitPool,
+             /// Count-only capacity, independent of generation admission and rendering.
+             count_preprocess: PermitPool,
              /// Lanes currently occupied by an active job in the scheduler.
              active_lanes: Arc<AtomicUsize>,
-             /// connection threads alive; at most MAX_CONNS
-             conns: Arc<AtomicUsize>,
+             /// Live connections, capped globally and per peer.
+             conns: ConnectionSlots,
              /// opt-in non-blocking JSONL card traffic recorder
              recorder: Option<Arc<crate::record::Recorder>> }
 const MAX_CONNS: usize = 512;
+const MAX_PEER_CONNS: usize = 128;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct ConnectionSlots(Arc<Mutex<ConnectionCounts>>);
+
+#[derive(Default)]
+struct ConnectionCounts {
+    total: usize,
+    peers: HashMap<IpAddr, usize>,
+}
+
+struct ConnectionSlot {
+    counts: Arc<Mutex<ConnectionCounts>>,
+    peer: IpAddr,
+}
+
+impl ConnectionSlots {
+    fn acquire(&self, peer: IpAddr) -> Option<ConnectionSlot> {
+        let peer = peer.to_canonical();
+        let mut counts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.total >= MAX_CONNS {
+            return None;
+        }
+        let active = counts.peers.entry(peer).or_default();
+        if *active >= MAX_PEER_CONNS {
+            return None;
+        }
+        *active += 1;
+        counts.total += 1;
+        Some(ConnectionSlot { counts: self.0.clone(), peer })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let active = counts.peers.get_mut(&self.peer).expect("live connection has a peer entry");
+        *active -= 1;
+        if *active == 0 {
+            counts.peers.remove(&self.peer);
+        }
+        counts.total -= 1;
+    }
+}
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2722,13 +2280,10 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
 
 /// The would-be prompt's token count; no lane is taken, nothing is generated.
 fn count_tokens<W: Write + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
-    let Some(preprocess) = cx.preprocess.acquire() else { return anthropic_overloaded(s, cx.admission.retry_after_secs(), PREPROCESS_BUSY) };
-    let rendered = render_messages(cx, req, usize::MAX);
-    drop(preprocess);
-    match rendered {
+    match render_messages(cx, req, MAX_COUNT_TOKENS) {
         Ok(t) => respond(s, 200, &json!({"input_tokens": t.len()}).to_string()),
         Err(RenderError::Invalid(e)) => anthropic_error(s, 400, "invalid_request_error", &e),
-        Err(RenderError::TooLong) => anthropic_error(s, 400, "invalid_request_error", "prompt is too long to count"),
+        Err(RenderError::TooLong) => anthropic_error(s, 400, "invalid_request_error", &format!("prompt is too long to count: more than {MAX_COUNT_TOKENS} tokens")),
     }
 }
 
@@ -2810,7 +2365,7 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2856,105 +2411,137 @@ pub fn serve(o: ServeOpts) {
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
-        for c in l.incoming() {
-            let Ok(mut s) = c else { continue };
+        loop {
+            let (mut s, peer) = match l.accept() {
+                Ok(connection) => connection,
+                Err(e) => {
+                    eprintln!("[serve] accept: {e}");
+                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    continue;
+                }
+            };
+            let accepted_at = Instant::now();
+            let Some(slot) = cx.conns.acquire(peer.ip()) else {
+                // A rejected socket must never stall the listener while writing its reply.
+                if s.set_nonblocking(true).is_ok() {
+                    let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+                }
+                continue;
+            };
             if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
             let cx = cx.clone();
-            if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
-                cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
-                continue;
-            }
             let body_budget = body_budget.clone();
-            std::thread::spawn(move || {
-                struct Conn(Arc<std::sync::atomic::AtomicUsize>);
-                impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
-                let _conn = Conn(cx.conns.clone());
-                let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
-                let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
-                let Ok(h) = read_head(&mut r) else { return };
-                let path = route_path(&h.path);
-                let method = h.method.clone();
-                // the key is checked before any body is read
-                if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
-                    drop(r);
-                    let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message) }
-                            else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                            else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
-                    return;
-                }
-                // Routes that do not use a body can answer without waiting for one.
-                let route = route(&method, &path);
-                if matches!(route, Route::Models | Route::Health | Route::NotFound) {
-                    drop(r);
-                    let result = match route {
-                        Route::Models => respond(&mut s, 200, &models_body()),
-                        Route::Health => respond(&mut s, 200, &health_body(&cx)),
-                        Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
-                        Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
-                        _ => unreachable!("body routes are handled below"),
-                    };
-                    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-                    return;
-                }
-                r.get_mut().set_deadline(Instant::now() + BODY_READ_TIMEOUT);
-                let body = if h.chunked {
-                    read_chunked(&mut r, MAX_BODY, &body_budget)
-                } else {
-                    read_fixed(&mut r, h.len, &body_budget)
-                };
-                // A completed body may have come entirely from BufReader's
-                // buffer. Check the deadline even if no socket read was needed.
-                let body = body.and_then(|body| match r.get_mut().remaining() {
-                    Ok(_) => Ok(body),
-                    Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
-                    Err(_) => Err(BodyError::Incomplete),
-                });
-                drop(r);
-                let _ = s.set_read_timeout(None);
-                let anthropic = matches!(route, Route::Messages | Route::CountTokens);
-                let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
-                    Ok(decoded) => decoded,
-                    Err(BodyError::Busy) => {
-                        let message = "inky is busy: the request body budget is full";
-                        let retry = cx.admission.retry_after_secs();
-                        let _ = if anthropic {
-                            anthropic_overloaded(&mut s, retry, message)
-                        } else {
-                            openai_overloaded(&mut s, retry, message)
-                        };
-                        return;
-                    }
-                    Err(BodyError::Incomplete) => return,
-                    Err(e) => {
-                        let (code, kind, message) = match e {
-                            BodyError::TooLarge => (413, "request_too_large", format!("the body is over {MAX_BODY} bytes")),
-                            BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
-                            BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
-                            BodyError::Busy | BodyError::Incomplete => unreachable!(),
-                        };
-                        let result = if anthropic {
-                            anthropic_error(&mut s, code, kind, &message)
-                        } else {
-                            respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
-                        };
-                        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-                        return;
-                    }
-                };
-                let card_id = h.card_id.as_deref();
-                let result = match route {
-                    Route::Chat => chat_with_card(&cx, &decoded.value, card_id, &mut s),
-                    Route::Messages => messages_with_card(&cx, &decoded.value, card_id, &mut s),
-                    Route::CountTokens => count_tokens(&cx, &decoded.value, &mut s),
-                    _ => unreachable!("bodyless routes were handled above"),
-                };
-                drop(decoded);
-                if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-            });
+            if let Err(e) = std::thread::Builder::new().spawn(move || {
+                let _slot = slot;
+                handle_connection(&cx, &body_budget, s, accepted_at, REQUEST_READ_TIMEOUT);
+            }) {
+                eprintln!("[serve] connection worker: {e}");
+            }
         }
     });
-    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
+    scheduler(
+        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
+        #[cfg(test)]
+        None,
+    );
+}
+
+fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
+    let request_deadline = accepted_at + read_timeout;
+    let header_deadline = (accepted_at + HEADER_READ_TIMEOUT).min(request_deadline);
+    let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
+    let Ok(h) = read_head(&mut r) else { return };
+    if r.get_mut().remaining().is_err() { return; }
+    r.get_mut().set_deadline(request_deadline);
+    let path = route_path(&h.path);
+    let method = &h.method;
+    let route = route(method, &path);
+    let body_limit = if route == Route::CountTokens { MAX_COUNT_BODY } else { MAX_BODY };
+    // the key is checked before any body is read
+    if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref(), body_limit) {
+        drop(r);
+        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "request_too_large" }, &message) }
+                else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
+                else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
+        return;
+    }
+    // Routes that do not use a body can answer without waiting for one.
+    if matches!(route, Route::Models | Route::Health | Route::NotFound) {
+        drop(r);
+        let result = match route {
+            Route::Models => respond(&mut s, 200, &models_body()),
+            Route::Health => respond(&mut s, 200, &health_body(cx)),
+            Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
+            Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
+            _ => unreachable!("body routes are handled below"),
+        };
+        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+        return;
+    }
+    let body = if h.chunked {
+        read_chunked(&mut r, body_limit, body_budget)
+    } else {
+        read_fixed(&mut r, h.len, body_budget)
+    };
+    // A completed body may have come entirely from BufReader's
+    // buffer. Check the deadline even if no socket read was needed.
+    let body = body.and_then(|body| match r.get_mut().remaining() {
+        Ok(_) => Ok(body),
+        Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
+        Err(_) => Err(BodyError::Incomplete),
+    });
+    drop(r);
+    let _ = s.set_read_timeout(None);
+    let anthropic = matches!(route, Route::Messages | Route::CountTokens);
+    let _count_preprocess = if route == Route::CountTokens && body.is_ok() {
+        match cx.count_preprocess.acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let _ = anthropic_overloaded(&mut s, cx.admission.retry_after_secs(), "inky is busy: a token count is in progress");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
+        Ok(decoded) => decoded,
+        Err(BodyError::Busy) => {
+            let message = "inky is busy: the request body budget is full";
+            let retry = cx.admission.retry_after_secs();
+            let _ = if anthropic {
+                anthropic_overloaded(&mut s, retry, message)
+            } else {
+                openai_overloaded(&mut s, retry, message)
+            };
+            return;
+        }
+        Err(BodyError::Incomplete) => return,
+        Err(e) => {
+            let (code, kind, message) = match e {
+                BodyError::TooLarge => (413, "request_too_large", format!("the body is over {body_limit} bytes")),
+                BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
+                BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
+                BodyError::Busy | BodyError::Incomplete => unreachable!(),
+            };
+            let result = if anthropic {
+                anthropic_error(&mut s, code, kind, &message)
+            } else {
+                respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
+            };
+            if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+            return;
+        }
+    };
+    let card_id = h.card_id.as_deref();
+    let result = match route {
+        Route::Chat => chat_with_card(cx, &decoded.value, card_id, &mut s),
+        Route::Messages => messages_with_card(cx, &decoded.value, card_id, &mut s),
+        Route::CountTokens => count_tokens(cx, &decoded.value, &mut s),
+        _ => unreachable!("bodyless routes were handled above"),
+    };
+    drop(decoded);
+    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
 }
 
 #[cfg(test)]
@@ -3007,7 +2594,7 @@ mod tests {
                 DEFAULT_RETRY_AFTER_SECS,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         };
         (cx, rx)
     }
@@ -3036,8 +2623,8 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(cx.admission.try_acquire().is_none(), "the timed-out job still occupies the channel");
 
-        let mut queue = VecDeque::from([jobs.try_recv().unwrap()]);
-        assert!(queue[0].out.cancelled(), "the failed socket write signals cancellation");
+        let mut queue = VecDeque::from([QueuedJob::new(jobs.try_recv().unwrap())]);
+        assert!(queue[0].job.out.cancelled(), "the failed socket write signals cancellation");
         let mut response = Vec::new();
         chat(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"), "the timed-out job still occupies the queue");
@@ -3075,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn overload_precedes_rendering_and_count_tokens_shares_the_preprocessing_limit() {
+    fn overload_precedes_rendering_and_count_tokens_uses_independent_preprocessing() {
         let (cx, jobs) = admission_test_ctx(1);
         let req = json!({"max_tokens": 1, "messages": [{"role": "unsupported", "content": "hi"}]});
         let generation = cx.admission.try_acquire().unwrap();
@@ -3098,12 +2685,136 @@ mod tests {
         let _preprocess = cx.preprocess.acquire().unwrap();
         let mut response = Vec::new();
         count_tokens(&cx, &over_context, &mut response).unwrap();
-        assert!(response.starts_with(b"HTTP/1.1 429"));
+        assert!(response.starts_with(b"HTTP/1.1 200"), "counting remains available during generation rendering");
         response.clear();
         messages(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"));
         assert!(cx.admission.try_acquire().is_some(), "failed preprocessing admission returns the generation permit");
         assert!(jobs.try_recv().is_err());
+    }
+
+    fn open_http_test_connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn http_test_exchange(cx: &Ctx, request: &[u8]) -> String {
+        let (mut client, server) = open_http_test_connection();
+        let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
+        std::thread::scope(|scope| {
+            scope.spawn(move || handle_connection(cx, budget, server, Instant::now(), REQUEST_READ_TIMEOUT));
+            client.write_all(request).unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        })
+    }
+
+    fn json_request(path: &str, body: &str) -> String {
+        format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[test]
+    fn count_tokens_http_limits_both_body_framings_and_rendered_tokens() {
+        let (cx, jobs) = admission_test_ctx(1);
+        let path = "/v1/messages/count_tokens/?beta=true";
+        let declared = MAX_COUNT_BODY + 1;
+        let fixed = format!("POST {path} HTTP/1.1\r\nContent-Length: {declared}\r\n\r\n");
+        let chunked = format!("POST {path} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{declared:x}\r\n");
+        for request in [fixed, chunked] {
+            let response = http_test_exchange(&cx, request.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 413"));
+            assert!(response.contains("request_too_large"));
+        }
+
+        let body = json!({"messages": [{"role": "user", "content": "x".repeat(MAX_COUNT_TOKENS)}]}).to_string();
+        assert!(body.len() < MAX_COUNT_BODY);
+        let response = http_test_exchange(&cx, json_request(path, &body).as_bytes());
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("prompt is too long to count"));
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn count_tokens_uses_a_dedicated_http_preprocess_slot() {
+        let (cx, jobs) = admission_test_ctx(1);
+        let count = cx.count_preprocess.acquire().unwrap();
+        let body = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let count_req = json_request("/v1/messages/count_tokens", body);
+        let response = http_test_exchange(&cx, count_req.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 429"));
+        assert!(response.contains("Retry-After: 5"));
+        // An invalid prompt gets through generation admission and into rendering.
+        let invalid = r#"{"max_tokens":1,"messages":[{"role":"unsupported","content":"hello"}]}"#;
+        let messages = json_request("/v1/messages", invalid);
+        let response = http_test_exchange(&cx, messages.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(jobs.try_recv().is_err());
+
+        drop(count);
+        let generation = cx.preprocess.acquire().unwrap();
+        let response = http_test_exchange(&cx, count_req.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("input_tokens"));
+        drop(generation);
+    }
+
+    #[test]
+    fn partial_http_bodies_expire_within_the_request_read_deadline() {
+        let (cx, jobs) = admission_test_ctx(1);
+        for (framing, expected) in [
+            ("Content-Length: 8\r\n\r\n{", ""),
+            ("Transfer-Encoding: chunked\r\n\r\n8\r\n{", "HTTP/1.1 400"),
+        ] {
+            let (mut client, server) = open_http_test_connection();
+            write!(client, "POST /v1/messages/count_tokens HTTP/1.1\r\n{framing}").unwrap();
+            let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
+            std::thread::scope(|scope| {
+                let cx = &cx;
+                // Start with most of the request budget already spent so a fresh
+                // body budget would outlast the client's two-second read timeout.
+                let accepted_at = Instant::now() - Duration::from_millis(2800);
+                scope.spawn(move || handle_connection(cx, budget, server, accepted_at, Duration::from_secs(3)));
+                let mut response = String::new();
+                // Keep the write side open, so only the server deadline ends the request.
+                let result = client.read_to_string(&mut response);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                result.unwrap();
+                if expected.is_empty() {
+                    assert!(response.is_empty());
+                } else {
+                    assert!(response.starts_with(expected));
+                }
+            });
+        }
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn connection_slots_enforce_peer_and_global_limits_and_reuse_released_slots() {
+        let slots = ConnectionSlots::default();
+        let peer = "192.0.2.1".parse().unwrap();
+        let mapped = "::ffff:192.0.2.1".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_PEER_CONNS).map(|_| slots.acquire(peer).unwrap()).collect();
+        assert!(slots.acquire(mapped).is_none());
+        let other = "192.0.2.2".parse().unwrap();
+        assert!(slots.acquire(other).is_some());
+        held.pop();
+        held.push(slots.acquire(mapped).unwrap());
+
+        for n in 1..=(MAX_CONNS - held.len()) {
+            held.push(slots.acquire(IpAddr::from([198, 51, (n >> 8) as u8, n as u8])).unwrap());
+        }
+        assert!(slots.acquire(other).is_none());
+        held.pop();
+        held.push(slots.acquire(other).unwrap());
+        drop(held);
+        let counts = slots.0.lock().unwrap();
+        assert_eq!(counts.total, 0);
+        assert!(counts.peers.is_empty());
     }
 
     #[test]
@@ -3736,34 +3447,12 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit()), "the nonce is hex: {n}");
     }
 
-    #[test] fn stream_utf8_recovers_and_flushes_incomplete_sequences() {
-        let mut pend = vec![0xff, b'h', b'i', 0xe2, 0x82];
-        assert_eq!(take_stream_text(&mut pend, false), "�hi");
-        assert_eq!(pend, vec![0xe2, 0x82]);
-        pend.push(0xac);
-        assert_eq!(take_stream_text(&mut pend, false), "€");
-        pend.extend([0xe2, 0x82]);
-        assert_eq!(take_stream_text(&mut pend, true), "�");
-        assert!(pend.is_empty());
-        let mut bs = BlockStream::new("test", 1);
-        bs.open_text = true;
-        bs.pend = vec![0xff, b'h', b'i', 0xe2];
-        let mut events = Vec::new();
-        bs.flush_text(&mut events);
-        bs.close_text(&mut events);
-        let text: String = events.iter().filter_map(|event| {
-            let v: Value = serde_json::from_str(event.split("\ndata: ").nth(1)?.trim_end()).ok()?;
-            v["delta"]["text"].as_str().map(str::to_owned)
-        }).collect();
-        assert_eq!(text, "�hi�");
-    }
-
     #[test] fn chat_rejects_each_invalid_budget_before_admission() {
         let tk = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3786,7 +3475,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -3825,7 +3514,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -3853,7 +3542,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -3894,7 +3583,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -3916,7 +3605,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3940,7 +3629,7 @@ mod tests {
             method: "POST".into(), path: "/v1/chat/completions".into(),
             len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
         };
-        let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
+        let status = |h: &Head| check_headers(h, &h.path, Some("test"), MAX_BODY).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
         head.auth = Some("test".into());
         assert_eq!(status(&head), Err(413));
@@ -3996,7 +3685,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -4302,7 +3991,7 @@ mod tests {
         let head = read_head(&mut r_ok).unwrap();
         assert_eq!(head.method, "GET");
         assert_eq!(head.path, "/health");
-        r_ok.get_mut().set_deadline(fast_clock.get() + BODY_READ_TIMEOUT);
+        r_ok.get_mut().set_deadline(start + REQUEST_READ_TIMEOUT);
         let mut tail = Vec::new();
         r_ok.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"body");
@@ -4503,14 +4192,14 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
         let mut head_reader = BufReader::new(&raw_req[..]);
         let head = read_head(&mut head_reader).unwrap();
         assert_eq!(head.card_id.as_deref(), Some("card-multi-7"));
-        assert!(check_headers(&head, "/v1/chat/completions", cx.key.as_deref()).is_ok());
+        assert!(check_headers(&head, "/v1/chat/completions", cx.key.as_deref(), MAX_BODY).is_ok());
 
         let worker = std::thread::spawn(move || {
             for turn in 0..2 {
@@ -4684,14 +4373,14 @@ mod tests {
             chunked: false,
         };
         // Unkeyed server permits loopback requests without headers
-        assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None).is_ok());
+        assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None, MAX_BODY).is_ok());
         // Keyed server keeps /health public and requires Bearer or x-api-key on /v1/*
-        assert!(check_headers(&req("/health", None, None), "/health", Some("k")).is_ok());
-        assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k")).unwrap_err().0, 401);
-        assert_eq!(check_headers(&req("/v1/models", Some("wrong"), None), "/v1/models", Some("k")).unwrap_err().0, 401);
-        assert_eq!(check_headers(&req("/v1/messages", None, Some("wrong")), "/v1/messages", Some("k")).unwrap_err().0, 401);
-        assert!(check_headers(&req("/v1/models", Some("k"), None), "/v1/models", Some("k")).is_ok());
-        assert!(check_headers(&req("/v1/messages", None, Some("k")), "/v1/messages", Some("k")).is_ok());
+        assert!(check_headers(&req("/health", None, None), "/health", Some("k"), MAX_BODY).is_ok());
+        assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert_eq!(check_headers(&req("/v1/models", Some("wrong"), None), "/v1/models", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert_eq!(check_headers(&req("/v1/messages", None, Some("wrong")), "/v1/messages", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert!(check_headers(&req("/v1/models", Some("k"), None), "/v1/models", Some("k"), MAX_BODY).is_ok());
+        assert!(check_headers(&req("/v1/messages", None, Some("k")), "/v1/messages", Some("k"), MAX_BODY).is_ok());
     }
 
     #[test] fn openai_stream_options_include_usage_and_tool_loop() {
@@ -4703,7 +4392,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4763,7 +4452,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         });
 
         let req = json!({
@@ -5150,9 +4839,12 @@ mod tests {
             (turn2, turn3, t1_out, t2_out, t3_out)
         });
 
+        use crate::scheduler::LaneState::{Admitted, Queued, Ready, Restoring};
+        let mut admissions = Vec::new();
         scheduler_trace::capture_if_requested(|| {
-            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None)
+            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None, Some(&mut admissions))
         });
+        assert_eq!(admissions, [[Queued, Admitted, Restoring, Ready]; 3]);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
 
         // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!
@@ -5164,6 +4856,34 @@ mod tests {
         assert_eq!(t3_out, cold3, "Turn 3 cached greedy tokens must match cold uncached solo token-for-token");
     }
 
+
+    #[test]
+    fn serve_lane_is_not_runnable_before_restore_finishes() {
+        use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        let mut planner = ServeStepPlanner::new(1, 16);
+        let inputs = [ServeLaneInput {
+            runnable: true,
+            n_past: 0,
+            pf_end: 64,
+            has_pending_decode: false,
+        }];
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.admit_queued(0, LaneState::Queued);
+        assert_eq!(planner.state(0), LaneState::Admitted);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.start_restore(0);
+        assert_eq!(planner.state(0), LaneState::Restoring);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.finish_restore(0);
+        assert_eq!(planner.state(0), LaneState::Ready);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), Some(ServeStepPlan::Prefill(vec![(0, 0, 64)])));
+        assert_eq!(planner.state(0), LaneState::InStep);
+        assert!(!planner.request_cancel(0));
+        assert_eq!(planner.state(0), LaneState::Cancelling);
+        assert_eq!(planner.complete_step(), vec![0]);
+        assert_eq!(planner.state(0), LaneState::Cancelled);
+    }
 
     #[test] fn serve_step_max_bypass_bursts_sixteen_decodes_before_prefill() {
         assert_eq!(SERVE_STEP_MAX_BYPASS, 16);
@@ -5402,7 +5122,8 @@ mod tests {
 
         // 1. Live arrived job drained into queue; cancelled arrived job dropped & metrics.queued updated.
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().seq, 10);
+        assert_eq!(queue.front().unwrap().job.seq, 10);
+        assert_eq!(queue.front().unwrap().state, LaneState::Queued);
         assert_eq!(metrics.lock().unwrap().queued, 1);
 
         // 2. CancelInStep: lane 0 transitioned InStep -> Cancelling (NOT Cancelled!),
