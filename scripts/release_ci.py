@@ -1,8 +1,48 @@
 """Wait for the tagged commit's main-push CI before publishing any release assets."""
 import json
+import re
 import subprocess
 import sys
 import time
+
+
+_PR_ONLY_CANCEL_RE = re.compile(
+    r"^\$\{\{\s*github\.event_name\s*==\s*(['\"])pull_request\1\s*\}\}$"
+)
+
+
+def _validate_concurrency_block(block, location):
+    if not isinstance(block, dict):
+        raise ValueError(f"{location}: missing or non-mapping concurrency block")
+    group = block.get("group")
+    if not isinstance(group, str) or not group.strip():
+        raise ValueError(f"{location}: concurrency.group must be a non-empty string")
+    if "cancel-in-progress" not in block:
+        raise ValueError(f"{location}: concurrency must set cancel-in-progress")
+    cancel = block["cancel-in-progress"]
+    if cancel is False:
+        return
+    if isinstance(cancel, str) and _PR_ONLY_CANCEL_RE.match(cancel.strip()):
+        if "github.run_id" not in group:
+            raise ValueError(
+                f"{location}: pull_request cancel-in-progress group {group!r} must fall back to github.run_id for non-PR runs"
+            )
+        return
+    raise ValueError(
+        f"{location}: cancel-in-progress={cancel!r} can cancel non-PR (main/tag/nightly) runs"
+    )
+
+
+def validate_no_main_cancellation(doc, workflow_name):
+    """Fail if a workflow or any job in it can cancel an in-progress run on main or non-PR triggers."""
+    if not isinstance(doc, dict):
+        raise ValueError(f"{workflow_name}: workflow document must be a mapping")
+    _validate_concurrency_block(doc.get("concurrency"), workflow_name)
+    jobs = doc.get("jobs") or {}
+    if isinstance(jobs, dict):
+        for job_name, job in jobs.items():
+            if isinstance(job, dict) and "concurrency" in job:
+                _validate_concurrency_block(job["concurrency"], f"{workflow_name}:jobs.{job_name}")
 
 
 REQUIRED_JOBS = {

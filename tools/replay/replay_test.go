@@ -497,7 +497,16 @@ func TestMemorySamplePeaksAndUnavailableOutput(t *testing.T) {
 	for i, name := range head {
 		values[name] = row[i]
 	}
-	for field, want := range map[string]string{"ttft_samples": "0", "ttft_p95_ms": "n/a", "ttft_p50_ms": "n/a", "peak_memory_bytes": "n/a", "peak_budget_estimate_bytes": "500"} {
+	for field, want := range map[string]string{
+		"ttft_samples":               "0",
+		"ttft_p95_ms":                "n/a",
+		"ttft_p50_ms":                "n/a",
+		"peak_memory_bytes":          "n/a",
+		"peak_budget_estimate_bytes": "500",
+		"peak_rss_bytes":             "n/a",
+		"min_headroom_bytes":         "n/a",
+		"host_memory_bytes":          "n/a",
+	} {
 		if values[field] != want {
 			t.Fatalf("%s = %q, want %q", field, values[field], want)
 		}
@@ -547,5 +556,160 @@ func TestLoadReplaySetReadsLargeRecorderRowAndFollowingTurn(t *testing.T) {
 	turns := cards[0].Turns
 	if len(turns[0].Request) != len(`{"metadata":""}`)+(16<<20) || string(turns[1].Request) != `{"stream":true}` {
 		t.Fatal("the loader lost part of the large request or its following turn")
+	}
+}
+
+func TestParseMemoryTelemetryParsers(t *testing.T) {
+	rss, err := ParsePSRssKiB("  2048 \n")
+	if err != nil || rss != 2048*1024 {
+		t.Fatalf("ParsePSRssKiB = (%d, %v), want %d", rss, err, 2048*1024)
+	}
+	for _, bad := range []string{"", "0", "-5", "abc", "12 34"} {
+		if _, err := ParsePSRssKiB(bad); err == nil {
+			t.Fatalf("ParsePSRssKiB(%q) unexpectedly succeeded", bad)
+		}
+	}
+
+	memsize, err := ParseSysctlMemsize("68719476736\n")
+	if err != nil || memsize != 68719476736 {
+		t.Fatalf("ParseSysctlMemsize = (%d, %v)", memsize, err)
+	}
+	for _, bad := range []string{"", "0", "-1", "notanumber"} {
+		if _, err := ParseSysctlMemsize(bad); err == nil {
+			t.Fatalf("ParseSysctlMemsize(%q) unexpectedly succeeded", bad)
+		}
+	}
+
+	const sampleVMStat = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                    90000.
+Pages active:                                 400000.
+Pages inactive:                               900000.
+Pages speculative:                              1000.
+Pages wired down:                             150000.
+Pages purgeable:                                9000.
+`
+	freeB, availB, err := ParseVMStat(sampleVMStat)
+	if err != nil {
+		t.Fatalf("ParseVMStat: %v", err)
+	}
+	if wantFree := uint64(91000) * 16384; freeB != wantFree {
+		t.Fatalf("freeB = %d, want %d", freeB, wantFree)
+	}
+	if wantAvail := uint64(1000000) * 16384; availB != wantAvail {
+		t.Fatalf("availB = %d, want %d", availB, wantAvail)
+	}
+	if _, _, err := ParseVMStat("Pages free: 10.\n"); err == nil {
+		t.Fatal("expected ParseVMStat to fail without page size header")
+	}
+	if _, _, err := ParseVMStat("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages active: 10.\n"); err == nil {
+		t.Fatal("expected ParseVMStat to fail without Pages free")
+	}
+
+	meminfo, err := ParseProcMeminfo("MemTotal:       16384000 kB\nMemFree:         2000000 kB\nMemAvailable:   10240000 kB\n")
+	if err != nil || meminfo.TotalBytes != 16384000*1024 || meminfo.AvailableBytes != 10240000*1024 || meminfo.FreeBytes != 2000000*1024 {
+		t.Fatalf("ParseProcMeminfo = %+v, err=%v", meminfo, err)
+	}
+	fallback, err := ParseProcMeminfo("MemTotal: 4096 kB\nMemFree: 512 kB\nBuffers: 256 kB\nCached: 1024 kB\n")
+	if err != nil || fallback.AvailableBytes != (512+256+1024)*1024 {
+		t.Fatalf("ParseProcMeminfo fallback = %+v, err=%v", fallback, err)
+	}
+}
+
+func TestRunSweepTracksInjectedRSSMinHeadroomAndForceStream(t *testing.T) {
+	cards, err := LoadReplaySet(filepath.Join("testdata", "sample_cards.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/health" {
+			return memResponse(http.StatusOK, "application/json", `{"ok":true,"active_lanes":2,"process_footprint_bytes":5000,"model_bytes":1000,"per_lane_worst_case_bytes":500}`, nil), nil
+		}
+		var body struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			return memResponse(http.StatusBadRequest, "application/json", `{"error":{"message":"bad json"}}`, nil), nil
+		}
+		if !body.Stream {
+			return memResponse(http.StatusBadRequest, "application/json", `{"error":{"message":"expected force-stream"}}`, nil), nil
+		}
+		sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"
+		return memResponse(http.StatusOK, "text/event-stream", sse, nil), nil
+	})
+
+	rssReadings := []uint64{1000, 4200, 2900}
+	headroomReadings := []uint64{8000, 3500, 6200}
+	var pollIdx atomic.Int64
+
+	cfg := SweepConfig{
+		BaseURL:        "http://inky.invalid:8090",
+		LaneCounts:     []int{2},
+		CardsPerRung:   4,
+		HealthInterval: 5 * time.Millisecond,
+		ServerPID:      4242,
+		ForceStream:    true,
+		RSSSampler: func(pid int) (uint64, error) {
+			if pid != 4242 {
+				return 0, fmt.Errorf("unexpected pid %d", pid)
+			}
+			i := int(pollIdx.Load()) % len(rssReadings)
+			return rssReadings[i], nil
+		},
+		HeadroomSampler: func() (SystemMemorySample, error) {
+			i := int(pollIdx.Add(1)-1) % len(headroomReadings)
+			return SystemMemorySample{
+				TotalBytes:     16000,
+				AvailableBytes: headroomReadings[i],
+				FreeBytes:      headroomReadings[i] / 2,
+			}, nil
+		},
+		Client: &http.Client{Transport: transport},
+		Clock:  newFakeClock(time.Date(2026, 11, 25, 18, 0, 0, 0, time.UTC)),
+	}
+
+	rungs, _, err := RunSweep(context.Background(), cfg, cards)
+	if err != nil {
+		t.Fatalf("RunSweep: %v", err)
+	}
+	if len(rungs) != 1 {
+		t.Fatalf("got %d rungs, want 1", len(rungs))
+	}
+	r := rungs[0]
+	// sample_cards.jsonl has 9 turns across 4 cards (7 streamed + 2 buffered); ForceStream streams all 9.
+	if r.TTFTSamples != 9 {
+		t.Fatalf("TTFTSamples = %d, want 9 with ForceStream", r.TTFTSamples)
+	}
+	if r.PeakMemoryBytes != 5000 || r.PeakBudgetEstimateBytes != 2000 {
+		t.Fatalf("footprint=%d budget=%d", r.PeakMemoryBytes, r.PeakBudgetEstimateBytes)
+	}
+	if r.PeakRSSBytes != 4200 || r.RSSSamples < 3 {
+		t.Fatalf("PeakRSSBytes=%d RSSSamples=%d, want 4200 and >=3", r.PeakRSSBytes, r.RSSSamples)
+	}
+	if r.MinHeadroomBytes != 3500 || r.HostMemoryBytes != 16000 || r.HeadroomSamples < 3 {
+		t.Fatalf("MinHeadroomBytes=%d HostMemoryBytes=%d HeadroomSamples=%d", r.MinHeadroomBytes, r.HostMemoryBytes, r.HeadroomSamples)
+	}
+	tsv := FormatTSV(rungs)
+	if !strings.Contains(tsv, "\t4200\t3500\t16000\n") {
+		t.Fatalf("unexpected RSS/headroom columns in TSV:\n%s", tsv)
+	}
+}
+
+func TestNegativeServerPIDRejectedBeforeTraffic(t *testing.T) {
+	var calls atomic.Int64
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return memResponse(http.StatusInternalServerError, "application/json", `{}`, nil), nil
+	})
+	var out, stderr bytes.Buffer
+	code := runCLIWithDeps(
+		[]string{"--input", filepath.Join("testdata", "sample_cards.jsonl"), "--server-pid=-1", "--url", "http://inky.invalid:8090"},
+		func(string) string { return "" },
+		&http.Client{Transport: transport},
+		newFakeClock(time.Date(2026, 11, 25, 18, 0, 0, 0, time.UTC)),
+		&out,
+		&stderr,
+	)
+	if code != 2 || !strings.Contains(stderr.String(), "--server-pid") || calls.Load() != 0 {
+		t.Fatalf("exit=%d requests=%d stderr=%s", code, calls.Load(), stderr.String())
 	}
 }

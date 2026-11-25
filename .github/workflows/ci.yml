@@ -28,6 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: soak qualification shell tests
         run: tests/soak_qualification_test.sh
+      - name: branch hygiene and CI non-cancellation tests
+        run: |
+          python3 tests/test_branch_hygiene.py
+          python3 scripts/check_branch_hygiene.py --offline-workflows
       - name: unit and integration tests (debug assertions)
         run: cargo test --locked --bins --tests
       # tests/serve.sh's in-process header test runs here, not in m5-serve. Like serve.sh, require exactly one

@@ -8,6 +8,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# Cancel only superseded pull request runs; pushes to main, schedules, and manual runs never cancel.
+concurrency:
+  group: dependency-audit-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   audit:
     runs-on: ubuntu-latest
