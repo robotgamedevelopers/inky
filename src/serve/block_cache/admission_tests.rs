@@ -8,13 +8,22 @@ fn prefill_to(
 ) -> (BlockTable, LaneBlockState) {
     let mut table = BlockTable::new(256).unwrap();
     let mut state = LaneBlockState::default();
-    assert!(cache.match_and_bind(pools, &mut table, &mut state, prompt).is_none());
+    assert!(cache
+        .match_and_bind(pools, &mut table, &mut state, prompt)
+        .is_none());
     cache.ensure_span_blocks(pools, &mut table, 0, end).unwrap();
-    cache.finish_prefill_span(pools, &mut table, &mut state, prompt, 0, end, || vec![0; 16]);
+    cache.finish_prefill_span(pools, &mut table, &mut state, prompt, 0, end, || {
+        vec![0; 16]
+    });
     (table, state)
 }
 
-fn lane<'a>(id: usize, prompt: &'a [u32], written: usize, max_gen: usize) -> InflightLaneReserve<'a> {
+fn lane<'a>(
+    id: usize,
+    prompt: &'a [u32],
+    written: usize,
+    max_gen: usize,
+) -> InflightLaneReserve<'a> {
     InflightLaneReserve {
         lane: id,
         namespace: 0,
@@ -80,7 +89,10 @@ fn matching_retained_window_blocks_reduces_admission_headroom() {
     let prompt_b = vec![3; 28 * BLOCK + 1];
     let active = [lane(0, &prompt_a, 8 * BLOCK, 1)];
     assert_eq!(cache.peek_match_len(&pools, &prompt_b), 16 * BLOCK);
-    assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Window), 32);
+    assert_eq!(
+        cache.free_plus_evictable_slots(&pools, BlockKind::Window),
+        32
+    );
     // The next B span needs 12 new window blocks while its 16 history blocks
     // are pinned. A can still grow by eight window blocks.
     assert!(!cache.can_admit(&pools, &active, 1, &prompt_b, 1, 12 * BLOCK));
@@ -95,8 +107,13 @@ fn binding_blocks_already_pinned_by_an_active_lane_costs_no_full_slots() {
     let (mut table, mut state) = prefill_to(&mut cache, &mut pools, &prior, 24 * BLOCK);
     cache.release_lane(&mut pools, &mut table, &mut state);
     let prompt = vec![5; 24 * BLOCK + 3];
-    let (matched, _) = cache.match_and_bind(&mut pools, &mut table, &mut state, &prompt).unwrap();
-    let active = [InflightLaneReserve { cached: matched, ..lane(0, &prompt, matched, 1) }];
+    let (matched, _) = cache
+        .match_and_bind(&mut pools, &mut table, &mut state, &prompt)
+        .unwrap();
+    let active = [InflightLaneReserve {
+        cached: matched,
+        ..lane(0, &prompt, matched, 1)
+    }];
 
     assert_eq!(matched, 24 * BLOCK);
     assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Full), 8);
@@ -114,7 +131,10 @@ fn followers_cannot_both_charge_the_same_future_checkpoint_to_each_other() {
     c.push(4);
     let active = [lane(0, &a, 0, 1), lane(1, &b, 0, 1), lane(2, &c, 0, 1)];
     let reserved = reserved_inflight_full_slots(&active);
-    assert!(reserved >= b.len().div_ceil(BLOCK), "B alone needs 129 Full slots, reserved {reserved}");
+    assert!(
+        reserved >= b.len().div_ceil(BLOCK),
+        "B alone needs 129 Full slots, reserved {reserved}"
+    );
 
     let pools = BlockPools::with_capacities(180, 512, 2).unwrap();
     let mut cache = ServeBlockCache::new();
@@ -137,7 +157,12 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
     let spill_id = 1;
     let mut tip = None;
     for (i, tokens) in prompt.as_chunks::<BLOCK>().0.iter().enumerate() {
-        tip = Some(cache.spilled_tree.insert(tip, i * BLOCK, tokens, spill_id).unwrap());
+        tip = Some(
+            cache
+                .spilled_tree
+                .insert(tip, i * BLOCK, tokens, spill_id)
+                .unwrap(),
+        );
     }
     cache.spilled_tree.retain_start(tip.unwrap()).unwrap();
     cache.spilled_starts.insert(
@@ -160,7 +185,9 @@ fn small_window_pool_keeps_enough_history_for_each_planned_prefill_and_decode() 
     use crate::scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
     use crate::serve::{pooled_context, window_span_end};
 
-    for (windows, prompt_len, generated) in [(1, 60, 5), (16, 1024, 1), (17, 2311, 138), (20, 3073, 81)] {
+    for (windows, prompt_len, generated) in
+        [(1, 60, 5), (16, 1024, 1), (17, 2311, 138), (20, 3073, 81)]
+    {
         assert!(pooled_context(8192, 128, windows) >= prompt_len + generated + 2);
         for guided in [false, true] {
             let mut pools = BlockPools::with_capacities(128, windows, 1).unwrap();
@@ -177,21 +204,36 @@ fn small_window_pool_keeps_enough_history_for_each_planned_prefill_and_decode() 
                 let input = ServeLaneInput {
                     runnable: true,
                     n_past: pos,
-                    pf_end: effective_pf_target(pos, prompt_len).min(final_prefill).min(window_span_end(pos, windows)),
+                    pf_end: effective_pf_target(pos, prompt_len)
+                        .min(final_prefill)
+                        .min(window_span_end(pos, windows)),
                     has_pending_decode: pos >= final_prefill,
                 };
-                match planner.plan_and_begin_step(&[input], 4096, BLOCK).expect("single lane can progress") {
+                match planner
+                    .plan_and_begin_step(&[input], 4096, BLOCK)
+                    .expect("single lane can progress")
+                {
                     ServeStepPlan::Prefill(spans) => {
                         let (_, start, count) = spans[0];
                         assert_eq!(start, pos);
-                        cache.ensure_span_blocks(&mut pools, &mut table, pos, count).unwrap();
-                        cache.finish_prefill_span(&mut pools, &mut table, &mut state, &prompt, pos, count, || {
-                            vec![0; 16]
-                        });
+                        cache
+                            .ensure_span_blocks(&mut pools, &mut table, pos, count)
+                            .unwrap();
+                        cache.finish_prefill_span(
+                            &mut pools,
+                            &mut table,
+                            &mut state,
+                            &prompt,
+                            pos,
+                            count,
+                            || vec![0; 16],
+                        );
                         pos += count;
                     }
                     ServeStepPlan::Decode(_) => {
-                        cache.ensure_span_blocks(&mut pools, &mut table, pos, 1).unwrap();
+                        cache
+                            .ensure_span_blocks(&mut pools, &mut table, pos, 1)
+                            .unwrap();
                         cache.finish_decode_span(&mut pools, &mut table, &mut state, pos);
                         pos += 1;
                     }
@@ -208,20 +250,33 @@ fn small_window_pool_keeps_enough_history_for_each_planned_prefill_and_decode() 
 fn long_reply_maintains_a_rolling_decode_reservation_after_4096_tokens() {
     let prompt = [42];
     let generated = 8192;
-    let active = InflightLaneReserve { gen: generated, ..lane(0, &prompt, generated, generated + 2 * BLOCK) };
+    let active = InflightLaneReserve {
+        gen: generated,
+        ..lane(0, &prompt, generated, generated + 2 * BLOCK)
+    };
     assert_eq!(reserved_inflight_full_slots(&[active]), 2);
 }
 
 fn reference_all_pairs_reserved_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
-    let prefills: Vec<InflightPrefillLane<'_>> = lanes.iter().filter_map(|l| l.as_prefill_lane()).collect();
+    let prefills: Vec<InflightPrefillLane<'_>> = lanes
+        .iter()
+        .filter_map(|l| l.as_prefill_lane())
+        .collect();
     lanes
         .iter()
         .map(|lane| {
-            let credited = prefills.iter().find(|f| f.lane == lane.lane && f.eligible_follower).map_or(0, |me| {
-                let next = effective_pf_target(me.n_past, me.pf_end);
-                let final_ckpt = me.pf_end.saturating_sub(1) / BLOCK * BLOCK;
-                prefills.iter().map(|prod| pair_shared_checkpoint_exact(me, prod, next, final_ckpt)).max().unwrap_or(0)
-            });
+            let credited = prefills
+                .iter()
+                .find(|f| f.lane == lane.lane && f.eligible_follower)
+                .map_or(0, |me| {
+                    let next = effective_pf_target(me.n_past, me.pf_end);
+                    let final_ckpt = me.pf_end.saturating_sub(1) / BLOCK * BLOCK;
+                    prefills
+                        .iter()
+                        .map(|prod| pair_shared_checkpoint_exact(me, prod, next, final_ckpt))
+                        .max()
+                        .unwrap_or(0)
+                });
             lane.reserved_end().div_ceil(BLOCK) - lane.written.max(credited).div_ceil(BLOCK)
         })
         .sum()
@@ -300,7 +355,15 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
         let mut run_decisions = Vec::with_capacity(N_LANES);
         let mut reserves_so_far: Vec<InflightLaneReserve<'_>> = Vec::with_capacity(N_LANES);
         for i in 0..N_LANES {
-            let ok = cache.can_admit_with_cohort(&pools, &cohort, i, &prompts[i], Some(&hashes[i]), max_gen, chunk);
+            let ok = cache.can_admit_with_cohort(
+                &pools,
+                &cohort,
+                i,
+                &prompts[i],
+                Some(&hashes[i]),
+                max_gen,
+                chunk,
+            );
             run_decisions.push(ok);
             if ok {
                 let r = InflightLaneReserve {
@@ -320,8 +383,10 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
                 reserves_so_far.push(r);
             }
         }
-        let run_pf_lanes: Vec<InflightPrefillLane<'_>> =
-            reserves_so_far.iter().filter_map(|r| r.as_prefill_lane()).collect();
+        let run_pf_lanes: Vec<InflightPrefillLane<'_>> = reserves_so_far
+            .iter()
+            .filter_map(|r| r.as_prefill_lane())
+            .collect();
         let run_leaders = find_prefill_leaders(&run_pf_lanes);
         let elapsed = began.elapsed();
         if elapsed < best_elapsed {
@@ -332,8 +397,11 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
         leaders = run_leaders;
     }
 
-    let budget =
-        if cfg!(debug_assertions) { std::time::Duration::from_millis(15) } else { std::time::Duration::from_millis(2) };
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(15)
+    } else {
+        std::time::Duration::from_millis(2)
+    };
     eprintln!(
         "[u331-admit-scan] 32 x 65,536-token burst admission + leader election completed in {best_elapsed:?} (budget {budget:?})"
     );
@@ -372,8 +440,10 @@ fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_pari
         }
     }
     for (idx, pf) in pf_lanes.iter().enumerate() {
-        let no_hash_pf: Vec<InflightPrefillLane<'_>> =
-            pf_lanes.iter().map(|p| InflightPrefillLane { block_hashes: None, ..*p }).collect();
+        let no_hash_pf: Vec<InflightPrefillLane<'_>> = pf_lanes
+            .iter()
+            .map(|p| InflightPrefillLane { block_hashes: None, ..*p })
+            .collect();
         let ref_leader = find_prefill_leader(&no_hash_pf, idx);
         assert_eq!(leaders[idx], ref_leader, "leader mismatch for prefill idx {idx} (lane {})", pf.lane);
     }

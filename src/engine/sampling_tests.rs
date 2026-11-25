@@ -1,6 +1,8 @@
 use super::{ArgmaxArgs, SampArgs};
 use crate::metal::{Enc, Gpu};
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCreateSystemDefaultDevice};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCreateSystemDefaultDevice,
+};
 
 // Three partitions exercise both stages of the reduction, including a partial final group.
 const WIDTH: usize = 2049;
@@ -12,7 +14,11 @@ fn sample_rows(gpu: &Gpu, rows: &[[f32; WIDTH]; 2], temps: [f32; 2], bans: [u32;
     let tokens = gpu.buffer(rows.len() * size_of::<u32>());
     // The buffers are idle and the logits occupy the first score_words words.
     unsafe {
-        std::ptr::copy_nonoverlapping(rows.as_ptr().cast::<f32>(), arena.contents().as_ptr().cast(), score_words);
+        std::ptr::copy_nonoverlapping(
+            rows.as_ptr().cast::<f32>(),
+            arena.contents().as_ptr().cast(),
+            score_words,
+        );
     }
 
     let cb = gpu.cmd();
@@ -55,7 +61,12 @@ fn sample_rows(gpu: &Gpu, rows: &[[f32; WIDTH]; 2], temps: [f32; 2], bans: [u32;
     e.end();
     cb.commit();
     cb.waitUntilCompleted();
-    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed, "{:?}", cb.error());
+    assert_eq!(
+        cb.status(),
+        MTLCommandBufferStatus::Completed,
+        "{:?}",
+        cb.error()
+    );
     // Completion makes both token writes visible to the CPU.
     unsafe { *tokens.contents().as_ptr().cast::<[u32; 2]>() }
 }
@@ -70,7 +81,10 @@ fn metal_sampling_validates_each_row_and_preserves_greedy_order() {
     let all = include_str!("../kernels.metal");
     let start = all.find("// argmax over logits").unwrap();
     let end = all[start..].find("// Adaptive LoopCD-Logits").unwrap();
-    let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{}", &all[start..start + end]);
+    let src = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n{}",
+        &all[start..start + end]
+    );
     let gpu = Gpu::new(&src, &["k_gumbel", "k_argmax1", "k_argmax2"]);
 
     let mut rows = [[-20.0; WIDTH]; 2];
@@ -89,7 +103,11 @@ fn metal_sampling_validates_each_row_and_preserves_greedy_order() {
         rows[0][2048] = bad;
         for (temp, ban) in [(0.0, 1), (0.5, 1), (1.25e-38, 2048), (0.5, 2048)] {
             let tokens = sample_rows(&gpu, &rows, [temp, 0.5], [ban, u32::MAX]);
-            assert_eq!(tokens, [u32::MAX, 12], "logit {bad}, banned {ban}, temperature {temp}");
+            assert_eq!(
+                tokens,
+                [u32::MAX, 12],
+                "logit {bad}, banned {ban}, temperature {temp}"
+            );
         }
     }
     rows[0].fill(f32::NAN);

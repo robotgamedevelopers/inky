@@ -8,14 +8,16 @@ use std::fmt;
 
 use crate::blockbook::Geometry;
 use crate::blocks::{
-    block_length, byte_offset, BlockEntry, BlockError, BlockIndex, BlockKind, BlockPools, BlockTable, Slot,
+    block_length, byte_offset, BlockEntry, BlockError, BlockIndex, BlockKind, BlockPools,
+    BlockTable, Slot,
 };
 use crate::cache_trace::{
-    emit_block_layout_config, emit_block_layout_event, emit_block_layout_step, emit_cache_scheduler_config,
-    emit_cache_scheduler_event, emit_cache_scheduler_step, kind_name, BlockLayoutConfig, BlockLayoutEvent,
-    BlockLayoutState, BlockLayoutStep, CacheBlockId, CacheBlockSnapshot, CacheLaneSnapshot, CacheSchedulerConfig,
-    CacheSchedulerEvent, CacheSchedulerState, CacheSchedulerStep, JsonVal, OffsetLimbs, PinHandleSnapshot,
-    StartPointSnapshot, TraceError, TraceSink,
+    emit_block_layout_config, emit_block_layout_event, emit_block_layout_step,
+    emit_cache_scheduler_config, emit_cache_scheduler_event, emit_cache_scheduler_step, kind_name,
+    BlockLayoutConfig, BlockLayoutEvent, BlockLayoutState, BlockLayoutStep, CacheBlockId,
+    CacheBlockSnapshot, CacheLaneSnapshot, CacheSchedulerConfig, CacheSchedulerEvent,
+    CacheSchedulerState, CacheSchedulerStep, JsonVal, OffsetLimbs, PinHandleSnapshot, StartPointSnapshot, TraceError,
+    TraceSink,
 };
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -69,12 +71,23 @@ pub fn ceil_div_u32(n: u32, d: u32) -> Result<u32, SchedulerError> {
 /// Conservative window-block pin bound `ceil((W - 1 + c) / B) + 1` matching
 /// `SpanBound(c)` in `BlockLayout.tla`, `CacheScheduler.tla`, and `blocks::span_bound`.
 /// Refuses zero `span_tokens`, `block_size`, or `window_size`, and checked-overflows cleanly.
-pub fn span_bound_blocks(span_tokens: u32, block_size: u32, window_size: u32) -> Result<u32, SchedulerError> {
+pub fn span_bound_blocks(
+    span_tokens: u32,
+    block_size: u32,
+    window_size: u32,
+) -> Result<u32, SchedulerError> {
     if span_tokens == 0 || block_size == 0 || window_size == 0 {
-        return Err(SchedulerError::InvalidConfig("span_tokens, block_size, and window_size must be positive"));
+        return Err(SchedulerError::InvalidConfig(
+            "span_tokens, block_size, and window_size must be positive",
+        ));
     }
-    let numer = (window_size - 1).checked_add(span_tokens).ok_or(SchedulerError::Block(BlockError::Overflow))?;
-    numer.div_ceil(block_size).checked_add(1).ok_or(SchedulerError::Block(BlockError::Overflow))
+    let numer = (window_size - 1)
+        .checked_add(span_tokens)
+        .ok_or(SchedulerError::Block(BlockError::Overflow))?;
+    numer
+        .div_ceil(block_size)
+        .checked_add(1)
+        .ok_or(SchedulerError::Block(BlockError::Overflow))
 }
 
 /// Logical block range `{p / B : p in lo..=hi}` (`{}` when `hi < lo`).
@@ -127,7 +140,9 @@ pub fn worst_case_blocks_checked(
     let full = ceil_div_u32(target_pos, block_size)?;
     let bound = span_bound_blocks(max_span, block_size, window_size)?;
     let win = bound.min(full);
-    let total = full.checked_add(win).ok_or(SchedulerError::Block(BlockError::Overflow))?;
+    let total = full
+        .checked_add(win)
+        .ok_or(SchedulerError::Block(BlockError::Overflow))?;
     Ok((full, win, total))
 }
 
@@ -170,8 +185,17 @@ impl TrackedBlockAllocator {
     ) -> Result<Self, SchedulerError> {
         cfg.validate()?;
         let num_blocks = cfg.num_blocks();
-        let geo = Geometry { block: cfg.block_size, window: cfg.window_size, every: 1, blocks: num_blocks };
-        let pools = BlockPools::with_capacities(cfg.full_capacity as usize, cfg.window_capacity as usize, cfg.kvb)?;
+        let geo = Geometry {
+            block: cfg.block_size,
+            window: cfg.window_size,
+            every: 1,
+            blocks: num_blocks,
+        };
+        let pools = BlockPools::with_capacities(
+            cfg.full_capacity as usize,
+            cfg.window_capacity as usize,
+            cfg.kvb,
+        )?;
         let full_meta = vec![(0u32, vec![0u8; cfg.block_size as usize]); cfg.full_capacity as usize];
         let win_meta = vec![(0u32, vec![0u8; cfg.block_size as usize]); cfg.window_capacity as usize];
 
@@ -205,8 +229,12 @@ impl TrackedBlockAllocator {
         };
         emit_block_layout_event(event_sink, &BlockLayoutEvent::Config(alloc.cfg.clone()))?;
         emit_block_layout_config(state_sink, &alloc.cfg)?;
-        let init_step =
-            BlockLayoutStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: alloc.snapshot_state()? };
+        let init_step = BlockLayoutStep {
+            seq: 0,
+            action: "Init".into(),
+            args: BTreeMap::new(),
+            state: alloc.snapshot_state()?,
+        };
         emit_block_layout_step(state_sink, &init_step)?;
         alloc.assert_invariants()?;
         Ok(alloc)
@@ -236,7 +264,11 @@ impl TrackedBlockAllocator {
 
     /// Physical `blocks::Slot` passed into `crate::blocks::byte_offset`: `slot_base + local_slot`.
     fn physical_slot(&self, local_slot: Slot) -> Result<Slot, SchedulerError> {
-        let idx = self.cfg.slot_base.checked_add(local_slot.get()).ok_or(BlockError::Overflow)?;
+        let idx = self
+            .cfg
+            .slot_base
+            .checked_add(local_slot.get())
+            .ok_or(BlockError::Overflow)?;
         Ok(Slot::new(idx)?)
     }
 
@@ -298,7 +330,12 @@ impl TrackedBlockAllocator {
     ) -> Result<(), SchedulerError> {
         self.seq += 1;
         emit_block_layout_event(event_sink, &ev)?;
-        let step = BlockLayoutStep { seq: self.seq, action: action.into(), args, state: self.snapshot_state()? };
+        let step = BlockLayoutStep {
+            seq: self.seq,
+            action: action.into(),
+            args,
+            state: self.snapshot_state()?,
+        };
         emit_block_layout_step(state_sink, &step)?;
         self.assert_invariants()
     }
@@ -332,7 +369,12 @@ impl TrackedBlockAllocator {
         self.record_step(
             "Prepare",
             args,
-            BlockLayoutEvent::Prepare { lane: lane.into(), tokens: span_tokens, budget, pos: pos_before },
+            BlockLayoutEvent::Prepare {
+                lane: lane.into(),
+                tokens: span_tokens,
+                budget,
+                pos: pos_before,
+            },
             event_sink,
             state_sink,
         )
@@ -383,7 +425,11 @@ impl TrackedBlockAllocator {
         }
 
         let entry = BlockEntry::new(slot, new_gen, offset, kind, kvb);
-        self.lanes.get_mut(lane).unwrap().table.set(kind, BlockIndex::new(block), Some(entry))?;
+        self.lanes
+            .get_mut(lane)
+            .unwrap()
+            .table
+            .set(kind, BlockIndex::new(block), Some(entry))?;
 
         let mut args = BTreeMap::new();
         args.insert("lane".into(), JsonVal::str(lane));
@@ -426,7 +472,11 @@ impl TrackedBlockAllocator {
                     .table
                     .get(k, BlockIndex::new(b))?
                     .ok_or(SchedulerError::Precondition("missing needed block before begin_step"))?;
-                pins.insert(PinHandleSnapshot { kind: e.kind(), slot: e.slot().get(), generation: e.generation() });
+                pins.insert(PinHandleSnapshot {
+                    kind: e.kind(),
+                    slot: e.slot().get(),
+                    generation: e.generation(),
+                });
             }
             pins
         };
@@ -540,8 +590,13 @@ impl TrackedBlockAllocator {
                 return Err(SchedulerError::Precondition("slide_window requires idle lane"));
             }
             let keep: BTreeSet<u32> =
-                history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size).into_iter().collect();
-            l.table.entries().filter(|(b, e)| e.kind() == BlockKind::Window && !keep.contains(&b.get())).collect()
+                history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size)
+                    .into_iter()
+                    .collect();
+            l.table
+                .entries()
+                .filter(|(b, e)| e.kind() == BlockKind::Window && !keep.contains(&b.get()))
+                .collect()
         };
         if pruned.is_empty() {
             return Ok(false);
@@ -579,16 +634,20 @@ impl TrackedBlockAllocator {
             }
             let mut st = BlockTable::new(num_blocks)?;
             let mut held = Vec::new();
-            let retained_iter =
-                full_blocks(l.pos, self.cfg.block_size).into_iter().map(|b| (BlockKind::Full, b)).chain(
+            let retained_iter = full_blocks(l.pos, self.cfg.block_size)
+                .into_iter()
+                .map(|b| (BlockKind::Full, b))
+                .chain(
                     history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size)
                         .into_iter()
                         .map(|b| (BlockKind::Window, b)),
                 );
             for (kind, b) in retained_iter {
                 let bi = BlockIndex::new(b);
-                let e =
-                    l.table.get(kind, bi)?.ok_or(SchedulerError::Precondition("missing retained block at boundary"))?;
+                let e = l
+                    .table
+                    .get(kind, bi)?
+                    .ok_or(SchedulerError::Precondition("missing retained block at boundary"))?;
                 st.set(kind, bi, Some(e))?;
                 held.push(e);
             }
@@ -627,7 +686,13 @@ impl TrackedBlockAllocator {
             self.release_slot(e.kind(), e.slot())?;
         }
         self.start_kept = false;
-        self.record_step("DropStart", BTreeMap::new(), BlockLayoutEvent::DropStart, event_sink, state_sink)
+        self.record_step(
+            "DropStart",
+            BTreeMap::new(),
+            BlockLayoutEvent::DropStart,
+            event_sink,
+            state_sink,
+        )
     }
 
     pub fn match_start(
@@ -660,7 +725,13 @@ impl TrackedBlockAllocator {
         let mut args = BTreeMap::new();
         args.insert("lane".into(), JsonVal::str(lane));
         args.insert("pos".into(), JsonVal::uint(p));
-        self.record_step("Match", args, BlockLayoutEvent::Match { lane: lane.into(), pos: p }, event_sink, state_sink)
+        self.record_step(
+            "Match",
+            args,
+            BlockLayoutEvent::Match { lane: lane.into(), pos: p },
+            event_sink,
+            state_sink,
+        )
     }
 
     pub fn finish(
@@ -687,11 +758,18 @@ impl TrackedBlockAllocator {
         }
         let mut args = BTreeMap::new();
         args.insert("lane".into(), JsonVal::str(lane));
-        self.record_step("Finish", args, BlockLayoutEvent::Finish { lane: lane.into() }, event_sink, state_sink)
+        self.record_step(
+            "Finish",
+            args,
+            BlockLayoutEvent::Finish { lane: lane.into() },
+            event_sink,
+            state_sink,
+        )
     }
 
     pub fn snapshot_state(&self) -> Result<BlockLayoutState, TraceError> {
-        let (full_pool, window_pool) = BlockLayoutState::snapshot_pools(&self.pools, &self.full_meta, &self.win_meta)?;
+        let (full_pool, window_pool) =
+            BlockLayoutState::snapshot_pools(&self.pools, &self.full_meta, &self.win_meta)?;
         let num_blocks = self.cfg.num_blocks();
         let mut table = BTreeMap::new();
         let mut pos = BTreeMap::new();
@@ -777,7 +855,8 @@ impl TrackedBlockAllocator {
                 }
             }
             if l.phase == "step" {
-                let need_bound = span_bound_blocks(l.target - l.span_start, self.cfg.block_size, self.cfg.window_size)?;
+                let need_bound =
+                    span_bound_blocks(l.target - l.span_start, self.cfg.block_size, self.cfg.window_size)?;
                 if l.budget < need_bound {
                     return Err(SchedulerError::InvariantViolation("SpanPinned: budget too small".into()));
                 }
@@ -785,7 +864,11 @@ impl TrackedBlockAllocator {
                     let e = l.table.get(k, BlockIndex::new(b))?.ok_or_else(|| {
                         SchedulerError::InvariantViolation("SpanPinned: missing needed table entry".into())
                     })?;
-                    let h = PinHandleSnapshot { kind: k, slot: e.slot().get(), generation: e.generation() };
+                    let h = PinHandleSnapshot {
+                        kind: k,
+                        slot: e.slot().get(),
+                        generation: e.generation(),
+                    };
                     if !l.pin.contains(&h) {
                         return Err(SchedulerError::InvariantViolation("SpanPinned: handle not pinned".into()));
                     }
@@ -793,7 +876,9 @@ impl TrackedBlockAllocator {
                 for h in &l.pin {
                     let rec = self.pools.of(h.kind).record(Slot::new(h.slot)?)?;
                     if rec.generation() != h.generation {
-                        return Err(SchedulerError::InvariantViolation("SpanPinned: pinned generation mutated".into()));
+                        return Err(SchedulerError::InvariantViolation(
+                            "SpanPinned: pinned generation mutated".into(),
+                        ));
                     }
                 }
             }
@@ -807,8 +892,10 @@ impl TrackedBlockAllocator {
                 *expected_refs.entry((rk(e.kind()), e.slot().get())).or_default() += 1;
                 check_entry(e.kind(), b.get(), &e)?;
             }
-            let retained_iter =
-                full_blocks(self.start_pos, self.cfg.block_size).into_iter().map(|b| (BlockKind::Full, b)).chain(
+            let retained_iter = full_blocks(self.start_pos, self.cfg.block_size)
+                .into_iter()
+                .map(|b| (BlockKind::Full, b))
+                .chain(
                     history_blocks(self.start_pos, self.cfg.block_size, self.cfg.window_size)
                         .into_iter()
                         .map(|b| (BlockKind::Window, b)),
@@ -846,7 +933,10 @@ impl TrackedBlockAllocator {
                         .lanes
                         .values()
                         .filter(|l| {
-                            l.phase != "done" && l.table.entries().any(|(_, e)| e.kind() == kind && e.slot().get() == s)
+                            l.phase != "done"
+                                && l.table
+                                    .entries()
+                                    .any(|(_, e)| e.kind() == kind && e.slot().get() == s)
                         })
                         .count();
                     if owners > 1 {
@@ -1046,8 +1136,12 @@ impl CacheScheduler {
         };
         emit_cache_scheduler_event(event_sink, &CacheSchedulerEvent::Config(sched.cfg.clone()))?;
         emit_cache_scheduler_config(state_sink, &sched.cfg)?;
-        let init_step =
-            CacheSchedulerStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: sched.snapshot_state() };
+        let init_step = CacheSchedulerStep {
+            seq: 0,
+            action: "Init".into(),
+            args: BTreeMap::new(),
+            state: sched.snapshot_state(),
+        };
         emit_cache_scheduler_step(state_sink, &init_step)?;
         sched.assert_invariants()?;
         Ok(sched)
@@ -1088,11 +1182,17 @@ impl CacheScheduler {
     }
 
     pub fn state_mem_used(&self) -> u32 {
-        self.start_points.values().filter(|sp| sp.kept && sp.state_in_mem()).count() as u32
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && sp.state_in_mem())
+            .count() as u32
     }
 
     pub fn state_disk_used(&self) -> u32 {
-        self.start_points.values().filter(|sp| sp.kept && sp.state_on_disk()).count() as u32
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && sp.state_on_disk())
+            .count() as u32
     }
 
     pub fn reserved_total(&self) -> u32 {
@@ -1112,9 +1212,14 @@ impl CacheScheduler {
     }
 
     pub fn worst_case_for(&self, target: u32) -> u32 {
-        worst_case_blocks_checked(target, self.cfg.max_span, self.cfg.block_size, self.cfg.window_size)
-            .expect("validated CacheSchedulerConfig bounds")
-            .2
+        worst_case_blocks_checked(
+            target,
+            self.cfg.max_span,
+            self.cfg.block_size,
+            self.cfg.window_size,
+        )
+        .expect("validated CacheSchedulerConfig bounds")
+        .2
     }
 
     fn prompt_end_of(&self, target: u32) -> u32 {
@@ -1130,7 +1235,11 @@ impl CacheScheduler {
     }
 
     fn lane_blocks_of(l: &SchedLane) -> BTreeSet<CacheBlockId> {
-        l.full.iter().chain(l.win.iter()).filter_map(|x| x.clone()).collect()
+        l.full
+            .iter()
+            .chain(l.win.iter())
+            .filter_map(|x| x.clone())
+            .collect()
     }
 
     fn lane_referrers(&self, id: &CacheBlockId) -> BTreeSet<String> {
@@ -1145,7 +1254,10 @@ impl CacheScheduler {
     }
 
     fn start_referrers_count(&self, id: &CacheBlockId) -> u32 {
-        self.start_points.values().filter(|sp| sp.kept && (sp.full.contains(id) || sp.win.contains(id))).count() as u32
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && (sp.full.contains(id) || sp.win.contains(id)))
+            .count() as u32
     }
 
     fn sync_ref_counts(&mut self) {
@@ -1169,13 +1281,22 @@ impl CacheScheduler {
         self.cfg
             .boundaries()
             .into_iter()
-            .filter(|&k| k <= max_pos && self.start_points.get(&(prefix.to_owned(), k)).is_some_and(|sp| sp.kept))
+            .filter(|&k| {
+                k <= max_pos
+                    && self
+                        .start_points
+                        .get(&(prefix.to_owned(), k))
+                        .is_some_and(|sp| sp.kept)
+            })
             .max()
             .unwrap_or(0)
     }
 
     fn need_full_for_span(&self, l: &SchedLane, c: u32) -> Vec<u32> {
-        full_blocks(l.pos + c, self.cfg.block_size).into_iter().filter(|&i| l.full[i as usize].is_none()).collect()
+        full_blocks(l.pos + c, self.cfg.block_size)
+            .into_iter()
+            .filter(|&i| l.full[i as usize].is_none())
+            .collect()
     }
 
     fn need_win_for_span(&self, l: &SchedLane, c: u32) -> Vec<u32> {
@@ -1194,7 +1315,9 @@ impl CacheScheduler {
             1
         } else {
             let pend = self.prompt_end_of(l.target);
-            self.cfg.max_span.min(self.cfg.step_token_budget.min(pend.saturating_sub(l.pos)))
+            self.cfg
+                .max_span
+                .min(self.cfg.step_token_budget.min(pend.saturating_sub(l.pos)))
         }
     }
 
@@ -1216,16 +1339,29 @@ impl CacheScheduler {
 
     fn window_pruned(&self, l: &SchedLane) -> bool {
         let keep: BTreeSet<u32> =
-            history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size).into_iter().collect();
-        l.win.iter().enumerate().all(|(i, opt)| opt.is_none() || keep.contains(&(i as u32)))
+            history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size)
+                .into_iter()
+                .collect();
+        l.win
+            .iter()
+            .enumerate()
+            .all(|(i, opt)| opt.is_none() || keep.contains(&(i as u32)))
     }
 
     fn start_state_ready(&self, l: &SchedLane) -> bool {
-        l.pos == 0 || self.start_points.get(&(l.prefix.clone(), l.pos)).is_some_and(|sp| sp.kept && sp.state_in_mem())
+        l.pos == 0
+            || self
+                .start_points
+                .get(&(l.prefix.clone(), l.pos))
+                .is_some_and(|sp| sp.kept && sp.state_in_mem())
     }
 
     fn restoring_start_need(&self) -> BTreeSet<(String, u32)> {
-        self.lanes.values().filter(|l| l.state == "Restoring" && l.pos > 0).map(|l| (l.prefix.clone(), l.pos)).collect()
+        self.lanes
+            .values()
+            .filter(|l| l.state == "Restoring" && l.pos > 0)
+            .map(|l| (l.prefix.clone(), l.pos))
+            .collect()
     }
 
     fn cold_mem_states(&self) -> Vec<(String, u32)> {
@@ -1292,10 +1428,12 @@ impl CacheScheduler {
             return false;
         }
         let restoring_blocked = self.mem_used() >= self.cfg.mem_budget
-            && self
-                .lanes
-                .values()
-                .any(|l| l.state == "Restoring" && Self::lane_blocks_of(l).iter().any(|b| !self.blocks[b].in_memory()));
+            && self.lanes.values().any(|l| {
+                l.state == "Restoring"
+                    && Self::lane_blocks_of(l)
+                        .iter()
+                        .any(|b| !self.blocks[b].in_memory())
+            });
         let steppable_need: u32 = self
             .lanes
             .values()
@@ -1314,7 +1452,10 @@ impl CacheScheduler {
             && self.lanes.values().any(|l| {
                 l.state == "Restoring"
                     && l.pos > 0
-                    && self.start_points.get(&(l.prefix.clone(), l.pos)).is_some_and(|sp| sp.state_tier == "disk")
+                    && self
+                        .start_points
+                        .get(&(l.prefix.clone(), l.pos))
+                        .is_some_and(|sp| sp.state_tier == "disk")
             });
         let steppable_need: u32 = self
             .lanes
@@ -1328,7 +1469,8 @@ impl CacheScheduler {
             })
             .sum();
         let has_steppable = self.lanes.values().any(|l| l.state == "Ready" && l.pos < l.target);
-        restoring_blocked || (has_steppable && self.state_mem_used() + steppable_need > self.state_mem_budget())
+        restoring_blocked
+            || (has_steppable && self.state_mem_used() + steppable_need > self.state_mem_budget())
     }
 
     fn can_fit_request(&self, req_len: u32) -> bool {
@@ -1405,7 +1547,12 @@ impl CacheScheduler {
     ) -> Result<(), SchedulerError> {
         self.seq += 1;
         emit_cache_scheduler_event(event_sink, &ev)?;
-        let step = CacheSchedulerStep { seq: self.seq, action: action.into(), args, state: self.snapshot_state() };
+        let step = CacheSchedulerStep {
+            seq: self.seq,
+            action: action.into(),
+            args,
+            state: self.snapshot_state(),
+        };
         emit_cache_scheduler_step(state_sink, &step)?;
         self.assert_invariants()
     }
@@ -1421,15 +1568,21 @@ impl CacheScheduler {
         if !self.cfg.prefixes.iter().any(|p| p == prefix) || !self.cfg.request_lengths.contains(&req_len) {
             return Err(SchedulerError::Precondition("unknown prefix or disallowed request length"));
         }
-        let state_ok =
-            self.lanes.get(lane).is_some_and(|l| matches!(l.state, "Idle" | "Refused" | "Cancelled" | "Finished"));
+        let state_ok = self
+            .lanes
+            .get(lane)
+            .is_some_and(|l| matches!(l.state, "Idle" | "Refused" | "Cancelled" | "Finished"));
         if !state_ok {
             return Err(SchedulerError::Precondition("arrive requires Idle/Refused/Cancelled/Finished lane"));
         }
 
         let wc = self.worst_case_for(req_len);
-        let queued_names: Vec<String> =
-            self.lanes.iter().filter(|(_, l)| l.state == "Queued").map(|(n, _)| n.clone()).collect();
+        let queued_names: Vec<String> = self
+            .lanes
+            .iter()
+            .filter(|(_, l)| l.state == "Queued")
+            .map(|(n, _)| n.clone())
+            .collect();
         let q_cnt = queued_names.len() as u32;
         let can_enqueue = wc <= self.cfg.mem_budget && q_cnt < self.cfg.max_queue;
         let can_direct_admit = wc <= self.cfg.mem_budget
@@ -1508,9 +1661,11 @@ impl CacheScheduler {
                 target: req_len,
                 state: "Admitted".into(),
             },
-            ArriveOutcome::Refused429 { .. } => {
-                CacheSchedulerEvent::Refuse429 { lane: lane.into(), prefix: prefix.into(), target: req_len }
-            }
+            ArriveOutcome::Refused429 { .. } => CacheSchedulerEvent::Refuse429 {
+                lane: lane.into(),
+                prefix: prefix.into(),
+                target: req_len,
+            },
         };
         self.record_step("Arrive", args, ev, event_sink, state_sink)?;
         Ok(outcome)
@@ -1528,7 +1683,12 @@ impl CacheScheduler {
         let target = self.lanes[lane].target;
         let wc = self.worst_case_for(target);
         let max_byp = self.cfg.max_bypass;
-        let older: Vec<String> = self.queue_seq.iter().take_while(|x| x.as_str() != lane).cloned().collect();
+        let older: Vec<String> = self
+            .queue_seq
+            .iter()
+            .take_while(|x| x.as_str() != lane)
+            .cloned()
+            .collect();
         for qname in &older {
             let q = self.lanes.get_mut(qname).unwrap();
             if q.state == "Queued" {
@@ -1617,7 +1777,11 @@ impl CacheScheduler {
         self.record_step(
             "BeginRestore",
             args,
-            CacheSchedulerEvent::BeginRestore { lane: lane.into(), pos: k, reservation: wc },
+            CacheSchedulerEvent::BeginRestore {
+                lane: lane.into(),
+                pos: k,
+                reservation: wc,
+            },
             event_sink,
             state_sink,
         )?;
@@ -1667,7 +1831,12 @@ impl CacheScheduler {
         self.record_step(
             "RestoreBlock",
             args,
-            CacheSchedulerEvent::RestoreBlock { lane: lane.into(), prefix: prefix.clone(), kind: *kind, block: *idx },
+            CacheSchedulerEvent::RestoreBlock {
+                lane: lane.into(),
+                prefix: prefix.clone(),
+                kind: *kind,
+                block: *idx,
+            },
             event_sink,
             state_sink,
         )
@@ -1714,7 +1883,11 @@ impl CacheScheduler {
         self.record_step(
             "RestoreStartState",
             args,
-            CacheSchedulerEvent::RestoreStartState { lane: lane.into(), prefix, boundary },
+            CacheSchedulerEvent::RestoreStartState {
+                lane: lane.into(),
+                prefix,
+                boundary,
+            },
             event_sink,
             state_sink,
         )
@@ -1732,9 +1905,7 @@ impl CacheScheduler {
                 || !Self::lane_blocks_of(l).iter().all(|b| self.blocks[b].in_memory())
                 || !self.start_state_ready(l)
             {
-                return Err(SchedulerError::Precondition(
-                    "finish_restore requires all lane blocks and start state in memory",
-                ));
+                return Err(SchedulerError::Precondition("finish_restore requires all lane blocks and start state in memory"));
             }
         }
         self.lanes.get_mut(lane).unwrap().state = "Ready";
@@ -1783,7 +1954,11 @@ impl CacheScheduler {
         self.record_step(
             "EvictCleanOrUnrefMem",
             args,
-            CacheSchedulerEvent::EvictMem { prefix: prefix.clone(), kind: *kind, block: *idx },
+            CacheSchedulerEvent::EvictMem {
+                prefix: prefix.clone(),
+                kind: *kind,
+                block: *idx,
+            },
             event_sink,
             state_sink,
         )?;
@@ -1823,7 +1998,11 @@ impl CacheScheduler {
         self.record_step(
             "StartColdWriteback",
             args,
-            CacheSchedulerEvent::StartWriteback { prefix: prefix.clone(), kind: *kind, block: *idx },
+            CacheSchedulerEvent::StartWriteback {
+                prefix: prefix.clone(),
+                kind: *kind,
+                block: *idx,
+            },
             event_sink,
             state_sink,
         )?;
@@ -1887,7 +2066,10 @@ impl CacheScheduler {
         self.record_step(
             "EvictCleanStartState",
             args,
-            CacheSchedulerEvent::EvictStartState { prefix: victim.0.clone(), boundary: victim.1 },
+            CacheSchedulerEvent::EvictStartState {
+                prefix: victim.0.clone(),
+                boundary: victim.1,
+            },
             event_sink,
             state_sink,
         )?;
@@ -1917,7 +2099,10 @@ impl CacheScheduler {
         self.record_step(
             "SpillStartState",
             args,
-            CacheSchedulerEvent::SpillStartState { prefix: victim.0.clone(), boundary: victim.1 },
+            CacheSchedulerEvent::SpillStartState {
+                prefix: victim.0.clone(),
+                boundary: victim.1,
+            },
             event_sink,
             state_sink,
         )?;
@@ -1948,8 +2133,10 @@ impl CacheScheduler {
                         *b = SchedBlock::empty(bsz);
                     }
                 } else {
-                    let cold_union: BTreeSet<CacheBlockId> =
-                        cold_disk.into_iter().chain(self.cold_mem_blocks()).collect();
+                    let cold_union: BTreeSet<CacheBlockId> = cold_disk
+                        .into_iter()
+                        .chain(self.cold_mem_blocks())
+                        .collect();
                     let victim_pk = self
                         .start_points
                         .iter()
@@ -1975,8 +2162,11 @@ impl CacheScheduler {
             }
         }
         if st_disk_full {
-            let candidates: BTreeSet<(String, u32)> =
-                self.cold_disk_states().into_iter().chain(self.cold_mem_states()).collect();
+            let candidates: BTreeSet<(String, u32)> = self
+                .cold_disk_states()
+                .into_iter()
+                .chain(self.cold_mem_states())
+                .collect();
             let victim_pk = candidates
                 .into_iter()
                 .filter(|pk| {
@@ -2019,7 +2209,11 @@ impl CacheScheduler {
         self.record_step(
             "DropUnreferenced",
             args,
-            CacheSchedulerEvent::DropUnreferenced { prefix: prefix.clone(), kind: *kind, block: *idx },
+            CacheSchedulerEvent::DropUnreferenced {
+                prefix: prefix.clone(),
+                kind: *kind,
+                block: *idx,
+            },
             event_sink,
             state_sink,
         )
@@ -2036,7 +2230,9 @@ impl CacheScheduler {
             if l.state != "Ready" {
                 return Err(SchedulerError::Precondition("slide_window requires Ready lane"));
             }
-            history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size).into_iter().collect()
+            history_blocks(l.pos, self.cfg.block_size, self.cfg.window_size)
+                .into_iter()
+                .collect()
         };
         let mut changed = false;
         {
@@ -2092,7 +2288,13 @@ impl CacheScheduler {
         self.sync_ref_counts();
         let mut args = BTreeMap::new();
         args.insert("lane".into(), JsonVal::str(lane));
-        self.record_step("FinishReady", args, CacheSchedulerEvent::Finish { lane: lane.into() }, event_sink, state_sink)
+        self.record_step(
+            "FinishReady",
+            args,
+            CacheSchedulerEvent::Finish { lane: lane.into() },
+            event_sink,
+            state_sink,
+        )
     }
 
     pub fn build_step(
@@ -2102,9 +2304,7 @@ impl CacheScheduler {
         state_sink: &mut dyn TraceSink,
     ) -> Result<(), SchedulerError> {
         if self.step_active || !self.step_io.is_empty() || spans.is_empty() {
-            return Err(SchedulerError::Precondition(
-                "build_step requires inactive step, empty step_io, and non-empty spans",
-            ));
+            return Err(SchedulerError::Precondition("build_step requires inactive step, empty step_io, and non-empty spans"));
         }
         let mut chosen = BTreeSet::new();
         let mut span_map: BTreeMap<String, u32> = self.cfg.lanes.iter().map(|l| (l.clone(), 0)).collect();
@@ -2134,8 +2334,12 @@ impl CacheScheduler {
             return Err(SchedulerError::Precondition("total step tokens exceed step_token_budget"));
         }
 
-        let steppable: Vec<String> =
-            self.lanes.iter().filter(|(_, l)| l.state == "Ready" && l.pos < l.target).map(|(n, _)| n.clone()).collect();
+        let steppable: Vec<String> = self
+            .lanes
+            .iter()
+            .filter(|(_, l)| l.state == "Ready" && l.pos < l.target)
+            .map(|(n, _)| n.clone())
+            .collect();
         let max_w = steppable.iter().map(|n| self.lanes[n].wait_ticks).max().unwrap();
 
         let mut new_ids = BTreeSet::new();
@@ -2154,14 +2358,15 @@ impl CacheScheduler {
             }
         }
         let alloc_cnt = new_ids.len() as u32;
-        let new_st_mem = new_bnds.iter().filter(|pk| !self.start_points[*pk].state_in_mem()).count() as u32;
+        let new_st_mem = new_bnds
+            .iter()
+            .filter(|pk| !self.start_points[*pk].state_in_mem())
+            .count() as u32;
         if self.mem_used() + alloc_cnt > self.cfg.mem_budget
             || self.state_mem_used() + new_st_mem > self.state_mem_budget()
             || new_ids.iter().any(|id| self.blocks[id].tier != "none")
         {
-            return Err(SchedulerError::Precondition(
-                "insufficient memory/state budget or private tail already active",
-            ));
+            return Err(SchedulerError::Precondition("insufficient memory/state budget or private tail already active"));
         }
 
         let mem_used_now = self.mem_used();
@@ -2209,8 +2414,11 @@ impl CacheScheduler {
             return Err(SchedulerError::Precondition("decode priority or longest-waiting leader violated"));
         }
 
-        let bypassed: BTreeSet<String> =
-            self.actionable_waiting().into_iter().filter(|n| !chosen.contains(n)).collect();
+        let bypassed: BTreeSet<String> = self
+            .actionable_waiting()
+            .into_iter()
+            .filter(|n| !chosen.contains(n))
+            .collect();
         if bypassed.iter().any(|w| self.lanes[w].wait_ticks >= self.cfg.max_bypass) {
             return Err(SchedulerError::Precondition("StepBypassed lane would exceed MaxBypass"));
         }
@@ -2298,15 +2506,13 @@ impl CacheScheduler {
             .iter()
             .filter_map(|l| {
                 let t = self.step_span[l];
-                if t > 0 {
-                    Some((l.clone(), t))
-                } else {
-                    None
-                }
+                if t > 0 { Some((l.clone(), t)) } else { None }
             })
             .collect();
-        let spans_obj: BTreeMap<String, JsonVal> =
-            ordered_spans.iter().map(|(l, t)| (l.clone(), JsonVal::uint(*t))).collect();
+        let spans_obj: BTreeMap<String, JsonVal> = ordered_spans
+            .iter()
+            .map(|(l, t)| (l.clone(), JsonVal::uint(*t)))
+            .collect();
         let mut args = BTreeMap::new();
         args.insert("spans".into(), JsonVal::Obj(spans_obj));
         self.record_step(
@@ -2344,8 +2550,12 @@ impl CacheScheduler {
             }
         }
 
-        let all_steppable_max_w =
-            self.lanes.values().filter(|l| l.state == "Ready" && l.pos < l.target).map(|l| l.wait_ticks).max()?;
+        let all_steppable_max_w = self
+            .lanes
+            .values()
+            .filter(|l| l.state == "Ready" && l.pos < l.target)
+            .map(|l| l.wait_ticks)
+            .max()?;
 
         let leader = steppable
             .iter()
@@ -2367,7 +2577,10 @@ impl CacheScheduler {
                     bnds.insert(pk);
                 }
             }
-            let new_st = bnds.iter().filter(|pk| !self.start_points[*pk].state_in_mem()).count() as u32;
+            let new_st = bnds
+                .iter()
+                .filter(|pk| !self.start_points[*pk].state_in_mem())
+                .count() as u32;
             self.mem_used() + tot_alloc <= self.cfg.mem_budget
                 && self.state_mem_used() + new_st <= self.state_mem_budget()
         };
@@ -2422,8 +2635,11 @@ impl CacheScheduler {
                 if self.is_prefilling(l) && used_tokens < self.cfg.step_token_budget {
                     let cur = chosen[&n];
                     let pend = self.prompt_end_of(l.target);
-                    let max_cap =
-                        self.cfg.max_span.min(pend - l.pos).min(cur + (self.cfg.step_token_budget - used_tokens));
+                    let max_cap = self
+                        .cfg
+                        .max_span
+                        .min(pend - l.pos)
+                        .min(cur + (self.cfg.step_token_budget - used_tokens));
                     for cand in (cur + 1..=max_cap).rev() {
                         let mut trial = chosen.clone();
                         trial.insert(n.clone(), cand);
@@ -2442,7 +2658,11 @@ impl CacheScheduler {
                 let l = &self.lanes[n];
                 if !chosen.contains_key(n) && self.is_prefilling(l) {
                     let pend = self.prompt_end_of(l.target);
-                    let max_cap = self.cfg.max_span.min(pend - l.pos).min(self.cfg.step_token_budget - used_tokens);
+                    let max_cap = self
+                        .cfg
+                        .max_span
+                        .min(pend - l.pos)
+                        .min(self.cfg.step_token_budget - used_tokens);
                     for cand in (1..=max_cap).rev() {
                         let mut trial = chosen.clone();
                         trial.insert(n.clone(), cand);
@@ -2462,7 +2682,13 @@ impl CacheScheduler {
             }
         }
 
-        Some(self.cfg.lanes.iter().filter_map(|l| chosen.get(l).map(|&t| (l.clone(), t))).collect())
+        Some(
+            self.cfg
+                .lanes
+                .iter()
+                .filter_map(|l| chosen.get(l).map(|&t| (l.clone(), t)))
+                .collect(),
+        )
     }
 
     pub fn gpu_execute(
@@ -2493,7 +2719,13 @@ impl CacheScheduler {
             }
         }
         self.gpu_done = true;
-        self.record_step("GpuExecute", BTreeMap::new(), CacheSchedulerEvent::GpuExecute, event_sink, state_sink)
+        self.record_step(
+            "GpuExecute",
+            BTreeMap::new(),
+            CacheSchedulerEvent::GpuExecute,
+            event_sink,
+            state_sink,
+        )
     }
 
     pub fn finish_step(
@@ -2509,10 +2741,18 @@ impl CacheScheduler {
         let def_tgt = self.cfg.default_target();
         let nblk = self.cfg.num_blocks() as usize;
 
-        let surviving: BTreeSet<String> =
-            self.step_lanes.iter().filter(|l| self.lanes[*l].state == "InStep").cloned().collect();
-        let cancelling: BTreeSet<String> =
-            self.step_lanes.iter().filter(|l| self.lanes[*l].state == "Cancelling").cloned().collect();
+        let surviving: BTreeSet<String> = self
+            .step_lanes
+            .iter()
+            .filter(|l| self.lanes[*l].state == "InStep")
+            .cloned()
+            .collect();
+        let cancelling: BTreeSet<String> = self
+            .step_lanes
+            .iter()
+            .filter(|l| self.lanes[*l].state == "Cancelling")
+            .cloned()
+            .collect();
         let mut seal_map: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for ln in &surviving {
             let l = &self.lanes[ln];
@@ -2553,7 +2793,11 @@ impl CacheScheduler {
             for &bi in blks {
                 for kind in [BlockKind::Full, BlockKind::Window] {
                     let tid = CacheBlockId::Tree { prefix: pfx.clone(), kind, idx: bi };
-                    let next_tier = if matches!(self.blocks[&tid].tier, "disk" | "both") { "both" } else { "memory" };
+                    let next_tier = if matches!(self.blocks[&tid].tier, "disk" | "both") {
+                        "both"
+                    } else {
+                        "memory"
+                    };
                     let prev_refs = self.blocks[&tid].ref_count;
                     self.blocks.insert(
                         tid,
@@ -2570,7 +2814,11 @@ impl CacheScheduler {
                 }
                 let bnd = (bi + 1) * bsz;
                 let prev_st_tier = self.start_points[&(pfx.clone(), bnd)].state_tier;
-                let next_st_tier = if matches!(prev_st_tier, "disk" | "both") { "both" } else { "memory" };
+                let next_st_tier = if matches!(prev_st_tier, "disk" | "both") {
+                    "both"
+                } else {
+                    "memory"
+                };
                 let full_set: BTreeSet<CacheBlockId> = full_blocks(bnd, bsz)
                     .into_iter()
                     .map(|i| CacheBlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: i })
@@ -2617,10 +2865,16 @@ impl CacheScheduler {
             let l = self.lanes.get_mut(ln).unwrap();
             l.pos += span;
             for bi in sealed_blks {
-                l.full[bi as usize] =
-                    Some(CacheBlockId::Tree { prefix: l.prefix.clone(), kind: BlockKind::Full, idx: bi });
-                l.win[bi as usize] =
-                    Some(CacheBlockId::Tree { prefix: l.prefix.clone(), kind: BlockKind::Window, idx: bi });
+                l.full[bi as usize] = Some(CacheBlockId::Tree {
+                    prefix: l.prefix.clone(),
+                    kind: BlockKind::Full,
+                    idx: bi,
+                });
+                l.win[bi as usize] = Some(CacheBlockId::Tree {
+                    prefix: l.prefix.clone(),
+                    kind: BlockKind::Window,
+                    idx: bi,
+                });
             }
             l.state = "Ready";
         }
@@ -2649,7 +2903,11 @@ impl CacheScheduler {
         event_sink: &mut dyn TraceSink,
         state_sink: &mut dyn TraceSink,
     ) -> Result<&'static str, SchedulerError> {
-        let cur_state = self.lanes.get(lane).ok_or(SchedulerError::Precondition("unknown lane"))?.state;
+        let cur_state = self
+            .lanes
+            .get(lane)
+            .ok_or(SchedulerError::Precondition("unknown lane"))?
+            .state;
         if !matches!(cur_state, "Queued" | "Admitted" | "Restoring" | "Ready" | "InStep") {
             return Err(SchedulerError::Precondition("cancel requires active non-cancelling lane"));
         }
@@ -2681,7 +2939,10 @@ impl CacheScheduler {
         self.record_step(
             "Cancel",
             args,
-            CacheSchedulerEvent::Cancel { lane: lane.into(), state: next_state.into() },
+            CacheSchedulerEvent::Cancel {
+                lane: lane.into(),
+                state: next_state.into(),
+            },
             event_sink,
             state_sink,
         )?;
@@ -2778,13 +3039,21 @@ impl CacheScheduler {
                 for i in pend_blk..self.cfg.num_blocks() {
                     for id in [&l.full[i as usize], &l.win[i as usize]].into_iter().flatten() {
                         if !matches!(id, CacheBlockId::Priv { .. }) || self.blocks[id].sealed {
-                            return Err(SchedulerError::InvariantViolation("NoDecodeBlocksSealed violated".into()));
+                            return Err(SchedulerError::InvariantViolation(
+                                "NoDecodeBlocksSealed violated".into(),
+                            ));
                         }
                     }
                 }
             }
         }
-        let max_prefill_bnd = self.cfg.request_lengths.iter().map(|&r| self.prompt_end_of(r)).max().unwrap_or(0);
+        let max_prefill_bnd = self
+            .cfg
+            .request_lengths
+            .iter()
+            .map(|&r| self.prompt_end_of(r))
+            .max()
+            .unwrap_or(0);
         for ((_, bnd), sp) in &self.start_points {
             if sp.kept && (*bnd > max_prefill_bnd || sp.state_tier == "none") {
                 return Err(SchedulerError::InvariantViolation(
@@ -2819,7 +3088,9 @@ impl CacheScheduler {
                     || self.start_referrers_count(id) != 0
                     || b.data[b.length as usize..].iter().any(|&d| d != 0)
                 {
-                    return Err(SchedulerError::InvariantViolation("UnsealedPrivateInvisibleZero violated".into()));
+                    return Err(SchedulerError::InvariantViolation(
+                        "UnsealedPrivateInvisibleZero violated".into(),
+                    ));
                 }
             }
         }
@@ -2830,7 +3101,9 @@ impl CacheScheduler {
             }
             for id in &self.step_pins {
                 if !self.blocks[id].in_memory() {
-                    return Err(SchedulerError::InvariantViolation("StepBlocksInMemoryAndOwned violated".into()));
+                    return Err(SchedulerError::InvariantViolation(
+                        "StepBlocksInMemoryAndOwned violated".into(),
+                    ));
                 }
             }
         }

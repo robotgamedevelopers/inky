@@ -12,52 +12,34 @@ fn prefill(eng: &Engine, cache: &mut ServeBlockCache, tokens: &[u32]) -> (usize,
     let run = eng.on(&lane);
     let mut state = LaneBlockState::default();
     let matched = cache.match_and_bind(
-        &mut eng.block_pool().borrow_mut(),
-        &mut lane.block_table().borrow_mut(),
-        &mut state,
-        tokens,
+        &mut eng.block_pool().borrow_mut(), &mut lane.block_table().borrow_mut(), &mut state, tokens,
     );
     let start = match matched {
-        Some((pos, cs)) => {
-            run.set_cs(&cs);
-            pos
-        }
-        None => {
-            run.reset();
-            0
-        }
+        Some((pos, cs)) => { run.set_cs(&cs); pos }
+        None => { run.reset(); 0 }
     };
     run.set_tokens(0, tokens);
     let mut pos = start;
     while pos < tokens.len() {
         let target = effective_pf_target(pos, tokens.len());
         let count = (target - pos).min(2 * BLOCK).min(eng.chunk);
-        cache
-            .ensure_span_blocks(&mut eng.block_pool().borrow_mut(), &mut lane.block_table().borrow_mut(), pos, count)
-            .unwrap();
+        cache.ensure_span_blocks(
+            &mut eng.block_pool().borrow_mut(), &mut lane.block_table().borrow_mut(), pos, count,
+        ).unwrap();
         let cb = eng.gpu.cmd();
         eng.encode_spans(&cb, &[Span { lane: &lane, p0: pos, t: count }], pos + count == tokens.len(), false);
         cb.commit();
         crate::serve::wait_committed_step(&cb, "spill model regression").unwrap();
         cache.finish_prefill_span(
-            &mut eng.block_pool().borrow_mut(),
-            &mut lane.block_table().borrow_mut(),
-            &mut state,
-            tokens,
-            pos,
-            count,
-            || run.get_cs(),
+            &mut eng.block_pool().borrow_mut(), &mut lane.block_table().borrow_mut(),
+            &mut state, tokens, pos, count, || run.get_cs(),
         );
         pos += count;
     }
-    let row: Vec<_> = eng
-        .logits()
-        .iter()
-        .map(|x| {
-            assert!(x.is_finite(), "model produced nonfinite logits at prompt length {}", tokens.len());
-            x.to_bits()
-        })
-        .collect();
+    let row: Vec<_> = eng.logits().iter().map(|x| {
+        assert!(x.is_finite(), "model produced nonfinite logits at prompt length {}", tokens.len());
+        x.to_bits()
+    }).collect();
     cache.release_lane(&mut eng.block_pool().borrow_mut(), &mut lane.block_table().borrow_mut(), &mut state);
     (start, row)
 }
@@ -66,13 +48,7 @@ fn assert_same_logits(cached: &[u32], cold: &[u32]) {
     assert!(!cold.is_empty());
     assert_eq!(cached.len(), cold.len());
     for (token, (a, b)) in cached.iter().zip(cold).enumerate() {
-        assert_eq!(
-            a,
-            b,
-            "different logits at vocabulary token {token}: {} vs {}",
-            f32::from_bits(*a),
-            f32::from_bits(*b)
-        );
+        assert_eq!(a, b, "different logits at vocabulary token {token}: {} vs {}", f32::from_bits(*a), f32::from_bits(*b));
     }
 }
 
@@ -113,10 +89,7 @@ fn restored_long_prefix_and_early_fork_match_cold_logits() {
     assert_eq!(start, boundary);
     assert_eq!(cache.stats().starts_restored, restores_before + 1);
     let reads = cache.spill_store().unwrap().stats().reads_hit - reads_before;
-    assert!(
-        reads >= (boundary / BLOCK + WINDOW / BLOCK + 1) as u64,
-        "expected all Full and Window blocks and recurrent state from SSD"
-    );
+    assert!(reads >= (boundary / BLOCK + WINDOW / BLOCK + 1) as u64, "expected all Full and Window blocks and recurrent state from SSD");
     assert_same_logits(&restored, &cold_long);
 
     let root = cache.tree.deepest_start(&long).ids[0];

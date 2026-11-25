@@ -3,8 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut entries: Vec<_> =
-        fs::read_dir(dir).expect("read src directory").map(|e| e.expect("dir entry").path()).collect();
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .expect("read src directory")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
     entries.sort();
     for path in entries {
         if path.is_dir() {
@@ -20,7 +22,11 @@ fn actual_allow_dead_code_sites(repo_root: &Path) -> BTreeSet<(String, String)> 
     collect_rs_files(&repo_root.join("src"), &mut files);
     let mut sites = BTreeSet::new();
     for path in files {
-        let rel = path.strip_prefix(repo_root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(repo_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let content = fs::read_to_string(&path).expect("read rust source");
         let lines: Vec<&str> = content.lines().collect();
         for (idx, raw) in lines.iter().enumerate() {
@@ -42,8 +48,9 @@ fn actual_allow_dead_code_sites(repo_root: &Path) -> BTreeSet<(String, String)> 
                 target = Some(nt.to_string());
                 break;
             }
-            let target =
-                target.unwrap_or_else(|| panic!("{rel}:{}: allow(dead_code) has no following item line", idx + 1));
+            let target = target.unwrap_or_else(|| {
+                panic!("{rel}:{}: allow(dead_code) has no following item line", idx + 1)
+            });
             sites.insert((rel.clone(), target));
         }
     }
@@ -53,9 +60,14 @@ fn actual_allow_dead_code_sites(repo_root: &Path) -> BTreeSet<(String, String)> 
 fn parse_ledger_sites(ledger_md: &str) -> BTreeSet<(String, String)> {
     let start_marker = "<!-- DEAD_CODE_LEDGER_START -->";
     let end_marker = "<!-- DEAD_CODE_LEDGER_END -->";
-    let start =
-        ledger_md.find(start_marker).expect("missing DEAD_CODE_LEDGER_START in docs/DEAD-CODE.md") + start_marker.len();
-    let end = ledger_md[start..].find(end_marker).expect("missing DEAD_CODE_LEDGER_END in docs/DEAD-CODE.md") + start;
+    let start = ledger_md
+        .find(start_marker)
+        .expect("missing DEAD_CODE_LEDGER_START in docs/DEAD-CODE.md")
+        + start_marker.len();
+    let end = ledger_md[start..]
+        .find(end_marker)
+        .expect("missing DEAD_CODE_LEDGER_END in docs/DEAD-CODE.md")
+        + start;
     let mut sites = BTreeSet::new();
     for line in ledger_md[start..end].lines() {
         let t = line.trim();
@@ -74,7 +86,10 @@ fn parse_ledger_sites(ledger_md: &str) -> BTreeSet<(String, String)> {
             "unexpected dead-code category '{category}' in row: {t}"
         );
         assert!(!reason.is_empty(), "missing reason in row: {t}");
-        assert!(sites.insert((file.clone(), target.clone())), "duplicate ledger entry for ({file}, {target})");
+        assert!(
+            sites.insert((file.clone(), target.clone())),
+            "duplicate ledger entry for ({file}, {target})"
+        );
     }
     sites
 }

@@ -144,7 +144,7 @@ start table-overwrite-leak check_mutant table-overwrite-leak blocks.rs tight \
 # 6. PrefixTree::deepest_start_in_namespace stopping at shallowest held start -> DeepestStartBound violated
 start shallow-prefix-match check_mutant shallow-prefix-match prefix.rs tight \
     'Invariant DeepestStartBound is violated' \
-    $'if n.starts > 0 {\n                // MUTANT_ANCHOR_DEEPEST_NS' \
+    'if n.starts > 0 { // MUTANT_ANCHOR_DEEPEST_NS' \
     'if n.starts > 0 && best_len == 0 {'
 
 # 7. SpillStore::read_block ignoring SHA-256 checksum mismatch -> CorruptSpillNeverRestored violated

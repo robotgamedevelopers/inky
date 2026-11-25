@@ -28,12 +28,21 @@ pub struct GrammarLimits {
 }
 
 impl GrammarLimits {
-    pub const DEFAULT: Self =
-        Self { max_depth: 28, max_container_items: 1024, max_string_bytes: 256 * 1024, max_ws_run: 64 };
+    pub const DEFAULT: Self = Self {
+        max_depth: 28,
+        max_container_items: 1024,
+        max_string_bytes: 256 * 1024,
+        max_ws_run: 64,
+    };
 
     #[cfg(test)]
     pub const fn adversarial_test() -> Self {
-        Self { max_depth: 8, max_container_items: 8, max_string_bytes: 48, max_ws_run: 4 }
+        Self {
+            max_depth: 8,
+            max_container_items: 8,
+            max_string_bytes: 48,
+            max_ws_run: 4,
+        }
     }
 }
 
@@ -70,7 +79,12 @@ impl VocabBytes {
             }
         }
         offsets.push(data.len() as u32);
-        Self { data, offsets, special_bits, vocab_len: n }
+        Self {
+            data,
+            offsets,
+            special_bits,
+            vocab_len: n,
+        }
     }
 
     #[inline]
@@ -139,15 +153,27 @@ struct PropValueSpec {
 
 impl PropValueSpec {
     const fn any() -> Self {
-        Self { mask: TypeMask::ANY, nested_schema: NO_SCHEMA, fixed_str: NO_FIXED_STR }
+        Self {
+            mask: TypeMask::ANY,
+            nested_schema: NO_SCHEMA,
+            fixed_str: NO_FIXED_STR,
+        }
     }
 
     const fn object(nested_schema: u16) -> Self {
-        Self { mask: TypeMask::OBJ, nested_schema, fixed_str: NO_FIXED_STR }
+        Self {
+            mask: TypeMask::OBJ,
+            nested_schema,
+            fixed_str: NO_FIXED_STR,
+        }
     }
 
     const fn fixed_string(fixed_str: u16) -> Self {
-        Self { mask: TypeMask::STR, nested_schema: NO_SCHEMA, fixed_str }
+        Self {
+            mask: TypeMask::STR,
+            nested_schema: NO_SCHEMA,
+            fixed_str,
+        }
     }
 }
 
@@ -225,7 +251,11 @@ impl SchemaArena {
         // unless an explicit JSON `"type"` is declared.
         let Some(ty_val) = obj.get("type") else {
             if obj.contains_key("properties") || obj.contains_key("required") {
-                let nested = if depth < 6 { self.compile_object_schema(schema, depth + 1) } else { NO_SCHEMA };
+                let nested = if depth < 6 {
+                    self.compile_object_schema(schema, depth + 1)
+                } else {
+                    NO_SCHEMA
+                };
                 return PropValueSpec::object(nested);
             }
             return PropValueSpec::any();
@@ -268,7 +298,11 @@ impl SchemaArena {
         } else {
             NO_SCHEMA
         };
-        PropValueSpec { mask, nested_schema, fixed_str: NO_FIXED_STR }
+        PropValueSpec {
+            mask,
+            nested_schema,
+            fixed_str: NO_FIXED_STR,
+        }
     }
 
     pub fn compile_object_schema(&mut self, schema: &Value, depth: usize) -> u16 {
@@ -314,13 +348,20 @@ impl SchemaArena {
             if required_names.iter().any(|r| r == name) {
                 required_mask |= 1u64 << idx;
             }
-            props.push(PropSpec { escaped: json_escaped_inner(name), spec });
+            props.push(PropSpec {
+                escaped: json_escaped_inner(name),
+                spec,
+            });
         }
         if self.schemas.len() >= MAX_SCHEMAS {
             return NO_SCHEMA;
         }
         let id = self.schemas.len() as u16;
-        self.schemas.push(ObjectSchema { props, required_mask, allow_additional });
+        self.schemas.push(ObjectSchema {
+            props,
+            required_mask,
+            allow_additional,
+        });
         id
     }
 
@@ -331,20 +372,38 @@ impl SchemaArena {
                 if fs != NO_FIXED_STR {
                     PropValueSpec::fixed_string(fs)
                 } else {
-                    PropValueSpec { mask: TypeMask::STR, nested_schema: NO_SCHEMA, fixed_str: NO_FIXED_STR }
+                    PropValueSpec {
+                        mask: TypeMask::STR,
+                        nested_schema: NO_SCHEMA,
+                        fixed_str: NO_FIXED_STR,
+                    }
                 }
             }
-            None => PropValueSpec { mask: TypeMask::STR, nested_schema: NO_SCHEMA, fixed_str: NO_FIXED_STR },
+            None => PropValueSpec {
+                mask: TypeMask::STR,
+                nested_schema: NO_SCHEMA,
+                fixed_str: NO_FIXED_STR,
+            },
         };
         let args_spec = PropValueSpec::object(args_schema);
         let props = vec![
-            PropSpec { escaped: b"name".to_vec(), spec: name_spec },
-            PropSpec { escaped: b"args".to_vec(), spec: args_spec },
+            PropSpec {
+                escaped: b"name".to_vec(),
+                spec: name_spec,
+            },
+            PropSpec {
+                escaped: b"args".to_vec(),
+                spec: args_spec,
+            },
         ];
         // `parse_tool_call` in `src/serve/reply.rs` requires `"args"` to be a JSON object and reads
         // optional `"name"` (falling back to the header name when omitted).
         let id = self.schemas.len() as u16;
-        self.schemas.push(ObjectSchema { props, required_mask: 1u64 << 1, allow_additional: false });
+        self.schemas.push(ObjectSchema {
+            props,
+            required_mask: 1u64 << 1,
+            allow_additional: false,
+        });
         id
     }
 }
@@ -391,13 +450,25 @@ impl ToolCatalog {
             if arena.schemas.len() + 2 >= MAX_SCHEMAS {
                 break;
             }
-            let args_schema = params.map(|p| arena.compile_object_schema(p, 0)).unwrap_or(NO_SCHEMA);
+            let args_schema = params
+                .map(|p| arena.compile_object_schema(p, 0))
+                .unwrap_or(NO_SCHEMA);
             let wrapper_schema = arena.build_tool_wrapper_schema(Some(&name), args_schema);
-            tools.push(ToolEntry { name, wrapper_schema });
+            tools.push(ToolEntry {
+                name,
+                wrapper_schema,
+            });
         }
-        let fallback_wrapper_schema =
-            if tools.len() == 1 { tools[0].wrapper_schema } else { arena.build_tool_wrapper_schema(None, NO_SCHEMA) };
-        Some(Arc::new(Self { arena, tools, fallback_wrapper_schema }))
+        let fallback_wrapper_schema = if tools.len() == 1 {
+            tools[0].wrapper_schema
+        } else {
+            arena.build_tool_wrapper_schema(None, NO_SCHEMA)
+        };
+        Some(Arc::new(Self {
+            arena,
+            tools,
+            fallback_wrapper_schema,
+        }))
     }
 }
 
@@ -443,7 +514,13 @@ enum StrStep {
 
 impl StrSubState {
     const fn new() -> Self {
-        Self { utf8_need: 0, utf8_first_min: 0x80, utf8_first_max: 0xBF, esc: EscState::None, byte_len: 0 }
+        Self {
+            utf8_need: 0,
+            utf8_first_min: 0x80,
+            utf8_first_max: 0xBF,
+            esc: EscState::None,
+            byte_len: 0,
+        }
     }
 
     #[inline]
@@ -532,13 +609,21 @@ impl StrSubState {
                         StrStep::Continue
                     }
                     b'u' => {
-                        self.esc = EscState::Hex { digits: 0, val: 0, after_high: false };
+                        self.esc = EscState::Hex {
+                            digits: 0,
+                            val: 0,
+                            after_high: false,
+                        };
                         StrStep::Continue
                     }
                     _ => StrStep::Invalid,
                 }
             }
-            EscState::Hex { digits, val, after_high } => {
+            EscState::Hex {
+                digits,
+                val,
+                after_high,
+            } => {
                 let Some(nib) = hex_nibble(b) else {
                     return StrStep::Invalid;
                 };
@@ -565,7 +650,11 @@ impl StrSubState {
                         self.esc = EscState::None;
                     }
                 } else {
-                    self.esc = EscState::Hex { digits: next_digits, val: next_val, after_high };
+                    self.esc = EscState::Hex {
+                        digits: next_digits,
+                        val: next_val,
+                        after_high,
+                    };
                 }
                 StrStep::Continue
             }
@@ -582,7 +671,11 @@ impl StrSubState {
                     return StrStep::Invalid;
                 }
                 self.byte_len = self.byte_len.saturating_add(1);
-                self.esc = EscState::Hex { digits: 0, val: 0, after_high: true };
+                self.esc = EscState::Hex {
+                    digits: 0,
+                    val: 0,
+                    after_high: true,
+                };
                 StrStep::Continue
             }
         }
@@ -604,7 +697,10 @@ enum NumStage {
 impl NumStage {
     #[inline]
     fn is_complete(self) -> bool {
-        matches!(self, Self::Zero | Self::Int { .. } | Self::Frac { .. } | Self::Exp { .. })
+        matches!(
+            self,
+            Self::Zero | Self::Int { .. } | Self::Frac { .. } | Self::Exp { .. }
+        )
     }
 
     #[inline]
@@ -705,14 +801,28 @@ impl NumStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Frame {
     Empty,
-    Obj { schema_idx: u16, seen_mask: u64, items: u16 },
-    Arr { items: u16 },
+    Obj {
+        schema_idx: u16,
+        seen_mask: u64,
+        items: u16,
+    },
+    Arr {
+        items: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyMode {
-    Restricted { schema_idx: u16, cand_mask: u64, pos: u16 },
-    Free { schema_idx: u16, cand_mask: u64, pos: u16 },
+    Restricted {
+        schema_idx: u16,
+        cand_mask: u64,
+        pos: u16,
+    },
+    Free {
+        schema_idx: u16,
+        cand_mask: u64,
+        pos: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -789,10 +899,19 @@ impl AutoState {
         if self.depth as usize >= MAX_DEPTH_CAP {
             return false;
         }
-        self.stack[self.depth as usize] = Frame::Obj { schema_idx, seen_mask: 0, items: 0 };
+        self.stack[self.depth as usize] = Frame::Obj {
+            schema_idx,
+            seen_mask: 0,
+            items: 0,
+        };
         self.depth += 1;
-        let has_req = schema_idx != NO_SCHEMA && !arena.schemas[schema_idx as usize].required_satisfied(0);
-        self.phase = if has_req { Phase::ObjExpectKey } else { Phase::ObjExpectKeyOrEnd };
+        let has_req = schema_idx != NO_SCHEMA
+            && !arena.schemas[schema_idx as usize].required_satisfied(0);
+        self.phase = if has_req {
+            Phase::ObjExpectKey
+        } else {
+            Phase::ObjExpectKeyOrEnd
+        };
         true
     }
 
@@ -817,14 +936,27 @@ impl AutoState {
     }
 
     fn begin_key(&mut self, arena: &SchemaArena) -> bool {
-        let Frame::Obj { schema_idx, seen_mask, items } = self.top() else {
+        let Frame::Obj {
+            schema_idx,
+            seen_mask,
+            items,
+        } = self.top()
+        else {
             return false;
         };
         let next_items = items.saturating_add(1);
-        *self.top_mut() = Frame::Obj { schema_idx, seen_mask, items: next_items };
+        *self.top_mut() = Frame::Obj {
+            schema_idx,
+            seen_mask,
+            items: next_items,
+        };
         self.str_sub = StrSubState::new();
         if schema_idx == NO_SCHEMA {
-            self.phase = Phase::InKey(KeyMode::Free { schema_idx: NO_SCHEMA, cand_mask: 0, pos: 0 });
+            self.phase = Phase::InKey(KeyMode::Free {
+                schema_idx: NO_SCHEMA,
+                cand_mask: 0,
+                pos: 0,
+            });
             return true;
         }
         let schema = &arena.schemas[schema_idx as usize];
@@ -833,10 +965,18 @@ impl AutoState {
             if unseen == 0 {
                 return false;
             }
-            self.phase = Phase::InKey(KeyMode::Restricted { schema_idx, cand_mask: unseen, pos: 0 });
+            self.phase = Phase::InKey(KeyMode::Restricted {
+                schema_idx,
+                cand_mask: unseen,
+                pos: 0,
+            });
             true
         } else {
-            self.phase = Phase::InKey(KeyMode::Free { schema_idx, cand_mask: unseen, pos: 0 });
+            self.phase = Phase::InKey(KeyMode::Free {
+                schema_idx,
+                cand_mask: unseen,
+                pos: 0,
+            });
             true
         }
     }
@@ -855,7 +995,10 @@ impl AutoState {
             b'"' if spec.mask.contains(TypeMask::STR) => {
                 self.str_sub = StrSubState::new();
                 if spec.fixed_str != NO_FIXED_STR {
-                    self.phase = Phase::InString(StrMode::Fixed { fixed_str: spec.fixed_str, pos: 0 });
+                    self.phase = Phase::InString(StrMode::Fixed {
+                        fixed_str: spec.fixed_str,
+                        pos: 0,
+                    });
                 } else {
                     self.phase = Phase::InString(StrMode::Free);
                 }
@@ -863,29 +1006,50 @@ impl AutoState {
             }
             b'-' if spec.mask.contains(TypeMask::NUM) || spec.mask.contains(TypeMask::INT) => {
                 let int_only = !spec.mask.contains(TypeMask::NUM);
-                self.phase = Phase::InNumber { stage: NumStage::Sign, int_only };
+                self.phase = Phase::InNumber {
+                    stage: NumStage::Sign,
+                    int_only,
+                };
                 true
             }
             b'0' if spec.mask.contains(TypeMask::NUM) || spec.mask.contains(TypeMask::INT) => {
                 let int_only = !spec.mask.contains(TypeMask::NUM);
-                self.phase = Phase::InNumber { stage: NumStage::Zero, int_only };
+                self.phase = Phase::InNumber {
+                    stage: NumStage::Zero,
+                    int_only,
+                };
                 true
             }
             b'1'..=b'9' if spec.mask.contains(TypeMask::NUM) || spec.mask.contains(TypeMask::INT) => {
                 let int_only = !spec.mask.contains(TypeMask::NUM);
-                self.phase = Phase::InNumber { stage: NumStage::Int { digits: 1 }, int_only };
+                self.phase = Phase::InNumber {
+                    stage: NumStage::Int { digits: 1 },
+                    int_only,
+                };
                 true
             }
             b't' if spec.mask.contains(TypeMask::BOOL) => {
-                self.phase = Phase::InLit { target: *b"true\0", len: 4, pos: 1 };
+                self.phase = Phase::InLit {
+                    target: *b"true\0",
+                    len: 4,
+                    pos: 1,
+                };
                 true
             }
             b'f' if spec.mask.contains(TypeMask::BOOL) => {
-                self.phase = Phase::InLit { target: *b"false", len: 5, pos: 1 };
+                self.phase = Phase::InLit {
+                    target: *b"false",
+                    len: 5,
+                    pos: 1,
+                };
                 true
             }
             b'n' if spec.mask.contains(TypeMask::NULL) => {
-                self.phase = Phase::InLit { target: *b"null\0", len: 4, pos: 1 };
+                self.phase = Phase::InLit {
+                    target: *b"null\0",
+                    len: 4,
+                    pos: 1,
+                };
                 true
             }
             _ => false,
@@ -898,7 +1062,11 @@ impl AutoState {
         }
         self.ws_run = 0;
         match self.top() {
-            Frame::Obj { schema_idx, seen_mask, items } => {
+            Frame::Obj {
+                schema_idx,
+                seen_mask,
+                items,
+            } => {
                 let (req_ok, more_ok) = if schema_idx == NO_SCHEMA {
                     (true, items < limits.max_container_items)
                 } else {
@@ -956,10 +1124,17 @@ impl AutoState {
                 }
                 self.ws_run = 0;
                 if b == b'}' {
-                    let Frame::Obj { schema_idx, seen_mask, .. } = self.top() else {
+                    let Frame::Obj {
+                        schema_idx,
+                        seen_mask,
+                        ..
+                    } = self.top()
+                    else {
                         return false;
                     };
-                    if schema_idx != NO_SCHEMA && !arena.schemas[schema_idx as usize].required_satisfied(seen_mask) {
+                    if schema_idx != NO_SCHEMA
+                        && !arena.schemas[schema_idx as usize].required_satisfied(seen_mask)
+                    {
                         return false;
                     }
                     self.pop_container();
@@ -967,7 +1142,11 @@ impl AutoState {
                 }
                 if b == b'"' {
                     let can_key = match self.top() {
-                        Frame::Obj { schema_idx, seen_mask, items } => {
+                        Frame::Obj {
+                            schema_idx,
+                            seen_mask,
+                            items,
+                        } => {
                             items < limits.max_container_items
                                 && (schema_idx == NO_SCHEMA
                                     || arena.schemas[schema_idx as usize].can_add_more_keys(seen_mask))
@@ -989,7 +1168,11 @@ impl AutoState {
                 false
             }
             Phase::InKey(mode) => match mode {
-                KeyMode::Restricted { schema_idx, cand_mask, pos } => {
+                KeyMode::Restricted {
+                    schema_idx,
+                    cand_mask,
+                    pos,
+                } => {
                     let schema = &arena.schemas[schema_idx as usize];
                     let pos_usize = pos as usize;
                     if b == b'"' {
@@ -1024,12 +1207,19 @@ impl AutoState {
                         if next_mask == 0 || pos == u16::MAX {
                             return false;
                         }
-                        self.phase =
-                            Phase::InKey(KeyMode::Restricted { schema_idx, cand_mask: next_mask, pos: pos + 1 });
+                        self.phase = Phase::InKey(KeyMode::Restricted {
+                            schema_idx,
+                            cand_mask: next_mask,
+                            pos: pos + 1,
+                        });
                         true
                     }
                 }
-                KeyMode::Free { schema_idx, cand_mask, pos } => match self.str_sub.step(b, limits.max_string_bytes) {
+                KeyMode::Free {
+                    schema_idx,
+                    cand_mask,
+                    pos,
+                } => match self.str_sub.step(b, limits.max_string_bytes) {
                     StrStep::Invalid => false,
                     StrStep::Closed => {
                         let mut val_spec = PropValueSpec::any();
@@ -1134,7 +1324,10 @@ impl AutoState {
                             false
                         }
                     } else if target[pos_usize] == b {
-                        self.phase = Phase::InString(StrMode::Fixed { fixed_str, pos: pos + 1 });
+                        self.phase = Phase::InString(StrMode::Fixed {
+                            fixed_str,
+                            pos: pos + 1,
+                        });
                         true
                     } else {
                         false
@@ -1159,7 +1352,11 @@ impl AutoState {
                 if pos + 1 == len {
                     self.phase = Phase::AfterValue;
                 } else {
-                    self.phase = Phase::InLit { target, len, pos: pos + 1 };
+                    self.phase = Phase::InLit {
+                        target,
+                        len,
+                        pos: pos + 1,
+                    };
                 }
                 true
             }
@@ -1197,7 +1394,11 @@ impl JsonObjectGrammar {
     pub fn with_schema(schema: &Value) -> Self {
         let mut arena = SchemaArena::default();
         let root = arena.compile_object_schema(schema, 0);
-        Self { arena: Arc::new(arena), state: AutoState::new(root), limits: GrammarLimits::DEFAULT }
+        Self {
+            arena: Arc::new(arena),
+            state: AutoState::new(root),
+            limits: GrammarLimits::DEFAULT,
+        }
     }
 
     pub fn with_limits(mut self, limits: GrammarLimits) -> Self {
@@ -1330,14 +1531,22 @@ impl ToolCallGrammar {
             self.mode = SpanMode::Header;
             return;
         }
-        if tok == c_think_tok || tok == c_text_tok || tok == end_tok || tok == end_sampling_tok || tok == eos_tok {
+        if tok == c_think_tok
+            || tok == c_text_tok
+            || tok == end_tok
+            || tok == end_sampling_tok
+            || tok == eos_tok
+        {
             self.header_buf.clear();
             self.dynamic_arena = None;
             self.mode = SpanMode::Idle;
             return;
         }
         if tok == c_tool_tok {
-            let header = std::str::from_utf8(&self.header_buf).ok().map(str::trim).unwrap_or("");
+            let header = std::str::from_utf8(&self.header_buf)
+                .ok()
+                .map(str::trim)
+                .unwrap_or("");
             self.dynamic_arena = None;
             let root_schema = if let Some(entry) = self.catalog.tools.iter().find(|t| t.name == header) {
                 entry.wrapper_schema
@@ -1363,7 +1572,8 @@ impl ToolCallGrammar {
             }
             SpanMode::Json(state) => {
                 if let Some(bytes) = vocab.non_special_bytes(tok) {
-                    let arena_ptr: *const SchemaArena = self.dynamic_arena.as_ref().unwrap_or(&self.catalog.arena);
+                    let arena_ptr: *const SchemaArena =
+                        self.dynamic_arena.as_ref().unwrap_or(&self.catalog.arena);
                     // SAFETY: `arena_ptr` borrows `self.dynamic_arena` or `self.catalog.arena`, neither
                     // of which is mutated while advancing `state` (`Copy`).
                     let arena = unsafe { &*arena_ptr };
@@ -1645,11 +1855,7 @@ mod tests {
                 emitted_bytes.extend_from_slice(&tk.decode_bytes(tok));
             }
 
-            assert!(
-                finished_with_end,
-                "trial {trial} did not reach <|end_message|>; partial={:?}",
-                String::from_utf8_lossy(&emitted_bytes)
-            );
+            assert!(finished_with_end, "trial {trial} did not reach <|end_message|>; partial={:?}", String::from_utf8_lossy(&emitted_bytes));
             let body_str = std::str::from_utf8(&emitted_bytes)
                 .unwrap_or_else(|e| panic!("trial {trial} emitted invalid UTF-8 {emitted_bytes:?}: {e}"));
             let parsed: Value = serde_json::from_str(body_str)
@@ -1663,14 +1869,8 @@ mod tests {
                 .get("args")
                 .and_then(Value::as_object)
                 .unwrap_or_else(|| panic!("trial {trial}: missing args object in {parsed}"));
-            assert!(
-                args.get("query").and_then(Value::as_str).is_some(),
-                "trial {trial}: missing string 'query' in {parsed}"
-            );
-            assert!(
-                args.get("max_results").and_then(Value::as_i64).is_some(),
-                "trial {trial}: missing integer 'max_results' in {parsed}"
-            );
+            assert!(args.get("query").and_then(Value::as_str).is_some(), "trial {trial}: missing string 'query' in {parsed}");
+            assert!(args.get("max_results").and_then(Value::as_i64).is_some(), "trial {trial}: missing integer 'max_results' in {parsed}");
         }
     }
 }

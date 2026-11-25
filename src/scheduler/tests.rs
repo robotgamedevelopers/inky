@@ -185,7 +185,9 @@ fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
     let mut max_seen = 0u32;
     for _ in 0..32 {
         for l in 0..4 {
-            if s.lanes()[l].state == LaneState::Ready && s.lanes()[l].pos == s.lanes()[l].target {
+            if s.lanes()[l].state == LaneState::Ready
+                && s.lanes()[l].pos == s.lanes()[l].target
+            {
                 s.finish_ready(l).unwrap();
             }
         }
@@ -198,7 +200,11 @@ fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
         let _step = s.build_step().unwrap().expect("step built");
         for l in s.lanes() {
             max_seen = max_seen.max(l.wait_ticks);
-            assert!(l.wait_ticks <= 2, "starvation bound violated: {} > 2", l.wait_ticks);
+            assert!(
+                l.wait_ticks <= 2,
+                "starvation bound violated: {} > 2",
+                l.wait_ticks
+            );
         }
         s.check_invariants().unwrap();
         s.gpu_execute().unwrap();
@@ -310,7 +316,8 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
 
         // Finish any completed Ready lanes.
         for l in 0..8 {
-            if s.lanes()[l].state == LaneState::Ready && s.lanes()[l].pos == s.lanes()[l].target {
+            if s.lanes()[l].state == LaneState::Ready && s.lanes()[l].pos == s.lanes()[l].target
+            {
                 let was_long = s.lanes()[l].target == LONG_64K;
                 s.finish_ready(l).unwrap();
                 if was_long {
@@ -327,7 +334,9 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
                 if s.arrive(idle_l, "short", SHORT_2K).unwrap() == ArriveOutcome::Queued {
                     extra_short_submitted += 1;
                     // Lane 4 is at W=3 -> younger queued 2K MUST NOT be allowed to admit!
-                    if s.lanes()[4].state == LaneState::Queued && s.lanes()[4].wait_ticks >= w_bound {
+                    if s.lanes()[4].state == LaneState::Queued
+                        && s.lanes()[4].wait_ticks >= w_bound
+                    {
                         assert!(
                             !s.can_admit_now(idle_l),
                             "younger 2K lane {idle_l} illegally leapfrogged 64K lane 4 at W"
@@ -453,9 +462,15 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
     assert!(max_wait_observed <= w_bound);
     assert_eq!(s.reserved_total(), 0, "zero reservation leak after drain");
     assert_eq!(s.admitted_total(), 0, "zero admission budget leak after drain");
-    assert!(s.lanes().iter().all(|l| l.state.is_terminal_or_idle()), "all lanes drained cleanly");
+    assert!(
+        s.lanes().iter().all(|l| l.state.is_terminal_or_idle()),
+        "all lanes drained cleanly"
+    );
     // Every remaining in-memory block must be a sealed cold prefix block (zero unsealed tails!).
-    assert!(s.blocks().values().all(|b| b.sealed && b.tier.is_present()), "zero leaked private tail blocks");
+    assert!(
+        s.blocks().values().all(|b| b.sealed && b.tier.is_present()),
+        "zero leaked private tail blocks"
+    );
 }
 
 #[test]
@@ -631,10 +646,7 @@ fn serve_step_planner_adversarial_multi_prefill_wait_ticks_bounded() {
         }
         assert!(p.complete_step().is_empty());
     }
-    assert!(
-        decode_steps > prefill_steps * 2,
-        "decoders must burst between prefill rounds ({decode_steps} dec vs {prefill_steps} pf)"
-    );
+    assert!(decode_steps > prefill_steps * 2, "decoders must burst between prefill rounds ({decode_steps} dec vs {prefill_steps} pf)");
     for l in 3..nlanes {
         assert!(n_past[l] >= pf_end[l], "prefiller {l} starved: n_past={} < {}", n_past[l], pf_end[l]);
     }

@@ -10,7 +10,10 @@ impl TempDir {
         let dir = std::env::temp_dir().join(format!(
             "inky-fleet-serve-test-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -63,13 +66,17 @@ fn fleet_serve_records_only_when_opted_in_and_fails_on_chmod_error() {
         .output()
         .expect("run default fleet-serve");
     assert!(out_default.status.success(), "stderr: {}", String::from_utf8_lossy(&out_default.stderr));
-    let args_default: Vec<String> = String::from_utf8_lossy(&out_default.stdout).lines().map(str::to_owned).collect();
-    assert!(
-        !args_default.iter().any(|a| a == "--record-dir"),
-        "default must not enable --record-dir: {args_default:?}"
-    );
-    let flag_val =
-        |flag: &str| -> Option<&str> { args_default.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str()) };
+    let args_default: Vec<String> = String::from_utf8_lossy(&out_default.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(!args_default.iter().any(|a| a == "--record-dir"), "default must not enable --record-dir: {args_default:?}");
+    let flag_val = |flag: &str| -> Option<&str> {
+        args_default
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    };
     assert_eq!(flag_val("--lanes"), Some("64"), "default lanes must match M5 Max sweep knee (64)");
     assert_eq!(flag_val("--queue"), Some("128"), "default queue must match docs/LANE-SWEEP.md (128)");
     assert_eq!(flag_val("--effort"), Some("low"), "default effort must match docs/LANE-SWEEP.md (low)");

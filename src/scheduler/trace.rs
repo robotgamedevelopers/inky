@@ -88,7 +88,10 @@ pub struct SchedulerTrace {
 
 impl SchedulerTrace {
     pub fn new(sched: &Scheduler) -> Self {
-        let mut t = Self { config: sched.cfg.clone(), steps: Vec::new() };
+        let mut t = Self {
+            config: sched.cfg.clone(),
+            steps: Vec::new(),
+        };
         t.record_action(TraceAction::Init, sched);
         t
     }
@@ -144,7 +147,8 @@ fn tla_trace_action(act: &TraceAction, cfg: &SchedulerConfig) -> String {
         | TraceAction::Cancel { lane } => {
             format!("<<\"{}\", \"{}\">>", act.name(), ln[*lane])
         }
-        TraceAction::RestoreBlock { lane, block } | TraceAction::BeginRestoreIO { lane, block } => {
+        TraceAction::RestoreBlock { lane, block }
+        | TraceAction::BeginRestoreIO { lane, block } => {
             format!("<<\"{}\", \"{}\", {}>>", act.name(), ln[*lane], tla_block_id(block, ln))
         }
         TraceAction::EvictCleanOrUnrefMem { block }
@@ -152,13 +156,24 @@ fn tla_trace_action(act: &TraceAction, cfg: &SchedulerConfig) -> String {
         | TraceAction::DropUnreferenced { block } => {
             format!("<<\"{}\", {}>>", act.name(), tla_block_id(block, ln))
         }
-        TraceAction::EvictCleanStartState { prefix, boundary } | TraceAction::SpillStartState { prefix, boundary } => {
+        TraceAction::EvictCleanStartState { prefix, boundary }
+        | TraceAction::SpillStartState { prefix, boundary } => {
             format!("<<\"{}\", \"{}\", {}>>", act.name(), prefix, boundary)
         }
         TraceAction::BuildStep { spans } => {
-            let chosen: Vec<String> = spans.iter().filter(|(_, &tok)| tok > 0).map(|(&l, _)| tla_str(&ln[l])).collect();
-            let sp_seq: Vec<String> = (0..ln.len()).map(|l| spans.get(&l).copied().unwrap_or(0).to_string()).collect();
-            format!("<<\"BuildStep\", {{{}}}, <<{}>>>>", chosen.join(", "), sp_seq.join(", "))
+            let chosen: Vec<String> = spans
+                .iter()
+                .filter(|(_, &tok)| tok > 0)
+                .map(|(&l, _)| tla_str(&ln[l]))
+                .collect();
+            let sp_seq: Vec<String> = (0..ln.len())
+                .map(|l| spans.get(&l).copied().unwrap_or(0).to_string())
+                .collect();
+            format!(
+                "<<\"BuildStep\", {{{}}}, <<{}>>>>",
+                chosen.join(", "),
+                sp_seq.join(", ")
+            )
         }
         TraceAction::ReclaimColdDisk
         | TraceAction::GpuExecute
@@ -221,12 +236,23 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
     let mut lane_entries = Vec::new();
     for (i, slot) in step.lanes.iter().enumerate() {
         let full_seq: Vec<String> = (0..n_blks)
-            .map(|bi| slot.full.get(&bi).map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln)))
+            .map(|bi| {
+                slot.full
+                    .get(&bi)
+                    .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln))
+            })
             .collect();
         let win_seq: Vec<String> = (0..n_blks)
-            .map(|bi| slot.win.get(&bi).map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln)))
+            .map(|bi| {
+                slot.win
+                    .get(&bi)
+                    .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln))
+            })
             .collect();
-        let rio = slot.restore_io_block.as_ref().map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln));
+        let rio = slot
+            .restore_io_block
+            .as_ref()
+            .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln));
         lane_entries.push(format!(
             "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, ghostBypass |-> {}, stepSpan |-> {}, restoreIO |-> {}]",
             slot.state.as_tla(),
@@ -264,7 +290,9 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
 /// Render `(TraceData.tla, TraceCheck.tla, TraceCheck.cfg)` verifying one or more concrete
 /// `SchedulerTrace` runs directly against `specs/CacheScheduler.tla` (`Init /\ [][Next]_vars`,
 /// step-exact `ActionConforms`, all 13 safety invariants, and all 5 action properties).
-pub fn render_cache_scheduler_tla_bundle(traces: &[SchedulerTrace]) -> Result<(String, String, String), SchedError> {
+pub fn render_cache_scheduler_tla_bundle(
+    traces: &[SchedulerTrace],
+) -> Result<(String, String, String), SchedError> {
     let Some(first) = traces.first() else {
         return Err(SchedError::Precondition("cannot render empty trace slice"));
     };
@@ -272,7 +300,9 @@ pub fn render_cache_scheduler_tla_bundle(traces: &[SchedulerTrace]) -> Result<(S
     cfg.validate()?;
     for t in traces {
         if t.config != *cfg || t.steps.len() < 2 {
-            return Err(SchedError::Precondition("all traces must share config and have at least 2 steps"));
+            return Err(SchedError::Precondition(
+                "all traces must share config and have at least 2 steps",
+            ));
         }
     }
 
@@ -299,9 +329,24 @@ pub fn render_cache_scheduler_tla_bundle(traces: &[SchedulerTrace]) -> Result<(S
         trace_names.join(", ")
     ));
 
-    let lane_seq_lit = cfg.lanes.iter().map(|s| tla_str(s)).collect::<Vec<_>>().join(", ");
-    let pfx_seq_lit = cfg.prefixes.iter().map(|s| tla_str(s)).collect::<Vec<_>>().join(", ");
-    let req_set_lit = cfg.request_lengths.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    let lane_seq_lit = cfg
+        .lanes
+        .iter()
+        .map(|s| tla_str(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pfx_seq_lit = cfg
+        .prefixes
+        .iter()
+        .map(|s| tla_str(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let req_set_lit = cfg
+        .request_lengths
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let check = format!(
         "---------------------------- MODULE TraceCheck ----------------------------\n\
@@ -551,7 +596,10 @@ pub fn walk_scheduler_trace_opts(
     let mut stats = WalkStats::default();
     let n_lanes = cfg.lanes.len();
 
-    let record_checked = |trace: &mut SchedulerTrace, act: TraceAction, sched: &Scheduler| -> Result<(), SchedError> {
+    let record_checked = |trace: &mut SchedulerTrace,
+                          act: TraceAction,
+                          sched: &Scheduler|
+     -> Result<(), SchedError> {
         trace.record_action(act, sched);
         if verify_invariants {
             sched.check_invariants().map_err(SchedError::Invariant)?;
@@ -580,7 +628,10 @@ pub fn walk_scheduler_trace_opts(
             }
             if sched.lanes()[l].state == LaneState::Cancelling
                 || sched.mem_used() < cfg.mem_budget
-                || sched.lanes()[l].restore_io_block.as_ref().is_some_and(|b| sched.block_tier(b) != BlockTier::Disk)
+                || sched.lanes()[l]
+                    .restore_io_block
+                    .as_ref()
+                    .is_some_and(|b| sched.block_tier(b) != BlockTier::Disk)
             {
                 let was_restoring = sched.lanes()[l].state == LaneState::Restoring;
                 sched.complete_restore_io(l)?;
@@ -597,8 +648,10 @@ pub fn walk_scheduler_trace_opts(
         if sched.step_active() {
             if !sched.gpu_done() {
                 if !draining && rng.pick(5) == 0 {
-                    if let Some(&victim) =
-                        sched.step_lanes().iter().find(|&&l| sched.lanes()[l].state == LaneState::InStep)
+                    if let Some(&victim) = sched
+                        .step_lanes()
+                        .iter()
+                        .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                     {
                         sched.cancel(victim)?;
                         record_checked(&mut trace, TraceAction::Cancel { lane: victim }, &sched)?;
@@ -621,7 +674,10 @@ pub fn walk_scheduler_trace_opts(
                 }
             }
             if !draining && rng.pick(9) == 0 {
-                if let Some(&victim) = sched.step_lanes().iter().find(|&&l| sched.lanes()[l].state == LaneState::InStep)
+                if let Some(&victim) = sched
+                    .step_lanes()
+                    .iter()
+                    .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                 {
                     sched.cancel(victim)?;
                     record_checked(&mut trace, TraceAction::Cancel { lane: victim }, &sched)?;
@@ -647,9 +703,10 @@ pub fn walk_scheduler_trace_opts(
         }
 
         // 2. Finish any Ready lane that has reached its target.
-        if let Some(l) = (0..n_lanes)
-            .find(|&i| sched.lanes()[i].state == LaneState::Ready && sched.lanes()[i].pos == sched.lanes()[i].target)
-        {
+        if let Some(l) = (0..n_lanes).find(|&i| {
+            sched.lanes()[i].state == LaneState::Ready
+                && sched.lanes()[i].pos == sched.lanes()[i].target
+        }) {
             sched.finish_ready(l)?;
             record_checked(&mut trace, TraceAction::FinishReady { lane: l }, &sched)?;
             stats.finished += 1;
@@ -657,7 +714,9 @@ pub fn walk_scheduler_trace_opts(
         }
 
         // Prune any Ready lane whose window holds blocks older than `History(pos)` (`SlideWindow`).
-        if let Some(l) = (0..n_lanes).find(|&i| sched.lanes()[i].state == LaneState::Ready && !sched.window_pruned(i)) {
+        if let Some(l) = (0..n_lanes)
+            .find(|&i| sched.lanes()[i].state == LaneState::Ready && !sched.window_pruned(i))
+        {
             if sched.slide_window(l) {
                 record_checked(&mut trace, TraceAction::SlideWindow { lane: l }, &sched)?;
                 stats.slide_windows += 1;
@@ -683,11 +742,19 @@ pub fn walk_scheduler_trace_opts(
         }
         if sched.state_mem_pressure() {
             if let Some((prefix, boundary)) = sched.evict_clean_start_state() {
-                record_checked(&mut trace, TraceAction::EvictCleanStartState { prefix, boundary }, &sched)?;
+                record_checked(
+                    &mut trace,
+                    TraceAction::EvictCleanStartState { prefix, boundary },
+                    &sched,
+                )?;
                 continue;
             }
             if let Some((prefix, boundary)) = sched.spill_start_state() {
-                record_checked(&mut trace, TraceAction::SpillStartState { prefix, boundary }, &sched)?;
+                record_checked(
+                    &mut trace,
+                    TraceAction::SpillStartState { prefix, boundary },
+                    &sched,
+                )?;
                 continue;
             }
             if sched.reclaim_cold_disk() {
@@ -723,13 +790,24 @@ pub fn walk_scheduler_trace_opts(
                 && sched.lanes()[i].restore_io_block.is_none()
                 && sched.lanes()[i].wait_ticks >= cfg.max_bypass
         }) {
-            let disk_blk = sched.lane_block_set(l).into_iter().find(|b| sched.block_tier(b) == BlockTier::Disk);
+            let disk_blk = sched
+                .lane_block_set(l)
+                .into_iter()
+                .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
                 if !draining && rng.pick(2) == 0 && sched.begin_restore_io(l, &b).is_ok() {
-                    record_checked(&mut trace, TraceAction::BeginRestoreIO { lane: l, block: b }, &sched)?;
+                    record_checked(
+                        &mut trace,
+                        TraceAction::BeginRestoreIO { lane: l, block: b },
+                        &sched,
+                    )?;
                     advanced_ceiling = true;
                 } else if sched.restore_block(l, &b).is_ok() {
-                    record_checked(&mut trace, TraceAction::RestoreBlock { lane: l, block: b.clone() }, &sched)?;
+                    record_checked(
+                        &mut trace,
+                        TraceAction::RestoreBlock { lane: l, block: b.clone() },
+                        &sched,
+                    )?;
                     stats.disk_restores += 1;
                     if !verify_invariants && sched.block_tier(&b) == BlockTier::Disk {
                         break;
@@ -781,13 +859,19 @@ pub fn walk_scheduler_trace_opts(
         let roll = rng.pick(100);
 
         if !draining && (op < 2 || roll < 36) {
-            let idle: Vec<usize> = (0..n_lanes).filter(|&i| sched.lanes()[i].state.is_terminal_or_idle()).collect();
+            let idle: Vec<usize> = (0..n_lanes)
+                .filter(|&i| sched.lanes()[i].state.is_terminal_or_idle())
+                .collect();
             if !idle.is_empty() {
                 let l = idle[rng.pick(idle.len())];
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                record_checked(&mut trace, TraceAction::Arrive { lane: l, prefix: pfx, target: len }, &sched)?;
+                record_checked(
+                    &mut trace,
+                    TraceAction::Arrive { lane: l, prefix: pfx, target: len },
+                    &sched,
+                )?;
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;
@@ -812,20 +896,34 @@ pub fn walk_scheduler_trace_opts(
 
         // Advance Restoring lanes (longest-waiting first).
         let mut restoring: Vec<usize> = (0..n_lanes)
-            .filter(|&i| sched.lanes()[i].state == LaneState::Restoring && sched.lanes()[i].restore_io_block.is_none())
+            .filter(|&i| {
+                sched.lanes()[i].state == LaneState::Restoring
+                    && sched.lanes()[i].restore_io_block.is_none()
+            })
             .collect();
         restoring.sort_by_key(|&i| (std::cmp::Reverse(sched.lanes()[i].wait_ticks), i));
         let mut did_restore = false;
         let mut stuttered = false;
         for l in restoring {
-            let disk_blk = sched.lane_block_set(l).into_iter().find(|b| sched.block_tier(b) == BlockTier::Disk);
+            let disk_blk = sched
+                .lane_block_set(l)
+                .into_iter()
+                .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
                 if !draining && rng.pick(2) == 0 && sched.begin_restore_io(l, &b).is_ok() {
-                    record_checked(&mut trace, TraceAction::BeginRestoreIO { lane: l, block: b }, &sched)?;
+                    record_checked(
+                        &mut trace,
+                        TraceAction::BeginRestoreIO { lane: l, block: b },
+                        &sched,
+                    )?;
                     did_restore = true;
                     break;
                 } else if sched.restore_block(l, &b).is_ok() {
-                    record_checked(&mut trace, TraceAction::RestoreBlock { lane: l, block: b.clone() }, &sched)?;
+                    record_checked(
+                        &mut trace,
+                        TraceAction::RestoreBlock { lane: l, block: b.clone() },
+                        &sched,
+                    )?;
                     stats.disk_restores += 1;
                     if !verify_invariants && sched.block_tier(&b) == BlockTier::Disk {
                         stuttered = true;
@@ -892,7 +990,11 @@ pub fn walk_scheduler_trace_opts(
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                record_checked(&mut trace, TraceAction::Arrive { lane: l, prefix: pfx, target: len }, &sched)?;
+                record_checked(
+                    &mut trace,
+                    TraceAction::Arrive { lane: l, prefix: pfx, target: len },
+                    &sched,
+                )?;
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;

@@ -59,9 +59,15 @@ impl OffsetLimbs {
     pub fn from_u64(offset: u64) -> Result<OffsetLimbs, TraceError> {
         let hi64 = offset >> 32;
         if hi64 > i32::MAX as u64 {
-            return Err(TraceError::OffsetOutOfRange(format!("high 32-bit limb {hi64} exceeds signed 32-bit TLC Int")));
+            return Err(TraceError::OffsetOutOfRange(format!(
+                "high 32-bit limb {hi64} exceeds signed 32-bit TLC Int"
+            )));
         }
-        Ok(OffsetLimbs { hi: hi64 as u32, mib: ((offset >> 20) & 0xfff) as u32, sub: (offset & 0xfffff) as u32 })
+        Ok(OffsetLimbs {
+            hi: hi64 as u32,
+            mib: ((offset >> 20) & 0xfff) as u32,
+            sub: (offset & 0xfffff) as u32,
+        })
     }
 
     pub fn to_u64(self) -> Result<u64, TraceError> {
@@ -82,9 +88,9 @@ impl OffsetLimbs {
     /// Mirrors `AddBytes(o, n)` in `specs/BlockLayout.tla` with checked carry.
     pub fn add_bytes(self, n: u32) -> Result<OffsetLimbs, TraceError> {
         let base = self.to_u64()?;
-        let sum = base
-            .checked_add(u64::from(n))
-            .ok_or_else(|| TraceError::OffsetOutOfRange(format!("byte offset {base} + {n} overflowed u64")))?;
+        let sum = base.checked_add(u64::from(n)).ok_or_else(|| {
+            TraceError::OffsetOutOfRange(format!("byte offset {base} + {n} overflowed u64"))
+        })?;
         OffsetLimbs::from_u64(sum)
     }
 }
@@ -454,7 +460,8 @@ impl<'a> JsonParser<'a> {
 }
 
 fn req_field<'a>(obj: &'a BTreeMap<String, JsonVal>, key: &str) -> Result<&'a JsonVal, TraceError> {
-    obj.get(key).ok_or_else(|| TraceError::InvalidSchema(format!("missing required field {key:?}")))
+    obj.get(key)
+        .ok_or_else(|| TraceError::InvalidSchema(format!("missing required field {key:?}")))
 }
 
 // ---- Trace Sink Abstraction -----------------------------------------------
@@ -592,7 +599,10 @@ impl BlockLayoutConfig {
         m.insert("event".into(), JsonVal::str("config"));
         m.insert("model".into(), JsonVal::str("block_layout"));
         m.insert("version".into(), JsonVal::uint(TRACE_SCHEMA_VERSION));
-        m.insert("lanes".into(), JsonVal::Arr(self.lanes.iter().cloned().map(JsonVal::Str).collect()));
+        m.insert(
+            "lanes".into(),
+            JsonVal::Arr(self.lanes.iter().cloned().map(JsonVal::Str).collect()),
+        );
         m.insert("full_capacity".into(), JsonVal::uint(self.full_capacity));
         m.insert("window_capacity".into(), JsonVal::uint(self.window_capacity));
         m.insert("block_size".into(), JsonVal::uint(self.block_size));
@@ -624,7 +634,10 @@ impl PoolSlotSnapshot {
         m.insert("kind".into(), JsonVal::str(kind_name(self.kind)));
         m.insert("block".into(), JsonVal::uint(self.block));
         m.insert("length".into(), JsonVal::uint(self.length));
-        m.insert("data".into(), JsonVal::Arr(self.data.iter().map(|&b| JsonVal::uint(b)).collect()));
+        m.insert(
+            "data".into(),
+            JsonVal::Arr(self.data.iter().map(|&b| JsonVal::uint(b)).collect()),
+        );
         JsonVal::Obj(m)
     }
 }
@@ -681,7 +694,11 @@ pub struct PinHandleSnapshot {
 
 impl Ord for PinHandleSnapshot {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (kind_rank(self.kind), self.slot, self.generation).cmp(&(kind_rank(other.kind), other.slot, other.generation))
+        (kind_rank(self.kind), self.slot, self.generation).cmp(&(
+            kind_rank(other.kind),
+            other.slot,
+            other.generation,
+        ))
     }
 }
 
@@ -693,7 +710,11 @@ impl PartialOrd for PinHandleSnapshot {
 
 impl PinHandleSnapshot {
     fn to_json_val(&self) -> JsonVal {
-        JsonVal::Arr(vec![JsonVal::str(kind_name(self.kind)), JsonVal::uint(self.slot), JsonVal::uint(self.generation)])
+        JsonVal::Arr(vec![
+            JsonVal::str(kind_name(self.kind)),
+            JsonVal::uint(self.slot),
+            JsonVal::uint(self.generation),
+        ])
     }
 }
 
@@ -716,12 +737,18 @@ pub struct BlockLayoutState {
 
 impl BlockLayoutState {
     /// Snapshot a `BlockTable` (`src/blocks.rs`) across `0..blocks_per_kind`.
-    pub fn snapshot_table(table: &BlockTable, blocks_per_kind: u32) -> Result<Vec<TableEntrySnapshot>, TraceError> {
+    pub fn snapshot_table(
+        table: &BlockTable,
+        blocks_per_kind: u32,
+    ) -> Result<Vec<TableEntrySnapshot>, TraceError> {
         let mut out = Vec::new();
         for kind in [BlockKind::Full, BlockKind::Window] {
             for b in 0..blocks_per_kind {
                 let idx = BlockIndex::new(b);
-                if let Some(entry) = table.get(kind, idx).map_err(|e| TraceError::InvalidSchema(e.to_string()))? {
+                if let Some(entry) = table
+                    .get(kind, idx)
+                    .map_err(|e| TraceError::InvalidSchema(e.to_string()))?
+                {
                     out.push(TableEntrySnapshot::from_block_entry(idx, entry)?);
                 }
             }
@@ -769,7 +796,10 @@ impl BlockLayoutState {
 
     pub fn to_json_val(&self) -> JsonVal {
         let mut pool = BTreeMap::new();
-        pool.insert("full".into(), JsonVal::Arr(self.full_pool.iter().map(PoolSlotSnapshot::to_json_val).collect()));
+        pool.insert(
+            "full".into(),
+            JsonVal::Arr(self.full_pool.iter().map(PoolSlotSnapshot::to_json_val).collect()),
+        );
         pool.insert(
             "window".into(),
             JsonVal::Arr(self.window_pool.iter().map(PoolSlotSnapshot::to_json_val).collect()),
@@ -947,7 +977,10 @@ fn parse_table_entries(arr: &[JsonVal], cfg: &BlockLayoutConfig) -> Result<Vec<T
 }
 
 pub fn parse_block_layout_jsonl(input: &str) -> Result<BlockLayoutTrace, TraceError> {
-    let mut non_empty = input.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+    let mut non_empty = input
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty());
     let Some((first_idx, first_line)) = non_empty.next() else {
         return Err(TraceError::InvalidSchema("empty trace input".into()));
     };
@@ -992,7 +1025,10 @@ pub fn parse_block_layout_jsonl(input: &str) -> Result<BlockLayoutTrace, TraceEr
         }
         let seq = req_field(obj, "seq")?.as_u64()?;
         if seq != steps.len() as u64 {
-            return Err(TraceError::InvalidSchema(format!("non-contiguous step seq {seq}, expected {}", steps.len())));
+            return Err(TraceError::InvalidSchema(format!(
+                "non-contiguous step seq {seq}, expected {}",
+                steps.len()
+            )));
         }
         let action = req_field(obj, "action")?.as_str()?.to_owned();
         if !BLOCK_LAYOUT_ACTIONS.contains(&action.as_str()) {
@@ -1114,7 +1150,9 @@ pub fn parse_block_layout_jsonl(input: &str) -> Result<BlockLayoutTrace, TraceEr
 
 /// Render `(TraceData.tla, TraceCheck.tla, TraceCheck.cfg)` for checking one or more
 /// `BlockLayoutTrace` runs sharing the same `BlockLayoutConfig` against `specs/BlockLayout.tla`.
-pub fn render_block_layout_tla_bundle(traces: &[BlockLayoutTrace]) -> Result<(String, String, String), TraceError> {
+pub fn render_block_layout_tla_bundle(
+    traces: &[BlockLayoutTrace],
+) -> Result<(String, String, String), TraceError> {
     let Some(first) = traces.first() else {
         return Err(TraceError::InvalidSchema("cannot render empty trace slice".into()));
     };
@@ -1135,7 +1173,8 @@ pub fn render_block_layout_tla_bundle(traces: &[BlockLayoutTrace]) -> Result<(St
     data.push_str("Traces == <<\n");
 
     let write_dense_table = |out: &mut String, entries: &[TableEntrySnapshot]| {
-        let mut grid: Vec<Vec<Option<&TableEntrySnapshot>>> = vec![vec![None; num_blocks as usize]; 2];
+        let mut grid: Vec<Vec<Option<&TableEntrySnapshot>>> =
+            vec![vec![None; num_blocks as usize]; 2];
         for e in entries {
             let ki = match e.kind {
                 BlockKind::Full => 0,
@@ -1158,7 +1197,13 @@ pub fn render_block_layout_tla_bundle(traces: &[BlockLayoutTrace]) -> Result<(St
                     let _ = write!(
                         out,
                         "<<{}, {}, {}, {}, {}, {}, {}>>",
-                        e.slot, e.generation, e.offset_limbs.hi, e.offset_limbs.mib, e.offset_limbs.sub, kcode, e.kvb
+                        e.slot,
+                        e.generation,
+                        e.offset_limbs.hi,
+                        e.offset_limbs.mib,
+                        e.offset_limbs.sub,
+                        kcode,
+                        e.kvb
                     );
                 } else {
                     out.push_str("NE");
@@ -1306,7 +1351,12 @@ pub fn render_block_layout_tla_bundle(traces: &[BlockLayoutTrace]) -> Result<(St
     }
     data.push_str("\n>>\n=============================================================================\n");
 
-    let lane_seq_lit = cfg.lanes.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+    let lane_seq_lit = cfg
+        .lanes
+        .iter()
+        .map(|l| format!("\"{l}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let lane_set_lit = format!("{{{lane_seq_lit}}}");
 
     let check = format!(
@@ -1630,8 +1680,14 @@ impl CacheSchedulerConfig {
         m.insert("event".into(), JsonVal::str("config"));
         m.insert("model".into(), JsonVal::str("cache_scheduler"));
         m.insert("version".into(), JsonVal::uint(TRACE_SCHEMA_VERSION));
-        m.insert("lanes".into(), JsonVal::Arr(self.lanes.iter().cloned().map(JsonVal::Str).collect()));
-        m.insert("prefixes".into(), JsonVal::Arr(self.prefixes.iter().cloned().map(JsonVal::Str).collect()));
+        m.insert(
+            "lanes".into(),
+            JsonVal::Arr(self.lanes.iter().cloned().map(JsonVal::Str).collect()),
+        );
+        m.insert(
+            "prefixes".into(),
+            JsonVal::Arr(self.prefixes.iter().cloned().map(JsonVal::Str).collect()),
+        );
         m.insert(
             "request_lengths".into(),
             JsonVal::Arr(self.request_lengths.iter().map(|&r| JsonVal::uint(r)).collect()),
@@ -1669,7 +1725,10 @@ impl CacheBlockSnapshot {
         m.insert("sealed".into(), JsonVal::Bool(self.sealed));
         m.insert("idx".into(), JsonVal::uint(self.idx));
         m.insert("length".into(), JsonVal::uint(self.length));
-        m.insert("data".into(), JsonVal::Arr(self.data.iter().map(|&d| JsonVal::uint(d)).collect()));
+        m.insert(
+            "data".into(),
+            JsonVal::Arr(self.data.iter().map(|&d| JsonVal::uint(d)).collect()),
+        );
         m.insert("ref_count".into(), JsonVal::uint(self.ref_count));
         m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
@@ -1694,8 +1753,14 @@ impl StartPointSnapshot {
         m.insert("boundary".into(), JsonVal::uint(self.boundary));
         m.insert("state_kept".into(), JsonVal::Bool(self.state_kept));
         m.insert("state_tier".into(), JsonVal::str(self.state_tier.clone()));
-        m.insert("full".into(), JsonVal::Arr(self.full.iter().map(|b| JsonVal::str(b.encode())).collect()));
-        m.insert("win".into(), JsonVal::Arr(self.win.iter().map(|b| JsonVal::str(b.encode())).collect()));
+        m.insert(
+            "full".into(),
+            JsonVal::Arr(self.full.iter().map(|b| JsonVal::str(b.encode())).collect()),
+        );
+        m.insert(
+            "win".into(),
+            JsonVal::Arr(self.win.iter().map(|b| JsonVal::str(b.encode())).collect()),
+        );
         m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
     }
@@ -1754,20 +1819,42 @@ pub struct CacheSchedulerState {
 
 impl CacheSchedulerState {
     pub fn to_json_val(&self) -> JsonVal {
-        let span_obj = self.step_span.iter().map(|(k, &v)| (k.clone(), JsonVal::uint(v))).collect();
+        let span_obj = self
+            .step_span
+            .iter()
+            .map(|(k, &v)| (k.clone(), JsonVal::uint(v)))
+            .collect();
         let mut m = BTreeMap::new();
-        m.insert("blocks".into(), JsonVal::Arr(self.blocks.iter().map(CacheBlockSnapshot::to_json_val).collect()));
+        m.insert(
+            "blocks".into(),
+            JsonVal::Arr(self.blocks.iter().map(CacheBlockSnapshot::to_json_val).collect()),
+        );
         m.insert(
             "start_points".into(),
             JsonVal::Arr(self.start_points.iter().map(StartPointSnapshot::to_json_val).collect()),
         );
-        m.insert("lanes".into(), JsonVal::Arr(self.lanes.iter().map(CacheLaneSnapshot::to_json_val).collect()));
-        m.insert("queue_seq".into(), JsonVal::Arr(self.queue_seq.iter().cloned().map(JsonVal::Str).collect()));
+        m.insert(
+            "lanes".into(),
+            JsonVal::Arr(self.lanes.iter().map(CacheLaneSnapshot::to_json_val).collect()),
+        );
+        m.insert(
+            "queue_seq".into(),
+            JsonVal::Arr(self.queue_seq.iter().cloned().map(JsonVal::Str).collect()),
+        );
         m.insert("step_active".into(), JsonVal::Bool(self.step_active));
-        m.insert("step_lanes".into(), JsonVal::Arr(self.step_lanes.iter().cloned().map(JsonVal::Str).collect()));
+        m.insert(
+            "step_lanes".into(),
+            JsonVal::Arr(self.step_lanes.iter().cloned().map(JsonVal::Str).collect()),
+        );
         m.insert("step_span".into(), JsonVal::Obj(span_obj));
-        m.insert("step_pins".into(), JsonVal::Arr(self.step_pins.iter().map(|b| JsonVal::str(b.encode())).collect()));
-        m.insert("step_io".into(), JsonVal::Arr(self.step_io.iter().map(|b| JsonVal::str(b.encode())).collect()));
+        m.insert(
+            "step_pins".into(),
+            JsonVal::Arr(self.step_pins.iter().map(|b| JsonVal::str(b.encode())).collect()),
+        );
+        m.insert(
+            "step_io".into(),
+            JsonVal::Arr(self.step_io.iter().map(|b| JsonVal::str(b.encode())).collect()),
+        );
         m.insert("gpu_done".into(), JsonVal::Bool(self.gpu_done));
         JsonVal::Obj(m)
     }
@@ -1799,17 +1886,26 @@ pub struct CacheSchedulerTrace {
     pub steps: Vec<CacheSchedulerStep>,
 }
 
-pub fn emit_cache_scheduler_config(sink: &mut dyn TraceSink, cfg: &CacheSchedulerConfig) -> Result<(), TraceError> {
+pub fn emit_cache_scheduler_config(
+    sink: &mut dyn TraceSink,
+    cfg: &CacheSchedulerConfig,
+) -> Result<(), TraceError> {
     cfg.validate()?;
     sink.emit_line(&cfg.to_json_val().to_json_line())
 }
 
-pub fn emit_cache_scheduler_step(sink: &mut dyn TraceSink, step: &CacheSchedulerStep) -> Result<(), TraceError> {
+pub fn emit_cache_scheduler_step(
+    sink: &mut dyn TraceSink,
+    step: &CacheSchedulerStep,
+) -> Result<(), TraceError> {
     sink.emit_line(&step.to_json_val().to_json_line())
 }
 
 pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, TraceError> {
-    let mut non_empty = input.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+    let mut non_empty = input
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty());
     let Some((first_idx, first_line)) = non_empty.next() else {
         return Err(TraceError::InvalidSchema("empty trace input".into()));
     };
@@ -1871,7 +1967,10 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
         }
         let seq = req_field(obj, "seq")?.as_u64()?;
         if seq != steps.len() as u64 {
-            return Err(TraceError::InvalidSchema(format!("non-contiguous step seq {seq}, expected {}", steps.len())));
+            return Err(TraceError::InvalidSchema(format!(
+                "non-contiguous step seq {seq}, expected {}",
+                steps.len()
+            )));
         }
         let action = req_field(obj, "action")?.as_str()?.to_owned();
         if !CACHE_SCHEDULER_ACTIONS.contains(&action.as_str()) {
@@ -1915,7 +2014,16 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             }
             let ref_count = req_field(bobj, "ref_count")?.as_u32()?;
             let last_used_tick = req_field(bobj, "last_used_tick")?.as_u64()?;
-            blocks.push(CacheBlockSnapshot { id, tier, sealed, idx, length, data, ref_count, last_used_tick });
+            blocks.push(CacheBlockSnapshot {
+                id,
+                tier,
+                sealed,
+                idx,
+                length,
+                data,
+                ref_count,
+                last_used_tick,
+            });
         }
 
         let valid_boundaries: BTreeSet<u32> = config.boundaries().into_iter().collect();
@@ -1925,11 +2033,15 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             let sobj = item.as_obj()?;
             let prefix = req_field(sobj, "prefix")?.as_str()?.to_owned();
             if !config.prefixes.contains(&prefix) {
-                return Err(TraceError::InvalidSchema(format!("start_point unknown prefix {prefix:?}")));
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point unknown prefix {prefix:?}"
+                )));
             }
             let boundary = req_field(sobj, "boundary")?.as_u32()?;
             if !valid_boundaries.contains(&boundary) {
-                return Err(TraceError::InvalidSchema(format!("start_point invalid boundary {boundary}")));
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point invalid boundary {boundary}"
+                )));
             }
             if !seen_starts.insert((prefix.clone(), boundary)) {
                 return Err(TraceError::InvalidSchema("duplicate start_point record in step".into()));
@@ -1937,7 +2049,9 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             let state_kept = req_field(sobj, "state_kept")?.as_bool()?;
             let state_tier = req_field(sobj, "state_tier")?.as_str()?.to_owned();
             if !matches!(state_tier.as_str(), "none" | "memory" | "disk" | "both") {
-                return Err(TraceError::InvalidSchema(format!("invalid start_point state_tier {state_tier:?}")));
+                return Err(TraceError::InvalidSchema(format!(
+                    "invalid start_point state_tier {state_tier:?}"
+                )));
             }
             let last_used_tick = req_field(sobj, "last_used_tick")?.as_u64()?;
             let full = req_field(sobj, "full")?
@@ -2106,8 +2220,11 @@ pub fn render_cache_scheduler_tla_bundle(
     }
 
     let all_ids = cfg.all_block_ids();
-    let id_to_code: BTreeMap<CacheBlockId, usize> =
-        all_ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1)).collect();
+    let id_to_code: BTreeMap<CacheBlockId, usize> = all_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i + 1))
+        .collect();
     let boundaries = cfg.boundaries();
 
     let empty_data = (0..cfg.block_size).map(|_| "0").collect::<Vec<_>>().join(", ");
@@ -2161,8 +2278,8 @@ pub fn render_cache_scheduler_tla_bundle(
                 }
                 Ok(format!("<<\"Arrive\", \"{l}\", \"{p}\", {tgt}>>"))
             }
-            "Refuse429" | "Admit" | "BeginRestore" | "RestoreStartState" | "FinishRestore" | "SlideWindow"
-            | "FinishReady" | "Cancel" => {
+            "Refuse429" | "Admit" | "BeginRestore" | "RestoreStartState" | "FinishRestore"
+            | "SlideWindow" | "FinishReady" | "Cancel" => {
                 let l = req_lane(&step.action)?;
                 Ok(format!("<<\"{}\", \"{l}\">>", step.action))
             }
@@ -2205,7 +2322,11 @@ pub fn render_cache_scheduler_tla_bundle(
                 if chosen.is_empty() {
                     return Err(TraceError::InvalidSchema("BuildStep spans must choose >= 1 lane".into()));
                 }
-                Ok(format!("<<\"BuildStep\", {{{}}}, <<{}>>>>", chosen.join(", "), sp_seq.join(", ")))
+                Ok(format!(
+                    "<<\"BuildStep\", {{{}}}, <<{}>>>>",
+                    chosen.join(", "),
+                    sp_seq.join(", ")
+                ))
             }
             "ReclaimColdDisk" | "GpuExecute" | "CompleteStepIO" | "FinishStep" | "Stutter" => {
                 Ok(format!("<<\"{}\">>", step.action))
@@ -2224,9 +2345,13 @@ pub fn render_cache_scheduler_tla_bundle(
                 data.push_str(",\n");
             }
             let st = &step.state;
-            let blk_map: BTreeMap<&CacheBlockId, &CacheBlockSnapshot> = st.blocks.iter().map(|b| (&b.id, b)).collect();
-            let sp_map: BTreeMap<(&str, u32), &StartPointSnapshot> =
-                st.start_points.iter().map(|sp| ((sp.prefix.as_str(), sp.boundary), sp)).collect();
+            let blk_map: BTreeMap<&CacheBlockId, &CacheBlockSnapshot> =
+                st.blocks.iter().map(|b| (&b.id, b)).collect();
+            let sp_map: BTreeMap<(&str, u32), &StartPointSnapshot> = st
+                .start_points
+                .iter()
+                .map(|sp| ((sp.prefix.as_str(), sp.boundary), sp))
+                .collect();
 
             data.push_str("    <<");
             data.push_str("<<");
@@ -2239,7 +2364,13 @@ pub fn render_cache_scheduler_tla_bundle(
                         data.push_str("EB");
                     } else {
                         let sealed_lit = if b.sealed { "TRUE" } else { "FALSE" };
-                        let _ = write!(data, "<<{}, {sealed_lit}, {}, {}, <<", tier_code(&b.tier), b.idx, b.length);
+                        let _ = write!(
+                            data,
+                            "<<{}, {sealed_lit}, {}, {}, <<",
+                            tier_code(&b.tier),
+                            b.idx,
+                            b.length
+                        );
                         for (di, &dv) in b.data.iter().enumerate() {
                             if di > 0 {
                                 data.push_str(", ");
@@ -2264,11 +2395,23 @@ pub fn render_cache_scheduler_tla_bundle(
                     }
                     if let Some(sp) = sp_map.get(&(pfx.as_str(), bnd)) {
                         let st_code = tier_code(&sp.state_tier);
-                        let f_codes =
-                            sp.full.iter().map(|id| id_to_code[id].to_string()).collect::<Vec<_>>().join(", ");
-                        let w_codes = sp.win.iter().map(|id| id_to_code[id].to_string()).collect::<Vec<_>>().join(", ");
-                        let _ =
-                            write!(data, "<<TRUE, {st_code}, {{{f_codes}}}, {{{w_codes}}}, {}>>", sp.last_used_tick);
+                        let f_codes = sp
+                            .full
+                            .iter()
+                            .map(|id| id_to_code[id].to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let w_codes = sp
+                            .win
+                            .iter()
+                            .map(|id| id_to_code[id].to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(
+                            data,
+                            "<<TRUE, {st_code}, {{{f_codes}}}, {{{w_codes}}}, {}>>",
+                            sp.last_used_tick
+                        );
                     } else {
                         data.push_str("ES");
                     }
@@ -2362,17 +2505,37 @@ pub fn render_cache_scheduler_tla_bundle(
                 let _ = write!(data, "{}", l.ghost_bypass);
             }
             let sa_lit = if st.step_active { "TRUE" } else { "FALSE" };
-            let sl_lit = st.step_lanes.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+            let sl_lit = st
+                .step_lanes
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             let ss_lit = cfg
                 .lanes
                 .iter()
                 .map(|l| st.step_span.get(l).copied().unwrap_or(0).to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sp_lit = st.step_pins.iter().map(|id| id_to_code[id].to_string()).collect::<Vec<_>>().join(", ");
-            let sio_lit = st.step_io.iter().map(|id| id_to_code[id].to_string()).collect::<Vec<_>>().join(", ");
+            let sp_lit = st
+                .step_pins
+                .iter()
+                .map(|id| id_to_code[id].to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sio_lit = st
+                .step_io
+                .iter()
+                .map(|id| id_to_code[id].to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             let gd_lit = if st.gpu_done { "TRUE" } else { "FALSE" };
-            let qs_lit = st.queue_seq.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+            let qs_lit = st
+                .queue_seq
+                .iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             let act_lit = encode_cs_act(step)?;
             let _ = write!(
                 data,
@@ -2383,11 +2546,30 @@ pub fn render_cache_scheduler_tla_bundle(
     }
     data.push_str("\n>>\n=============================================================================\n");
 
-    let lane_seq_lit = cfg.lanes.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
-    let pfx_seq_lit = cfg.prefixes.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", ");
+    let lane_seq_lit = cfg
+        .lanes
+        .iter()
+        .map(|l| format!("\"{l}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pfx_seq_lit = cfg
+        .prefixes
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let bnd_seq_lit = boundaries.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
-    let blk_seq_lit = all_ids.iter().map(CacheBlockId::to_tla_tuple).collect::<Vec<_>>().join(", ");
-    let req_set_lit = cfg.request_lengths.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    let blk_seq_lit = all_ids
+        .iter()
+        .map(CacheBlockId::to_tla_tuple)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let req_set_lit = cfg
+        .request_lengths
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut check = format!(
         "---------------------------- MODULE TraceCheck ----------------------------
@@ -2637,12 +2819,7 @@ PROPERTIES
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BlockLayoutEvent {
     Config(BlockLayoutConfig),
-    Prepare {
-        lane: String,
-        tokens: u32,
-        budget: u32,
-        pos: u32,
-    },
+    Prepare { lane: String, tokens: u32, budget: u32, pos: u32 },
     Alloc {
         lane: String,
         kind: BlockKind,
@@ -2653,33 +2830,14 @@ pub enum BlockLayoutEvent {
         offset_limbs: OffsetLimbs,
         kvb: u32,
     },
-    BeginStep {
-        lane: String,
-        pin_count: u32,
-    },
-    Write {
-        lane: String,
-        pos: u32,
-    },
-    EndStep {
-        lane: String,
-        pos: u32,
-    },
-    SlideWindow {
-        lane: String,
-    },
-    KeepStart {
-        lane: String,
-        pos: u32,
-    },
+    BeginStep { lane: String, pin_count: u32 },
+    Write { lane: String, pos: u32 },
+    EndStep { lane: String, pos: u32 },
+    SlideWindow { lane: String },
+    KeepStart { lane: String, pos: u32 },
     DropStart,
-    Match {
-        lane: String,
-        pos: u32,
-    },
-    Finish {
-        lane: String,
-    },
+    Match { lane: String, pos: u32 },
+    Finish { lane: String },
 }
 
 impl BlockLayoutEvent {
@@ -2692,7 +2850,10 @@ impl BlockLayoutEvent {
                     _ => unreachable!(),
                 };
                 obj.insert("pool_mode".into(), JsonVal::str("per_kind"));
-                obj.insert("capacity".into(), JsonVal::uint(cfg.full_capacity.max(cfg.window_capacity)));
+                obj.insert(
+                    "capacity".into(),
+                    JsonVal::uint(cfg.full_capacity.max(cfg.window_capacity)),
+                );
                 return JsonVal::Obj(obj);
             }
             BlockLayoutEvent::Prepare { lane, tokens, budget, pos } => {
@@ -2702,7 +2863,16 @@ impl BlockLayoutEvent {
                 m.insert("budget".into(), JsonVal::uint(*budget));
                 m.insert("pos".into(), JsonVal::uint(*pos));
             }
-            BlockLayoutEvent::Alloc { lane, kind, block, slot, generation, offset, offset_limbs, kvb } => {
+            BlockLayoutEvent::Alloc {
+                lane,
+                kind,
+                block,
+                slot,
+                generation,
+                offset,
+                offset_limbs,
+                kvb,
+            } => {
                 let mut limbs = BTreeMap::new();
                 limbs.insert("hi".into(), JsonVal::uint(offset_limbs.hi));
                 limbs.insert("mib".into(), JsonVal::uint(offset_limbs.mib));
@@ -2970,7 +3140,10 @@ mod tests {
         assert_eq!(off_4gib_kv8, 1u64 << 32);
         let win_20gib_kv8 = byte_offset(BlockKind::Window, hi_slot_kv8, 1).unwrap();
         assert_eq!(win_20gib_kv8, 4096 * (WINDOW_STRIDE / 2));
-        assert_eq!(OffsetLimbs::from_u64(win_20gib_kv8).unwrap(), OffsetLimbs { hi: 5, mib: 0, sub: 0 });
+        assert_eq!(
+            OffsetLimbs::from_u64(win_20gib_kv8).unwrap(),
+            OffsetLimbs { hi: 5, mib: 0, sub: 0 }
+        );
     }
 
     #[test]
@@ -3063,10 +3236,8 @@ mod tests {
         assert!(parse_block_layout_jsonl(&bad_mib).is_err());
 
         // 3. Out-of-range slot ("slot":1 -> "slot":3 when full_capacity == 2) -> rejected!
-        let bad_slot = valid_jsonl.replace(
-            "\"offset\":4294967296,\"offset_limbs\":{\"hi\":1,\"mib\":0,\"sub\":0},\"slot\":1",
-            "\"offset\":4294967296,\"offset_limbs\":{\"hi\":1,\"mib\":0,\"sub\":0},\"slot\":3",
-        );
+        let bad_slot = valid_jsonl.replace("\"offset\":4294967296,\"offset_limbs\":{\"hi\":1,\"mib\":0,\"sub\":0},\"slot\":1",
+                                           "\"offset\":4294967296,\"offset_limbs\":{\"hi\":1,\"mib\":0,\"sub\":0},\"slot\":3");
         assert_ne!(bad_slot, valid_jsonl);
         assert!(parse_block_layout_jsonl(&bad_slot).is_err());
 
@@ -3255,7 +3426,10 @@ mod tests {
         ] {
             let dropped = valid.replacen(needle, "", 1);
             assert_ne!(dropped, valid, "failed to strip {needle}");
-            assert!(parse_cache_scheduler_jsonl(&dropped).is_err(), "parser silently accepted trace missing {needle}");
+            assert!(
+                parse_cache_scheduler_jsonl(&dropped).is_err(),
+                "parser silently accepted trace missing {needle}"
+            );
         }
 
         let bad_lane_state = valid.replacen("\"state\":\"Idle\"", "\"state\":\"Bogus\"", 1);

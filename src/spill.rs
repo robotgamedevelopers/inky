@@ -36,10 +36,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(all(unix, standalone_blocks))]
-use crate::libc;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(all(unix, standalone_blocks))]
+use crate::libc;
 
 mod store;
 pub use store::{read_block_from_dir, RawDiskRead, SpillStore};
@@ -89,7 +89,10 @@ pub fn set_test_spill_read_hook(hook: Option<std::sync::Arc<SpillReadHook>>) {
 
 #[cfg(test)]
 pub(super) fn run_test_spill_read_hook(dir: &Path, key: SpillKey) {
-    let hook = spill_read_hook_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let hook = spill_read_hook_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Some(h) = hook {
         h(dir, key);
     }
@@ -108,23 +111,30 @@ pub struct Sha256 {
     total_len: u64,
 }
 
-const SHA256_H0: [u32; 8] =
-    [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+const SHA256_H0: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
 const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
-    0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
-    0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
-    0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-    0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 impl Sha256 {
     pub fn new() -> Self {
-        Self { state: SHA256_H0, buf: [0u8; 64], buf_len: 0, total_len: 0 }
+        Self {
+            state: SHA256_H0,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
@@ -176,7 +186,12 @@ impl Sha256 {
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -468,7 +483,13 @@ struct HostKindPool {
 impl HostKindPool {
     fn new(kind: SpillBlockKind, capacity: usize, stride: usize) -> Self {
         let slots = (0..capacity)
-            .map(|_| HostSlot { generation: 0, occupied: false, sealed: false, refs: 0, bytes: vec![0u8; stride] })
+            .map(|_| HostSlot {
+                generation: 0,
+                occupied: false,
+                sealed: false,
+                refs: 0,
+                bytes: vec![0u8; stride],
+            })
             .collect();
         Self { kind, stride, slots, used: 0 }
     }
@@ -494,8 +515,10 @@ impl HostKindPool {
     fn take_free(&mut self) -> Result<ResidentSlot, SpillError> {
         for (idx, rec) in self.slots.iter_mut().enumerate() {
             if !rec.occupied && rec.refs == 0 {
-                let next_gen =
-                    rec.generation.checked_add(1).ok_or_else(|| SpillError::Pool("generation exhausted".into()))?;
+                let next_gen = rec
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| SpillError::Pool("generation exhausted".into()))?;
                 rec.bytes.fill(0);
                 rec.generation = next_gen;
                 rec.occupied = true;
@@ -505,7 +528,12 @@ impl HostKindPool {
                 let offset = (idx as u64)
                     .checked_mul(self.stride as u64)
                     .ok_or_else(|| SpillError::Pool("offset overflow".into()))?;
-                return Ok(ResidentSlot { kind: self.kind, slot: (idx as u32) + 1, generation: next_gen, offset });
+                return Ok(ResidentSlot {
+                    kind: self.kind,
+                    slot: (idx as u32) + 1,
+                    generation: next_gen,
+                    offset,
+                });
             }
         }
         Err(SpillError::Pool("no free slots".into()))
@@ -517,7 +545,10 @@ impl HostKindPool {
         if rec.refs != 0 {
             return Err(SpillError::Pool("cannot release slot with live refs".into()));
         }
-        let next_gen = rec.generation.checked_add(1).ok_or_else(|| SpillError::Pool("generation exhausted".into()))?;
+        let next_gen = rec
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| SpillError::Pool("generation exhausted".into()))?;
         rec.bytes.fill(0);
         rec.generation = next_gen;
         rec.occupied = false;
@@ -537,7 +568,12 @@ pub struct HostBlockPoolBackend {
 }
 
 impl HostBlockPoolBackend {
-    pub fn new(full_capacity: usize, window_capacity: usize, full_stride: usize, window_stride: usize) -> Self {
+    pub fn new(
+        full_capacity: usize,
+        window_capacity: usize,
+        full_stride: usize,
+        window_stride: usize,
+    ) -> Self {
         Self {
             full: HostKindPool::new(SpillBlockKind::Full, full_capacity, full_stride),
             window: HostKindPool::new(SpillBlockKind::Window, window_capacity, window_stride),
@@ -623,16 +659,20 @@ impl SpillPoolBackend for HostBlockPoolBackend {
     fn add_ref(&mut self, slot: ResidentSlot) -> Result<u32, SpillError> {
         let p = self.pool_mut(slot.kind);
         let idx = p.slot_index(slot)?;
-        p.slots[idx].refs =
-            p.slots[idx].refs.checked_add(1).ok_or_else(|| SpillError::Pool("refcount overflow".into()))?;
+        p.slots[idx].refs = p.slots[idx]
+            .refs
+            .checked_add(1)
+            .ok_or_else(|| SpillError::Pool("refcount overflow".into()))?;
         Ok(p.slots[idx].refs)
     }
 
     fn drop_ref(&mut self, slot: ResidentSlot) -> Result<u32, SpillError> {
         let p = self.pool_mut(slot.kind);
         let idx = p.slot_index(slot)?;
-        p.slots[idx].refs =
-            p.slots[idx].refs.checked_sub(1).ok_or_else(|| SpillError::Pool("refcount underflow".into()))?;
+        p.slots[idx].refs = p.slots[idx]
+            .refs
+            .checked_sub(1)
+            .ok_or_else(|| SpillError::Pool("refcount underflow".into()))?;
         Ok(p.slots[idx].refs)
     }
 
@@ -663,10 +703,20 @@ struct ManagedBlock {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReserveError {
     /// Requested working set exceeds hard pool slot capacity and can never fit.
-    ExceedsCapacity { need_full: usize, cap_full: usize, need_window: usize, cap_window: usize },
+    ExceedsCapacity {
+        need_full: usize,
+        cap_full: usize,
+        need_window: usize,
+        cap_window: usize,
+    },
     /// Not enough free + evictable (`refs == 0`) slots right now; lane should
     /// wait in `Restoring` without performing partial reads or thrashing.
-    WouldBlock { need_full: usize, avail_full: usize, need_window: usize, avail_window: usize },
+    WouldBlock {
+        need_full: usize,
+        avail_full: usize,
+        need_window: usize,
+        avail_window: usize,
+    },
     /// Underlying pool or I/O error.
     BackendFailed,
 }
@@ -840,7 +890,8 @@ impl<P: SpillPoolBackend> SpillManager<P> {
             if self.evictable_count(kind) == 0 {
                 return Err(ReserveError::WouldBlock {
                     need_full: usize::from(kind == SpillBlockKind::Full),
-                    avail_full: self.pool.free_slots(SpillBlockKind::Full) + self.evictable_count(SpillBlockKind::Full),
+                    avail_full: self.pool.free_slots(SpillBlockKind::Full)
+                        + self.evictable_count(SpillBlockKind::Full),
                     need_window: usize::from(kind == SpillBlockKind::Window),
                     avail_window: self.pool.free_slots(SpillBlockKind::Window)
                         + self.evictable_count(SpillBlockKind::Window),
@@ -868,8 +919,16 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         let seq = self.next_lru();
         let on_disk = self.store.contains(key);
         let tier = if on_disk { BlockTier::Both } else { BlockTier::Memory };
-        self.blocks
-            .insert(key, ManagedBlock { tier, resident: Some(slot), recurrent_state, last_used_seq: seq, io_pins: 0 });
+        self.blocks.insert(
+            key,
+            ManagedBlock {
+                tier,
+                resident: Some(slot),
+                recurrent_state,
+                last_used_seq: seq,
+                io_pins: 0,
+            },
+        );
         Ok(())
     }
 
@@ -943,7 +1002,10 @@ impl<P: SpillPoolBackend> SpillManager<P> {
                 k.kind == kind
                     && b.tier.in_memory()
                     && b.io_pins == 0
-                    && b.resident.and_then(|s| self.pool.refs(s).ok()).map(|r| r == 0).unwrap_or(false)
+                    && b.resident
+                        .and_then(|s| self.pool.refs(s).ok())
+                        .map(|r| r == 0)
+                        .unwrap_or(false)
             })
             .count()
     }
@@ -955,7 +1017,10 @@ impl<P: SpillPoolBackend> SpillManager<P> {
                 k.kind == kind
                     && b.tier.in_memory()
                     && b.io_pins == 0
-                    && b.resident.and_then(|s| self.pool.refs(s).ok()).map(|r| r == 0).unwrap_or(false)
+                    && b.resident
+                        .and_then(|s| self.pool.refs(s).ok())
+                        .map(|r| r == 0)
+                        .unwrap_or(false)
             })
             .min_by_key(|(k, b)| (b.last_used_seq, **k))
             .map(|(k, _)| *k)
@@ -967,7 +1032,9 @@ impl<P: SpillPoolBackend> SpillManager<P> {
     /// - If `BlockTier::Memory`, spills K/V + recurrent state atomically to SSD,
     ///   updates tier to `Disk` (or `None` if over `--max-spill-bytes`), and frees memory slot.
     fn evict_one_lru_cold(&mut self, kind: SpillBlockKind) -> Result<SpillKey, SpillError> {
-        let key = self.pick_lru_evictable(kind).ok_or_else(|| SpillError::Pool("no evictable cold block".into()))?;
+        let key = self
+            .pick_lru_evictable(kind)
+            .ok_or_else(|| SpillError::Pool("no evictable cold block".into()))?;
         let (tier, slot) = {
             let b = self.blocks.get_mut(&key).unwrap();
             b.io_pins = b.io_pins.saturating_add(1);
@@ -992,10 +1059,20 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         let state_copy = self.blocks.get(&key).and_then(|b| b.recurrent_state.clone());
 
         // Protect any disk block currently undergoing I/O (active spill or pending restore) from disk GC.
-        let protected: HashSet<SpillKey> = self.blocks.iter().filter(|(_, b)| b.io_pins > 0).map(|(k, _)| *k).collect();
+        let protected: HashSet<SpillKey> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| b.io_pins > 0)
+            .map(|(k, _)| *k)
+            .collect();
 
-        let write_res =
-            self.store.write_block(key, u64::from(slot.generation), &kv_copy, state_copy.as_deref(), &protected);
+        let write_res = self.store.write_block(
+            key,
+            u64::from(slot.generation),
+            &kv_copy,
+            state_copy.as_deref(),
+            &protected,
+        );
 
         let (outcome, disk_gc_evicted) = match write_res {
             Ok(v) => v,
@@ -1216,7 +1293,12 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         }
 
         match self.reserve_working_set(disk_full.len(), disk_window.len()) {
-            Ok(reservation) => Ok(PreparedRestore { pinned_in_memory, disk_full, disk_window, reservation }),
+            Ok(reservation) => Ok(PreparedRestore {
+                pinned_in_memory,
+                disk_full,
+                disk_window,
+                reservation,
+            }),
             Err(e) => {
                 // Atomic rollback: unpin disk I/O pins and every in-memory block we pinned.
                 for &key in disk_full.iter().chain(disk_window.iter()) {
@@ -1259,7 +1341,12 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         &mut self,
         prepared: PreparedRestore,
     ) -> Result<RestoredWorkingSet, RestoreWorkingSetMiss> {
-        let PreparedRestore { pinned_in_memory, disk_full, disk_window, reservation } = prepared;
+        let PreparedRestore {
+            pinned_in_memory,
+            disk_full,
+            disk_window,
+            reservation,
+        } = prepared;
 
         let full_stride = self.pool.stride_bytes(SpillBlockKind::Full);
         let window_stride = self.pool.stride_bytes(SpillBlockKind::Window);
@@ -1267,7 +1354,9 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         let mut verified_full = Vec::with_capacity(disk_full.len());
         let mut verified_window = Vec::with_capacity(disk_window.len());
 
-        let release_io_pins = |blocks: &mut HashMap<SpillKey, ManagedBlock>, df: &[SpillKey], dw: &[SpillKey]| {
+        let release_io_pins = |blocks: &mut HashMap<SpillKey, ManagedBlock>,
+                               df: &[SpillKey],
+                               dw: &[SpillKey]| {
             for &k in df.iter().chain(dw.iter()) {
                 if let Some(b) = blocks.get_mut(&k) {
                     b.io_pins = b.io_pins.saturating_sub(1);
@@ -1332,7 +1421,11 @@ impl<P: SpillPoolBackend> SpillManager<P> {
             }
         }
 
-        for ((&key, maybe_blk), slot) in disk_full.iter().zip(verified_full).zip(reservation.full_slots) {
+        for ((&key, maybe_blk), slot) in disk_full
+            .iter()
+            .zip(verified_full)
+            .zip(reservation.full_slots)
+        {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 // Concurrent lane already restored `key`; pin existing slot and free redundant slot.
                 self.pool.add_ref(existing).expect("pin existing restored full slot");
@@ -1368,7 +1461,11 @@ impl<P: SpillPoolBackend> SpillManager<P> {
             }
         }
 
-        for ((&key, maybe_blk), slot) in disk_window.iter().zip(verified_window).zip(reservation.window_slots) {
+        for ((&key, maybe_blk), slot) in disk_window
+            .iter()
+            .zip(verified_window)
+            .zip(reservation.window_slots)
+        {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 self.pool.add_ref(existing).expect("pin existing restored window slot");
                 let _ = self.pool.drop_ref(slot);
@@ -1403,7 +1500,11 @@ impl<P: SpillPoolBackend> SpillManager<P> {
             }
         }
 
-        Ok(RestoredWorkingSet { full_slots, window_slots, recurrent_states })
+        Ok(RestoredWorkingSet {
+            full_slots,
+            window_slots,
+            recurrent_states,
+        })
     }
 }
 

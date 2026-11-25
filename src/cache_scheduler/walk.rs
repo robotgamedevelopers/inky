@@ -251,7 +251,9 @@ pub fn walk_cache_scheduler(
                 let _ = allow_precond(sched.restore_block(&lanes[2], &b, event_sink, state_sink))?;
             }
         }
-        if CacheScheduler::lane_blocks_of(&sched.lanes[&lanes[2]]).iter().all(|b| sched.blocks[b].in_memory())
+        if CacheScheduler::lane_blocks_of(&sched.lanes[&lanes[2]])
+            .iter()
+            .all(|b| sched.blocks[b].in_memory())
             && sched.start_state_ready(&sched.lanes[&lanes[2]])
         {
             sched.finish_restore(&lanes[2], event_sink, state_sink)?;
@@ -320,8 +322,11 @@ pub fn walk_cache_scheduler(
     for round in 0..24 {
         if sched.step_active {
             if round % 5 == 2 {
-                if let Some(in_step_lane) =
-                    sched.step_lanes.iter().find(|l| sched.lane_state(l) == Some("InStep")).cloned()
+                if let Some(in_step_lane) = sched
+                    .step_lanes
+                    .iter()
+                    .find(|l| sched.lane_state(l) == Some("InStep"))
+                    .cloned()
                 {
                     if rng.pick(2) == 0 {
                         let _ = sched.cancel(&in_step_lane, event_sink, state_sink)?;
@@ -349,7 +354,10 @@ pub fn walk_cache_scheduler(
             if submitted >= burst {
                 break;
             }
-            if matches!(sched.lane_state(ln), Some("Idle" | "Refused" | "Cancelled" | "Finished")) {
+            if matches!(
+                sched.lane_state(ln),
+                Some("Idle" | "Refused" | "Cancelled" | "Finished")
+            ) {
                 let pfx = &prefixes[rng.pick(prefixes.len())];
                 let tgt = req_lens[rng.pick(req_lens.len())];
                 let _ = sched.arrive(ln, pfx, tgt, event_sink, state_sink)?;
@@ -358,8 +366,11 @@ pub fn walk_cache_scheduler(
         }
 
         loop {
-            let next_q =
-                lanes.iter().filter(|l| sched.can_admit_now(l)).max_by_key(|l| sched.lanes[*l].wait_ticks).cloned();
+            let next_q = lanes
+                .iter()
+                .filter(|l| sched.can_admit_now(l))
+                .max_by_key(|l| sched.lanes[*l].wait_ticks)
+                .cloned();
             let Some(ql) = next_q else { break };
             sched.admit(&ql, event_sink, state_sink)?;
         }
@@ -380,7 +391,10 @@ pub fn walk_cache_scheduler(
                 .blocks
                 .iter()
                 .filter(|(id, b)| {
-                    b.present() && b.ref_count == 0 && !sched.step_pins.contains(*id) && !sched.step_io.contains(*id)
+                    b.present()
+                        && b.ref_count == 0
+                        && !sched.step_pins.contains(*id)
+                        && !sched.step_io.contains(*id)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -416,10 +430,14 @@ pub fn walk_cache_scheduler(
                         let _ = allow_precond(sched.restore_block(ln, &b, event_sink, state_sink))?;
                     }
                 }
-                if !sched.start_state_ready(&sched.lanes[ln]) && sched.state_mem_used() < sched.state_mem_budget() {
+                if !sched.start_state_ready(&sched.lanes[ln])
+                    && sched.state_mem_used() < sched.state_mem_budget()
+                {
                     let _ = allow_precond(sched.restore_start_state(ln, event_sink, state_sink))?;
                 }
-                if CacheScheduler::lane_blocks_of(&sched.lanes[ln]).iter().all(|b| sched.blocks[b].in_memory())
+                if CacheScheduler::lane_blocks_of(&sched.lanes[ln])
+                    .iter()
+                    .all(|b| sched.blocks[b].in_memory())
                     && sched.start_state_ready(&sched.lanes[ln])
                 {
                     sched.finish_restore(ln, event_sink, state_sink)?;

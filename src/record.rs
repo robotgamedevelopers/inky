@@ -80,8 +80,14 @@ impl ResponseMetrics {
             .and_then(|x| x.as_u64())
             .and_then(|x| usize::try_from(x).ok())
             .ok_or("response.completion_tokens missing or invalid")?;
-        let ttft_ms = obj.get("ttft_ms").and_then(|x| x.as_u64()).ok_or("response.ttft_ms missing or invalid")?;
-        let total_ms = obj.get("total_ms").and_then(|x| x.as_u64()).ok_or("response.total_ms missing or invalid")?;
+        let ttft_ms = obj
+            .get("ttft_ms")
+            .and_then(|x| x.as_u64())
+            .ok_or("response.ttft_ms missing or invalid")?;
+        let total_ms = obj
+            .get("total_ms")
+            .and_then(|x| x.as_u64())
+            .ok_or("response.total_ms missing or invalid")?;
         let queue_ms = obj.get("queue_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let prefill_ms = obj.get("prefill_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let decode_ms = obj.get("decode_ms").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -95,8 +101,7 @@ impl ResponseMetrics {
             .and_then(|x| x.as_u64())
             .and_then(|x| u16::try_from(x).ok())
             .ok_or("response.status_code missing or invalid")?;
-        let generation_finish_reason = obj
-            .get("generation_finish_reason")
+        let generation_finish_reason = obj.get("generation_finish_reason")
             .map(|v| v.as_str().map(str::to_owned).ok_or("invalid response.generation_finish_reason"))
             .transpose()?;
         let delivery_status = match obj.get("delivery_status") {
@@ -152,19 +157,46 @@ impl RecordEntry {
             .and_then(|x| x.as_u64())
             .and_then(|x| u32::try_from(x).ok())
             .ok_or("schema_version missing or invalid")?;
-        let recorded_at_ms =
-            obj.get("recorded_at_ms").and_then(|x| x.as_u64()).ok_or("recorded_at_ms missing or invalid")?;
-        let card_id = obj.get("card_id").and_then(|x| x.as_str()).ok_or("card_id missing or invalid")?.to_string();
-        let turn_index = obj.get("turn_index").and_then(|x| x.as_u64()).ok_or("turn_index missing or invalid")?;
-        let endpoint = obj.get("endpoint").and_then(|x| x.as_str()).unwrap_or("/v1/chat/completions").to_string();
-        let request = obj.get("request").cloned().ok_or("request missing")?;
+        let recorded_at_ms = obj
+            .get("recorded_at_ms")
+            .and_then(|x| x.as_u64())
+            .ok_or("recorded_at_ms missing or invalid")?;
+        let card_id = obj
+            .get("card_id")
+            .and_then(|x| x.as_str())
+            .ok_or("card_id missing or invalid")?
+            .to_string();
+        let turn_index = obj
+            .get("turn_index")
+            .and_then(|x| x.as_u64())
+            .ok_or("turn_index missing or invalid")?;
+        let endpoint = obj
+            .get("endpoint")
+            .and_then(|x| x.as_str())
+            .unwrap_or("/v1/chat/completions")
+            .to_string();
+        let request = obj
+            .get("request")
+            .cloned()
+            .ok_or("request missing")?;
         let response = ResponseMetrics::from_json(obj.get("response").ok_or("response missing")?)?;
-        Ok(Self { schema_version, recorded_at_ms, card_id, turn_index, endpoint, request, response })
+        Ok(Self {
+            schema_version,
+            recorded_at_ms,
+            card_id,
+            turn_index,
+            endpoint,
+            request,
+            response,
+        })
     }
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Converts Unix epoch milliseconds to UTC `YYYYMMDD`.
@@ -231,8 +263,10 @@ pub fn parse_jsonl(input: &str) -> Result<Vec<RecordEntry>, String> {
         if trimmed.is_empty() {
             continue;
         }
-        let val: Value = serde_json::from_str(trimmed).map_err(|e| format!("line {}: invalid JSON: {e}", idx + 1))?;
-        let entry = RecordEntry::from_json(&val).map_err(|e| format!("line {}: {e}", idx + 1))?;
+        let val: Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("line {}: invalid JSON: {e}", idx + 1))?;
+        let entry = RecordEntry::from_json(&val)
+            .map_err(|e| format!("line {}: {e}", idx + 1))?;
         out.push(entry);
     }
     Ok(out)
@@ -301,7 +335,9 @@ impl TurnTracker {
     }
 
     fn compact_lru(&mut self) {
-        self.lru.retain(|(stamp, id)| self.entries.get(id).is_some_and(|&(_, cur_stamp)| cur_stamp == *stamp));
+        self.lru.retain(|(stamp, id)| {
+            self.entries.get(id).is_some_and(|&(_, cur_stamp)| cur_stamp == *stamp)
+        });
     }
 
     fn evict_one(&mut self) {
@@ -390,7 +426,12 @@ impl Recorder {
         Self::with_limits(dir, capacity, DEFAULT_MAX_QUEUE_BYTES, max_file_bytes)
     }
 
-    pub fn with_limits(dir: PathBuf, capacity: usize, max_queue_bytes: usize, max_file_bytes: u64) -> Self {
+    pub fn with_limits(
+        dir: PathBuf,
+        capacity: usize,
+        max_queue_bytes: usize,
+        max_file_bytes: u64,
+    ) -> Self {
         let (tx, rx) = sync_channel::<QueuedRecord>(capacity.max(1));
         let stats = Arc::new(Stats::new());
         let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -413,9 +454,7 @@ impl Recorder {
                         }
                     }
                 }
-                if let Err(e) =
-                    append_serialized_entry(&dir, item.recorded_at_ms, &item.bytes, max_file_bytes, &worker_stats)
-                {
+                if let Err(e) = append_serialized_entry(&dir, item.recorded_at_ms, &item.bytes, max_file_bytes, &worker_stats) {
                     let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || n.is_power_of_two() {
                         eprintln!("[record] write failed in {} (errors={n}): {e}", dir.display());
@@ -463,7 +502,12 @@ impl Recorder {
             if next > self.max_queue_bytes {
                 return false;
             }
-            match self.queued_bytes.compare_exchange_weak(cur, next, Ordering::Acquire, Ordering::Relaxed) {
+            match self.queued_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }
@@ -487,7 +531,11 @@ impl Recorder {
             self.note_drop("queue byte budget full");
             return false;
         }
-        let item = QueuedRecord { recorded_at_ms, bytes, queued_bytes: self.queued_bytes.clone() };
+        let item = QueuedRecord {
+            recorded_at_ms,
+            bytes,
+            queued_bytes: self.queued_bytes.clone(),
+        };
         match tx.try_send(item) {
             Ok(()) => true,
             Err(TrySendError::Full(_item)) => {
@@ -722,8 +770,8 @@ fn repair_existing_record_files(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 fn format_jsonl_line(entry: &RecordEntry) -> std::io::Result<Vec<u8>> {
-    let mut buf =
-        serde_json::to_vec(&entry.to_json()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut buf = serde_json::to_vec(&entry.to_json())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     buf.push(b'\n');
     Ok(buf)
 }
@@ -735,7 +783,12 @@ fn write_whole_line<W: Write>(writer: &mut W, line_with_nl: &[u8]) -> std::io::R
 }
 
 #[cfg(test)]
-fn append_entry(dir: &Path, entry: &RecordEntry, max_file_bytes: u64, stats: &Stats) -> std::io::Result<()> {
+fn append_entry(
+    dir: &Path,
+    entry: &RecordEntry,
+    max_file_bytes: u64,
+    stats: &Stats,
+) -> std::io::Result<()> {
     let line = format_jsonl_line(entry)?;
     append_serialized_entry(dir, entry.recorded_at_ms, &line, max_file_bytes, stats)
 }
@@ -994,7 +1047,12 @@ mod tests {
                 delivery_status: None,
             },
         };
-        let entries = vec![mk("card-b", 1, 2000), mk("card-a", 1, 1500), mk("card-b", 0, 1100), mk("card-a", 0, 1000)];
+        let entries = vec![
+            mk("card-b", 1, 2000),
+            mk("card-a", 1, 1500),
+            mk("card-b", 0, 1100),
+            mk("card-a", 0, 1000),
+        ];
         let grouped = group_by_card(&entries);
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0][0].card_id, "card-a");
@@ -1081,8 +1139,7 @@ mod tests {
             response: ResponseMetrics::from_json(&json!({
                 "prompt_tokens": 1, "completion_tokens": 1, "ttft_ms": 1, "total_ms": 1,
                 "queue_ms": 0, "prefill_ms": 0, "decode_ms": 0, "finish_reason": "stop", "status_code": 200,
-            }))
-            .unwrap(),
+            })).unwrap(),
         };
         let max_bytes = serde_json::to_vec(&entry.to_json()).unwrap().len() as u64 + 1;
         let recorder = Recorder::with_options(dir.clone(), 4, max_bytes);
@@ -1398,8 +1455,13 @@ mod tests {
             assert_eq!(fs::metadata(&active).unwrap().permissions().mode() & 0o777, 0o600);
             assert_eq!(fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        let dir_bytes =
-            || -> u64 { fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.metadata().unwrap().len()).sum() };
+        let dir_bytes = || -> u64 {
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.metadata().unwrap().len())
+                .sum()
+        };
         assert!(dir_bytes() <= max_bytes * 2, "day 1 total bytes {} exceeded cap {}", dir_bytes(), max_bytes * 2);
 
         // Advance across days and verify older dated files are pruned to stay within 2*max_bytes.

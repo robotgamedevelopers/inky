@@ -54,10 +54,7 @@ pub const WINDOW_PASSES: usize = 40;
 pub const FULL_PASSES: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BlockKind {
-    Window,
-    Full,
-}
+pub enum BlockKind { Window, Full }
 
 impl BlockKind {
     pub fn passes(self) -> usize {
@@ -77,12 +74,9 @@ impl BlockKind {
     /// Bytes in one slot at this element width. `kvb` is 2 for fp16 and 1 for `--kv8`.
     /// Any other width is refused. At 2 this is `FULL_STRIDE` or `WINDOW_STRIDE`.
     pub fn stride_bytes(self, kvb: u32) -> Result<u64, BlockError> {
-        if kvb != 1 && kvb != 2 {
-            return Err(BlockError::Width);
-        }
+        if kvb != 1 && kvb != 2 { return Err(BlockError::Width); }
         let passes = self.passes() as u64;
-        passes
-            .checked_mul(2)
+        passes.checked_mul(2)
             .and_then(|v| v.checked_mul(NKV as u64))
             .and_then(|v| v.checked_mul(BLOCK as u64))
             .and_then(|v| v.checked_mul(HD as u64))
@@ -147,19 +141,11 @@ pub struct Slot(u32);
 
 impl Slot {
     pub fn new(n: u32) -> Result<Slot, BlockError> {
-        if n == 0 {
-            Err(BlockError::SlotZero)
-        } else {
-            Ok(Slot(n))
-        }
+        if n == 0 { Err(BlockError::SlotZero) } else { Ok(Slot(n)) }
     }
-    pub fn get(self) -> u32 {
-        self.0
-    }
+    pub fn get(self) -> u32 { self.0 }
     /// The 0-based index of this slot in its pool.
-    pub fn pool_index(self) -> PoolIndex {
-        PoolIndex(self.0 - 1)
-    }
+    pub fn pool_index(self) -> PoolIndex { PoolIndex(self.0 - 1) }
 }
 
 /// A 0-based index into one kind's pool. Not a slot.
@@ -167,9 +153,7 @@ impl Slot {
 pub struct PoolIndex(u32);
 
 impl PoolIndex {
-    pub fn get(self) -> u32 {
-        self.0
-    }
+    pub fn get(self) -> u32 { self.0 }
 }
 
 /// Which 64-position block of the token stream. Not a slot.
@@ -177,12 +161,8 @@ impl PoolIndex {
 pub struct BlockIndex(u32);
 
 impl BlockIndex {
-    pub fn new(n: u32) -> BlockIndex {
-        BlockIndex(n)
-    }
-    pub fn get(self) -> u32 {
-        self.0
-    }
+    pub fn new(n: u32) -> BlockIndex { BlockIndex(n) }
+    pub fn get(self) -> u32 { self.0 }
     pub fn of_pos(pos: usize) -> Result<BlockIndex, BlockError> {
         u32::try_from(pos / BLOCK).map(BlockIndex).map_err(|_| BlockError::Overflow)
     }
@@ -221,15 +201,7 @@ pub fn byte_offset(kind: BlockKind, slot: Slot, kvb: u32) -> Result<u64, BlockEr
 /// so one head's 64 keys are contiguous. `base` is the slot's `byte_offset`.
 /// A pass, head or position outside the block is `OutOfRange`.
 #[cfg(any(test, standalone_blocks))]
-pub fn key_row(
-    base: u64,
-    kind: BlockKind,
-    kvb: u32,
-    pass: u32,
-    kv: Kv,
-    head: u32,
-    index: u32,
-) -> Result<u64, BlockError> {
+pub fn key_row(base: u64, kind: BlockKind, kvb: u32, pass: u32, kv: Kv, head: u32, index: u32) -> Result<u64, BlockError> {
     key_row_at(base, kind.passes() as u32, NKV as u32, BLOCK as u32, HD as u32, kvb, pass, kv.index(), head, index)
 }
 
@@ -237,21 +209,8 @@ pub fn key_row(
 /// Order is `[pass][K|V][head][pos in the block][hd]`, each element `kvb` bytes,
 /// matching `kv_blk_ptr` in `src/kernels.metal` and `src/prefill.metal`.
 /// The InBlock trace calls it at the spec's bounds (2 passes, 3 heads, 4 positions, `HD` 2).
-pub fn key_row_at(
-    base: u64,
-    passes: u32,
-    heads: u32,
-    block: u32,
-    hd: u32,
-    kvb: u32,
-    pass: u32,
-    plane: u32,
-    head: u32,
-    index: u32,
-) -> Result<u64, BlockError> {
-    if kvb != 1 && kvb != 2 {
-        return Err(BlockError::Width);
-    }
+pub fn key_row_at(base: u64, passes: u32, heads: u32, block: u32, hd: u32, kvb: u32, pass: u32, plane: u32, head: u32, index: u32) -> Result<u64, BlockError> {
+    if kvb != 1 && kvb != 2 { return Err(BlockError::Width); }
     if pass >= passes || plane >= 2 || head >= heads || index >= block {
         return Err(BlockError::OutOfRange);
     }
@@ -259,15 +218,10 @@ pub fn key_row_at(
     let head_step = u64::from(block).checked_mul(row).ok_or(BlockError::Overflow)?;
     let kv_plane = u64::from(heads).checked_mul(head_step).ok_or(BlockError::Overflow)?;
     let pass_step = kv_plane.checked_mul(2).ok_or(BlockError::Overflow)?;
-    let within = u64::from(pass)
-        .checked_mul(pass_step)
-        .ok_or(BlockError::Overflow)?
-        .checked_add(u64::from(plane).checked_mul(kv_plane).ok_or(BlockError::Overflow)?)
-        .ok_or(BlockError::Overflow)?
-        .checked_add(u64::from(head).checked_mul(head_step).ok_or(BlockError::Overflow)?)
-        .ok_or(BlockError::Overflow)?
-        .checked_add(u64::from(index).checked_mul(row).ok_or(BlockError::Overflow)?)
-        .ok_or(BlockError::Overflow)?;
+    let within = u64::from(pass).checked_mul(pass_step).ok_or(BlockError::Overflow)?
+        .checked_add(u64::from(plane).checked_mul(kv_plane).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?
+        .checked_add(u64::from(head).checked_mul(head_step).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?
+        .checked_add(u64::from(index).checked_mul(row).ok_or(BlockError::Overflow)?).ok_or(BlockError::Overflow)?;
     base.checked_add(within).ok_or(BlockError::Overflow)
 }
 
@@ -343,7 +297,9 @@ pub fn walk_grouped_tiles(
     assert!(lengths[0] >= 1 && lengths[1] >= 1);
     assert!(shared <= lengths[0].min(lengths[1]) / block_size);
 
-    let slot_of = |r: usize, b: usize| -> (usize, usize) { (b, if b < shared { 1 } else { r + 1 }) };
+    let slot_of = |r: usize, b: usize| -> (usize, usize) {
+        (b, if b < shared { 1 } else { r + 1 })
+    };
     let mask_start = |r: usize| -> usize {
         let first_r = if windowed { lengths[r].saturating_sub(window_size) } else { 0 }; // MUTANT_ANCHOR_GRP_MASK_START
         first_r
@@ -476,7 +432,12 @@ pub fn parse_metal_kv_layout(kernels_src: &str, prefill_src: &str) -> Result<Met
         let rest = &src[idx..];
         let body_end = rest[1..].find("\nkernel void ").map_or(rest.len(), |p| p + 1);
         let ksrc = &rest[..body_end];
-        for bind in ["KV0 [[buffer(3)]]", "KV1 [[buffer(10)]]", "KV2 [[buffer(11)]]", "KV3 [[buffer(12)]]"] {
+        for bind in [
+            "KV0 [[buffer(3)]]",
+            "KV1 [[buffer(10)]]",
+            "KV2 [[buffer(11)]]",
+            "KV3 [[buffer(12)]]",
+        ] {
             if !ksrc.contains(bind) {
                 return Err("Layer 3 kernel missing canonical KV0..KV3 buffer(3,10,11,12) binding");
             }
@@ -489,10 +450,19 @@ pub fn parse_metal_kv_layout(kernels_src: &str, prefill_src: &str) -> Result<Met
         }
         Ok(())
     };
-    for kname in ["k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec"] {
+    for kname in [
+        "k_kvprep_dec",
+        "k_attn_dec_solo",
+        "k_attn_grp_dec",
+    ] {
         check_kernel(kernels_src, kname)?;
     }
-    for kname in ["k_kvprep_b_blk", "k_attn_b_blk", "k_attn_bt_blk", "k_attn_h_blk"] {
+    for kname in [
+        "k_kvprep_b_blk",
+        "k_attn_b_blk",
+        "k_attn_bt_blk",
+        "k_attn_h_blk",
+    ] {
         check_kernel(prefill_src, kname)?;
     }
     Ok(MetalKvLayout {
@@ -543,8 +513,11 @@ pub fn metal_in_slot_byte_offset(
     head: u32,
     pos: u32,
 ) -> Result<u64, BlockError> {
-    let layout = parse_metal_kv_layout(include_str!("kernels.metal"), include_str!("prefill.metal"))
-        .expect("src/kernels.metal and src/prefill.metal KV layout must remain valid");
+    let layout = parse_metal_kv_layout(
+        include_str!("kernels.metal"),
+        include_str!("prefill.metal"),
+    )
+    .expect("src/kernels.metal and src/prefill.metal KV layout must remain valid");
     metal_in_slot_byte_offset_from_layout(&layout, kind, kvb, pass, kv, head, pos)
 }
 
@@ -566,10 +539,9 @@ pub fn write_inblock_trace(path: &str) -> std::io::Result<()> {
             for k in 0..2u32 {
                 for h in 0..3u32 {
                     for i in 0..4u32 {
-                        let addr = key_row_at(0, 2, 3, 4, 2, kvb, p, k, h, i).expect("the spec bounds are in range");
-                        if !first {
-                            out.push_str(",\n");
-                        }
+                        let addr = key_row_at(0, 2, 3, 4, 2, kvb, p, k, h, i)
+                            .expect("the spec bounds are in range");
+                        if !first { out.push_str(",\n"); }
                         first = false;
                         out.push_str(&format!("  <<{p}, {k}, {h}, {i}, {addr}>>"));
                     }
@@ -596,10 +568,9 @@ pub fn write_inblock_trace(path: &str) -> std::io::Result<()> {
                         let addr = metal_in_slot_byte_offset(kind, kvb, p, kv_plane, h, i)
                             .expect("production Metal KV bounds in range");
                         #[cfg(standalone_blocks)]
-                        let addr = key_row(0, kind, kvb, p, kv_plane, h, i).expect("production KV bounds in range");
-                        if !first {
-                            out.push_str(",\n");
-                        }
+                        let addr = key_row(0, kind, kvb, p, kv_plane, h, i)
+                            .expect("production KV bounds in range");
+                        if !first { out.push_str(",\n"); }
                         first = false;
                         out.push_str(&format!("  <<{p}, {k_idx}, {h}, {i}, {addr}>>"));
                     }
@@ -623,9 +594,7 @@ pub fn stride_at(kind: BlockKind, kvb: u32) -> Result<u64, BlockError> {
 
 /// How many slots fit in one slab. A stride larger than the cap is [`BlockError::Slab`].
 fn slots_in_slab(stride: u64, max_slab_bytes: u64) -> Result<usize, BlockError> {
-    if stride == 0 || max_slab_bytes < stride {
-        return Err(BlockError::Slab);
-    }
+    if stride == 0 || max_slab_bytes < stride { return Err(BlockError::Slab); }
     usize::try_from(max_slab_bytes / stride).map_err(|_| BlockError::Overflow)
 }
 
@@ -633,13 +602,8 @@ fn slots_in_slab(stride: u64, max_slab_bytes: u64) -> Result<usize, BlockError> 
 /// Full is the even index, window the odd. Refuses an index past the declared rows
 /// and a multiply that does not fit.
 pub fn table_index(kind: BlockKind, block: BlockIndex, blocks_per_kind: u32) -> Result<u32, BlockError> {
-    if block.get() >= blocks_per_kind {
-        return Err(BlockError::OutOfRange);
-    }
-    let lane = match kind {
-        BlockKind::Full => 0,
-        BlockKind::Window => 1,
-    };
+    if block.get() >= blocks_per_kind { return Err(BlockError::OutOfRange); }
+    let lane = match kind { BlockKind::Full => 0, BlockKind::Window => 1 };
     block.get().checked_mul(2).and_then(|v| v.checked_add(lane)).ok_or(BlockError::Overflow)
 }
 
@@ -655,11 +619,7 @@ pub fn next_generation(generation: u32) -> Result<u32, BlockError> {
 
 /// A written length, in positions. Past 64 is refused.
 pub fn block_length(n: u32) -> Result<u32, BlockError> {
-    if n > BLOCK as u32 {
-        Err(BlockError::Length)
-    } else {
-        Ok(n)
-    }
+    if n > BLOCK as u32 { Err(BlockError::Length) } else { Ok(n) }
 }
 
 /// One pool slot, the record the prefix tree, the start points and the poisoned-slot
@@ -683,28 +643,16 @@ impl SlotRecord {
         SlotRecord { generation, kind, length: 0, sealed: false, refs: 0 }
     }
 
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-    pub fn kind(&self) -> BlockKind {
-        self.kind
-    }
-    pub fn length(&self) -> u32 {
-        self.length
-    }
-    pub fn sealed(&self) -> bool {
-        self.sealed
-    }
-    pub fn refs(&self) -> u32 {
-        self.refs
-    }
+    pub fn generation(&self) -> u32 { self.generation }
+    pub fn kind(&self) -> BlockKind { self.kind }
+    pub fn length(&self) -> u32 { self.length }
+    pub fn sealed(&self) -> bool { self.sealed }
+    pub fn refs(&self) -> u32 { self.refs }
 
     /// The next generation. A live reference is `Refs`, and the count is left
     /// as it was. `reissue` is the route that waits for the last reference.
     pub fn bump_generation(&mut self) -> Result<(), BlockError> {
-        if self.refs != 0 {
-            return Err(BlockError::Refs);
-        }
+        if self.refs != 0 { return Err(BlockError::Refs); }
         self.generation = next_generation(self.generation)?;
         Ok(())
     }
@@ -714,13 +662,9 @@ impl SlotRecord {
         Ok(())
     }
 
-    pub fn seal(&mut self) {
-        self.sealed = true;
-    }
+    pub fn seal(&mut self) { self.sealed = true; }
 
-    fn unseal(&mut self) {
-        self.sealed = false;
-    }
+    fn unseal(&mut self) { self.sealed = false; }
 
     pub fn add_ref(&mut self) -> Result<(), BlockError> {
         self.refs = self.refs.checked_add(1).ok_or(BlockError::Overflow)?;
@@ -735,9 +679,7 @@ impl SlotRecord {
     /// Take the slot again once nothing holds it. A live reference is `Refs`.
     /// Otherwise the generation bumps, the length goes to 0, and the seal clears.
     pub fn reissue(&mut self) -> Result<(), BlockError> {
-        if self.refs != 0 {
-            return Err(BlockError::Refs);
-        }
+        if self.refs != 0 { return Err(BlockError::Refs); }
         self.bump_generation()?;
         self.length = 0;
         self.sealed = false;
@@ -759,21 +701,11 @@ impl BlockEntry {
     pub fn new(slot: Slot, generation: u32, offset: u64, kind: BlockKind, kvb: u32) -> BlockEntry {
         BlockEntry { slot, generation, offset, kind, kvb }
     }
-    pub fn slot(&self) -> Slot {
-        self.slot
-    }
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-    pub fn kind(&self) -> BlockKind {
-        self.kind
-    }
-    pub fn kvb(&self) -> u32 {
-        self.kvb
-    }
+    pub fn slot(&self) -> Slot { self.slot }
+    pub fn generation(&self) -> u32 { self.generation }
+    pub fn offset(&self) -> u64 { self.offset }
+    pub fn kind(&self) -> BlockKind { self.kind }
+    pub fn kvb(&self) -> u32 { self.kvb }
 }
 
 /// One slab: a contiguous allocation holding one or more slots of this kind.
@@ -858,10 +790,7 @@ impl BlockPool {
         let stride = kind.stride_bytes(kvb)?;
         let slots_per_slab = slots_in_slab(stride, u64::MAX)?;
         Ok(BlockPool {
-            kind,
-            kvb,
-            stride,
-            slots_per_slab,
+            kind, kvb, stride, slots_per_slab,
             slots: vec![SlotRecord::fresh(kind); n_slots],
             gpu_zero_pending: vec![false; n_slots],
             slabs: Vec::new(),
@@ -880,9 +809,7 @@ impl BlockPool {
 
     fn open_host(kind: BlockKind, n_slots: usize, kvb: u32, max_slab_bytes: u64) -> Result<BlockPool, BlockError> {
         #[cfg(not(standalone_blocks))]
-        {
-            Self::open(kind, n_slots, kvb, max_slab_bytes, None)
-        }
+        { Self::open(kind, n_slots, kvb, max_slab_bytes, None) }
         #[cfg(standalone_blocks)]
         {
             let stride = stride_at(kind, kvb)?;
@@ -896,9 +823,7 @@ impl BlockPool {
                 gpu_zero_pending: Vec::with_capacity(n_slots),
                 slabs: Vec::new(),
             };
-            if n_slots > 0 {
-                pool.grow_by(n_slots)?;
-            }
+            if n_slots > 0 { pool.grow_by(n_slots)?; }
             Ok(pool)
         }
     }
@@ -923,9 +848,7 @@ impl BlockPool {
             slabs: Vec::new(),
             device,
         };
-        if n_slots > 0 {
-            pool.grow_by(n_slots)?;
-        }
+        if n_slots > 0 { pool.grow_by(n_slots)?; }
         Ok(pool)
     }
 
@@ -935,8 +858,7 @@ impl BlockPool {
         if let Some(dev) = &self.device {
             // Metal anonymous shared buffers arrive page-zeroed from the OS kernel; avoid
             // synchronously faulting and memset-ing multi-GiB slabs on the host thread.
-            let buf =
-                dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
+            let buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
             return Ok(SlabStorage::Gpu(buf));
         }
         Ok(SlabStorage::Host(vec![0u8; n]))
@@ -945,9 +867,7 @@ impl BlockPool {
     /// Grow the slab that owns `index`, or open the next one. Does not move a slot already placed.
     fn ensure_slot(&mut self, index: usize) -> Result<(), BlockError> {
         let slab_i = index / self.slots_per_slab;
-        if slab_i >= MAX_SLABS {
-            return Err(BlockError::Slab);
-        }
+        if slab_i >= MAX_SLABS { return Err(BlockError::Slab); }
         let within = index % self.slots_per_slab;
         let count = (within as u64).checked_add(1).ok_or(BlockError::Overflow)?;
         let need = count.checked_mul(self.stride).ok_or(BlockError::Overflow)?;
@@ -955,9 +875,7 @@ impl BlockPool {
             self.slabs.push(self.allocate_slab(need)?);
             return Ok(());
         }
-        if slab_i + 1 != self.slabs.len() {
-            return Err(BlockError::Slab);
-        }
+        if slab_i + 1 != self.slabs.len() { return Err(BlockError::Slab); }
         self.resize_slab(slab_i, need)
     }
 
@@ -965,9 +883,7 @@ impl BlockPool {
         let n = usize::try_from(nbytes).map_err(|_| BlockError::Overflow)?;
         #[allow(irrefutable_let_patterns)]
         if let SlabStorage::Host(v) = &mut self.slabs[slab_i] {
-            if v.len() < n {
-                v.resize(n, 0);
-            }
+            if v.len() < n { v.resize(n, 0); }
             return Ok(());
         }
         #[cfg(not(standalone_blocks))]
@@ -976,19 +892,12 @@ impl BlockPool {
                 SlabStorage::Gpu(b) => b.length(),
                 SlabStorage::Host(_) => return Ok(()),
             };
-            if old_len >= n {
-                return Ok(());
-            }
+            if old_len >= n { return Ok(()); }
             let dev = self.device.as_ref().expect("gpu slab without a device");
-            let new_buf =
-                dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
+            let new_buf = dev.newBufferWithLength_options(n, MTLResourceOptions::StorageModeShared).expect("block pool buffer");
             if let SlabStorage::Gpu(old) = &self.slabs[slab_i] {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        old.contents().as_ptr() as *const u8,
-                        new_buf.contents().as_ptr() as *mut u8,
-                        old_len,
-                    );
+                    std::ptr::copy_nonoverlapping(old.contents().as_ptr() as *const u8, new_buf.contents().as_ptr() as *mut u8, old_len);
                 }
             }
             self.slabs[slab_i] = SlabStorage::Gpu(new_buf);
@@ -996,21 +905,11 @@ impl BlockPool {
         Ok(())
     }
 
-    pub fn kind(&self) -> BlockKind {
-        self.kind
-    }
-    pub fn kvb(&self) -> u32 {
-        self.kvb
-    }
-    pub fn stride_bytes(&self) -> u64 {
-        self.stride
-    }
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-    pub fn slab_count(&self) -> usize {
-        self.slabs.len()
-    }
+    pub fn kind(&self) -> BlockKind { self.kind }
+    pub fn kvb(&self) -> u32 { self.kvb }
+    pub fn stride_bytes(&self) -> u64 { self.stride }
+    pub fn len(&self) -> usize { self.slots.len() }
+    pub fn slab_count(&self) -> usize { self.slabs.len() }
 
     /// Fast `(usable_slots, reclaimable_slots)` scan over `self.slots` without per-slot
     /// `Slot::new` / `Result` wrapper overhead on large pools.
@@ -1042,11 +941,7 @@ impl BlockPool {
 
     fn index(&self, slot: Slot) -> Result<usize, BlockError> {
         let i = slot.pool_index().get() as usize;
-        if i >= self.slots.len() {
-            Err(BlockError::OutOfRange)
-        } else {
-            Ok(i)
-        }
+        if i >= self.slots.len() { Err(BlockError::OutOfRange) } else { Ok(i) }
     }
 
     /// Which slab holds `slot`. Slots in one slab share one allocation.
@@ -1075,51 +970,30 @@ impl BlockPool {
     pub fn gpu_buffer(&self, slot: Slot) -> Result<Option<&crate::metal::Buf>, BlockError> {
         let i = self.index(slot)?;
         let slab = i / self.slots_per_slab;
-        Ok(match &self.slabs[slab] {
-            SlabStorage::Gpu(b) => Some(b),
-            SlabStorage::Host(_) => None,
-        })
+        Ok(match &self.slabs[slab] { SlabStorage::Gpu(b) => Some(b), SlabStorage::Host(_) => None })
     }
 
     /// Every allocated GPU slab buffer in slab order (0..slab_count).
     #[cfg(not(standalone_blocks))]
     pub fn gpu_slabs(&self) -> Vec<&crate::metal::Buf> {
-        self.slabs
-            .iter()
-            .filter_map(|s| match s {
-                SlabStorage::Gpu(b) => Some(b),
-                SlabStorage::Host(_) => None,
-            })
-            .collect()
+        self.slabs.iter().filter_map(|s| match s { SlabStorage::Gpu(b) => Some(b), SlabStorage::Host(_) => None }).collect()
     }
 
     /// 64-bit GPU block-table word for `entry`: `(slab_index << 62) | within_slab_byte_offset`.
     /// Validates kind, width, generation, and live reference count before returning.
     /// For single-slab pools (`slab_index == 0`), this equals `entry.offset()`.
     pub fn gpu_table_entry(&self, entry: BlockEntry) -> Result<u64, BlockError> {
-        if entry.kind() != self.kind {
-            return Err(BlockError::OutOfRange);
-        }
-        if entry.kvb() != self.kvb {
-            return Err(BlockError::Width);
-        }
+        if entry.kind() != self.kind { return Err(BlockError::OutOfRange); }
+        if entry.kvb() != self.kvb { return Err(BlockError::Width); }
         let i = self.index(entry.slot())?;
         let rec = &self.slots[i];
-        if rec.generation() != entry.generation() {
-            return Err(BlockError::Stale);
-        }
-        if rec.refs() == 0 {
-            return Err(BlockError::Refs);
-        }
+        if rec.generation() != entry.generation() { return Err(BlockError::Stale); }
+        if rec.refs() == 0 { return Err(BlockError::Refs); }
         let slab = i / self.slots_per_slab;
-        if slab >= MAX_SLABS {
-            return Err(BlockError::Slab);
-        }
+        if slab >= MAX_SLABS { return Err(BlockError::Slab); }
         let within = (i % self.slots_per_slab) as u64;
         let off = within.checked_mul(self.stride).ok_or(BlockError::Overflow)?;
-        if off >= (1u64 << KV_SLAB_SHIFT) {
-            return Err(BlockError::Overflow);
-        }
+        if off >= (1u64 << KV_SLAB_SHIFT) { return Err(BlockError::Overflow); }
         let word = ((slab as u64) << KV_SLAB_SHIFT) | off;
         assert_ne!(word, CLEARED_GPU_TABLE_ENTRY, "valid GPU block-table word collided with CLEARED_GPU_TABLE_ENTRY");
         Ok(word)
@@ -1192,9 +1066,7 @@ impl BlockPool {
     /// Append one slot. Its offset is `len * stride`. Earlier offsets stay put.
     /// The new slot has generation 0 until `take`. A fifth slab is [`BlockError::Slab`].
     pub fn grow(&mut self) -> Result<Slot, BlockError> {
-        if self.slots.len() >= u32::MAX as usize {
-            return Err(BlockError::Overflow);
-        }
+        if self.slots.len() >= u32::MAX as usize { return Err(BlockError::Overflow); }
         let slot = Slot::new((self.slots.len() as u32).checked_add(1).ok_or(BlockError::Overflow)?)?;
         let _ = mul_offset(u64::from(slot.pool_index().get()), self.stride)?;
         self.ensure_slot(slot.pool_index().get() as usize)?;
@@ -1205,14 +1077,10 @@ impl BlockPool {
 
     /// Append `count` fresh slots in one resize per touched slab, avoiding repeated copies.
     pub fn grow_by(&mut self, count: usize) -> Result<(), BlockError> {
-        if count == 0 {
-            return Ok(());
-        }
+        if count == 0 { return Ok(()); }
         let start = self.slots.len();
         let end = start.checked_add(count).ok_or(BlockError::Overflow)?;
-        if end > u32::MAX as usize {
-            return Err(BlockError::Overflow);
-        }
+        if end > u32::MAX as usize { return Err(BlockError::Overflow); }
         let last_idx = end - 1;
         let _ = mul_offset(last_idx as u64, self.stride)?;
         let mut idx = start;
@@ -1231,9 +1099,7 @@ impl BlockPool {
     /// A live reference count is refused. Generation `u32::MAX` is refused and not cleared.
     pub fn take(&mut self, slot: Slot) -> Result<u64, BlockError> {
         let i = self.index(slot)?;
-        if self.slots[i].refs() != 0 {
-            return Err(BlockError::Refs);
-        }
+        if self.slots[i].refs() != 0 { return Err(BlockError::Refs); }
         let _ = next_generation(self.slots[i].generation())?;
         self.bytes_of_mut(i).fill(0);
         self.slots[i].bump_generation()?;
@@ -1250,9 +1116,7 @@ impl BlockPool {
     /// before all 64 positions are overwritten; callers restoring a full block clear the flag.
     pub fn take_unzeroed(&mut self, slot: Slot) -> Result<u64, BlockError> {
         let i = self.index(slot)?;
-        if self.slots[i].refs() != 0 {
-            return Err(BlockError::Refs);
-        }
+        if self.slots[i].refs() != 0 { return Err(BlockError::Refs); }
         let _ = next_generation(self.slots[i].generation())?;
         self.slots[i].bump_generation()?;
         self.slots[i].set_length(0)?;
@@ -1340,10 +1204,7 @@ impl BlockPools {
 
     /// Both pools with `n_slots` each at fp16 (`kvb = 2`).
     pub fn new(n_slots: usize) -> BlockPools {
-        BlockPools {
-            window: BlockPool::new(BlockKind::Window, n_slots),
-            full: BlockPool::new(BlockKind::Full, n_slots),
-        }
+        BlockPools { window: BlockPool::new(BlockKind::Window, n_slots), full: BlockPool::new(BlockKind::Full, n_slots) }
     }
 
     /// Both pools with independent capacities at element width `kvb` (`1` or `2`).
@@ -1355,17 +1216,11 @@ impl BlockPools {
     }
 
     pub fn of(&self, kind: BlockKind) -> &BlockPool {
-        match kind {
-            BlockKind::Window => &self.window,
-            BlockKind::Full => &self.full,
-        }
+        match kind { BlockKind::Window => &self.window, BlockKind::Full => &self.full }
     }
 
     pub fn of_mut(&mut self, kind: BlockKind) -> &mut BlockPool {
-        match kind {
-            BlockKind::Window => &mut self.window,
-            BlockKind::Full => &mut self.full,
-        }
+        match kind { BlockKind::Window => &mut self.window, BlockKind::Full => &mut self.full }
     }
 }
 
@@ -1465,12 +1320,22 @@ impl BlockTable {
     }
 
     pub fn empty() -> BlockTable {
-        BlockTable { blocks_per_kind: 0, entries: Vec::new(), dirty: [None; 2], needs_full_sync: [true; 2] }
+        BlockTable {
+            blocks_per_kind: 0,
+            entries: Vec::new(),
+            dirty: [None; 2],
+            needs_full_sync: [true; 2],
+        }
     }
 
     pub fn new(blocks_per_kind: u32) -> Result<BlockTable, BlockError> {
         let n = usize::try_from(blocks_per_kind).ok().and_then(|n| n.checked_mul(2)).ok_or(BlockError::Overflow)?;
-        Ok(BlockTable { blocks_per_kind, entries: vec![None; n], dirty: [None; 2], needs_full_sync: [true; 2] })
+        Ok(BlockTable {
+            blocks_per_kind,
+            entries: vec![None; n],
+            dirty: [None; 2],
+            needs_full_sync: [true; 2],
+        })
     }
 
     pub fn get(&self, kind: BlockKind, block: BlockIndex) -> Result<Option<BlockEntry>, BlockError> {
@@ -1478,15 +1343,11 @@ impl BlockTable {
         Ok(self.entries.get(i).copied().flatten())
     }
 
-    pub fn blocks_per_kind(&self) -> u32 {
-        self.blocks_per_kind
-    }
+    pub fn blocks_per_kind(&self) -> u32 { self.blocks_per_kind }
 
     /// Set or clear the entry for `(kind, block)`. An entry of the other kind is refused.
     pub fn set(&mut self, kind: BlockKind, block: BlockIndex, entry: Option<BlockEntry>) -> Result<(), BlockError> {
-        if entry.is_some_and(|e| e.kind() != kind) {
-            return Err(BlockError::OutOfRange);
-        }
+        if entry.is_some_and(|e| e.kind() != kind) { return Err(BlockError::OutOfRange); }
         let i = table_index(kind, block, self.blocks_per_kind)? as usize;
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
         if *cell != entry {
@@ -1535,23 +1396,11 @@ impl BlockTable {
     /// generation is still the slot's generation. Every check finishes before
     /// any reference changes. An empty pool is `NoSlots`. This does not bump
     /// the generation and does not allocate a buffer.
-    pub fn fill(
-        &mut self,
-        pool: &mut BlockPool,
-        block: BlockIndex,
-        slot: Slot,
-        generation: u32,
-    ) -> Result<(), BlockError> {
-        if pool.len() == 0 {
-            return Err(BlockError::NoSlots);
-        }
+    pub fn fill(&mut self, pool: &mut BlockPool, block: BlockIndex, slot: Slot, generation: u32) -> Result<(), BlockError> {
+        if pool.len() == 0 { return Err(BlockError::NoSlots); }
         let record_gen = pool.record(slot)?.generation();
-        if generation == 0 || record_gen == 0 {
-            return Err(BlockError::NotTaken);
-        }
-        if record_gen != generation {
-            return Err(BlockError::Stale);
-        }
+        if generation == 0 || record_gen == 0 { return Err(BlockError::NotTaken); }
+        if record_gen != generation { return Err(BlockError::Stale); }
         let kvb = pool.kvb();
         let offset = byte_offset(pool.kind(), slot, kvb)?;
         let i = table_index(pool.kind(), block, self.blocks_per_kind)? as usize;
@@ -1563,13 +1412,9 @@ impl BlockTable {
         let same = drop_prev && prev.map(|prev| prev.slot()) == Some(slot);
         if drop_prev {
             let held = prev.ok_or(BlockError::NoEntry)?;
-            if pool.record(held.slot())?.refs() == 0 {
-                return Err(BlockError::Refs);
-            }
+            if pool.record(held.slot())?.refs() == 0 { return Err(BlockError::Refs); }
         }
-        if !same && pool.record(slot)?.refs() == u32::MAX {
-            return Err(BlockError::Overflow);
-        }
+        if !same && pool.record(slot)?.refs() == u32::MAX { return Err(BlockError::Overflow); }
         if drop_prev && !same {
             let held = prev.ok_or(BlockError::NoEntry)?;
             pool.record_mut(held.slot())?.drop_ref()?;
@@ -1616,9 +1461,7 @@ impl BlockTable {
 }
 
 impl Default for BlockTable {
-    fn default() -> Self {
-        BlockTable::empty()
-    }
+    fn default() -> Self { BlockTable::empty() }
 }
 
 #[cfg(test)]
@@ -1931,10 +1774,7 @@ mod tests {
         max_slot.set_length(32).unwrap();
         max_slot.seal();
         assert_eq!(max_slot.bump_generation(), Err(BlockError::Generation));
-        assert_eq!(
-            (max_slot.generation(), max_slot.length(), max_slot.sealed(), max_slot.refs()),
-            (u32::MAX, 32, true, 0)
-        );
+        assert_eq!((max_slot.generation(), max_slot.length(), max_slot.sealed(), max_slot.refs()), (u32::MAX, 32, true, 0));
     }
 
     #[test]
@@ -1960,21 +1800,18 @@ mod tests {
         assert_eq!(full.record(slot).unwrap().refs(), 1);
         assert_eq!(full.gpu_table_entry(stored).unwrap(), stored.offset());
         assert_eq!(
-            key_row_at(stored.offset(), FULL_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 0)
-                .unwrap(),
+            key_row_at(stored.offset(), FULL_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 0).unwrap(),
             stored.offset()
         );
         assert_eq!(
-            key_row_at(stored.offset(), FULL_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 63)
-                .unwrap(),
+            key_row_at(stored.offset(), FULL_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 63).unwrap(),
             stored.offset() + 63 * (HD as u64) * 2
         );
         let win_stored = t.get(BlockKind::Window, BlockIndex::new(0)).unwrap().unwrap();
         assert_eq!(win_stored.offset(), byte_offset(BlockKind::Window, slot, 2).unwrap());
         assert_eq!(win_stored.offset(), 2 * WINDOW_STRIDE);
         assert_eq!(
-            key_row_at(win_stored.offset(), WINDOW_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 1)
-                .unwrap(),
+            key_row_at(win_stored.offset(), WINDOW_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 1).unwrap(),
             win_stored.offset() + (HD as u64) * 2
         );
         take(&mut full, Slot::new(1).unwrap());
@@ -2057,8 +1894,7 @@ mod tests {
         t.fill(&mut pool, BlockIndex::new(0), slot, 1).unwrap();
         written(&mut pool, slot, 1);
         let entry = t.get(BlockKind::Window, BlockIndex::new(0)).unwrap().unwrap();
-        let off = key_row_at(entry.offset(), WINDOW_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 0)
-            .unwrap();
+        let off = key_row_at(entry.offset(), WINDOW_PASSES as u32, NKV as u32, BLOCK as u32, HD as u32, 2, 0, 0, 0, 0).unwrap();
         assert_eq!(off, byte_offset(BlockKind::Window, slot, 2).unwrap());
         assert!(off > u64::from(u32::MAX));
         assert!(u32::try_from(off).is_err());
@@ -2180,9 +2016,7 @@ mod tests {
         let mut rows = Vec::new();
         for line in rest[..end].lines() {
             let line = line.trim().trim_end_matches(',');
-            if !line.starts_with("<<") {
-                continue;
-            }
+            if !line.starts_with("<<") { continue; }
             let inner = line.trim_start_matches("<<").trim_end_matches(">>");
             let nums: Vec<u64> = inner.split(',').map(|s| s.trim().parse().unwrap()).collect();
             rows.push((nums[0] as u32, nums[1] as u32, nums[2] as u32, nums[3] as u32, nums[4]));
@@ -2464,28 +2298,17 @@ mod tests {
 
         // Planted shader macro & buffer-binding mutations MUST fail `parse_metal_kv_layout`.
         assert!(parse_metal_kv_layout(
-            &kernels_src.replacen(
-                "#define KV_PASS_BYTES  (2UL * KV_PLANE_BYTES)",
-                "#define KV_PASS_BYTES  KV_PLANE_BYTES",
-                1
-            ),
+            &kernels_src.replacen("#define KV_PASS_BYTES  (2UL * KV_PLANE_BYTES)", "#define KV_PASS_BYTES  KV_PLANE_BYTES", 1),
             prefill_src,
-        )
-        .is_err());
+        ).is_err());
         assert!(parse_metal_kv_layout(
-            &kernels_src.replacen(
-                "#define KV_SLAB_MASK ((1UL << 62) - 1UL)",
-                "#define KV_SLAB_MASK ((1UL << 60) - 1UL)",
-                1
-            ),
+            &kernels_src.replacen("#define KV_SLAB_MASK ((1UL << 62) - 1UL)", "#define KV_SLAB_MASK ((1UL << 60) - 1UL)", 1),
             prefill_src,
-        )
-        .is_err());
+        ).is_err());
         assert!(parse_metal_kv_layout(
             kernels_src,
             &prefill_src.replacen("KV1 [[buffer(10)]]", "KV1 [[buffer(9)]]", 1),
-        )
-        .is_err());
+        ).is_err());
     }
 
     #[test]
@@ -2532,7 +2355,9 @@ mod tests {
                 let slab_first_slot = slots[si * 2];
                 let (s_ptr, _) = pool.slot_raw_region(slab_first_slot).unwrap();
                 let resolved_start = unsafe { std::slice::from_raw_parts(s_ptr.add(off as usize), 8) };
-                let resolved_end = unsafe { std::slice::from_raw_parts(s_ptr.add((off + stride - 8) as usize), 8) };
+                let resolved_end = unsafe {
+                    std::slice::from_raw_parts(s_ptr.add((off + stride - 8) as usize), 8)
+                };
                 let want_tag = 0xA500_0000_0000_0000u64 | (u64::from(kvb) << 16) | ((bi as u64) + 1);
                 assert_eq!(u64::from_le_bytes(resolved_start.try_into().unwrap()), want_tag);
                 assert_eq!(u64::from_le_bytes(resolved_end.try_into().unwrap()), want_tag ^ 0xFFFF);
@@ -2547,9 +2372,9 @@ mod tests {
 
         // Construct a lightweight metadata-only pool at the 62-bit boundary (`slab = 1` and `slab = 2`).
         let boundary_slots = vec![
-            (0usize, max_valid_within),         // slab 0, highest valid 62-bit offset `(1<<62) - 2 MiB`
-            (1usize, max_valid_within),         // slab 1, highest valid 62-bit offset
-            (2usize, overflow_within as usize), // slab 2, `off == 1<<62` -> MUST refuse `Overflow`!
+            (0usize, max_valid_within),                  // slab 0, highest valid 62-bit offset `(1<<62) - 2 MiB`
+            (1usize, max_valid_within),                  // slab 1, highest valid 62-bit offset
+            (2usize, overflow_within as usize),          // slab 2, `off == 1<<62` -> MUST refuse `Overflow`!
         ];
         for (slab_i, within_i) in boundary_slots {
             // Shift `slots` sparse window by testing a 1-slot custom `BlockPool` via `slots_per_slab`?
@@ -2612,8 +2437,11 @@ mod tests {
             let pos = (WINDOW - 1) + offset;
             let win_blks = span_window_blocks(pos, 512).unwrap();
             let pinned = tbl.pinned_span_entries(pos, 512).unwrap();
-            let table_win: Vec<u32> =
-                pinned.iter().filter(|(k, _, _)| *k == BlockKind::Window).map(|(_, bi, _)| bi.get()).collect();
+            let table_win: Vec<u32> = pinned
+                .iter()
+                .filter(|(k, _, _)| *k == BlockKind::Window)
+                .map(|(_, bi, _)| bi.get())
+                .collect();
             let direct_win: Vec<u32> = win_blks.iter().map(|bi| bi.get()).collect();
             assert_eq!(table_win, direct_win);
             assert!(table_win.len() <= 25, "alignment {offset} exceeded 25 window blocks");
@@ -2678,8 +2506,9 @@ mod tests {
                             assert_eq!(last.visits[r], want_visits);
                             let sp_a = first / 4;
                             let sp_b = (len - 1) / 4;
-                            let want_partials: Vec<_> =
-                                (sp_a..=sp_b).map(|s| (s, ((s + 1) * 4).min(len) - 1)).collect();
+                            let want_partials: Vec<_> = (sp_a..=sp_b)
+                                .map(|s| (s, ((s + 1) * 4).min(len) - 1))
+                                .collect();
                             assert_eq!(last.partials[r], want_partials);
                         }
                     }

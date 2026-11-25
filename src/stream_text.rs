@@ -4,18 +4,12 @@ pub fn stream_text(pend: &mut Vec<u8>, end: bool, emit: impl FnOnce(&str)) {
     let mut consumed = 0;
     while consumed < pend.len() {
         match std::str::from_utf8(&pend[consumed..]) {
-            Ok(_) => {
-                consumed = pend.len();
-                break;
-            }
+            Ok(_) => { consumed = pend.len(); break; }
             Err(e) => {
                 consumed += e.valid_up_to();
                 match e.error_len() {
                     Some(n) => consumed += n,
-                    None if end => {
-                        consumed = pend.len();
-                        break;
-                    }
+                    None if end => { consumed = pend.len(); break; }
                     None => break,
                 }
             }

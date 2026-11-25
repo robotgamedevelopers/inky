@@ -3,8 +3,8 @@
 use crate::engine::{Engine, Lane, Run};
 use crate::metal::{wait_all, wait_completed, wait_or_drain};
 use crate::sampler::Sampler;
-use crate::stream_text::stream_text;
 use crate::tokenizer::Tokenizer;
+use crate::stream_text::stream_text;
 use objc2_metal::MTLCommandBuffer;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -22,14 +22,9 @@ pub struct Session<'a> {
 }
 
 #[derive(Default, Clone, Copy)]
-pub struct Stats {
-    pub prompt_tokens: usize,
-    pub prompt_time: Duration,
-    pub gen_tokens: usize,
-    pub gen_time: Duration,
-    /// largest activation buffer (decode arena + prefill arena) any prefill needed, bytes
-    pub peak_scratch: usize,
-}
+pub struct Stats { pub prompt_tokens: usize, pub prompt_time: Duration, pub gen_tokens: usize, pub gen_time: Duration,
+                   /// largest activation buffer (decode arena + prefill arena) any prefill needed, bytes
+                   pub peak_scratch: usize }
 
 /// Snapshot of a [`Session`] before an interactive CLI turn (`t-audit-engine-cli-step-status`),
 /// allowing a failed prefill chunk or decode step to roll back K/V, convolution state, `n_past`,
@@ -43,26 +38,18 @@ pub struct TurnCheckpoint {
 }
 
 impl<'a> Session<'a> {
-    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> {
-        Self::with_lane(eng, tk, Lane::new(eng))
-    }
+    pub fn new(eng: &'a Engine, tk: &'a Tokenizer) -> Session<'a> { Self::with_lane(eng, tk, Lane::new(eng)) }
     /// a new session on an existing lane: its buffers are kept (no regrowth), its contents forgotten
     pub fn with_lane(eng: &'a Engine, tk: &'a Tokenizer, lane: Lane) -> Session<'a> {
         eng.on(&lane).reset();
         Session { eng, tk, lane, n_past: 0, pending: None, stats: Stats::default() }
     }
     /// give the lane back, to start another session on it
-    pub fn into_lane(self) -> Lane {
-        self.lane
-    }
+    pub fn into_lane(self) -> Lane { self.lane }
     /// the engine working on this session's lane
-    pub fn run(&self) -> Run<'_> {
-        self.eng.on(&self.lane)
-    }
+    pub fn run(&self) -> Run<'_> { self.eng.on(&self.lane) }
 
-    pub fn ctx_left(&self) -> usize {
-        self.eng.max_ctx.saturating_sub(self.n_past + 1)
-    }
+    pub fn ctx_left(&self) -> usize { self.eng.max_ctx.saturating_sub(self.n_past + 1) }
 
     /// Snapshot valid session context (`0..n_past`) before a chat turn so a failed Metal command
     /// buffer leaves the session state intact for the next turn.
@@ -149,7 +136,7 @@ impl<'a> Session<'a> {
             return Err(format!("context full ({} tokens)", self.eng.max_ctx));
         }
         let t0 = Instant::now();
-        self.run().tier_leave(self.n_past); // (--kv-disk) a prefill attends through the whole cache in memory
+        self.run().tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
         self.run().set_tokens(self.n_past, &all);
         let end = self.n_past + all.len();
         self.run().reserve(end + 1, true);
@@ -164,9 +151,8 @@ impl<'a> Session<'a> {
             cb.commit();
             // Let Metal run the next chunk while the CPU checks the previous one.
             if let Some((pos, prev)) = last.replace((p0, cb)) {
-                wait_or_drain((pos, &prev), last.as_ref().map(|(pos, cb)| (*pos, cb)), |(pos, cb)| {
-                    wait_completed(cb, "prefill", pos)
-                })?;
+                wait_or_drain((pos, &prev), last.as_ref().map(|(pos, cb)| (*pos, cb)),
+                              |(pos, cb)| wait_completed(cb, "prefill", pos))?;
             }
             p0 += t;
         }
@@ -185,20 +171,12 @@ impl<'a> Session<'a> {
     /// just emitted: when generation stops, the context (KV + conv state) is exactly "everything emitted so far".
     /// Sampling reads the logits back each step.
     /// After an error, discard or reset the lane before using it for another inference.
-    pub fn generate(
-        &mut self,
-        first: u32,
-        max: usize,
-        sampler: &mut Sampler,
-        mut on_token: impl FnMut(u32) -> bool,
-    ) -> Result<usize, String> {
+    pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> Result<usize, String> {
         let t0 = Instant::now();
         let eng = self.eng.on(&self.lane);
         let eos = self.tk.eos;
-        eng.release_batch(); // the prefill arena is not needed while generating
-        if max == 0 {
-            return Ok(0);
-        }
+        eng.release_batch();      // the prefill arena is not needed while generating
+        if max == 0 { return Ok(0); }
         let mut tok = if sampler.greedy() {
             first
         } else {
@@ -209,9 +187,8 @@ impl<'a> Session<'a> {
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
         if sampler.greedy() {
-            if stop {
-                self.pending = Some(tok);
-            } else {
+            if stop { self.pending = Some(tok); }
+            else {
                 eng.set_tokens(self.n_past, &[tok]);
                 let mut inflight = VecDeque::with_capacity(2);
                 let step = |pos: usize| (pos, eng.step(pos, true, true));
@@ -270,57 +247,30 @@ impl<'a> Session<'a> {
 }
 
 /// Streams model output: hides protocol tokens, dims the reasoning, emits valid UTF-8 only.
-pub struct Renderer {
-    buf: Vec<u8>,
-    pub thinking: bool,
-    pub show_thinking: bool,
-    pub raw: bool,
-    think_note: bool,
-}
+pub struct Renderer { buf: Vec<u8>, pub thinking: bool, pub show_thinking: bool, pub raw: bool, think_note: bool }
 
 impl Renderer {
-    pub fn new(show_thinking: bool, raw: bool) -> Renderer {
-        Renderer { buf: Vec::new(), thinking: false, show_thinking, raw, think_note: false }
-    }
+    pub fn new(show_thinking: bool, raw: bool) -> Renderer { Renderer { buf: Vec::new(), thinking: false, show_thinking, raw, think_note: false } }
 
     pub fn push(&mut self, tk: &Tokenizer, t: u32, out: &mut impl std::io::Write) {
-        if self.raw {
-            self.emit(&tk.decode_bytes(t), out);
-            return;
-        }
+        if self.raw { self.emit(&tk.decode_bytes(t), out); return; }
         if tk.is_special(t) {
             self.flush_text(true, out);
             let s = String::from_utf8_lossy(&tk.decode_bytes(t)).to_string();
             match s.as_str() {
                 "<|content_thinking|>" => {
                     self.thinking = true;
-                    if self.show_thinking {
-                        let _ = write!(out, "\x1b[2m");
-                    } else if !self.think_note {
-                        let _ = write!(out, "\x1b[2m(thinking…)\x1b[0m ");
-                        self.think_note = true;
-                    }
+                    if self.show_thinking { let _ = write!(out, "\x1b[2m"); } else if !self.think_note { let _ = write!(out, "\x1b[2m(thinking…)\x1b[0m "); self.think_note = true; }
                 }
-                "<|content_text|>" => {
-                    self.thinking = false;
-                }
-                "<|end_message|>" => {
-                    if self.thinking && self.show_thinking {
-                        let _ = write!(out, "\x1b[0m\n\n");
-                    }
-                    self.thinking = false;
-                }
+                "<|content_text|>" => { self.thinking = false; }
+                "<|end_message|>" => { if self.thinking && self.show_thinking { let _ = write!(out, "\x1b[0m\n\n"); } self.thinking = false; }
                 "<|message_model|>" | "<|content_model_end_sampling|>" => {}
-                _ => {
-                    let _ = write!(out, "{s}");
-                }
+                _ => { let _ = write!(out, "{s}"); }
             }
             let _ = out.flush();
             return;
         }
-        if self.thinking && !self.show_thinking {
-            return;
-        }
+        if self.thinking && !self.show_thinking { return; }
         self.emit(&tk.decode_bytes(t), out);
     }
 
@@ -338,9 +288,7 @@ impl Renderer {
 
     pub fn end(&mut self, out: &mut impl std::io::Write) {
         self.flush_text(true, out);
-        if self.thinking && self.show_thinking {
-            let _ = write!(out, "\x1b[0m");
-        }
+        if self.thinking && self.show_thinking { let _ = write!(out, "\x1b[0m"); }
         let _ = out.flush();
     }
 }
@@ -390,23 +338,14 @@ mod tests {
         let mut consumed = false;
         let result = wait_or_drain(0, [1, 2], |command| {
             waited.push(command);
-            if command == 0 {
-                Err("first command failed".into())
-            } else {
-                Ok(())
-            }
-        })
-        .map(|_| consumed = true);
+            if command == 0 { Err("first command failed".into()) } else { Ok(()) }
+        }).map(|_| consumed = true);
         assert_eq!(result, Err("first command failed".into()));
         assert_eq!(waited, [0, 1, 2]);
         assert!(!consumed);
 
         waited.clear();
-        wait_or_drain(0, [1], |command| {
-            waited.push(command);
-            Ok(())
-        })
-        .unwrap();
+        wait_or_drain(0, [1], |command| { waited.push(command); Ok(()) }).unwrap();
         assert_eq!(waited, [0]);
     }
 
@@ -420,11 +359,7 @@ mod tests {
             let mut waited = Vec::new();
             let result = wait_all(failures.into_iter().enumerate(), |(command, failed)| {
                 waited.push(command);
-                if failed {
-                    Err(format!("command {command}"))
-                } else {
-                    Ok(())
-                }
+                if failed { Err(format!("command {command}")) } else { Ok(()) }
             });
             assert_eq!(result, expected);
             assert_eq!(waited, [0, 1, 2]);
@@ -495,24 +430,8 @@ mod tests {
         //  (3) greedy decode step (`decode`, call 0 — drains pipelined step 1 without consuming!)
         //  (4) sampled decode step (`decode`, call 0)
         for (label, temp, stage, call_idx, want_npast, want_hash, want_out2) in [
-            (
-                "early prefill chunk",
-                0.0f32,
-                "prefill",
-                0usize,
-                clean_greedy_npast,
-                clean_greedy_hash,
-                &clean_greedy_out2,
-            ),
-            (
-                "final prefill chunk",
-                0.0f32,
-                "prefill",
-                1usize,
-                clean_greedy_npast,
-                clean_greedy_hash,
-                &clean_greedy_out2,
-            ),
+            ("early prefill chunk", 0.0f32, "prefill", 0usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
+            ("final prefill chunk", 0.0f32, "prefill", 1usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
             ("greedy decode step", 0.0f32, "decode", 0usize, clean_greedy_npast, clean_greedy_hash, &clean_greedy_out2),
             ("sampled decode step", 0.8f32, "decode", 0usize, clean_samp_npast, clean_samp_hash, &clean_samp_out2),
         ] {
@@ -522,8 +441,11 @@ mod tests {
             sess.run_chat_turn(&turn1, 4, true, true, &mut s1, &mut out1).unwrap();
             let turn1_npast = sess.n_past;
             let turn1_cs = sess.run().get_cs();
-            let turn1_kv: Vec<Vec<u8>> =
-                eng.snapshot_kv_positions(&sess.lane, 0, turn1_npast).into_iter().map(|u| u.rows).collect();
+            let turn1_kv: Vec<Vec<u8>> = eng
+                .snapshot_kv_positions(&sess.lane, 0, turn1_npast)
+                .into_iter()
+                .map(|u| u.rows)
+                .collect();
 
             // Inject device/command-buffer failure on turn 2: must return Err and leave session at turn 1 state!
             inject_wait_failure(stage, call_idx);
@@ -535,8 +457,11 @@ mod tests {
             assert!(std::str::from_utf8(&fail_out).is_ok(), "{label}: output left invalid UTF-8");
             assert_eq!(sess.n_past, turn1_npast, "{label}: n_past mutated after failed turn");
             assert_eq!(sess.run().get_cs(), turn1_cs, "{label}: CS corrupted after failed turn");
-            let after_kv: Vec<Vec<u8>> =
-                eng.snapshot_kv_positions(&sess.lane, 0, turn1_npast).into_iter().map(|u| u.rows).collect();
+            let after_kv: Vec<Vec<u8>> = eng
+                .snapshot_kv_positions(&sess.lane, 0, turn1_npast)
+                .into_iter()
+                .map(|u| u.rows)
+                .collect();
             assert_eq!(after_kv, turn1_kv, "{label}: committed KV[0..turn1_npast) corrupted after failed turn");
 
             // Retry turn 2 on the same session: must match the clean 2-turn session bit-for-bit!

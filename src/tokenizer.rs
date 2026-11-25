@@ -30,26 +30,11 @@ fn uflags(c: u32) -> u8 {
     let i = RUN_START.partition_point(|&s| s <= c);
     RUN_FLAGS[i.saturating_sub(1)]
 }
-#[inline]
-fn is_l(f: u8) -> bool {
-    f & (U_LU | U_LL | U_LT | U_LM | U_LO) != 0
-}
-#[inline]
-fn is_n(f: u8) -> bool {
-    f & U_N != 0
-}
-#[inline]
-fn is_ws(f: u8) -> bool {
-    f & U_WS != 0
-}
-#[inline]
-fn is_ucls(f: u8) -> bool {
-    f & (U_LU | U_LT | U_LM | U_LO | U_M) != 0
-}
-#[inline]
-fn is_lcls(f: u8) -> bool {
-    f & (U_LL | U_LM | U_LO | U_M) != 0
-}
+#[inline] fn is_l(f: u8) -> bool { f & (U_LU | U_LL | U_LT | U_LM | U_LO) != 0 }
+#[inline] fn is_n(f: u8) -> bool { f & U_N != 0 }
+#[inline] fn is_ws(f: u8) -> bool { f & U_WS != 0 }
+#[inline] fn is_ucls(f: u8) -> bool { f & (U_LU | U_LT | U_LM | U_LO | U_M) != 0 }
+#[inline] fn is_lcls(f: u8) -> bool { f & (U_LL | U_LM | U_LO | U_M) != 0 }
 
 impl Tokenizer {
     pub fn load(g: &Gguf) -> Tokenizer {
@@ -69,13 +54,11 @@ impl Tokenizer {
         };
         let tok_type = match g.kv.get("tokenizer.ggml.token_type") {
             Some(Value::AI(v)) if v.len() == id_to_tok.len() => v.clone(),
-            Some(Value::AI(v)) => {
-                return Err(invalid_model(format_args!(
-                    "tokenizer.ggml.token_type length {} does not match {} tokens",
-                    v.len(),
-                    id_to_tok.len(),
-                )))
-            }
+            Some(Value::AI(v)) => return Err(invalid_model(format_args!(
+                "tokenizer.ggml.token_type length {} does not match {} tokens",
+                v.len(),
+                id_to_tok.len(),
+            ))),
             _ => return Err(invalid_model("missing or invalid tokenizer.ggml.token_type")),
         };
         let merges_s = match g.kv.get("tokenizer.ggml.merges") {
@@ -98,9 +81,11 @@ impl Tokenizer {
             if a.is_empty() || b.is_empty() || b.contains(' ') {
                 return Err(invalid_model(format_args!("malformed BPE merge at index {rank}")));
             }
-            if let (Some(&ia), Some(&ib), Some(&im)) =
-                (tok_to_id.get(a), tok_to_id.get(b), tok_to_id.get(&format!("{a}{b}")))
-            {
+            if let (Some(&ia), Some(&ib), Some(&im)) = (
+                tok_to_id.get(a),
+                tok_to_id.get(b),
+                tok_to_id.get(&format!("{a}{b}")),
+            ) {
                 merges.insert((ia, ib), (rank as u32, im));
                 // Every mapped character represents one original input byte.
                 if let Some(merged_tok) = id_to_tok.get(im as usize) {
@@ -124,14 +109,9 @@ impl Tokenizer {
         let mut n = 0u32;
         for b in 0..256u32 {
             let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
-            let cp = if keep {
-                b
-            } else {
-                n += 1;
-                255 + n
-            };
-            let ch =
-                char::from_u32(cp).ok_or_else(|| invalid_model(format_args!("invalid byte mapping codepoint {cp}")))?;
+            let cp = if keep { b } else { n += 1; 255 + n };
+            let ch = char::from_u32(cp)
+                .ok_or_else(|| invalid_model(format_args!("invalid byte mapping codepoint {cp}")))?;
             let id = tok_to_id
                 .get(&ch.to_string())
                 .copied()
@@ -159,30 +139,19 @@ impl Tokenizer {
         })
     }
 
-    pub fn vocab_len(&self) -> usize {
-        self.id_to_tok.len()
-    }
+    pub fn vocab_len(&self) -> usize { self.id_to_tok.len() }
 
-    pub fn is_special(&self, id: u32) -> bool {
-        self.tok_type.get(id as usize) == Some(&3)
-    }
+    pub fn is_special(&self, id: u32) -> bool { self.tok_type.get(id as usize) == Some(&3) }
 
     /// Raw bytes of one token (special tokens rendered literally; out-of-range IDs return empty).
     pub fn decode_bytes(&self, id: u32) -> Vec<u8> {
-        let Some(t) = self.id_to_tok.get(id as usize) else {
-            return Vec::new();
-        };
-        if self.is_special(id) {
-            return t.as_bytes().to_vec();
-        }
+        let Some(t) = self.id_to_tok.get(id as usize) else { return Vec::new(); };
+        if self.is_special(id) { return t.as_bytes().to_vec(); }
         let mut out = Vec::with_capacity(t.len());
         for ch in t.chars() {
             match self.uni_to_byte.get(&ch) {
                 Some(b) => out.push(*b),
-                None => {
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                }
+                None => { let mut buf = [0u8; 4]; out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()); }
             }
         }
         out
@@ -194,37 +163,27 @@ impl Tokenizer {
     /// |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
     fn piece_end(s: &[char], f: &[u8], i: usize) -> usize {
         let n = s.len().min(f.len());
-        if i >= n {
-            return n;
-        }
+        if i >= n { return n; }
         let lower = |c: char| c.to_ascii_lowercase();
         let contraction = |e: usize| -> usize {
             if e < n && s[e] == '\'' && e + 1 < n {
                 let a = lower(s[e + 1]);
                 let b = if e + 2 < n { lower(s[e + 2]) } else { '\0' };
-                if (a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l') {
-                    return e + 3;
-                }
-                if matches!(a, 's' | 't' | 'm' | 'd') {
-                    return e + 2;
-                }
+                if (a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l') { return e + 3; }
+                if matches!(a, 's' | 't' | 'm' | 'd') { return e + 2; }
             }
             e
         };
         let is_p = |i: usize| i < n && s[i] != '\r' && s[i] != '\n' && !is_l(f[i]) && !is_n(f[i]);
         let body1 = |k: usize| -> Option<usize> {
             let mut u = k;
-            while u < n && is_ucls(f[u]) {
-                u += 1;
-            }
+            while u < n && is_ucls(f[u]) { u += 1; }
             let mut t = u + 1;
             while t > k {
                 t -= 1;
                 if t < n && is_lcls(f[t]) {
                     let mut e = t;
-                    while e < n && is_lcls(f[e]) {
-                        e += 1;
-                    }
+                    while e < n && is_lcls(f[e]) { e += 1; }
                     return Some(e);
                 }
             }
@@ -232,78 +191,49 @@ impl Tokenizer {
         };
         let body2 = |k: usize| -> Option<usize> {
             let mut u = k;
-            while u < n && is_ucls(f[u]) {
-                u += 1;
-            }
-            if u == k {
-                return None;
-            }
+            while u < n && is_ucls(f[u]) { u += 1; }
+            if u == k { return None; }
             let mut e = u;
-            while e < n && is_lcls(f[e]) {
-                e += 1;
-            }
+            while e < n && is_lcls(f[e]) { e += 1; }
             Some(e)
         };
         for alt in 0..2 {
             let body = |k: usize| if alt == 0 { body1(k) } else { body2(k) };
             if is_p(i) {
-                if let Some(e) = body(i + 1) {
-                    return contraction(e);
-                }
+                if let Some(e) = body(i + 1) { return contraction(e); }
             }
-            if let Some(e) = body(i) {
-                return contraction(e);
-            }
+            if let Some(e) = body(i) { return contraction(e); }
         }
         if is_n(f[i]) {
             let mut e = i + 1;
-            while e < n && e < i + 3 && is_n(f[e]) {
-                e += 1;
-            }
+            while e < n && e < i + 3 && is_n(f[e]) { e += 1; }
             return e;
         }
         let cls = |j: usize| j < n && !is_ws(f[j]) && !is_l(f[j]) && !is_n(f[j]);
         let mut k = i;
-        if s[k] == ' ' && cls(k + 1) {
-            k += 1;
-        }
+        if s[k] == ' ' && cls(k + 1) { k += 1; }
         if cls(k) {
             let mut e = k + 1;
-            while cls(e) {
-                e += 1;
-            }
-            while e < n && matches!(s[e], '\r' | '\n' | '/') {
-                e += 1;
-            }
+            while cls(e) { e += 1; }
+            while e < n && matches!(s[e], '\r' | '\n' | '/') { e += 1; }
             return e;
         }
         if is_ws(f[i]) {
             let mut w = i + 1;
-            while w < n && is_ws(f[w]) {
-                w += 1;
-            }
+            while w < n && is_ws(f[w]) { w += 1; }
             let last = (i..w).rev().find(|&j| s[j] == '\r' || s[j] == '\n');
-            return if let Some(l) = last {
-                l + 1
-            } else if w == n {
-                w
-            } else if w - i >= 2 {
-                w - 1
-            } else {
-                w
-            };
+            return if let Some(l) = last { l + 1 } else if w == n { w } else if w - i >= 2 { w - 1 } else { w };
         }
         i + 1
     }
 
     fn bpe(&self, piece: &str, out: &mut Vec<u32>, remaining: usize) -> bool {
         // fast path: whole piece is a token
-        let mapped: String =
-            piece.bytes().map(|b| self.id_to_tok[self.byte_to_id[b as usize] as usize].as_str()).collect();
+        let mapped: String = piece.bytes()
+            .map(|b| self.id_to_tok[self.byte_to_id[b as usize] as usize].as_str())
+            .collect();
         if let Some(&id) = self.tok_to_id.get(&mapped) {
-            if remaining == 0 {
-                return false;
-            }
+            if remaining == 0 { return false; }
             out.push(id);
             return true;
         }
@@ -320,22 +250,15 @@ impl Tokenizer {
             let mut best: Option<(u32, usize, u32)> = None;
             for j in 0..sym.len().saturating_sub(1) {
                 if let Some(&(rank, merged)) = self.merges.get(&(sym[j], sym[j + 1])) {
-                    if best.is_none_or(|b| rank < b.0) {
-                        best = Some((rank, j, merged));
-                    }
+                    if best.is_none_or(|b| rank < b.0) { best = Some((rank, j, merged)); }
                 }
             }
             match best {
-                Some((_, j, m)) => {
-                    sym[j] = m;
-                    sym.remove(j + 1);
-                }
+                Some((_, j, m)) => { sym[j] = m; sym.remove(j + 1); }
                 None => break,
             }
         }
-        if sym.len() > remaining {
-            return false;
-        }
+        if sym.len() > remaining { return false; }
         out.extend_from_slice(&sym);
         true
     }
@@ -343,33 +266,27 @@ impl Tokenizer {
     fn bpe_ranked(&self, piece: &str, out: &mut Vec<u32>, remaining: usize) -> bool {
         // Link symbols by their original byte offsets, with `end` as the missing-link sentinel.
         let end = piece.len();
-        let mut symbols: Vec<BpeSymbol> = piece
-            .bytes()
-            .enumerate()
-            .map(|(i, b)| BpeSymbol {
-                id: self.byte_to_id[b as usize],
-                prev: i.checked_sub(1).unwrap_or(end),
-                next: i + 1,
-            })
-            .collect();
+        let mut symbols: Vec<BpeSymbol> = piece.bytes().enumerate().map(|(i, b)| BpeSymbol {
+            id: self.byte_to_id[b as usize],
+            prev: i.checked_sub(1).unwrap_or(end),
+            next: i + 1,
+        }).collect();
 
         let candidate = |symbols: &[BpeSymbol], left: usize| {
             let right = symbols[left].next;
-            if right == end {
-                return None;
-            }
+            if right == end { return None; }
             let &(rank, merged) = self.merges.get(&(symbols[left].id, symbols[right].id))?;
             // Byte positions keep equal ranks in left-to-right order after any merge.
             Some(Reverse((rank, left, symbols[right].next, merged)))
         };
-        let mut candidates: BinaryHeap<_> = (0..end).filter_map(|left| candidate(&symbols, left)).collect();
+        let mut candidates: BinaryHeap<_> = (0..end)
+            .filter_map(|left| candidate(&symbols, left))
+            .collect();
         let mut count = end;
         while let Some(Reverse((_, left, pair_end, merged))) = candidates.pop() {
             let right = symbols[left].next;
             // Any change to a live pair extends its end. Removed left symbols have no next link.
-            if right == end || symbols[right].next != pair_end {
-                continue;
-            }
+            if right == end || symbols[right].next != pair_end { continue; }
             symbols[left].id = merged;
             symbols[left].next = pair_end;
             symbols[right].next = end;
@@ -386,9 +303,7 @@ impl Tokenizer {
             candidates.extend(candidate(&symbols, left));
         }
 
-        if count > remaining {
-            return false;
-        }
+        if count > remaining { return false; }
         out.reserve(count);
         let mut i = 0;
         while i != end {
@@ -405,21 +320,15 @@ impl Tokenizer {
     /// Append plain-text pieces and return true if all fit within `max_len` total tokens.
     /// On overflow, leave only the complete pieces that fit.
     pub(crate) fn encode_plain_limited(&self, text: &str, out: &mut Vec<u32>, max_len: usize) -> bool {
-        if text.is_empty() {
-            return out.len() <= max_len;
-        }
-        if out.len() >= max_len {
-            return false;
-        }
+        if text.is_empty() { return out.len() <= max_len; }
+        if out.len() >= max_len { return false; }
         let cps: Vec<char> = text.chars().collect();
         let flags: Vec<u8> = cps.iter().map(|&c| uflags(c as u32)).collect();
         let mut start = 0;
         while start < cps.len() && out.len() < max_len {
             let end = Self::piece_end(&cps, &flags, start);
             let piece: String = cps[start..end].iter().collect();
-            if !self.bpe(&piece, out, max_len - out.len()) {
-                return false;
-            }
+            if !self.bpe(&piece, out, max_len - out.len()) { return false; }
             start = end;
         }
         start == cps.len()
@@ -455,70 +364,31 @@ impl Tokenizer {
     /// so plain text encodes one token per character. Newlines and non-ASCII bytes fall back to
     /// `?`; test strings stay plain ASCII.
     pub(crate) fn for_test() -> Tokenizer {
-        let special_strs = [
-            "<|message_user|>",
-            "<|message_model|>",
-            "<|message_system|>",
-            "<|message_tool|>",
-            "<|content_text|>",
-            "<|content_thinking|>",
-            "<|content_xml|>",
-            "<|content_invoke_tool_json|>",
-            "<|end_message|>",
-            "<|content_model_end_sampling|>",
-            "<|eos|>",
-        ];
+        let special_strs = ["<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>",
+            "<|content_text|>", "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>",
+            "<|end_message|>", "<|content_model_end_sampling|>", "<|eos|>"];
         let mut id_to_tok: Vec<String> = special_strs.iter().map(|s| s.to_string()).collect();
         let mut tok_type: Vec<i64> = vec![3; special_strs.len()];
-        for b in 32u8..127 {
-            id_to_tok.push((b as char).to_string());
-            tok_type.push(0);
-        }
+        for b in 32u8..127 { id_to_tok.push((b as char).to_string()); tok_type.push(0); }
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
-        for (i, t) in id_to_tok.iter().enumerate() {
-            tok_to_id.insert(t.clone(), i as u32);
-        }
-        let mut specials: Vec<(String, u32)> =
-            special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
+        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         let fallback = *tok_to_id.get("?").unwrap();
         let mut byte_to_id = [0u32; 256];
         for (b, slot) in byte_to_id.iter_mut().enumerate() {
-            *slot =
-                if (32..127).contains(&b) { *tok_to_id.get(&(b as u8 as char).to_string()).unwrap() } else { fallback };
+            *slot = if (32..127).contains(&b) { *tok_to_id.get(&(b as u8 as char).to_string()).unwrap() } else { fallback };
         }
         let mut uni_to_byte = HashMap::new();
-        for b in 32u8..127 {
-            uni_to_byte.insert(b as char, b);
-        }
+        for b in 32u8..127 { uni_to_byte.insert(b as char, b); }
         let eos = (special_strs.len() - 1) as u32;
-        Tokenizer {
-            id_to_tok,
-            tok_type,
-            tok_to_id,
-            merges: HashMap::new(),
-            max_bpe_token_bytes: 1,
-            specials,
-            byte_to_id,
-            uni_to_byte,
-            eos,
-        }
+        Tokenizer { id_to_tok, tok_type, tok_to_id, merges: HashMap::new(), max_bpe_token_bytes: 1, specials, byte_to_id, uni_to_byte, eos }
     }
 
     pub(crate) fn for_byte_test() -> Tokenizer {
-        let special_strs = [
-            "<|message_user|>",
-            "<|message_model|>",
-            "<|message_system|>",
-            "<|message_tool|>",
-            "<|content_text|>",
-            "<|content_thinking|>",
-            "<|content_xml|>",
-            "<|content_invoke_tool_json|>",
-            "<|end_message|>",
-            "<|content_model_end_sampling|>",
-            "<|eos|>",
-        ];
+        let special_strs = ["<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>",
+            "<|content_text|>", "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>",
+            "<|end_message|>", "<|content_model_end_sampling|>", "<|eos|>"];
         let mut id_to_tok: Vec<String> = special_strs.iter().map(|s| s.to_string()).collect();
         let mut tok_type: Vec<i64> = vec![3; special_strs.len()];
         let mut byte_to_id = [0u32; 256];
@@ -526,12 +396,7 @@ impl Tokenizer {
         let mut n = 0u32;
         for b in 0..256u32 {
             let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
-            let cp = if keep {
-                b
-            } else {
-                n += 1;
-                255 + n
-            };
+            let cp = if keep { b } else { n += 1; 255 + n };
             let ch = char::from_u32(cp).unwrap();
             let id = id_to_tok.len() as u32;
             id_to_tok.push(ch.to_string());
@@ -540,24 +405,11 @@ impl Tokenizer {
             uni_to_byte.insert(ch, b as u8);
         }
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
-        for (i, t) in id_to_tok.iter().enumerate() {
-            tok_to_id.insert(t.clone(), i as u32);
-        }
-        let mut specials: Vec<(String, u32)> =
-            special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
+        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         let eos = (special_strs.len() - 1) as u32;
-        Tokenizer {
-            id_to_tok,
-            tok_type,
-            tok_to_id,
-            merges: HashMap::new(),
-            max_bpe_token_bytes: 1,
-            specials,
-            byte_to_id,
-            uni_to_byte,
-            eos,
-        }
+        Tokenizer { id_to_tok, tok_type, tok_to_id, merges: HashMap::new(), max_bpe_token_bytes: 1, specials, byte_to_id, uni_to_byte, eos }
     }
 }
 
@@ -587,11 +439,9 @@ mod tests {
             return vec![id];
         }
         loop {
-            let best = symbols
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, pair)| t.merges.get(&(pair[0], pair[1])).map(|&(rank, merged)| (rank, i, merged)))
-                .min();
+            let best = symbols.windows(2).enumerate().filter_map(|(i, pair)| {
+                t.merges.get(&(pair[0], pair[1])).map(|&(rank, merged)| (rank, i, merged))
+            }).min();
             let Some((_, i, merged)) = best else { return symbols };
             symbols[i] = merged;
             symbols.remove(i + 1);
@@ -616,18 +466,9 @@ mod tests {
     fn bpe_matches_scan_for_overlapping_and_newly_ranked_pairs() {
         let mut t = Tokenizer::for_test();
         for (left, right, rank) in [
-            ("a", "b", 5),
-            ("b", "a", 5),
-            ("a", "a", 6),
-            ("b", "c", 8),
-            ("ab", "a", 1),
-            ("a", "ba", 2),
-            ("c", "ab", 0),
-            ("aa", "ab", 3),
-            ("aba", "bc", 4),
-            ("c", "a", 9),
-            ("ca", "b", 7),
-            ("?", "?", 3),
+            ("a", "b", 5), ("b", "a", 5), ("a", "a", 6), ("b", "c", 8),
+            ("ab", "a", 1), ("a", "ba", 2), ("c", "ab", 0), ("aa", "ab", 3),
+            ("aba", "bc", 4), ("c", "a", 9), ("ca", "b", 7), ("?", "?", 3),
         ] {
             add_merge(&mut t, left, right, rank);
         }
@@ -638,12 +479,10 @@ mod tests {
         }
         let mut state = 17u32;
         for len in 0..160 {
-            let piece: String = (0..len)
-                .map(|_| {
-                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                    (b'a' + ((state >> 16) % 3) as u8) as char
-                })
-                .collect();
+            let piece: String = (0..len).map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (b'a' + ((state >> 16) % 3) as u8) as char
+            }).collect();
             let mut actual = Vec::new();
             assert!(t.bpe(&piece, &mut actual, usize::MAX));
             assert_eq!(actual, reference_piece(&t, &piece), "{piece}");
@@ -722,47 +561,23 @@ mod tests {
             assert_eq!(Tokenizer::try_load(&g).err().unwrap().kind(), ErrorKind::InvalidData);
         };
 
-        check_err(|g| {
-            g.kv.remove("tokenizer.ggml.tokens");
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.tokens".into(), Value::AS(Vec::new()));
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.tokens".into(), Value::U(1));
-        });
-        check_err(|g| {
-            g.kv.remove("tokenizer.ggml.token_type");
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.token_type".into(), Value::AI(vec![1; 3]));
-        });
-        check_err(|g| {
-            g.kv.remove("tokenizer.ggml.merges");
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["nospace".into()]));
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["a b c".into()]));
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec![" b".into()]));
-        });
+        check_err(|g| { g.kv.remove("tokenizer.ggml.tokens"); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.tokens".into(), Value::AS(Vec::new())); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.tokens".into(), Value::U(1)); });
+        check_err(|g| { g.kv.remove("tokenizer.ggml.token_type"); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.token_type".into(), Value::AI(vec![1; 3])); });
+        check_err(|g| { g.kv.remove("tokenizer.ggml.merges"); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["nospace".into()])); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["a b c".into()])); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec![" b".into()])); });
         check_err(|g| {
             if let Some(Value::AS(toks)) = g.kv.get_mut("tokenizer.ggml.tokens") {
                 toks[0] = "missing-byte-zero".into();
             }
         });
-        check_err(|g| {
-            g.kv.remove("tokenizer.ggml.eos_token_id");
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::I(-1));
-        });
-        check_err(|g| {
-            g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::U(999_999));
-        });
+        check_err(|g| { g.kv.remove("tokenizer.ggml.eos_token_id"); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::I(-1)); });
+        check_err(|g| { g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::U(999_999)); });
     }
 
     #[test]
@@ -793,16 +608,18 @@ mod tests {
         );
         // GPT-4o `o200k` `body1` (`[\p{Lu}]*[\p{Ll}]+`) keeps `HTTPServer` together, splits
         // `httpServer` at the lowercase->uppercase boundary, and `body2` (`[\p{Lu}]+[\p{Ll}]*`) splits `HTTP99`.
-        assert_eq!(split_pieces("HTTPServer httpServer HTTP99"), vec!["HTTPServer", " http", "Server", " HTTP", "99"],);
+        assert_eq!(
+            split_pieces("HTTPServer httpServer HTTP99"),
+            vec!["HTTPServer", " http", "Server", " HTTP", "99"],
+        );
         // Numbers split into chunks of 1..=3 digits.
         assert_eq!(split_pieces("1234567890"), vec!["123", "456", "789", "0"]);
         // Punctuation absorbs optional leading space and trailing newlines/slashes.
         assert_eq!(split_pieces("a //\nnext"), vec!["a", " //\n", "next"]);
         // Indentation leaves the final space attached to the following word (`\s+(?!\S)`).
-        assert_eq!(
-            split_pieces("    let x = 42;\r\n  return x;"),
-            vec!["   ", " let", " x", " =", " ", "42", ";\r\n", " ", " return", " x", ";",]
-        );
+        assert_eq!(split_pieces("    let x = 42;\r\n  return x;"), vec![
+            "   ", " let", " x", " =", " ", "42", ";\r\n", " ", " return", " x", ";",
+        ]);
         // Combining accents and CJK characters stay grouped in word runs.
         assert_eq!(split_pieces("cafe\u{0301} 日本語123"), vec!["cafe\u{0301}", " 日本語", "123"]);
     }
@@ -881,11 +698,19 @@ mod tests {
 
         let ids_first = tk.encode(&corpus, false);
         let ids_second = tk.encode(&corpus, false);
-        assert!(ids_first.len() >= 74_000, "expected >= 74,000 tokens from real GGUF corpus, got {}", ids_first.len(),);
+        assert!(
+            ids_first.len() >= 74_000,
+            "expected >= 74,000 tokens from real GGUF corpus, got {}",
+            ids_first.len(),
+        );
         assert_eq!(ids_first, ids_second, "real GGUF BPE encoding must be 100% deterministic");
 
         let reconstructed: Vec<u8> = ids_first.iter().flat_map(|&id| tk.decode_bytes(id)).collect();
-        assert_eq!(reconstructed, corpus.as_bytes(), "real GGUF 74K+ token corpus must roundtrip byte-for-byte",);
+        assert_eq!(
+            reconstructed,
+            corpus.as_bytes(),
+            "real GGUF 74K+ token corpus must roundtrip byte-for-byte",
+        );
         println!(
             "real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism: {} bytes -> {} tokens -> exact byte roundtrip",
             corpus.len(),
@@ -936,17 +761,23 @@ mod tests {
         assert_eq!(
             split_pieces("don't won't I'm we're they've you'll he'd IT'S WE'RE rock'n'roll"),
             vec![
-                "don't", " won't", " I'm", " we're", " they've", " you'll", " he'd", " IT'S", " WE'RE", " rock", "'n",
-                "'roll",
+                "don't", " won't", " I'm", " we're", " they've", " you'll", " he'd",
+                " IT'S", " WE'RE", " rock", "'n", "'roll",
             ]
         );
         // CamelCase / acronym transitions (body1 merges acronym+title `HTTPServer`, while lowercase ` parse` stops before uppercase `JSON`).
-        assert_eq!(split_pieces("HTTPServer HTML5 parseJSON"), vec!["HTTPServer", " HTML", "5", " parse", "JSON"]);
+        assert_eq!(
+            split_pieces("HTTPServer HTML5 parseJSON"),
+            vec!["HTTPServer", " HTML", "5", " parse", "JSON"]
+        );
         // 1-3 digit chunking across ASCII and Unicode digits.
         assert_eq!(split_pieces("1234567890"), vec!["123", "456", "789", "0"]);
         assert_eq!(split_pieces("١٢٣٤"), vec!["١٢٣", "٤"]);
         // Optional leading space on punctuation + trailing slashes/CRLF consumption.
-        assert_eq!(split_pieces("a += 1;//\r\nb"), vec!["a", " +=", " ", "1", ";//\r\n", "b"]);
+        assert_eq!(
+            split_pieces("a += 1;//\r\nb"),
+            vec!["a", " +=", " ", "1", ";//\r\n", "b"]
+        );
         // Whitespace lookahead: `\s+(?!\S)` leaves the final space attached to the next word,
         // while trailing whitespace at end-of-string stays one piece and `\s*[\r\n]+` splits after last newline.
         assert_eq!(split_pieces("x    y   "), vec!["x", "   ", " y", "   "]);

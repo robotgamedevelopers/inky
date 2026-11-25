@@ -82,9 +82,9 @@ fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<(
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF in pread"));
             }
             buf = &mut buf[n..];
-            offset = offset
-                .checked_add(n as u64)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pread offset overflow"))?;
+            offset = offset.checked_add(n as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "pread offset overflow")
+            })?;
         }
         Ok(())
     }
@@ -239,7 +239,9 @@ impl SpillStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
-            if SpillKey::parse_tmp_filename(&name).is_some() || name.starts_with(SPILL_INDEX_TMP_PREFIX) {
+            if SpillKey::parse_tmp_filename(&name).is_some()
+                || name.starts_with(SPILL_INDEX_TMP_PREFIX)
+            {
                 if meta.is_file() && unlink_if_present(&path)? {
                     self.stats.orphans_swept += 1;
                 }
@@ -287,7 +289,11 @@ impl SpillStore {
 
     /// Evict least-recently-used `.blk` files not in `protected` until
     /// `self.used_bytes + additional <= self.max_bytes` (returns evicted keys).
-    pub fn evict_lru_to_fit(&mut self, additional: u64, protected: &HashSet<SpillKey>) -> Vec<SpillKey> {
+    pub fn evict_lru_to_fit(
+        &mut self,
+        additional: u64,
+        protected: &HashSet<SpillKey>,
+    ) -> Vec<SpillKey> {
         let mut evicted = Vec::new();
         let mut failed = HashSet::new();
         while self.used_bytes.saturating_add(additional) > self.max_bytes {
@@ -368,11 +374,8 @@ impl SpillStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
                 Err(e) => return Err(e.into()),
                 Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("unindexed file at {}", final_path.display()),
-                    )
-                    .into());
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                        format!("unindexed file at {}", final_path.display())).into());
                 }
             },
         };
@@ -484,7 +487,12 @@ impl SpillStore {
 
     /// Remove any indexed `.blk` files not present in `keep`, returning the number removed.
     pub fn retain_keys(&mut self, keep: &HashSet<SpillKey>) -> usize {
-        let stale: Vec<SpillKey> = self.entries.keys().copied().filter(|k| !keep.contains(k)).collect();
+        let stale: Vec<SpillKey> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|k| !keep.contains(k))
+            .collect();
         let mut removed = 0usize;
         for k in stale {
             if self.remove_block(k) {
@@ -594,7 +602,12 @@ pub struct RawDiskRead {
 
 /// Standalone `pread` + SHA-256 verification of a `.blk` file inside `dir`.
 /// Safe to execute on a background restore worker thread without blocking the scheduler.
-pub fn read_block_from_dir(dir: &Path, kvb: u32, key: SpillKey, expected_kv_len: Option<usize>) -> RawDiskRead {
+pub fn read_block_from_dir(
+    dir: &Path,
+    kvb: u32,
+    key: SpillKey,
+    expected_kv_len: Option<usize>,
+) -> RawDiskRead {
     #[cfg(test)]
     super::run_test_spill_read_hook(dir, key);
 
@@ -616,9 +629,16 @@ pub fn read_block_from_dir(dir: &Path, kvb: u32, key: SpillKey, expected_kv_len:
                     is_corrupt: true,
                 };
             }
-            let reason =
-                if e.kind() == io::ErrorKind::NotFound { MissReason::NotFound } else { MissReason::IoReadError };
-            return RawDiskRead { outcome: ReadOutcome::Miss(reason), observed_file_len: None, is_corrupt: false };
+            let reason = if e.kind() == io::ErrorKind::NotFound {
+                MissReason::NotFound
+            } else {
+                MissReason::IoReadError
+            };
+            return RawDiskRead {
+                outcome: ReadOutcome::Miss(reason),
+                observed_file_len: None,
+                is_corrupt: false,
+            };
         }
     };
 
@@ -690,8 +710,9 @@ pub fn read_block_from_dir(dir: &Path, kvb: u32, key: SpillKey, expected_kv_len:
             return miss_corrupt(MissReason::LengthMismatch);
         }
     }
-    let expected_file_len =
-        (SPILL_HEADER_LEN as u64).checked_add(kv_len_u64).and_then(|v| v.checked_add(state_len_u64));
+    let expected_file_len = (SPILL_HEADER_LEN as u64)
+        .checked_add(kv_len_u64)
+        .and_then(|v| v.checked_add(state_len_u64));
     if expected_file_len != Some(file_len) {
         return miss_corrupt(MissReason::SizeMismatch);
     }
@@ -724,7 +745,12 @@ pub fn read_block_from_dir(dir: &Path, kvb: u32, key: SpillKey, expected_kv_len:
     }
 
     RawDiskRead {
-        outcome: ReadOutcome::Hit(RestoredBlock { key, generation, kv_bytes, recurrent_state }),
+        outcome: ReadOutcome::Hit(RestoredBlock {
+            key,
+            generation,
+            kv_bytes,
+            recurrent_state,
+        }),
         observed_file_len: Some(file_len),
         is_corrupt: false,
     }
@@ -734,10 +760,16 @@ pub(super) fn prepare_spill_dir(dir: &Path) -> Result<(), SpillError> {
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                return Err(SpillError::InvalidDir(format!("{} must not be a symlink", dir.display())));
+                return Err(SpillError::InvalidDir(format!(
+                    "{} must not be a symlink",
+                    dir.display()
+                )));
             }
             if !meta.is_dir() {
-                return Err(SpillError::InvalidDir(format!("{} exists and is not a directory", dir.display())));
+                return Err(SpillError::InvalidDir(format!(
+                    "{} exists and is not a directory",
+                    dir.display()
+                )));
             }
             #[cfg(unix)]
             {

@@ -109,15 +109,9 @@ pub struct BlockHandles {
 }
 
 impl BlockHandles {
-    pub fn new(full: BlockEntry, window: Option<BlockEntry>) -> BlockHandles {
-        BlockHandles { full, window }
-    }
-    pub fn full(self) -> BlockEntry {
-        self.full
-    }
-    pub fn window(self) -> Option<BlockEntry> {
-        self.window
-    }
+    pub fn new(full: BlockEntry, window: Option<BlockEntry>) -> BlockHandles { BlockHandles { full, window } }
+    pub fn full(self) -> BlockEntry { self.full }
+    pub fn window(self) -> Option<BlockEntry> { self.window }
     #[cfg(test)]
     fn entries(self) -> impl Iterator<Item = BlockEntry> {
         std::iter::once(self.full).chain(self.window)
@@ -157,9 +151,7 @@ fn digest_in_namespace(namespace: u64, parent: Option<SealedId>, pos: usize, tok
     mix(namespace);
     mix(parent.map(|p| p.index + 1).unwrap_or(0));
     mix(pos as u64);
-    for &t in tokens {
-        mix(t as u64);
-    }
+    for &t in tokens { mix(t as u64); }
     h
 }
 
@@ -187,27 +179,17 @@ impl<B: Copy> PrefixTree<B> {
     }
 
     fn node(&self, id: SealedId) -> Option<&Node<B>> {
-        if id.tree != self.tree {
-            return None;
-        }
+        if id.tree != self.tree { return None; }
         self.nodes.get(&id.index)
     }
 
     fn node_mut(&mut self, id: SealedId) -> Option<&mut Node<B>> {
-        if id.tree != self.tree {
-            return None;
-        }
+        if id.tree != self.tree { return None; }
         self.nodes.get_mut(&id.index)
     }
 
     /// Add one sealed block in the default namespace (`0`).
-    pub fn insert(
-        &mut self,
-        parent: Option<SealedId>,
-        pos: usize,
-        tokens: &[u32],
-        handle: B,
-    ) -> Result<SealedId, InsertError> {
+    pub fn insert(&mut self, parent: Option<SealedId>, pos: usize, tokens: &[u32], handle: B) -> Result<SealedId, InsertError> {
         self.insert_in_namespace(0, parent, pos, tokens, handle)
     }
 
@@ -223,25 +205,17 @@ impl<B: Copy> PrefixTree<B> {
         tokens: &[u32],
         handle: B,
     ) -> Result<SealedId, InsertError> {
-        if tokens.len() != BLOCK {
-            return Err(InsertError::NotFullBlock(tokens.len()));
-        }
+        if tokens.len() != BLOCK { return Err(InsertError::NotFullBlock(tokens.len())); }
         let expected = match parent {
             None => 0,
             Some(p) => {
-                if p.tree != self.tree {
-                    return Err(InsertError::ForeignId);
-                }
+                if p.tree != self.tree { return Err(InsertError::ForeignId); }
                 let pn = self.node(p).ok_or(InsertError::UnknownParent)?;
-                if pn.namespace != namespace {
-                    return Err(InsertError::UnknownParent);
-                }
+                if pn.namespace != namespace { return Err(InsertError::UnknownParent); }
                 pn.pos + BLOCK
             }
         };
-        if pos != expected {
-            return Err(InsertError::WrongPosition { expected, got: pos });
-        }
+        if pos != expected { return Err(InsertError::WrongPosition { expected, got: pos }); }
         let d = digest_in_namespace(namespace, parent, pos, tokens);
         if let Some(bucket) = self.by_digest.get(&d) {
             for &id in bucket {
@@ -254,20 +228,10 @@ impl<B: Copy> PrefixTree<B> {
         let index = self.next_index;
         self.next_index = index.checked_add(1).ok_or(InsertError::IdExhausted)?;
         let id = SealedId { tree: self.tree, index };
-        self.nodes.insert(
-            index,
-            Node {
-                namespace,
-                parent,
-                pos,
-                digest: d,
-                tokens: tokens.into(),
-                handle,
-                starts: 0,
-                pins: 0,
-                children: Vec::new(),
-            },
-        );
+        self.nodes.insert(index, Node {
+            namespace, parent, pos, digest: d, tokens: tokens.into(), handle,
+            starts: 0, pins: 0, children: Vec::new(),
+        });
         match parent {
             None => self.roots.push(id),
             Some(p) => self.node_mut(p).expect("the parent was just checked").children.push(id),
@@ -287,7 +251,9 @@ impl<B: Copy> PrefixTree<B> {
     /// (a parent always precedes its children).
     #[cfg(any(test, standalone_blocks))]
     pub fn entries(&self) -> Vec<(SealedId, B)> {
-        self.nodes.iter().map(|(&index, n)| (SealedId { tree: self.tree, index }, n.handle)).collect()
+        self.nodes.iter()
+            .map(|(&index, n)| (SealedId { tree: self.tree, index }, n.handle))
+            .collect()
     }
 
     #[cfg(standalone_blocks)]
@@ -319,10 +285,7 @@ impl<B: Copy> PrefixTree<B> {
     /// without removing descendants or breaking active start points).
     pub fn set_handle(&mut self, id: SealedId, handle: B) -> bool {
         match self.node_mut(id) {
-            Some(n) => {
-                n.handle = handle;
-                true
-            }
+            Some(n) => { n.handle = handle; true }
             None => false,
         }
     }
@@ -351,10 +314,7 @@ impl<B: Copy> PrefixTree<B> {
     /// tell them apart checks `handle` or `start_holders` first.
     pub fn release_start(&mut self, id: SealedId) -> bool {
         match self.node_mut(id) {
-            Some(n) if n.starts > 0 => {
-                n.starts -= 1;
-                true
-            }
+            Some(n) if n.starts > 0 => { n.starts -= 1; true }
             _ => false,
         }
     }
@@ -375,10 +335,7 @@ impl<B: Copy> PrefixTree<B> {
     /// Add one pin. `Ok(false)` when the id names no block here.
     pub fn pin(&mut self, id: SealedId) -> Result<bool, BlockError> {
         match self.node_mut(id) {
-            Some(n) => {
-                n.pins = n.pins.checked_add(1).ok_or(BlockError::Overflow)?;
-                Ok(true)
-            }
+            Some(n) => { n.pins = n.pins.checked_add(1).ok_or(BlockError::Overflow)?; Ok(true) }
             None => Ok(false),
         }
     }
@@ -387,10 +344,7 @@ impl<B: Copy> PrefixTree<B> {
     /// the block had no pin left.
     pub fn unpin(&mut self, id: SealedId) -> bool {
         match self.node_mut(id) {
-            Some(n) if n.pins > 0 => {
-                n.pins -= 1;
-                true
-            }
+            Some(n) if n.pins > 0 => { n.pins -= 1; true }
             _ => false,
         }
     }
@@ -418,20 +372,14 @@ impl<B: Copy> PrefixTree<B> {
         }
         match parent {
             None => self.roots.retain(|&r| r != id),
-            Some(p) => {
-                if let Some(n) = self.node_mut(p) {
-                    n.children.retain(|&c| c != id);
-                }
-            }
+            Some(p) => if let Some(n) = self.node_mut(p) { n.children.retain(|&c| c != id); },
         }
         let mut handles = Vec::new();
         for g in gone {
             let n = self.nodes.remove(&g.index).expect("collected blocks are live");
             if let Some(bucket) = self.by_digest.get_mut(&n.digest) {
                 bucket.retain(|&b| b != g);
-                if bucket.is_empty() {
-                    self.by_digest.remove(&n.digest);
-                }
+                if bucket.is_empty() { self.by_digest.remove(&n.digest); }
             }
             handles.push((n.handle, n.pins));
         }
@@ -447,18 +395,11 @@ impl<B: Copy> PrefixTree<B> {
 
     /// The child of `parent` (or a root) within `namespace` whose tokens are
     /// exactly this block. The digest bucket narrows the search; exact fields decide.
-    fn child_in_namespace(
-        &self,
-        namespace: u64,
-        parent: Option<SealedId>,
-        pos: usize,
-        tokens: &[u32],
-    ) -> Option<SealedId> {
+    fn child_in_namespace(&self, namespace: u64, parent: Option<SealedId>, pos: usize, tokens: &[u32]) -> Option<SealedId> {
         let bucket = self.by_digest.get(&digest_in_namespace(namespace, parent, pos, tokens))?;
         for &id in bucket {
             let n = self.node(id)?;
-            if n.namespace == namespace && n.parent == parent && n.pos == pos && n.tokens.as_ref() == tokens {
-                // MUTANT_ANCHOR_NS_MATCH
+            if n.namespace == namespace && n.parent == parent && n.pos == pos && n.tokens.as_ref() == tokens { // MUTANT_ANCHOR_NS_MATCH
                 return Some(id);
             }
         }
@@ -481,8 +422,7 @@ impl<B: Copy> PrefixTree<B> {
             chain.push(n.handle);
             at += BLOCK;
             parent = Some(id);
-            if n.starts > 0 {
-                // MUTANT_ANCHOR_DEEPEST_NS
+            if n.starts > 0 { // MUTANT_ANCHOR_DEEPEST_NS
                 best_len = ids.len();
                 best_start = Some(id);
             }
@@ -498,9 +438,7 @@ impl<B: Copy> PrefixTree<B> {
 }
 
 impl<B: Copy> Default for PrefixTree<B> {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl<B: Copy> PrefixMatch<B> for PrefixTree<B> {
@@ -544,16 +482,12 @@ pub enum LiveError {
 
 #[cfg(test)]
 impl From<InsertError> for LiveError {
-    fn from(e: InsertError) -> LiveError {
-        LiveError::Insert(e)
-    }
+    fn from(e: InsertError) -> LiveError { LiveError::Insert(e) }
 }
 
 #[cfg(test)]
 impl From<BlockError> for LiveError {
-    fn from(e: BlockError) -> LiveError {
-        LiveError::Pool(e)
-    }
+    fn from(e: BlockError) -> LiveError { LiveError::Pool(e) }
 }
 
 /// The prefix matcher over live pool slots. A cached block sits at
@@ -587,9 +521,7 @@ impl<R: SlotRecords> LiveTree<R> {
     }
 
     fn handles_current(&self, h: BlockHandles) -> Result<(), LiveError> {
-        for e in h.entries() {
-            self.check_current(e)?;
-        }
+        for e in h.entries() { self.check_current(e)?; }
         Ok(())
     }
 
@@ -606,9 +538,7 @@ impl<R: SlotRecords> LiveTree<R> {
     }
 
     fn drop_pinned(&mut self, h: BlockHandles) -> Result<(), LiveError> {
-        for e in h.entries() {
-            self.drop_ref_if_current(e)?;
-        }
+        for e in h.entries() { self.drop_ref_if_current(e)?; }
         Ok(())
     }
 
@@ -624,13 +554,7 @@ impl<R: SlotRecords> LiveTree<R> {
     /// fresh block takes its place, also unpinned. The returned id's
     /// handles may be another publisher's entries; `handle` shows the
     /// pair the tree actually holds.
-    pub fn insert(
-        &mut self,
-        parent: Option<SealedId>,
-        pos: usize,
-        tokens: &[u32],
-        handles: BlockHandles,
-    ) -> Result<SealedId, LiveError> {
+    pub fn insert(&mut self, parent: Option<SealedId>, pos: usize, tokens: &[u32], handles: BlockHandles) -> Result<SealedId, LiveError> {
         if handles.full.kind() != BlockKind::Full {
             return Err(LiveError::WrongKind { expected: BlockKind::Full, got: handles.full.kind() });
         }
@@ -643,9 +567,7 @@ impl<R: SlotRecords> LiveTree<R> {
         if tokens.len() == BLOCK {
             if let Some(id) = self.tree.find(parent, pos, tokens) {
                 let twin = self.tree.handle(id).expect("a found block has handles");
-                if self.handles_current(twin).is_ok() {
-                    return Ok(id);
-                }
+                if self.handles_current(twin).is_ok() { return Ok(id); }
                 self.remove(id)?; // the stale twin: evict it, then insert fresh below
             }
         }
@@ -665,9 +587,7 @@ impl<R: SlotRecords> LiveTree<R> {
                 match self.records.add_ref(e.slot(), e.kind(), e.generation()) {
                     Ok(()) => taken.push(e),
                     Err(err) => {
-                        for t in taken {
-                            let _ = self.drop_ref_if_current(t);
-                        }
+                        for t in taken { let _ = self.drop_ref_if_current(t); }
                         return Err(err.into());
                     }
                 }
@@ -683,34 +603,22 @@ impl<R: SlotRecords> LiveTree<R> {
     /// block here or the block had no pin left.
     pub fn unpin(&mut self, id: SealedId) -> Result<bool, LiveError> {
         let Some(handles) = self.tree.handle(id) else { return Ok(false) };
-        if self.tree.pin_count(id) == 0 {
-            return Ok(false);
-        }
-        if self.tree.pin_count(id) == 1 {
-            self.drop_pinned(handles)?;
-        }
+        if self.tree.pin_count(id) == 0 { return Ok(false); }
+        if self.tree.pin_count(id) == 1 { self.drop_pinned(handles)?; }
         Ok(self.tree.unpin(id))
     }
 
     /// How many pins hold this block.
-    pub fn pin_count(&self, id: SealedId) -> u32 {
-        self.tree.pin_count(id)
-    }
+    pub fn pin_count(&self, id: SealedId) -> u32 { self.tree.pin_count(id) }
 
     /// Keep or drop one holder of a start point (see `PrefixTree`).
-    pub fn retain_start(&mut self, id: SealedId) -> Result<bool, BlockError> {
-        self.tree.retain_start(id)
-    }
-    pub fn release_start(&mut self, id: SealedId) -> bool {
-        self.tree.release_start(id)
-    }
+    pub fn retain_start(&mut self, id: SealedId) -> Result<bool, BlockError> { self.tree.retain_start(id) }
+    pub fn release_start(&mut self, id: SealedId) -> bool { self.tree.release_start(id) }
 
     /// The handles the tree holds on a block, if it is here. After a
     /// racing publisher's `Ok(id)`, this is how the caller tells whose
     /// entries the tree kept.
-    pub fn handle(&self, id: SealedId) -> Option<BlockHandles> {
-        self.tree.handle(id)
-    }
+    pub fn handle(&self, id: SealedId) -> Option<BlockHandles> { self.tree.handle(id) }
 
     /// Remove a block and everything below it. Pinned blocks among
     /// them drop their refs generation-checked (see
@@ -721,9 +629,7 @@ impl<R: SlotRecords> LiveTree<R> {
         for (h, pins) in &removed {
             if *pins > 0 {
                 if let Err(e) = self.drop_pinned(*h) {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                    if first_err.is_none() { first_err = Some(e); }
                 }
             }
         }
@@ -743,10 +649,7 @@ impl<R: SlotRecords> LiveTree<R> {
     /// prompt is non-empty: an exact full match steps back one block,
     /// leaving at least the final token to prefill.
     pub fn deepest_start(&mut self, tokens: &[u32]) -> Result<StartMatch<BlockHandles>, LiveError> {
-        let stale: Vec<SealedId> = self
-            .tree
-            .entries()
-            .into_iter()
+        let stale: Vec<SealedId> = self.tree.entries().into_iter()
             .filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))
             .map(|(id, _)| id)
             .collect();
@@ -770,9 +673,7 @@ mod tests {
     use super::*;
     use crate::blocks::SlotRecord;
 
-    fn block(seed: u32) -> Vec<u32> {
-        (0..BLOCK as u32).map(|i| seed * 1000 + i).collect()
-    }
+    fn block(seed: u32) -> Vec<u32> { (0..BLOCK as u32).map(|i| seed * 1000 + i).collect() }
 
     fn tree3() -> (PrefixTree<u64>, Vec<SealedId>) {
         let mut t = PrefixTree::new();
@@ -825,11 +726,7 @@ mod tests {
         let mut second = block(2);
         second[63] ^= 1;
         let toks = [block(1), second, block(3)].concat();
-        assert_eq!(
-            t.deepest_start(&toks).at,
-            0,
-            "the second block differs, so even the third block's start point is unreachable"
-        );
+        assert_eq!(t.deepest_start(&toks).at, 0, "the second block differs, so even the third block's start point is unreachable");
         let (mut t2, ids2) = tree3();
         t2.retain_start(ids2[1]).unwrap();
         assert_eq!(t2.deepest_start(&[block(1), block(7)].concat()).at, 0);
@@ -845,11 +742,8 @@ mod tests {
         assert_ne!(a2, x2);
         t.retain_start(a2).unwrap();
         t.retain_start(x2).unwrap();
-        assert_eq!(
-            t.deepest_start(&[block(5), block(2)].concat()).blocks,
-            vec![50, 60],
-            "the match follows the parent chain, never the local tokens alone"
-        );
+        assert_eq!(t.deepest_start(&[block(5), block(2)].concat()).blocks, vec![50, 60],
+            "the match follows the parent chain, never the local tokens alone");
         assert_eq!(t.deepest_start(&[block(1), block(2)].concat()).blocks, vec![10, 20]);
     }
 
@@ -857,11 +751,7 @@ mod tests {
     fn racing_publishers_dedupe_only_on_exact_tokens() {
         let mut t: PrefixTree<u64> = PrefixTree::new();
         let a = t.insert(None, 0, &block(1), 10).unwrap();
-        assert_eq!(
-            t.insert(None, 0, &block(1), 99),
-            Ok(a),
-            "the same block again is the canonical one, with its first handle"
-        );
+        assert_eq!(t.insert(None, 0, &block(1), 99), Ok(a), "the same block again is the canonical one, with its first handle");
         assert_ne!(t.insert(None, 0, &block(2), 20).unwrap(), a, "different tokens are a different root");
     }
 
@@ -870,17 +760,10 @@ mod tests {
         let mut t: PrefixTree<u64> = PrefixTree::new();
         let mut other: PrefixTree<u64> = PrefixTree::new();
         let foreign = other.insert(None, 0, &block(1), 1).unwrap();
-        assert_eq!(
-            t.insert(None, 0, &block(1)[..63], 10),
-            Err(InsertError::NotFullBlock(63)),
-            "a partial tail is unsealed"
-        );
+        assert_eq!(t.insert(None, 0, &block(1)[..63], 10), Err(InsertError::NotFullBlock(63)), "a partial tail is unsealed");
         assert_eq!(t.insert(None, BLOCK, &block(1), 10), Err(InsertError::WrongPosition { expected: 0, got: BLOCK }));
-        assert_eq!(
-            t.insert(Some(foreign), BLOCK, &block(1), 10),
-            Err(InsertError::ForeignId),
-            "an id from another tree names nothing here, even at an existing index"
-        );
+        assert_eq!(t.insert(Some(foreign), BLOCK, &block(1), 10), Err(InsertError::ForeignId),
+            "an id from another tree names nothing here, even at an existing index");
         assert_eq!(t.retain_start(foreign), Ok(false), "a foreign id is no block here");
         assert!(t.remove(foreign).is_empty());
         let a = t.insert(None, 0, &block(1), 10).unwrap();
@@ -960,14 +843,10 @@ mod tests {
     /// Johnny's slot records behind the test's own map: the fake is only
     /// storage; every record in it is his `SlotRecord`.
     #[derive(Default)]
-    struct FakeRecords {
-        map: HashMap<(u32, bool), SlotRecord>,
-    }
+    struct FakeRecords { map: HashMap<(u32, bool), SlotRecord> }
 
     impl FakeRecords {
-        fn key(slot: Slot, kind: BlockKind) -> (u32, bool) {
-            (slot.get(), kind == BlockKind::Full)
-        }
+        fn key(slot: Slot, kind: BlockKind) -> (u32, bool) { (slot.get(), kind == BlockKind::Full) }
         fn record(&mut self, slot: Slot, kind: BlockKind) -> &mut SlotRecord {
             // a record starts at generation 1 when the slot is first
             // taken: generation 0 is "never taken" (blocks.rs)
@@ -977,32 +856,24 @@ mod tests {
                 r
             })
         }
-        fn refs(&mut self, slot: Slot, kind: BlockKind) -> u32 {
-            self.record(slot, kind).refs()
-        }
+        fn refs(&mut self, slot: Slot, kind: BlockKind) -> u32 { self.record(slot, kind).refs() }
         fn pool_refs(&self, slot: Slot, kind: BlockKind) -> u32 {
             self.map.get(&Self::key(slot, kind)).map(|r| r.refs()).unwrap_or(0)
         }
         fn reuse(&mut self, slot: Slot, kind: BlockKind) {
             let r = self.record(slot, kind);
-            while r.refs() > 0 {
-                r.drop_ref().unwrap();
-            }
+            while r.refs() > 0 { r.drop_ref().unwrap(); }
             r.reissue().unwrap();
         }
     }
 
     impl SlotRecords for FakeRecords {
         fn add_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError> {
-            if self.generation(slot, kind) != Some(generation) {
-                return Err(BlockError::Generation);
-            }
+            if self.generation(slot, kind) != Some(generation) { return Err(BlockError::Generation); }
             self.record(slot, kind).add_ref()
         }
         fn drop_ref(&mut self, slot: Slot, kind: BlockKind, generation: u32) -> Result<(), BlockError> {
-            if self.generation(slot, kind) != Some(generation) {
-                return Err(BlockError::Generation);
-            }
+            if self.generation(slot, kind) != Some(generation) { return Err(BlockError::Generation); }
             self.record(slot, kind).drop_ref()
         }
         fn generation(&self, slot: Slot, kind: BlockKind) -> Option<u32> {
@@ -1045,19 +916,11 @@ mod tests {
         assert_eq!(m.at, 0, "the gen-1 entry for a gen-2 slot is stale: a miss, not a match");
         assert_eq!(live.deepest_start(&toks).unwrap().at, 0, "and it was evicted, not rechecked forever");
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "no ref leaks on the reused slot");
-        assert_eq!(
-            live.records.refs(Slot::new(4).unwrap(), BlockKind::Full),
-            0,
-            "the evicted child's pinned ref was dropped too"
-        );
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "the evicted child's pinned ref was dropped too");
         // a fresh block at the slot's new generation matches again
         let a2 = live.insert(None, 0, &block(1), handles(3, 2)).unwrap();
         live.retain_start(a2).unwrap();
-        assert_eq!(
-            live.deepest_start(&block(1)).unwrap().at,
-            0,
-            "one block is the whole prompt: the suffix is never empty"
-        );
+        assert_eq!(live.deepest_start(&block(1)).unwrap().at, 0, "one block is the whole prompt: the suffix is never empty");
         assert_eq!(live.deepest_start(&[block(1), block(9)].concat()).unwrap().blocks, vec![handles(3, 2)]);
     }
 
@@ -1097,18 +960,12 @@ mod tests {
         let a2 = live.insert(None, 0, &block(1), handles(3, 2)).unwrap();
         assert_ne!(a2, a, "the fresh block is a new block, not the stale twin");
         assert_eq!(live.pin_count(a2), 0, "the fresh block starts unpinned");
-        assert_eq!(
-            live.records.refs(Slot::new(3).unwrap(), BlockKind::Full),
-            0,
-            "the twin's pin died with its generation; no blind drop touched the new owner"
-        );
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0,
+            "the twin's pin died with its generation; no blind drop touched the new owner");
         live.pin(a2).unwrap();
         live.retain_start(a2).unwrap();
-        assert_eq!(
-            live.deepest_start(&[block(1), block(9)].concat()).unwrap().blocks,
-            vec![handles(3, 2)],
-            "and the fresh block survives the next seek"
-        );
+        assert_eq!(live.deepest_start(&[block(1), block(9)].concat()).unwrap().blocks, vec![handles(3, 2)],
+            "and the fresh block survives the next seek");
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1);
     }
 
@@ -1121,16 +978,10 @@ mod tests {
         let a = live.insert(None, 0, &block(1), handles(3, 1)).unwrap();
         live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // slot 3 is generation 2 now
         let stale = LiveError::StaleEntry { slot: Slot::new(3).unwrap(), claimed: 1, current: Some(2) };
-        assert_eq!(
-            live.insert(None, 0, &block(9), handles(3, 1)),
-            Err(stale.clone()),
-            "a gen-1 entry for a gen-2 slot is refused, not inserted"
-        );
-        assert_eq!(
-            live.insert(None, 0, &block(1), handles(3, 1)),
-            Err(stale),
-            "the same refusal when the tokens are already in the tree"
-        );
+        assert_eq!(live.insert(None, 0, &block(9), handles(3, 1)), Err(stale.clone()),
+            "a gen-1 entry for a gen-2 slot is refused, not inserted");
+        assert_eq!(live.insert(None, 0, &block(1), handles(3, 1)), Err(stale),
+            "the same refusal when the tokens are already in the tree");
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 0, "no ref was taken by either refusal");
         assert_eq!(live.handle(a), Some(handles(3, 1)), "the tree is unchanged");
         // a fresh entry at the current generation still lands
@@ -1151,11 +1002,7 @@ mod tests {
         let m = live.deepest_start(&[block(1), block(9)].concat()).unwrap();
         assert_eq!(m.at, BLOCK, "the live path still matches");
         assert_eq!(live.handle(off), None, "the stale off-path block was evicted by the seek");
-        assert_eq!(
-            live.records.refs(Slot::new(4).unwrap(), BlockKind::Full),
-            0,
-            "and no ref is left on the reused slot"
-        );
+        assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Full), 0, "and no ref is left on the reused slot");
     }
 
     #[test]
@@ -1169,11 +1016,7 @@ mod tests {
         assert_eq!(live.pin_count(a), 2);
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "two pins, one Full ref");
         assert_eq!(live.records.refs(Slot::new(4).unwrap(), BlockKind::Window), 1, "two pins, one Window ref");
-        assert_eq!(
-            live.handle(a).unwrap().window(),
-            Some(entry(4, 1, BlockKind::Window)),
-            "both entries ride on the node"
-        );
+        assert_eq!(live.handle(a).unwrap().window(), Some(entry(4, 1, BlockKind::Window)), "both entries ride on the node");
         live.unpin(a).unwrap();
         assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1, "a pin remains");
         live.unpin(a).unwrap();
@@ -1198,11 +1041,8 @@ mod tests {
         live.records.reuse(Slot::new(3).unwrap(), BlockKind::Full); // gen 2; Emma's poolgate resets refs there
         live.records.add_ref(Slot::new(3).unwrap(), BlockKind::Full, 2).unwrap(); // the new owner's ref
         live.remove(a).unwrap();
-        assert_eq!(
-            live.records.refs(Slot::new(3).unwrap(), BlockKind::Full),
-            1,
-            "the stale block's eviction skipped the drop: the new owner's ref stands"
-        );
+        assert_eq!(live.records.refs(Slot::new(3).unwrap(), BlockKind::Full), 1,
+            "the stale block's eviction skipped the drop: the new owner's ref stands");
         // and a generation-blind checked drop at the old generation refuses outright
         assert_eq!(live.records.drop_ref(Slot::new(3).unwrap(), BlockKind::Full, 1), Err(BlockError::Generation));
     }
@@ -1239,34 +1079,19 @@ mod tests {
     /// The model's block-boundary sequences over {1, 2}, shortest first.
     fn tla_universe() -> Vec<Vec<u32>> {
         let mut u = vec![Vec::new()];
-        for a in 1..=2 {
-            for b in 1..=2 {
-                u.push(vec![a, b]);
-            }
-        }
-        for a in 1..=2 {
-            for b in 1..=2 {
-                for c in 1..=2 {
-                    for d in 1..=2 {
-                        u.push(vec![a, b, c, d]);
-                    }
-                }
-            }
-        }
+        for a in 1..=2 { for b in 1..=2 { u.push(vec![a, b]); } }
+        for a in 1..=2 { for b in 1..=2 { for c in 1..=2 { for d in 1..=2 { u.push(vec![a, b, c, d]); } } } }
         u
     }
 
     fn tla_fn(values: &HashMap<Vec<u32>, i64>) -> String {
         // a CASE function over the whole domain: explicit-point
         // function literals ([<<>> |-> 0, ...]) do not parse
-        let cases: Vec<String> = tla_universe()
-            .iter()
+        let cases: Vec<String> = tla_universe().iter()
             .filter(|s| values.get(*s).copied().unwrap_or(0) != 0)
             .map(|s| format!("s = {} -> {}", tla_seq(s), values[s]))
             .collect();
-        if cases.is_empty() {
-            return "[s \\in BlockSeqs |-> 0]".to_string();
-        }
+        if cases.is_empty() { return "[s \\in BlockSeqs |-> 0]".to_string(); }
         format!("[s \\in BlockSeqs |-> CASE {} [] OTHER -> 0]", cases.join(" [] "))
     }
 
@@ -1318,8 +1143,14 @@ mod tests {
                         req_abs: &[u32]|
          -> String {
             let mut sealed: Vec<String> = vec![tla_seq(&[])];
-            let (mut starts, mut slot_of_m, mut gen_of, mut win_slot, mut win_gen, mut refs) =
-                (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
+            let (mut starts, mut slot_of_m, mut gen_of, mut win_slot, mut win_gen, mut refs) = (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            );
             for (id, h) in live.tree.entries() {
                 let seq = seq_of[&id].clone();
                 sealed.push(tla_seq(&seq));
@@ -1350,10 +1181,18 @@ mod tests {
             );
             let fg = |sl: u32| live.records.generation(Slot::new(sl).unwrap(), BlockKind::Full).unwrap() - 1;
             let wg = |sl: u32| live.records.generation(Slot::new(sl).unwrap(), BlockKind::Window).unwrap() - 1;
-            let pool =
-                format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", fg(1), fg(2), fg(3));
-            let win_pool =
-                format!("[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]", wg(1), wg(2), wg(3));
+            let pool = format!(
+                "[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]",
+                fg(1),
+                fg(2),
+                fg(3)
+            );
+            let win_pool = format!(
+                "[s \\in Slots |-> IF s = 1 THEN {} ELSE IF s = 2 THEN {} ELSE {}]",
+                wg(1),
+                wg(2),
+                wg(3)
+            );
             format!(
                 "[op |-> \"{op}\", s |-> {}, slot |-> {slot}, wslot |-> {wslot}, sealed |-> {{{}}}, starts |-> {}, \
                  slotOf |-> {}, genOf |-> {}, winSlotOf |-> {}, winGenOf |-> {}, poolGen |-> {}, winPoolGen |-> {}, \
@@ -1390,24 +1229,31 @@ mod tests {
             let had_stale_win_only = live.tree.entries().iter().any(|(_, h)| {
                 let f = h.full();
                 let f_ok = live.records.generation(f.slot(), BlockKind::Full) == Some(f.generation());
-                let w_stale = h
-                    .window()
-                    .is_some_and(|w| live.records.generation(w.slot(), BlockKind::Window) != Some(w.generation()));
+                let w_stale = h.window().is_some_and(|w| {
+                    live.records.generation(w.slot(), BlockKind::Window) != Some(w.generation())
+                });
                 f_ok && w_stale
             });
             let had_stale_full_only = live.tree.entries().iter().any(|(_, h)| {
                 let f = h.full();
                 let f_stale = live.records.generation(f.slot(), BlockKind::Full) != Some(f.generation());
-                let w_ok = h
-                    .window()
-                    .is_none_or(|w| live.records.generation(w.slot(), BlockKind::Window) == Some(w.generation()));
+                let w_ok = h.window().is_none_or(|w| {
+                    live.records.generation(w.slot(), BlockKind::Window) == Some(w.generation())
+                });
                 f_stale && w_ok
             });
-            let held_b1 = seq_of.iter().any(|(id, sq)| *sq == [1, 2] && live.tree.start_holders(*id) > 0);
-            let held_b2 = seq_of.iter().any(|(id, sq)| *sq == [1, 2, 1, 2] && live.tree.start_holders(*id) > 0);
+            let held_b1 = seq_of
+                .iter()
+                .any(|(id, sq)| *sq == [1, 2] && live.tree.start_holders(*id) > 0);
+            let held_b2 = seq_of
+                .iter()
+                .any(|(id, sq)| *sq == [1, 2, 1, 2] && live.tree.start_holders(*id) > 0);
 
-            let (tokens, req_abs) =
-                if use_ext { (&req_ext[..], &req_ext_abs[..]) } else { (&req_full[..], &req_full_abs[..]) };
+            let (tokens, req_abs) = if use_ext {
+                (&req_ext[..], &req_ext_abs[..])
+            } else {
+                (&req_full[..], &req_full_abs[..])
+            };
             let m = live.deepest_start(tokens).unwrap();
             let live_ids: Vec<SealedId> = live.tree.entries().into_iter().map(|(id, _)| id).collect();
             seq_of.retain(|id, _| live_ids.contains(id));
@@ -1423,7 +1269,17 @@ mod tests {
             if !use_ext && held_b2 && m.at < 2 * BLOCK {
                 cov.full_match_stepback += 1;
             }
-            rows.push(snapshot(live, seq_of, "seek", &[], 0, 0, &req_full_abs[..m.at / BLOCK * 2], true, req_abs));
+            rows.push(snapshot(
+                live,
+                seq_of,
+                "seek",
+                &[],
+                0,
+                0,
+                &req_full_abs[..m.at / BLOCK * 2],
+                true,
+                req_abs,
+            ));
         };
 
         rows.push(snapshot(&live, &seq_of, "init", &[], 0, 0, &[], false, &req_full_abs));
@@ -1608,8 +1464,11 @@ mod tests {
                     }
                 }
                 3 => {
-                    let held: Vec<SealedId> =
-                        live_ids.iter().copied().filter(|id| live.tree.start_holders(*id) < 2).collect();
+                    let held: Vec<SealedId> = live_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| live.tree.start_holders(*id) < 2)
+                        .collect();
                     if held.is_empty() {
                         continue;
                     }
@@ -1619,8 +1478,11 @@ mod tests {
                     rows.push(snapshot(&live, &seq_of, "retain", &seq, 0, 0, &[], false, &req_full_abs));
                 }
                 4 => {
-                    let held: Vec<SealedId> =
-                        live_ids.iter().copied().filter(|id| live.tree.start_holders(*id) > 0).collect();
+                    let held: Vec<SealedId> = live_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| live.tree.start_holders(*id) > 0)
+                        .collect();
                     if held.is_empty() {
                         continue;
                     }
@@ -1725,7 +1587,11 @@ mod tests {
                     do_seek(&mut live, &mut seq_of, &mut rows, &mut cov, use_ext);
                 }
                 10 => {
-                    let cand: Vec<SealedId> = live_ids.iter().copied().filter(|id| live.pin_count(*id) == 0).collect();
+                    let cand: Vec<SealedId> = live_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| live.pin_count(*id) == 0)
+                        .collect();
                     if cand.is_empty() {
                         continue;
                     }
@@ -1737,7 +1603,11 @@ mod tests {
                     rows.push(snapshot(&live, &seq_of, "pin", &seq, 0, 0, &[], false, &req_full_abs));
                 }
                 11 => {
-                    let cand: Vec<SealedId> = live_ids.iter().copied().filter(|id| live.pin_count(*id) > 0).collect();
+                    let cand: Vec<SealedId> = live_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| live.pin_count(*id) > 0)
+                        .collect();
                     if cand.is_empty() {
                         continue;
                     }
@@ -1768,8 +1638,8 @@ mod tests {
     #[test]
     #[ignore = "trace dump; run by specs/run_tlc.zsh"]
     fn prefix_trace_dump() {
-        let out =
-            std::env::var("INKY_PREFIX_TRACE_OUT").unwrap_or_else(|_| "specs/PrefixTreeTraceData.tla".to_string());
+        let out = std::env::var("INKY_PREFIX_TRACE_OUT")
+            .unwrap_or_else(|_| "specs/PrefixTreeTraceData.tla".to_string());
         let base_seed: u64 = std::env::var("INKY_PREFIX_TRACE_SEED")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1837,7 +1707,10 @@ mod tests {
         assert_eq!(m101.blocks, vec![11, 12]);
 
         // Cross-namespace child insertion under another namespace's parent is refused.
-        assert_eq!(t.insert_in_namespace(202, Some(a1), BLOCK, &block(8), 99), Err(InsertError::UnknownParent));
+        assert_eq!(
+            t.insert_in_namespace(202, Some(a1), BLOCK, &block(8), 99),
+            Err(InsertError::UnknownParent)
+        );
 
         // Principal 202 inserting the same tokens gets a distinct node and handle.
         let b1 = t.insert_in_namespace(202, None, 0, &block(7), 21).unwrap();
@@ -1868,6 +1741,7 @@ mod tests {
         let after = live.deepest_start(&ext).unwrap();
         assert_eq!(after.at, BLOCK, "stale Window on child must evict child while keeping live root");
     }
+
 
     #[test]
     fn entry_handles_come_back_as_johnnys_entries() {

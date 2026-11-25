@@ -74,7 +74,8 @@ impl Tensor {
         let row_blocks = ne[0] / block_elems;
         let overflow = || invalid_model(format_args!("tensor {name} byte size overflows"));
         let row_bytes = row_blocks.checked_mul(block_bytes).ok_or_else(overflow)?;
-        let nbytes = ne[1..].iter().try_fold(row_bytes, |n, &dim| n.checked_mul(dim)).ok_or_else(overflow)?;
+        let nbytes = ne[1..].iter().try_fold(row_bytes, |n, &dim| n.checked_mul(dim))
+            .ok_or_else(overflow)?;
         Ok(Self { ne, ty, file_off, row_bytes, nbytes })
     }
 
@@ -121,34 +122,27 @@ impl Drop for Gguf {
     }
 }
 
-struct Rd<'a> {
-    rest: &'a [u8],
-}
+struct Rd<'a> { rest: &'a [u8] }
 impl<'a> Rd<'a> {
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
-        let (bytes, rest) = self.rest.split_at_checked(n).ok_or_else(|| invalid_model("truncated GGUF header"))?;
+        let (bytes, rest) = self.rest.split_at_checked(n)
+            .ok_or_else(|| invalid_model("truncated GGUF header"))?;
         self.rest = rest;
         Ok(bytes)
     }
-    fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> io::Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
+    fn u8(&mut self) -> io::Result<u8> { Ok(self.take(1)?[0]) }
+    fn u16(&mut self) -> io::Result<u16> { Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap())) }
+    fn u32(&mut self) -> io::Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
+    fn u64(&mut self) -> io::Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
     fn size(&mut self) -> io::Result<usize> {
         usize::try_from(self.u64()?).map_err(|_| invalid_model("GGUF size exceeds the address space"))
     }
     fn str(&mut self) -> io::Result<String> {
         let n = self.size()?;
         let raw = self.take(n)?;
-        std::str::from_utf8(raw).map(str::to_owned).map_err(|_| invalid_model("invalid UTF-8 string in GGUF"))
+        std::str::from_utf8(raw)
+            .map(str::to_owned)
+            .map_err(|_| invalid_model("invalid UTF-8 string in GGUF"))
     }
     fn count(&mut self, min_bytes: usize) -> io::Result<usize> {
         let n = self.size()?;
@@ -195,15 +189,11 @@ impl<'a> Rd<'a> {
             7 => Value::AB((0..n).map(|_| self.u8().map(|b| b != 0)).collect::<io::Result<_>>()?),
             8 => Value::AS((0..n).map(|_| self.str()).collect::<io::Result<_>>()?),
             12 => Value::AF((0..n).map(|_| self.u64().map(f64::from_bits)).collect::<io::Result<_>>()?),
-            _ => Value::AI(
-                (0..n)
-                    .map(|_| match self.integer(et)? {
-                        Value::U(u) => Ok(u as i64),
-                        Value::I(i) => Ok(i),
-                        _ => unreachable!(),
-                    })
-                    .collect::<io::Result<_>>()?,
-            ),
+            _ => Value::AI((0..n).map(|_| match self.integer(et)? {
+                Value::U(u) => Ok(u as i64),
+                Value::I(i) => Ok(i),
+                _ => unreachable!(),
+            }).collect::<io::Result<_>>()?),
         })
     }
 }
@@ -233,9 +223,7 @@ fn parse_tables(bytes: &[u8]) -> io::Result<(HashMap<String, Value>, HashMap<Str
     }
     // The Q4_K Metal kernels read 16-byte vectors directly from the mapping.
     let align = match kv.get("general.alignment") {
-        Some(Value::U(a)) => usize::try_from(*a)
-            .ok()
-            .filter(|a| *a >= 16 && a.is_power_of_two())
+        Some(Value::U(a)) => usize::try_from(*a).ok().filter(|a| *a >= 16 && a.is_power_of_two())
             .ok_or_else(|| invalid_model("invalid GGUF alignment"))?,
         None => 32,
         _ => return Err(invalid_model("invalid GGUF alignment")),
@@ -259,8 +247,7 @@ fn parse_tables(bytes: &[u8]) -> io::Result<(HashMap<String, Value>, HashMap<Str
         }
     }
     if !tensors.is_empty() {
-        let data_off = (bytes.len() - r.rest.len())
-            .checked_next_multiple_of(align)
+        let data_off = (bytes.len() - r.rest.len()).checked_next_multiple_of(align)
             .ok_or_else(|| invalid_model("GGUF tensor data offset overflows"))?;
         for (name, t) in &mut tensors {
             t.locate(name, data_off, align, bytes.len())?;
@@ -274,12 +261,9 @@ fn page_aligned_map_len(file_len: usize) -> io::Result<usize> {
         return Err(invalid_model("invalid GGUF file size"));
     }
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page = usize::try_from(page)
-        .ok()
-        .filter(|&p| p != 0)
+    let page = usize::try_from(page).ok().filter(|&p| p != 0)
         .ok_or_else(|| io::Error::other("could not determine mmap page size"))?;
-    file_len
-        .checked_next_multiple_of(page)
+    file_len.checked_next_multiple_of(page)
         .filter(|&n| n <= isize::MAX as usize)
         .ok_or_else(|| invalid_model("GGUF mapping exceeds the address space"))
 }
@@ -291,7 +275,8 @@ impl Gguf {
         if !meta.file_type().is_file() {
             return Err(invalid_model("GGUF path must be a regular file"));
         }
-        let file_len = usize::try_from(meta.len()).ok().ok_or_else(|| invalid_model("invalid GGUF file size"))?;
+        let file_len = usize::try_from(meta.len()).ok()
+            .ok_or_else(|| invalid_model("invalid GGUF file size"))?;
         let map_len = page_aligned_map_len(file_len)?;
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
@@ -304,8 +289,7 @@ impl Gguf {
             return Err(io::Error::other("GGUF mapping returned a null address"));
         };
         // Own the mapping before parsing so it is unmapped on any error.
-        let mut g =
-            Gguf { _file: Some(file), map: map_ptr, map_len, file_len, kv: HashMap::new(), tensors: HashMap::new() };
+        let mut g = Gguf { _file: Some(file), map: map_ptr, map_len, file_len, kv: HashMap::new(), tensors: HashMap::new() };
         (g.kv, g.tensors) = parse_tables(g.data())?;
         Ok(g)
     }
@@ -346,15 +330,9 @@ impl Gguf {
         Ok(g)
     }
 
-    pub fn ptr(&self) -> *mut u8 {
-        self.map.as_ptr()
-    }
-    pub fn map_len(&self) -> usize {
-        self.map_len
-    }
-    pub fn file_len(&self) -> usize {
-        self.file_len
-    }
+    pub fn ptr(&self) -> *mut u8 { self.map.as_ptr() }
+    pub fn map_len(&self) -> usize { self.map_len }
+    pub fn file_len(&self) -> usize { self.file_len }
 
     fn data(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.map.as_ptr(), self.file_len) }
@@ -389,9 +367,7 @@ impl Gguf {
         t.check(name, shape, types)?;
         Ok(t)
     }
-    pub fn opt(&self, name: &str) -> Option<&Tensor> {
-        self.tensors.get(name)
-    }
+    pub fn opt(&self, name: &str) -> Option<&Tensor> { self.tensors.get(name) }
     pub fn bytes(&self, t: &Tensor) -> &[u8] {
         &self.data()[t.file_off..][..t.nbytes]
     }
@@ -416,12 +392,7 @@ pub(crate) mod test_builder {
         let mut n = 0u32;
         for b in 0..256u32 {
             let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
-            let cp = if keep {
-                b
-            } else {
-                n += 1;
-                255 + n
-            };
+            let cp = if keep { b } else { n += 1; 255 + n };
             out.push(char::from_u32(cp).unwrap().to_string());
         }
         out
@@ -504,8 +475,8 @@ pub(crate) mod test_builder {
 
 #[cfg(test)]
 mod tests {
-    use super::test_builder::{push_raw_str, push_str, valid_gguf_with_tokenizer};
     use super::*;
+    use super::test_builder::{push_raw_str, push_str, valid_gguf_with_tokenizer};
 
     #[test]
     fn tensor_rows_require_whole_blocks_and_checked_sizes() {
