@@ -50,7 +50,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | feature | done |
 |---|:---:|
 | Allow Q8 attention in debug decoding ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
-| Keep assistant text parts separate in the model prompt ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
+| Keep assistant text parts separate in the model prompt ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
 | Require complete source and destination tensors ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Preserve the previous model if conversion fails ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Reject nonfinite weights and handle zero reference rows ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
@@ -71,7 +71,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Name both decode-dispatch counters in the v0.2.2 note ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Tie the 63/64 dirty-range claim to a real decode step ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 54% |
+| complete | 59% |
 
 [Source data](roadmap.sexp)
 
@@ -89,16 +89,16 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Require successful tools and independent fleet acceptance tests ([#82](https://github.com/robotgamedevelopers/inky/pull/82)) | ✅ |
 | Require an endpoint for a live fleet verdict ([#82](https://github.com/robotgamedevelopers/inky/pull/82)) | ✅ |
 | Repeat the live fleet card with the corrected verifier ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) | ✅ |
-| Apply the machine profile before clamping serving lanes ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Compute first-token percentiles from observable streamed output ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Separate sampled process footprint from the admission estimate ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Apply the machine profile before clamping serving lanes ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| Compute first-token percentiles from observable streamed output ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| Separate sampled process footprint from the admission estimate ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Repeat the M5 Max lane sweep with corrected measurements | ❌ |
-| Replay both retained recording segments ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Keep unrelated anonymous requests separate across restarts ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Enforce recording byte limits on individual rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Replay both retained recording segments ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| Keep unrelated anonymous requests separate across restarts ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| Enforce recording byte limits on individual rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Stop lane recommendations at a failing measured rung ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Reject negative replay durations before sending traffic ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
-| Validate actual replies and terminal usage before crediting a turn ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Validate actual replies and terminal usage before crediting a turn ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Prove the storm reached each target disconnect phase ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
 | Pass spill settings to the server and prove spill activity ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
 | Verify the server had active work at the crash point ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
@@ -106,22 +106,22 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Print effective workload settings in soak receipts ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
 | Repeat corrected spill, disconnect and crash qualifications on hardware | ❌ |
 | Complete the multi-day real-load stability run | ❌ |
-| Honor or explicitly reject unsupported tool choices ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Honor or explicitly reject custom generation boundaries ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Keep Chat tool identities unique and resolve old history locally ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Preserve Messages block order through streaming, buffering and replayed history ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Finalize recording after response delivery ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Bound simultaneous authenticated body reads and decoding ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Enforce a wall-clock deadline throughout body ingestion ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
+| Honor or explicitly reject unsupported tool choices ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Honor or explicitly reject custom generation boundaries ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Keep Chat tool identities unique and resolve old history locally ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Preserve Messages block order through streaming, buffering and replayed history ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Finalize recording after response delivery ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Bound simultaneous authenticated body reads and decoding ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Enforce a wall-clock deadline throughout body ingestion ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
 | Run servecheck units and verify live negative controls ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Prove queue occupancy, rejection and recovery with finite overlapping streams ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Give each M5 serving probe a deadline within the CI suite budget ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Include Rust integration tests in hosted debug CI ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
-| Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Keep count_tokens from filling the generation preprocess pool | ❌ |
+| Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
+| Keep count_tokens from filling the generation preprocess pool | ✅ |
 | Fail ci.sh sabotage probes on the command status, not only on grep ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 36% |
+| complete | 78% |
 
 [Source data](roadmap.sexp)
 
@@ -162,12 +162,12 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Release cancelled work and bound stalled output | ✅ |
 | Validate token budgets and continue after damaged UTF-8 | ✅ |
 | Bound preprocessing before prompt rendering | ✅ |
-| Document the lane-dependent preprocessing limit ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Document the lane-dependent preprocessing limit ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Require successful streamed workloads and valid load rates | ✅ |
 | Enforce supported context sizes and correct CLI turn accounting | ✅ |
-| Reacquire the memory reservation after the helper restarts ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ❌ |
-| Isolate the retained-window cold reference from the warm cache ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ❌ |
-| complete | 78% |
+| Reacquire the memory reservation after the helper restarts ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ✅ |
+| Isolate the retained-window cold reference from the warm cache ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -184,9 +184,9 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Verify M5 Max and Pro reference agreement and chip goldens | ✅ |
 | Check the published binary and the three-turn RAM cache on M5 Pro | ✅ |
 | Replay shipped model traces and their negative controls | ✅ |
-| Run helper socket tests independently of checkout path length ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ❌ |
-| Isolate the helper socket test from concurrent recorder tests ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| complete | 71% |
+| Run helper socket tests independently of checkout path length ([#84](https://github.com/robotgamedevelopers/inky/pull/84)) | ✅ |
+| Isolate the helper socket test from concurrent recorder tests ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -264,9 +264,9 @@ Gates that do not run, that test a different path from the one served, or that p
 | Tests drive the serve connection handler with chunked, oversized, unauthenticated, slow and over-cap requests | ✅ |
 | Admission and handler unit tests run on an injected clock, with no sleeps or wall-clock assertions | ✅ |
 | The full-disk and kill steps read the record files back and fail on a torn line | ✅ |
-| The soak and fault gates run in a blocking nightly, and the soak fails on 429s under capacity and on a wired limit that never moved | ❌ |
+| The soak and fault gates run in a blocking nightly, and the soak fails on 429s under capacity and on a wired limit that never moved | ✅ |
 | Every GPU gate in ci.sh has a planted-bug control that CI requires to fail ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) | ✅ |
-| complete | 81% |
+| complete | 90% |
 
 [Source data](roadmap.sexp)
 
@@ -298,10 +298,10 @@ The self-hosted runner, branch protection, per-pull-request CI time and the nigh
 | Remove spill::BLOCK_POSITIONS, spill::WINDOW_STRIDE and SpillBlockKind::default_stride | ❌ |
 | Remove the getter SpillStore::max_bytes | ❌ |
 | Remove ServeBlockCache::set_spill_store and spill_store_mut | ❌ |
-| Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ❌ |
+| Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ✅ |
 | The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget | ✅ |
 | The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget | ❌ |
-| complete | 4% |
+| complete | 9% |
 
 [Source data](roadmap.sexp)
 
@@ -344,9 +344,9 @@ The remaining low findings, grouped so that one small change set can close each 
 | Every workflow pins actions by SHA and the Rust toolchain by version, and builds with --locked ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) | ✅ |
 | CI test steps fail on zero matched tests, and every ignored test runs in a tier or is ledgered | ❌ |
 | A job with no M5 runner online fails with a message instead of waiting in the queue | ❌ |
-| The fleet script's lane, effort and queue defaults are the ones the lane sweep measured ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| The fleet script's lane, effort and queue defaults are the ones the lane sweep measured ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | The public repository holds no host inventory, network addresses, firewall state, account paths or secret-store layout | ❌ |
-| The default tuning budget cannot underflow on a small or unreadable memory size ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| The default tuning budget cannot underflow on a small or unreadable memory size ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | PoisonGate.tla is bound by trace to poolgate, with take, share and release inside the poisoned phase ([#117](https://github.com/robotgamedevelopers/inky/pull/117)) | ✅ |
 | The scheduler twin's walks assert drain, reach the disk tier and check invariants, and cancel during restore is modelled ([#117](https://github.com/robotgamedevelopers/inky/pull/117)) | ✅ |
 | Trace checkers pin each mutant to the property it names and require every action, spill and restore to appear ([#117](https://github.com/robotgamedevelopers/inky/pull/117)) | ✅ |
@@ -399,7 +399,7 @@ The remaining low findings, grouped so that one small change set can close each 
 | The production tokenizer's pre-splitter and Unicode tables have tests against known pieces | ❌ |
 | A cleared GPU block-table entry is distinct from slot 1, and release builds validate every block of a span ([#115](https://github.com/robotgamedevelopers/inky/pull/115)) | ✅ |
 | Each evaluation measurement row names the job or recorded run that produced it | ❌ |
-| complete | 45% |
+| complete | 48% |
 
 [Source data](roadmap.sexp)
 
@@ -528,19 +528,19 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | feature | done |
 |---|:---:|
 | Lane lifecycle: Queued, Admitted, Restoring, Ready, InStep, Finished; Cancelling and Cancelled | ✅ |
-| Specify and verify the production decode burst, bounded prefill wait and per-step token budget | ❌ |
-| No Ready, Restoring or Queued lane is passed over more than W ticks | ❌ |
-| Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ❌ |
+| Specify and verify the production decode burst, bounded prefill wait and per-step token budget | ✅ |
+| No Ready, Restoring or Queued lane is passed over more than W ticks | ✅ |
+| Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After | ✅ |
 | The memory budget read from Metal's recommended working set at start, never passed by hand | ✅ |
-| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ❌ |
+| Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not | ✅ |
 | Cancel in a step waits for the step's GPU work and disk I/O | ✅ |
 | Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ✅ |
-| Restoring reserves the whole working set atomically before reading | ❌ |
-| Gate: scheduler traces are behaviours of the model, checked in CI | ❌ |
-| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ❌ |
-| Gate: kill -9 in mid-write loses cache and never correctness | ❌ |
-| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ❌ |
-| complete | 30% |
+| Restoring reserves the whole working set atomically before reading | ✅ |
+| Gate: scheduler traces are behaviours of the model, checked in CI | ✅ |
+| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ✅ |
+| Gate: kill -9 in mid-write loses cache and never correctness | ✅ |
+| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -555,15 +555,15 @@ The endpoint a coding-agent harness talks to.
 | feature | done |
 |---|:---:|
 | OpenAI-compatible chat completions, streaming and not, over the lanes | ✅ |
-| The chat template rendered exactly, tested against the GGUF's own template | ❌ |
+| The chat template rendered exactly, tested against the GGUF's own template | ✅ |
 | Tool declarations, tool calls and tool results translated both ways | ✅ |
-| Earlier turns rendered exactly as the client sends them | ❌ |
+| Earlier turns rendered exactly as the client sends them | ✅ |
 | A client that disconnects cancels its lane | ✅ |
 | A health endpoint, and binding to loopback or a private network only | ✅ |
 | Gate: the tracer card and a recorded replay set land through it | ✅ |
 | Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ✅ |
 | Gate: memd traces are behaviours of MemMode.tla, checked in CI | ✅ |
-| complete | 77% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -578,10 +578,10 @@ Measure the curve and pick the lane count where adding lanes stops paying.
 | feature | done |
 |---|:---:|
 | Real card traffic recorded as a replay set | ❌ |
-| Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ❌ |
+| Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour | ✅ |
 | Each candidate machine measured: memory bandwidth, single-stream decode, prefill | ✅ |
-| Measure the lane-count knee against streamed first-token latency and observed memory, then apply each machine profile | ❌ |
-| complete | 25% |
+| Measure the lane-count knee against streamed first-token latency and observed memory, then apply each machine profile | ✅ |
+| complete | 75% |
 
 [Source data](roadmap.sexp)
 
@@ -597,8 +597,8 @@ Real work arrives from a fleet of agents.
 |---|:---:|
 | A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling | ✅ |
 | Harness and tools run on other machines and reach the endpoint over a private network | ✅ |
-| Gate: a real low-priority card lands from the fleet | ❌ |
-| complete | 66% |
+| Gate: a real low-priority card lands from the fleet | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -613,8 +613,8 @@ Run it for days.
 | feature | done |
 |---|:---:|
 | Days under real load with no growth in blocks, memory or disk | ❌ |
-| Kills, a full disk and client disconnect storms leave the server correct | ❌ |
-| complete | 0% |
+| Kills, a full disk and client disconnect storms leave the server correct | ✅ |
+| complete | 50% |
 
 [Source data](roadmap.sexp)
 
@@ -647,7 +647,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | The 8-bit cache, behind the quality replay (later) | ❌ |
 | Far-key pruning on the full-attention passes, behind the quality replay (later) | ❌ |
 | Smaller weight quantizations, behind the quality replay (later) | ❌ |
-| Tool calls constrained to valid JSON while sampling (later) | ❌ |
+| Tool calls constrained to valid JSON while sampling (later) | ✅ |
 | Sampling on the GPU (later) | ❌ |
 | General fixes sent upstream to inkling (later) | ❌ |
 | Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
@@ -664,11 +664,11 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Dedicated isolated macOS user and sandbox for self-hosted M5 CI runners, separate from the owner login (later) | ❌ |
 | Pin every GitHub Action in CI workflows by full 40-hex commit SHA rather than mutable major tag ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Short pre-authentication socket header deadline and separate unauthenticated connection budget on non-loopback binds (later) | ❌ |
-| Detect memd helper restart or reinstall in running serve processes and re-establish the wired-limit lease (later) | ❌ |
+| Detect memd helper restart or reinstall in running serve processes and re-establish the wired-limit lease (later) | ✅ |
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve (later) | ❌ |
-| complete | 27% |
+| complete | 33% |
 
 [Source data](roadmap.sexp)
 
