@@ -332,7 +332,7 @@ impl BArena {
     fn vec(&self, i: usize) -> u32 { self.vec0 + (i * self.cap * E) as u32 }
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, pad: [u32; 3] }
+struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, checked: u32, pad: [u32; 2] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
@@ -1077,7 +1077,7 @@ impl Engine {
             softcap: self.effective_sampler_softcap(),
         };
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
-        let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
+        let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, checked: 1, pad: [0; 2] };
         let e = Enc::new(cb);
         self.bind_eng(&e);
         self.bind_lane(&e, lane);
@@ -1142,7 +1142,8 @@ impl Engine {
                 part_off: self.ar.part + (idx * PART_STRIDE) as u32,
                 nparts,
                 out_index: item.out_index as u32,
-                pad: [0; 3],
+                checked: 1,
+                pad: [0; 2],
             };
             self.go_nb(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
         }
@@ -1155,7 +1156,8 @@ impl Engine {
                 part_off: self.ar.part + (idx * PART_STRIDE) as u32,
                 nparts,
                 out_index: item.out_index as u32,
-                pad: [0; 3],
+                checked: 1,
+                pad: [0; 2],
             };
             e.buf(&item.lane.toks, 0, 6);
             self.go_nb(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
@@ -2672,7 +2674,7 @@ impl Engine {
             if argmax {
                 for (si, sp) in spans.iter().enumerate() {
                     let nparts = 128u32;
-                    let am = ArgmaxArgs { logits_off: b.lg + (si * self.vocab_pad()) as u32, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + 1) as u32, pad: [0; 3] };
+                    let am = ArgmaxArgs { logits_off: b.lg + (si * self.vocab_pad()) as u32, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + 1) as u32, checked: 0, pad: [0; 2] };
                     e.buf(&sp.lane.toks, 0, 6);
                     self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
                     self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
@@ -2690,7 +2692,7 @@ impl Engine {
                 self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
                 if argmax {
                     let nparts = 128u32;
-                    let am = ArgmaxArgs { logits_off: lg, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + sp.t) as u32, pad: [0; 3] };
+                    let am = ArgmaxArgs { logits_off: lg, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: (sp.p0 + sp.t) as u32, checked: 0, pad: [0; 2] };
                     e.buf(&sp.lane.toks, 0, 6);
                     self.go(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
                     self.go(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
@@ -3786,6 +3788,11 @@ impl<'a> Run<'a> {
         Ok(())
     }
     pub fn token_at(&self, i: usize) -> u32 { unsafe { *(self.lane.toks.contents().as_ptr() as *const i32).add(i) as u32 } }
+    /// Read a checked GPU sample after its command buffer completed.
+    pub fn sampled_token_at(&self, pos: usize) -> Result<u32, &'static str> {
+        let tok = self.token_at(pos);
+        if tok == u32::MAX { Err("model returned invalid sampling logits") } else { Ok(tok) }
+    }
     /// Encode one full decode step for token at `pos` (input token read from toks[pos]).
     /// If `logits` is set, also computes lm_head and writes argmax to toks[pos+1].
     pub fn encode_step(&self, cb: &CmdBuf, pos: usize, logits: bool, argmax: bool) {
@@ -3876,7 +3883,7 @@ impl<'a> Run<'a> {
         }
         if logits && argmax {
             let nparts = 128u32;
-            let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: pos as u32 + 1, pad: [0; 3] };
+            let am = ArgmaxArgs { logits_off: ar.logits, n: self.n_vocab as u32, part_off: ar.amax, nparts, out_index: pos as u32 + 1, checked: 0, pad: [0; 2] };
             self.go(e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
             self.go(e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
         }
@@ -4144,6 +4151,9 @@ pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32
     }
     omega_t
 }
+
+#[cfg(test)]
+mod sampling_tests;
 
 #[cfg(test)]
 mod tests {

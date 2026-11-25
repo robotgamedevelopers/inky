@@ -1090,7 +1090,7 @@ kernel void k_moe_down(device const uchar * W [[buffer(0)]], device const uchar 
 
 // ---------------------------------------------------------------------------------------------
 // argmax over logits (two stages). stage 1: grid G TGs x 1024 threads -> partial (val, idx). stage 2: 1 TG.
-struct ArgmaxArgs { uint logits_off, n, part_off, nparts, out_index; uint pad0, pad1, pad2; };
+struct ArgmaxArgs { uint logits_off, n, part_off, nparts, out_index, checked; uint pad0, pad1; };
 
 kernel void k_argmax1(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[buffer(5)]],
                       uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]], ushort tid [[thread_index_in_threadgroup]],
@@ -1119,7 +1119,11 @@ kernel void k_argmax2(device float * A [[buffer(2)]], constant ArgmaxArgs & a [[
     }
     const float m = simd_max(best);
     int c = best == m ? idx : 0x7fffffff; c = simd_min(c);
-    if (lane == 0) toks[a.out_index] = uint(c) < a.n ? c : 0;
+    if (lane == 0) {
+        // Checked Gumbel rows reserve +infinity for invalid logits and -infinity for masked tokens.
+        const bool invalid = a.checked && (as_type<uint>(m) & 0x7f800000u) == 0x7f800000u;
+        toks[a.out_index] = invalid ? -1 : (uint(c) < a.n ? c : 0);
+    }
 }
 
 // GPU Gumbel-max sampling (chadlyb/erisinky): argmax(softcap(l) / T + G), G = -log(-log(u)),
@@ -1131,15 +1135,17 @@ kernel void k_gumbel(device float * A [[buffer(2)]], constant SampArgs & a [[buf
                      uint i [[thread_position_in_grid]]) {
     if (i >= a.n) return;
     float x = A[a.logits_off + i];
+    // Check the raw value before either masking or softcapping can hide the fault.
+    if ((as_type<uint>(x) & 0x7f800000u) == 0x7f800000u) { A[a.logits_off + i] = INFINITY; return; }
     if (i == a.ban_tok) { A[a.logits_off + i] = -INFINITY; return; }
+    // Match the CPU sampler's raw argmax, including its tie rule, at near-zero temperatures.
+    if (a.temp < 1e-5f) return;
     if (a.softcap > 0.0f) x = a.softcap * precise::tanh(x / a.softcap);
-    if (a.temp > 0.0f) {
-        const uint h = mix32(mix32(mix32(mix32(i ^ 0x9e3779b9u) ^ a.pos) ^ a.seed_lo) ^ a.seed_hi);
-        // u in (0, 1), never 1: 23 random bits plus a half step are exact in binary32
-        const float u = (float(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
-        x = x / a.temp - precise::log(-precise::log(u));
-    }
-    A[a.logits_off + i] = x;
+    const uint h = mix32(mix32(mix32(mix32(i ^ 0x9e3779b9u) ^ a.pos) ^ a.seed_lo) ^ a.seed_hi);
+    // u in (0, 1), never 1: 23 random bits plus a half step are exact in binary32.
+    const float u = (float(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
+    // Scaling the noise instead of dividing the logits preserves the argmax and avoids overflow.
+    A[a.logits_off + i] = x - a.temp * precise::log(-precise::log(u));
 }
 
 // Adaptive LoopCD-Logits (Liu et al., 2026, arXiv:2610.02185, Eqs. 3-4 & Appendix A.1-A.3)
