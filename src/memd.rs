@@ -353,11 +353,19 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 }
 
 /// `inky memd --owner UID` is the root helper. The unprivileged `--fake --socket PATH` form uses an in-memory limit.
+/// Tests can set its simulated target explicitly with `--fake-target-mb MB`.
 pub fn daemon(args: &[String]) {
     if let Err(e) = run_daemon(args) {
         eprintln!("[inky memd] {e}");
         std::process::exit(1);
     }
+}
+
+fn daemon_target(args: &[String], fake: bool, tuned_mb: u64) -> Result<u64, String> {
+    let Some(index) = args.iter().position(|arg| arg == "--fake-target-mb") else { return Ok(tuned_mb); };
+    if !fake { return Err("--fake-target-mb requires --fake".into()); }
+    args.get(index + 1).and_then(|v| v.parse::<u32>().ok()).map(u64::from)
+        .ok_or_else(|| "--fake-target-mb requires a wired limit in MB (unsigned 32-bit integer)".into())
 }
 
 fn run_daemon(args: &[String]) -> Result<(), String> {
@@ -378,7 +386,7 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     };
     let (chip, mem) = crate::tuning::this_machine();
     let tuning = crate::tuning::select(&chip, mem);
-    let target = tuning.wired_limit_mb;
+    let target = daemon_target(args, fake, tuning.wired_limit_mb)?;
     let fake_limit = Arc::new(Mutex::new(0u64));
     let (fl1, fl2) = (fake_limit.clone(), fake_limit.clone());
     let get: Arc<dyn Fn() -> Option<u64> + Send + Sync> = if fake { Arc::new(move || Some(*fl1.lock().unwrap())) } else { Arc::new(get_limit) };
@@ -745,6 +753,18 @@ mod tests {
     use std::cell::Cell;
     // Coordinate the filesystem fixtures in this module.
     static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn explicit_target_is_only_for_the_fake_daemon() {
+        assert_eq!(daemon_target(&[], true, 0).unwrap(), 0);
+        assert_eq!(daemon_target(&[], true, 65536).unwrap(), 65536);
+        assert_eq!(daemon_target(&[], false, 65536).unwrap(), 65536);
+        let args = ["--fake-target-mb".to_owned(), "8192".to_owned()];
+        assert_eq!(daemon_target(&args, true, 0).unwrap(), 8192);
+        assert!(daemon_target(&args, false, 65536).is_err());
+        assert!(daemon_target(&args[..1], true, 0).is_err());
+        assert!(daemon_target(&[args[0].clone(), "-1".into()], true, 0).is_err());
+    }
 
     // Darwin bounds the full pathname stored in sockaddr_un, including the scratch directory.
     struct SocketTestDir(std::path::PathBuf);
