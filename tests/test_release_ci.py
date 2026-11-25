@@ -12,11 +12,15 @@ import release_ci
 
 
 def workflow(path):
-    # Read Actions YAML with the hosted runner's standard Ruby/Psych installation.
-    return json.loads(subprocess.check_output(
-        ["ruby", "-ryaml", "-rjson", "-e", "puts JSON.generate(YAML.load_file(ARGV[0]))", path],
-        text=True,
-    ))
+    try:
+        import yaml
+        return yaml.safe_load(Path(path).read_text())
+    except ImportError:
+        # Read Actions YAML with the hosted runner's standard Ruby/Psych installation.
+        return json.loads(subprocess.check_output(
+            ["ruby", "-ryaml", "-rjson", "-e", "puts JSON.generate(YAML.load_file(ARGV[0]))", path],
+            text=True,
+        ))
 
 
 class ReleaseCiTests(unittest.TestCase):
@@ -103,6 +107,44 @@ class ReleaseCiTests(unittest.TestCase):
             serve.index("tests/serve.sh ./target/ci/inky"),
             serve.index("tests/serve-negative.sh tests/serve.sh ./target/ci/inky"),
         )
+
+    def test_workflows_pin_actions_by_sha_rust_toolchain_and_locked_cargo(self):
+        import re
+        sha_pin = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+        workflows = ROOT / ".github/workflows"
+        for wf_name in ("ci.yml", "nightly.yml", "release.yml"):
+            doc = workflow(workflows / wf_name)
+            for job_name, job in doc["jobs"].items():
+                steps = job.get("steps", [])
+                saw_rust_pin = False
+                runs_cargo = False
+                for step in steps:
+                    if "uses" in step:
+                        uses = step["uses"]
+                        self.assertRegex(
+                            uses, sha_pin,
+                            f"{wf_name}:{job_name} uses unpinned action {uses!r}",
+                        )
+                        if uses.startswith("dtolnay/rust-toolchain@"):
+                            self.assertEqual(str(step.get("with", {}).get("toolchain")), "1.98.1")
+                            saw_rust_pin = True
+                    run_cmd = step.get("run", "")
+                    if "rustc 1.98.1" in run_cmd:
+                        saw_rust_pin = True
+                    for line in run_cmd.splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("#") or "cargo " not in stripped:
+                            continue
+                        runs_cargo = True
+                        self.assertIn(
+                            "--locked", stripped,
+                            f"{wf_name}:{job_name} runs cargo without --locked: {stripped!r}",
+                        )
+                if runs_cargo:
+                    self.assertTrue(
+                        saw_rust_pin,
+                        f"{wf_name}:{job_name} runs cargo without pinning Rust 1.98.1",
+                    )
 
 
 if __name__ == "__main__":

@@ -563,6 +563,8 @@ fn check(o: &Opts) -> Result<(), String> {
     // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
     let dec_steps = std::env::var("INK_DEC").is_ok();
     if dec_steps { eng.ensure_dbatch(1); }
+    let sabotage = std::env::var("INK_CHECK_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut agree = 0;
     let mut compared = 0;
     let mut worst = 0f32;
@@ -600,7 +602,12 @@ fn check(o: &Opts) -> Result<(), String> {
         }
         for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap())).collect();
+        let mut lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap())).collect();
+        if sabotage && !sabotaged {
+            for x in &mut lg { *x = -*x; }
+            println!("INK_CHECK_SABOTAGE: negated engine logits at position {pos}");
+            sabotaged = true;
+        }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
             .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
@@ -615,6 +622,13 @@ fn check(o: &Opts) -> Result<(), String> {
         let (n, (rb, rt)) = (toks.len(), eng.tier_io());
         eprintln!("disk tier: {:.1} MiB in memory, {:.1} MiB on disk only (all in memory: {:.1} MiB); read {:.0} MiB in {:.0} ms",
                   eng.mem().0 as f64 / 1048576.0, eng.kv_disk_bytes(n) as f64 / 1048576.0, eng.kv_exact_bytes(n) as f64 / 1048576.0, rb as f64 / 1048576.0, rt.as_secs_f64() * 1e3);
+    }
+    if sabotage {
+        if !sabotaged || (agree == compared && worst <= 0.01) {
+            eprintln!("INK_CHECK_SABOTAGE: failed to induce disagreement");
+            std::process::exit(2);
+        }
+        return Err(format!("CHECK AGREEMENT FAILED ({agree}/{compared}, worst KL {worst:.9})"));
     }
     Ok(())
 }
@@ -799,13 +813,21 @@ fn binv(o: &Opts) {
     // which tests that the same split gives the same bits run after run
     let splits: Vec<Vec<usize>> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',')
         .map(|v| v.split('+').map(|x| x.parse().unwrap()).filter(|&x| x > 0).collect()).collect();
+    let sabotage = std::env::var("INK_BINV_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut first = None;
     let mut base: Vec<f32> = Vec::new();
     let mut ok = true;
     for k in splits {
         let mut sess = Session::new(&eng, &tk);
+        let mut run_toks = toks.clone();
+        if sabotage && first.is_some() && !sabotaged {
+            run_toks[0] = (run_toks[0] + 1) % (eng.n_vocab as u32);
+            println!("INK_BINV_SABOTAGE: perturbed token 0 on second split");
+            sabotaged = true;
+        }
         let mut p = 0;
-        for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b]); p = b; } }
+        for &b in k.iter().chain(std::iter::once(&run_toks.len())) { if b > p { sess.prefill(&run_toks[p..b]); p = b; } }
         let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
         let k = if k.is_empty() { "0".to_string() } else { k };
         let mut h = 0xcbf29ce484222325u64;
@@ -822,6 +844,10 @@ fn binv(o: &Opts) {
         let (l1, l2) = (lse(&pa), lse(&pb));
         let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
         println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
+    }
+    if sabotage && !sabotaged {
+        eprintln!("INK_BINV_SABOTAGE: need at least two splits in INK_SPLITS");
+        std::process::exit(2);
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
@@ -871,6 +897,12 @@ fn lanes(o: &Opts) {
     let (la, lb) = (Lane::new(&eng), Lane::new(&eng));
     let (ra, rb) = (eng.on(&la), eng.on(&lb));
     for (r, t) in [(&ra, &a), (&rb, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+    if std::env::var("INK_LANES_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        let pos = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
+        let leaked = if a[pos] != b[pos] { b[pos] } else { (a[pos] + 1) % (eng.n_vocab as u32) };
+        ra.set_tokens(pos, &[leaked]);
+        println!("INK_LANES_SABOTAGE: bled lane B token into lane A at position {pos}");
+    }
     let (mut ia, mut ib) = (0xcbf29ce484222325u64, 0xcbf29ce484222325u64);
     for &w in &work { hash_step(&ra, w, &mut ia); hash_step(&rb, w, &mut ib); }
     if std::env::var("INK_LANE_TRACE").is_ok() {
@@ -1471,6 +1503,8 @@ fn dbatch(o: &Opts) {
     }
     let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
     println!("alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s", if old { "decode path" } else { "decode steps of one lane" }, 1e3 / ms_alone);
+    let sabotage = std::env::var("INK_DBATCH_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut ok = true;
     for &n in &counts {
         let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
@@ -1478,7 +1512,12 @@ fn dbatch(o: &Opts) {
         let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
         let t0 = std::time::Instant::now();
         for q in 0..nd {
-            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            let mut b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            if sabotage && !sabotaged && n >= 2 && q == 0 {
+                println!("INK_DBATCH_SABOTAGE: lane 0 decode span bound to lane 1 at step 0");
+                b[0].0 = &lanes[1];
+                sabotaged = true;
+            }
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
@@ -1489,6 +1528,10 @@ fn dbatch(o: &Opts) {
         println!("{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}", n as f64 * 1e3 / ms, 1e3 / ms,
                  if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) });
         ok &= bad.is_empty();
+    }
+    if sabotage && !sabotaged {
+        eprintln!("INK_DBATCH_SABOTAGE: need a lane count >= 2 in INK_LANES");
+        std::process::exit(2);
     }
     println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
     if !ok { std::process::exit(1); }

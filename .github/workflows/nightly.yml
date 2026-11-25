@@ -19,7 +19,10 @@ jobs:
   release-cpu:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        with:
+          toolchain: 1.98.1
       - name: build
         run: cargo build --locked --release
       - name: unit and integration tests (release profile)
@@ -80,7 +83,15 @@ jobs:
     needs: guard
     runs-on: [self-hosted, macOS, ARM64, m5]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: verify pinned Rust toolchain
+        run: |
+          v=$(rustc --version)
+          echo "$v"
+          case "$v" in
+            "rustc 1.98.1 "*) ;;
+            *) echo "expected rustc 1.98.1, got: $v" >&2; exit 1 ;;
+          esac
       - name: build
         run: cargo build --locked --release
       - name: GPU router regression

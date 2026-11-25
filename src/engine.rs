@@ -1279,6 +1279,7 @@ impl Engine {
         };
 
         let n_vocab = validate_vocab(&g, g.uint(&a("vocab_size_unpadded"))?, N_VOCAB_PAD)?;
+        let _ = crate::tokenizer::Tokenizer::try_load(&g)?;
         let embed_shape = [E, N_VOCAB_PAD];
         let tok_embd = qw(&g, "token_embd.weight", &embed_shape, &[T_Q4_K, T_Q8_0])?;
         let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K, T_Q8_0])?;
