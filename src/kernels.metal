@@ -58,10 +58,20 @@ typedef half kv_t;
 typedef half4 kvw_t;
 #endif
 
+struct block_q2_K { uchar scales[16]; uchar qs[64]; half d; half dmin; };
+struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
 struct block_q4_K { half d; half dmin; uchar scales[12]; uchar qs[128]; };
 struct block_q6_K { uchar ql[128]; uchar qh[64]; char scales[16]; half d; };
 struct block_q8_0 { half d; char qs[32]; };
 struct block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
+struct block_q3_0 { half d; uchar qh[4]; uchar qs[8]; };
+
+inline int q3k_scale(device const uchar * scales, uint is) {
+    const uint j = is & 3u;
+    const uint lo = (is < 8u) ? (scales[is] & 0xFu) : ((scales[is - 8u] >> 4) & 0xFu);
+    const uint hi = (scales[8u + j] >> (2u * (is >> 2))) & 3u;
+    return int(lo | (hi << 4)) - 32;
+}
 
 inline float bf16f(ushort u) { return as_type<float>(uint(u) << 16); }
 
@@ -255,6 +265,88 @@ inline void dot_mx8(device const uchar * const * w, int nb, device const float *
 }
 
 template <int NR>
+inline void dot_q3k(device const uchar * const * w, int nb, device const float * x, ushort lane, thread float * sumf) {
+    const uint n = lane / 16u, l = lane % 16u;
+    for (int ib = 0; ib < nb; ib++) {
+        device const float * xb = x + ib * 256 + n * 128 + l;
+        float xl[8];
+        for (uint g = 0; g < 4u; g++) {
+            xl[2u * g] = xb[32u * g];
+            xl[2u * g + 1u] = xb[32u * g + 16u];
+        }
+        for (short row = 0; row < NR; ++row) {
+            device const block_q3_K * b = (device const block_q3_K *) (w[row] + (ulong) ib * 110u);
+            device const uchar * qp = b->qs + 32u * n;
+            const uchar q0b = qp[l], q1b = qp[16u + l];
+            const uchar h0b = b->hmask[l], h1b = b->hmask[16u + l];
+            float acc = 0.0f;
+            for (uint g = 0; g < 4u; g++) {
+                const uint sh = 2u * g;
+                const uchar m = uchar(1u << (4u * n + g));
+                const int q0 = int((q0b >> sh) & 3u) - ((h0b & m) ? 0 : 4);
+                const int q1 = int((q1b >> sh) & 3u) - ((h1b & m) ? 0 : 4);
+                const int s0 = q3k_scale(b->scales, 8u * n + 2u * g);
+                const int s1 = q3k_scale(b->scales, 8u * n + 2u * g + 1u);
+                acc += xl[2u * g] * float(s0 * q0) + xl[2u * g + 1u] * float(s1 * q1);
+            }
+            sumf[row] += float(b->d) * acc;
+        }
+    }
+}
+
+template <int NR>
+inline void dot_q2k(device const uchar * const * w, int nb, device const float * x, ushort lane, thread float * sumf) {
+    const uint n = lane / 16u, l = lane % 16u;
+    for (int ib = 0; ib < nb; ib++) {
+        device const float * xb = x + ib * 256 + n * 128 + l;
+        float xl[8];
+        for (uint g = 0; g < 4u; g++) {
+            xl[2u * g] = xb[32u * g];
+            xl[2u * g + 1u] = xb[32u * g + 16u];
+        }
+        for (short row = 0; row < NR; ++row) {
+            device const block_q2_K * b = (device const block_q2_K *) (w[row] + (ulong) ib * 84u);
+            device const uchar * qp = b->qs + 32u * n;
+            const uchar q0b = qp[l], q1b = qp[16u + l];
+            const float d = float(b->d), dmin = float(b->dmin);
+            float acc_d = 0.0f, acc_m = 0.0f;
+            for (uint g = 0; g < 4u; g++) {
+                const uint sh = 2u * g;
+                const uchar sc0 = b->scales[8u * n + 2u * g];
+                const uchar sc1 = b->scales[8u * n + 2u * g + 1u];
+                const uint q0 = (q0b >> sh) & 3u;
+                const uint q1 = (q1b >> sh) & 3u;
+                acc_d += xl[2u * g] * float((sc0 & 0xFu) * q0) + xl[2u * g + 1u] * float((sc1 & 0xFu) * q1);
+                acc_m += xl[2u * g] * float(sc0 >> 4) + xl[2u * g + 1u] * float(sc1 >> 4);
+            }
+            sumf[row] += d * acc_d - dmin * acc_m;
+        }
+    }
+}
+
+template <int NR>
+inline void dot_q3_0(device const uchar * const * w, int nb, device const float * x, ushort lane, thread float * sumf) {
+    const short ix = lane / 4, il = lane % 4;
+    for (int ib = ix; ib < nb; ib += 8) {
+        device const float * xb = x + ib * 32 + il * 8;
+        float xv[8];
+        for (int k = 0; k < 8; k++) xv[k] = xb[k];
+        for (short row = 0; row < NR; ++row) {
+            device const block_q3_0 * b = (device const block_q3_0 *) (w[row] + (ulong) ib * 14u);
+            const uint qh = uint(b->qh[0]) | (uint(b->qh[1]) << 8) | (uint(b->qh[2]) << 16) | (uint(b->qh[3]) << 24);
+            float s = 0.0f;
+            for (int k = 0; k < 8; k++) {
+                const uint j = uint(il * 8 + k);
+                const uint q2 = (b->qs[j >> 2] >> ((j & 3u) * 2u)) & 3u;
+                const uint hb = ((qh >> j) & 1u) << 2;
+                s += xv[k] * float(int(q2 | hb) - 4);
+            }
+            sumf[row] += s * float(b->d);
+        }
+    }
+}
+
+template <int NR>
 inline void dot_bf16(device const uchar * const * w, int K, device const float * x, ushort lane, thread float * sumf) {
     for (int i = lane * 8; i < K; i += 256) {
         const float4 xa = *(device const float4 *) (x + i), xb = *(device const float4 *) (x + i + 4);
@@ -324,7 +416,7 @@ struct DecodeSpanDesc {
     uint  full_nsplit;
     float full_tau;
     float swa_tau;
-    uint  pad1;
+    uint  full_recent_start;
 };
 
 struct EmbedDecArgs { uint emb_lo, emb_hi, row_bytes, norm_off, out_off, desc_off; float eps; uint pad; };
@@ -534,6 +626,9 @@ kernel void k_mv(device const uchar * W [[buffer(0)]], device const uchar * PB [
     device const float * x = A + S.in_off;
     if (S.wtype == 12) dot_q4k<MV_NR>(wp, S.K / 256, x, lane, sumf);
     else if (S.wtype == 14) dot_q6k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+    else if (S.wtype == 11) dot_q3k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+    else if (S.wtype == 10) dot_q2k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+    else if (S.wtype == 202) dot_q3_0<MV_NR>(wp, S.K / 32, x, lane, sumf);
     else if (S.wtype == 8) dot_q8<MV_NR>(wp, S.K / 32, x, lane, sumf);
     else dot_bf16<MV_NR>(wp, S.K, x, lane, sumf);
     for (int rr = 0; rr < MV_NR; rr++) {
@@ -567,6 +662,9 @@ kernel void k_mvb(device const uchar * W [[buffer(0)]], device const uchar * PB 
             device const float * x = A + S.in_off + v * nv.y;
             if (S.wtype == 12) dot_q4k<MV_NR>(wp, S.K / 256, x, lane, sumf);
             else if (S.wtype == 14) dot_q6k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+            else if (S.wtype == 11) dot_q3k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+            else if (S.wtype == 10) dot_q2k<MV_NR>(wp, S.K / 256, x, lane, sumf);
+            else if (S.wtype == 202) dot_q3_0<MV_NR>(wp, S.K / 32, x, lane, sumf);
             else if (S.wtype == 8) dot_q8<MV_NR>(wp, S.K / 32, x, lane, sumf);
             else dot_bf16<MV_NR>(wp, S.K, x, lane, sumf);
             for (int rr = 0; rr < MV_NR; rr++) {
@@ -939,6 +1037,9 @@ kernel void k_moe_gu(device const uchar * W [[buffer(0)]], device const uchar * 
     float sumf[2] = {0, 0};
     if (a.gu_type == 200) dot_nv4<2>(wp, E / 32, A + a.x_off, lane, sumf);
     else if (a.gu_type == 201) dot_mx8<2>(wp, E / 32, A + a.x_off, lane, sumf);
+    else if (a.gu_type == 202) dot_q3_0<2>(wp, E / 32, A + a.x_off, lane, sumf);
+    else if (a.gu_type == 11) dot_q3k<2>(wp, E / 256, A + a.x_off, lane, sumf);
+    else if (a.gu_type == 10) dot_q2k<2>(wp, E / 256, A + a.x_off, lane, sumf);
     else if (a.gu_type == 8) dot_q8<2>(wp, E / 32, A + a.x_off, lane, sumf);
     else dot_q4k<2>(wp, E / 256, A + a.x_off, lane, sumf);
     const float g = a.gu_type == 200 ? gscale_at(W, a.gu_gs_lo, a.gu_gs_hi, e) * NV4_K : 1.0f;
@@ -970,6 +1071,21 @@ inline void down_rows(device const uchar * eb, uint row0, uint row_bytes, uint t
             device const packed_uchar4 * q4 = (device const packed_uchar4 *) (bq + 2);
             for (int i = 0; i < 8; i++) sum += dot(xv[i], e4m3f4(uchar4(q4[i])));
             sum *= float(*(device const half *) bq) * MX8_K;
+        } else if (type == 202) {
+            device const block_q3_0 * bq = (device const block_q3_0 *) (rowp + (ulong) b * 14u);
+            const uint qh = uint(bq->qh[0]) | (uint(bq->qh[1]) << 8) | (uint(bq->qh[2]) << 16) | (uint(bq->qh[3]) << 24);
+            for (int i = 0; i < 8; i++) {
+                const uint qb = bq->qs[i];
+                const uint hb = qh >> (4 * i);
+                const float4 wv = float4(
+                    float(int(((qb >> 0) & 3u) | (((hb >> 0) & 1u) << 2)) - 4),
+                    float(int(((qb >> 2) & 3u) | (((hb >> 1) & 1u) << 2)) - 4),
+                    float(int(((qb >> 4) & 3u) | (((hb >> 2) & 1u) << 2)) - 4),
+                    float(int(((qb >> 6) & 3u) | (((hb >> 3) & 1u) << 2)) - 4)
+                );
+                sum += dot(xv[i], wv);
+            }
+            sum *= float(bq->d);
         } else if (type == 8) {
             device const block_q8_0 * bq = (device const block_q8_0 *) rowp + b;
             device const packed_char4 * q = (device const packed_char4 *) bq->qs;
@@ -1429,8 +1545,13 @@ kernel void k_attn_dec_solo(device const uchar * PB [[buffer(1)]], device float 
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const ushort kk = lane / 4, pp = lane % 4;
     const uint pos = d0.pos;
-    const uint p_lo = is_swa ? d0.swa_first_pos : 0u;
-    const uint p1 = min(pos + 1u, split_end);
+    const uint full_recent_start = is_swa ? 0u : d0.full_recent_start;
+    const uint full_rlo = full_recent_start / a.kps;
+    const uint p_lo = is_swa ? d0.swa_first_pos : ((full_recent_start > 0u && abs_sp > 0u) ? full_recent_start : 0u);
+    const uint p1 = (!is_swa && full_recent_start > 0u && abs_sp == 0u && full_rlo > 0u)
+        ? min(pos + 1u, 64u)
+        : min(pos + 1u, split_end);
+    const bool sink_recent_gap = (!is_swa && full_recent_start > 0u && abs_sp == 0u && full_rlo == 0u);
     const uint kc_off = a.kv_cur_off + si0 * (2 * NKV * HD) + g * HD;
     const uint vc_off = a.kv_cur_off + si0 * (2 * NKV * HD) + NKV * HD + g * HD;
     float4 rl[3];
@@ -1439,8 +1560,9 @@ kernel void k_attn_dec_solo(device const uchar * PB [[buffer(1)]], device float 
     float4 ov[3] = {0, 0, 0};
     for (uint pb = split_start + sg * 8; pb < p1; pb += 32) {
         if (pb + 8 <= p_lo) continue;
+        if (sink_recent_gap && pb >= 64u && pb + 8u <= full_recent_start) continue;
         const uint raw_p = pb + kk;
-        const bool valid = (raw_p >= p_lo) && (raw_p < p1);
+        const bool valid = (raw_p >= p_lo) && (raw_p < p1) && (!sink_recent_gap || raw_p < 64u || raw_p >= full_recent_start);
         const uint p = min(max(raw_p, p_lo), p1 - 1);
         float acc[3] = {0, 0, 0};
         if (p == pos) {
@@ -1493,6 +1615,7 @@ kernel void k_attn_dec_solo(device const uchar * PB [[buffer(1)]], device float 
             const uint pq = pb + q;
             if (pq < p_lo) continue;
             if (pq >= p1) break;
+            if (sink_recent_gap && pq >= 64u && pq < full_recent_start) continue;
             const float4 v = (pq == pos) ? *(device const float4 *) (A + vc_off + lane * 4)
 #ifdef KV8
                                          : float4(char4(*(device const packed_char4 *) (kv_blk_ptr(KV0, KV1, KV2, KV3, BT, pq >> 6, voff) + (pq & KV_BLK_MASK) * HD + lane * 4)));
@@ -1506,7 +1629,8 @@ kernel void k_attn_dec_solo(device const uchar * PB [[buffer(1)]], device float 
     for (int h = 0; h < 3; h++) os_[sg][h][lane] = ov[h];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint nsplit = is_swa ? d0.swa_nsplit : d0.full_nsplit;
-    const uint local_sp = is_swa ? (abs_sp - (d0.swa_first_pos >> 6)) : abs_sp;
+    const uint local_sp = is_swa ? (abs_sp - (d0.swa_first_pos >> 6))
+                                 : ((full_recent_start > 0u && abs_sp > 0u && full_rlo > 0u) ? (1u + abs_sp - full_rlo) : abs_sp);
     for (int h = 0; h < 3; h++) {
         float M_val = -INFINITY;
         for (int s2 = 0; s2 < 4; s2++) M_val = max(M_val, ms_[s2][h]);
@@ -1767,7 +1891,9 @@ kernel void k_attn_grp_dec(device const uchar * PB [[buffer(1)]], device float *
             const uint si = uint(grp.span_idx[u]);
             device const DecodeSpanDesc & du = descs[si];
             const uint nsplit = is_swa ? du.swa_nsplit : du.full_nsplit;
-            const uint local_sp = is_swa ? (abs_sp - (du.swa_first_pos >> 6)) : abs_sp;
+            const uint rlo = (!is_swa && du.full_recent_start > 0u) ? (du.full_recent_start / a.kps) : 0u;
+            const uint local_sp = is_swa ? (abs_sp - (du.swa_first_pos >> 6))
+                                         : ((du.full_recent_start > 0u && abs_sp > 0u && rlo > 0u) ? (1u + abs_sp - rlo) : abs_sp);
             for (int h = 0; h < 3; h++) {
                 float M_val = -INFINITY;
                 for (int s2 = 0; s2 < 4; s2++) M_val = max(M_val, sh.red.ms[s2][h]);

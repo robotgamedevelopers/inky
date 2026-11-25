@@ -9,12 +9,17 @@ use std::ptr::NonNull;
 pub const T_F32: u32 = 0;
 pub const T_Q5_0: u32 = 6;
 pub const T_Q8_0: u32 = 8;
+pub const T_Q2_K: u32 = 10;
+pub const T_Q3_K: u32 = 11;
 pub const T_Q4_K: u32 = 12;
 pub const T_Q6_K: u32 = 14;
 pub const T_BF16: u32 = 30;
 /// Native expert weight formats (chadlyb/erisinky): NVFP4 and MXFP8 blocks of 32 weights
 pub const T_NV4: u32 = 200;
 pub const T_MX8: u32 = 201;
+/// Compact symmetric 3-bit blocks of 32 weights (14 bytes = fp16 d + qh[4] + qs[8], 3.5 bpw)
+/// for K % 32 == 0 tensors such as ffn_down_exps (K = 1152).
+pub const T_Q3_0: u32 = 202;
 
 /// (bytes per block, elements per block)
 fn type_block(t: u32) -> Option<(usize, usize)> {
@@ -24,11 +29,14 @@ fn type_block(t: u32) -> Option<(usize, usize)> {
         2 => (18, 32),
         6 => (22, 32),
         8 => (34, 32),
+        10 => (84, 256),
+        11 => (110, 256),
         12 => (144, 256),
         13 => (176, 256),
         14 => (210, 256),
         200 => (18, 32),
         201 => (34, 32),
+        202 => (14, 32),
         _ => return None,
     })
 }
@@ -543,6 +551,21 @@ mod tests {
         assert_eq!(mx8.row_bytes, 1152 / 32 * 34);
         assert_eq!(mx8.nbytes, mx8.row_bytes * 2304 * 128);
         assert!(Tensor::from_decl("bad_mx8", vec![33], T_MX8, 0).is_err());
+
+        let q3k = Tensor::from_decl("gu_q3k", vec![2304, 2304, 128], T_Q3_K, 0).unwrap();
+        assert_eq!(q3k.row_bytes, 2304 / 256 * 110);
+        let q2k = Tensor::from_decl("gu_q2k", vec![2304, 2304, 128], T_Q2_K, 0).unwrap();
+        assert_eq!(q2k.row_bytes, 2304 / 256 * 84);
+        let q4k = Tensor::from_decl("gu_q4k", vec![2304, 2304, 128], T_Q4_K, 0).unwrap();
+        assert!(q2k.nbytes < q3k.nbytes && q3k.nbytes < q4k.nbytes);
+        assert!(Tensor::from_decl("bad_q3k", vec![128], T_Q3_K, 0).is_err());
+        assert!(Tensor::from_decl("bad_q2k", vec![128], T_Q2_K, 0).is_err());
+
+        let q3_0 = Tensor::from_decl("dn_q3_0", vec![1152, 2304, 128], T_Q3_0, 0).unwrap();
+        assert_eq!(q3_0.row_bytes, 1152 / 32 * 14);
+        let q5_0 = Tensor::from_decl("dn_q5_0", vec![1152, 2304, 128], T_Q5_0, 0).unwrap();
+        assert!(q3_0.nbytes < q5_0.nbytes);
+        assert!(Tensor::from_decl("bad_q3_0", vec![31], T_Q3_0, 0).is_err());
     }
 
     #[test]

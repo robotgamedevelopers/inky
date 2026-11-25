@@ -61,6 +61,8 @@ options:
   --kv-disk         keep only half of the (exact) K/V cache in memory while generating; the older half lives in a
                     temporary file and is read back for every token (slower generation)
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
+  --full-attn-budget N
+                    opt-in far-key pruning on full-attention passes: keep 64 sink tokens + (N - 64) recent keys (N >= 128; default off = exact)
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   --raw             do not apply the chat template; print special tokens";
@@ -94,6 +96,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   --dspark PATH     opt-in DSpark drafter GGUF for speculative decoding (default: off)
   --draft-k N       draft tokens per speculative verify step in 1..=4 (default 3)
+  --full-attn-budget N
+                    opt-in far-key pruning on full-attention passes: keep 64 sink tokens + (N - 64) recent keys (N >= 128; default off = exact)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -137,6 +141,17 @@ fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
         return Err(format!("{flag} must be between 1 and {MAX_CONTEXT} tokens"));
     }
     Ok(ctx.div_ceil(CONTEXT_ALIGNMENT) * CONTEXT_ALIGNMENT)
+}
+
+fn parse_full_attn_budget(flag: &str, value: &str) -> Result<usize, String> {
+    let budget = parse_usize(flag, value)?;
+    if !(engine::FULL_ATTN_MIN_BUDGET..=MAX_CONTEXT).contains(&budget) {
+        return Err(format!(
+            "{flag} must be between {} and {MAX_CONTEXT} tokens",
+            engine::FULL_ATTN_MIN_BUDGET
+        ));
+    }
+    Ok(budget)
 }
 
 fn parse_loopcd_omega(flag: &str, value: &str) -> Result<f32, String> {
@@ -308,6 +323,7 @@ fn parse_serve(
         no_mpp: false,
         dspark: None,
         draft_k: scheduler::DEFAULT_DRAFT_K,
+        full_attn_budget: None,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -355,6 +371,7 @@ fn parse_serve(
             "--no-mpp" => o.no_mpp = true,
             "--dspark" => o.dspark = Some(std::path::PathBuf::from(value()?)),
             "--draft-k" => o.draft_k = parse_draft_k(flag, value()?)?,
+            "--full-attn-budget" => o.full_attn_budget = Some(parse_full_attn_budget(flag, value()?)?),
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -612,6 +629,16 @@ mod cli_tests {
             .unwrap()
             .contains("--kv-disk cannot be combined with --kv8"));
 
+        // --full-attn-budget opt-in parsing, bounds, and --kv-disk mutual exclusion
+        assert_eq!(cli(&["run"]).unwrap().1.full_attn_budget, None);
+        assert_eq!(cli(&["run", "--full-attn-budget", "1024"]).unwrap().1.full_attn_budget, Some(1024));
+        assert_eq!(serve_args(&[]).unwrap().full_attn_budget, None);
+        assert_eq!(serve_args(&["--full-attn-budget", "2048"]).unwrap().full_attn_budget, Some(2048));
+        assert!(cli(&["run", "--full-attn-budget", "64"]).is_err());
+        assert!(cli(&["run", "--full-attn-budget", "0"]).is_err());
+        assert!(serve_args(&["--full-attn-budget", "127"]).is_err());
+        assert!(cli(&["run", "--full-attn-budget", "1024", "--kv-disk"]).err().unwrap().contains("--full-attn-budget cannot be combined with --kv-disk"));
+
         // Unknown subcommands fail with error instead of printing usage with exit 0
         for unknown in ["bogus", "sever", "runs", "--unknown-first"] {
             let err = cli(&[unknown]).err().unwrap();
@@ -660,6 +687,7 @@ struct Opts {
     kv8: bool,
     kv_disk: bool,
     no_mpp: bool,
+    full_attn_budget: Option<usize>,
     allow_mismatch: bool,
 }
 
@@ -691,6 +719,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
         kv8: false,
         kv_disk: false,
         no_mpp: false,
+        full_attn_budget: None,
         allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0"),
     };
     while let Some(a) = args.next() {
@@ -711,6 +740,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--kv8" => o.kv8 = true,
             "--kv-disk" => o.kv_disk = true,
             "--no-mpp" => o.no_mpp = true,
+            "--full-attn-budget" => o.full_attn_budget = Some(parse_full_attn_budget(a, v()?)?),
             "--allow-mismatch" => o.allow_mismatch = true,
             "--effort" => o.effort = parse_effort(a, v()?)?,
             "--system" => o.system = v()?.into(),
@@ -734,6 +764,9 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
     if o.loopcd_omega > 0.0 && o.kv_disk {
         return Err("--loopcd cannot be combined with --kv-disk".into());
     }
+    if o.full_attn_budget.is_some() && o.kv_disk {
+        return Err("--full-attn-budget cannot be combined with --kv-disk".into());
+    }
     Ok((cmd, o))
 }
 
@@ -750,6 +783,7 @@ fn parse() -> (String, Opts) {
         if o.no_mpp {
             engine::DISABLE_MPP.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        engine::FULL_ATTN_BUDGET.store(o.full_attn_budget.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         o.seed = Some(resolve_seed(o.seed));
     }
     (cmd, o)

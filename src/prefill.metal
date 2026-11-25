@@ -31,6 +31,46 @@ inline void deq16_q4k(device const uchar * row, uint k0, thread half * out) {
 
 inline void deq16(device const uchar * row, uint wtype, uint k0, thread half * out) {
     if (wtype == 12) { deq16_q4k(row, k0, out); return; }
+    if (wtype == 11) {          // Q3_K: 110 bytes per 256 weights (3.4375 bpw)
+        device const block_q3_K * b = (device const block_q3_K *) (row + (ulong) (k0 / 256u) * 110u);
+        const uint w = k0 % 256u, n = w / 128u, g = (w % 128u) / 32u, hp = (w % 32u) / 16u;
+        const float dl = float(b->d) * float(q3k_scale(b->scales, 8u * n + 2u * g + hp));
+        device const uchar * qp = b->qs + 32u * n + 16u * hp;
+        device const uchar * hm = b->hmask + 16u * hp;
+        const uint sh = 2u * g;
+        const uchar m = uchar(1u << (4u * n + g));
+        for (int i = 0; i < 16; i++) {
+            const int q = int((qp[i] >> sh) & 3u) - ((hm[i] & m) ? 0 : 4);
+            out[i] = half(dl * float(q));
+        }
+        return;
+    }
+    if (wtype == 10) {          // Q2_K: 84 bytes per 256 weights (2.625 bpw)
+        device const block_q2_K * b = (device const block_q2_K *) (row + (ulong) (k0 / 256u) * 84u);
+        const uint w = k0 % 256u, n = w / 128u, g = (w % 128u) / 32u, hp = (w % 32u) / 16u;
+        const uchar sc = b->scales[8u * n + 2u * g + hp];
+        const float dl = float(b->d) * float(sc & 0xFu);
+        const float ml = float(b->dmin) * float(sc >> 4);
+        device const uchar * qp = b->qs + 32u * n + 16u * hp;
+        const uint sh = 2u * g;
+        for (int i = 0; i < 16; i++) {
+            out[i] = half(dl * float((qp[i] >> sh) & 3u) - ml);
+        }
+        return;
+    }
+    if (wtype == 202) {         // Q3_0: 14 bytes per 32 weights (3.50 bpw)
+        device const block_q3_0 * b = (device const block_q3_0 *) (row + (ulong) (k0 / 32u) * 14u);
+        const float d = float(b->d);
+        const bool hi = (k0 % 32u) != 0u;
+        const uint hb = ((device const ushort *) b->qh)[hi ? 1 : 0];
+        device const uchar * qp = b->qs + (hi ? 4 : 0);
+        for (int i = 0; i < 16; i++) {
+            const uint q2 = (qp[i >> 2] >> ((i & 3) * 2)) & 3u;
+            const uint qh = ((hb >> i) & 1u) << 2;
+            out[i] = half(d * float(int(q2 | qh) - 4));
+        }
+        return;
+    }
     if (wtype == 200) {         // NV4: fp4 * e4m3 scale is exact in half (|w| <= 6 * 448); expert gscale applied later in fp32
         device const uchar * b = row + (k0 / 32) * 18;
         const uint hp = (k0 % 32) / 16;
@@ -647,6 +687,9 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint plast = a.p0 + t0 + nq - 1;
     const uint pfirst = a.p0 + t0;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) & ~31u) : 0u;
     // Align `kstart` down to a cache-fixed 32-key tile boundary so online-softmax reduction tiles
     // `[32*b, 32*b + 32)` are independent of how prefill chunks were split (`a.p0`).
     const uint kstart = ((a.window > 0 && pfirst + 1 > a.window) ? (pfirst + 1 - a.window) : 0u) & ~31u;
@@ -656,7 +699,7 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
     float m[AQT * 3], l[AQT * 3];
     for (int r = 0; r < AQT * 3; r++) { m[r] = 0.0f; l[r] = 1.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint kc = kstart; kc <= plast; kc += 32) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 32u && recent_kstart > 64u) ? recent_kstart : (kc + 32u)) {
         const uint nk = min(32u, plast + 1 - kc);
         for (uint i = tid; i < 32 * HD / 4; i += 128) {
             const uint j = i / (HD / 4), d4 = i % (HD / 4);
@@ -677,7 +720,7 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
             const uint row = i / 32, j = i % 32, tt = row / 3;
             const uint qp = a.p0 + t0 + tt, kp = kc + j;
             float s = -INFINITY;
-            if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)) {
+            if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window) && (!pruned || kp < 64u || qp - kp < recent_win)) {
                 float acc = 0;
                 for (int d4 = 0; d4 < HD / 4; d4++)
                     acc += dot(float4(((threadgroup const half4 *) qs[row])[d4]), float4(((threadgroup const half4 *) ks[j])[d4]));
@@ -882,9 +925,12 @@ kernel void k_attn_bt(device const uchar * PB [[buffer(1)]], device float * A [[
     for (short jj = 0; jj < NQR; jj++) { M[jj] = 0.0f; S[jj] = 2980.9579870417283f; }   // the sink: logit 0 -> e^8
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) / FCK * FCK) : 0u;
     uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
     kstart = kstart / FCK * FCK;
-    for (uint kc = kstart; kc <= plast; kc += FCK) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 0u && recent_kstart > FCK) ? recent_kstart : (kc + FCK)) {
         const uint idx = (uint) ((int) kc - a.kpos0);
         auto tk = tensor(kbase + idx * HD, dextents<int32_t, 2>(HD, FCK), array<int, 2>({1, HD}));
         mm_qk.run(tq, tk, ts);
@@ -900,7 +946,8 @@ kernel void k_attn_bt(device const uchar * PB [[buffer(1)]], device float * A [[
             float m = M[jj];
             for (short ii = 0; ii < FCK / 32; ii++) {
                 const uint col = ii * 32 + tiisg, kp = kc + col;
-                const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window);
+                const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)
+                    && (!pruned || kp < 64u || qp - kp < recent_win);
                 float v = -INFINITY;
                 if (valid) {
 #ifdef KV8
@@ -1001,9 +1048,12 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
     }
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) / AK * AK) : 0u;
     uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
     kstart = kstart / AK * AK;
-    for (uint kc = kstart; kc <= plast; kc += AK) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 0u && recent_kstart > AK) ? recent_kstart : (kc + AK)) {
         const uint idx = (uint) ((int) kc - a.kpos0);
         auto tk = tensor(kbase + idx * HD, dextents<int32_t, 2>(HD, AK), array<int, 2>({1, HD}));
         // (a threadgroup-memory destination is far slower than register accumulators + store)
@@ -1017,7 +1067,7 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // interior chunk: every key is visible to every query of the tile and inside the bias table (or entirely beyond it)
-        const bool fast = nq == AQ && D0 >= AK - 1 && (a.window == 0 || D0 + AQ - 1 < (int) a.window) && (!bias || D0 + AQ - 1 < EXT);
+        const bool fast = !pruned && nq == AQ && D0 >= AK - 1 && (a.window == 0 || D0 + AQ - 1 < (int) a.window) && (!bias || D0 + AQ - 1 < EXT);
         const int gofs = D0 - dlo - int(lane);
 #ifdef KV8
         // scales of this lane's two keys: K into the scores, V into the probabilities that weight the stored integers
@@ -1037,8 +1087,8 @@ kernel void k_attn_h(device const uchar * PB [[buffer(1)]], device float * A [[b
                 const int d0 = D0 + int(j) - int(lane), d1 = d0 - 32;
                 if (bias && d0 < EXT) s0 += G[j * AG + clamp(d0 - dlo, 0, AG - 1)];
                 if (bias && d1 < EXT) s1 += G[j * AG + clamp(d1 - dlo, 0, AG - 1)];
-                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window))) s0 = -INFINITY;
-                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window))) s1 = -INFINITY;
+                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window) && (!pruned || (kc + lane < 64u) || d0 < (int) recent_win))) s0 = -INFINITY;
+                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window) && (!pruned || (kc + 32u + lane < 64u) || d1 < (int) recent_win))) s1 = -INFINITY;
             }
             const float m = simd_max(max(M[jj], max(s0, s1)));
             const float ms = exp(M[jj] - m);
@@ -1545,13 +1595,16 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint plast = a.p0 + t0 + nq - 1;
     const uint pfirst = a.p0 + t0;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) & ~31u) : 0u;
     const uint kstart = ((a.window > 0 && pfirst + 1 > a.window) ? (pfirst + 1 - a.window) : 0u) & ~31u;
     float o[AQT * 3];
     for (int r = 0; r < AQT * 3; r++) o[r] = 0;
     float m[AQT * 3], l[AQT * 3];
     for (int r = 0; r < AQT * 3; r++) { m[r] = 0.0f; l[r] = 1.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint kc = kstart; kc <= plast; kc += 32) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 32u && recent_kstart > 64u) ? recent_kstart : (kc + 32u)) {
         const uint nk = min(32u, plast + 1 - kc);
         for (uint i = tid; i < 32 * HD / 4; i += 128) {
             const uint j = i / (HD / 4), d4 = i % (HD / 4);
@@ -1571,7 +1624,7 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
             const uint row = i / 32, j = i % 32, tt = row / 3;
             const uint qp = a.p0 + t0 + tt, kp = kc + j;
             float s = -INFINITY;
-            if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)) {
+            if (j < nk && tt < nq && kp <= qp && (a.window == 0 || qp - kp < a.window) && (!pruned || kp < 64u || qp - kp < recent_win)) {
                 float acc = 0;
                 for (int d4 = 0; d4 < HD / 4; d4++)
                     acc += dot(float4(((threadgroup const half4 *) qs[row])[d4]), float4(((threadgroup const half4 *) ks[j])[d4]));
@@ -1660,9 +1713,12 @@ kernel void k_attn_bt_blk(device const uchar * PB [[buffer(1)]], device float * 
     for (short jj = 0; jj < NQR; jj++) { M[jj] = 0.0f; S[jj] = 2980.9579870417283f; }
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) / FCK * FCK) : 0u;
     uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
     kstart = kstart / FCK * FCK;
-    for (uint kc = kstart; kc <= plast; kc += FCK) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 0u && recent_kstart > FCK) ? recent_kstart : (kc + FCK)) {
         const uint blk = kc >> 6;
         device kv_t * kptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff);
         device kv_t * vptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff);
@@ -1680,7 +1736,8 @@ kernel void k_attn_bt_blk(device const uchar * PB [[buffer(1)]], device float * 
             float m = M[jj];
             for (short ii = 0; ii < FCK / 32; ii++) {
                 const uint col = ii * 32 + tiisg, kp = kc + col;
-                const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window);
+                const bool valid = j < nq && kp <= qp && (a.window == 0 || qp - kp < a.window)
+                    && (!pruned || kp < 64u || qp - kp < recent_win);
                 float v = -INFINITY;
                 if (valid) {
 #ifdef KV8
@@ -1771,9 +1828,12 @@ kernel void k_attn_h_blk(device const uchar * PB [[buffer(1)]], device float * A
     }
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint pfirst = a.p0 + t0, plast = a.p0 + t0 + nq - 1;
+    const bool pruned = (a.window == 0u) && (a.pad2 > 0u) && (plast + 1u > a.pad2);
+    const uint recent_win = pruned ? (a.pad2 - 64u) : 0u;
+    const uint recent_kstart = (pruned && pfirst + 1u > recent_win) ? ((pfirst + 1u - recent_win) / AK * AK) : 0u;
     uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
     kstart = kstart / AK * AK;
-    for (uint kc = kstart; kc <= plast; kc += AK) {
+    for (uint kc = kstart; kc <= plast; kc = (pruned && kc == 0u && recent_kstart > AK) ? recent_kstart : (kc + AK)) {
         const uint blk = kc >> 6;
         device kv_t * kptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff);
         device kv_t * vptr = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff);
@@ -1787,7 +1847,7 @@ kernel void k_attn_h_blk(device const uchar * PB [[buffer(1)]], device float * A
             auto cg = mm_g.template get_destination_cooperative_tensor<decltype(tr), decltype(tb), float>(); mm_g.run(tr, tb, cg); cg.store(tg);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const bool fast = nq == AQ && D0 >= AK - 1 && (a.window == 0 || D0 + AQ - 1 < (int) a.window) && (!bias || D0 + AQ - 1 < EXT);
+        const bool fast = !pruned && nq == AQ && D0 >= AK - 1 && (a.window == 0 || D0 + AQ - 1 < (int) a.window) && (!bias || D0 + AQ - 1 < EXT);
         const int gofs = D0 - dlo - int(lane);
 #ifdef KV8
         const float ks0 = kv_vscale(kptr + lane * HD), ks1 = kv_vscale(kptr + (32 + lane) * HD);
@@ -1806,8 +1866,8 @@ kernel void k_attn_h_blk(device const uchar * PB [[buffer(1)]], device float * A
                 const int d0 = D0 + int(j) - int(lane), d1 = d0 - 32;
                 if (bias && d0 < EXT) s0 += G[j * AG + clamp(d0 - dlo, 0, AG - 1)];
                 if (bias && d1 < EXT) s1 += G[j * AG + clamp(d1 - dlo, 0, AG - 1)];
-                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window))) s0 = -INFINITY;
-                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window))) s1 = -INFINITY;
+                if (!(j < nq && d0 >= 0 && (a.window == 0 || d0 < (int) a.window) && (!pruned || (kc + lane < 64u) || d0 < (int) recent_win))) s0 = -INFINITY;
+                if (!(j < nq && d1 >= 0 && (a.window == 0 || d1 < (int) a.window) && (!pruned || (kc + 32u + lane < 64u) || d1 < (int) recent_win))) s1 = -INFINITY;
             }
             const float m = simd_max(max(M[jj], max(s0, s1)));
             const float ms = exp(M[jj] - m);
