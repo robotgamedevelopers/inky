@@ -78,7 +78,7 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
 | `--key-env NAME` (`--api-key-env NAME`) | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allows a non-loopback listen address without a key. |
-| `--lanes N` | 16 | Concurrent requests |
+| `--lanes N` | Machine tuning (32 on M5 Pro 64 GB, otherwise 64) | Concurrent requests, subject to the memory budget |
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
@@ -94,7 +94,7 @@ Each completed request logs its queue wait (`queue_ms`), prefill time (`prefill_
 
 A recording directory keeps active `cards-YYYYMMDD.jsonl` files and their rotated `.jsonl.1` backups. Directory replay reads both. Requests with an `X-Inky-Card-Id` retain that identifier across turns. Anonymous requests receive a fresh single-turn ID, including after a recorder restart. The `--record-max-bytes` cap includes the terminating newline. An oversized row is dropped before rotation and increments `record_dropped` in `/health`.
 
-The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. Up to four requests can translate and tokenize prompts concurrently, including `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
+The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. The number of concurrent prompt translations and tokenizations is the greater of four and the effective lane count. This limit includes `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
 
 Generation prompt rendering stops early once the applicable token limit is exceeded. A prompt token count reported for an early rejection is a lower bound. To get the exact rendered count for a Messages request, use `count_tokens`, which can count past the lane context. A full output buffer pauses its own lane, and a socket write that stalls for five seconds closes the connection and cancels any remaining generation.
 

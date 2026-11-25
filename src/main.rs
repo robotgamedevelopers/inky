@@ -61,7 +61,6 @@ options:
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --raw             do not apply the chat template; print special tokens";
 
-const DEFAULT_SERVE_LANES: usize = 64;
 
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
@@ -73,7 +72,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
                     alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
-  --lanes N         active inference lanes (default 64)
+  --lanes N         active inference lanes (defaults to this machine's tuning)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
@@ -130,9 +129,9 @@ fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
 
-fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
+fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: default_lanes, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
@@ -185,13 +184,21 @@ mod cli_tests {
     use super::*;
 
     fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
-        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), |name| match name {
+        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), 64, |name| match name {
             "PRESENT" => Ok("configured-key".into()),
             "EMPTY" => Ok(String::new()),
             "BLANK" => Ok(" \t".into()),
             "NONUNICODE" => Err(std::env::VarError::NotUnicode("secret data".into())),
             _ => Err(std::env::VarError::NotPresent),
         })
+    }
+
+    #[test]
+    fn serving_uses_machine_lane_default_unless_overridden() {
+        let lanes = tuning::select("Apple M5 Pro", 64 << 30).default_lanes;
+        assert_eq!(parse_serve(&[], lanes, |_| unreachable!()).unwrap().lanes, 32);
+        let args = ["--lanes".to_string(), "8".to_string()];
+        assert_eq!(parse_serve(&args, lanes, |_| unreachable!()).unwrap().lanes, 8);
     }
 
     #[test]
@@ -1745,7 +1752,8 @@ fn main() {
                 println!("{SERVE_USAGE}");
                 return;
             }
-            let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
+            let (chip, memory) = tuning::this_machine();
+            let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
             enter_inky_mode();
             serve::serve(options);
             return;

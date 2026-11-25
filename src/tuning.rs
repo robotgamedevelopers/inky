@@ -36,7 +36,7 @@ pub fn select(chip: &str, memory_bytes: u64) -> Tuning {
     }
     // defaults: leave max(8 GB, 10%) for macOS
     let mb = memory_bytes / (1 << 20);
-    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb - (mb / 10).max(8192), lane_margin_gib: 4.0, default_lanes: 64 }
+    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb.saturating_sub((mb / 10).max(8192)), lane_margin_gib: 4.0, default_lanes: 64 }
 }
 
 /// This machine's chip name and memory, from sysctl.
