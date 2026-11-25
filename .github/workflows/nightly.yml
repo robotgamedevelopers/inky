@@ -74,7 +74,7 @@ jobs:
         env:
           REPO: ${{ github.repository }}
         run: |
-          test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
+          test "$REPO" = robotgamedevelopers/inky || { echo "nightly runs only in robotgamedevelopers/inky" >&2; exit 1; }
   # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
   # its sabotage, dbatch, CLI checks, the golden hashes, the long poolgate (tests/nightly.sh) and the serve API
   # negative control.
@@ -141,3 +141,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: tests/serve-negative.sh tests/serve.sh
+      - name: one-hour steady-state soak
+        if: ${{ !cancelled() }}
+        run: |
+          INKY_SERVE_KEY=$(openssl rand -hex 16)
+          export INKY_SERVE_KEY
+          tests/soak.sh --inky "$PWD/target/release/inky" --duration 1h --epoch 10m --seed 20261125
+      - name: soak fault qualification
+        if: ${{ !cancelled() }}
+        run: tests/soak_faults.sh --inky "$PWD/target/release/inky"

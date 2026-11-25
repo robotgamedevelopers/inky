@@ -8,7 +8,7 @@
 #    every pool slot outside the step poisoned; must give layer 2's outputs bit for bit.
 #  - SSD spill/restore model logit exactness test (`restored_long_prefix_and_early_fork_match_cold_logits`).
 set -e
-set -o pipefail
+setopt pipefail
 cd "${0:A:h}/.."
 B=${INKY_BIN:-./target/release/inky}
 REF=${INKY_REF:-$HOME/inky-ci/ref}
@@ -27,7 +27,7 @@ db_out=$(INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 "$B" dbatch -
 if [ "$db_rc" = 1 ] && print -r -- "$db_out" | grep -q '^DBATCH NOT EXACT$'; then echo "nightly dbatch sabotage: detected, as required"; else echo "FAIL: nightly dbatch sabotage not detected (exit $db_rc)"; fail=1; fi
 
 INK_POOLGATE_LANES=17 INK_POOLGATE_CHUNKS=31,1,23,7,17,1,29,64,127,61,1,256,256,193 INK_POOLGATE_DECODE=64 \
-    "$B" poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
+    "$B" poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
 # A fresh path makes a skipped test or a disconnected trace hook fail the replay.
 trace_work=$(mktemp -d "${TMPDIR:-/tmp}/inky-nightly-serve.XXXXXX")
 trap 'rm -rf "$trace_work"' EXIT
