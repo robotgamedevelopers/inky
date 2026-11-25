@@ -6,7 +6,7 @@
 
 use crate::blockbook::{EVERY, PROMPT};
 use crate::blocks::{
-    span_bound, BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
+    BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
 };
 use crate::engine::EXT;
 use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, PrefixTree, SealedId};
@@ -149,81 +149,63 @@ pub struct InflightPrefillLane<'a> {
     pub eligible_follower: bool,
 }
 
-/// Maximum checkpoint boundary `ckpt >= EARLY_EVERY_TOKENS` strictly shorter than both `toks`
-/// and an active runnable prefilling leader's `pf_end` that the leader will seal ahead of
-/// `leader.n_past`.
-pub fn inflight_shared_checkpoint(toks: &[u32], leaders: &[InflightPrefillLane<'_>]) -> usize {
-    if toks.len() <= EARLY_EVERY_TOKENS {
-        return 0;
+/// A producer must be strictly ahead in (progress, reverse lane ID) and must seal the
+/// checkpoint where this follower actually waits. Use the same rule in admission and scheduling.
+fn can_lead(me: &InflightPrefillLane<'_>, producer: &InflightPrefillLane<'_>, next: usize) -> bool {
+    if !me.runnable
+        || !me.eligible_follower
+        || next <= me.n_past
+        || next >= me.pf_end
+        || !producer.runnable
+        || producer.n_past >= next
+        || next >= producer.pf_end
+    {
+        return false;
     }
-    let mut best = 0usize;
-    for leader in leaders {
-        if !leader.runnable || leader.n_past >= leader.pf_end || leader.pf_end <= EARLY_EVERY_TOKENS {
+    let ahead = producer.n_past > me.n_past || (producer.n_past == me.n_past && producer.lane < me.lane);
+    let prompt_checkpoint = (producer.pf_end - 1) / BLOCK * BLOCK;
+    ahead
+        && (is_every_checkpoint(next) || next == prompt_checkpoint)
+        && producer.toks[..next] == me.toks[..next]
+}
+
+pub fn find_prefill_leader(lanes: &[InflightPrefillLane<'_>], idx: usize) -> Option<usize> {
+    let me = lanes.get(idx)?;
+    let next = effective_pf_target(me.n_past, me.pf_end);
+    lanes.iter().find(|producer| can_lead(me, producer, next)).map(|producer| producer.lane)
+}
+
+/// Furthest checkpoint these lanes will rendezvous at before their inputs diverge.
+/// A producer's final, nonperiodic PROMPT checkpoint only counts if the follower also stops there.
+fn inflight_shared_checkpoint(me: &InflightPrefillLane<'_>, lanes: &[InflightPrefillLane<'_>]) -> usize {
+    let next = effective_pf_target(me.n_past, me.pf_end);
+    let final_checkpoint = me.pf_end.saturating_sub(1) / BLOCK * BLOCK;
+    let mut best = 0;
+    for producer in lanes {
+        if !can_lead(me, producer, next) {
             continue;
         }
-        let limit = (toks.len() - 1).min(leader.pf_end - 1).min(leader.toks.len() - 1);
-        if limit < EARLY_EVERY_TOKENS || leader.n_past >= limit {
-            continue;
+        let limit = me.pf_end.min(producer.pf_end) - 1;
+        let common_final = final_checkpoint == (producer.pf_end - 1) / BLOCK * BLOCK;
+        if common_final && me.toks[next..final_checkpoint] == producer.toks[next..final_checkpoint] {
+            return final_checkpoint;
         }
-        if leader.toks[..EARLY_EVERY_TOKENS] != toks[..EARLY_EVERY_TOKENS] {
-            continue;
+        let last_periodic = max_every_checkpoint_le(limit);
+        if last_periodic > best && last_periodic >= next {
+            let before = &me.toks[next..last_periodic];
+            let after = &producer.toks[next..last_periodic];
+            let common = if before == after {
+                last_periodic
+            } else {
+                next + before.iter().zip(after).take_while(|(a, b)| a == b).count()
+            };
+            best = best.max(max_every_checkpoint_le(common));
         }
-        let common = EARLY_EVERY_TOKENS
-            + leader.toks[EARLY_EVERY_TOKENS..=limit]
-                .iter()
-                .zip(&toks[EARLY_EVERY_TOKENS..=limit])
-                .take_while(|(a, b)| a == b)
-                .count();
-        let capped = common.min(limit);
-        let every_ckpt = max_every_checkpoint_le(capped);
-        if every_ckpt >= EARLY_EVERY_TOKENS && leader.n_past < every_ckpt {
-            best = best.max(every_ckpt);
-        }
-        let leader_prompt_ckpt = ((leader.pf_end - 1) / BLOCK) * BLOCK;
-        if leader_prompt_ckpt >= EARLY_EVERY_TOKENS
-            && leader_prompt_ckpt <= capped
-            && leader.n_past < leader_prompt_ckpt
-        {
-            best = best.max(leader_prompt_ckpt);
+        if best == final_checkpoint {
+            break;
         }
     }
     best
-}
-
-/// Returns `Some(leader_lane)` if `lanes[idx]` is an eligible untouched prefilling follower
-/// whose next checkpoint will be sealed by another active runnable prefilling lane strictly
-/// ahead in `(n_past, Reverse(lane))` order, or `None` if this lane should run itself.
-pub fn find_prefill_leader(lanes: &[InflightPrefillLane<'_>], idx: usize) -> Option<usize> {
-    let me = lanes.get(idx)?;
-    if !me.runnable || !me.eligible_follower || me.n_past + 1 >= me.pf_end {
-        return None;
-    }
-    let next_ckpt = effective_pf_target(me.n_past, me.pf_end);
-    if next_ckpt <= me.n_past || next_ckpt >= me.pf_end || next_ckpt % BLOCK != 0 {
-        return None;
-    }
-    let every = is_every_checkpoint(next_ckpt);
-    for cand in lanes {
-        if cand.lane == me.lane || !cand.runnable || cand.n_past >= cand.pf_end {
-            continue;
-        }
-        if cand.n_past >= next_ckpt || next_ckpt >= cand.pf_end || next_ckpt > cand.toks.len() {
-            continue;
-        }
-        let leader_prompt_ckpt = ((cand.pf_end - 1) / BLOCK) * BLOCK;
-        if !every && next_ckpt != leader_prompt_ckpt {
-            continue;
-        }
-        let ahead_or_tie =
-            cand.n_past > me.n_past || (cand.n_past == me.n_past && cand.lane < me.lane);
-        if !ahead_or_tie {
-            continue;
-        }
-        if cand.toks[..next_ckpt] == me.toks[..next_ckpt] {
-            return Some(cand.lane);
-        }
-    }
-    None
 }
 
 /// Compute the capped prefill target for the current step so `finish_prefill_span` lands
@@ -260,14 +242,17 @@ pub struct InflightLaneReserve<'a> {
     pub runnable: bool,
 }
 
-/// Exact remaining `Full` slots already promised to currently active lanes (unwritten prompt suffix
-/// plus remaining bounded decode reserve), avoiding double-counting shared prefixes for voluntary
-/// singleflight followers waiting on a runnable prefilling leader.
-pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
-    if lanes.is_empty() {
-        return 0;
+impl InflightLaneReserve<'_> {
+    fn reserved_end(&self) -> usize {
+        let prompt_end = self.n_past.max(self.pf_end);
+        prompt_end + self.max_gen.min(MAX_ADMIT_DECODE_RESERVE).saturating_sub(self.gen)
     }
-    let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
+}
+
+/// Pool slots not already owned by a lane or covered by a strictly earlier producer.
+/// Including the incoming lane in the same election handles reuse of a low-numbered idle lane.
+pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
+    let prefills: Vec<_> = lanes
         .iter()
         .filter(|l| l.gen == 0 && l.n_past < l.pf_end)
         .map(|l| InflightPrefillLane {
@@ -280,31 +265,16 @@ pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize 
         })
         .collect();
 
-    let mut total = 0usize;
-    for l in lanes {
-        let unwritten_prompt_tokens = if l.gen == 0 && l.n_past < l.pf_end {
-            let mut unwritten = l.pf_end.saturating_sub(l.n_past);
-            if let Some(cand_idx) = prefill_cands.iter().position(|c| c.lane == l.lane) {
-                if find_prefill_leader(&prefill_cands, cand_idx).is_some() {
-                    let other_leaders: Vec<InflightPrefillLane<'_>> = prefill_cands
-                        .iter()
-                        .copied()
-                        .filter(|c| c.lane != l.lane)
-                        .collect();
-                    let shared_ckpt = inflight_shared_checkpoint(l.toks, &other_leaders);
-                    if shared_ckpt > l.n_past {
-                        unwritten = l.pf_end.saturating_sub(shared_ckpt);
-                    }
-                }
-            }
-            unwritten
-        } else {
-            0
-        };
-        let rem_dec_tokens = l.max_gen.min(MAX_ADMIT_DECODE_RESERVE).saturating_sub(l.gen);
-        total += (unwritten_prompt_tokens + rem_dec_tokens).div_ceil(BLOCK);
-    }
-    total
+    lanes
+        .iter()
+        .map(|lane| {
+            let credited = prefills
+                .iter()
+                .find(|f| f.lane == lane.lane && f.eligible_follower)
+                .map_or(0, |f| inflight_shared_checkpoint(f, &prefills));
+            lane.reserved_end().div_ceil(BLOCK) - lane.written.max(credited).div_ceil(BLOCK)
+        })
+        .sum()
 }
 
 fn entry_is_live_sealed(pools: &BlockPools, kind: BlockKind, e: BlockEntry) -> bool {
@@ -421,9 +391,15 @@ impl ServeBlockCache {
     /// Number of slots in `kind`'s pool that are currently free (`refs == 0`) OR held only by
     /// evictable `RetainedStart` entries (no active lane references them).
     pub fn free_plus_evictable_slots(&self, pools: &BlockPools, kind: BlockKind) -> usize {
+        self.pool_headroom(pools, kind).1
+    }
+
+    // (non-retired capacity, slots reclaimable before any active lane is released).
+    fn pool_headroom(&self, pools: &BlockPools, kind: BlockKind) -> (usize, usize) {
         let pool = pools.of(kind);
         let srefs = &self.start_slot_refs[kind_idx(kind)];
-        let mut avail = 0usize;
+        let mut usable = 0;
+        let mut avail = 0;
         for i in 0..pool.len() {
             let slot = Slot::new((i + 1) as u32).expect("valid pool slot");
             let rec = pool.record(slot).expect("pool record");
@@ -435,80 +411,101 @@ impl ServeBlockCache {
                 rec.refs(),
                 held_by_starts
             );
-            if rec.generation() < u32::MAX && rec.refs() <= held_by_starts {
-                avail += 1;
+            if rec.generation() < u32::MAX {
+                usable += 1;
+                if rec.refs() <= held_by_starts {
+                    avail += 1;
+                }
             }
         }
-        avail
+        (usable, avail)
     }
 
-    /// Peek how many leading tokens of `toks` match a live `RetainedStart` without mutating state.
+    fn resident_start(&self, pools: &BlockPools, toks: &[u32]) -> Option<&RetainedStart> {
+        let prefix = toks.get(..toks.len().checked_sub(1)?)?;
+        let matched = self.tree.deepest_start(prefix);
+        let st = self.starts.get(&matched.start?)?;
+        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)).then_some(st)
+    }
+
+    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt.
     pub fn peek_match_len(&self, pools: &BlockPools, toks: &[u32]) -> usize {
-        if toks.len() <= 1 {
-            return 0;
-        }
-        let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
-        if matched.at == 0 {
-            return 0;
-        }
-        let Some(sid) = matched.start else {
-            return 0;
-        };
-        let Some(st) = self.starts.get(&sid) else {
-            return 0;
-        };
-        if st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)) {
-            matched.at
-        } else {
-            0
-        }
+        self.resident_start(pools, toks).map_or(0, |st| st.pos)
     }
 
-    /// Pool-pressure admission guard: returns true if `pools` has enough free + evictable slots
-    /// for this request's uncached prompt suffix plus bounded decode reserve. Always returns true
-    /// when `active_lanes == 0` so at least one request always makes progress and never deadlocks.
-    #[allow(dead_code)]
+    /// Check the marginal cost of binding the prospective lane and completing the bounded
+    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
     pub fn can_admit(
         &mut self,
         pools: &BlockPools,
-        active_lanes: usize,
+        active: &[InflightLaneReserve<'_>],
+        lane: usize,
         toks: &[u32],
         max_gen: usize,
         chunk: usize,
     ) -> bool {
-        self.can_admit_with_shared(pools, active_lanes, toks, max_gen, chunk, 0, 0)
-    }
-
-    /// Pool-pressure admission guard accounting for an in-flight shared prefix checkpoint
-    /// `shared_ckpt` being produced by an active prefilling leader AND `reserved_inflight_full_slots`
-    /// already promised to currently active lanes. `need_full` credits `cached.max(shared_ckpt)`
-    /// while `need_win` stays conservative since each admitted lane binds its own window table entries.
-    pub fn can_admit_with_shared(
-        &mut self,
-        pools: &BlockPools,
-        active_lanes: usize,
-        toks: &[u32],
-        max_gen: usize,
-        chunk: usize,
-        shared_ckpt: usize,
-        reserved_inflight_full_slots: usize,
-    ) -> bool {
-        if active_lanes == 0 {
+        // The scheduler rejects prompts larger than the physical Full pool before reaching here.
+        // An otherwise idle server must try a single job even if its requested decode reserve is large.
+        if active.is_empty() {
             return true;
         }
-        let cached = self.peek_match_len(pools, toks);
-        let effective_cached = cached.max(shared_ckpt.min(toks.len().saturating_sub(1)));
-        let uncached_full = toks.len().saturating_sub(effective_cached);
-        let uncached_win = toks.len().saturating_sub(cached);
-        let dec_reserve = max_gen.min(MAX_ADMIT_DECODE_RESERVE);
-        let need_full = (uncached_full + dec_reserve).div_ceil(BLOCK) + 2;
-        let need_win = ((WINDOW / BLOCK) + 2 + uncached_win.min(chunk).div_ceil(BLOCK))
-            .min(span_bound(chunk) + 2);
-        let avail_full = self
-            .free_plus_evictable_slots(pools, BlockKind::Full)
-            .saturating_sub(reserved_inflight_full_slots);
-        let ok = avail_full >= need_full
-            && self.free_plus_evictable_slots(pools, BlockKind::Window) >= need_win;
+
+        let (usable_window, available_window) = self.pool_headroom(pools, BlockKind::Window);
+        let available_full = self.free_plus_evictable_slots(pools, BlockKind::Full);
+        let mut pins = [0; 2];
+        let mut cached = 0;
+        if let Some(st) = self.resident_start(pools, toks) {
+            cached = st.pos;
+            for &(kind, _, entry) in &st.entries {
+                let i = kind_idx(kind);
+                let slot = entry.slot();
+                let refs = self.start_slot_refs[i][slot.pool_index().get() as usize];
+                if pools.of(kind).record(slot).unwrap().refs() == refs {
+                    pins[i] += 1;
+                }
+            }
+        }
+
+        let mut cohort = active.to_vec();
+        let mut fits = |start: usize, newly_pinned: [usize; 2]| {
+            cohort.push(InflightLaneReserve {
+                lane,
+                toks,
+                n_past: start,
+                pf_end: toks.len(),
+                cached: start,
+                written: start,
+                gen: 0,
+                max_gen,
+                runnable: true,
+            });
+            let full = reserved_inflight_full_slots(&cohort) + newly_pinned[kind_idx(BlockKind::Full)];
+            let mut window_growth = newly_pinned[kind_idx(BlockKind::Window)];
+            let mut steady_window = 0;
+            for lane in &cohort {
+                let end = (lane.pf_end + lane.max_gen).div_ceil(BLOCK);
+                window_growth += end - lane.written.div_ceil(BLOCK);
+                steady_window += end.min(WINDOW / BLOCK + 1);
+            }
+            // Two independent upper bounds: all remaining writes with no pruning, or the
+            // whole cohort's rolling windows plus one shared step budget and per-span rounding.
+            let peak_window = steady_window + chunk.div_ceil(BLOCK) + cohort.len();
+            let window_ok = window_growth <= available_window || peak_window <= usable_window;
+            cohort.pop();
+            full <= available_full && window_ok
+        };
+
+        let mut ok = fits(cached, pins);
+        // A deeper SSD restore can replace the resident start during bind. Budget that outcome
+        // too, including the newly pinned restored blocks, without doing disk I/O on a refused job.
+        if ok && !toks.is_empty() && !self.spilled_starts.is_empty() {
+            let disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]).at;
+            if disk > cached {
+                let blocks = disk / BLOCK;
+                let already_pinned_full = cached / BLOCK - pins[kind_idx(BlockKind::Full)];
+                ok = fits(disk, [blocks.min(WINDOW / BLOCK), blocks - already_pinned_full]);
+            }
+        }
         if !ok {
             self.stats.admit_deferred_pool_pressure += 1;
         }
@@ -533,7 +530,7 @@ impl ServeBlockCache {
             return None;
         }
         self.release_lane(pools, tbl, state);
-        let matched = self.match_and_bind(pools, tbl, state, toks);
+        let matched = self.bind_resident_start(pools, tbl, state, toks);
         if let Some((matched_at, _)) = &matched {
             if *matched_at > n_past {
                 self.stats.singleflight_rebinds += 1;
@@ -585,6 +582,13 @@ impl ServeBlockCache {
                 }
             }
         }
+        self.bind_resident_start(pools, tbl, state, toks)
+    }
+
+    fn bind_resident_start(
+        &mut self, pools: &mut BlockPools, tbl: &mut BlockTable, state: &mut LaneBlockState, toks: &[u32],
+    ) -> Option<(usize, Vec<u8>)> {
+        state.prompt_len = toks.len();
         let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
         if matched.at == 0 {
             return None;
@@ -1600,7 +1604,7 @@ mod tests {
 
         // Pool-pressure admit guard: always admits when active_lanes == 0, defers when active lane fills pool.
         let big: Vec<u32> = (0..4000u32).map(|i| 90000 + i).collect();
-        assert!(cache.can_admit(&pools, 0, &big, 1024, 2048));
+        assert!(cache.can_admit(&pools, &[], 0, &big, 1024, 2048));
         // Requesting more window blocks in a single span than exist in the pool returns PoolExhausted without panicking.
         assert_eq!(
             cache.ensure_span_blocks(&mut pools, &mut tbl, 0, 3840),
@@ -1617,7 +1621,7 @@ mod tests {
             cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &active_toks, ap, chunk_t, || fake_cs(9));
             ap += chunk_t;
         }
-        assert!(!cache.can_admit(&pools, 1, &big, 1024, 2048), "should defer when active lane consumes pool");
+        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
         cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
     }
@@ -1723,19 +1727,6 @@ mod tests {
         // Admit all 22 simultaneous requests at t=0 via in-flight shared prefix accounting.
         let mut planner = ServeStepPlanner::new(nlanes, 16);
         for i in 0..nlanes {
-            let leaders: Vec<InflightPrefillLane<'_>> = lanes
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.active && l.n_past < l.toks.len())
-                .map(|(idx, l)| InflightPrefillLane {
-                    lane: idx,
-                    toks: &l.toks,
-                    n_past: l.n_past,
-                    pf_end: l.toks.len(),
-                    runnable: true,
-                    eligible_follower: false,
-                })
-                .collect();
             let reserves: Vec<InflightLaneReserve<'_>> = lanes
                 .iter()
                 .enumerate()
@@ -1752,21 +1743,8 @@ mod tests {
                     runnable: true,
                 })
                 .collect();
-            let reserved_inflight_full = reserved_inflight_full_slots(&reserves);
-            let shared_ckpt = inflight_shared_checkpoint(&lanes[i].toks, &leaders);
-            if i > 0 {
-                assert_eq!(shared_ckpt, 8192);
-            }
             assert!(
-                cache.can_admit_with_shared(
-                    &pools,
-                    i,
-                    &lanes[i].toks,
-                    128,
-                    chunk,
-                    shared_ckpt,
-                    reserved_inflight_full,
-                ),
+                cache.can_admit(&pools, &reserves, i, &lanes[i].toks, 128, chunk),
                 "lane {i} should admit under singleflight shared prefix accounting"
             );
             let l = &mut lanes[i];
@@ -2054,17 +2032,20 @@ mod tests {
         assert_eq!(find_prefill_leader(&cands, 1), None, "prompt < EARLY_EVERY_TOKENS must never wait");
         assert_eq!(find_prefill_leader(&cands, 2), None, "diverged prefix must never wait");
 
-        assert_eq!(inflight_shared_checkpoint(&short_toks, &cands[..1]), 0);
-        assert_eq!(inflight_shared_checkpoint(&diverged_toks, &cands[..1]), 0);
+        assert_eq!(inflight_shared_checkpoint(&cands[1], &cands[..1]), 0);
+        assert_eq!(inflight_shared_checkpoint(&cands[2], &cands[..1]), 0);
         let mut matching = leader_toks.clone();
         matching.extend(90000..90300);
-        assert_eq!(inflight_shared_checkpoint(&matching, &cands[..1]), 8448);
+        let longer = InflightPrefillLane { lane: 1, toks: &matching, pf_end: matching.len(), ..cands[0] };
+        assert_eq!(inflight_shared_checkpoint(&longer, &cands[..1]), 8192, "only the common periodic boundary is promised");
+        let equal = InflightPrefillLane { lane: 1, ..cands[0] };
+        assert_eq!(inflight_shared_checkpoint(&equal, &cands[..1]), 8448);
     }
 
     #[test]
     fn simultaneous_burst_admission_guard_prevents_midflight_exhaustion() {
         // 130 Full slots = 8,320 tokens. Each request needs (2000 + 512).div_ceil(64) = 40 Full slots
-        // (+ 2 guard margin = 42). Six independent requests arriving simultaneously would demand 240 Full
+        // Six independent requests arriving simultaneously would demand 240 Full
         // slots (> 130) if admitted together; reserved_inflight_full_slots must admit 3 and defer 3!
         let mut pools = BlockPools::with_capacities(130, 128, 1).unwrap();
         let mut cache = ServeBlockCache::new();
@@ -2105,9 +2086,7 @@ mod tests {
                     runnable: true,
                 })
                 .collect();
-            let reserved = reserved_inflight_full_slots(&reserves);
-            let active_now = lanes.iter().filter(|l| l.active).count();
-            if !cache.can_admit_with_shared(&pools, active_now, toks, max_gen, chunk, 0, reserved) {
+            if !cache.can_admit(&pools, &reserves, lanes.len(), toks, max_gen, chunk) {
                 break;
             }
             let toks = queue.pop_front().unwrap();
@@ -2181,9 +2160,7 @@ mod tests {
                         runnable: true,
                     })
                     .collect();
-                let reserved = reserved_inflight_full_slots(&reserves);
-                let active_now = lanes.iter().filter(|l| l.active).count();
-                if !cache.can_admit_with_shared(&pools, active_now, toks, max_gen, chunk, 0, reserved) {
+                if !cache.can_admit(&pools, &reserves, lanes.len(), toks, max_gen, chunk) {
                     break;
                 }
                 let toks = queue.pop_front().unwrap();
@@ -2543,3 +2520,6 @@ mod tests {
         assert_zero_pool_leaks(&pools);
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

@@ -26,8 +26,7 @@ use std::time::{Duration, Instant};
 mod block_cache;
 mod timing;
 use block_cache::{
-    effective_pf_target, find_prefill_leader, inflight_shared_checkpoint,
-    reserved_inflight_full_slots, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
+    effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
     ServeBlockCache,
 };
 use timing::{Counters, RequestTiming, TimingSnapshot};
@@ -1007,7 +1006,14 @@ fn scheduler(
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, eng.max_ctx)));
                 continue;
             }
-            let active_now = lanes.iter().filter(|l| l.job.is_some()).count();
+            let full_pool_tokens = eng.block_pool().borrow().full.len() * crate::blocks::BLOCK;
+            if j.toks.len() > full_pool_tokens {
+                let j = queue.pop_front().unwrap();
+                let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                m.queued = m.queued.saturating_sub(1);
+                let _ = j.out.send(Ev::Err(format!("prompt is too long: {} tokens > {full_pool_tokens} available in the KV pool", j.toks.len())));
+                continue;
+            }
             {
                 let pools = eng.block_pool().borrow();
                 let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
@@ -1029,29 +1035,7 @@ fn scheduler(
                         })
                     })
                     .collect();
-                let leaders: Vec<InflightPrefillLane<'_>> = active_reserves
-                    .iter()
-                    .filter(|r| r.gen == 0 && r.n_past < r.pf_end)
-                    .map(|r| InflightPrefillLane {
-                        lane: r.lane,
-                        toks: r.toks,
-                        n_past: r.n_past,
-                        pf_end: r.pf_end,
-                        runnable: r.runnable,
-                        eligible_follower: false,
-                    })
-                    .collect();
-                let shared_ckpt = inflight_shared_checkpoint(&j.toks, &leaders);
-                let reserved_inflight_full = reserved_inflight_full_slots(&active_reserves);
-                if !cache.can_admit_with_shared(
-                    &pools,
-                    active_now,
-                    &j.toks,
-                    j.max,
-                    eng.chunk,
-                    shared_ckpt,
-                    reserved_inflight_full,
-                ) {
+                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
                     break;
                 }
             }
