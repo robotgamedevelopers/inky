@@ -51,10 +51,10 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 |---|:---:|
 | Allow Q8 attention in debug decoding ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
 | Keep assistant text parts separate in the model prompt ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
-| Require complete source and destination tensors ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
-| Preserve the previous model if conversion fails ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
-| Reject nonfinite weights and handle zero reference rows ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
-| Reject unrecognized expert row layouts ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ❌ |
+| Require complete source and destination tensors ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
+| Preserve the previous model if conversion fails ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
+| Reject nonfinite weights and handle zero reference rows ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
+| Reject unrecognized expert row layouts ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Qualify a converted official native checkpoint on M5 | ❌ |
 | Record the pinned tokenizer and GGUF geometry controls | ✅ |
 | Isolate LoopCD transforms by sampling lane ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
@@ -62,7 +62,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Propagate nonfinite GPU sampling rows as job errors ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
 | Match CPU sampling at very small positive temperatures ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
 | Check every CLI Metal step before accepting its result ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ❌ |
-| Preserve valid CLI output after malformed bytes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ❌ |
+| Preserve valid CLI output after malformed bytes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ✅ |
 | Use identical top-k tie handling in direct and draft sampling ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
 | Record fused routing agreement with the original kernels | ✅ |
 | Record batched attention and dry-pass state agreement | ✅ |
@@ -71,7 +71,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Name both decode-dispatch counters in the v0.2.2 note ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Tie the 63/64 dirty-range claim to a real decode step ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 31% |
+| complete | 54% |
 
 [Source data](roadmap.sexp)
 
@@ -96,8 +96,8 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Replay both retained recording segments ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
 | Keep unrelated anonymous requests separate across restarts ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
 | Enforce recording byte limits on individual rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Stop lane recommendations at a failing measured rung ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
-| Reject negative replay durations before sending traffic ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Stop lane recommendations at a failing measured rung ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
+| Reject negative replay durations before sending traffic ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Validate actual replies and terminal usage before crediting a turn ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
 | Prove the storm reached each target disconnect phase ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
 | Pass spill settings to the server and prove spill activity ([#85](https://github.com/robotgamedevelopers/inky/pull/85)) | ❌ |
@@ -117,11 +117,11 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Prove queue occupancy, rejection and recovery with finite overlapping streams ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Give each M5 serving probe a deadline within the CI suite budget ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
 | Include Rust integration tests in hosted debug CI ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ✅ |
-| Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
 | Keep count_tokens from filling the generation preprocess pool | ❌ |
 | Fail ci.sh sabotage probes on the command status, not only on grep ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 28% |
+| complete | 36% |
 
 [Source data](roadmap.sexp)
 
@@ -256,7 +256,7 @@ Gates that do not run, that test a different path from the one served, or that p
 | feature | done |
 |---|:---:|
 | Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ✅ |
-| A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
+| A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#106](https://github.com/robotgamedevelopers/inky/pull/106)) | ✅ |
 | The replay set is real fleet card traffic, and the lane-count knee is derived from it | ❌ |
 | Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans | ✅ |
 | servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug | ✅ |

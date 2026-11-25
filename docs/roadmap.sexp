@@ -161,17 +161,17 @@
   (:id "t-audit-engine-assistant-parts" :type :task :title "Keep assistant text parts separate in the model prompt" :state :doing
    :evidence ("src/serve.rs" "src/tokenizer.rs" "https://github.com/robotgamedevelopers/inky/pull/90")
    :note "Two text parts in assistant history became one segment. The embedded GGUF Jinja and actual tokenizer produced different prompts. Check the fix against independently rendered token IDs with two parts, empty parts and a following user turn.")
-  (:id "t-audit-engine-convert-complete" :type :task :title "Require complete source and destination tensors" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-convert-complete" :type :task :title "Require complete source and destination tensors" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/main.go")
    :note "PR #74 checks tensor extents at open, exact copying if the source shrinks, and declared output bytes before publication. Linux regression fixtures cover short tensors and a successful conversion with known weights.")
-  (:id "t-audit-engine-convert-publish" :type :task :title "Preserve the previous model if conversion fails" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/mtp.go")
+  (:id "t-audit-engine-convert-publish" :type :task :title "Preserve the previous model if conversion fails" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/mtp.go")
    :note "PR #74 rejects output aliases of opened inputs and renames a completed sibling file into place. Linux tests cover direct, hard-link and symlink aliases and failure after staging begins for MTP.")
-  (:id "t-audit-engine-convert-row-check" :type :task :title "Reject nonfinite weights and handle zero reference rows" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/formats.go" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-convert-row-check" :type :task :title "Reject nonfinite weights and handle zero reference rows" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/formats.go" "tools/inkconvert/main.go")
    :note "PR #74 makes a nonfinite coordinate fail verification, accepts two zero rows and rejects a nonzero row against a zero reference. The compiled Linux CLI passed all three controls on synthetic native and Q8 GGUF files.")
-  (:id "t-audit-engine-w13-layout" :type :task :title "Reject unrecognized expert row layouts" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-w13-layout" :type :task :title "Reject unrecognized expert row layouts" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/main.go")
    :note "A misspelled W13 layout selected stacked rows for the interleaved official checkpoint. PR #74 checks both accepted names, rejects other values before opening model files and tests the gate and up row mappings.")
   (:id "t-audit-engine-native-checkpoint" :type :task :title "Qualify a converted official native checkpoint on M5" :state :todo
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "docs/releases/v0.2.2.md" "tools/inkconvert/main.go" "src/engine.rs")
@@ -194,8 +194,8 @@
   (:id "t-audit-engine-cli-step-status" :type :task :title "Check every CLI Metal step before accepting its result" :state :doing
    :evidence ("src/session.rs" "src/main.rs" "src/metal.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "CLI prefill waited only on the final chunk and decode consumed unchecked results. Exercise failed early and final prefill chunks and both sampled and greedy decode. An error must leave output and chat state consistent for the next turn. The original audit traced this path without injecting a device failure.")
-  (:id "t-audit-engine-cli-utf8" :type :task :title "Preserve valid CLI output after malformed bytes" :state :doing
-   :evidence ("src/session.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
+  (:id "t-audit-engine-cli-utf8" :type :task :title "Preserve valid CLI output after malformed bytes" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "src/session.rs" "src/serve/reply.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "A malformed leading byte caused the CLI to discard valid following text. Share incremental decoding with serve and flush incomplete sequences at content boundaries and end of stream. Check valid split code points, a malformed prefix followed by valid text, and an incomplete final code point.")
   (:id "t-audit-engine-spec-topk-ties" :type :task :title "Use identical top-k tie handling in direct and draft sampling" :state :doing
    :evidence ("src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
@@ -342,11 +342,11 @@
   (:id "t-audit-record-row-cap" :type :task :title "Enforce recording byte limits on individual rows" :state :doing
    :evidence ("src/record.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Check serialized size including the newline before rotating. Count an oversized row as dropped, preserve the active segment, and accept a row exactly at the limit.")
-  (:id "t-audit-replay-knee" :type :task :title "Stop lane recommendations at a failing measured rung" :state :doing
-   :evidence ("tools/replay/knee.go" "tools/replay/main.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-knee" :type :task :title "Stop lane recommendations at a failing measured rung" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/knee.go" "tools/replay/main.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Retain zero-completion rungs during selection. Return no recommendation if the initial rung fails or requested TTFT has no observations. Preserve measurements from a failed sweep.")
-  (:id "t-audit-replay-duration" :type :task :title "Reject negative replay durations before sending traffic" :state :doing
-   :evidence ("tools/replay/main.go" "tools/replay/replay.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-duration" :type :task :title "Reject negative replay durations before sending traffic" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/main.go" "tools/replay/replay.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Validate the command-line flag and sweep configuration. Cover a negative duration with a positive card count and verify no requests were issued.")
   (:id "t-audit-replay-completion" :type :task :title "Validate actual replies and terminal usage before crediting a turn" :state :doing
    :evidence ("tools/replay/replay.go" "tools/replay/replay_test.go" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
@@ -405,8 +405,8 @@
   (:id "t-audit-ci-integration-tests" :type :task :title "Include Rust integration tests in hosted debug CI" :state :done
    :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" ".github/workflows/ci.yml" "https://github.com/robotgamedevelopers/inky/pull/75")
    :note "PR #75 adds integration targets to the debug suite so new subprocess or helper-lifecycle tests under tests/ are scheduled alongside binary tests.")
-  (:id "t-audit-replay-line-size" :type :task :title "Read the full range of recorder-supported JSONL rows" :state :doing
-   :evidence ("tools/replay/replay.go" "src/serve.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-line-size" :type :task :title "Read the full range of recorder-supported JSONL rows" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/replay.go" "src/serve.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "The loader aborts a replay set at a 16 MiB line, while the server accepts 32 MiB bodies and the recorder defaults to 100 MiB per segment. Read a valid recorded line above 16 MiB and its following turn without silent loss.")
   (:id "t-audit-record-generation-delivery" :type :task :title "Represent generation and delivery outcomes independently" :state :doing
    :evidence ("src/serve.rs" "src/record.rs" "tools/replay/replay.go" "https://github.com/robotgamedevelopers/inky/pull/90")
@@ -440,8 +440,8 @@
      ("audit-pr59-tail" "done" "t-audit-pr59-tail")
    ))
   (:id "t-audit-pr37-port" :type :task :title "PR #37 — Port fixed-split attention to current main" :state :todo
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/37" "https://github.com/robotgamedevelopers/inky/pull/53" "https://github.com/robotgamedevelopers/inky/pull/46" "https://github.com/robotgamedevelopers/inky/pull/88")
-   :note "PR #37 is an open draft. PR #88 proposes the boundary-test correction on the draft itself. Port contiguous and paged prefill/decode and disk-backed generation. Retain #53’s independent 17-row spans at all 12 endpoints: the original test has only one row at eight boundaries. Run agreement, crosspath and paged-versus-contiguous on the same integrated commit.")
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/37" "https://github.com/robotgamedevelopers/inky/pull/53" "https://github.com/robotgamedevelopers/inky/pull/46" "https://github.com/robotgamedevelopers/inky/pull/88" "https://github.com/robotgamedevelopers/inky/pull/96")
+   :note "PR #37 is an open draft. PR #88 proposes the boundary-test correction on the draft itself. Port contiguous and paged prefill/decode and disk-backed generation. Retain #53’s independent 17-row spans at all 12 endpoints: the original test has only one row at eight boundaries. Run agreement, crosspath and paged-versus-contiguous on the same integrated commit. PR #96 compares finite final-logit bits and a private KV and convolution state hash for a 17-row prefill versus a 16-row prefill followed by one prefill row at 12 boundaries. The full M5 gate also requires a planted final-token mismatch to be detected. The independent llama.cpp agreement checks continue to cover prefill and decode. The paged and disk-backed paths and two-chip golden qualification remain open.")
   (:id "t-audit-pr60-goldens" :type :task :title "PR #60 — Qualify chip goldens on integrated arithmetic" :state :todo
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/60" "https://github.com/robotgamedevelopers/inky/actions/runs/45538544639/job/138951078907")
    :note "PR #60’s six Max hashes corroborate its historical cover-branch arithmetic, not current main. Keep current main baselines until the final integrated commit is measured on both M5 Pro and Max. Compare agreement and crosspath before adopting new goldens.")
@@ -682,7 +682,7 @@
   (:id "audit-gates" :type :roadmap :title "Rowan's audit: gates and tests"
    :rows (
      ("au-l4-lifecycle" "Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path")
-     ("au-loopcd-gpu-gate" "A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86))")
+     ("au-loopcd-gpu-gate" "A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#106](https://github.com/robotgamedevelopers/inky/pull/106))")
      ("au-replay-real" "The replay set is real fleet card traffic, and the lane-count knee is derived from it")
      ("au-blocked-invariance" "Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans")
      ("au-servecheck-server-fault" "servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug")
@@ -708,7 +708,7 @@
      ("au-gpu-sabotage" "done" "t-au-gpu-sabotage")
    ))
   (:id "t-au-l4-lifecycle" :type :task :title "Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path" :state :done :evidence ("src/serve.rs: scheduler, serve_layer3_three_turn_10k_cached_matches_cold_solo" "src/serve.rs: serve_lane_is_not_runnable_before_restore_finishes") :severity "high" :audit "U9" :note "The serving queue owns the Queued request until admission passes. Its physical lane enters Admitted and Restoring before becoming Ready. The 10K Metal serving test asserts these transitions for cold and cached requests.")
-  (:id "t-au-loopcd-gpu-gate" :type :task :title "A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control" :state :done :evidence ("src/main.rs: cmd_loopcd" "src/engine/model.rs: verify_loopcd_gate" "tests/ci.sh" "https://github.com/robotgamedevelopers/inky/pull/86" "https://github.com/robotgamedevelopers/inky/pull/110") :severity "high" :audit "U19" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. No gate ran GPU LoopCD on main. Findings: U19. inky loopcd runs the GPU dry weak pass while verifying KV and recurrent state preservation, checks k_loopcd_blend against an independent CPU oracle, and validates a mixed-omega decode batch (omega = 0 vs omega > 0) with a planted --sabotage-blend control in tests/ci.sh.")
+  (:id "t-au-loopcd-gpu-gate" :type :task :title "A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control" :state :done :evidence ("src/main.rs: loopcdgate, weak_loopcd_mismatch" "src/loopcd_tests.rs" "tests/ci.sh" "tests/loopcd-gate.sh" ".github/workflows/nightly.yml" "https://github.com/robotgamedevelopers/inky/pull/86" "https://github.com/robotgamedevelopers/inky/pull/106" "https://github.com/robotgamedevelopers/inky/pull/110" "https://github.com/robotgamedevelopers/inky/pull/121" "https://github.com/robotgamedevelopers/inky/pull/122") :severity "high" :audit "U19" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. No gate ran GPU LoopCD on main. Findings: U19. inky loopcdgate runs on PR CI across a mixed-omega blocked batch, checking both the dry-probe and standalone 1-pass weak-logit references, k_loopcd_blend against an independent CPU oracle, KV/CS preservation, and INK_LOOPCDGATE_SABOTAGE=1. Nightly tests/loopcd-gate.sh also runs the CLI first-token and paged mixed-lane model fixtures and requires INKY_TEST_LOOPCD_WRITE_WEAK_STATE=1 to fail.")
   (:id "t-au-replay-real" :type :task :title "The replay set is real fleet card traffic, and the lane-count knee is derived from it" :state :todo :evidence ("tests/replay/recorded_cards.jsonl" "docs/LANE-SWEEP.md" "docs/ROADMAP.md") :severity "high" :audit "U34" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. docs/LANE-SWEEP.md:3,28 and docs/ROADMAP.md:365 still call the scripted, canned-tool-result tests/replay/recorded_cards.jsonl real card traffic. Findings: U34. The fixture contains seven scripted cards and 22 turns. PR #97 adds a per-run recording gateway. A representative corpus from authorized runs, a repeat sweep with streaming first-token samples and observed process footprint, and a fleet-derived lane count remain outstanding.")
   (:id "t-au-blocked-invariance" :type :task :title "Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans" :state :done :evidence ("src/main.rs: cmd_binv, cmd_lanes, cmd_dbatch" "tests/ci.sh" "tests/nightly.sh" "https://github.com/robotgamedevelopers/inky/pull/110") :severity "medium" :audit "U79" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. Invariance gates used unpaged Lane::new only. Findings: U79. binv --blocked checks blocked prefill/decode spans up to 4,096 positions past 1,024, and lanes 18 1088 and dbatch 18 1088 exercise the >16-lane k_route_b multi-simdgroup path and sliding-window wrap in CI and nightly.")
   (:id "t-au-servecheck-server-fault" :type :task :title "servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug" :state :done :evidence ("src/serve.rs: ServeFault, active_serve_fault" "tests/serve-negative.sh" "tests/servecheck/gate.go" "https://github.com/robotgamedevelopers/inky/pull/109") :severity "medium" :audit "U115" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. Negative controls mutated client-side observations rather than planting server bugs. Findings: U115. Guarded by INKY_SERVE_ALLOW_FAULT_INJECTION=1, INKY_SERVE_FAULT plants real server faults (health-status, ignore-budget, skip-thinking-cancel, leak-permit) that tests/serve-negative.sh requires servecheck to catch.")

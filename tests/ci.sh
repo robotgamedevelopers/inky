@@ -117,6 +117,13 @@ fi
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other status does not count
 sp_out=$(INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1) && sp_rc=0 || sp_rc=$?
 if [ "$sp_rc" = 1 ] && print -r -- "$sp_out" | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else print -r -- "$sp_out"; echo "FAIL: spans sabotage not detected (exit $sp_rc)"; fail=1; fi
+$B crosspath --ref ref/long.tokens -c 4096 || { echo "FAIL: crosspath"; fail=1; }
+cross_out=$(INK_CROSSPATH_SABOTAGE=1 $B crosspath --ref ref/long.tokens -c 4096 2>&1) && cross_rc=0 || cross_rc=$?
+if [ "$cross_rc" = 1 ] && print -r -- "$cross_out" | grep -q '^CROSSPATH MISMATCH'; then
+    echo "crosspath sabotage: detected, as required"
+else
+    echo "FAIL: crosspath sabotage (exit $cross_rc)"; fail=1
+fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
 db_out=$(INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 $B dbatch --ref ref/long.tokens -c 4096 2>&1) && db_rc=0 || db_rc=$?
 if [ "$db_rc" = 1 ] && print -r -- "$db_out" | grep -q '^DBATCH NOT EXACT$'; then echo "dbatch sabotage: detected, as required"; else echo "FAIL: dbatch sabotage not detected (exit $db_rc)"; fail=1; fi

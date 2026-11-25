@@ -91,6 +91,9 @@ class ReleaseCiTests(unittest.TestCase):
         ci_jobs = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]
         expanded = set()
         for key, job in ci_jobs.items():
+            if key == "m5-pr-result":
+                self.assertIn("github.event_name == 'pull_request'", job["if"])
+                continue
             base = job.get("name", key)
             parts = job.get("strategy", {}).get("matrix", {}).get("part")
             if parts:
@@ -145,6 +148,32 @@ class ReleaseCiTests(unittest.TestCase):
                         saw_rust_pin,
                         f"{wf_name}:{job_name} runs cargo without pinning Rust 1.98.1",
                     )
+
+
+    def test_pr_m5_result_requires_real_success_and_same_repository(self):
+        job = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]["m5-pr-result"]
+        self.assertIn("always()", job["if"])
+        self.assertIn("github.base_ref == 'main'", job["if"])
+        self.assertEqual(job["needs"], ["m5-gpu", "m5-serve"])
+        step = job["steps"][0]
+        self.assertEqual(step["env"]["GPU"], "${{ needs.m5-gpu.result }}")
+        self.assertEqual(step["env"]["SERVE"], "${{ needs.m5-serve.result }}")
+        for same_repo, gpu, serve, passes in (
+            ("true", "success", "success", True),
+            ("false", "success", "success", False),
+            ("false", "skipped", "skipped", False),
+            ("true", "skipped", "success", False),
+            ("true", "success", "skipped", False),
+            ("true", "failure", "success", False),
+            ("true", "success", "cancelled", False),
+        ):
+            with self.subTest(same_repo=same_repo, gpu=gpu, serve=serve):
+                result = subprocess.run(
+                    ["bash", "-c", step["run"]],
+                    env={"SAME_REPOSITORY": same_repo, "GPU": gpu, "SERVE": serve},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
 
 
 if __name__ == "__main__":
