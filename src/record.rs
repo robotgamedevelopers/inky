@@ -201,19 +201,6 @@ pub fn sanitize_card_id(raw: Option<&str>) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Extracts only `X-Inky-Card-Id` from HTTP headers while strictly ignoring auth/cookie headers.
-#[allow(dead_code)]
-pub fn card_id_from_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("x-inky-card-id") {
-            if let Some(id) = sanitize_card_id(Some(value)) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 fn is_sensitive_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -332,11 +319,6 @@ impl Recorder {
     #[allow(dead_code)]
     pub fn new(dir: PathBuf) -> Self {
         Self::with_options(dir, DEFAULT_QUEUE_CAPACITY, DEFAULT_MAX_FILE_BYTES)
-    }
-
-    #[allow(dead_code)]
-    pub fn with_capacity(dir: PathBuf, capacity: usize) -> Self {
-        Self::with_options(dir, capacity, DEFAULT_MAX_FILE_BYTES)
     }
 
     pub fn with_options(dir: PathBuf, capacity: usize, max_file_bytes: u64) -> Self {
@@ -674,24 +656,12 @@ mod tests {
 
     #[test]
     fn auth_headers_and_keys_are_never_recorded() {
-        let headers = [
-            ("Authorization", "Bearer super-secret-token-xyz"),
-            ("Cookie", "session=top-secret-cookie"),
-            ("X-Api-Key", "sk-secret-api-key-999"),
-            ("X-Inky-Card-Id", "card-safe-1"),
-        ];
-        assert_eq!(card_id_from_headers(headers), Some("card-safe-1".to_string()));
-        assert_eq!(
-            card_id_from_headers([("Authorization", "Bearer secret"), ("Cookie", "a=b")]),
-            None
-        );
-
         let dir = temp_dir("auth");
         let _ = fs::remove_dir_all(&dir);
         let ts = 1_795_543_200_000u64;
         {
             let rec = Recorder::new(dir.clone());
-            let (cid, turn) = rec.allocate_turn(card_id_from_headers(headers).as_deref());
+            let (cid, turn) = rec.allocate_turn(sanitize_card_id(Some("card-safe-1")).as_deref());
             rec.record(RecordEntry {
                 schema_version: SCHEMA_VERSION,
                 recorded_at_ms: ts,
@@ -701,6 +671,7 @@ mod tests {
                 request: json!({
                     "Authorization": "Bearer leaked-in-body",
                     "Cookie": "secret=cookie",
+                    "X-Api-Key": "sk-secret-api-key-999",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": false
                 }),
@@ -718,8 +689,6 @@ mod tests {
             });
         }
         let content = fs::read_to_string(dir.join("cards-20261124.jsonl")).unwrap();
-        assert!(!content.contains("super-secret-token-xyz"));
-        assert!(!content.contains("top-secret-cookie"));
         assert!(!content.contains("sk-secret-api-key-999"));
         assert!(!content.contains("leaked-in-body"));
         assert!(!content.contains("secret=cookie"));

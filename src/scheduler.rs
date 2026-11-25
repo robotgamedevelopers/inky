@@ -212,7 +212,7 @@ impl SchedulerConfig {
         if self.window_size < self.block_size {
             return Err(SchedError::InvalidConfig("window_size must be >= block_size"));
         }
-        if self.max_pos < self.block_size || self.max_pos % self.block_size != 0 {
+        if self.max_pos < self.block_size || !self.max_pos.is_multiple_of(self.block_size) {
             return Err(SchedError::InvalidConfig("max_pos must be a positive multiple of block_size"));
         }
         for &r in &self.request_lengths {
@@ -307,7 +307,7 @@ impl std::error::Error for SchedError {}
 // ---- Exact Logical Block-Range Helpers (`specs/BlockLayout.tla` / `CacheScheduler.tla`) ----
 
 pub fn ceil_div(n: u32, d: u32) -> u32 {
-    (n + d - 1) / d
+    n.div_ceil(d)
 }
 
 pub fn span_bound(window_size: u32, block_size: u32, c: u32) -> u32 {
@@ -1164,7 +1164,7 @@ impl Scheduler {
         decoders.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
         for d in decoders {
             let need = self.need_alloc(d);
-            if used_tokens + 1 <= self.cfg.step_token_budget
+            if used_tokens < self.cfg.step_token_budget
                 && mem_used + alloc_cnt + need <= mem_budget
             {
                 chosen_set.insert(d);
@@ -1400,7 +1400,7 @@ impl Scheduler {
         let mut boundary_lanes: Vec<(usize, u32)> = Vec::new();
         for &l in &surviving {
             let npos = self.lanes[l].pos + self.step_span[l];
-            if npos % bsz == 0 {
+            if npos.is_multiple_of(bsz) {
                 boundary_lanes.push((l, npos));
             }
         }
@@ -1453,7 +1453,7 @@ impl Scheduler {
             let npos = self.lanes[l].pos + self.step_span[l];
             let pfx = self.lanes[l].prefix.clone();
             self.lanes[l].pos = npos;
-            if npos % bsz == 0 {
+            if npos.is_multiple_of(bsz) {
                 let bi = (npos / bsz) - 1;
                 self.lanes[l].full.insert(
                     bi,
@@ -1474,7 +1474,7 @@ impl Scheduler {
         for &(l, npos) in &boundary_lanes {
             let blk_cnt = npos / bsz;
             let at_prompt_end = npos == prompt_end(self.lanes[l].target, bsz) || npos == self.lanes[l].target;
-            if !at_prompt_end && blk_cnt % stride != 0 {
+            if !at_prompt_end && !blk_cnt.is_multiple_of(stride) {
                 continue;
             }
             let pfx = self.lanes[l].prefix.clone();

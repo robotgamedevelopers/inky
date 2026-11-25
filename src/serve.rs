@@ -9,7 +9,7 @@
 //! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
-use crate::engine::{Engine, Lane, Span, EXT};
+use crate::engine::{Engine, Lane, Span};
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -54,52 +54,111 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
 
-fn special(tk: &Tokenizer, s: &str) -> u32 {
+fn try_special(tk: &Tokenizer, s: &str) -> Result<u32, String> {
     let v = tk.encode(s, true);
-    assert!(v.len() == 1, "{s} is not one token");
-    v[0]
-}
-
-fn effort_num(e: &str) -> String {
-    let v = match e.trim() {
-        "none" => 0.0, "minimal" => 0.1, "low" => 0.2, "medium" => 0.7, "high" => 0.9, "xhigh" | "max" => 0.99,
-        x => match x.parse::<f64>() {
-            Ok(f) if f.is_finite() => f.clamp(0.0, 0.99),
-            _ => 0.9,
-        },
-    };
-    if v == 0.0 { "0".into() } else { format!("{v}") }
-}
-
-fn request_effort(req: &Value, default_effort: &str) -> String {
-    let raw = req.get("reasoning_effort")
-        .filter(|v| !v.is_null())
-        .or_else(|| req.get("chat_template_kwargs").and_then(|k| k.get("reasoning_effort")).filter(|v| !v.is_null()));
-    match raw {
-        Some(Value::String(s)) => effort_num(s),
-        Some(Value::Number(n)) => match n.as_f64() {
-            Some(f) if f.is_finite() => {
-                let v = f.clamp(0.0, 0.99);
-                if v == 0.0 { "0".into() } else { format!("{v}") }
-            }
-            _ => effort_num(default_effort),
-        },
-        _ => effort_num(default_effort),
+    if v.len() == 1 && tk.is_special(v[0]) {
+        Ok(v[0])
+    } else {
+        Err(format!("model tokenizer is missing required special token {s}"))
     }
 }
 
-fn content_parts(v: &Value) -> Vec<&str> {
+impl Specials {
+    fn try_from_tokenizer(tk: &Tokenizer) -> Result<Self, String> {
+        Ok(Self {
+            msg_user: try_special(tk, "<|message_user|>")?,
+            msg_model: try_special(tk, "<|message_model|>")?,
+            msg_system: try_special(tk, "<|message_system|>")?,
+            msg_tool: try_special(tk, "<|message_tool|>")?,
+            c_text: try_special(tk, "<|content_text|>")?,
+            c_think: try_special(tk, "<|content_thinking|>")?,
+            c_xml: try_special(tk, "<|content_xml|>")?,
+            c_tool: try_special(tk, "<|content_invoke_tool_json|>")?,
+            end: try_special(tk, "<|end_message|>")?,
+            end_sampling: try_special(tk, "<|content_model_end_sampling|>")?,
+        })
+    }
+}
+
+#[cfg(test)]
+fn special(tk: &Tokenizer, s: &str) -> u32 {
+    try_special(tk, s).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn format_effort_num(v: f64) -> String {
+    if v == 0.0 { "0".into() } else { format!("{v}") }
+}
+
+pub fn validate_effort(e: &str) -> Result<String, String> {
+    let trimmed = e.trim();
+    let v = match trimmed {
+        "none" => 0.0,
+        "minimal" => 0.1,
+        "low" => 0.2,
+        "medium" => 0.7,
+        "high" => 0.9,
+        "xhigh" | "max" => 0.99,
+        x => match x.parse::<f64>() {
+            Ok(f) if f.is_finite() && (0.0..=0.99).contains(&f) => f,
+            _ => {
+                return Err(format!(
+                    "unknown effort level {trimmed:?} (expected none, minimal, low, medium, high, xhigh, max, or a number between 0 and 0.99)"
+                ));
+            }
+        },
+    };
+    Ok(format_effort_num(v))
+}
+
+fn request_effort(req: &Value, default_effort: &str) -> Result<String, String> {
+    let kwargs = match req.get("chat_template_kwargs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => Some(o),
+        Some(_) => return Err("chat_template_kwargs must be an object".into()),
+    };
+    let raw = match req.get("reasoning_effort") {
+        Some(v) if !v.is_null() => Some(v),
+        _ => kwargs.and_then(|k| k.get("reasoning_effort")).filter(|v| !v.is_null()),
+    };
+    match raw {
+        None => validate_effort(default_effort),
+        Some(Value::String(s)) => validate_effort(s),
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(f) if f.is_finite() && (0.0..=0.99).contains(&f) => Ok(format_effort_num(f)),
+            _ => Err("reasoning_effort must be a finite number between 0 and 0.99".into()),
+        },
+        Some(_) => Err("reasoning_effort must be a string or a finite number between 0 and 0.99".into()),
+    }
+}
+
+fn try_content_parts(v: &Value, allow_empty_array: bool) -> Result<Vec<&str>, String> {
     match v {
-        Value::String(s) => vec![s],
-        Value::Array(a) => a.iter().filter_map(|p| match p {
-            Value::String(s) => Some(s.as_str()),
-            Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
-                None | Some("text") | Some("input_text") => Some(o.get("text").and_then(|t| t.as_str()).unwrap_or("")),
-                _ => None,
-            },
-            _ => None,
-        }).collect(),
-        _ => vec![],
+        Value::String(s) => Ok(vec![s.as_str()]),
+        Value::Array(a) => {
+            if a.is_empty() && !allow_empty_array {
+                return Err("message content array must not be empty".into());
+            }
+            a.iter()
+                .map(|p| match p {
+                    Value::String(s) => Ok(s.as_str()),
+                    Value::Object(o) => {
+                        match o.get("type") {
+                            None => {}
+                            Some(Value::String(kind)) if matches!(kind.as_str(), "text" | "input_text") => {}
+                            Some(Value::String(other)) => {
+                                return Err(format!("unsupported content part type {other}"));
+                            }
+                            Some(_) => return Err("content part type must be a string".into()),
+                        }
+                        o.get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "text content part requires a string text field".to_string())
+                    }
+                    _ => Err("each content part must be a string or text object".into()),
+                })
+                .collect()
+        }
+        _ => Err("message content must be a string or an array of text parts".into()),
     }
 }
 
@@ -120,6 +179,9 @@ impl From<&str> for RenderError {
 /// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
 /// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
 fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize) -> Result<Vec<u32>, RenderError> {
+    if !req.is_object() {
+        return Err("request body must be a JSON object".into());
+    }
     let text = |t: &mut Vec<u32>, s: &str| {
         if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
     };
@@ -129,20 +191,43 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
         Ok(())
     };
     let mut t = Vec::new();
-    let msgs = req["messages"].as_array().ok_or("messages missing")?;
-    if let Some(tools) = req["tools"].as_array().filter(|a| !a.is_empty()) {
-        let specs: Vec<Value> = tools.iter().map(|tool| {
-            let f = tool.get("function").unwrap_or(tool);
-            json!({"description": f.get("description").and_then(|d| d.as_str()).unwrap_or(""), "name": f["name"],
-                   "parameters": f.get("parameters").cloned().unwrap_or(json!({})), "type": tool.get("type").and_then(|d| d.as_str()).unwrap_or("function")})
-        }).collect();
-        marks(&mut t, &[sp.msg_system])?;
-        text(&mut t, "tool_declare")?;
-        marks(&mut t, &[sp.c_xml])?;
-        text(&mut t, &Value::Array(specs).to_string())?;
-        marks(&mut t, &[sp.end])?;
+    let msgs = req.get("messages").and_then(Value::as_array).ok_or("messages missing")?;
+    if msgs.is_empty() {
+        return Err("messages must not be empty".into());
     }
-    let effort = request_effort(req, default_effort);
+    if let Some(tools_val) = req.get("tools").filter(|v| !v.is_null()) {
+        let tools = tools_val.as_array().ok_or("tools must be an array")?;
+        if !tools.is_empty() {
+            let mut specs = Vec::with_capacity(tools.len());
+            for tool in tools {
+                let tool_obj = tool.as_object().ok_or("each tool must be an object")?;
+                let f = match tool_obj.get("function") {
+                    None | Some(Value::Null) => tool_obj,
+                    Some(Value::Object(fo)) => fo,
+                    Some(_) => return Err("tool.function must be an object".into()),
+                };
+                let name = f.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool without a name")?;
+                let desc = match f.get("description") {
+                    None | Some(Value::Null) => "",
+                    Some(Value::String(d)) => d.as_str(),
+                    Some(_) => return Err("tool description must be a string".into()),
+                };
+                let tool_type = match tool_obj.get("type") {
+                    None | Some(Value::Null) => "function",
+                    Some(Value::String(ty)) => ty.as_str(),
+                    Some(_) => return Err("tool type must be a string".into()),
+                };
+                let params = f.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                specs.push(json!({"description": desc, "name": name, "parameters": params, "type": tool_type}));
+            }
+            marks(&mut t, &[sp.msg_system])?;
+            text(&mut t, "tool_declare")?;
+            marks(&mut t, &[sp.c_xml])?;
+            text(&mut t, &Value::Array(specs).to_string())?;
+            marks(&mut t, &[sp.end])?;
+        }
+    }
+    let effort = request_effort(req, default_effort)?;
     let emit_effort = |t: &mut Vec<u32>| {
         marks(t, &[sp.msg_system, sp.c_text])?;
         text(t, &format!("Thinking effort level: {effort}"))?;
@@ -150,25 +235,49 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
     };
     let mut effort_done = false;
     let mut call_names = std::collections::HashMap::new();
-    for m in msgs { for tc in m["tool_calls"].as_array().into_iter().flatten() { if let (Some(id), Some(n)) = (tc["id"].as_str(), tc["function"]["name"].as_str()) { call_names.insert(id.to_string(), n.to_string()); } } }
     for m in msgs {
-        let role = m["role"].as_str().ok_or("message without role")?;
+        let m_obj = m.as_object().ok_or("each message must be an object")?;
+        if let Some(tcs) = m_obj.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcs {
+                if let (Some(id), Some(n)) = (tc.get("id").and_then(Value::as_str), tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)) {
+                    call_names.insert(id.to_string(), n.to_string());
+                }
+            }
+        }
+    }
+    for m in msgs {
+        let m_obj = m.as_object().ok_or("each message must be an object")?;
+        let role = m_obj.get("role").and_then(Value::as_str).ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
         if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
         match role {
             "system" | "user" => {
                 let h = if role == "system" { sp.msg_system } else { sp.msg_user };
-                for p in content_parts(&m["content"]) {
+                let content = m_obj.get("content").ok_or("message content missing")?;
+                for p in try_content_parts(content, false)? {
                     marks(&mut t, &[h, sp.c_text])?;
                     text(&mut t, p)?;
                     marks(&mut t, &[sp.end])?;
                 }
             }
             "tool" => {
-                let name = m["name"].as_str().map(|s| s.to_string()).or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).cloned())).unwrap_or_default();
-                let mut parts = content_parts(&m["content"]);
+                let name = match m_obj.get("name") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(_) => return Err("tool message name must be a string".into()),
+                }
+                .or_else(|| m_obj.get("tool_call_id").and_then(Value::as_str).and_then(|id| call_names.get(id).cloned()))
+                .unwrap_or_default();
+                let mut parts = match m_obj.get("content") {
+                    None | Some(Value::Null) => vec![""],
+                    Some(c) => try_content_parts(c, true)?,
+                };
                 if parts.is_empty() { parts.push(""); }
-                let is_error = m["is_error"].as_bool().unwrap_or(false);
+                let is_error = match m_obj.get("is_error") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("tool is_error must be a boolean".into()),
+                };
                 for (i, p) in parts.iter().enumerate() {
                     marks(&mut t, &[sp.msg_tool])?;
                     text(&mut t, &name)?;
@@ -179,8 +288,16 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                 }
             }
             "assistant" => {
-                let asst_name = m["name"].as_str().filter(|n| !n.is_empty());
-                let reasoning = m["reasoning_content"].as_str().filter(|r| !r.is_empty());
+                let asst_name = match m_obj.get("name") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(n)) => (!n.is_empty()).then_some(n.as_str()),
+                    Some(_) => return Err("assistant name must be a string".into()),
+                };
+                let reasoning = match m_obj.get("reasoning_content") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(r)) => (!r.is_empty()).then_some(r.as_str()),
+                    Some(_) => return Err("reasoning_content must be a string".into()),
+                };
                 if let Some(r) = reasoning {
                     marks(&mut t, &[sp.msg_model])?;
                     if let Some(name) = asst_name { text(&mut t, name)?; }
@@ -188,10 +305,18 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                     text(&mut t, r)?;
                     marks(&mut t, &[sp.end])?;
                 }
-                let calls: Vec<&Value> = m["tool_calls"].as_array().into_iter().flatten().collect();
-                match &m["content"] {
-                    Value::Null => {}
-                    Value::String(s) => {
+                let calls: Vec<&Value> = match m_obj.get("tool_calls") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(arr)) => arr.iter().collect(),
+                    Some(_) => return Err("tool_calls must be an array".into()),
+                };
+                match m_obj.get("content") {
+                    None | Some(Value::Null) => {
+                        if calls.is_empty() && reasoning.is_none() {
+                            return Err("assistant message must include content, reasoning_content, or tool_calls".into());
+                        }
+                    }
+                    Some(Value::String(s)) => {
                         if !s.is_empty() || (calls.is_empty() && reasoning.is_none()) {
                             marks(&mut t, &[sp.msg_model])?;
                             if let Some(name) = asst_name { text(&mut t, name)?; }
@@ -200,8 +325,8 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                             marks(&mut t, &[sp.end])?;
                         }
                     }
-                    other => {
-                        let content = content_parts(other).join("");
+                    Some(other) => {
+                        let content = try_content_parts(other, !calls.is_empty() || reasoning.is_some())?.join("");
                         if !content.is_empty() || (calls.is_empty() && reasoning.is_none()) {
                             marks(&mut t, &[sp.msg_model])?;
                             if let Some(name) = asst_name { text(&mut t, name)?; }
@@ -212,11 +337,14 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                     }
                 }
                 for tc in calls {
-                    let name = tc["function"]["name"].as_str().ok_or("tool call without a name")?;
-                    let args: Value = match &tc["function"]["arguments"] {
-                        Value::String(s) if s.trim().is_empty() => json!({}),
-                        Value::String(s) => serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?,
-                        Value::Null => json!({}), v => v.clone(),
+                    let tc_obj = tc.as_object().ok_or("each tool call must be an object")?;
+                    let fn_obj = tc_obj.get("function").and_then(Value::as_object).ok_or("tool call function must be an object")?;
+                    let name = fn_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool call without a name")?;
+                    let args: Value = match fn_obj.get("arguments") {
+                        None | Some(Value::Null) => json!({}),
+                        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+                        Some(Value::String(s)) => serde_json::from_str(s).map_err(|e| format!("tool call arguments: {e}"))?,
+                        Some(v) => v.clone(),
                     };
                     marks(&mut t, &[sp.msg_model])?;
                     text(&mut t, name)?;
@@ -283,58 +411,87 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 /// message's text and tool uses become its content and tool calls (rendered text first, as the
 /// chat path renders them).
 fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
-    let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
+    if !req.is_object() {
+        return Err("request body must be a JSON object".into());
+    }
+    let msgs_in = req.get("messages").and_then(Value::as_array).ok_or("messages missing")?;
     if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
     let mut msgs: Vec<Value> = Vec::new();
-    match &req["system"] {
-        Value::Null => {}
-        Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
-        Value::Array(blocks) => {
-            let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+    match req.get("system") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
+        Some(Value::Array(blocks)) => {
+            let parts: Vec<Value> = blocks.iter().map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let txt = b.get("text").and_then(Value::as_str).ok_or("system text block requires a string text field")?;
+                    Ok(json!({"type": "text", "text": txt}))
+                }
                 t => Err(format!("unsupported system block type {}", t.unwrap_or("none"))),
-            }).collect::<Result<_, _>>()?;
+            }).collect::<Result<_, String>>()?;
             if !parts.is_empty() { msgs.push(json!({"role": "system", "content": parts})); }
         }
-        _ => return Err("system must be a string or an array of text blocks".into()),
+        Some(_) => return Err("system must be a string or an array of text blocks".into()),
     }
     for m in msgs_in {
-        let role = m["role"].as_str().ok_or("message without role")?;
-        match (role, &m["content"]) {
+        let m_obj = m.as_object().ok_or("each message must be an object")?;
+        let role = m_obj.get("role").and_then(Value::as_str).ok_or("message without role")?;
+        let content = m_obj.get("content").unwrap_or(&Value::Null);
+        match (role, content) {
             ("system", Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
             ("system", Value::Array(blocks)) => {
-                let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                    Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
+                let parts: Vec<Value> = blocks.iter().map(|b| match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let txt = b.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
+                        Ok(json!({"type": "text", "text": txt}))
+                    }
                     t => Err(format!("unsupported content block type {} in a system message", t.unwrap_or("none"))),
-                }).collect::<Result<_, _>>()?;
+                }).collect::<Result<_, String>>()?;
                 msgs.push(json!({"role": "system", "content": parts}));
             }
             ("user", Value::String(s)) => msgs.push(json!({"role": "user", "content": s})),
             ("assistant", Value::String(s)) => msgs.push(json!({"role": "assistant", "content": s})),
             ("user", Value::Array(blocks)) => {
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
                 let mut texts: Vec<Value> = Vec::new();
                 for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => texts.push(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                    let b_obj = b.as_object().ok_or("each content block must be an object")?;
+                    match b_obj.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            let txt = b_obj.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
+                            texts.push(json!({"type": "text", "text": txt}));
+                        }
                         Some("image") => texts.push(json!({"type": "text", "text": "[image]"})),
                         Some("tool_result") => {
                             if !texts.is_empty() { msgs.push(json!({"role": "user", "content": std::mem::take(&mut texts)})); }
-                            let id = b["tool_use_id"].as_str().ok_or("tool_result without tool_use_id")?;
-                            let c = match &b["content"] {
-                                Value::Null => json!(""),
-                                Value::String(s) => json!(s),
-                                Value::Array(parts) => {
-                                    let ps: Vec<Value> = parts.iter().map(|p| match p["type"].as_str() {
-                                        Some("text") => Ok(json!({"type": "text", "text": p["text"].as_str().unwrap_or("")})),
+                            let id = b_obj.get("tool_use_id").and_then(Value::as_str).ok_or("tool_result without tool_use_id")?;
+                            let c = match b_obj.get("content") {
+                                None | Some(Value::Null) => json!(""),
+                                Some(Value::String(s)) => json!(s),
+                                Some(Value::Array(parts)) => {
+                                    let ps: Vec<Value> = parts.iter().map(|p| match p.get("type").and_then(Value::as_str) {
+                                        Some("text") => {
+                                            let txt = p.get("text").and_then(Value::as_str).ok_or("tool_result text block requires a string text field")?;
+                                            Ok(json!({"type": "text", "text": txt}))
+                                        }
                                         Some("image") => Ok(json!({"type": "text", "text": "[image]"})),
                                         t => Err(format!("unsupported tool_result content type {}", t.unwrap_or("none"))),
-                                    }).collect::<Result<_, _>>()?;
+                                    }).collect::<Result<_, String>>()?;
                                     Value::Array(ps)
                                 }
-                                _ => return Err("tool_result content must be a string or an array of text blocks".into()),
+                                Some(_) => return Err("tool_result content must be a string or an array of text blocks".into()),
+                            };
+                            let is_error = match b_obj.get("is_error") {
+                                None | Some(Value::Null) => false,
+                                Some(Value::Bool(err)) => *err,
+                                Some(_) => return Err("tool_result is_error must be a boolean".into()),
                             };
                             let mut tool_msg = json!({"role": "tool", "tool_call_id": id, "content": c});
-                            if b["is_error"].as_bool().unwrap_or(false) { tool_msg["is_error"] = json!(true); }
+                            if is_error { tool_msg["is_error"] = json!(true); }
                             msgs.push(tool_msg);
                         }
                         t => return Err(format!("unsupported content block type {} in a user message", t.unwrap_or("none"))),
@@ -343,15 +500,25 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                 if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
             }
             ("assistant", Value::Array(blocks)) => {
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
                 let mut text = String::new();
                 let mut calls: Vec<Value> = Vec::new();
                 for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => text.push_str(b["text"].as_str().unwrap_or("")),
+                    let b_obj = b.as_object().ok_or("each content block must be an object")?;
+                    match b_obj.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            let txt = b_obj.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
+                            text.push_str(txt);
+                        }
                         Some("tool_use") => {
-                            let id = b["id"].as_str().ok_or("tool_use without id")?;
-                            let name = b["name"].as_str().ok_or("tool_use without a name")?;
-                            let input = if b["input"].is_null() { json!({}) } else { b["input"].clone() };
+                            let id = b_obj.get("id").and_then(Value::as_str).ok_or("tool_use without id")?;
+                            let name = b_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool_use without a name")?;
+                            let input = match b_obj.get("input") {
+                                None | Some(Value::Null) => json!({}),
+                                Some(v) => v.clone(),
+                            };
                             calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": input}}));
                         }
                         Some("thinking") | Some("redacted_thinking") => {}
@@ -372,9 +539,15 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
         let tools = tools.as_array().ok_or("tools must be an array")?;
         if !tools.is_empty() {
             let mapped: Vec<Value> = tools.iter().map(|t| {
-                let name = t["name"].as_str().ok_or("tool without a name")?;
-                Ok(json!({"type": "function", "function": {"name": name, "description": t["description"].as_str().unwrap_or(""),
-                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({}))}}))
+                let t_obj = t.as_object().ok_or("each tool must be an object")?;
+                let name = t_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool without a name")?;
+                let desc = match t_obj.get("description") {
+                    None | Some(Value::Null) => "",
+                    Some(Value::String(d)) => d.as_str(),
+                    Some(_) => return Err("tool description must be a string".into()),
+                };
+                Ok(json!({"type": "function", "function": {"name": name, "description": desc,
+                        "parameters": t_obj.get("input_schema").cloned().unwrap_or_else(|| json!({}))}}))
             }).collect::<Result<_, String>>()?;
             out["tools"] = json!(mapped);
         }
@@ -382,34 +555,27 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
-/// The thinking effort a Messages request asks for, as the `reasoning_effort`
-/// the chat path renders through `effort_num` — or none, when the request
-/// leaves the serve default standing. An explicit effort field wins (top
-/// level, `output_config`, or inside `thinking`); then `thinking` itself:
-/// disabled is none, an enabled budget maps by size (1024–4095 low,
-/// 4096–16383 medium, else high), and adaptive — or no thinking at all —
-/// decides for itself, so it sets nothing. Anything malformed refuses
-/// (the caller answers 400): no silent fallback may turn an unknown
-/// effort into 0.9 or drop a budget on the floor.
 fn anthropic_effort(req: &Value) -> Result<Option<String>, String> {
-    // an effort field that is present must be a known level (or a number in
-    // effort_num's range): an unknown string would otherwise reach effort_num
-    // and silently become 0.9, and a non-string would silently vanish
     let field = |v: &Value| -> Result<String, String> {
         let s = v.as_str().ok_or("effort must be a string")?.trim();
-        let known = matches!(s, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-            || s.parse::<f64>().is_ok_and(|n| n.is_finite() && (0.0..=0.99).contains(&n));
-        if known { Ok(s.to_string()) } else { Err(format!("unknown effort level {s:?}")) }
+        let _ = validate_effort(s)?;
+        Ok(s.to_string())
     };
-    if let Some(v) = req.get("output_config").and_then(|o| o.get("effort")).filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    if let Some(oc) = req.get("output_config").filter(|v| !v.is_null()) {
+        let oc_obj = oc.as_object().ok_or("output_config must be an object")?;
+        if let Some(v) = oc_obj.get("effort").filter(|v| !v.is_null()) {
+            return Ok(Some(field(v)?));
+        }
+    }
     if let Some(v) = req.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
     let Some(th) = req.get("thinking").filter(|v| !v.is_null()) else { return Ok(None) };
-    if let Some(v) = th.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
-    match th["type"].as_str() {
+    let th_obj = th.as_object().ok_or("thinking must be an object")?;
+    if let Some(v) = th_obj.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    match th_obj.get("type").and_then(Value::as_str) {
         Some("disabled") => Ok(Some("none".into())),
         Some("adaptive") => Ok(None),
         Some("enabled") => {
-            let b = th.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
+            let b = th_obj.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
             let b = b.as_u64().ok_or("thinking budget_tokens must be a non-negative integer")?;
             match b {
                 0 => Ok(Some("none".into())),
@@ -728,10 +894,9 @@ impl LaneS {
         metrics: &Mutex<Counters>,
         tick_seq: &mut u64,
     ) {
-        let active = self
-            .release_job(eng, cache, metrics, tick_seq)
-            .expect("failed lane must have an active job");
-        let _ = active.job.out.send(Ev::Failed(message));
+        if let Some(active) = self.release_job(eng, cache, metrics, tick_seq) {
+            let _ = active.job.out.send(Ev::Failed(message));
+        }
     }
 }
 
@@ -783,15 +948,12 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
         .max_by_key(|(_, c)| (c.prefix, c.tick));
     match src {
         Some((s, c)) if s != dst => {
-            let lru = cands.iter().enumerate().filter(|(_, c)| c.free).min_by_key(|(_, c)| c.tick).unwrap().0;
+            let (lru, _) = cands.iter().enumerate().filter(|(_, c)| c.free).min_by_key(|(_, c)| c.tick)?;
             Some(Admission { dst: lru, src: s, prefix: c.prefix })
         }
         _ => Some(Admission { dst, src: dst, prefix: own_prefix }),
     }
 }
-
-#[allow(dead_code)]
-fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
 
 /// Wait for an already-committed `MTLCommandBuffer` and inspect its completion status.
 fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
@@ -824,12 +986,8 @@ fn overlap_host_work_step<'a>(
     cache: &mut ServeBlockCache,
     metrics: &Mutex<Counters>,
 ) -> Vec<usize> {
-    loop {
-        match rx.try_recv() {
-            Ok(j) => queue.push_back(j),
-            // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        }
+    while let Ok(j) = rx.try_recv() {
+        queue.push_back(j);
     }
     let dropped = discard_cancelled_jobs(queue);
     if dropped > 0 {
@@ -848,12 +1006,11 @@ fn overlap_host_work_step<'a>(
                     debug_assert!(!released_now, "InStep cancel must defer release until complete_step");
                 }
             }
-            crate::scheduler::LaneState::Ready => {
+            crate::scheduler::LaneState::Ready
                 if a.job.out.cancelled()
-                    || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
-                {
-                    waiting_cancelled.push(i);
-                }
+                    || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err()) =>
+            {
+                waiting_cancelled.push(i);
             }
             _ => {}
         }
@@ -941,7 +1098,9 @@ fn partition_pool_exhausted(
         return (exhausted.into_iter().map(|(i, _)| i).collect(), Vec::new());
     }
     let mut to_fail = exhausted;
-    let victim = to_fail.pop().expect("non-empty exhausted");
+    let Some(victim) = to_fail.pop() else {
+        return (Vec::new(), Vec::new());
+    };
     let to_defer = to_fail.into_iter().map(|(i, _)| i).collect();
     (to_defer, vec![victim])
 }
@@ -980,9 +1139,14 @@ fn scheduler(
     let mut pool_deferred = vec![false; nlanes];
     let mut prev_lanes_released = cache.stats().lanes_released;
     let mut prev_window_pruned = cache.stats().window_pruned;
+    let mut prev_starts_spilled = 0u64;
     let mut checkpoints_sealed = false;
     loop {
         let cur_stats = cache.stats();
+        if cur_stats.starts_spilled != prev_starts_spilled {
+            metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled = cur_stats.starts_spilled;
+            prev_starts_spilled = cur_stats.starts_spilled;
+        }
         if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
             pool_deferred.fill(false);
             prev_lanes_released = cur_stats.lanes_released;
@@ -1042,7 +1206,7 @@ fn scheduler(
                 continue;
             }
             if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap();
+                let Some(j) = queue.pop_front() else { break };
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
@@ -1073,7 +1237,7 @@ fn scheduler(
                     break;
                 }
             }
-            let j = queue.pop_front().unwrap();
+            let Some(j) = queue.pop_front() else { break };
             // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
             let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
             let prep_began = Instant::now();
@@ -1222,7 +1386,7 @@ fn scheduler(
                         .enumerate()
                         .filter_map(|(k, &(i, p0, t))| {
                             let l = &lanes[i];
-                            let a = l.job.as_ref().unwrap();
+                            let a = l.job.as_ref()?;
                             let next_pos = p0 + t;
                             (next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel())
                                 .then(|| crate::engine::GumbelSpan {
@@ -1239,10 +1403,11 @@ fn scheduler(
                     eng.encode_gumbel_spans(&cb, &gumbels);
                 } else if let Some(&(i, p0, t)) = live_sp.first() {
                     let l = &lanes[i];
-                    let a = l.job.as_ref().unwrap();
-                    let next_pos = p0 + t;
-                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
-                        eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                    if let Some(a) = l.job.as_ref() {
+                        let next_pos = p0 + t;
+                        if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                            eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        }
                     }
                 }
                 cb.commit();
@@ -1260,7 +1425,7 @@ fn scheduler(
                     let mut pools = eng.block_pool().borrow_mut();
                     for &(i, p0, t) in &live_sp {
                         let l = &mut lanes[i];
-                        let a = l.job.as_ref().unwrap();
+                        let Some(a) = l.job.as_ref() else { continue };
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.finish_prefill_span(
                             &mut pools,
@@ -1278,9 +1443,8 @@ fn scheduler(
                 }
                 metrics.lock().unwrap_or_else(|e| e.into_inner()).input += live_sp.iter().map(|&(_, _, t)| t).sum::<usize>();
                 for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
-
                     let l = &mut lanes[i];
-                    let a = l.job.as_mut().unwrap();
+                    let Some(a) = l.job.as_mut() else { continue };
                     a.timing.prefill.add(t, elapsed);
                     a.n_past = p0 + t;
                     if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
@@ -1322,10 +1486,15 @@ fn scheduler(
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &i in &need_dec {
-                        let pos = lanes[i].job.as_ref().unwrap().n_past;
+                        let Some(a) = lanes[i].job.as_ref() else { continue };
+                        let Some(tok) = a.pending else { continue };
+                        let pos = a.n_past;
                         let mut tbl = lanes[i].lane.block_table().borrow_mut();
                         match cache.ensure_span_blocks(&mut pools, &mut tbl, pos, 1) {
-                            Ok(()) => live_dec.push(i),
+                            Ok(()) => {
+                                eng.on(&lanes[i].lane).set_tokens(pos, &[tok]);
+                                live_dec.push(i);
+                            }
                             Err(err) => exhausted.push((i, err.to_string())),
                         }
                     }
@@ -1354,13 +1523,14 @@ fn scheduler(
                     }
                     continue;
                 }
-                // feed each lane's pending token at its position
-                for &i in &live_dec {
-                    let a = lanes[i].job.as_ref().unwrap();
-                    eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
-                }
-                let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-                let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().job.loopcd_omega).collect();
+                let spans: Vec<Span> = live_dec
+                    .iter()
+                    .filter_map(|&i| Some(Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref()?.n_past, t: 1 }))
+                    .collect();
+                let omegas: Vec<f32> = live_dec
+                    .iter()
+                    .filter_map(|&i| Some(lanes[i].job.as_ref()?.job.loopcd_omega))
+                    .collect();
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode_with_omegas(&cb, &spans, true, false, &omegas);
@@ -1369,7 +1539,7 @@ fn scheduler(
                     .enumerate()
                     .filter_map(|(k, &i)| {
                         let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
+                        let a = l.job.as_ref()?;
                         (!a.job.out.cancelled() && a.sampler.uses_gpu_gumbel()).then(|| {
                             let next_pos = a.n_past + 1;
                             crate::engine::GumbelSpan {
@@ -1398,7 +1568,7 @@ fn scheduler(
                     let mut pools = eng.block_pool().borrow_mut();
                     for &i in &live_dec {
                         let l = &mut lanes[i];
-                        let pos = l.job.as_ref().unwrap().n_past;
+                        let Some(pos) = l.job.as_ref().map(|a| a.n_past) else { continue };
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.finish_decode_span(&mut pools, &mut tbl, &mut l.blocks, pos);
                     }
@@ -1406,7 +1576,7 @@ fn scheduler(
                 let elapsed = began.elapsed();
                 for (k, &i) in live_dec.iter().enumerate() {
                     let l = &mut lanes[i];
-                    let a = l.job.as_mut().unwrap();
+                    let Some(a) = l.job.as_mut() else { continue };
                     a.timing.generation.add(1, elapsed);
                     a.n_past += 1;
                     if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
@@ -1755,12 +1925,9 @@ impl MemoryBudget {
     ) -> Self {
         let reserved = model_bytes.saturating_add(safety_headroom_bytes);
         let available_kv_budget_bytes = recommended_working_set_bytes.saturating_sub(reserved);
-        let max_budget_lanes = if per_lane_worst_case_bytes == 0 {
-            configured_lanes.max(1)
-        } else {
-            usize::try_from(available_kv_budget_bytes / per_lane_worst_case_bytes)
-                .unwrap_or(usize::MAX)
-                .max(1)
+        let max_budget_lanes = match available_kv_budget_bytes.checked_div(per_lane_worst_case_bytes) {
+            None => configured_lanes.max(1),
+            Some(q) => usize::try_from(q).unwrap_or(usize::MAX).max(1),
         };
         let max_admitted_lanes = configured_lanes.min(max_budget_lanes).max(1);
         Self {
@@ -1977,6 +2144,7 @@ impl PermitPool {
 
 fn health_body(cx: &Ctx) -> String {
     let kv_bytes_per_elem: u32 = if cx.kv8 { 1 } else { 2 };
+    let starts_spilled = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled;
     let mut obj = serde_json::Map::from_iter([
         ("ok".into(), json!(true)),
         ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
@@ -1985,6 +2153,7 @@ fn health_body(cx: &Ctx) -> String {
         ("model_bytes".into(), json!(cx.budget.model_bytes)),
         ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
         ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
+        ("starts_spilled".into(), json!(starts_spilled)),
         ("queued_requests".into(), json!(cx.admission.queued())),
         ("kv8".into(), json!(cx.kv8)),
         ("kv_bytes_per_elem".into(), json!(kv_bytes_per_elem)),
@@ -2047,7 +2216,8 @@ fn context_over(prompt: usize, max: usize, ctx: usize) -> bool {
 }
 
 fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
-    format!("context full: {prompt} prompt tokens and {max} to generate, {ctx} per lane")
+    let max_prompt = ctx.saturating_sub(max.saturating_add(2));
+    format!("context full: {prompt} prompt tokens exceeds {max_prompt} maximum ({ctx} per lane with {max} to generate and 2 reserved)")
 }
 
 /// The reply budget of a `/v1/messages` request, adjusted to the lane: when
@@ -2133,15 +2303,75 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     chat_with_card(cx, req, None, s)
 }
 
+fn parse_request_temp(req: &Value) -> Result<f64, String> {
+    match req.get("temperature") {
+        None | Some(Value::Null) => Ok(1.0),
+        Some(v) => match v.as_f64() {
+            Some(t) if t.is_finite() && (0.0..=2.0).contains(&t) => Ok(t),
+            _ => Err("temperature must be a finite number between 0 and 2".into()),
+        },
+    }
+}
+
+fn parse_request_top_p(req: &Value) -> Result<f64, String> {
+    match req.get("top_p") {
+        None | Some(Value::Null) => Ok(0.95),
+        Some(v) => match v.as_f64() {
+            Some(p) if p.is_finite() && p > 0.0 && p <= 1.0 => Ok(p),
+            _ => Err("top_p must be a finite number in (0, 1]".into()),
+        },
+    }
+}
+
+fn parse_request_top_k(req: &Value) -> Result<usize, String> {
+    match req.get("top_k") {
+        None | Some(Value::Null) => Ok(64),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("top_k must be an integer between 0 and {}", usize::MAX)),
+    }
+}
+
+fn parse_request_stream(req: &Value) -> Result<bool, String> {
+    match req.get("stream") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("stream must be a boolean".into()),
+    }
+}
+
+fn parse_request_model(req: &Value) -> Result<String, String> {
+    match req.get("model") {
+        None | Some(Value::Null) => Ok("inkling-2-mini".into()),
+        Some(Value::String(s)) => Ok(if s.is_empty() { "inkling-2-mini".into() } else { s.clone() }),
+        Some(_) => Err("model must be a string".into()),
+    }
+}
+
+fn parse_request_seed(req: &Value) -> Result<Option<u64>, String> {
+    match req.get("seed") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_i64().map(|n| n as u64))
+            .map(Some)
+            .ok_or_else(|| format!("seed must be a 64-bit integer ({}..={})", i64::MIN, u64::MAX)),
+    }
+}
+
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
     let req_start = Instant::now();
     let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let mut first_tok: Option<Instant> = None;
-    // every client-controlled number is checked here, never in the scheduler
+    // every client-controlled field is checked here, never in the scheduler
     let mut bad = |m: String| {
         record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
         respond(s, 400, &json!({"error": {"message": m}}).to_string())
     };
+    if !req.is_object() {
+        return bad("request body must be a JSON object".into());
+    }
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -2152,22 +2382,24 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         }
     }
     let requested_max = budgets[0].or(budgets[1]).unwrap_or(cx.max_tokens);
-    let temp = req["temperature"].as_f64().unwrap_or(1.0);
-    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
-    let top_k = match req.get("top_k") {
-        None | Some(Value::Null) => 64,
-        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(k) => k,
-            None => return bad("top_k must be a nonnegative integer".into()),
-        },
-    };
-    let thinking_budget = match req.get("thinking_budget").or_else(|| req.get("thinking_budget_tokens")) {
-        None | Some(Value::Null) => cx.thinking_budget,
-        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(b) => b,
-            None => return bad("thinking_budget must be a nonnegative integer".into()),
-        },
-    };
+    let temp = match parse_request_temp(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let top_p = match parse_request_top_p(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let top_k = match parse_request_top_k(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let stream = match parse_request_stream(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let model = match parse_request_model(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let explicit_seed = match parse_request_seed(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let _ = match request_effort(req, &cx.effort) { Ok(v) => v, Err(e) => return bad(e) };
+    let mut tb_opts = [None, None];
+    for (i, name) in ["thinking_budget", "thinking_budget_tokens"].iter().enumerate() {
+        match req.get(*name) {
+            None | Some(Value::Null) => {}
+            Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                Some(b) => tb_opts[i] = Some(b),
+                None => return bad(format!("{name} must be an integer between 0 and {}", usize::MAX)),
+            },
+        }
+    }
+    let thinking_budget = tb_opts[0].or(tb_opts[1]).unwrap_or(cx.thinking_budget);
     let loopcd_omega = match req.get("loopcd_omega") {
         None | Some(Value::Null) => cx.loopcd_omega,
         Some(v) => match v.as_f64() {
@@ -2184,8 +2416,6 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         },
         Some(_) => return bad("stream_options must be an object".into()),
     };
-    if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
-    if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
@@ -2206,7 +2436,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             drop(permit);
             let message = match e {
                 RenderError::Invalid(message) => message,
-                RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
+                RenderError::TooLong => format!("context full: more than {prompt_limit} maximum prompt tokens ({} per lane with at least 1 to generate and 2 reserved)", cx.ctx),
             };
             record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
@@ -2222,7 +2452,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     };
     let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
     // the seed is the request's own: its `seed`, or a hash of what decides the output (the rendered tokens and sampling)
-    let seed = req["seed"].as_u64().unwrap_or_else(|| {
+    let seed = explicit_seed.unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
@@ -2233,9 +2463,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
-    let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
-    let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
     if stream {
         write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
@@ -2268,7 +2496,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             Ev::Tok(t) => {
                 if first_tok.is_none() { first_tok = Some(Instant::now()); }
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() {
+                if gen.len().is_multiple_of(16) && s.client_gone() {
                     record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
                     return Ok(());
                 }
@@ -2365,21 +2593,52 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
         record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
     };
-    // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
-    let max = match req["max_tokens"].as_u64() {
-        Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
-        Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
-    };
-    let temp = req["temperature"].as_f64().unwrap_or(1.0);
-    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
-    let top_k = match req.get("top_k") {
-        None | Some(Value::Null) => 64,
+    if !req.is_object() {
+        record_err(first_tok, 400, "invalid_request_error", 0);
+        return anthropic_error(s, 400, "invalid_request_error", "request body must be a JSON object");
+    }
+    // every client-controlled field is checked here, never in the scheduler (the chat path's rule)
+    let max = match req.get("max_tokens") {
+        None | Some(Value::Null) => {
+            record_err(first_tok, 400, "invalid_request_error", 0);
+            return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required");
+        }
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(k) => k,
-            None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            Some(n) if n > 0 && n <= MAX_CHAT_TOKEN_BUDGET => n,
+            _ => {
+                record_err(first_tok, 400, "invalid_request_error", 0);
+                return anthropic_error(s, 400, "invalid_request_error", &format!("max_tokens must be between 1 and {MAX_CHAT_TOKEN_BUDGET}"));
+            }
         },
     };
+    let temp = match parse_request_temp(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let top_p = match parse_request_top_p(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let top_k = match parse_request_top_k(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let stream = match parse_request_stream(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let model = match parse_request_model(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let explicit_seed = match parse_request_seed(req) {
+        Ok(v) => v,
+        Err(e) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    if let Err(e) = anthropic_effort(req) {
+        record_err(first_tok, 400, "invalid_request_error", 0);
+        return anthropic_error(s, 400, "invalid_request_error", &e);
+    }
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
         Some(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("enabled") => {
             obj.get("budget_tokens").and_then(|v| v.as_u64()).and_then(|n| usize::try_from(n).ok()).unwrap_or(cx.thinking_budget)
@@ -2396,8 +2655,6 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
             }
         },
     };
-    if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
@@ -2429,18 +2686,16 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         }
     };
     let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
-    // the seed is the request's own: a hash of what decides the output, as on the chat path
-    let seed = {
+    // the seed is the request's own: its `seed`, or a hash of what decides the output, as on the chat path
+    let seed = explicit_seed.unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
-    };
+    });
     let (tx, rx) = job_events();
     let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
-    let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
-    let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let sp = cx.sp;
     if stream {
         write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
@@ -2468,7 +2723,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                 Ev::Tok(t) => {
                     if first_tok.is_none() { first_tok = Some(Instant::now()); }
                     received += 1;
-                    if received % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    if received.is_multiple_of(16) && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
                     for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
                 }
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
@@ -2508,7 +2763,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
             Ev::Tok(t) => {
                 if first_tok.is_none() { first_tok = Some(Instant::now()); }
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); }
+                if gen.len().is_multiple_of(16) && s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
@@ -2556,109 +2811,73 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-pub fn serve(o: ServeOpts) {
-    if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
-    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
-    crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
-    let eng = Engine::load(&o.model, o.ctx);
-    eng.set_loopcd_omega(o.loopcd_omega);
-    eng.ensure_batch(eng.chunk);
-    let (chip, mem) = crate::tuning::this_machine();
-    let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
-    let budget = MemoryBudget::compute(
-        eng.gpu.recommended_max_working_set_size(),
-        eng.model_and_scratch_bytes(),
-        safety_headroom_bytes,
-        eng.per_lane_paged_reserve_bytes(),
-        o.lanes,
-    );
-    let effective_lanes = budget.max_admitted_lanes;
-    if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
-    eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
-    let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
-    let tk = Arc::new(Tokenizer::load(&eng.g));
-    let sp = Specials {
-        msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
-        msg_tool: special(&tk, "<|message_tool|>"), c_text: special(&tk, "<|content_text|>"), c_think: special(&tk, "<|content_thinking|>"),
-        c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
-        end_sampling: special(&tk, "<|content_model_end_sampling|>"),
-    };
-    let (jtx, jrx) = channel::<Job>();
-    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
-    let active_lanes = Arc::new(AtomicUsize::new(0));
-    let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
-    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
-    let spill_store = if let Some(spill_dir) = &o.spill_dir {
-        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
-        match crate::spill::SpillStore::open_with_kvb(spill_dir, o.max_spill_bytes, kvb) {
-            Ok(store) => {
-                let swept = store.stats().orphans_swept;
-                eprintln!(
-                    "[serve] spill dir {} ready (kvb={}, budget {:.2} GiB, swept {} orphan tmp file(s))",
-                    store.dir().display(),
-                    store.kvb(),
-                    o.max_spill_bytes as f64 / (1u64 << 30) as f64,
-                    swept,
-                );
-                Some(store)
-            }
-            Err(e) => {
-                eprintln!("cannot prepare --spill-dir {}: {e}", spill_dir.display());
-                std::process::exit(2);
-            }
+fn bind_listeners(addrs: &[SocketAddr]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
+    if addrs.is_empty() {
+        return Err("--bind resolved to no addresses".into());
+    }
+    let mut unique: Vec<SocketAddr> = Vec::with_capacity(addrs.len());
+    for &addr in addrs {
+        if !unique.contains(&addr) {
+            unique.push(addr);
         }
+    }
+    let mut bound = Vec::with_capacity(unique.len());
+    for addr in unique {
+        let listener = TcpListener::bind(addr).map_err(|e| format!("cannot bind {addr}: {e}"))?;
+        let local = listener.local_addr().map_err(|e| format!("cannot inspect bound address for {addr}: {e}"))?;
+        bound.push((listener, local));
+    }
+    Ok(bound)
+}
+
+struct PreModeServe {
+    chunk: usize,
+    prepared: crate::engine::PreparedModel,
+    tk: Arc<Tokenizer>,
+    sp: Specials,
+    spill_store: Option<crate::spill::SpillStore>,
+    listeners: Vec<(TcpListener, SocketAddr)>,
+}
+
+fn validate_serve_pre_mode(o: &ServeOpts) -> Result<PreModeServe, (i32, String)> {
+    check_serve_shape(o.ctx, o.max_tokens).map_err(|e| (2, e))?;
+    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS {
+        return Err((2, format!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS)));
+    }
+    validate_effort(&o.effort).map_err(|e| (2, e))?;
+    if !o.loopcd_omega.is_finite() || !(0.0..=4.0).contains(&o.loopcd_omega) {
+        return Err((2, "--loopcd must be a finite number between 0 and 4".into()));
+    }
+    let chunk = Engine::prefill_chunk_for(o.ctx).map_err(|e| (2, format!("[inky] {e}")))?;
+    let prepared = Engine::prepare_model(&o.model, o.ctx)
+        .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?;
+    let tk = Arc::new(
+        Tokenizer::try_load(&prepared.g)
+            .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?,
+    );
+    let sp = Specials::try_from_tokenizer(&tk)
+        .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?;
+    let spill_store = if let Some(spill_dir) = &o.spill_dir {
+        let kvb = if o.kv8 { 1u32 } else { 2u32 };
+        let store = crate::spill::SpillStore::open_with_kvb(spill_dir, o.max_spill_bytes, kvb)
+            .map_err(|e| (2, format!("cannot prepare --spill-dir {}: {e}", spill_dir.display())))?;
+        let swept = store.stats().orphans_swept;
+        eprintln!(
+            "[serve] spill dir {} ready (kvb={}, budget {:.2} GiB, swept {} orphan tmp file(s))",
+            store.dir().display(),
+            store.kvb(),
+            o.max_spill_bytes as f64 / (1u64 << 30) as f64,
+            swept,
+        );
+        Some(store)
     } else {
         None
     };
-    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
-        nonce: startup_nonce(), key: o.key.clone(), ctx: context,
-        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
-        budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
-    let reporter_cx = Arc::downgrade(&cx);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(60));
-        let Some(cx) = reporter_cx.upgrade() else { break };
-        let waiting = cx.admission.queued();
-        let summary = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).summarize(Instant::now(), waiting);
-        eprintln!("{summary}");
-    });
-    // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
-    let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
-    let addr = l.local_addr().expect("bound address");
-    let auth = if o.key.is_some() {
-        if is_private_ip(addr.ip()) { "a key required (private/loopback)" } else { "a key required" }
-    } else if addr.ip().to_canonical().is_loopback() {
-        "no key (loopback)"
-    } else {
-        "no key (non-loopback explicitly enabled)"
-    };
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    if effective_lanes < o.lanes {
-        eprintln!(
-            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB): capping lanes {} -> {}",
-            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
-            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), o.lanes, effective_lanes
-        );
-    } else {
-        eprintln!(
-            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB, max_admitted_lanes {})",
-            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
-            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
-        );
-    }
-    {
-        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
-        let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap()));
-        let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap()));
-        eprintln!("[serve] Layer 3 paged KV pool (kvb={kvb}{}): {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)",
-                  if eng.kv8 { ", --kv8" } else { "" });
-    }
-    if o.loopcd_omega > 0.0 {
-        eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
-    }
-    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+    let listeners = bind_listeners(&o.bind).map_err(|e| (2, e))?;
+    Ok(PreModeServe { chunk, prepared, tk, sp, spill_store, listeners })
+}
+
+fn spawn_accept_loop(l: TcpListener, cx: Arc<Ctx>) {
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
@@ -2736,6 +2955,99 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
+}
+
+#[allow(dead_code)]
+pub fn serve(o: ServeOpts) {
+    serve_with_mode(o, || {});
+}
+
+pub fn serve_with_mode(o: ServeOpts, enter_mode: impl FnOnce()) {
+    let PreModeServe { chunk, prepared, tk, sp, spill_store, listeners } = match validate_serve_pre_mode(&o) {
+        Ok(ok) => ok,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            std::process::exit(code);
+        }
+    };
+    enter_mode();
+    crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
+    let eng = match prepared.into_engine(o.kv8, chunk) {
+        Ok(eng) => eng,
+        Err(err) => {
+            eprintln!("[inky] could not load {}: {err}", o.model);
+            std::process::exit(1);
+        }
+    };
+    eng.set_loopcd_omega(o.loopcd_omega);
+    eng.ensure_batch(eng.chunk);
+    let (chip, mem) = crate::tuning::this_machine();
+    let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
+    let budget = MemoryBudget::compute(
+        eng.gpu.recommended_max_working_set_size(),
+        eng.model_and_scratch_bytes(),
+        safety_headroom_bytes,
+        eng.per_lane_paged_reserve_bytes(),
+        o.lanes,
+    );
+    let effective_lanes = budget.max_admitted_lanes;
+    if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
+    eng.ensure_dbatch(effective_lanes);
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
+    let (jtx, jrx) = channel::<Job>();
+    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
+    let active_lanes = Arc::new(AtomicUsize::new(0));
+    let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
+    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
+    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
+        nonce: startup_nonce(), key: o.key.clone(), ctx: context,
+        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
+        budget,
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+    let reporter_cx = Arc::downgrade(&cx);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let Some(cx) = reporter_cx.upgrade() else { break };
+        let waiting = cx.admission.queued();
+        let summary = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).summarize(Instant::now(), waiting);
+        eprintln!("{summary}");
+    });
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if effective_lanes < o.lanes {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB): capping lanes {} -> {}",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), o.lanes, effective_lanes
+        );
+    } else {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB, max_admitted_lanes {})",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
+        );
+    }
+    {
+        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
+        let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap_or(0)));
+        let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap_or(0)));
+        eprintln!("[serve] Layer 3 paged KV pool (kvb={kvb}{}): {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)",
+                  if eng.kv8 { ", --kv8" } else { "" });
+    }
+    if o.loopcd_omega > 0.0 {
+        eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
+    }
+    for (l, addr) in listeners {
+        let auth = if o.key.is_some() {
+            if is_private_ip(addr.ip()) { "a key required (private/loopback)" } else { "a key required" }
+        } else if addr.ip().to_canonical().is_loopback() {
+            "no key (loopback)"
+        } else {
+            "no key (non-loopback explicitly enabled)"
+        };
+        eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+        spawn_accept_loop(l, cx.clone());
+    }
     scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
 }
 
@@ -2917,7 +3229,10 @@ mod tests {
         assert!(!context_over(0, 1, 3));
         // saturating: a huge prompt can never wrap into fitting
         assert!(context_over(usize::MAX, 1, 100));
-        assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
+        assert_eq!(
+            context_full_message(11, 5, 17),
+            "context full: 11 prompt tokens exceeds 10 maximum (17 per lane with 5 to generate and 2 reserved)"
+        );
     }
 
     #[test] fn chunked_bodies_decode_bounded_and_fail_closed() {
@@ -3526,13 +3841,6 @@ mod tests {
         let mut at_end = ext.clone(); at_end[100] = 9999;
         assert_eq!(reusable_prefix(&p, true, &at_end), 100, "diverging at the first suffix token still reuses the whole prompt");
     }
-    #[test] fn decoding_invalidates_only_when_a_write_wraps_into_prefill_history() {
-        assert!(!decode_overwrites_prompt(100, 100));
-        assert!(!decode_overwrites_prompt(EXT - 1, 100));
-        assert!(decode_overwrites_prompt(EXT, 100));
-        assert!(decode_overwrites_prompt(EXT, EXT));
-        assert!(decode_overwrites_prompt(EXT + 40, EXT + 40));
-    }
 
     #[test] fn inference_failures_reach_both_apis_without_a_success_terminator() {
         let tk = Arc::new(Tokenizer::for_test());
@@ -3851,6 +4159,7 @@ mod tests {
             "inflight": 0,
             "recommended_working_set_bytes": b.recommended_working_set_bytes,
             "model_bytes": b.model_bytes,
+            "starts_spilled": 0,
             "per_lane_worst_case_bytes": b.per_lane_worst_case_bytes,
             "max_admitted_lanes": b.max_admitted_lanes,
             "queued_requests": 0,
@@ -3864,9 +4173,11 @@ mod tests {
         cx.kv8 = false;
         let p = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
+        cx.metrics.lock().unwrap().starts_spilled = 2;
         let busy: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(busy["ok"], true);
         assert_eq!(busy["active_lanes"], 1);
+        assert_eq!(busy["starts_spilled"], 2);
         assert_eq!(busy["inflight"], 1);
         assert_eq!(busy["queued_requests"], 0);
         assert_eq!(busy["max_admitted_lanes"], 4);
@@ -4951,5 +5262,149 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[test] fn chat_and_messages_reject_wrongly_typed_fields_and_unrenderable_content() {
+        let (cx, jrx) = admission_test_ctx(4);
+        let check_400 = |is_msg: bool, req: Value, substr: &str| {
+            let mut out = Vec::new();
+            if is_msg {
+                messages(&cx, &req, &mut out).unwrap();
+            } else {
+                chat(&cx, &req, &mut out).unwrap();
+            }
+            let resp = String::from_utf8(out).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 400"), "is_msg={is_msg} req={req} resp={resp}");
+            assert!(resp.contains(substr), "is_msg={is_msg} expected {substr:?} in {resp}");
+            assert_eq!(cx.admission.inflight(), 0, "rejected request must not leak admission permits");
+            assert!(jrx.try_recv().is_err(), "rejected request must not reach scheduler");
+        };
+
+        for is_msg in [false, true] {
+            check_400(is_msg, json!("not-an-object"), "JSON object");
+            check_400(is_msg, json!([1, 2, 3]), "JSON object");
+            check_400(is_msg, json!({"max_tokens": 8, "temperature": "hot", "messages": [{"role": "user", "content": "hi"}]}), "temperature");
+            check_400(is_msg, json!({"max_tokens": 8, "temperature": true, "messages": [{"role": "user", "content": "hi"}]}), "temperature");
+            check_400(is_msg, json!({"max_tokens": 8, "top_p": true, "messages": [{"role": "user", "content": "hi"}]}), "top_p");
+            check_400(is_msg, json!({"max_tokens": 8, "top_p": "wide", "messages": [{"role": "user", "content": "hi"}]}), "top_p");
+            check_400(is_msg, json!({"max_tokens": 8, "stream": "yes", "messages": [{"role": "user", "content": "hi"}]}), "stream must be a boolean");
+            check_400(is_msg, json!({"max_tokens": 8, "stream": 1, "messages": [{"role": "user", "content": "hi"}]}), "stream must be a boolean");
+            check_400(is_msg, json!({"max_tokens": 8, "seed": "abc", "messages": [{"role": "user", "content": "hi"}]}), "seed");
+            check_400(is_msg, json!({"max_tokens": 8, "seed": 1.5, "messages": [{"role": "user", "content": "hi"}]}), "seed");
+            check_400(is_msg, json!({"max_tokens": 8, "model": 42, "messages": [{"role": "user", "content": "hi"}]}), "model must be a string");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": []}), "messages must not be empty");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": 42}]}), "content");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": []}]}), "empty");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]}), "unsupported");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": 123}]}]}), "string text field");
+        }
+
+        // Chat-specific effort, kwargs, tools, and content part checks.
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": "bogus", "messages": [{"role": "user", "content": "hi"}]}), "unknown effort level");
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": 2.0, "messages": [{"role": "user", "content": "hi"}]}), "0 and 0.99");
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": true, "messages": [{"role": "user", "content": "hi"}]}), "reasoning_effort");
+        check_400(false, json!({"max_tokens": 8, "chat_template_kwargs": "bad", "messages": [{"role": "user", "content": "hi"}]}), "chat_template_kwargs must be an object");
+        check_400(false, json!({"max_tokens": 8, "chat_template_kwargs": {"reasoning_effort": "bogus"}, "messages": [{"role": "user", "content": "hi"}]}), "unknown effort level");
+        check_400(false, json!({"max_tokens": 8, "thinking_budget": null, "thinking_budget_tokens": "bad", "messages": [{"role": "user", "content": "hi"}]}), "thinking_budget_tokens");
+        check_400(false, json!({"max_tokens": 8, "tools": "not-array", "messages": [{"role": "user", "content": "hi"}]}), "tools must be an array");
+        check_400(false, json!({"max_tokens": 8, "tools": [{"type": "function", "function": {}}], "messages": [{"role": "user", "content": "hi"}]}), "tool without a name");
+        check_400(false, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}]}]}), "unsupported content part type image_url");
+
+        // Messages-specific max_tokens type/range and non-object thinking/output_config checks.
+        check_400(true, json!({"max_tokens": "8", "messages": [{"role": "user", "content": "hi"}]}), "max_tokens must be between 1 and");
+        check_400(true, json!({"max_tokens": -5, "messages": [{"role": "user", "content": "hi"}]}), "max_tokens must be between 1 and");
+        check_400(true, json!({"max_tokens": 8, "thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}), "thinking must be an object");
+        check_400(true, json!({"max_tokens": 8, "output_config": "high", "messages": [{"role": "user", "content": "hi"}]}), "output_config must be an object");
+
+        // Real prompt limit stated in context_full_message (64 per lane - 1 to generate - 2 reserved = 61 max prompt tokens).
+        let msg = context_full_message(62, 1, 64);
+        assert!(msg.contains("context full") && msg.contains("61 maximum"), "got: {msg}");
+    }
+
+    #[test] fn startup_validation_reports_missing_specials_bad_models_and_binds_every_address() {
+        let mut stripped = Tokenizer::for_test();
+        let bad_tok = Tokenizer::for_byte_test();
+        // Build a tokenizer missing `<|message_user|>` by cloning `for_test` and re-encoding without specials.
+        let g_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("inky-serve-start-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&g_dir);
+        let bad_gguf = g_dir.join("not_a_model.gguf");
+        std::fs::write(&bad_gguf, b"NOT_GGUF_BYTES_AT_ALL_0123456789").unwrap();
+
+        // Missing special token returns a clean Err instead of panicking.
+        assert!(Specials::try_from_tokenizer(&stripped).is_ok());
+        assert!(Specials::try_from_tokenizer(&bad_tok).is_ok());
+        // Strip specials from `stripped` via GGUF roundtrip without `<|message_user|>` as special.
+        let _ = &mut stripped;
+        let empty_gguf = g_dir.join("no_specials.gguf");
+        let mut raw = b"GGUF".to_vec();
+        raw.extend(3u32.to_le_bytes());
+        raw.extend(0u64.to_le_bytes());
+        raw.extend(0u64.to_le_bytes());
+        raw.resize(32, 0);
+        std::fs::write(&empty_gguf, &raw).unwrap();
+        let mut g = crate::gguf::Gguf::open(empty_gguf.to_str().unwrap()).unwrap();
+        let mut toks = Vec::new();
+        let mut n = 0u32;
+        for b in 0..256u32 {
+            let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+            let cp = if keep { b } else { n += 1; 255 + n };
+            toks.push(char::from_u32(cp).unwrap().to_string());
+        }
+        g.kv.insert("tokenizer.ggml.tokens".into(), crate::gguf::Value::AS(toks));
+        g.kv.insert("tokenizer.ggml.token_type".into(), crate::gguf::Value::AI(vec![0; 256]));
+        g.kv.insert("tokenizer.ggml.merges".into(), crate::gguf::Value::AS(Vec::new()));
+        g.kv.insert("tokenizer.ggml.eos_token_id".into(), crate::gguf::Value::U(0));
+        let plain_tk = Tokenizer::try_load(&g).unwrap();
+        let sp_err = Specials::try_from_tokenizer(&plain_tk).err().expect("missing specials must error");
+        assert!(sp_err.contains("<|message_user|>"), "unexpected error: {sp_err}");
+
+        // Pre-mode validation rejects bad model file BEFORE entering inky mode (exit code 1).
+        let opts = ServeOpts {
+            model: bad_gguf.to_string_lossy().into_owned(),
+            ctx: 4096,
+            bind: vec!["127.0.0.1:0".parse().unwrap()],
+            lanes: 4,
+            effort: "medium".into(),
+            max_tokens: 64,
+            key: None,
+            queue: 4,
+            thinking_budget: 0,
+            loopcd_omega: 0.0,
+            record_dir: None,
+            record_max_bytes: crate::record::DEFAULT_MAX_FILE_BYTES,
+            spill_dir: None,
+            max_spill_bytes: crate::spill::DEFAULT_MAX_SPILL_BYTES,
+            kv8: false,
+        };
+        let (code, msg) = validate_serve_pre_mode(&opts).err().expect("bad model must fail pre-mode");
+        assert_eq!(code, 1);
+        assert!(msg.contains("could not load"), "got: {msg}");
+
+        // Multi-address bind binds every unique resolved address and fails cleanly if any address is occupied.
+        let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let v4_b: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // Distinct addresses (two ephemeral binds when port differs or v4 + v6 when IPv6 loopback is enabled).
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        assert!(bind_listeners(&[v4, occupied_addr]).is_err(), "occupied second address must fail cleanly");
+        drop(occupied);
+
+        let mut multi = vec![v4];
+        if let Ok(probe_v6) = TcpListener::bind("[::1]:0") {
+            drop(probe_v6);
+            multi.push("[::1]:0".parse().unwrap());
+        }
+        // Duplicate entries are deduplicated cleanly.
+        multi.push(v4_b);
+        let bound = bind_listeners(&multi).expect("all unique resolved addresses must bind");
+        assert_eq!(bound.len(), if multi.len() == 3 { 2 } else { 1 });
+        for (listener, local) in &bound {
+            assert_eq!(listener.local_addr().unwrap(), *local);
+            let _ = std::net::TcpStream::connect_timeout(local, Duration::from_secs(1)).expect("bound listener must accept TCP connect");
+        }
+        let _ = std::fs::remove_dir_all(&g_dir);
     }
 }

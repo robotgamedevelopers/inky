@@ -54,11 +54,6 @@ pub struct SealedId {
     index: u64,
 }
 
-impl SealedId {
-    /// This block's index inside its own tree (diagnostics, tests).
-    pub fn index(&self) -> u64 { self.index }
-}
-
 /// Why a block was not added. Nothing is added on any of these.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InsertError {

@@ -73,7 +73,7 @@ start no-zero check_mutant no-zero 'gpu.zero(kind, slot);' '{}'
 start kept-tail check_mutant kept-tail '        self.release_table(&table)?;' \
     '        for (_, e) in table.entries() { if self.pools.of(e.kind()).record(e.slot())?.sealed() { self.release(e)?; } }'
 # every-16 points on the wrong boundaries
-start every-off check_mutant every-off 'if (n / geo.block) % geo.every == 0 { reasons |= EVERY; }' \
+start every-off check_mutant every-off 'if (n / geo.block).is_multiple_of(geo.every) { reasons |= EVERY; }' \
     'if (n / geo.block) % geo.every == 1 { reasons |= EVERY; }'
 
 failed=0

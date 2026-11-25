@@ -68,7 +68,7 @@ impl Tensor {
         if !(1..=4).contains(&ne.len()) || ne.contains(&0) {
             return Err(invalid_model(format_args!("tensor {name} has invalid dimensions {ne:?}")));
         }
-        if ne[0] % block_elems != 0 {
+        if !ne[0].is_multiple_of(block_elems) {
             return Err(invalid_model(format_args!("tensor {name} has an incomplete quantization block in each row")));
         }
         let row_blocks = ne[0] / block_elems;
@@ -80,7 +80,7 @@ impl Tensor {
     }
 
     fn locate(&mut self, name: &str, data_off: usize, align: usize, file_len: usize) -> io::Result<()> {
-        if self.file_off % align != 0 {
+        if !self.file_off.is_multiple_of(align) {
             return Err(invalid_model(format_args!("tensor {name} has an unaligned offset")));
         }
         let out_of_bounds = || invalid_model(format_args!("tensor {name} extends beyond the file"));
@@ -176,7 +176,7 @@ impl<'a> Rd<'a> {
         let min_bytes = match et {
             0 | 1 | 7 => 1,
             2 | 3 => 2,
-            4 | 5 | 6 => 4,
+            4..=6 => 4,
             8 | 10 | 11 | 12 => 8,
             _ => return Err(invalid_model(format_args!("unsupported GGUF array element type {et}"))),
         };
@@ -288,12 +288,6 @@ impl Gguf {
             Some(Value::U(u)) => Ok(*u),
             Some(Value::I(i)) if *i >= 0 => Ok(*i as u64),
             _ => Err(invalid_model(format_args!("{k} must be a nonnegative integer"))),
-        }
-    }
-    pub fn u(&self, k: &str) -> u64 {
-        match self.kv.get(k) {
-            Some(Value::B(b)) => u64::from(*b),
-            _ => self.uint(k).unwrap(),
         }
     }
     pub fn f(&self, k: &str) -> io::Result<f32> {

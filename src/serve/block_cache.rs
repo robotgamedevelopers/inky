@@ -119,13 +119,13 @@ fn kind_idx(kind: BlockKind) -> usize {
 
 /// True when `end` (a multiple of `BLOCK`) is a periodic `EVERY` checkpoint boundary.
 pub fn is_every_checkpoint(end: usize) -> bool {
-    if end == 0 || end % BLOCK != 0 {
+    if end == 0 || !end.is_multiple_of(BLOCK) {
         return false;
     }
     if end <= EARLY_EVERY_LIMIT {
-        end % EARLY_EVERY_TOKENS == 0
+        end.is_multiple_of(EARLY_EVERY_TOKENS)
     } else {
-        end % LATE_EVERY_TOKENS == 0
+        end.is_multiple_of(LATE_EVERY_TOKENS)
     }
 }
 
@@ -340,18 +340,8 @@ impl ServeBlockCache {
     }
 
     #[allow(dead_code)]
-    pub fn set_spill_store(&mut self, store: SpillStore) {
-        self.spill_store = Some(store);
-    }
-
-    #[allow(dead_code)]
     pub fn spill_store(&self) -> Option<&SpillStore> {
         self.spill_store.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub fn spill_store_mut(&mut self) -> Option<&mut SpillStore> {
-        self.spill_store.as_mut()
     }
 
     /// Bounded host/disk-only maintenance safe to overlap with an in-flight GPU step:
@@ -372,14 +362,9 @@ impl ServeBlockCache {
             self.remove_spilled_start(oid, true);
             evicted += 1;
         }
-        let gc_evicted = if let Some(store) = self.spill_store.as_mut() {
-            if store.used_bytes() > store.max_bytes() {
-                store.evict_lru_to_fit(0, &HashSet::new())
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
+        let gc_evicted = match self.spill_store.as_mut() {
+            Some(store) => store.evict_lru_to_fit(0, &HashSet::new()),
+            None => Vec::new(),
         };
         if !gc_evicted.is_empty() {
             evicted += gc_evicted.len();
@@ -634,13 +619,9 @@ impl ServeBlockCache {
             return None;
         }
         let sid = matched.start?;
-        let all_live = match self.starts.get(&sid) {
-            Some(st) => {
-                debug_assert_eq!(st.pos, matched.at);
-                st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
-            }
-            None => return None,
-        };
+        let st = self.starts.get(&sid)?;
+        debug_assert_eq!(st.pos, matched.at);
+        let all_live = st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e));
         if !all_live {
             self.evict_start_inner(pools, sid, false, None);
             return None;
@@ -720,7 +701,7 @@ impl ServeBlockCache {
     fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart, restore: Option<&RestoreSource>) {
         if self.spill_store.is_none()
             || st.pos == 0
-            || st.pos % BLOCK != 0
+            || !st.pos.is_multiple_of(BLOCK)
             || st.toks.len() != st.pos
             || st.entries.is_empty()
         {
@@ -1375,7 +1356,7 @@ impl ServeBlockCache {
             }
         }
         // Retain start points on 64-token boundaries for `EVERY` and `PROMPT` checkpoints.
-        if end > 0 && end % BLOCK == 0 && state.sealed.len() == end / BLOCK {
+        if end > 0 && end.is_multiple_of(BLOCK) && state.sealed.len() == end / BLOCK {
             let prompt_ckpt = ((state.prompt_len.saturating_sub(1)) / BLOCK) * BLOCK;
             let mut reasons = 0u8;
             if (prompt_ckpt > 0 && end == prompt_ckpt) || end == state.prompt_len {

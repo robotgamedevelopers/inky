@@ -181,14 +181,14 @@ impl Sampler {
     }
 
     fn draw_dist(&mut self, dist: &[(u32, f32)]) -> u32 {
-        assert!(!dist.is_empty(), "empty sampling distribution");
+        let Some(&(last_tok, _)) = dist.last() else { return 0 };
         let total: f32 = dist.iter().map(|d| d.1).sum();
         let mut r = self.next_f32() * total;
         for &(tok, p) in dist {
             r -= p;
             if r <= 0.0 { return tok; }
         }
-        dist[dist.len() - 1].0
+        last_tok
     }
 
     /// p and q on the union of the two top-k sets, after softcap-after-top-k, `/temp`, and top-p.
@@ -197,8 +197,11 @@ impl Sampler {
         let k = if self.top_k == 0 { target.len().max(draft.len()) } else { self.top_k };
         let mut target_kept = Vec::new();
         let mut draft_kept = Vec::new();
-        select_top_k(target, k.min(target.len()), &mut target_kept).expect("invalid target sampling row");
-        select_top_k(draft, k.min(draft.len()), &mut draft_kept).expect("invalid draft sampling row");
+        if select_top_k(target, k.min(target.len()), &mut target_kept).is_err()
+            || select_top_k(draft, k.min(draft.len()), &mut draft_kept).is_err()
+        {
+            return Vec::new();
+        }
         let draft_ids: Vec<u32> = draft_kept.iter().map(|c| c.1).collect();
         let target_ids: Vec<u32> = target_kept.iter().map(|c| c.1).collect();
         // zeros of the other side sit on the support, after this side's own top-k, and do not enter its softmax
@@ -250,7 +253,7 @@ fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<
 
 /// Softcap after the top-k cut, then `/temp`, then the same top-p. `zeros` are the other side's
 /// top-k tokens: they extend the support with probability 0 and are not in the softmax.
-fn side_probs(cand: &mut Vec<(f32, u32)>, zeros: &[u32], softcap: f32, temp: f32, top_p: f32) -> Vec<(u32, f32)> {
+fn side_probs(cand: &mut [(f32, u32)], zeros: &[u32], softcap: f32, temp: f32, top_p: f32) -> Vec<(u32, f32)> {
     if cand.is_empty() { return Vec::new(); }
     cand.sort_by(|a, b| b.0.total_cmp(&a.0));
     let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };

@@ -1,0 +1,2 @@
+# Kernel launch, block-layout trace, and turn-recording entrypoints pass explicit scalar coordinates.
+too-many-arguments-threshold = 12

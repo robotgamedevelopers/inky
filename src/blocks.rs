@@ -65,13 +65,6 @@ impl BlockKind {
         }
     }
 
-    /// Bytes of one position at fp16. The stride divides into 64 positions.
-    pub fn position_bytes(self) -> usize {
-        let stride = self.stride();
-        debug_assert!(stride % BLOCK as u64 == 0);
-        (stride / BLOCK as u64) as usize
-    }
-
     /// Bytes in one slot at this element width. `kvb` is 2 for fp16 and 1 for `--kv8`.
     /// Any other width is refused. At 2 this is `FULL_STRIDE` or `WINDOW_STRIDE`.
     pub fn stride_bytes(self, kvb: u32) -> Result<u64, BlockError> {
@@ -274,7 +267,7 @@ pub fn table_index(kind: BlockKind, block: BlockIndex, blocks_per_kind: u32) -> 
 
 /// How many window blocks a span of `c` tokens pins. A span of 512 pins 25, not 17.
 pub fn span_bound(c: usize) -> usize {
-    (WINDOW - 1 + c + BLOCK - 1) / BLOCK + 1
+    (WINDOW - 1 + c).div_ceil(BLOCK) + 1
 }
 
 /// The next generation. `u32::MAX` is the last one; the successor is refused, never 0.
@@ -393,7 +386,6 @@ impl KeyAddr {
     pub fn slot(&self) -> Slot { self.slot }
     pub fn generation(&self) -> u32 { self.generation }
     pub fn kind(&self) -> BlockKind { self.kind }
-    pub fn kvb(&self) -> u32 { self.kvb }
 
     /// Byte offset of one key row. See `key_row`.
     pub fn row(&self, pass: u32, kv: Kv, head: u32) -> Result<u64, BlockError> {
@@ -666,13 +658,6 @@ impl BlockPool {
         Ok(self.bytes_of_mut(i))
     }
 
-    /// Explicitly zero-fill one slot's backing storage.
-    pub fn zero_slot(&mut self, slot: Slot) -> Result<(), BlockError> {
-        let i = self.index(slot)?;
-        self.bytes_of_mut(i).fill(0);
-        Ok(())
-    }
-
     fn slot_range(&self, i: usize) -> (usize, usize, usize) {
         let slab = i / self.slots_per_slab;
         let start = (i % self.slots_per_slab) * (self.stride as usize);
@@ -757,21 +742,6 @@ impl BlockPool {
         }
         let slot = self.grow()?;
         Ok((slot, self.take(slot)?))
-    }
-
-    /// Write the next position. `data` is one position. A sealed slot and a 65th position are refused.
-    /// Bytes past the new length stay as they were (zero after `take`).
-    pub fn append(&mut self, slot: Slot, data: &[u8]) -> Result<(), BlockError> {
-        let width = (self.stride / BLOCK as u64) as usize;
-        if data.len() != width { return Err(BlockError::Length); }
-        let i = self.index(slot)?;
-        if self.slots[i].generation() == 0 || self.slots[i].sealed() { return Err(BlockError::Length); }
-        let len = self.slots[i].length();
-        let new_len = block_length(len.checked_add(1).ok_or(BlockError::Overflow)?)?;
-        let at = (len as usize).checked_mul(width).ok_or(BlockError::Overflow)?;
-        self.bytes_of_mut(i)[at..at + width].copy_from_slice(data);
-        self.slots[i].set_length(new_len)?;
-        Ok(())
     }
 
     /// The lowest slot nothing references whose generation can still advance.
@@ -920,9 +890,9 @@ impl BlockTable {
         let lo = lo as usize;
         let hi = (hi as usize).min(n_blk.saturating_sub(1));
         let mut written = 0usize;
-        for b in lo..=hi {
+        for (b, slot_out) in dst.iter_mut().enumerate().take(hi + 1).skip(lo) {
             let bi = BlockIndex::new(b as u32);
-            dst[b] = match self.get(kind, bi)? {
+            *slot_out = match self.get(kind, bi)? {
                 Some(entry) => pool.gpu_table_entry(entry)?,
                 None => 0,
             };
@@ -1220,42 +1190,13 @@ mod tests {
         assert_eq!(pool.slot_bytes(slot).unwrap()[0], 0x11);
         pool.force_generation(slot, 0).unwrap();
         pool.take(slot).unwrap();
-        let width = BlockKind::Full.position_bytes();
-        let mut pos = vec![0u8; width];
-        pos[0] = 7;
-        pool.append(slot, &pos).unwrap();
+        pool.slot_bytes_mut_for_test(slot)[0] = 7;
+        pool.record_mut(slot).unwrap().set_length(1).unwrap();
         pool.record_mut(slot).unwrap().seal();
         pool.take(slot).unwrap();
         assert!(!pool.record(slot).unwrap().sealed());
         assert_eq!(pool.record(slot).unwrap().generation(), 2);
         assert!(pool.slot_bytes(slot).unwrap().iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn append_writes_the_next_position_only() {
-        let mut pool = BlockPool::new(BlockKind::Full, 1);
-        let slot = Slot::new(1).unwrap();
-        let width = BlockKind::Full.position_bytes();
-        let mut pos = vec![0u8; width];
-        pos[0] = 3;
-        assert_eq!(pool.append(slot, &pos), Err(BlockError::Length));
-        pool.take(slot).unwrap();
-        assert_eq!(pool.append(slot, &[0u8; 4]), Err(BlockError::Length));
-        pool.append(slot, &pos).unwrap();
-        assert_eq!(pool.record(slot).unwrap().length(), 1);
-        assert_eq!(pool.slot_bytes(slot).unwrap()[0], 3);
-        assert_eq!(pool.slot_bytes(slot).unwrap()[width], 0);
-        assert_eq!(*pool.slot_bytes(slot).unwrap().last().unwrap(), 0);
-        pool.record_mut(slot).unwrap().seal();
-        pos[0] = 9;
-        assert_eq!(pool.append(slot, &pos), Err(BlockError::Length));
-        assert_eq!(pool.record(slot).unwrap().length(), 1);
-        assert_eq!(pool.slot_bytes(slot).unwrap()[0], 3);
-        pool.record_mut(slot).unwrap().unseal();
-        pool.record_mut(slot).unwrap().set_length(64).unwrap();
-        assert_eq!(pool.append(slot, &pos), Err(BlockError::Length));
-        assert_eq!(pool.record(slot).unwrap().length(), 64);
-        assert!(!pool.record(slot).unwrap().sealed());
     }
 
     #[test]

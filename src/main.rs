@@ -150,7 +150,11 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "-c" | "--ctx" => o.ctx = parse_context(flag, value()?)?,
             "--bind" => bind = value()?,
             "--lanes" => o.lanes = parse_usize(flag, value()?)?,
-            "--effort" => o.effort = value()?.into(),
+            "--effort" => {
+                let v = value()?;
+                serve::validate_effort(v)?;
+                o.effort = v.into();
+            }
             "-n" => o.max_tokens = parse_usize(flag, value()?)?,
             "--key-env" | "--api-key-env" => {
                 let name = value()?;
@@ -238,6 +242,8 @@ mod cli_tests {
             (&["--loopcd", "-inf"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "5.0"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "abc"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--effort", "bogus"], "unknown effort level"),
+            (&["--effort", "2.0"], "unknown effort level"),
             (&["--typo"], "unknown serve option --typo"),
         ] {
             let err = serve_args(args).err().unwrap();
@@ -360,7 +366,7 @@ fn parse() -> (String, Opts) {
     let (cmd, mut o) = parse_cli_args(&raw).unwrap_or_else(|e| cli_error(e));
     if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
     if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
-    if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64; }
+    if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64; }
     (cmd, o)
 }
 
@@ -500,13 +506,13 @@ fn reference_tokens(text: &str, context: usize) -> Result<Vec<u32>, String> {
 
 fn reference_logits(raw: &[u8], tokens: usize, vocab: usize) -> Result<Vec<f32>, String> {
     let row_bytes = vocab * size_of::<f32>();
-    if raw.is_empty() || row_bytes == 0 || raw.len() % row_bytes != 0 || raw.len() / row_bytes > tokens {
+    if raw.is_empty() || row_bytes == 0 || !raw.len().is_multiple_of(row_bytes) || raw.len() / row_bytes > tokens {
         return Err(format!("expected 1 to {tokens} complete reference logit rows of width {vocab}, got {} bytes", raw.len()));
     }
     // Trimmed dumps cover the last positions of the token list.
     let first_pos = tokens - raw.len() / row_bytes;
-    raw.chunks_exact(size_of::<f32>()).enumerate().map(|(i, bytes)| {
-        let logit = f32::from_le_bytes(bytes.try_into().unwrap());
+    raw.as_chunks::<{ size_of::<f32>() }>().0.iter().enumerate().map(|(i, &bytes)| {
+        let logit = f32::from_le_bytes(bytes);
         if logit.is_finite() {
             Ok(logit)
         } else {
@@ -698,9 +704,9 @@ fn rows(o: &Opts) {
     cb.commit();
     cb.waitUntilCompleted();
     let mut ok = true;
-    for r in 0..1 + k {
+    for (r, exp) in expect.iter().enumerate().take(1 + k) {
         let got = eng.span_logits(r);
-        let same = got == expect[r].as_slice();
+        let same = got == exp.as_slice();
         ok &= same;
         println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
     }
@@ -734,7 +740,7 @@ fn rollback(o: &Opts) {
         cb.waitUntilCompleted();
     };
     let mut ok = true;
-    for (name, n_keep) in [("middle", (k + 1) / 2), ("last", k)] {
+    for (name, n_keep) in [("middle", k.div_ceil(2)), ("last", k)] {
         let reject_at = p0 + n_keep;
         assert!(n_keep >= 1 && n_keep < t && reject_at < ntok);
         let draft_tok = |i: usize| if i >= reject_at { ((i * 17 + 9) % 1000) as u32 } else { true_tok(i) };
@@ -1482,7 +1488,7 @@ fn dbatch(o: &Opts) {
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
+            for (j, h) in hs.iter_mut().enumerate().take(n) { h.push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
@@ -1501,7 +1507,7 @@ fn dbatch(o: &Opts) {
 fn sharedkv(o: &Opts) {
     use poolgate::{Layer3Pool, StepPath};
     let prefix_len: usize = std::env::var("INK_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    assert!(prefix_len >= 64 && prefix_len % 64 == 0, "INK_PREFIX must be a non-zero multiple of 64");
+    assert!(prefix_len >= 64 && prefix_len.is_multiple_of(64), "INK_PREFIX must be a non-zero multiple of 64");
     let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
     let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let max_suffix = 256usize;
@@ -1654,7 +1660,7 @@ fn maxctx(o: &Opts) {
     let steps = 8usize;
     let ckpts: Vec<usize> = std::env::var("INK_CKPTS").unwrap_or("16384,65536,131072,262000".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let last = *ckpts.iter().max().unwrap();
-    assert!(last + steps + 1 <= eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
+    assert!(last + steps < eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
     toks.truncate(last + steps + 1);
     // lane memory: what Metal's working set leaves after everything allocated so far, less the tuning's margin
     let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64).unwrap_or_else(|| {
@@ -1895,8 +1901,7 @@ fn main() {
                 return;
             }
             let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
-            enter_inky_mode();
-            serve::serve(options);
+            serve::serve_with_mode(options, enter_inky_mode);
             return;
         }
         Some("mode") => {

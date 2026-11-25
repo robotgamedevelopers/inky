@@ -10,6 +10,7 @@ set -eu
 setopt pipefail
 
 cd "${0:A:h}/.."
+source tests/soak_qualification.zsh
 
 duration=3600
 epoch=0
@@ -26,13 +27,13 @@ disconnect=30
 record_dir=
 record_max_bytes=1048576
 spill_dir=
-spill_max_bytes=0
+spill_max_bytes=
 max_rss_drift_pct=15
 allow_existing=0
 effort_note=medium
 
 usage() {
-    print -r -- "usage: tests/soak.sh [--duration DUR] [--epoch DUR] [--warmup-epochs N] [--lanes N] [--clients N] [--bind ADDR] [--ctx N] [--queue N] [--seed N] [--inky PATH] [--model PATH] [--disconnect-pct N] [--record-dir DIR] [--record-max-bytes N] [--spill-dir DIR] [--allow-existing-inky]"
+    print -r -- "usage: tests/soak.sh [--duration DUR] [--epoch DUR] [--warmup-epochs N] [--lanes N] [--clients N] [--bind ADDR] [--ctx N] [--queue N] [--seed N] [--inky PATH] [--model PATH] [--disconnect-pct N] [--record-dir DIR] [--record-max-bytes N] [--spill-dir DIR [--spill-max-bytes N]] [--allow-existing-inky]"
     print -r -- "receipt run: tests/soak.sh --duration 3600 --lanes 16"
     print -r -- "multi-day:   tests/soak.sh --duration 72h --lanes 16"
 }
@@ -78,7 +79,12 @@ integer_ok "$ctx" && (( ctx >= 64 )) || { print -r -- "bad --ctx"; exit 2 }
 integer_ok "$queue" && (( queue >= 0 )) || { print -r -- "bad --queue"; exit 2 }
 integer_ok "$disconnect" && (( disconnect >= 0 && disconnect <= 100 )) || { print -r -- "bad --disconnect-pct"; exit 2 }
 integer_ok "$record_max_bytes" && (( record_max_bytes >= 1 )) || { print -r -- "bad --record-max-bytes"; exit 2 }
-integer_ok "$spill_max_bytes" || { print -r -- "bad --spill-max-bytes"; exit 2 }
+if [[ -n $spill_max_bytes ]]; then
+    [[ -n $spill_dir ]] || { print -r -- "--spill-max-bytes requires --spill-dir"; exit 2 }
+    integer_ok "$spill_max_bytes" && (( spill_max_bytes > 0 )) || { print -r -- "bad --spill-max-bytes"; exit 2 }
+else
+    spill_max_bytes=$(( 64 * 1024 * 1024 * 1024 )) # server's default spill budget
+fi
 if [[ -z $seed ]]; then
     seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
 fi
@@ -128,7 +134,7 @@ fi
 command -v curl >/dev/null || { print -r -- "curl not found"; exit 4 }
 command -v go >/dev/null || { print -r -- "go not found (needed to build tests/soak_client.go)"; exit 4 }
 
-if (( allow_existing == 0 )) && ps -ax -o command= | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
+if (( allow_existing == 0 )) && ps -ax -o pid=,command= | awk -v self="$$" '$1 != self { $1=""; print substr($0, 2) }' | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
     print -r -- "refusing: inky or a cargo build is already running on this machine; not starting a second server"
     exit 3
 fi
@@ -213,9 +219,7 @@ client_args=(
     -record-max-total-bytes "$record_max_total_bytes"
     -max-rss-drift-pct "$max_rss_drift_pct"
 )
-if [[ -n $spill_dir ]]; then
-    client_args+=( -spill-dir "$spill_dir" -spill-max-total-bytes "$spill_max_bytes" )
-fi
+add_spill_args "$spill_dir" "$spill_max_bytes"
 
 if (( use_env_key == 1 )); then
     serve_cmd=( "${serve_args[@]}" )
@@ -333,9 +337,12 @@ fi
 print -r -- "check_recovery_wave=$recovery_ok completed=${recovery_completed:-missing} requested=${recovery_requested:-missing} server_active_lanes_end=${server_active_lanes_end:-missing} server_inflight_end=${server_inflight_end:-missing} server_queued_end=${server_queued_end:-missing} source=server_health_and_client_outstanding"
 print -r -- "check_client=$client_ok workload_completed=${workload_completed:-missing} client_exit=$client_ec"
 print -r -- "check_drift=${drift_ok:-0} epochs_total=${rec[epochs_total]:-0} epochs_steady=${rec[epochs_steady]:-0} rss_steady_first=${rec[rss_steady_first_bytes]:-0} rss_steady_last=${rec[rss_steady_last_bytes]:-0} rss_drift_bytes=${rec[rss_drift_bytes]:-0} record_dir_bytes_max=${rec[record_dir_bytes_max]:-0}"
+if [[ -n $spill_dir ]]; then
+    print -r -- "starts_spilled=${rec[starts_spilled]:-missing} spill_dir_bytes_max=${rec[spill_dir_bytes_max]:-missing} spill_max_bytes=$spill_max_bytes"
+fi
 print -r -- "check_wired_limit=$wired_restored before=$wired_before after=${wired_after:-unread}"
 print -r -- "prompt_lengths=short:${rec[prompt_short_bytes]:-64}B medium:${rec[prompt_medium_bytes]:-1024}B long:${rec[prompt_long_bytes]:-4096}B"
-print -r -- "max_tokens=${rec[max_tokens]:-16,64,256}"
+print -r -- "max_tokens=${rec[max_tokens]:-missing}"
 print -r -- "requests=${rec[requests]:-0} http_200=${rec[http_200]:-0} http_429=${rec[http_429]:-0} disconnected=${rec[disconnected]:-0} inflight_max=${rec[inflight_max]:-0}"
 print -r -- "effort_default=$effort_note temperature=0 stream=true"
 

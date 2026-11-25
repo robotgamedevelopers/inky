@@ -42,10 +42,21 @@ impl<'a> Session<'a> {
     /// Feed `toks` (preceded by any pending sampled token) through the model in prefill chunks.
     /// Returns the greedy next token (argmax of the last position); logits stay available in the engine.
     pub fn prefill(&mut self, toks: &[u32]) -> u32 {
+        self.try_prefill(toks).unwrap_or_else(|e| {
+            eprintln!("[inky] {e}");
+            std::process::exit(1);
+        })
+    }
+
+    pub fn try_prefill(&mut self, toks: &[u32]) -> Result<u32, String> {
         let mut all: Vec<u32> = self.pending.take().into_iter().collect();
         all.extend_from_slice(toks);
-        assert!(!all.is_empty());
-        assert!(self.n_past + all.len() < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
+        if all.is_empty() {
+            return Err("cannot prefill an empty token sequence".into());
+        }
+        if self.n_past.saturating_add(all.len()) >= self.eng.max_ctx {
+            return Err(format!("context full ({} tokens)", self.eng.max_ctx));
+        }
         let t0 = Instant::now();
         self.run().tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
         self.run().set_tokens(self.n_past, &all);
@@ -63,11 +74,13 @@ impl<'a> Session<'a> {
             last = Some(cb);
             p0 += t;
         }
-        last.unwrap().waitUntilCompleted();
+        if let Some(cb) = last {
+            cb.waitUntilCompleted();
+        }
         self.n_past = end;
         self.stats.prompt_tokens += all.len();
         self.stats.prompt_time += t0.elapsed();
-        self.run().token_at(end)
+        Ok(self.run().token_at(end))
     }
 
     /// Generate up to `max` tokens after a prefill. `on_token` returns false to stop early.
@@ -75,18 +88,23 @@ impl<'a> Session<'a> {
     /// never sits between steps. Exactly two steps are kept in flight, so the in-flight step always processes the token
     /// just emitted: when generation stops, the context (KV + conv state) is exactly "everything emitted so far".
     /// Sampling reads the logits back each step.
-    pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> usize {
+    pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, on_token: impl FnMut(u32) -> bool) -> usize {
+        self.try_generate(first, max, sampler, on_token).unwrap_or_else(|e| {
+            eprintln!("[inky] {e}");
+            std::process::exit(1);
+        })
+    }
+
+    pub fn try_generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> Result<usize, &'static str> {
         let t0 = Instant::now();
         let eng = self.eng.on(&self.lane);
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
-        if max == 0 { return 0; }
+        if max == 0 { return Ok(0); }
         let mut tok = if sampler.greedy() {
             first
         } else {
-            sampler
-                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
-                .expect("model sampling failed")
+            sampler.sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())?
         };
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
@@ -100,15 +118,17 @@ impl<'a> Session<'a> {
                 inflight.push_back(step(self.n_past));
                 loop {
                     if inflight.len() < 2 {
-                        let pos = inflight.back().unwrap().0 + 1;
-                        if pos >= eng.gen_capacity() {
-                            // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
-                            for (_, cb) in inflight.iter() { cb.waitUntilCompleted(); }
-                            eng.gen_reserve(pos);
+                        if let Some(&(last_pos, _)) = inflight.back() {
+                            let pos = last_pos + 1;
+                            if pos >= eng.gen_capacity() {
+                                // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
+                                for (_, cb) in inflight.iter() { cb.waitUntilCompleted(); }
+                                eng.gen_reserve(pos);
+                            }
+                            inflight.push_back(step(pos));
                         }
-                        inflight.push_back(step(pos));
                     }
-                    let (pos, cb) = inflight.pop_front().unwrap();
+                    let Some((pos, cb)) = inflight.pop_front() else { break };
                     cb.waitUntilCompleted();
                     self.n_past = pos + 1;
                     tok = eng.token_at(pos + 1);
@@ -130,9 +150,7 @@ impl<'a> Session<'a> {
                 eng.gen_reserve(self.n_past);
                 eng.step(self.n_past, true, false).waitUntilCompleted();
                 self.n_past += 1;
-                tok = sampler
-                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
-                    .expect("model sampling failed");
+                tok = sampler.sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())?;
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
             }
@@ -140,7 +158,7 @@ impl<'a> Session<'a> {
         }
         self.stats.gen_tokens += n;
         self.stats.gen_time += t0.elapsed();
-        n
+        Ok(n)
     }
 }
 

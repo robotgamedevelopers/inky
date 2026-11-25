@@ -39,12 +39,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-/// Positions in one sealed block (`docs/DESIGN.md`, Blocks).
-pub const BLOCK_POSITIONS: usize = 64;
-/// Bytes in one full-attention fp16 block (8 full passes, 2 MiB).
-pub const FULL_STRIDE: usize = 2 * 1024 * 1024;
-/// Bytes in one sliding-window fp16 block (40 window passes, 10 MiB).
-pub const WINDOW_STRIDE: usize = 10 * 1024 * 1024;
 /// Default `--max-spill-bytes` disk budget (64 GiB).
 pub const DEFAULT_MAX_SPILL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Maximum allowed recurrent state payload per spilled block (16 MiB;
@@ -228,13 +222,6 @@ impl SpillBlockKind {
         match self {
             Self::Full => 'f',
             Self::Window => 'w',
-        }
-    }
-
-    pub fn default_stride(self) -> usize {
-        match self {
-            Self::Full => FULL_STRIDE,
-            Self::Window => WINDOW_STRIDE,
         }
     }
 }
@@ -830,10 +817,6 @@ impl SpillStore {
         &self.dir
     }
 
-    pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -1000,7 +983,7 @@ impl SpillStore {
         let total_bytes = (SPILL_HEADER_LEN as u64)
             .checked_add(kv_bytes.len() as u64)
             .and_then(|v| v.checked_add(state_slice.len() as u64))
-            .ok_or_else(|| SpillError::PayloadTooLarge(usize::MAX))?;
+            .ok_or(SpillError::PayloadTooLarge(usize::MAX))?;
 
         if total_bytes > self.max_bytes {
             self.stats.over_budget_drops += 1;
@@ -1791,7 +1774,7 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         })();
 
         if claim.is_err() {
-            for s in full_slots.into_iter().chain(window_slots.into_iter()) {
+            for s in full_slots.into_iter().chain(window_slots) {
                 let _ = self.pool.drop_ref(s);
                 let _ = self.pool.release_cold_slot(s);
             }
@@ -1810,7 +1793,7 @@ impl<P: SpillPoolBackend> SpillManager<P> {
     /// `Restoring`), returning every reserved slot to free & zero-filled state.
     pub fn release_reservation(&mut self, reservation: WorkingSetReservation) {
         self.active_reservations.remove(&reservation.id);
-        for s in reservation.full_slots.into_iter().chain(reservation.window_slots.into_iter()) {
+        for s in reservation.full_slots.into_iter().chain(reservation.window_slots) {
             let _ = self.pool.drop_ref(s);
             let _ = self.pool.release_cold_slot(s);
         }
@@ -2021,8 +2004,8 @@ impl<P: SpillPoolBackend> SpillManager<P> {
 
         for ((&key, maybe_blk), slot) in disk_full
             .iter()
-            .zip(verified_full.into_iter())
-            .zip(reservation.full_slots.into_iter())
+            .zip(verified_full)
+            .zip(reservation.full_slots)
         {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 // Concurrent lane already restored `key`; pin existing slot and free redundant slot.
@@ -2061,8 +2044,8 @@ impl<P: SpillPoolBackend> SpillManager<P> {
 
         for ((&key, maybe_blk), slot) in disk_window
             .iter()
-            .zip(verified_window.into_iter())
-            .zip(reservation.window_slots.into_iter())
+            .zip(verified_window)
+            .zip(reservation.window_slots)
         {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 self.pool.add_ref(existing).expect("pin existing restored window slot");
@@ -3190,6 +3173,7 @@ mod tests {
 
     #[test]
     fn full_scale_block_and_recurrent_state_roundtrip() {
+        const FULL_STRIDE: usize = 2 * 1024 * 1024;
         let scratch = ScratchTestDir::new("full-scale");
         let dir = scratch.path().join("spill");
         // Real Layer 3 Full block (2 MiB) + Inkling 2 Mini recurrent state (~3.66 MiB).

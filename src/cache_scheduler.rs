@@ -1260,11 +1260,7 @@ impl CacheScheduler {
     }
 
     fn prompt_end_of(&self, target: u32) -> u32 {
-        if target > self.cfg.block_size {
-            target - self.cfg.block_size
-        } else {
-            0
-        }
+        target.saturating_sub(self.cfg.block_size)
     }
 
     fn is_prefilling(&self, l: &SchedLane) -> bool {
@@ -2398,14 +2394,12 @@ impl CacheScheduler {
             let bi = (l.pos / bsz) as usize;
             let off = (l.pos % bsz) as usize;
             let cnt = self.step_span[&ln] as usize;
-            for opt_id in [&l.full[bi], &l.win[bi]] {
-                if let Some(id) = opt_id {
-                    let b = self.blocks.get_mut(id).unwrap();
-                    if b.present() && !b.sealed {
-                        b.length = (off + cnt) as u32;
-                        for d in &mut b.data[off..off + cnt] {
-                            *d = 1;
-                        }
+            for id in [&l.full[bi], &l.win[bi]].into_iter().flatten() {
+                let b = self.blocks.get_mut(id).unwrap();
+                if b.present() && !b.sealed {
+                    b.length = (off + cnt) as u32;
+                    for d in &mut b.data[off..off + cnt] {
+                        *d = 1;
                     }
                 }
             }
@@ -2447,7 +2441,7 @@ impl CacheScheduler {
             .collect();
         let boundary_lanes: BTreeSet<String> = surviving
             .iter()
-            .filter(|l| (self.lanes[*l].pos + self.step_span[*l]) % bsz == 0)
+            .filter(|l| (self.lanes[*l].pos + self.step_span[*l]).is_multiple_of(bsz))
             .cloned()
             .collect();
 
@@ -2874,7 +2868,7 @@ pub fn walk_cache_scheduler(
 
     // Opening scenario when `max_queue >= 2` and `lanes.len() >= 3` and `max_len > min_len`:
     // deterministically exercise BOTH `admit` queue-bypass (`wait_ticks += 1`) AND `build_step` `StepBypassed` (`wait_ticks += 1`).
-    if seed % 2 == 0
+    if seed.is_multiple_of(2)
         && cfg.max_queue >= 2
         && lanes.len() >= 3
         && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget
