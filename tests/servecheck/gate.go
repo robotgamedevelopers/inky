@@ -252,7 +252,7 @@ func verifyConcurrentToolCalls(wantName string, ref toolSample, got []toolSample
 
 func (g *gate) concurrentToolCalls() error {
 	const concurrency = 4
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 90*time.Second)
 	defer cancel()
 	nonStreamBody, err := toolCallRequestBody(false)
 	if err != nil {
@@ -297,7 +297,7 @@ func (g *gate) concurrentToolCalls() error {
 			}
 			got[o.idx] = o.sample
 		}
-		if g.sabotage == "concurrent-tool-calls" && tc.stream {
+		if g.sabotageEnabled("concurrent-tool-calls") && tc.stream {
 			// Negative control: inject duplicate call ID + argument bleed to prove validator catches it.
 			got[1].ToolCalls[0].ID = got[0].ToolCalls[0].ID
 			got[1].ToolCalls[0].Function.Arguments += "bleed"
@@ -335,7 +335,7 @@ func verifyDisconnectMidThinking(logBytes []byte, maxTokens int, drained healthS
 
 func (g *gate) disconnectMidThinking() error {
 	const thinkMaxTokens = 512
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
 	defer cancel()
 	// Solo seeded reference before the disconnect trial (same 1-lane server guarantees exact lane reuse).
 	refBody := `{"messages":[{"role":"user","content":"What is 17 times 23? Answer with only the integer."}],"max_tokens":32,"seed":9001,"temperature":0.8,"reasoning_effort":"none","stream":false}`
@@ -454,7 +454,7 @@ func (g *gate) disconnectMidThinking() error {
 	if err != nil {
 		return err
 	}
-	if g.sabotage == "disconnect-mid-thinking" {
+	if g.sabotageEnabled("disconnect-mid-thinking") {
 		// Negative control: simulate an uncancelled lane that ran to max_tokens.
 		fakeLog := []byte(fmt.Sprintf("[serve] client gone after %d generated tokens; lane freed\n", thinkMaxTokens))
 		if err := verifyDisconnectMidThinking(fakeLog, thinkMaxTokens, drained, ref, followUp); err != nil {

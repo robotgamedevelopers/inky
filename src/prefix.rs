@@ -37,7 +37,7 @@
 //! on a tree block are the same fact seen from two sides; the caller
 //! seals in both places, this file cannot seal for the pool.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::blocks::{BlockEntry, BlockError, BlockKind, Slot};
@@ -51,12 +51,12 @@ pub use crate::blocks::BLOCK;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SealedId {
     tree: u64,
-    index: u32,
+    index: u64,
 }
 
 impl SealedId {
     /// This block's index inside its own tree (diagnostics, tests).
-    pub fn index(&self) -> u32 { self.index }
+    pub fn index(&self) -> u64 { self.index }
 }
 
 /// Why a block was not added. Nothing is added on any of these.
@@ -70,6 +70,8 @@ pub enum InsertError {
     UnknownParent,
     /// The parent id belongs to a different tree.
     ForeignId,
+    /// All distinct block IDs in the tree have been issued.
+    IdExhausted,
 }
 
 /// The deepest start point a request matches.
@@ -136,7 +138,7 @@ struct Node<B> {
 fn digest(parent: Option<SealedId>, pos: usize, tokens: &[u32]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let mut mix = |x: u64| h = (h ^ x).wrapping_mul(0x100000001b3);
-    mix(parent.map(|p| p.index as u64 + 1).unwrap_or(0));
+    mix(parent.map(|p| p.index + 1).unwrap_or(0));
     mix(pos as u64);
     for &t in tokens { mix(t as u64); }
     h
@@ -147,24 +149,32 @@ static NEXT_TREE: AtomicU64 = AtomicU64::new(1);
 /// The prefix tree of sealed blocks.
 pub struct PrefixTree<B> {
     tree: u64,
-    nodes: Vec<Option<Node<B>>>,
+    next_index: u64,
+    // Keep live blocks in insertion order; IDs of evicted blocks remain invalid.
+    nodes: BTreeMap<u64, Node<B>>,
     roots: Vec<SealedId>,
     by_digest: HashMap<u64, Vec<SealedId>>,
 }
 
 impl<B: Copy> PrefixTree<B> {
     pub fn new() -> PrefixTree<B> {
-        PrefixTree { tree: NEXT_TREE.fetch_add(1, Ordering::Relaxed), nodes: Vec::new(), roots: Vec::new(), by_digest: HashMap::new() }
+        PrefixTree {
+            tree: NEXT_TREE.fetch_add(1, Ordering::Relaxed),
+            next_index: 0,
+            nodes: BTreeMap::new(),
+            roots: Vec::new(),
+            by_digest: HashMap::new(),
+        }
     }
 
     fn node(&self, id: SealedId) -> Option<&Node<B>> {
         if id.tree != self.tree { return None; }
-        self.nodes.get(id.index as usize).and_then(|n| n.as_ref())
+        self.nodes.get(&id.index)
     }
 
     fn node_mut(&mut self, id: SealedId) -> Option<&mut Node<B>> {
         if id.tree != self.tree { return None; }
-        self.nodes.get_mut(id.index as usize).and_then(|n| n.as_mut())
+        self.nodes.get_mut(&id.index)
     }
 
     /// Add one sealed block. `parent` is the block before it (`None` for
@@ -189,8 +199,13 @@ impl<B: Copy> PrefixTree<B> {
                 if n.parent == parent && n.pos == pos && n.tokens.as_ref() == tokens { return Ok(id); }
             }
         }
-        let id = SealedId { tree: self.tree, index: self.nodes.len() as u32 };
-        self.nodes.push(Some(Node { parent, pos, digest: d, tokens: tokens.into(), handle, starts: 0, pins: 0, children: Vec::new() }));
+        let index = self.next_index;
+        self.next_index = index.checked_add(1).ok_or(InsertError::IdExhausted)?;
+        let id = SealedId { tree: self.tree, index };
+        self.nodes.insert(index, Node {
+            parent, pos, digest: d, tokens: tokens.into(), handle,
+            starts: 0, pins: 0, children: Vec::new(),
+        });
         match parent {
             None => self.roots.push(id),
             Some(p) => self.node_mut(p).expect("the parent was just checked").children.push(id),
@@ -208,8 +223,8 @@ impl<B: Copy> PrefixTree<B> {
     /// Every live block with its handle, root-first in insertion order
     /// (a parent always precedes its children).
     pub fn entries(&self) -> Vec<(SealedId, B)> {
-        self.nodes.iter().enumerate()
-            .filter_map(|(i, n)| n.as_ref().map(|n| (SealedId { tree: self.tree, index: i as u32 }, n.handle)))
+        self.nodes.iter()
+            .map(|(&index, n)| (SealedId { tree: self.tree, index }, n.handle))
             .collect()
     }
 
@@ -327,7 +342,7 @@ impl<B: Copy> PrefixTree<B> {
         }
         let mut handles = Vec::new();
         for g in gone {
-            let n = self.nodes[g.index as usize].take().expect("collected blocks are live");
+            let n = self.nodes.remove(&g.index).expect("collected blocks are live");
             if let Some(bucket) = self.by_digest.get_mut(&n.digest) {
                 bucket.retain(|&b| b != g);
                 if bucket.is_empty() { self.by_digest.remove(&n.digest); }
@@ -696,6 +711,28 @@ mod tests {
     }
 
     #[test]
+    fn pruned_prefixes_release_node_storage_and_leave_old_ids_invalid() {
+        let mut tree = PrefixTree::new();
+        let root = tree.insert(None, 0, &block(1), 11).unwrap();
+        tree.retain_start(root).unwrap();
+        let old = tree.insert(Some(root), BLOCK, &block(2), 12).unwrap();
+        assert_eq!(tree.prune_unreferenced(old), 1);
+        for i in 0..4096 {
+            let tip = tree.insert(Some(root), BLOCK, &block(2), i).unwrap();
+            assert_ne!(old, tip);
+            assert!(!tree.pin(old).unwrap());
+            assert!(tree.remove(old).is_empty());
+            assert_eq!(tree.insert(Some(old), 2 * BLOCK, &block(3), 13), Err(InsertError::UnknownParent));
+            assert_eq!(tree.entries(), vec![(root, 11), (tip, i)]);
+            assert_eq!(tree.prune_unreferenced(tip), 1);
+        }
+        assert_eq!(tree.nodes.len(), 1, "evicted nodes must not accumulate");
+        assert!(tree.release_start(root));
+        assert_eq!(tree.prune_unreferenced(root), 1);
+        assert!(tree.nodes.is_empty());
+    }
+
+    #[test]
     fn remove_shrinks_the_tree_and_returns_handles() {
         let (mut t, ids) = tree3();
         t.retain_start(ids[2]).unwrap();
@@ -708,6 +745,17 @@ mod tests {
         assert_ne!(b, ids[1], "ids are never reused");
         t.retain_start(b).unwrap();
         assert_eq!(t.deepest_start(&toks).blocks, vec![10, 21]);
+    }
+
+    #[test]
+    fn exhausted_tree_ids_never_wrap_or_replace_existing_nodes() {
+        let mut tree = PrefixTree::new();
+        let root = tree.insert(None, 0, &block(1), 11).unwrap();
+        tree.next_index = u64::MAX - 1;
+        let tip = tree.insert(Some(root), BLOCK, &block(2), 12).unwrap();
+        assert_eq!(tree.insert(Some(root), BLOCK, &block(2), 13), Ok(tip));
+        assert_eq!(tree.insert(Some(tip), 2 * BLOCK, &block(3), 14), Err(InsertError::IdExhausted));
+        assert_eq!(tree.entries(), vec![(root, 11), (tip, 12)]);
     }
 
     #[test]

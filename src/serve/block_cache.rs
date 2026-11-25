@@ -6,7 +6,7 @@
 
 use crate::blockbook::{EVERY, PROMPT};
 use crate::blocks::{
-    span_bound, BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
+    BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
 };
 use crate::engine::EXT;
 use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, PrefixTree, SealedId};
@@ -87,6 +87,20 @@ struct SpilledStart {
     last_used_tick: u64,
 }
 
+// Preserve the source files and shorter resident match while making room for a restore.
+struct RestoreSource {
+    spill_id: u64,
+    keys: HashSet<SpillKey>,
+    resident_start: Option<SealedId>,
+}
+
+/// Only blocks leaving the sliding window during this span need their table entries cleared.
+/// A cached prefix binds the still-live window at its checkpoint, so the same range applies on a hit.
+fn newly_expired_window_blocks(start: usize, end: usize) -> std::ops::Range<usize> {
+    let first_needed = |pos: usize| pos.saturating_sub(EXT - 1) / BLOCK;
+    first_needed(start)..first_needed(end)
+}
+
 fn to_spill_kind(kind: BlockKind) -> SpillBlockKind {
     match kind {
         BlockKind::Full => SpillBlockKind::Full,
@@ -135,81 +149,63 @@ pub struct InflightPrefillLane<'a> {
     pub eligible_follower: bool,
 }
 
-/// Maximum checkpoint boundary `ckpt >= EARLY_EVERY_TOKENS` strictly shorter than both `toks`
-/// and an active runnable prefilling leader's `pf_end` that the leader will seal ahead of
-/// `leader.n_past`.
-pub fn inflight_shared_checkpoint(toks: &[u32], leaders: &[InflightPrefillLane<'_>]) -> usize {
-    if toks.len() <= EARLY_EVERY_TOKENS {
-        return 0;
+/// A producer must be strictly ahead in (progress, reverse lane ID) and must seal the
+/// checkpoint where this follower actually waits. Use the same rule in admission and scheduling.
+fn can_lead(me: &InflightPrefillLane<'_>, producer: &InflightPrefillLane<'_>, next: usize) -> bool {
+    if !me.runnable
+        || !me.eligible_follower
+        || next <= me.n_past
+        || next >= me.pf_end
+        || !producer.runnable
+        || producer.n_past >= next
+        || next >= producer.pf_end
+    {
+        return false;
     }
-    let mut best = 0usize;
-    for leader in leaders {
-        if !leader.runnable || leader.n_past >= leader.pf_end || leader.pf_end <= EARLY_EVERY_TOKENS {
+    let ahead = producer.n_past > me.n_past || (producer.n_past == me.n_past && producer.lane < me.lane);
+    let prompt_checkpoint = (producer.pf_end - 1) / BLOCK * BLOCK;
+    ahead
+        && (is_every_checkpoint(next) || next == prompt_checkpoint)
+        && producer.toks[..next] == me.toks[..next]
+}
+
+pub fn find_prefill_leader(lanes: &[InflightPrefillLane<'_>], idx: usize) -> Option<usize> {
+    let me = lanes.get(idx)?;
+    let next = effective_pf_target(me.n_past, me.pf_end);
+    lanes.iter().find(|producer| can_lead(me, producer, next)).map(|producer| producer.lane)
+}
+
+/// Furthest checkpoint these lanes will rendezvous at before their inputs diverge.
+/// A producer's final, nonperiodic PROMPT checkpoint only counts if the follower also stops there.
+fn inflight_shared_checkpoint(me: &InflightPrefillLane<'_>, lanes: &[InflightPrefillLane<'_>]) -> usize {
+    let next = effective_pf_target(me.n_past, me.pf_end);
+    let final_checkpoint = me.pf_end.saturating_sub(1) / BLOCK * BLOCK;
+    let mut best = 0;
+    for producer in lanes {
+        if !can_lead(me, producer, next) {
             continue;
         }
-        let limit = (toks.len() - 1).min(leader.pf_end - 1).min(leader.toks.len() - 1);
-        if limit < EARLY_EVERY_TOKENS || leader.n_past >= limit {
-            continue;
+        let limit = me.pf_end.min(producer.pf_end) - 1;
+        let common_final = final_checkpoint == (producer.pf_end - 1) / BLOCK * BLOCK;
+        if common_final && me.toks[next..final_checkpoint] == producer.toks[next..final_checkpoint] {
+            return final_checkpoint;
         }
-        if leader.toks[..EARLY_EVERY_TOKENS] != toks[..EARLY_EVERY_TOKENS] {
-            continue;
+        let last_periodic = max_every_checkpoint_le(limit);
+        if last_periodic > best && last_periodic >= next {
+            let before = &me.toks[next..last_periodic];
+            let after = &producer.toks[next..last_periodic];
+            let common = if before == after {
+                last_periodic
+            } else {
+                next + before.iter().zip(after).take_while(|(a, b)| a == b).count()
+            };
+            best = best.max(max_every_checkpoint_le(common));
         }
-        let common = EARLY_EVERY_TOKENS
-            + leader.toks[EARLY_EVERY_TOKENS..=limit]
-                .iter()
-                .zip(&toks[EARLY_EVERY_TOKENS..=limit])
-                .take_while(|(a, b)| a == b)
-                .count();
-        let capped = common.min(limit);
-        let every_ckpt = max_every_checkpoint_le(capped);
-        if every_ckpt >= EARLY_EVERY_TOKENS && leader.n_past < every_ckpt {
-            best = best.max(every_ckpt);
-        }
-        let leader_prompt_ckpt = ((leader.pf_end - 1) / BLOCK) * BLOCK;
-        if leader_prompt_ckpt >= EARLY_EVERY_TOKENS
-            && leader_prompt_ckpt <= capped
-            && leader.n_past < leader_prompt_ckpt
-        {
-            best = best.max(leader_prompt_ckpt);
+        if best == final_checkpoint {
+            break;
         }
     }
     best
-}
-
-/// Returns `Some(leader_lane)` if `lanes[idx]` is an eligible untouched prefilling follower
-/// whose next checkpoint will be sealed by another active runnable prefilling lane strictly
-/// ahead in `(n_past, Reverse(lane))` order, or `None` if this lane should run itself.
-pub fn find_prefill_leader(lanes: &[InflightPrefillLane<'_>], idx: usize) -> Option<usize> {
-    let me = lanes.get(idx)?;
-    if !me.runnable || !me.eligible_follower || me.n_past + 1 >= me.pf_end {
-        return None;
-    }
-    let next_ckpt = effective_pf_target(me.n_past, me.pf_end);
-    if next_ckpt <= me.n_past || next_ckpt >= me.pf_end || next_ckpt % BLOCK != 0 {
-        return None;
-    }
-    let every = is_every_checkpoint(next_ckpt);
-    for cand in lanes {
-        if cand.lane == me.lane || !cand.runnable || cand.n_past >= cand.pf_end {
-            continue;
-        }
-        if cand.n_past >= next_ckpt || next_ckpt >= cand.pf_end || next_ckpt > cand.toks.len() {
-            continue;
-        }
-        let leader_prompt_ckpt = ((cand.pf_end - 1) / BLOCK) * BLOCK;
-        if !every && next_ckpt != leader_prompt_ckpt {
-            continue;
-        }
-        let ahead_or_tie =
-            cand.n_past > me.n_past || (cand.n_past == me.n_past && cand.lane < me.lane);
-        if !ahead_or_tie {
-            continue;
-        }
-        if cand.toks[..next_ckpt] == me.toks[..next_ckpt] {
-            return Some(cand.lane);
-        }
-    }
-    None
 }
 
 /// Compute the capped prefill target for the current step so `finish_prefill_span` lands
@@ -246,14 +242,19 @@ pub struct InflightLaneReserve<'a> {
     pub runnable: bool,
 }
 
-/// Exact remaining `Full` slots already promised to currently active lanes (unwritten prompt suffix
-/// plus remaining bounded decode reserve), avoiding double-counting shared prefixes for voluntary
-/// singleflight followers waiting on a runnable prefilling leader.
-pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
-    if lanes.is_empty() {
-        return 0;
+impl InflightLaneReserve<'_> {
+    fn reserved_end(&self) -> usize {
+        let prompt_end = self.n_past.max(self.pf_end);
+        // The first generated token comes from the final prompt row. For longer
+        // replies, keep reserving the next bounded tranche after earlier tokens were emitted.
+        prompt_end + self.max_gen.saturating_sub(self.gen.max(1)).min(MAX_ADMIT_DECODE_RESERVE)
     }
-    let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
+}
+
+/// Pool slots not already owned by a lane or covered by a strictly earlier producer.
+/// Including the incoming lane in the same election handles reuse of a low-numbered idle lane.
+pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
+    let prefills: Vec<_> = lanes
         .iter()
         .filter(|l| l.gen == 0 && l.n_past < l.pf_end)
         .map(|l| InflightPrefillLane {
@@ -266,31 +267,16 @@ pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize 
         })
         .collect();
 
-    let mut total = 0usize;
-    for l in lanes {
-        let unwritten_prompt_tokens = if l.gen == 0 && l.n_past < l.pf_end {
-            let mut unwritten = l.pf_end.saturating_sub(l.n_past);
-            if let Some(cand_idx) = prefill_cands.iter().position(|c| c.lane == l.lane) {
-                if find_prefill_leader(&prefill_cands, cand_idx).is_some() {
-                    let other_leaders: Vec<InflightPrefillLane<'_>> = prefill_cands
-                        .iter()
-                        .copied()
-                        .filter(|c| c.lane != l.lane)
-                        .collect();
-                    let shared_ckpt = inflight_shared_checkpoint(l.toks, &other_leaders);
-                    if shared_ckpt > l.n_past {
-                        unwritten = l.pf_end.saturating_sub(shared_ckpt);
-                    }
-                }
-            }
-            unwritten
-        } else {
-            0
-        };
-        let rem_dec_tokens = l.max_gen.min(MAX_ADMIT_DECODE_RESERVE).saturating_sub(l.gen);
-        total += (unwritten_prompt_tokens + rem_dec_tokens).div_ceil(BLOCK);
-    }
-    total
+    lanes
+        .iter()
+        .map(|lane| {
+            let credited = prefills
+                .iter()
+                .find(|f| f.lane == lane.lane && f.eligible_follower)
+                .map_or(0, |f| inflight_shared_checkpoint(f, &prefills));
+            lane.reserved_end().div_ceil(BLOCK) - lane.written.max(credited).div_ceil(BLOCK)
+        })
+        .sum()
 }
 
 fn entry_is_live_sealed(pools: &BlockPools, kind: BlockKind, e: BlockEntry) -> bool {
@@ -316,7 +302,6 @@ pub struct ServeBlockCache {
     entry_spill_keys: HashMap<(u8, u32, u32), SpillKey>,
     spill_key_to_entry: HashMap<SpillKey, (u8, u32, u32)>,
     next_spill_id: u64,
-    next_spill_block_id: u64,
     max_spilled_starts: usize,
 }
 
@@ -342,7 +327,6 @@ impl ServeBlockCache {
             entry_spill_keys: HashMap::new(),
             spill_key_to_entry: HashMap::new(),
             next_spill_id: 1,
-            next_spill_block_id: 1,
             max_spilled_starts: DEFAULT_MAX_SPILLED_STARTS,
         }
     }
@@ -409,9 +393,15 @@ impl ServeBlockCache {
     /// Number of slots in `kind`'s pool that are currently free (`refs == 0`) OR held only by
     /// evictable `RetainedStart` entries (no active lane references them).
     pub fn free_plus_evictable_slots(&self, pools: &BlockPools, kind: BlockKind) -> usize {
+        self.pool_headroom(pools, kind).1
+    }
+
+    // (non-retired capacity, slots reclaimable before any active lane is released).
+    fn pool_headroom(&self, pools: &BlockPools, kind: BlockKind) -> (usize, usize) {
         let pool = pools.of(kind);
         let srefs = &self.start_slot_refs[kind_idx(kind)];
-        let mut avail = 0usize;
+        let mut usable = 0;
+        let mut avail = 0;
         for i in 0..pool.len() {
             let slot = Slot::new((i + 1) as u32).expect("valid pool slot");
             let rec = pool.record(slot).expect("pool record");
@@ -423,80 +413,101 @@ impl ServeBlockCache {
                 rec.refs(),
                 held_by_starts
             );
-            if rec.generation() < u32::MAX && rec.refs() <= held_by_starts {
-                avail += 1;
+            if rec.generation() < u32::MAX {
+                usable += 1;
+                if rec.refs() <= held_by_starts {
+                    avail += 1;
+                }
             }
         }
-        avail
+        (usable, avail)
     }
 
-    /// Peek how many leading tokens of `toks` match a live `RetainedStart` without mutating state.
+    fn resident_start(&self, pools: &BlockPools, toks: &[u32]) -> Option<&RetainedStart> {
+        let prefix = toks.get(..toks.len().checked_sub(1)?)?;
+        let matched = self.tree.deepest_start(prefix);
+        let st = self.starts.get(&matched.start?)?;
+        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)).then_some(st)
+    }
+
+    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt.
     pub fn peek_match_len(&self, pools: &BlockPools, toks: &[u32]) -> usize {
-        if toks.len() <= 1 {
-            return 0;
-        }
-        let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
-        if matched.at == 0 {
-            return 0;
-        }
-        let Some(sid) = matched.start else {
-            return 0;
-        };
-        let Some(st) = self.starts.get(&sid) else {
-            return 0;
-        };
-        if st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)) {
-            matched.at
-        } else {
-            0
-        }
+        self.resident_start(pools, toks).map_or(0, |st| st.pos)
     }
 
-    /// Pool-pressure admission guard: returns true if `pools` has enough free + evictable slots
-    /// for this request's uncached prompt suffix plus bounded decode reserve. Always returns true
-    /// when `active_lanes == 0` so at least one request always makes progress and never deadlocks.
-    #[allow(dead_code)]
+    /// Check the marginal cost of binding the prospective lane and completing the bounded
+    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
     pub fn can_admit(
         &mut self,
         pools: &BlockPools,
-        active_lanes: usize,
+        active: &[InflightLaneReserve<'_>],
+        lane: usize,
         toks: &[u32],
         max_gen: usize,
         chunk: usize,
     ) -> bool {
-        self.can_admit_with_shared(pools, active_lanes, toks, max_gen, chunk, 0, 0)
-    }
-
-    /// Pool-pressure admission guard accounting for an in-flight shared prefix checkpoint
-    /// `shared_ckpt` being produced by an active prefilling leader AND `reserved_inflight_full_slots`
-    /// already promised to currently active lanes. `need_full` credits `cached.max(shared_ckpt)`
-    /// while `need_win` stays conservative since each admitted lane binds its own window table entries.
-    pub fn can_admit_with_shared(
-        &mut self,
-        pools: &BlockPools,
-        active_lanes: usize,
-        toks: &[u32],
-        max_gen: usize,
-        chunk: usize,
-        shared_ckpt: usize,
-        reserved_inflight_full_slots: usize,
-    ) -> bool {
-        if active_lanes == 0 {
+        // The handler and scheduler backstop enforce each single-lane physical context bound.
+        // With no competing jobs, retained-only slots are reclaimable on demand.
+        if active.is_empty() {
             return true;
         }
-        let cached = self.peek_match_len(pools, toks);
-        let effective_cached = cached.max(shared_ckpt.min(toks.len().saturating_sub(1)));
-        let uncached_full = toks.len().saturating_sub(effective_cached);
-        let uncached_win = toks.len().saturating_sub(cached);
-        let dec_reserve = max_gen.min(MAX_ADMIT_DECODE_RESERVE);
-        let need_full = (uncached_full + dec_reserve).div_ceil(BLOCK) + 2;
-        let need_win = ((WINDOW / BLOCK) + 2 + uncached_win.min(chunk).div_ceil(BLOCK))
-            .min(span_bound(chunk) + 2);
-        let avail_full = self
-            .free_plus_evictable_slots(pools, BlockKind::Full)
-            .saturating_sub(reserved_inflight_full_slots);
-        let ok = avail_full >= need_full
-            && self.free_plus_evictable_slots(pools, BlockKind::Window) >= need_win;
+
+        let (usable_window, available_window) = self.pool_headroom(pools, BlockKind::Window);
+        let available_full = self.free_plus_evictable_slots(pools, BlockKind::Full);
+        let mut pins = [0; 2];
+        let mut cached = 0;
+        if let Some(st) = self.resident_start(pools, toks) {
+            cached = st.pos;
+            for &(kind, _, entry) in &st.entries {
+                let i = kind_idx(kind);
+                let slot = entry.slot();
+                let refs = self.start_slot_refs[i][slot.pool_index().get() as usize];
+                if pools.of(kind).record(slot).unwrap().refs() == refs {
+                    pins[i] += 1;
+                }
+            }
+        }
+
+        let mut cohort = active.to_vec();
+        let mut fits = |start: usize, newly_pinned: [usize; 2]| {
+            cohort.push(InflightLaneReserve {
+                lane,
+                toks,
+                n_past: start,
+                pf_end: toks.len(),
+                cached: start,
+                written: start,
+                gen: 0,
+                max_gen,
+                runnable: true,
+            });
+            let full = reserved_inflight_full_slots(&cohort) + newly_pinned[kind_idx(BlockKind::Full)];
+            let mut window_growth = newly_pinned[kind_idx(BlockKind::Window)];
+            let mut steady_window = 0;
+            for lane in &cohort {
+                let end = (lane.pf_end + lane.max_gen.saturating_sub(1)).div_ceil(BLOCK);
+                window_growth += end - lane.written.div_ceil(BLOCK);
+                steady_window += end.min(WINDOW / BLOCK + 1);
+            }
+            // Two independent upper bounds: all remaining writes with no pruning, or the
+            // whole cohort's rolling windows plus one shared step budget and per-span rounding.
+            let peak_window = steady_window + chunk.div_ceil(BLOCK) + cohort.len();
+            let window_ok = window_growth <= available_window || peak_window <= usable_window;
+            cohort.pop();
+            full <= available_full && window_ok
+        };
+
+        let mut ok = fits(cached, pins);
+        // A deeper SSD restore can replace the resident start during bind. Budget that outcome
+        // too, including the newly pinned restored blocks, without doing disk I/O on a refused job.
+        if ok && !toks.is_empty() && !self.spilled_starts.is_empty() {
+            let disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]).at;
+            if disk > cached {
+                let blocks = disk / BLOCK;
+                let already_pinned_full = cached / BLOCK - pins[kind_idx(BlockKind::Full)];
+                ok = fits(disk, [blocks.min(WINDOW / BLOCK), blocks - already_pinned_full]);
+            }
+        }
         if !ok {
             self.stats.admit_deferred_pool_pressure += 1;
         }
@@ -521,7 +532,7 @@ impl ServeBlockCache {
             return None;
         }
         self.release_lane(pools, tbl, state);
-        let matched = self.match_and_bind(pools, tbl, state, toks);
+        let matched = self.bind_resident_start(pools, tbl, state, toks);
         if let Some((matched_at, _)) = &matched {
             if *matched_at > n_past {
                 self.stats.singleflight_rebinds += 1;
@@ -558,7 +569,7 @@ impl ServeBlockCache {
                     None => false,
                 };
                 if !all_live {
-                    self.evict_start_inner(pools, sid, false);
+                    self.evict_start_inner(pools, sid, false, None);
                     in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
                 }
             } else {
@@ -573,6 +584,13 @@ impl ServeBlockCache {
                 }
             }
         }
+        self.bind_resident_start(pools, tbl, state, toks)
+    }
+
+    fn bind_resident_start(
+        &mut self, pools: &mut BlockPools, tbl: &mut BlockTable, state: &mut LaneBlockState, toks: &[u32],
+    ) -> Option<(usize, Vec<u8>)> {
+        state.prompt_len = toks.len();
         let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
         if matched.at == 0 {
             return None;
@@ -586,7 +604,7 @@ impl ServeBlockCache {
             None => return None,
         };
         if !all_live {
-            self.evict_start_inner(pools, sid, false);
+            self.evict_start_inner(pools, sid, false, None);
             return None;
         }
         self.tick += 1;
@@ -616,8 +634,7 @@ impl ServeBlockCache {
     }
 
     fn alloc_spill_key(&mut self, kind: BlockKind) -> SpillKey {
-        self.next_spill_block_id = self.next_spill_block_id.wrapping_add(1).max(1);
-        SpillKey::new(to_spill_kind(kind), self.next_spill_block_id)
+        self.spill_store.as_mut().expect("spill keys require an open store").fresh_key(to_spill_kind(kind))
     }
 
     fn remove_spilled_start(&mut self, spill_id: u64, delete_from_disk: bool) {
@@ -662,7 +679,7 @@ impl ServeBlockCache {
         }
     }
 
-    fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart) {
+    fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart, restore: Option<&RestoreSource>) {
         if self.spill_store.is_none()
             || st.pos == 0
             || st.pos % BLOCK != 0
@@ -682,9 +699,10 @@ impl ServeBlockCache {
             let oldest = self
                 .spilled_starts
                 .iter()
+                .filter(|(id, _)| !restore.is_some_and(|source| source.spill_id == **id))
                 .min_by_key(|(_, sp)| (sp.last_used_tick, std::cmp::Reverse(sp.pos)))
                 .map(|(&id, _)| id);
-            let Some(oid) = oldest else { break };
+            let Some(oid) = oldest else { return };
             self.remove_spilled_start(oid, true);
         }
         if self.max_spilled_starts == 0 {
@@ -694,7 +712,7 @@ impl ServeBlockCache {
         let spill_id = self.next_spill_id;
         self.next_spill_id = self.next_spill_id.wrapping_add(1).max(1);
 
-        let mut protected: HashSet<SpillKey> = HashSet::new();
+        let mut protected = restore.map(|source| source.keys.clone()).unwrap_or_default();
         let mut newly_written_keys: Vec<SpillKey> = Vec::new();
         let mut spilled_entries: Vec<(BlockKind, BlockIndex, SpillKey)> =
             Vec::with_capacity(st.entries.len());
@@ -710,7 +728,7 @@ impl ServeBlockCache {
                 .spill_store
                 .as_ref()
                 .is_some_and(|store| store.contains(sk));
-            if already_on_disk {
+            if !is_new_key && already_on_disk {
                 protected.insert(sk);
                 spilled_entries.push((kind, bi, sk));
                 continue;
@@ -938,7 +956,7 @@ impl ServeBlockCache {
             return None;
         }
 
-        // Phase 1: read and SHA-256 verify cs + every needed KV block BEFORE mutating pools or evicting RAM.
+        // Recurrent state is needed by every restore and has a separate bounded spill record.
         let cs = match self.spill_store.as_mut()?.read_block(cs_key, Some(0)) {
             ReadOutcome::Hit(blk) => match blk.recurrent_state {
                 Some(cs) if !cs.is_empty() => cs,
@@ -953,71 +971,27 @@ impl ServeBlockCache {
             }
         };
 
-        let mut verified_kv: Vec<Vec<u8>> = Vec::with_capacity(disk_entries.len());
-        for &(kind, _, sk) in &disk_entries {
-            let expected_len = pools.of(kind).stride_bytes() as usize;
-            match self.spill_store.as_mut()?.read_block(sk, Some(expected_len)) {
-                ReadOutcome::Hit(blk) => verified_kv.push(blk.kv_bytes),
-                ReadOutcome::Miss(_) => {
-                    self.remove_spilled_start(spill_id, true);
-                    return None;
-                }
-            }
+        let source = RestoreSource {
+            spill_id,
+            keys: entries.iter().map(|&(_, _, key)| key).chain(std::iter::once(cs_key)).collect(),
+            resident_start: in_ram.start,
+        };
+        // Reused blocks and newly loaded blocks stay private to the restore until the
+        // complete checkpoint is verified. This list owns one temporary ref per entry.
+        let mut held = Vec::with_capacity(entries.len());
+        for (bi, fe) in reused_full {
+            pools.full.record_mut(fe.slot()).unwrap().add_ref().expect("pin reused full block");
+            held.push((BlockKind::Full, bi, fe));
+        }
+        if self.stage_restore_blocks(pools, &source, &disk_entries, &mut held).is_none() {
+            Self::release_restore_refs(pools, held);
+            return None;
         }
 
-        // Phase 2: pin reused in-RAM entries so take_zeroed_slot cannot evict them.
-        for &(_, fe) in &reused_full {
-            pools
-                .of_mut(BlockKind::Full)
-                .record_mut(fe.slot())
-                .unwrap()
-                .add_ref()
-                .expect("temp pin reused full block");
-        }
-
-        let mut taken: Vec<(BlockKind, BlockIndex, BlockEntry)> =
-            Vec::with_capacity(disk_entries.len());
-        for ((kind, bi, _), kv_bytes) in disk_entries.into_iter().zip(verified_kv.into_iter()) {
-            match self.take_zeroed_slot(pools, kind) {
-                Ok((slot, gen)) => {
-                    let pool = pools.of_mut(kind);
-                    let Ok(dst) = pool.slot_bytes_mut(slot) else {
-                        for (k, _, e) in taken {
-                            let _ = pools.of_mut(k).record_mut(e.slot()).and_then(|r| r.drop_ref());
-                        }
-                        for (_, fe) in reused_full {
-                            let _ = pools.of_mut(BlockKind::Full).record_mut(fe.slot()).and_then(|r| r.drop_ref());
-                        }
-                        return None;
-                    };
-                    dst.copy_from_slice(&kv_bytes);
-                    let rec = pool.record_mut(slot).unwrap();
-                    rec.set_length(BLOCK as u32).expect("set restored block length");
-                    rec.seal();
-                    rec.add_ref().expect("temp pin restored slot");
-                    let offset = pool.offset(slot).expect("restored slot offset");
-                    let entry = BlockEntry::new(slot, gen, offset, kind, pool.kvb());
-                    taken.push((kind, bi, entry));
-                }
-                Err(_) => {
-                    for (k, _, e) in taken {
-                        let _ = pools.of_mut(k).record_mut(e.slot()).and_then(|r| r.drop_ref());
-                    }
-                    for (_, fe) in reused_full {
-                        let _ = pools.of_mut(BlockKind::Full).record_mut(fe.slot()).and_then(|r| r.drop_ref());
-                    }
-                    return None;
-                }
-            }
-        }
-
-        // Phase 3: assemble EntryTree nodes and RetainedStart, transferring refs cleanly.
+        // Publish the verified checkpoint, transferring its provisional refs to the retained start.
         let mut full_by_bi: HashMap<u32, BlockEntry> = HashMap::with_capacity(pos / BLOCK);
         let mut win_by_bi: HashMap<u32, BlockEntry> = HashMap::with_capacity(WINDOW / BLOCK);
-        for &(bi, fe) in &reused_full {
-            full_by_bi.insert(bi.get(), fe);
-        }
-        for &(kind, bi, e) in &taken {
+        for &(kind, bi, e) in &held {
             match kind {
                 BlockKind::Full => {
                     full_by_bi.insert(bi.get(), e);
@@ -1096,40 +1070,72 @@ impl ServeBlockCache {
             );
         }
 
-        // Release temporary pins taken during Phase 2.
-        for (k, _, e) in taken {
-            pools
-                .of_mut(k)
-                .record_mut(e.slot())
-                .unwrap()
-                .drop_ref()
-                .expect("drop temp restored slot pin");
-        }
-        for (_, fe) in reused_full {
-            pools
-                .of_mut(BlockKind::Full)
-                .record_mut(fe.slot())
-                .unwrap()
-                .drop_ref()
-                .expect("drop temp reused full pin");
-        }
-
+        Self::release_restore_refs(pools, held);
         self.remove_spilled_start(spill_id, true);
         self.stats.starts_restored += 1;
         Some(tip)
     }
 
-    #[allow(dead_code)]
-    fn evict_start(&mut self, pools: &mut BlockPools, sid: SealedId) -> bool {
-        self.evict_start_inner(pools, sid, true)
+    fn stage_restore_blocks(
+        &mut self,
+        pools: &mut BlockPools,
+        source: &RestoreSource,
+        disk_entries: &[(BlockKind, BlockIndex, SpillKey)],
+        held: &mut Vec<(BlockKind, BlockIndex, BlockEntry)>,
+    ) -> Option<()> {
+        let mut verified_before_eviction = false;
+        for (i, &(kind, bi, key)) in disk_entries.iter().enumerate() {
+            if !verified_before_eviction && pools.of(kind).lowest_free().is_none() {
+                // A bad file must not discard a healthy resident checkpoint. Only the
+                // restore that needs eviction pays for this extra pass, one block at a time.
+                for &(remaining_kind, _, remaining_key) in &disk_entries[i..] {
+                    let len = pools.of(remaining_kind).stride_bytes() as usize;
+                    self.read_restore_kv(source.spill_id, remaining_key, len)?;
+                }
+                verified_before_eviction = true;
+            }
+            let len = pools.of(kind).stride_bytes() as usize;
+            let bytes = self.read_restore_kv(source.spill_id, key, len)?;
+            let (slot, generation) = self.take_zeroed_slot_inner(pools, kind, Some(source)).ok()?;
+            let pool = pools.of_mut(kind);
+            pool.slot_bytes_mut(slot).ok()?.copy_from_slice(&bytes);
+            let rec = pool.record_mut(slot).unwrap();
+            rec.set_length(BLOCK as u32).expect("set restored block length");
+            rec.seal();
+            rec.add_ref().expect("pin restored block");
+            let offset = pool.offset(slot).expect("restored slot offset");
+            held.push((kind, bi, BlockEntry::new(slot, generation, offset, kind, pool.kvb())));
+        }
+        Some(())
     }
 
-    fn evict_start_inner(&mut self, pools: &mut BlockPools, sid: SealedId, allow_spill: bool) -> bool {
+    fn read_restore_kv(&mut self, spill_id: u64, key: SpillKey, expected_len: usize) -> Option<Vec<u8>> {
+        match self.spill_store.as_mut()?.read_block(key, Some(expected_len)) {
+            ReadOutcome::Hit(block) => Some(block.kv_bytes),
+            ReadOutcome::Miss(_) => {
+                self.remove_spilled_start(spill_id, true);
+                None
+            }
+        }
+    }
+
+    fn release_restore_refs(pools: &mut BlockPools, held: Vec<(BlockKind, BlockIndex, BlockEntry)>) {
+        for (kind, _, entry) in held {
+            pools.of_mut(kind).record_mut(entry.slot()).unwrap().drop_ref().expect("drop restore ref");
+        }
+    }
+
+    #[allow(dead_code)]
+    fn evict_start(&mut self, pools: &mut BlockPools, sid: SealedId) -> bool {
+        self.evict_start_inner(pools, sid, true, None)
+    }
+
+    fn evict_start_inner(&mut self, pools: &mut BlockPools, sid: SealedId, allow_spill: bool, restore: Option<&RestoreSource>) -> bool {
         let Some(st) = self.starts.remove(&sid) else {
             return false;
         };
         if allow_spill && self.spill_store.is_some() {
-            self.spill_retained_start(pools, &st);
+            self.spill_retained_start(pools, &st, restore);
         }
         let _ = self.tree.release_start(sid);
         for (kind, _, e) in st.entries {
@@ -1146,9 +1152,10 @@ impl ServeBlockCache {
         true
     }
 
-    fn evict_one_lru_start_inner(&mut self, pools: &mut BlockPools, allow_spill: bool) -> bool {
+    fn evict_one_lru_start_inner(&mut self, pools: &mut BlockPools, allow_spill: bool, restore: Option<&RestoreSource>) -> bool {
         let mut victim: Option<(SealedId, u64, usize)> = None;
         for (&sid, st) in &self.starts {
+            if restore.is_some_and(|source| source.resident_start == Some(sid)) { continue; }
             let better = match victim {
                 None => true,
                 // Evict oldest LRU tick first; on a tie, evict deeper leaf before shallower shared root.
@@ -1164,7 +1171,7 @@ impl ServeBlockCache {
         let Some((sid, _, _)) = victim else {
             return false;
         };
-        self.evict_start_inner(pools, sid, allow_spill)
+        self.evict_start_inner(pools, sid, allow_spill, restore)
     }
 
     /// Take one zeroed slot of `kind`, evicting LRU retained start points until a free slot
@@ -1174,6 +1181,15 @@ impl ServeBlockCache {
         &mut self,
         pools: &mut BlockPools,
         kind: BlockKind,
+    ) -> Result<(Slot, u32), CacheError> {
+        self.take_zeroed_slot_inner(pools, kind, None)
+    }
+
+    fn take_zeroed_slot_inner(
+        &mut self,
+        pools: &mut BlockPools,
+        kind: BlockKind,
+        restore: Option<&RestoreSource>,
     ) -> Result<(Slot, u32), CacheError> {
         loop {
             if let Some(slot) = pools.of(kind).lowest_free() {
@@ -1186,7 +1202,7 @@ impl ServeBlockCache {
                 }
                 return Ok((slot, gen));
             }
-            if !self.evict_one_lru_start_inner(pools, true) {
+            if !self.evict_one_lru_start_inner(pools, true, restore) {
                 return Err(CacheError::PoolExhausted(kind));
             }
         }
@@ -1236,12 +1252,8 @@ impl ServeBlockCache {
         Ok(())
     }
 
-    fn prune_expired_window(&mut self, pools: &mut BlockPools, tbl: &mut BlockTable, next_pos: usize) {
-        let min_win_blk = next_pos.saturating_sub(EXT - 1) / BLOCK;
-        if min_win_blk == 0 {
-            return;
-        }
-        for b in 0..min_win_blk {
+    fn prune_expired_window(&mut self, pools: &mut BlockPools, tbl: &mut BlockTable, start: usize, end: usize) {
+        for b in newly_expired_window_blocks(start, end) {
             let bi = BlockIndex::new(b as u32);
             if tbl.get(BlockKind::Window, bi).expect("window block in range").is_some() {
                 tbl.clear_kind_entry(&mut pools.window, bi)
@@ -1294,7 +1306,7 @@ impl ServeBlockCache {
                         .expect("insert sealed block into EntryTree");
                     let canon = self.tree.handle(id).expect("inserted handle");
                     let canon_f = canon.full();
-                    let canon_w = canon.window().expect("window handle on sealed block");
+                    let canon_w = canon.window();
                     let mut best_f = full_e;
                     let mut best_w = win_e;
                     if canon_f != full_e && entry_is_live_sealed(pools, BlockKind::Full, canon_f) {
@@ -1303,12 +1315,12 @@ impl ServeBlockCache {
                         best_f = canon_f;
                         self.stats.shared_dedups += 1;
                     }
-                    if canon_w != win_e && entry_is_live_sealed(pools, BlockKind::Window, canon_w) {
+                    if let Some(canon_w) = canon_w.filter(|&w| w != win_e && entry_is_live_sealed(pools, BlockKind::Window, w)) {
                         tbl.fill(&mut pools.window, bi, canon_w.slot(), canon_w.generation())
                             .expect("share canonical window block");
                         best_w = canon_w;
                     }
-                    if best_f != canon_f || best_w != canon_w {
+                    if best_f != canon_f || Some(best_w) != canon_w {
                         let _ = self.tree.set_handle(id, BlockHandles::new(best_f, Some(best_w)));
                     }
                     self.tree.pin(id).expect("pin newly sealed block");
@@ -1384,7 +1396,7 @@ impl ServeBlockCache {
                 }
             }
         }
-        self.prune_expired_window(pools, tbl, end);
+        self.prune_expired_window(pools, tbl, p0, end);
     }
 
     /// Post-decode bookkeeping: update unsealed block length (never sealed into `EntryTree`)
@@ -1411,7 +1423,7 @@ impl ServeBlockCache {
                 .set_length(block_len)
                 .expect("set decode length");
         }
-        self.prune_expired_window(pools, tbl, end);
+        self.prune_expired_window(pools, tbl, pos, end);
     }
 
     /// Release a lane's block-table references and unpin its `EntryTree` path so private/unsealed
@@ -1437,7 +1449,7 @@ impl ServeBlockCache {
 
     /// Evict every retained start point so all pool references drain cleanly on shutdown.
     pub fn shutdown(&mut self, pools: &mut BlockPools) {
-        while self.evict_one_lru_start_inner(pools, false) {}
+        while self.evict_one_lru_start_inner(pools, false, None) {}
     }
 }
 
@@ -1445,8 +1457,26 @@ impl ServeBlockCache {
 mod tests {
     use super::*;
 
+    mod spill_model;
+
     fn fake_cs(tag: u8) -> Vec<u8> {
         vec![tag; 16]
+    }
+
+    #[test]
+    fn window_pruning_visits_each_expired_block_once() {
+        // A cold prefill or a single span that advances a restored checkpoint.
+        assert_eq!(newly_expired_window_blocks(0, 2048), 0..16);
+        assert_eq!(newly_expired_window_blocks(2048, 4096), 16..48);
+        // At 128K context, 64 consecutive decode steps expire exactly one block.
+        let pos = 131072;
+        let first_live = (pos - EXT) / BLOCK;
+        let visited: Vec<_> = (pos..pos + BLOCK)
+            .flat_map(|p| newly_expired_window_blocks(p, p + 1))
+            .collect();
+        assert_eq!(visited, vec![first_live]);
+        assert_eq!(newly_expired_window_blocks(pos, pos + BLOCK - 2), first_live..first_live);
+        assert_eq!(newly_expired_window_blocks(pos + BLOCK - 2, pos + BLOCK - 1), first_live..first_live + 1);
     }
 
     #[test]
@@ -1515,6 +1545,15 @@ mod tests {
             .expect("Turn 2 must match Turn 1 prompt checkpoint");
         assert_eq!(matched, 8256);
         assert_eq!(cs, fake_cs((8256 / BLOCK) as u8));
+        // The first window block restored with this checkpoint stays live up to the boundary.
+        let oldest = BlockIndex::new(((matched - EXT) / BLOCK) as u32);
+        let near_boundary = matched + BLOCK - 2;
+        for (start, end) in [(matched, near_boundary), (near_boundary, near_boundary + 1)] {
+            cache.ensure_span_blocks(&mut pools, &mut tbl, start, end - start).unwrap();
+            cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &turn2, start, end - start, || fake_cs(0));
+            assert_eq!(tbl.get(BlockKind::Window, oldest).unwrap().is_some(), end == near_boundary);
+            assert!(tbl.get(BlockKind::Full, oldest).unwrap().is_some());
+        }
         cache.release_lane(&mut pools, &mut tbl, &mut st);
 
         // Card 2: shares first 6,500 tokens (system+tools), diverges after -> must hit 6,144!
@@ -1569,7 +1608,7 @@ mod tests {
 
         // Pool-pressure admit guard: always admits when active_lanes == 0, defers when active lane fills pool.
         let big: Vec<u32> = (0..4000u32).map(|i| 90000 + i).collect();
-        assert!(cache.can_admit(&pools, 0, &big, 1024, 2048));
+        assert!(cache.can_admit(&pools, &[], 0, &big, 1024, 2048));
         // Requesting more window blocks in a single span than exist in the pool returns PoolExhausted without panicking.
         assert_eq!(
             cache.ensure_span_blocks(&mut pools, &mut tbl, 0, 3840),
@@ -1586,7 +1625,7 @@ mod tests {
             cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &active_toks, ap, chunk_t, || fake_cs(9));
             ap += chunk_t;
         }
-        assert!(!cache.can_admit(&pools, 1, &big, 1024, 2048), "should defer when active lane consumes pool");
+        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
         cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
     }
@@ -1692,19 +1731,6 @@ mod tests {
         // Admit all 22 simultaneous requests at t=0 via in-flight shared prefix accounting.
         let mut planner = ServeStepPlanner::new(nlanes, 16);
         for i in 0..nlanes {
-            let leaders: Vec<InflightPrefillLane<'_>> = lanes
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.active && l.n_past < l.toks.len())
-                .map(|(idx, l)| InflightPrefillLane {
-                    lane: idx,
-                    toks: &l.toks,
-                    n_past: l.n_past,
-                    pf_end: l.toks.len(),
-                    runnable: true,
-                    eligible_follower: false,
-                })
-                .collect();
             let reserves: Vec<InflightLaneReserve<'_>> = lanes
                 .iter()
                 .enumerate()
@@ -1721,21 +1747,8 @@ mod tests {
                     runnable: true,
                 })
                 .collect();
-            let reserved_inflight_full = reserved_inflight_full_slots(&reserves);
-            let shared_ckpt = inflight_shared_checkpoint(&lanes[i].toks, &leaders);
-            if i > 0 {
-                assert_eq!(shared_ckpt, 8192);
-            }
             assert!(
-                cache.can_admit_with_shared(
-                    &pools,
-                    i,
-                    &lanes[i].toks,
-                    128,
-                    chunk,
-                    shared_ckpt,
-                    reserved_inflight_full,
-                ),
+                cache.can_admit(&pools, &reserves, i, &lanes[i].toks, 128, chunk),
                 "lane {i} should admit under singleflight shared prefix accounting"
             );
             let l = &mut lanes[i];
@@ -2023,17 +2036,20 @@ mod tests {
         assert_eq!(find_prefill_leader(&cands, 1), None, "prompt < EARLY_EVERY_TOKENS must never wait");
         assert_eq!(find_prefill_leader(&cands, 2), None, "diverged prefix must never wait");
 
-        assert_eq!(inflight_shared_checkpoint(&short_toks, &cands[..1]), 0);
-        assert_eq!(inflight_shared_checkpoint(&diverged_toks, &cands[..1]), 0);
+        assert_eq!(inflight_shared_checkpoint(&cands[1], &cands[..1]), 0);
+        assert_eq!(inflight_shared_checkpoint(&cands[2], &cands[..1]), 0);
         let mut matching = leader_toks.clone();
         matching.extend(90000..90300);
-        assert_eq!(inflight_shared_checkpoint(&matching, &cands[..1]), 8448);
+        let longer = InflightPrefillLane { lane: 1, toks: &matching, pf_end: matching.len(), ..cands[0] };
+        assert_eq!(inflight_shared_checkpoint(&longer, &cands[..1]), 8192, "only the common periodic boundary is promised");
+        let equal = InflightPrefillLane { lane: 1, ..cands[0] };
+        assert_eq!(inflight_shared_checkpoint(&equal, &cands[..1]), 8448);
     }
 
     #[test]
     fn simultaneous_burst_admission_guard_prevents_midflight_exhaustion() {
         // 130 Full slots = 8,320 tokens. Each request needs (2000 + 512).div_ceil(64) = 40 Full slots
-        // (+ 2 guard margin = 42). Six independent requests arriving simultaneously would demand 240 Full
+        // Six independent requests arriving simultaneously would demand 240 Full
         // slots (> 130) if admitted together; reserved_inflight_full_slots must admit 3 and defer 3!
         let mut pools = BlockPools::with_capacities(130, 128, 1).unwrap();
         let mut cache = ServeBlockCache::new();
@@ -2074,9 +2090,7 @@ mod tests {
                     runnable: true,
                 })
                 .collect();
-            let reserved = reserved_inflight_full_slots(&reserves);
-            let active_now = lanes.iter().filter(|l| l.active).count();
-            if !cache.can_admit_with_shared(&pools, active_now, toks, max_gen, chunk, 0, reserved) {
+            if !cache.can_admit(&pools, &reserves, lanes.len(), toks, max_gen, chunk) {
                 break;
             }
             let toks = queue.pop_front().unwrap();
@@ -2150,9 +2164,7 @@ mod tests {
                         runnable: true,
                     })
                     .collect();
-                let reserved = reserved_inflight_full_slots(&reserves);
-                let active_now = lanes.iter().filter(|l| l.active).count();
-                if !cache.can_admit_with_shared(&pools, active_now, toks, max_gen, chunk, 0, reserved) {
+                if !cache.can_admit(&pools, &reserves, lanes.len(), toks, max_gen, chunk) {
                     break;
                 }
                 let toks = queue.pop_front().unwrap();
@@ -2297,26 +2309,110 @@ mod tests {
         assert_zero_pool_leaks(&pools);
     }
 
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("block-cache-spill-tests")
+                .join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Populate a retained checkpoint at end, leaving its lane free.
+    fn retain_test_prompt(
+        cache: &mut ServeBlockCache,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        tokens: &[u32],
+        tag: u8,
+    ) -> SealedId {
+        let start = cache.match_and_bind(pools, tbl, state, tokens).map_or(0, |(p, _)| p);
+        let end = tokens.len() - 1;
+        cache.ensure_span_blocks(pools, tbl, start, end - start).unwrap();
+        cache.finish_prefill_span(pools, tbl, state, tokens, start, end - start, || fake_cs(tag));
+        let tip = *state.sealed.last().unwrap();
+        cache.release_lane(pools, tbl, state);
+        tip
+    }
+
+    #[test]
+    fn long_spill_restore_keeps_source_and_accepts_early_fork() {
+        let dir = ScratchDir::new("long-fork");
+        let store = SpillStore::open(&dir.0, 100 * 1024 * 1024).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut pools = BlockPools::with_capacities(18, 18, 1).unwrap();
+        let mut tbl = BlockTable::new(20).unwrap();
+        let mut state = LaneBlockState::default();
+        let end = WINDOW + BLOCK;
+        let long: Vec<u32> = (0..=end as u32).collect();
+        let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &long, 3);
+        assert!(cache.evict_start(&mut pools, tip));
+        // Two unrelated resident blocks leave only 16 free Full slots; the restore
+        // needs 17. Writing these victims to the tight SSD must preserve the source.
+        let unrelated: Vec<u32> = (0..=128).map(|i| 20_000 + i).collect();
+        retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &unrelated, 4);
+        assert_eq!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &long), Some((end, fake_cs(3))));
+        let root = state.sealed[0];
+        let root_full = cache.tree.handle(root).unwrap().full();
+        assert!(cache.tree.handle(root).unwrap().window().is_none());
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+
+        let mut fork = long[..BLOCK].to_vec();
+        fork.push(99_000);
+        assert!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &fork).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl, 0, BLOCK).unwrap();
+        let recomputed_window = tbl.get(BlockKind::Window, BlockIndex::new(0)).unwrap().unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut state, &fork, 0, BLOCK, || fake_cs(5));
+        assert_eq!(state.sealed[0], root);
+        assert_eq!(cache.tree.handle(root).unwrap(), BlockHandles::new(root_full, Some(recomputed_window)));
+        assert_eq!(tbl.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), Some(root_full));
+        cache.ensure_span_blocks(&mut pools, &mut tbl, BLOCK, 1).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut state, &fork, BLOCK, 1, || fake_cs(6));
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn spill_read_failure_releases_provisional_blocks_and_preserves_resident_match() {
+        let dir = ScratchDir::new("stream-rollback");
+        let store = SpillStore::open(&dir.0, 64 * 1024 * 1024).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut pools = BlockPools::with_capacities(16, 16, 1).unwrap();
+        let mut tbl = BlockTable::new(16).unwrap();
+        let mut state = LaneBlockState::default();
+        let long: Vec<u32> = (0..=6 * BLOCK as u32).collect();
+        let short = &long[..BLOCK + 1];
+        retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, short, 1);
+        let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &long, 2);
+        assert!(cache.evict_start(&mut pools, tip));
+
+        let checkpoint = cache.spilled_starts.values().next().unwrap();
+        let (_, _, last_file) = *checkpoint.entries.last().unwrap();
+        std::fs::remove_file(cache.spill_store().unwrap().block_path(last_file)).unwrap();
+        let before = cache.stats().slots_taken;
+        assert_eq!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &long), Some((BLOCK, fake_cs(1))));
+        assert!(cache.stats().slots_taken > before, "earlier files used bounded provisional slots");
+        assert_eq!(cache.stats().starts_restored, 0);
+        assert_eq!(cache.retained_start_count(), 1);
+        assert_eq!(cache.spilled_start_count(), 0);
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
     #[test]
     fn spill_store_eviction_restore_and_corrupt_fallback() {
-        struct ScratchDir(std::path::PathBuf);
-        impl ScratchDir {
-            fn new(name: &str) -> Self {
-                let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("block-cache-spill-tests")
-                    .join(format!("{name}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&p);
-                std::fs::create_dir_all(&p).unwrap();
-                Self(p)
-            }
-        }
-        impl Drop for ScratchDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
         let dir = ScratchDir::new("e2e");
         let store = SpillStore::open(&dir.0, 256 * 1024 * 1024).unwrap();
         // 24 Full slots, 16 Window slots at kvb=1 (1 MiB Full, 5 MiB Window).
@@ -2428,3 +2524,6 @@ mod tests {
         assert_zero_pool_leaks(&pools);
     }
 }
+
+#[cfg(test)]
+mod admission_tests;
