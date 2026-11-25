@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -224,5 +225,44 @@ func TestParseAnthropicSSEAndOpenAIUsageStream(t *testing.T) {
 	noUsageBody := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
 	if _, err := parseOpenAIUsageStream(strings.NewReader(noUsageBody)); err == nil {
 		t.Fatalf("expected missing final usage chunk to fail")
+	}
+}
+
+func TestNegativeControlVerdict(t *testing.T) {
+	budget := healthSnapshot{OK: true, RecommendedWorkingSetBytes: int64Ptr(0)}
+	late := []byte("[serve] client gone after 512 generated tokens; lane freed\n")
+	ref := sampleToolReplyFixture(1, `{"city":"Seattle"}`)
+	replies := make([]toolSample, 4)
+	for i := range replies {
+		replies[i] = sampleToolReplyFixture(i+2, ref.ToolCalls[0].Function.Arguments)
+	}
+	replies[1].ToolCalls[0].ID = replies[0].ToolCalls[0].ID
+	lines := []string{
+		fmt.Sprintf("FAIL bearer authentication and public health: sabotage health-status: %v", (apiObservation{code: 200}).expect(418)),
+		fmt.Sprintf("FAIL health reports Metal memory budget and admission limits: sabotage memory-budget: %v", verifyHealthBudget(budget, 1)),
+		fmt.Sprintf("FAIL disconnect in mid-thinking stops generation: sabotage disconnect-mid-thinking: %v", verifyDisconnectMidThinking(late, 512, healthSnapshot{}, replySample{}, replySample{})),
+		fmt.Sprintf("FAIL concurrent identical tool calls: sabotage concurrent-tool-calls: %v", verifyConcurrentToolCalls("get_weather", ref, replies)),
+		"one or more serve checks failed",
+	}
+	complete := strings.Join(lines, "\n")
+	for _, tc := range []struct {
+		name, log, exit string
+		ok              bool
+	}{
+		{"four observed controls", complete, "1", true},
+		{"probe silently passed", strings.Replace(complete, lines[1], "PASS memory budget", 1), "1", false},
+		{"wrong diagnostic", strings.Replace(complete, lines[1], "FAIL memory budget: timed out", 1), "1", false},
+		{"extra failure", complete + "\nFAIL another probe", "1", false},
+		{"incomplete run", strings.Join(lines[:4], "\n"), "1", false},
+		{"unexpected success", complete, "0", false},
+		{"crash", complete, "2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("../serve-negative.sh", "sh", "-c", `test "$SERVECHECK_SABOTAGE" = all || exit 3; printf '%s\n' "$1"; exit "$2"`, "runner", tc.log, tc.exit)
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != tc.ok {
+				t.Fatalf("negative control verdict: %v\n%s", err, out)
+			}
+		})
 	}
 }

@@ -13,8 +13,7 @@ concurrency:
 # Every job here must finish in about a minute (Glenn, 2026-11-23: pull request and push CI averages one minute or
 # less). Anything slower runs in .github/workflows/nightly.yml, where it still fails red:
 #   the CacheScheduler and nightly layout TLC models, the release-profile unit tests and clean release build,
-#   the slow GPU gates (binv, lanes, spans and its sabotage, dbatch, CLI checks, golden hashes) and the serve
-#   API negative control.
+#   and the slow GPU gates (binv, lanes, spans and its sabotage, dbatch, CLI checks, golden hashes, long poolgate).
 jobs:
   # unit: a GitHub-hosted ARM Mac; the CPU-only unit tests in the test profile (overflow checks and debug asserts on).
   # Shaders compile at runtime, so the build needs no GPU. rust-cache keeps target/ and ~/.cargo keyed on Cargo.lock.
@@ -24,8 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@v2
-      - name: unit tests
-        run: cargo test --locked --bins
+      - name: unit and integration tests (debug assertions)
+        run: cargo test --locked --bins --tests
       # tests/serve.sh's in-process header test runs here, not in m5-serve. Like serve.sh, require exactly one
       # serve_header_policy test to run and pass, so a rename or removal fails this job.
       - name: serve_header_policy runs exactly once
@@ -35,7 +34,7 @@ jobs:
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: crates.io package dry-run
         run: cargo publish --locked --dry-run
-  # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, and replay tools.
+  # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, servecheck, and replay tools.
   go:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -45,6 +44,8 @@ jobs:
         with:
           go-version: '1.26.10'
           cache: false
+      - name: release gate tests
+        run: python3 tests/test_release_ci.py
       - name: soak client tests
         run: go test -race tests/soak_client.go tests/soak_client_test.go
       - name: load client tests
@@ -53,9 +54,20 @@ jobs:
       - name: inkconvert tests
         working-directory: tools/inkconvert
         run: go test -race ./...
+      - name: install fleetcheck sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor-profiles
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          if [ -f "$profile" ] && [ ! -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -r "$profile"
+          fi
       - name: fleetcheck tests
         working-directory: tests
         run: go vet ./fleetcheck/... && go test -race ./fleetcheck/...
+      - name: servecheck tests
+        working-directory: tests
+        run: go vet ./servecheck && go test -race ./servecheck
       - name: replay sweep tests
         working-directory: tools/replay
         run: go vet ./... && go test -race ./...
@@ -95,7 +107,7 @@ jobs:
   m5-gpu:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: build
@@ -122,8 +134,13 @@ jobs:
       # lifetime, and cancels/waits for each child server before removing logs.
       # serve_header_policy runs in the unit job (cargo test --bins), so this job runs the probes alone.
       - name: serve API probes
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
           SERVECHECK_SABOTAGE: ''
           INKY_SERVE_PROBES_ONLY: '1'
         run: tests/serve.sh ./target/ci/inky
+      - name: serve API negative controls
+        timeout-minutes: 15
+        env:
+          INKY_SERVE_PROBES_ONLY: '1'
+        run: tests/serve-negative.sh tests/serve.sh ./target/ci/inky

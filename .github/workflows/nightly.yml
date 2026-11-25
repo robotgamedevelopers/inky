@@ -22,8 +22,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: build
         run: cargo build --locked --release
-      - name: unit tests (release profile)
-        run: cargo test --locked --release --bins
+      - name: unit and integration tests (release profile)
+        run: cargo test --locked --release --bins --tests
       - name: crates.io package dry-run
         run: cargo publish --locked --dry-run
   # The slow layout models (PrefixTree full, StartTails3) and PrefixTree trace mutants on macOS.
@@ -103,18 +103,7 @@ jobs:
         env:
           SERVECHECK_SABOTAGE: ''
         run: tests/serve.sh
-      - name: serve API negative control
+      - name: serve API negative controls
         if: ${{ !cancelled() }}
-        env:
-          SERVECHECK_SABOTAGE: health-status
-        run: |
-          log=$(mktemp)
-          trap 'rm -f "$log"' EXIT
-          if tests/serve.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
-          cat "$log"
-          # Require the deliberate mismatch and completed suite; a crash is not proof.
-          test "$rc" -eq 1
-          grep -Fxq 'FAIL bearer authentication and public health: sabotage health-status: got HTTP 200, want 418' "$log"
-          grep -Fxq 'one or more serve checks failed' "$log"
-          test "$(grep -c '^FAIL ' "$log")" -eq 1
-          echo 'serve health-status sabotage: detected, as required'
+        timeout-minutes: 15
+        run: tests/serve-negative.sh tests/serve.sh

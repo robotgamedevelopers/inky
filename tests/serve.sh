@@ -5,6 +5,7 @@
 #   memory-budget           - simulates zero Metal working-set reporting on /health
 #   concurrent-tool-calls   - injects duplicate tool_calls[0].id and argument bleed
 #   disconnect-mid-thinking - simulates uncancelled generation reaching max_tokens
+#   all                     - enables all four controls in the same suite run
 # CI runs normal success first, then requires each negative-control failure.
 set -eu
 cd "${0:A:h}/.."

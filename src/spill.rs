@@ -267,11 +267,13 @@ impl SpillKey {
         format!("blk-{}-{:016x}.tmp.{:08x}.{:016x}", self.kind.tag(), self.id, pid, nonce)
     }
 
-    fn parse_blk_filename(name: &str) -> Option<Self> {
-        let rest = name.strip_prefix("blk-")?;
-        let rest = rest.strip_suffix(".blk")?;
-        let (tag, hex) = rest.split_once('-')?;
-        if hex.len() != 16 {
+    fn is_lower_hex(s: &str, width: usize) -> bool {
+        s.len() == width && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    fn parse_file_stem(stem: &str) -> Option<Self> {
+        let (tag, hex) = stem.strip_prefix("blk-")?.split_once('-')?;
+        if !Self::is_lower_hex(hex, 16) {
             return None;
         }
         let kind = match tag {
@@ -281,6 +283,19 @@ impl SpillKey {
         };
         let id = u64::from_str_radix(hex, 16).ok()?;
         Some(Self { kind, id })
+    }
+
+    fn parse_blk_filename(name: &str) -> Option<Self> {
+        Self::parse_file_stem(name.strip_suffix(".blk")?)
+    }
+
+    fn parse_tmp_filename(name: &str) -> Option<Self> {
+        let (stem, suffix) = name.split_once(".tmp.")?;
+        let (pid, nonce) = suffix.split_once('.')?;
+        if !Self::is_lower_hex(pid, 8) || !Self::is_lower_hex(nonce, 16) {
+            return None;
+        }
+        Self::parse_file_stem(stem)
     }
 }
 
@@ -666,6 +681,9 @@ pub struct SpillStoreStats {
 
 /// Crash-safe, bounded, checksummed SSD directory store (`--spill-dir`).
 pub struct SpillStore {
+    // Keeping the locked directory open gives its index, writers, and GC a single owner.
+    directory_lock: File,
+    last_allocated_id: u64,
     dir: PathBuf,
     max_bytes: u64,
     used_bytes: u64,
@@ -673,6 +691,13 @@ pub struct SpillStore {
     kvb: u32,
     entries: HashMap<SpillKey, DiskEntry>,
     stats: SpillStoreStats,
+}
+
+impl Drop for SpillStore {
+    fn drop(&mut self) {
+        // Release immediately even if a concurrent fork briefly inherited the descriptor.
+        let _ = self.directory_lock.unlock();
+    }
 }
 
 fn enable_nocache(file: &File) {
@@ -692,6 +717,14 @@ fn enable_nocache(file: &File) {
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     let f = File::open(dir)?;
     f.sync_all()
+}
+
+fn unlink_if_present(path: &Path) -> io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
@@ -761,8 +794,22 @@ impl SpillStore {
         }
         let dir = dir.as_ref().to_path_buf();
         prepare_spill_dir(&dir)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let directory_lock = options.open(&dir)?;
+        match directory_lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(SpillError::InvalidDir(format!("{} is already in use", dir.display())));
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+        }
 
         let mut store = Self {
+            directory_lock,
+            last_allocated_id: 1,
             dir,
             max_bytes,
             used_bytes: 0,
@@ -799,6 +846,18 @@ impl SpillStore {
         self.entries.contains_key(&key)
     }
 
+    /// Allocate an identity for a new checkpoint block, skipping surviving blocks
+    /// whose content belongs to an earlier generation of the in-memory checkpoint index.
+    pub fn fresh_key(&mut self, kind: SpillBlockKind) -> SpillKey {
+        loop {
+            self.last_allocated_id = self.last_allocated_id.wrapping_add(1).max(1);
+            let key = SpillKey::new(kind, self.last_allocated_id);
+            if !self.contains(key) {
+                return key;
+            }
+        }
+    }
+
     pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
@@ -822,10 +881,11 @@ impl SpillStore {
             };
             let meta = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             };
-            if name.contains(".tmp.") {
-                if !meta.is_dir() && fs::remove_file(&path).is_ok() {
+            if SpillKey::parse_tmp_filename(&name).is_some() {
+                if meta.is_file() && unlink_if_present(&path)? {
                     self.stats.orphans_swept += 1;
                 }
                 continue;
@@ -833,8 +893,9 @@ impl SpillStore {
             if let Some(key) = SpillKey::parse_blk_filename(&name) {
                 if !meta.file_type().is_file() {
                     // Never trust symlinks or non-regular files in spill dir.
-                    let _ = fs::remove_file(&path);
-                    self.stats.corrupt_files_removed += 1;
+                    if unlink_if_present(&path)? {
+                        self.stats.corrupt_files_removed += 1;
+                    }
                     continue;
                 }
                 let mtime_key = meta
@@ -859,6 +920,12 @@ impl SpillStore {
         // Enforce disk budget on startup if existing files exceed max_bytes.
         let empty = HashSet::new();
         self.evict_lru_to_fit(0, &empty);
+        if self.used_bytes > self.max_bytes {
+            return Err(SpillError::InvalidDir(format!(
+                "could not reduce spill usage of {} bytes to the {} byte budget",
+                self.used_bytes, self.max_bytes
+            )));
+        }
         Ok(())
     }
 
@@ -870,21 +937,22 @@ impl SpillStore {
         protected: &HashSet<SpillKey>,
     ) -> Vec<SpillKey> {
         let mut evicted = Vec::new();
+        let mut failed = HashSet::new();
         while self.used_bytes.saturating_add(additional) > self.max_bytes {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(k, _)| !protected.contains(k))
+                .filter(|(k, _)| !protected.contains(k) && !failed.contains(*k))
                 .min_by_key(|(k, e)| (e.lru_seq, **k))
                 .map(|(k, _)| *k);
             let Some(victim_key) = victim else {
                 break;
             };
-            if let Some(entry) = self.entries.remove(&victim_key) {
-                let _ = fs::remove_file(self.block_path(victim_key));
-                self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            if self.remove_block(victim_key) {
                 self.stats.disk_gc_evictions += 1;
                 evicted.push(victim_key);
+            } else {
+                failed.insert(victim_key);
             }
         }
         evicted
@@ -892,14 +960,20 @@ impl SpillStore {
 
     /// Remove a specific block from disk if present.
     pub fn remove_block(&mut self, key: SpillKey) -> bool {
-        let path = self.block_path(key);
-        let removed_file = fs::remove_file(&path).is_ok();
+        let indexed = self.entries.contains_key(&key);
+        self.unlink_block(key).is_ok_and(|removed| removed || indexed)
+    }
+
+    fn forget_block(&mut self, key: SpillKey) {
         if let Some(entry) = self.entries.remove(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
-            true
-        } else {
-            removed_file
         }
+    }
+
+    fn unlink_block(&mut self, key: SpillKey) -> io::Result<bool> {
+        let removed = unlink_if_present(&self.block_path(key))?;
+        self.forget_block(key);
+        Ok(removed)
     }
 
     /// Crash-safe atomic write of a block (K/V + optional start-point recurrent state):
@@ -933,8 +1007,20 @@ impl SpillStore {
             return Ok((WriteOutcome::OverBudget, Vec::new()));
         }
 
-        // Account for replacing an existing copy of the same key if present.
-        let existing_bytes = self.entries.get(&key).map(|e| e.bytes).unwrap_or(0);
+        // A case-insensitive filesystem can resolve a canonical block path to an
+        // unrelated, noncanonical filename deliberately left out of the index.
+        let final_path = self.block_path(key);
+        let existing_bytes = match self.entries.get(&key) {
+            Some(entry) => entry.bytes,
+            None => match fs::symlink_metadata(&final_path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e.into()),
+                Ok(_) => {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                        format!("unindexed file at {}", final_path.display())).into());
+                }
+            },
+        };
         let net_additional = total_bytes.saturating_sub(existing_bytes);
         let mut protected_with_self = protected.clone();
         protected_with_self.insert(key);
@@ -948,7 +1034,6 @@ impl SpillStore {
         let pid = std::process::id();
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let tmp_path = self.dir.join(key.tmp_filename(pid, nonce));
-        let final_path = self.block_path(key);
 
         let write_result = (|| -> io::Result<()> {
             let mut opts = OpenOptions::new();
@@ -1014,11 +1099,9 @@ impl SpillStore {
                     self.drop_corrupt(key);
                     return ReadOutcome::Miss(MissReason::NotRegularFile);
                 }
-                if let Some(old) = self.entries.remove(&key) {
-                    self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
-                }
                 self.stats.reads_miss += 1;
                 let reason = if e.kind() == io::ErrorKind::NotFound {
+                    self.forget_block(key);
                     MissReason::NotFound
                 } else {
                     MissReason::IoReadError
@@ -1041,6 +1124,10 @@ impl SpillStore {
             return ReadOutcome::Miss(MissReason::NotRegularFile);
         }
         let file_len = meta.len();
+        // Charge the observed length even when verification fails and cleanup cannot unlink it.
+        let entry = self.entries.entry(key).or_insert(DiskEntry { bytes: 0, lru_seq: 0 });
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes).saturating_add(file_len);
+        entry.bytes = file_len;
         if file_len < SPILL_HEADER_LEN as u64 {
             self.drop_corrupt(key);
             return ReadOutcome::Miss(MissReason::TruncatedHeader);
@@ -1134,13 +1221,7 @@ impl SpillStore {
         }
 
         let seq = self.next_lru();
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.lru_seq = seq;
-            entry.bytes = file_len;
-        } else {
-            self.entries.insert(key, DiskEntry { bytes: file_len, lru_seq: seq });
-            self.used_bytes = self.used_bytes.saturating_add(file_len);
-        }
+        self.entries.get_mut(&key).expect("indexed before verification").lru_seq = seq;
         self.stats.reads_hit += 1;
 
         ReadOutcome::Hit(RestoredBlock {
@@ -1152,13 +1233,10 @@ impl SpillStore {
     }
 
     fn drop_corrupt(&mut self, key: SpillKey) {
-        let path = self.block_path(key);
-        let _ = fs::remove_file(&path);
-        if let Some(old) = self.entries.remove(&key) {
-            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+        if matches!(self.unlink_block(key), Ok(true)) {
+            self.stats.corrupt_files_removed += 1;
         }
         self.stats.reads_miss += 1;
-        self.stats.corrupt_files_removed += 1;
     }
 }
 
@@ -2082,6 +2160,62 @@ mod tests {
         s
     }
 
+    #[test]
+    fn fresh_checkpoint_keys_skip_existing_blocks_after_restart() {
+        let scratch = ScratchTestDir::new("restart-ids");
+        let mut first = SpillStore::open(scratch.path(), 1024).unwrap();
+        let old = first.fresh_key(SpillBlockKind::Full);
+        first.write_block(old, 1, b"old KV", None, &HashSet::new()).unwrap();
+        drop(first);
+
+        let mut next = SpillStore::open(scratch.path(), 1024).unwrap();
+        let fresh = next.fresh_key(SpillBlockKind::Full);
+        assert_ne!(old, fresh);
+        assert!(!next.contains(fresh));
+        next.write_block(fresh, 1, b"new KV", None, &HashSet::new()).unwrap();
+        assert!(matches!(next.read_block(old, None), ReadOutcome::Hit(b) if b.kv_bytes == b"old KV"));
+        assert!(matches!(next.read_block(fresh, None), ReadOutcome::Hit(b) if b.kv_bytes == b"new KV"));
+    }
+
+    #[test]
+    fn dropping_the_store_releases_ownership_even_with_a_duplicate_fd() {
+        let scratch = ScratchTestDir::new("directory-lock-lifetime");
+        let owner = SpillStore::open(scratch.path(), 1024).unwrap();
+        // A child between fork and exec holds another descriptor for the same open file.
+        let inherited = owner.directory_lock.try_clone().unwrap();
+        drop(owner);
+        let successor = SpillStore::open(scratch.path(), 1024).unwrap();
+        drop(inherited);
+        assert!(SpillStore::open(scratch.path(), 1024).is_err());
+        drop(successor);
+    }
+
+    #[test]
+    fn one_process_owns_the_spill_directory_until_drop() {
+        const CHILD_DIR: &str = "INKY_TEST_CONTENDED_SPILL_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            // A second opener must fail before a zero-byte budget can evict the writer's blocks.
+            let result = SpillStore::open(dir, 0);
+            assert!(matches!(result, Err(SpillError::InvalidDir(ref reason)) if reason.contains("already in use")));
+            return;
+        }
+
+        let scratch = ScratchTestDir::new("directory-owner");
+        let dir = scratch.path();
+        let mut owner = SpillStore::open(dir, 1024).unwrap();
+        let key = SpillKey::full(37);
+        owner.write_block(key, 1, b"retained", None, &HashSet::new()).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "spill::tests::one_process_owns_the_spill_directory_until_drop"])
+            .env(CHILD_DIR, dir)
+            .output().unwrap();
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout));
+        drop(owner);
+
+        let mut successor = SpillStore::open(dir, 1024).unwrap();
+        assert!(matches!(successor.read_block(key, None), ReadOutcome::Hit(block) if block.kv_bytes == b"retained"));
+    }
+
     /// Deterministic ground-truth generator for block K/V bytes and optional recurrent state.
     fn deterministic_kv(key: SpillKey, len: usize) -> Vec<u8> {
         let mut x = key.id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((key.kind as u64 + 1) << 56) ^ 0xa076_1d64_78bd_642f;
@@ -2255,6 +2389,92 @@ mod tests {
         assert_eq!(mgr.store().stats().writes_committed, writes_before);
         assert_eq!(mgr.stats().clean_mem_evictions, 1);
         assert_eq!(mgr.tier(SpillKey::full(2)), BlockTier::Disk);
+    }
+
+    #[test]
+    fn failed_unlink_preserves_budget_and_gc_skips_the_stuck_victim() {
+        let scratch = ScratchTestDir::new("unlink-budget");
+        let charge = (SPILL_HEADER_LEN + 4) as u64;
+        let mut store = SpillStore::open(scratch.path().join("spill"), 2 * charge).unwrap();
+        let keys = [1, 2, 3, 4].map(SpillKey::full);
+        let unprotected = HashSet::new();
+        for &key in &keys[..2] {
+            store.write_block(key, 1, b"data", None, &unprotected).unwrap();
+        }
+
+        // Preserve the original bytes under a directory that remove_file cannot unlink,
+        // including when this test runs with elevated filesystem permissions.
+        let path = store.block_path(keys[0]);
+        let saved = scratch.path().join("saved");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::rename(&saved, path.join("original")).unwrap();
+        assert!(!store.remove_block(keys[0]));
+        assert!(matches!(store.read_block(keys[0], None), ReadOutcome::Miss(_)));
+        assert_eq!(store.stats().corrupt_files_removed, 0);
+        assert!(store.contains(keys[0]));
+        assert_eq!(store.used_bytes(), 2 * charge);
+
+        let (outcome, victims) = store.write_block(keys[2], 1, b"data", None, &unprotected).unwrap();
+        assert_eq!(outcome, WriteOutcome::Written { on_disk_bytes: charge });
+        assert_eq!(victims, vec![keys[1]]);
+        let (outcome, victims) = store.write_block(keys[3], 1, b"data", None, &HashSet::from([keys[2]])).unwrap();
+        assert_eq!(outcome, WriteOutcome::OverBudget);
+        assert!(victims.is_empty());
+        assert_eq!(store.stats().disk_gc_evictions, 1);
+        assert!(store.contains(keys[0]));
+        assert_eq!(store.used_bytes(), 2 * charge);
+
+        fs::rename(path.join("original"), &saved).unwrap();
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        assert!(store.remove_block(keys[0]));
+        assert_eq!(store.used_bytes(), charge);
+    }
+
+    #[test]
+    fn startup_reports_canonical_block_it_cannot_remove() {
+        let scratch = ScratchTestDir::new("startup-unlink");
+        let dir = scratch.path().join("spill");
+        fs::create_dir(&dir).unwrap();
+        let stuck = dir.join(SpillKey::full(1).blk_filename());
+        fs::create_dir(&stuck).unwrap();
+        assert!(matches!(SpillStore::open(&dir, 0), Err(SpillError::Io(_))));
+        assert!(stuck.is_dir());
+        fs::remove_dir(stuck).unwrap();
+        let store = SpillStore::open(&dir, 0).unwrap();
+        assert_eq!(store.used_bytes(), 0);
+    }
+
+    #[test]
+    fn transient_open_error_retains_charge_and_absent_files_release_it_once() {
+        let scratch = ScratchTestDir::new("open-accounting");
+        let dir = scratch.path().join("spill");
+        let charge = (SPILL_HEADER_LEN + 4) as u64;
+        let mut store = SpillStore::open(&dir, 2 * charge).unwrap();
+        let keys = [1, 2].map(SpillKey::full);
+        for key in keys {
+            store.write_block(key, 1, b"data", None, &HashSet::new()).unwrap();
+        }
+
+        let saved = scratch.path().join("saved-dir");
+        fs::rename(&dir, &saved).unwrap();
+        fs::write(&dir, b"temporarily inaccessible").unwrap();
+        assert_eq!(store.read_block(keys[0], None), ReadOutcome::Miss(MissReason::IoReadError));
+        assert_eq!(store.used_bytes(), 2 * charge);
+        assert!(store.contains(keys[0]));
+        fs::remove_file(&dir).unwrap();
+        fs::rename(&saved, &dir).unwrap();
+        assert!(matches!(store.read_block(keys[0], None), ReadOutcome::Hit(_)));
+
+        fs::remove_file(store.block_path(keys[0])).unwrap();
+        assert_eq!(store.read_block(keys[0], None), ReadOutcome::Miss(MissReason::NotFound));
+        assert!(!store.remove_block(keys[0]));
+        assert_eq!(store.used_bytes(), charge);
+        fs::remove_file(store.block_path(keys[1])).unwrap();
+        assert!(store.remove_block(keys[1]));
+        assert!(!store.remove_block(keys[1]));
+        assert_eq!(store.used_bytes(), 0);
     }
 
     #[test]
@@ -2478,23 +2698,67 @@ mod tests {
     }
 
     #[test]
+    fn publication_preserves_an_unindexed_file_at_the_destination() {
+        let scratch = ScratchTestDir::new("unindexed-destination");
+        let mut store = SpillStore::open(scratch.path(), 4096).unwrap();
+        let key = SpillKey::full(0xab);
+        let destination = store.block_path(key);
+        fs::write(&destination, b"keep").unwrap();
+        let result = store.write_block(key, 1, b"new KV", None, &HashSet::new());
+        assert!(matches!(result, Err(SpillError::Io(err)) if err.kind() == io::ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(&destination).unwrap(), b"keep");
+        assert_eq!(store.entry_count(), 0);
+    }
+
+    #[test]
+    fn spill_file_names_require_canonical_lowercase_hex_fields() {
+        for key in [SpillKey::full(0), SpillKey::window(u64::MAX)] {
+            assert_eq!(SpillKey::parse_blk_filename(&key.blk_filename()), Some(key));
+            assert_eq!(SpillKey::parse_tmp_filename(&key.tmp_filename(u32::MAX, u64::MAX)), Some(key));
+        }
+        for name in ["blk-f-00000000000000AB.blk", "blk-f-+000000000000001.blk"] {
+            assert_eq!(SpillKey::parse_blk_filename(name), None, "{name}");
+        }
+        for name in [
+            "blk-f-0000000000000001.tmp.0000000A.0000000000000001",
+            "blk-f-0000000000000001.tmp.00000001.000000000000000A",
+        ] {
+            assert_eq!(SpillKey::parse_tmp_filename(name), None, "{name}");
+        }
+    }
+
+    #[test]
     fn corrupt_torn_bitflip_zero_and_orphan_files_cause_clean_cache_miss_never_corruption() {
         let scratch = ScratchTestDir::new("corruption");
         let dir = scratch.path().join("spill");
         let kv_len = 2048usize;
         let state_len = 512usize;
 
-        // Pre-plant orphan .tmp.* files before open().
+        // Only a spill writer's exact temporary names are eligible for cleanup.
         prepare_spill_dir(&dir).unwrap();
-        let orphan1 = dir.join("blk-f-0000000000000001.tmp.00001234.0000000000000001");
-        let orphan2 = dir.join("blk-w-0000000000000099.tmp.00005678.0000000000000002");
+        let orphan1 = dir.join(SpillKey::full(1).tmp_filename(0x1234, 1));
+        let orphan2 = dir.join(SpillKey::window(0x99).tmp_filename(0x5678, 2));
         fs::write(&orphan1, b"half-written-tmp-data").unwrap();
         fs::write(&orphan2, b"").unwrap();
+        let unrelated = [
+            "notes.tmp.backup",
+            "blk-x-0000000000000001.tmp.00001234.0000000000000001",
+            "blk-f-00000000000000AB.tmp.00001234.0000000000000001",
+            "blk-f-0000000000000001.tmp.1234.0000000000000001",
+            "blk-f-0000000000000001.tmp.00001234.000000000000000g",
+            "blk-f-0000000000000001.tmp.00001234.0000000000000001.bak",
+        ];
+        for name in unrelated {
+            fs::write(dir.join(name), b"keep").unwrap();
+        }
 
         let mut store = SpillStore::open(&dir, 64 * 1024 * 1024).unwrap();
         assert_eq!(store.stats().orphans_swept, 2);
         assert!(!orphan1.exists());
         assert!(!orphan2.exists());
+        for name in unrelated {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), b"keep", "{name}");
+        }
 
         let write_good = |s: &mut SpillStore, id: u64| -> (SpillKey, PathBuf) {
             let key = SpillKey::full(id);
@@ -2580,6 +2844,7 @@ mod tests {
         // 8. End-to-end SpillManager rollback on corrupt block in multi-block working set:
         //    pool slots must remain completely clean (zero-filled, zero leaks)!
         let pool = HostBlockPoolBackend::new(3, 1, kv_len, kv_len);
+        drop(store);
         let store2 = SpillStore::open(&dir, 64 * 1024 * 1024).unwrap();
         let mut mgr = SpillManager::new(pool, store2);
         // Write two blocks via store and corrupt the second.
@@ -2743,7 +3008,7 @@ mod tests {
                         .ok()
                         .map(|rd| {
                             rd.filter_map(Result::ok)
-                                .any(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                                .any(|e| e.file_name().to_str().and_then(SpillKey::parse_tmp_filename).is_some())
                         })
                         .unwrap_or(false);
                     if has_tmp {
@@ -2775,7 +3040,7 @@ mod tests {
             let remaining_tmps: Vec<_> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(Result::ok)
-                .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                .filter(|e| e.file_name().to_str().and_then(SpillKey::parse_tmp_filename).is_some())
                 .collect();
             assert!(
                 remaining_tmps.is_empty(),

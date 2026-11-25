@@ -4,6 +4,7 @@
 # inky_<tag>_tunings.tar.gz (the tunings/ folder the binary is built with) and SHA256SUMS.
 # The tag must equal Cargo.toml's version with a leading v, and the release notes are
 # docs/releases/<tag>.md; the run fails before building if either is wrong or CRATES_IO_TOKEN is unset.
+# Every job in ci.yml must pass on the tagged commit in main CI before release assets are built.
 # The crate inky-engine is verified with cargo publish --dry-run before creating the GitHub release and
 # published automatically to crates.io on every tagged release.
 name: release
@@ -11,9 +12,24 @@ on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 permissions:
-  contents: write
+  contents: read
 jobs:
+  main-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: wait for main CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_ci.py "$GITHUB_REPOSITORY" "$(git rev-parse HEAD)"
   release:
+    needs: main-ci
+    permissions:
+      contents: write
     # GitHub's own Apple silicon runner: the shaders compile at runtime (newLibraryWithSource),
     # so the build needs no GPU, and the runner has gh and cargo
     runs-on: macos-latest
