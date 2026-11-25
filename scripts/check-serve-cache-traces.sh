@@ -9,6 +9,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/inky-serve-cache.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 cp "$root"/src/{blockbook,blocks,prefix,spill}.rs "$work/"
+cp -R "$root/src/spill" "$work/"
 cp "$root/src/serve/block_cache.rs" "$work/"
 cp -R "$root/src/serve/block_cache" "$work/"
 cp "$root/scripts/serve-cache-traces.rs" "$work/main.rs"
