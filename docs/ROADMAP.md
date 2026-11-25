@@ -8,6 +8,8 @@ inky serves Inkling 2 Mini to many coding-agent tasks at once from one process o
 
 The November 24, 2026 audit covers v0.2.2 at `be82ef3` and the six pull requests open at review. The tables track repairs against their intended branches. A check marks a verified baseline result or a landed fix. The source data records the observed behavior, evidence and outstanding qualification for each row.
 
+Johnny Grok's read of that release, written up on 2026-11-25 against main at `d6778fe`, added the rows that were still open after those tables: the 4096 decode reserve, the pool-deferred stall, the agreement and dispatch sentences, the dirty-range test, the shared `count_tokens` pool, and the `ci.sh` sabotage pipelines. The LoopCD lane row already on this page now also records the two tanh paths.
+
 ### Cache, admission and scheduler models
 
 <!-- nova-work:audit-cache:start -->
@@ -31,6 +33,8 @@ The November 24, 2026 audit covers v0.2.2 at `be82ef3` and the six pull requests
 | Run a tractable branching PrefixTree model and account for every scheduled check ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
 | Model per-node pins separately from validity of a complete matched path ([#87](https://github.com/robotgamedevelopers/inky/pull/87)) | ❌ |
 | Compare SSD-restored and cold generation on an M5 across eviction, restart and branching ([#78](https://github.com/robotgamedevelopers/inky/pull/78)) | ❌ |
+| Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure | ❌ |
+| Wake a pool-deferred lane when the holder can make progress, including before the first window prune | ❌ |
 | complete | 0% |
 
 [Source data](roadmap.sexp)
@@ -62,7 +66,10 @@ The November 24, 2026 audit covers v0.2.2 at `be82ef3` and the six pull requests
 | Record batched attention and dry-pass state agreement | ✅ |
 | Record the 32-lane dispatch-count comparison | ✅ |
 | Keep disk and resident attention reductions aligned across staging resizes ([#83](https://github.com/robotgamedevelopers/inky/pull/83)) | ❌ |
-| complete | 21% |
+| Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss | ❌ |
+| Name both decode-dispatch counters in the v0.2.2 note | ❌ |
+| Tie the 63/64 dirty-range claim to a real decode step | ❌ |
+| complete | 18% |
 
 [Source data](roadmap.sexp)
 
@@ -108,6 +115,8 @@ The November 24, 2026 audit covers v0.2.2 at `be82ef3` and the six pull requests
 | Include Rust integration tests in hosted debug CI ([#75](https://github.com/robotgamedevelopers/inky/pull/75)) | ❌ |
 | Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
 | Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ❌ |
+| Keep count_tokens from filling the generation preprocess pool | ❌ |
+| Fail ci.sh sabotage probes on the command status, not only on grep | ❌ |
 | complete | 0% |
 
 [Source data](roadmap.sexp)

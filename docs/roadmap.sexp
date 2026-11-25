@@ -23,6 +23,8 @@
      ("audit-cache-prefix-nightly" "Run a tractable branching PrefixTree model and account for every scheduled check ([#87](https://github.com/robotgamedevelopers/inky/pull/87))")
      ("audit-cache-prefix-pins" "Model per-node pins separately from validity of a complete matched path ([#87](https://github.com/robotgamedevelopers/inky/pull/87))")
      ("audit-cache-spill-hardware" "Compare SSD-restored and cold generation on an M5 across eviction, restart and branching ([#78](https://github.com/robotgamedevelopers/inky/pull/78))")
+     ("audit-cache-decode-reserve" "Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure")
+     ("audit-cache-pool-deferred" "Wake a pool-deferred lane when the holder can make progress, including before the first window prune")
    )
    :columns (("done" "done"))
    :cells (
@@ -43,6 +45,8 @@
      ("audit-cache-prefix-nightly" "done" "t-audit-cache-prefix-nightly")
      ("audit-cache-prefix-pins" "done" "t-audit-cache-prefix-pins")
      ("audit-cache-spill-hardware" "done" "t-audit-cache-spill-hardware")
+     ("audit-cache-decode-reserve" "done" "t-audit-cache-decode-reserve")
+     ("audit-cache-pool-deferred" "done" "t-audit-cache-pool-deferred")
    ))
   (:id "t-audit-cache-spill-identity" :type :task :title "P1 — Keep SSD checkpoint identities unique across restarts and concurrent opens" :state :doing
    :evidence ("src/spill.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
@@ -95,6 +99,12 @@
   (:id "t-audit-cache-spill-hardware" :type :task :title "Compare SSD-restored and cold generation on an M5 across eviction, restart and branching" :state :todo
    :evidence ("src/serve/block_cache.rs" "src/serve.rs" "src/spill.rs" "tests/golden.sh")
    :note "PR #78 also exercises the real M5 Pro block cache with model weights. A 1,088-token restore performed 34 committed writes and 53 verified reads, and all 200,058 logits matched cold execution for the continuation and early branch. Process-restart and HTTP-level spill qualification remain open. The GPU disk golden exercised CLI --kv-disk. Drive serve --spill-dir with model weights, confirm a restore occurred where expected, and compare generated output with an independent cold path after both an intact restore and a cache miss.")
+  (:id "t-audit-cache-decode-reserve" :type :task :title "Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure" :state :todo
+   :evidence ("src/serve/block_cache.rs" "src/serve.rs" "src/main.rs" "docs/DESIGN.md" "docs/releases/v0.2.2.md")
+   :note "Johnny Grok, 2026-11-25, read this on main at d6778fe. InflightLaneReserve::reserved_end adds at most MAX_ADMIT_DECODE_RESERVE (4096) decode tokens (block_cache.rs:26 and :250). Serve default -n is 16384 (main.rs:88). An empty active set is admitted without a pool check (block_cache.rs:451). DESIGN.md still says a request is admitted only when every admitted lane's worst case fits. partition_pool_exhausted still fails one victim when nothing else can progress (serve.rs:894). Chat and Messages streams write HTTP 200 before generation (serve.rs:2197 and :2402), so that victim is a 200 stream with an error body. The v0.2.2 note says pool-exhaustion 500s were eliminated. The one-victim path is the livelock break and stays; the sentence and the 4096 cap need to match the code.")
+  (:id "t-audit-cache-pool-deferred" :type :task :title "Wake a pool-deferred lane when the holder can make progress, including before the first window prune" :state :todo
+   :evidence ("src/serve.rs" "src/serve/block_cache.rs" "src/engine.rs" "src/scheduler.rs")
+   :note "Johnny Grok, 2026-11-25, on main at d6778fe. pool_deferred clears only when lanes_released or window_pruned changes (serve.rs:948). A deferred lane is not runnable (serve.rs:1100), so the W=16 ceiling does not tick it. newly_expired_window_blocks is empty until a position reaches EXT (1024, engine.rs:16; block_cache.rs:99). A deferred prefill shorter than that waits until the holder finishes or prunes a window block. This is a stall of an admitted lane, not a permanent spin.")
   (:id "audit-engine" :type :roadmap :title "Inference, model conversion and tokenization"
    :rows (
      ("audit-engine-q8-debug" "Allow Q8 attention in debug decoding ([#74](https://github.com/robotgamedevelopers/inky/pull/74))")
@@ -116,6 +126,9 @@
      ("audit-engine-attention-control" "Record batched attention and dry-pass state agreement")
      ("audit-engine-dispatch-control" "Record the 32-lane dispatch-count comparison")
      ("audit-engine-disk-split-window" "Keep disk and resident attention reductions aligned across staging resizes ([#83](https://github.com/robotgamedevelopers/inky/pull/83))")
+     ("audit-engine-claim-agreement" "Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss")
+     ("audit-engine-claim-dispatch" "Name both decode-dispatch counters in the v0.2.2 note")
+     ("audit-engine-dirty-range" "Tie the 63/64 dirty-range claim to a real decode step")
    )
    :columns (("done" "done"))
    :cells (
@@ -138,6 +151,9 @@
      ("audit-engine-attention-control" "done" "t-audit-engine-attention-control")
      ("audit-engine-dispatch-control" "done" "t-audit-engine-dispatch-control")
      ("audit-engine-disk-split-window" "done" "t-audit-engine-disk-split-window")
+     ("audit-engine-claim-agreement" "done" "t-audit-engine-claim-agreement")
+     ("audit-engine-claim-dispatch" "done" "t-audit-engine-claim-dispatch")
+     ("audit-engine-dirty-range" "done" "t-audit-engine-dirty-range")
    ))
   (:id "t-audit-engine-q8-debug" :type :task :title "Allow Q8 attention in debug decoding" :state :doing
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "src/engine.rs" "src/kernels.metal")
@@ -165,7 +181,7 @@
    :note "At be82ef3 the production tokenizer matched all 45,073 llama.cpp reference IDs for the 119,312-byte mixed-text corpus, including long BPE pieces. Source review confirmed checked GGUF tensor extents, row divisibility, fixed kernel shapes, vocabulary and embedding bounds, and matching native NV4 and MX8 block widths. Coverage applies to those invariants and this corpus.")
   (:id "t-audit-engine-loopcd-lanes" :type :task :title "Isolate LoopCD transforms by sampling lane" :state :doing
    :evidence ("src/engine.rs" "src/kernels.metal" "src/sampler.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
-   :note "A disabled lane was softcapped when a neighbor enabled LoopCD. Two distinct raw logits became equal on M3 Ultra and greedy selection changed. Leave a disabled lane raw, retain per-lane blend status and check standalone and mixed-batch equality, including ties. Confirm on model-backed serving.")
+   :note "A disabled lane was softcapped when a neighbor enabled LoopCD. Two distinct raw logits became equal on M3 Ultra and greedy selection changed. Leave a disabled lane raw, retain per-lane blend status and check standalone and mixed-batch equality, including ties. Confirm on model-backed serving. Johnny Grok, 2026-11-25, read the same split still present on main at d6778fe: the step runs k_loopcd_blend when any lane has omega greater than 0, the omega less-or-equal 0 lane takes Metal precise::tanh and returns (kernels.metal), and last_step_loopcd is one flag for the step (engine.rs), so the CPU sampler's f32::tanh is skipped for every lane. A solo omega-0 lane never enters that kernel. He did not re-run the M3 Ultra flip.")
   (:id "t-audit-engine-loopcd-first" :type :task :title "Apply LoopCD to the first output token" :state :doing
    :evidence ("src/engine.rs" "src/serve.rs" "src/session.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
    :note "Terminal prefill bypassed the weak pass in both CLI and serve, so a one-token request could skip LoopCD entirely. Compare the final prompt row with a forced decode at zero and nonzero weights, including both cold and cached prompts. The audit established the call path. The effect on a given generated token requires model execution.")
@@ -196,6 +212,15 @@
   (:id "t-audit-engine-disk-split-window" :type :task :title "Keep disk and resident attention reductions aligned across staging resizes" :state :doing
    :evidence ("src/engine.rs" "src/session.rs" "tests/golden.sh" "docs/README.md" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "Default staging reserves 4,096 positions per half at context 32,760. The resident split grows to 4,128 at 32,768, ahead of the disk resize at 32,824. The CPU planner confirmed different key groupings. Cover the full interval in sizing tests, then compare complete disk and resident logits across the transition on M5. That numerical transition remained unmeasured at audit.")
+  (:id "t-audit-engine-claim-agreement" :type :task :title "Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss" :state :todo
+   :evidence ("README.md" "docs/README.md" "docs/DESIGN.md" "tests/ci.sh" "src/main.rs")
+   :note "Johnny Grok, 2026-11-25, on main at d6778fe. README.md:11 says the same answers as llama.cpp, checked position by position in CI. docs/README.md still says 61/61 and 25/25 after a batched 2379-token prefill. tests/ci.sh requires argmax equality and worst KL at most 0.01 on 58 short decode positions, 24 long-prefill positions, and 58 short decode-step positions. DESIGN.md:65 already says the long prompt's decode path is not checked position by position. inky check prints the agreement line and returns Ok when argmaxes disagree (main.rs:613). The awk in ci.sh is the gate. The 1.90x and 5.8x figures in docs/README.md are dated measurements, not a CI result.")
+  (:id "t-audit-engine-claim-dispatch" :type :task :title "Name both decode-dispatch counters in the v0.2.2 note" :state :todo
+   :evidence ("docs/releases/v0.2.2.md" "src/engine.rs")
+   :note "Johnny Grok, 2026-11-25. docs/releases/v0.2.2.md says encode_decode drops from 10,186 dispatches to 843. count_step asserts 1131 to 843 and 963 to 819 barriers and does not call encode_decode (engine.rs:4516). The four listed opts sum to 288, which is 1131 minus 843. The separate done row records an M5 Pro measurement of 10,186 to 843 encoded, unsubmitted command-buffer calls. The note should name both counters. The same paragraph's bit-identical IEEE claim is the two arithmetics agreeing with each other; lines 1 to 5 of the golden files were updated, and CI does not compare tokens with v0.2.1.")
+  (:id "t-audit-engine-dirty-range" :type :task :title "Tie the 63/64 dirty-range claim to a real decode step" :state :todo
+   :evidence ("docs/releases/v0.2.2.md" "src/blocks.rs")
+   :note "Johnny Grok, 2026-11-25, on main at d6778fe. The v0.2.2 note says 63 of 64 steady-state decode steps write 0 bytes. blocks.rs dirty_range_initial_full_sync_and_63_clean_decode_steps calls sync_dirty_to_slice 63 times on a table whose dirty range is already empty. It does not run a decode step.")
   (:id "audit-operations" :type :roadmap :title "Serving API, fleet tools and release qualification"
    :rows (
      ("audit-fleet-worker" "P1 — Isolate model-edited Go during fleet checks ([#82](https://github.com/robotgamedevelopers/inky/pull/82))")
@@ -232,6 +257,8 @@
      ("audit-ci-integration-tests" "Include Rust integration tests in hosted debug CI ([#75](https://github.com/robotgamedevelopers/inky/pull/75))")
      ("audit-replay-line-size" "Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91))")
      ("audit-record-generation-delivery" "Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90))")
+     ("audit-api-count-pool" "Keep count_tokens from filling the generation preprocess pool")
+     ("audit-ci-pipefail" "Fail ci.sh sabotage probes on the command status, not only on grep")
    )
    :columns (("done" "done"))
    :cells (
@@ -269,6 +296,8 @@
      ("audit-ci-integration-tests" "done" "t-audit-ci-integration-tests")
      ("audit-replay-line-size" "done" "t-audit-replay-line-size")
      ("audit-record-generation-delivery" "done" "t-audit-record-generation-delivery")
+     ("audit-api-count-pool" "done" "t-audit-api-count-pool")
+     ("audit-ci-pipefail" "done" "t-audit-ci-pipefail")
    ))
   (:id "t-audit-fleet-worker" :type :task :title "P1 — Isolate model-edited Go during fleet checks" :state :doing
    :evidence ("tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "docs/FLEET-SPRINT.md" "https://github.com/robotgamedevelopers/inky/pull/82")
@@ -372,6 +401,12 @@
   (:id "t-audit-record-generation-delivery" :type :task :title "Represent generation and delivery outcomes independently" :state :doing
    :evidence ("src/serve.rs" "src/record.rs" "tools/replay/replay.go" "https://github.com/robotgamedevelopers/inky/pull/90")
    :note "PR #90 retains the model finish reason when the final write fails and records the delivery outcome separately. Older rows keep their original interpretation.")
+  (:id "t-audit-api-count-pool" :type :task :title "Keep count_tokens from filling the generation preprocess pool" :state :todo
+   :evidence ("src/serve.rs" "docs/README.md")
+   :note "Johnny Grok, 2026-11-25, on main at d6778fe. count_tokens takes a preprocess permit and no lane (serve.rs:2486) and tokenizes up to the body cap. Generation takes a lane permit and then the same preprocess pool (serve.rs admit_for_render). The pool size is the greater of the effective lane count and 4 (serve.rs:2571). A burst of counts returns 429 to chat while GPU lanes are idle. docs/README.md describes a four-request cap. The lane-dependent documentation row is separate; this row is the shared pool itself.")
+  (:id "t-audit-ci-pipefail" :type :task :title "Fail ci.sh sabotage probes on the command status, not only on grep" :state :todo
+   :evidence ("tests/ci.sh")
+   :note "Johnny Grok, 2026-11-25, on main at d6778fe. tests/ci.sh is set -e and has no pipefail. The spans and xcopy negative controls are pipelines ending in grep -q (ci.sh:47 and :50). A panic after the sabotage string is still grep's success. The poolgate probe records the exit code and requires both status 1 and the text (ci.sh:54).")
   (:id "audit-prs" :type :roadmap :title "Integration decisions for the six audited pull requests"
    :rows (
      ("audit-pr37-port" "PR #37 — Port fixed-split attention to current main ([#88](https://github.com/robotgamedevelopers/inky/pull/88))")
