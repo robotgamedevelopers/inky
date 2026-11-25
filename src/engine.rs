@@ -1044,6 +1044,22 @@ impl Engine {
     /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`.
     /// Returns `(n_window, n_full)`.
     pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {
+        if let Ok(spec) = std::env::var("INKY_TEST_POOL_SLOTS") {
+            if let Some((w_str, f_str)) = spec.trim().split_once(',') {
+                if let (Ok(nw), Ok(nf)) = (w_str.trim().parse::<usize>(), f_str.trim().parse::<usize>()) {
+                    if nw >= 1 && nf >= 1 {
+                        let pools = crate::blocks::BlockPools::gpu(
+                            &self.gpu.dev,
+                            nw,
+                            nf,
+                            self.kvb as u32,
+                        );
+                        *self.block_pool.borrow_mut() = pools;
+                        return (nw, nf);
+                    }
+                }
+            }
+        }
         let max_slab = self.gpu.dev.maxBufferLength() as u64;
         let capped_budget = Self::capped_serve_kv_budget(
             kv_budget_bytes,

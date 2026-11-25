@@ -2614,6 +2614,17 @@ impl ServeStepPlanner {
         self.wait_ticks[lane] = 0;
     }
 
+    pub fn start_restore(&mut self, lane: usize) {
+        self.states[lane] = LaneState::Restoring;
+        self.wait_ticks[lane] = 0;
+    }
+
+    pub fn finish_restore(&mut self, lane: usize) {
+        debug_assert_eq!(self.states[lane], LaneState::Restoring);
+        self.states[lane] = LaneState::Ready;
+        self.wait_ticks[lane] = 0;
+    }
+
     pub fn on_finish(&mut self, lane: usize) {
         self.states[lane] = LaneState::Finished;
         self.wait_ticks[lane] = 0;
@@ -2655,13 +2666,13 @@ impl ServeStepPlanner {
         let need_dec: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_decode())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_decode())
             .map(|(i, _)| i)
             .collect();
         let need_pf: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_prefill())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_prefill())
             .map(|(i, _)| i)
             .collect();
 
@@ -3378,5 +3389,35 @@ mod tests {
         assert!(data.contains("MODULE TraceData"));
         assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
         assert!(tlc_cfg.contains("BypassBoundHolds"));
+    }
+
+    #[test]
+    fn serve_step_planner_skips_restoring_lanes_without_blocking_ready_decoders() {
+        let mut p = ServeStepPlanner::new(3, 4);
+        p.on_admit(0);
+        p.start_restore(1);
+        p.start_restore(2);
+        assert_eq!(p.state(1), LaneState::Restoring);
+        assert_eq!(p.state(2), LaneState::Restoring);
+
+        let inputs = [
+            ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+            ServeLaneInput { runnable: true, n_past: 0, pf_end: 1024, has_pending_decode: false },
+            ServeLaneInput { runnable: true, n_past: 0, pf_end: 1024, has_pending_decode: false },
+        ];
+        for _ in 0..6 {
+            let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+            assert_eq!(plan, ServeStepPlan::Decode(vec![0]));
+            assert_eq!(p.wait_ticks(1), 0, "Restoring lane must not accrue wait_ticks");
+            assert!(p.complete_step().is_empty());
+        }
+
+        // Mid-restore cancel immediately transitions Restoring -> Cancelled.
+        assert!(p.request_cancel(2));
+        assert_eq!(p.state(2), LaneState::Cancelled);
+
+        // Finishing restore transitions Restoring -> Ready so lane 1 joins step planning.
+        p.finish_restore(1);
+        assert_eq!(p.state(1), LaneState::Ready);
     }
 }

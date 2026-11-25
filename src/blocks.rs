@@ -585,6 +585,23 @@ impl BlockPool {
     pub fn len(&self) -> usize { self.slots.len() }
     pub fn slab_count(&self) -> usize { self.slabs.len() }
 
+    /// Fast `(usable_slots, reclaimable_slots)` scan over `self.slots` without per-slot
+    /// `Slot::new` / `Result` wrapper overhead on large pools.
+    pub fn count_usable_and_avail(&self, start_slot_refs: &[u32]) -> (usize, usize) {
+        let mut usable = 0usize;
+        let mut avail = 0usize;
+        for (i, rec) in self.slots.iter().enumerate() {
+            if rec.generation < u32::MAX {
+                usable += 1;
+                let held_by_starts = start_slot_refs.get(i).copied().unwrap_or(0);
+                if rec.refs <= held_by_starts {
+                    avail += 1;
+                }
+            }
+        }
+        (usable, avail)
+    }
+
     fn index(&self, slot: Slot) -> Result<usize, BlockError> {
         let i = slot.pool_index().get() as usize;
         if i >= self.slots.len() { Err(BlockError::OutOfRange) } else { Ok(i) }

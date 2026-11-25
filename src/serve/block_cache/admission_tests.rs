@@ -27,6 +27,7 @@ fn lane<'a>(
     InflightLaneReserve {
         lane: id,
         toks: prompt,
+        block_hashes: None,
         n_past: written,
         pf_end: prompt.len(),
         cached: 0,
@@ -154,6 +155,7 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
             reasons: EVERY,
             cs_key: SpillKey::new(SpillBlockKind::Full, 1),
             entries: Vec::new(),
+            toks: prompt[..8192].to_vec(),
             last_used_tick: 0,
         },
     );
@@ -235,4 +237,176 @@ fn long_reply_maintains_a_rolling_decode_reservation_after_4096_tokens() {
         ..lane(0, &prompt, generated, generated + 2 * BLOCK)
     };
     assert_eq!(reserved_inflight_full_slots(&[active]), 2);
+}
+
+fn reference_all_pairs_reserved_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize {
+    let prefills: Vec<InflightPrefillLane<'_>> = lanes
+        .iter()
+        .filter_map(|l| l.as_prefill_lane())
+        .collect();
+    lanes
+        .iter()
+        .map(|lane| {
+            let credited = prefills
+                .iter()
+                .find(|f| f.lane == lane.lane && f.eligible_follower)
+                .map_or(0, |me| {
+                    let next = effective_pf_target(me.n_past, me.pf_end);
+                    let final_ckpt = me.pf_end.saturating_sub(1) / BLOCK * BLOCK;
+                    prefills
+                        .iter()
+                        .map(|prod| pair_shared_checkpoint_exact(me, prod, next, final_ckpt))
+                        .max()
+                        .unwrap_or(0)
+                });
+            lane.reserved_end().div_ceil(BLOCK) - lane.written.max(credited).div_ceil(BLOCK)
+        })
+        .sum()
+}
+
+#[test]
+fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity() {
+    const N_LANES: usize = 32;
+    const PROMPT_LEN: usize = 65_536;
+
+    // Construct 32 realistic 65,536-token prompts across 4 prefix families:
+    // - 0..16: share 57,344 tokens, diverge in the tail (and lanes 0..4 share all 65,472 checkpoint tokens)
+    // - 16..24: share 24,576 tokens with family A, then share a second branch up to 49,152
+    // - 24..28: share 8,192 tokens only
+    // - 28..32: completely cold / distinct prefixes
+    let base_a: Vec<u32> = (0..PROMPT_LEN as u32).map(|i| (i.wrapping_mul(2654435761)) % 60_000).collect();
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(N_LANES);
+    for i in 0..N_LANES {
+        let mut p = base_a.clone();
+        match i {
+            0..=3 => {
+                // Identical up to final_checkpoint = 65,472; differ only in final 64-token tail!
+                p[PROMPT_LEN - 1] = 70_000 + i as u32;
+            }
+            4..=15 => {
+                for (k, slot) in p[58_000..].iter_mut().enumerate() {
+                    *slot = 80_000 + (i as u32) * 100 + (k as u32 % 97);
+                }
+            }
+            16..=23 => {
+                for (k, slot) in p[24_576..49_152].iter_mut().enumerate() {
+                    *slot = 90_000 + (k as u32 % 251);
+                }
+                for (k, slot) in p[49_152..].iter_mut().enumerate() {
+                    *slot = 100_000 + (i as u32) * 100 + (k as u32 % 89);
+                }
+            }
+            24..=27 => {
+                for (k, slot) in p[8_192..].iter_mut().enumerate() {
+                    *slot = 110_000 + (i as u32) * 100 + (k as u32 % 113);
+                }
+            }
+            _ => {
+                for (k, slot) in p.iter_mut().enumerate() {
+                    *slot = 120_000 + (i as u32) * 1000 + (k as u32 % 509);
+                }
+            }
+        }
+        prompts.push(p);
+    }
+
+    // Precompute compact per-block rolling hashes once per prompt (as Job preparation does).
+    let hashes: Vec<Vec<u64>> = prompts.iter().map(|p| compute_block_hashes(p)).collect();
+    for h in &hashes {
+        assert_eq!(h.len(), PROMPT_LEN / BLOCK);
+    }
+
+    // Metadata-only records pool avoids multi-GiB slab allocation while exercising exact pool_headroom!
+    let pools = BlockPools {
+        window: crate::blocks::BlockPool::records_only(BlockKind::Window, 2_048, 1).unwrap(),
+        full: crate::blocks::BlockPool::records_only(BlockKind::Full, 12_000, 1).unwrap(),
+    };
+    let mut cache = ServeBlockCache::new();
+    let max_gen = 64usize;
+    let chunk = 4096usize;
+
+    // Time the full 32-lane admission + leader-election burst!
+    let began = std::time::Instant::now();
+    let mut cohort = PreparedInflightCohort::empty();
+    let mut decisions = Vec::with_capacity(N_LANES);
+    let mut reserves_so_far: Vec<InflightLaneReserve<'_>> = Vec::with_capacity(N_LANES);
+    for i in 0..N_LANES {
+        let ok = cache.can_admit_with_cohort(
+            &pools,
+            &cohort,
+            i,
+            &prompts[i],
+            Some(&hashes[i]),
+            max_gen,
+            chunk,
+        );
+        decisions.push(ok);
+        if ok {
+            let r = InflightLaneReserve {
+                lane: i,
+                toks: &prompts[i],
+                block_hashes: Some(&hashes[i]),
+                n_past: 0,
+                pf_end: PROMPT_LEN,
+                cached: 0,
+                written: 0,
+                gen: 0,
+                max_gen,
+                runnable: true,
+            };
+            cohort.push_admitted(r);
+            reserves_so_far.push(r);
+        }
+    }
+    let pf_lanes: Vec<InflightPrefillLane<'_>> = reserves_so_far
+        .iter()
+        .filter_map(|r| r.as_prefill_lane())
+        .collect();
+    let leaders = find_prefill_leaders(&pf_lanes);
+    let elapsed = began.elapsed();
+
+    eprintln!(
+        "[u331-admit-scan] 32 x 65,536-token burst admission + leader election completed in {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2),
+        "32 x 65,536-token burst admission + leader election took {elapsed:?} (must be < 2ms)"
+    );
+
+    // Verify 100% exact parity at every admission step and leader election against reference all-pairs logic!
+    let mut ref_cache = ServeBlockCache::new();
+    let mut ref_active: Vec<InflightLaneReserve<'_>> = Vec::new();
+    for i in 0..N_LANES {
+        let mut trial = ref_active.clone();
+        trial.push(InflightLaneReserve {
+            lane: i,
+            toks: &prompts[i],
+            block_hashes: None,
+            n_past: 0,
+            pf_end: PROMPT_LEN,
+            cached: 0,
+            written: 0,
+            gen: 0,
+            max_gen,
+            runnable: true,
+        });
+        assert_eq!(
+            reserved_inflight_full_slots(&trial),
+            reference_all_pairs_reserved_full_slots(&trial),
+            "reserved_inflight_full_slots mismatch at lane {i}"
+        );
+        let ref_ok = ref_cache.can_admit(&pools, &ref_active, i, &prompts[i], max_gen, chunk);
+        assert_eq!(decisions[i], ref_ok, "can_admit decision mismatch at lane {i}");
+        if ref_ok {
+            ref_active.push(trial.pop().unwrap());
+        }
+    }
+    for (idx, pf) in pf_lanes.iter().enumerate() {
+        let no_hash_pf: Vec<InflightPrefillLane<'_>> = pf_lanes
+            .iter()
+            .map(|p| InflightPrefillLane { block_hashes: None, ..*p })
+            .collect();
+        let ref_leader = find_prefill_leader(&no_hash_pf, idx);
+        assert_eq!(leaders[idx], ref_leader, "leader mismatch for prefill idx {idx} (lane {})", pf.lane);
+    }
 }
