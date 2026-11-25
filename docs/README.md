@@ -60,7 +60,7 @@ To enable inky mode, the Mac's owner installs the memory helper once from the ch
 sudo ./target/release/inky tune-memory
 ```
 
-The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while inky is connected. It restores the prior limit after the last inky process disconnects. Inky runs under the owner's account and logs whether it entered inky mode. Without the helper, the server uses the macOS default limit. To remove it, run `sudo ./target/release/inky tune-memory --undo`.
+The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while inky is connected. It restores the prior limit after the last inky process disconnects. If the helper restarts, it restores the saved limit at startup. Processes that held a lease reconnect automatically and raise the limit again. Inky runs under the owner's account and logs when it enters, loses, or regains its connection. Without the helper, the server uses the macOS default limit. To remove it, run `sudo ./target/release/inky tune-memory --undo`.
 
 ### Start the server
 

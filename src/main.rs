@@ -1725,14 +1725,16 @@ fn vcost(o: &Opts) {
     }
 }
 
-fn enter_inky_mode() {
+fn enter_inky_mode() -> Option<memd::Lease> {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-    match memd::enter(&sock) {
-        Some(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
+    let lease = memd::enter(&sock);
+    match &lease {
+        Some(lease) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, lease.initial_limit),
         None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
     }
+    lease
 }
 
 fn main() {
@@ -1755,13 +1757,13 @@ fn main() {
                 return;
             }
             let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
-            enter_inky_mode();
+            let _lease = enter_inky_mode();
             serve::serve(options);
             return;
         }
         Some("mode") => {
             // Hold inky mode for the requested interval, then leave by exiting.
-            enter_inky_mode();
+            let _lease = enter_inky_mode();
             let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_secs(secs));
             return;
@@ -1769,7 +1771,7 @@ fn main() {
         _ => {}
     }
     let (cmd, o) = parse();
-    if !matches!(cmd.as_str(), "help" | "-h" | "--help") { enter_inky_mode(); }
+    let _lease = if matches!(cmd.as_str(), "help" | "-h" | "--help") { None } else { enter_inky_mode() };
     match cmd.as_str() {
         "check" => report_cli_result(&cmd, check(&o)),
         "rows" => rows(&o),
