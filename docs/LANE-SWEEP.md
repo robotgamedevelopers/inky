@@ -49,9 +49,9 @@ go run . --url http://127.0.0.1:18096 --input ../../tests/replay/recorded_cards.
   --lanes 8,16,32,48,64,96,128 --duration 20s --key-env INKY_SERVE_KEY
 ```
 
-Measured results (after sizing `serve()`'s preprocessing permit pool to `effective_lanes.max(PREPROCESS_LIMIT)` so admitted lanes never bounce with HTTP 429 during burst tokenization):
+The November 24 runner combined the time to first visible streamed output with the time to receive a complete buffered response. Seven of the fixture's 22 turns were buffered. For example, the original recording of turn 2 of `card-slice-bounds` shows 168 ms to first token and 5,979 ms to completion. The mixed latency percentiles below preserve what the runner reported. The memory column projects the admission budget from `model_bytes + active_lanes × per_lane_worst_case_bytes`.
 
-| lanes | total_tok_s | per_lane_tok_s | ttft_p50_ms | ttft_p95_ms | peak_memory_bytes | cards_completed | cards_per_hour | errors | retries_429 |
+| lanes | total_tok_s | per_lane_tok_s | mixed_latency_p50_ms | mixed_latency_p95_ms | peak_budget_estimate_bytes | cards_completed | cards_per_hour | errors | retries_429 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8 | 62.17 | 7.77 | 2080.8 | 9987.0 | 25,056,577,792 (23.34 GiB) | 8 | 854.7 | 0 | 0 |
 | 16 | 123.32 | 7.71 | 3135.9 | 11125.5 | 30,760,391,168 (28.65 GiB) | 16 | 1638.9 | 0 | 0 |
@@ -63,11 +63,11 @@ Measured results (after sizing `serve()`'s preprocessing permit pool to `effecti
 
 ## 4. Knee Selection & Default Lane Count
 
-- **Unconstrained scaling (`PickKnee` with `--min-gain 0.05`)**: Total throughput continues scaling cleanly at short-to-medium prompt sizes through `128` lanes (`401.96 tok/s`, `5,283.9 cards/hr`, `+21.8%/doubling` from `96` to `128`), because per-lane KV cache traffic at `< 2K` tokens is small relative to weight bandwidth.
-- **Selected Operational Knee (`PickKnee` with `--max-ttft-p95-ms 20000 --min-per-lane-tok-s 4.0`): `64` lanes**:
-  1. **Marginal gain inflection**: `48 -> 64` jumps `+38.5%` (`232.94 -> 322.66 tok/s`, `+92.8%/doubling`), whereas `64 -> 96` drops to `+14.2%` (`+24.3%/doubling`) and `96 -> 128` drops to `+9.0%` (`+21.8%/doubling`).
-  2. **Worker probe & latency SLO**: At `64` lanes, `ttft_p95_ms = 16,331.1 ms` stays under the `20,000 ms` (`20 s`) `nova-sprint` worker startup probe ceiling (`docs/README.md`) and `per_lane_tok_s = 5.04` stays above `4.0 tok/s`; `96` (`20,689.1 ms`, `3.84 tok/s`) and `128` (`25,447.6 ms`, `3.14 tok/s`) cross both thresholds.
-  3. **Working-set headroom**: At `64` lanes (`60.52 GiB` peak worst-case at `-c 16384`), `54.7 GiB` of working set remains free for macOS/spill/longer turns, whereas `128` lanes consumes `103.02 GiB` (`89%` of the `115.23 GiB` working set). When running at higher per-lane context (`-c 65536`), `MemoryBudget` automatically caps admission to `43` lanes on M5 Max 128 GB.
+**64 lanes was the highest tested concurrency above the 4.0 tok/s per-lane floor.** The M5 Max delivered 322.66 tok/s in aggregate, 5.04 tok/s per lane, and 4,259 cards/hour at that setting. Aggregate throughput continued rising to 401.96 tok/s at 128 lanes, while per-lane throughput fell to 3.84 tok/s at 96 lanes and 3.14 tok/s at 128.
+
+The historical aggregates leave the 20-second p95 TTFT target unverified. On a new sweep, `ttft_samples` counts successful streaming turns with observable output. Only these turns contribute to `ttft_p50_ms` and `ttft_p95_ms`. Buffered turns still count toward completed cards and throughput.
+
+At 64 lanes the budget projection was 60.52 GiB. Actual process footprint and available system memory were unmeasured in this run. With a server exposing `process_footprint_bytes` through `/health`, replay reports the largest sampled process footprint in `peak_memory_bytes` and the largest admission-budget estimate in `peak_budget_estimate_bytes`. Sampling can miss peaks between polls.
 
 The chosen default lane count **`64`** is set in:
 - [`src/main.rs`](../src/main.rs) (`DEFAULT_SERVE_LANES = 64`, `SERVE_USAGE`)

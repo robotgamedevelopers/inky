@@ -81,7 +81,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --loopcd OMEGA    default adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
   --record-max-bytes N
-                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
+                    max bytes per segment before rotating to .1 (default 104857600); larger rows are dropped
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
@@ -1715,6 +1715,17 @@ fn enter_inky_mode() {
     }
 }
 
+/// Current physical footprint charged to this process by the macOS kernel, in bytes.
+fn process_footprint_bytes() -> Option<u64> {
+    unsafe {
+        let mut usage: libc::rusage_info_v4 = std::mem::zeroed();
+        let result = libc::proc_pid_rusage(
+            libc::getpid(), libc::RUSAGE_INFO_V4, &mut usage as *mut _ as *mut libc::rusage_info_t,
+        );
+        (result == 0).then_some(usage.ri_phys_footprint)
+    }
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
@@ -1838,7 +1849,7 @@ fn main() {
             // the GPU's first touch of a page cost?
             let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_w(device uint * B [[buffer(0)]], constant uint2 & a [[buffer(1)]], uint gid [[thread_position_in_grid]]) { B[a.x + gid * a.y] += gid + 1; }\n";
             let gpu = metal::Gpu::new(src, &["k_w"]);
-            let foot = || unsafe { let mut ri: libc::rusage_info_v4 = std::mem::zeroed(); libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t); ri.ri_phys_footprint as f64 / 1048576.0 };
+            let foot = || process_footprint_bytes().expect("read process physical footprint") as f64 / 1048576.0;
             let len = 1usize << 30;
             let f0 = foot();
             let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) } as *mut u8;

@@ -427,10 +427,9 @@ fn anthropic_stop_reason(has_calls: bool, reason: &str) -> &'static str {
     if has_calls { "tool_use" } else if reason == "length" { "max_tokens" } else { "end_turn" }
 }
 
-/// A random per-process nonce (hex), read once at startup: tool ids carry it so an id
-/// issued before a restart never repeats after one. `/dev/urandom` is the source; the
-/// time-and-pid scramble is only the fallback for a machine without it.
-fn startup_nonce() -> String {
+/// A random startup nonce for tool and anonymous recording IDs across restarts.
+/// Reads `/dev/urandom` with a time-and-pid fallback.
+pub(crate) fn startup_nonce() -> String {
     let mut b = [0u8; 8];
     let have = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok();
     if !have {
@@ -1944,6 +1943,9 @@ fn health_body(cx: &Ctx) -> String {
         ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
         ("queued_requests".into(), json!(cx.admission.queued())),
     ]);
+    if let Some(bytes) = crate::process_footprint_bytes() {
+        obj.insert("process_footprint_bytes".into(), json!(bytes));
+    }
     if let Some(rec) = &cx.recorder {
         obj.insert("record_written".into(), json!(rec.written_count()));
         obj.insert("record_dropped".into(), json!(rec.dropped_count()));
@@ -3792,7 +3794,9 @@ mod tests {
     #[test] fn health_body_reports_ok_active_lanes_and_inflight() {
         let (cx, _jrx) = admission_test_ctx_with(4, 2, Duration::from_secs(1), 4);
         let b = cx.budget;
-        let idle: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        let mut idle: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        let footprint = idle.as_object_mut().unwrap().remove("process_footprint_bytes").unwrap();
+        assert!(footprint.as_u64().unwrap() > 0);
         assert_eq!(idle, json!({
             "ok": true,
             "active_lanes": 0,

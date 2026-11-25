@@ -71,7 +71,7 @@ type SweepConfig struct {
 	Clock          Clock
 }
 
-// LoadReplaySet loads one .jsonl file or a directory of .jsonl files, groups turns
+// LoadReplaySet loads one .jsonl file or a directory of .jsonl files and their .jsonl.1 backups, groups turns
 // by card_id in turn_index order, and returns cards in deterministic order.
 func LoadReplaySet(path string) ([]Card, error) {
 	info, err := os.Stat(path)
@@ -85,11 +85,17 @@ func LoadReplaySet(path string) ([]Card, error) {
 			return nil, err
 		}
 		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			if !e.IsDir() && (strings.HasSuffix(e.Name(), ".jsonl") || strings.HasSuffix(e.Name(), ".jsonl.1")) {
 				files = append(files, filepath.Join(path, e.Name()))
 			}
 		}
-		sort.Strings(files)
+		sort.Slice(files, func(i, j int) bool {
+			left, right := strings.TrimSuffix(files[i], ".1"), strings.TrimSuffix(files[j], ".1")
+			if left == right {
+				return files[i] > files[j] // retained backup precedes the active segment
+			}
+			return left < right
+		})
 	} else {
 		files = []string{path}
 	}
@@ -109,12 +115,17 @@ func LoadReplaySet(path string) ([]Card, error) {
 		return nil, fmt.Errorf("no valid replay entries found in %s", path)
 	}
 
+	var cards []Card
 	grouped := make(map[string][]RecordedEntry)
-	for _, e := range all {
+	for i, e := range all {
+		if e.CardID == "" {
+			e.CardID = fmt.Sprintf("anon-%d", i+1)
+			cards = append(cards, Card{ID: e.CardID, Turns: []RecordedEntry{e}})
+			continue
+		}
 		grouped[e.CardID] = append(grouped[e.CardID], e)
 	}
 
-	cards := make([]Card, 0, len(grouped))
 	for id, turns := range grouped {
 		sort.SliceStable(turns, func(i, j int) bool {
 			if turns[i].TurnIndex != turns[j].TurnIndex {
@@ -122,9 +133,18 @@ func LoadReplaySet(path string) ([]Card, error) {
 			}
 			return turns[i].RecordedAtMs < turns[j].RecordedAtMs
 		})
-		cards = append(cards, Card{ID: id, Turns: turns})
+		// Older recorders reused card-N after restarting. When every occurrence
+		// starts at turn zero there is no multi-turn sequence to reconstruct.
+		_, parseErr := strconv.ParseUint(strings.TrimPrefix(id, "card-"), 10, 64)
+		if strings.HasPrefix(id, "card-") && parseErr == nil && len(turns) > 1 && turns[len(turns)-1].TurnIndex == 0 {
+			for _, turn := range turns {
+				cards = append(cards, Card{ID: id, Turns: []RecordedEntry{turn}})
+			}
+		} else {
+			cards = append(cards, Card{ID: id, Turns: turns})
+		}
 	}
-	sort.Slice(cards, func(i, j int) bool {
+	sort.SliceStable(cards, func(i, j int) bool {
 		if cards[i].Turns[0].RecordedAtMs != cards[j].Turns[0].RecordedAtMs {
 			return cards[i].Turns[0].RecordedAtMs < cards[j].Turns[0].RecordedAtMs
 		}
@@ -160,9 +180,6 @@ func loadJSONLFile(path string) ([]RecordedEntry, error) {
 		// Skip malformed 400 client requests captured during recording.
 		if e.Response.StatusCode == http.StatusBadRequest {
 			continue
-		}
-		if e.CardID == "" {
-			e.CardID = fmt.Sprintf("anon-%d", lineNum)
 		}
 		if e.Endpoint == "" {
 			e.Endpoint = "/v1/chat/completions"
@@ -217,6 +234,7 @@ type healthTelemetry struct {
 	OK                     bool   `json:"ok"`
 	ActiveLanes            int    `json:"active_lanes"`
 	Inflight               int    `json:"inflight"`
+	ProcessFootprintBytes  uint64 `json:"process_footprint_bytes"`
 	PeakMemoryBytes        uint64 `json:"peak_memory_bytes"`
 	MemoryBytes            uint64 `json:"memory_bytes"`
 	UsedBytes              uint64 `json:"used_bytes"`
@@ -225,28 +243,18 @@ type healthTelemetry struct {
 	RecommendedWorkingSetB uint64 `json:"recommended_working_set_bytes"`
 }
 
-func (h healthTelemetry) observedMemoryBytes() uint64 {
-	best := h.PeakMemoryBytes
-	if h.MemoryBytes > best {
-		best = h.MemoryBytes
-	}
-	if h.UsedBytes > best {
-		best = h.UsedBytes
-	}
-	if h.ModelBytes > 0 || h.PerLaneWorstCaseBytes > 0 {
-		lanes := h.ActiveLanes
-		if lanes < 0 {
-			lanes = 0
-		}
-		est := h.ModelBytes + uint64(lanes)*h.PerLaneWorstCaseBytes
-		if est > best {
-			best = est
-		}
-	}
-	return best
+type memorySamples struct {
+	observed uint64
+	budget   uint64
 }
 
-func pollHealthOnce(ctx context.Context, client *http.Client, baseURL, apiKey string, peakMem *atomic.Uint64) {
+func (m *memorySamples) observe(h healthTelemetry) {
+	m.observed = max(m.observed, h.ProcessFootprintBytes, h.PeakMemoryBytes, h.MemoryBytes, h.UsedBytes)
+	estimate := h.ModelBytes + uint64(max(0, h.ActiveLanes))*h.PerLaneWorstCaseBytes
+	m.budget = max(m.budget, estimate)
+}
+
+func pollHealthOnce(ctx context.Context, client *http.Client, baseURL, apiKey string, memory *memorySamples) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/health", nil)
 	if err != nil {
 		return
@@ -267,13 +275,7 @@ func pollHealthOnce(ctx context.Context, client *http.Client, baseURL, apiKey st
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&h); err != nil {
 		return
 	}
-	mem := h.observedMemoryBytes()
-	for {
-		cur := peakMem.Load()
-		if mem <= cur || peakMem.CompareAndSwap(cur, mem) {
-			break
-		}
-	}
+	memory.observe(h)
 }
 
 func percentileMs(sorted []float64, p float64) float64 {
@@ -295,6 +297,9 @@ func percentileMs(sorted []float64, p float64) float64 {
 
 // RunSweep executes every configured concurrency rung in order and picks the knee.
 func RunSweep(ctx context.Context, cfg SweepConfig, cards []Card) ([]RungMetrics, KneeResult, error) {
+	if cfg.Duration < 0 {
+		return nil, KneeResult{}, errors.New("duration must be nonnegative")
+	}
 	if len(cards) == 0 {
 		return nil, KneeResult{}, errors.New("replay set has no cards")
 	}
@@ -343,13 +348,13 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 		healthInterval = 250 * time.Millisecond
 	}
 
-	var peakMem atomic.Uint64
+	var memory memorySamples
 	healthCtx, cancelHealth := context.WithCancel(ctx)
 	var healthWG sync.WaitGroup
 	healthWG.Add(1)
 	go func() {
 		defer healthWG.Done()
-		pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &peakMem)
+		pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
 		ticker := time.NewTicker(healthInterval)
 		defer ticker.Stop()
 		for {
@@ -357,13 +362,13 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 			case <-healthCtx.Done():
 				return
 			case <-ticker.C:
-				pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &peakMem)
+				pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
 			}
 		}
 	}()
 
 	totalCards := cfg.CardsPerRung
-	if cfg.Duration == 0 && totalCards <= 0 {
+	if cfg.Duration <= 0 && totalCards <= 0 {
 		totalCards = len(cards)
 		if lanes > totalCards {
 			totalCards = lanes
@@ -398,7 +403,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 					return
 				}
 				idx := int(nextCard.Add(1) - 1)
-				if cfg.Duration == 0 && idx >= totalCards {
+				if cfg.Duration <= 0 && idx >= totalCards {
 					return
 				}
 				template := cards[idx%len(cards)]
@@ -413,9 +418,11 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 						break
 					}
 					totalTokens.Add(int64(toks))
-					ttftMu.Lock()
-					ttftsMs = append(ttftsMs, ttftMs)
-					ttftMu.Unlock()
+					if ttftMs >= 0 {
+						ttftMu.Lock()
+						ttftsMs = append(ttftsMs, ttftMs)
+						ttftMu.Unlock()
+					}
 				}
 				if cardOK {
 					completedCards.Add(1)
@@ -428,7 +435,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	cancelHealth()
 	healthWG.Wait()
 	// Capture final post-rung memory snapshot if not yet sampled.
-	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &peakMem)
+	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
 
 	wall := clk.Now().Sub(start).Seconds()
 	if wall <= 0 {
@@ -442,25 +449,19 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	perLaneTokS := totalTokS / float64(lanes)
 
 	return RungMetrics{
-		Lanes:           lanes,
-		TotalTokS:       totalTokS,
-		PerLaneTokS:     perLaneTokS,
-		TTFTP50Ms:       percentileMs(ttftsMs, 0.50),
-		TTFTP95Ms:       percentileMs(ttftsMs, 0.95),
-		PeakMemoryBytes: peakMem.Load(),
-		CardsCompleted:  doneCards,
-		CardsPerHour:    float64(doneCards) / wall * 3600.0,
-		Errors:          int(errCount.Load()),
-		Retries429:      int(retry429Count.Load()),
+		Lanes:                   lanes,
+		TotalTokS:               totalTokS,
+		PerLaneTokS:             perLaneTokS,
+		TTFTP50Ms:               percentileMs(ttftsMs, 0.50),
+		TTFTP95Ms:               percentileMs(ttftsMs, 0.95),
+		TTFTSamples:             len(ttftsMs),
+		PeakMemoryBytes:         memory.observed,
+		PeakBudgetEstimateBytes: memory.budget,
+		CardsCompleted:          doneCards,
+		CardsPerHour:            float64(doneCards) / wall * 3600.0,
+		Errors:                  int(errCount.Load()),
+		Retries429:              int(retry429Count.Load()),
 	}
-}
-
-func isStreamRequest(raw json.RawMessage) bool {
-	var probe struct {
-		Stream bool `json:"stream"`
-	}
-	_ = json.Unmarshal(raw, &probe)
-	return probe.Stream
 }
 
 func executeTurn(
@@ -476,7 +477,15 @@ func executeTurn(
 		endpoint = "/" + endpoint
 	}
 	targetURL := baseURL + endpoint
-	stream := isStreamRequest(turn.Request)
+	var options struct {
+		Stream        bool `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(turn.Request, &options); err != nil {
+		return 0, -1, 0, fmt.Errorf("invalid recorded request: %w", err)
+	}
 
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
@@ -526,138 +535,269 @@ func executeTurn(
 			return 0, 0, retries429, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
-		if stream {
-			toks, ttft, parseErr := consumeSSE(resp.Body, clk, reqStart)
+		messages := strings.HasSuffix(strings.TrimRight(req.URL.Path, "/"), "/v1/messages")
+		if options.Stream {
+			toks, ttft, parseErr := consumeSSE(resp.Body, clk, reqStart, messages, options.StreamOptions.IncludeUsage)
 			resp.Body.Close()
 			return toks, ttft, retries429, parseErr
 		}
 
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		totalMs := clk.Now().Sub(reqStart).Seconds() * 1000.0
 		if readErr != nil {
 			return 0, 0, retries429, readErr
 		}
-		toks, parseErr := parseNonStreamingUsage(body)
-		return toks, totalMs, retries429, parseErr
+		toks, parseErr := parseNonStreamingUsage(body, messages)
+		return toks, -1, retries429, parseErr
 	}
 }
 
-func parseNonStreamingUsage(body []byte) (int, error) {
-	var v struct {
-		Usage struct {
-			CompletionTokens int `json:"completion_tokens"`
-			OutputTokens     int `json:"output_tokens"`
-		} `json:"usage"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
+type replyUsage struct {
+	CompletionTokens *int `json:"completion_tokens"`
+	OutputTokens     *int `json:"output_tokens"`
+}
+
+func requiredTokenCount(count *int) (int, error) {
+	if count == nil || *count < 0 {
+		return 0, errors.New("missing or invalid completion token count")
 	}
-	if err := json.Unmarshal(body, &v); err != nil {
+	return *count, nil
+}
+
+func parseNonStreamingUsage(body []byte, messages bool) (int, error) {
+	var reply struct {
+		Choices []struct {
+			Message      struct{ Role string } `json:"message"`
+			FinishReason string                `json:"finish_reason"`
+		} `json:"choices"`
+		Type       string                    `json:"type"`
+		Role       string                    `json:"role"`
+		Content    []json.RawMessage         `json:"content"`
+		StopReason string                    `json:"stop_reason"`
+		Usage      replyUsage                `json:"usage"`
+		Error      *struct{ Message string } `json:"error"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
 		return 0, fmt.Errorf("invalid JSON response: %w", err)
 	}
-	if v.Error != nil {
-		return 0, fmt.Errorf("server error: %s", v.Error.Message)
+	if reply.Error != nil {
+		return 0, fmt.Errorf("server error: %s", reply.Error.Message)
 	}
-	if v.Usage.CompletionTokens > 0 {
-		return v.Usage.CompletionTokens, nil
+	if messages {
+		if reply.Type != "message" || reply.Role != "assistant" || reply.Content == nil || reply.StopReason == "" {
+			return 0, errors.New("incomplete Messages response")
+		}
+		return requiredTokenCount(reply.Usage.OutputTokens)
 	}
-	return v.Usage.OutputTokens, nil
+	if len(reply.Choices) == 0 {
+		return 0, errors.New("missing chat completion choice")
+	}
+	for _, choice := range reply.Choices {
+		if choice.Message.Role != "assistant" || choice.FinishReason == "" {
+			return 0, errors.New("incomplete chat completion choice")
+		}
+	}
+	return requiredTokenCount(reply.Usage.CompletionTokens)
 }
 
-func consumeSSE(r io.Reader, clk Clock, reqStart time.Time) (int, float64, error) {
+// The two endpoints signal completion differently. Keep terminal state separate
+// from token usage so that a disconnect after a finish reason fails the turn.
+type streamReply struct {
+	started, finished, done bool
+	blockOpen               bool
+	blockIndex              int
+	tokens                  *int
+}
+
+func (s *streamReply) chatChunk(payload string, separateUsage bool) (bool, error) {
+	if payload == "[DONE]" {
+		if !s.finished || s.tokens == nil {
+			return false, errors.New("chat stream ended without finish reason or usage")
+		}
+		s.done = true
+		return false, nil
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta *struct {
+				Content   string            `json:"content"`
+				Reasoning string            `json:"reasoning_content"`
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *replyUsage               `json:"usage"`
+		Error *struct{ Message string } `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return false, fmt.Errorf("invalid chat chunk: %w", err)
+	}
+	if chunk.Error != nil {
+		return false, fmt.Errorf("stream error: %s", chunk.Error.Message)
+	}
+	if chunk.Choices == nil {
+		return false, errors.New("missing chat stream choices")
+	}
+	if len(chunk.Choices) == 0 {
+		if !s.finished || chunk.Usage == nil || s.tokens != nil {
+			return false, errors.New("misplaced or empty chat usage chunk")
+		}
+	} else {
+		if len(chunk.Choices) != 1 || s.finished || chunk.Choices[0].Delta == nil {
+			return false, errors.New("invalid chat stream choice")
+		}
+		s.finished = chunk.Choices[0].FinishReason != ""
+	}
+	if chunk.Usage != nil {
+		if !s.finished || (separateUsage && len(chunk.Choices) != 0) {
+			return false, errors.New("misplaced chat stream usage")
+		}
+		if _, err := requiredTokenCount(chunk.Usage.CompletionTokens); err != nil {
+			return false, err
+		}
+		s.tokens = chunk.Usage.CompletionTokens
+	}
+	if len(chunk.Choices) == 0 {
+		return false, nil
+	}
+	delta := chunk.Choices[0].Delta
+	return delta.Content != "" || delta.Reasoning != "" || len(delta.ToolCalls) != 0, nil
+}
+
+func (s *streamReply) messageEvent(event, payload string) (bool, error) {
+	var ev struct {
+		Type    string                                `json:"type"`
+		Message struct{ Type, Role string }           `json:"message"`
+		Index   *int                                  `json:"index"`
+		Block   struct{ Type, Text, Thinking string } `json:"content_block"`
+		Delta   struct {
+			Type, Text, Thinking string
+			PartialJSON          string `json:"partial_json"`
+			StopReason           string `json:"stop_reason"`
+		} `json:"delta"`
+		Usage replyUsage                `json:"usage"`
+		Error *struct{ Message string } `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		return false, fmt.Errorf("invalid Messages event: %w", err)
+	}
+	if ev.Error != nil {
+		return false, fmt.Errorf("stream error: %s", ev.Error.Message)
+	}
+	if event != "" && event != ev.Type {
+		return false, errors.New("Messages event type mismatch")
+	}
+	if ev.Type == "ping" {
+		return false, nil
+	}
+	if ev.Type == "message_start" {
+		if s.started || ev.Message.Type != "message" || ev.Message.Role != "assistant" {
+			return false, errors.New("invalid message_start")
+		}
+		s.started = true
+		return false, nil
+	}
+	if !s.started || (s.finished && ev.Type != "message_stop") {
+		return false, fmt.Errorf("misplaced Messages event %q", ev.Type)
+	}
+	switch ev.Type {
+	case "content_block_start", "content_block_delta", "content_block_stop":
+		if ev.Index == nil || *ev.Index != s.blockIndex {
+			return false, errors.New("unexpected Messages block index")
+		}
+		if ev.Type == "content_block_start" {
+			if s.blockOpen || ev.Block.Type == "" {
+				return false, errors.New("invalid content_block_start")
+			}
+			s.blockOpen = true
+			return ev.Block.Type == "tool_use" || ev.Block.Text != "" || ev.Block.Thinking != "", nil
+		}
+		if !s.blockOpen {
+			return false, errors.New("missing content_block_start")
+		}
+		if ev.Type == "content_block_stop" {
+			s.blockOpen = false
+			s.blockIndex++
+			return false, nil
+		}
+		if ev.Delta.Type == "" {
+			return false, errors.New("missing Messages block delta")
+		}
+		return ev.Delta.Text != "" || ev.Delta.Thinking != "" || ev.Delta.PartialJSON != "", nil
+	case "message_delta":
+		if s.blockOpen || ev.Delta.StopReason == "" {
+			return false, errors.New("incomplete Messages stream")
+		}
+		if _, err := requiredTokenCount(ev.Usage.OutputTokens); err != nil {
+			return false, err
+		}
+		s.finished = true
+		s.tokens = ev.Usage.OutputTokens
+	case "message_stop":
+		if !s.finished {
+			return false, errors.New("message_stop without final delta")
+		}
+		s.done = true
+	default:
+		return false, fmt.Errorf("unrecognized Messages event %q", ev.Type)
+	}
+	return false, nil
+}
+
+func consumeSSE(r io.Reader, clk Clock, reqStart time.Time, messages, separateUsage bool) (int, float64, error) {
+	const maxFrame = 4 * 1024 * 1024
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 16*1024), 4*1024*1024)
-
-	var firstTokMs float64
-	gotFirstTok := false
-	usageTokens := -1
-	deltaChunks := 0
-	sawTerminal := false
-
+	sc.Buffer(make([]byte, 16*1024), maxFrame)
+	var data strings.Builder
+	var event string
+	var reply streamReply
+	ttft := -1.0
 	for sc.Scan() {
 		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
+		if line != "" {
+			field, value, _ := strings.Cut(line, ":")
+			value = strings.TrimPrefix(value, " ")
+			switch field {
+			case "event":
+				event = value
+			case "data":
+				if data.Len()+len(value)+1 > maxFrame {
+					return 0, -1, errors.New("SSE frame too large")
+				}
+				data.WriteString(value)
+				data.WriteByte('\n')
+			}
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
+		if data.Len() == 0 {
+			event = ""
 			continue
 		}
-		if payload == "[DONE]" {
-			sawTerminal = true
-			continue
+		if reply.done {
+			return 0, -1, errors.New("data after terminal SSE event")
 		}
-
-		var ev struct {
-			Type    string `json:"type"`
-			Choices []struct {
-				Delta struct {
-					Content          string `json:"content"`
-					ReasoningContent string `json:"reasoning_content"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Delta *struct {
-				Text       string `json:"text"`
-				Thinking   string `json:"thinking"`
-				StopReason string `json:"stop_reason"`
-			} `json:"delta"`
-			Usage *struct {
-				CompletionTokens int `json:"completion_tokens"`
-				OutputTokens     int `json:"output_tokens"`
-			} `json:"usage"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
+		payload := strings.TrimSuffix(data.String(), "\n")
+		var hasOutput bool
+		var err error
+		if messages {
+			hasOutput, err = reply.messageEvent(event, payload)
+		} else {
+			hasOutput, err = reply.chatChunk(payload, separateUsage)
 		}
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			return 0, 0, fmt.Errorf("invalid SSE chunk: %w", err)
+		if err != nil {
+			return 0, -1, err
 		}
-		if ev.Error != nil {
-			return 0, 0, fmt.Errorf("stream error: %s", ev.Error.Message)
+		if hasOutput && ttft < 0 {
+			ttft = clk.Now().Sub(reqStart).Seconds() * 1000
 		}
-		if ev.Type == "message_stop" {
-			sawTerminal = true
-		}
-		if ev.Usage != nil {
-			if ev.Usage.CompletionTokens > 0 {
-				usageTokens = ev.Usage.CompletionTokens
-			} else if ev.Usage.OutputTokens > 0 {
-				usageTokens = ev.Usage.OutputTokens
-			}
-		}
-		hasTok := false
-		if len(ev.Choices) > 0 {
-			if ev.Choices[0].Delta.Content != "" || ev.Choices[0].Delta.ReasoningContent != "" {
-				hasTok = true
-			}
-			if ev.Choices[0].FinishReason != nil && *ev.Choices[0].FinishReason != "" {
-				sawTerminal = true
-			}
-		}
-		if ev.Type == "content_block_delta" && ev.Delta != nil && (ev.Delta.Text != "" || ev.Delta.Thinking != "") {
-			hasTok = true
-		}
-		if hasTok {
-			deltaChunks++
-			if !gotFirstTok {
-				gotFirstTok = true
-				firstTokMs = clk.Now().Sub(reqStart).Seconds() * 1000.0
-			}
-		}
+		event = ""
+		data.Reset()
 	}
 	if err := sc.Err(); err != nil {
-		return 0, 0, err
+		return 0, -1, err
 	}
-	if !sawTerminal {
-		return 0, 0, errors.New("truncated SSE stream")
+	if !reply.done || data.Len() != 0 {
+		return 0, -1, errors.New("truncated SSE stream")
 	}
-	if !gotFirstTok {
-		firstTokMs = clk.Now().Sub(reqStart).Seconds() * 1000.0
-	}
-	if usageTokens >= 0 {
-		return usageTokens, firstTokMs, nil
-	}
-	return deltaChunks, firstTokMs, nil
+	return *reply.tokens, ttft, nil
 }

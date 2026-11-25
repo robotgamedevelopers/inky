@@ -323,6 +323,7 @@ impl Stats {
 pub struct Recorder {
     tx: Option<SyncSender<RecordEntry>>,
     worker: Option<JoinHandle<()>>,
+    anonymous_nonce: String,
     next_card_seq: AtomicU64,
     turns: Mutex<TurnTracker>,
     stats: std::sync::Arc<Stats>,
@@ -363,14 +364,13 @@ impl Recorder {
                     if n == 1 || n.is_power_of_two() {
                         eprintln!("[record] write failed in {} (errors={n}): {e}", dir.display());
                     }
-                } else {
-                    worker_stats.written.fetch_add(1, Ordering::Relaxed);
                 }
             }
         });
         Self {
             tx: Some(tx),
             worker: Some(worker),
+            anonymous_nonce: crate::serve::startup_nonce(),
             next_card_seq: AtomicU64::new(1),
             turns: Mutex::new(TurnTracker::default()),
             stats,
@@ -385,7 +385,7 @@ impl Recorder {
             return (id, turn);
         }
         let seq = self.next_card_seq.fetch_add(1, Ordering::Relaxed);
-        (format!("card-{seq}"), 0)
+        (format!("card-{}-{seq}", self.anonymous_nonce), 0)
     }
 
     /// Enqueues an entry without blocking the caller. Returns `false` if the bounded channel was full.
@@ -501,6 +501,13 @@ fn append_entry(
     let line = serde_json::to_string(&entry.to_json())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let needed_bytes = (line.len() as u64).saturating_add(1);
+    if max_file_bytes != 0 && needed_bytes > max_file_bytes {
+        let n = stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            eprintln!("[record] {needed_bytes}-byte row exceeds {max_file_bytes}-byte file limit (dropped={n})");
+        }
+        return Ok(());
+    }
     let filename = format!("cards-{}.jsonl", yyyymmdd_utc(entry.recorded_at_ms));
     let path = dir.join(&filename);
     rotate_and_prune(dir, &filename, &path, needed_bytes, max_file_bytes, stats)?;
@@ -518,7 +525,9 @@ fn append_entry(
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     writeln!(file, "{line}")?;
-    file.flush()
+    file.flush()?;
+    stats.written.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -631,8 +640,8 @@ mod tests {
             let (anon2, ta2) = rec.allocate_turn(None);
             assert_eq!((c1.as_str(), t0), ("coding-card-99", 0));
             assert_eq!((c2.as_str(), t1), ("coding-card-99", 1));
-            assert_eq!((anon1.as_str(), ta1), ("card-1", 0));
-            assert_eq!((anon2.as_str(), ta2), ("card-2", 0));
+            assert_ne!(anon1, anon2);
+            assert_eq!((ta1, ta2), (0, 0));
 
             for (cid, turn) in [(c1, t0), (c2, t1)] {
                 assert!(rec.record(RecordEntry {
@@ -670,6 +679,49 @@ mod tests {
             assert_eq!(mode, 0o600, "recorded JSONL must have 0600 permissions");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anonymous_cards_stay_distinct_after_recorder_restart() {
+        let dir = temp_dir("anonymous-restart");
+        let first = Recorder::new(dir.clone()).allocate_turn(None);
+        let second = Recorder::new(dir).allocate_turn(None);
+        assert_eq!((first.1, second.1), (0, 0));
+        assert_ne!(first.0, second.0);
+    }
+
+    #[test]
+    fn drops_oversized_jsonl_rows_before_rotation() {
+        let dir = temp_dir("row-limit");
+        let entry = RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: 0,
+            card_id: "limit".into(),
+            turn_index: 0,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"text": ""}),
+            response: ResponseMetrics {
+                prompt_tokens: 1, completion_tokens: 1, ttft_ms: 1, total_ms: 1,
+                queue_ms: 0, prefill_ms: 0, decode_ms: 0, finish_reason: "stop".into(), status_code: 200,
+            },
+        };
+        let max_bytes = serde_json::to_vec(&entry.to_json()).unwrap().len() as u64 + 1;
+        let recorder = Recorder::with_options(dir.clone(), 4, max_bytes);
+        let stats = recorder.stats.clone();
+        assert!(recorder.record(entry.clone()));
+        let mut oversized = entry.clone();
+        oversized.request = json!({"text": "x"});
+        assert!(recorder.record(oversized));
+        drop(recorder);
+
+        assert_eq!(stats.written.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.write_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.rotations.load(Ordering::Relaxed), 0);
+        let file = dir.join("cards-19700101.jsonl");
+        assert_eq!(fs::metadata(&file).unwrap().len(), max_bytes);
+        assert_eq!(parse_jsonl(&fs::read_to_string(file).unwrap()).unwrap(), vec![entry]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -775,6 +827,7 @@ mod tests {
         let rec = Recorder {
             tx: Some(tx),
             worker: None,
+            anonymous_nonce: "test".into(),
             next_card_seq: AtomicU64::new(1),
             turns: Mutex::new(TurnTracker::default()),
             stats: std::sync::Arc::new(Stats::new()),

@@ -5,21 +5,24 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 // RungMetrics summarizes one concurrency rung of a replay sweep.
 type RungMetrics struct {
-	Lanes           int     `json:"lanes"`
-	TotalTokS       float64 `json:"total_tok_s"`
-	PerLaneTokS     float64 `json:"per_lane_tok_s"`
-	TTFTP50Ms       float64 `json:"ttft_p50_ms"`
-	TTFTP95Ms       float64 `json:"ttft_p95_ms"`
-	PeakMemoryBytes uint64  `json:"peak_memory_bytes"`
-	CardsCompleted  int     `json:"cards_completed"`
-	CardsPerHour    float64 `json:"cards_per_hour"`
-	Errors          int     `json:"errors"`
-	Retries429      int     `json:"retries_429"`
+	Lanes                   int     `json:"lanes"`
+	TotalTokS               float64 `json:"total_tok_s"`
+	PerLaneTokS             float64 `json:"per_lane_tok_s"`
+	TTFTP50Ms               float64 `json:"ttft_p50_ms"`
+	TTFTP95Ms               float64 `json:"ttft_p95_ms"`
+	TTFTSamples             int     `json:"ttft_samples"`
+	PeakBudgetEstimateBytes uint64  `json:"peak_budget_estimate_bytes"`
+	PeakMemoryBytes         uint64  `json:"peak_memory_bytes"`
+	CardsCompleted          int     `json:"cards_completed"`
+	CardsPerHour            float64 `json:"cards_per_hour"`
+	Errors                  int     `json:"errors"`
+	Retries429              int     `json:"retries_429"`
 }
 
 // KneeConfig controls deterministic lane-count knee selection.
@@ -60,6 +63,9 @@ func withinSLO(r RungMetrics, cfg KneeConfig) (bool, string) {
 	if r.Errors > 0 {
 		return false, fmt.Sprintf("%d error(s) observed", r.Errors)
 	}
+	if cfg.MaxTTFTP95Ms > 0 && r.TTFTSamples == 0 {
+		return false, "no streaming TTFT samples"
+	}
 	if cfg.MaxTTFTP95Ms > 0 && r.TTFTP95Ms > cfg.MaxTTFTP95Ms {
 		return false, fmt.Sprintf("p95 TTFT %.1fms > %.1fms ceiling", r.TTFTP95Ms, cfg.MaxTTFTP95Ms)
 	}
@@ -85,39 +91,11 @@ func PickKnee(rungs []RungMetrics, cfg KneeConfig) (KneeResult, error) {
 		return sorted[i].Lanes < sorted[j].Lanes
 	})
 
-	var completed []RungMetrics
-	for _, r := range sorted {
-		if r.CardsCompleted > 0 {
-			completed = append(completed, r)
-		}
+	best := sorted[0]
+	if ok, why := withinSLO(best, cfg); !ok {
+		return KneeResult{}, fmt.Errorf("no qualifying lane count before %d lanes (%s)", best.Lanes, why)
 	}
-	if len(completed) == 0 {
-		return KneeResult{}, errors.New("no completed cards across any concurrency rung")
-	}
-
-	firstIdx := -1
-	for i, r := range completed {
-		if ok, _ := withinSLO(r, cfg); ok {
-			firstIdx = i
-			break
-		}
-	}
-	if firstIdx == -1 {
-		best := completed[0]
-		for _, r := range completed[1:] {
-			if r.Errors < best.Errors || (r.Errors == best.Errors && r.CardsPerHour > best.CardsPerHour) {
-				best = r
-			}
-		}
-		return KneeResult{
-			RecommendedLanes: best.Lanes,
-			Reason:           "fallback to lowest-error / highest-throughput rung (no clean SLO-compliant rung)",
-			Rung:             best,
-		}, nil
-	}
-
-	best := completed[firstIdx]
-	for _, curr := range completed[firstIdx+1:] {
+	for _, curr := range sorted[1:] {
 		if ok, why := withinSLO(curr, cfg); !ok {
 			return KneeResult{
 				RecommendedLanes: best.Lanes,
@@ -155,40 +133,51 @@ func PickKnee(rungs []RungMetrics, cfg KneeConfig) (KneeResult, error) {
 	}, nil
 }
 
+// summaryRows keeps the Markdown and TSV representations of missing measurements identical.
+func summaryRows(rungs []RungMetrics) [][]string {
+	sorted := append([]RungMetrics(nil), rungs...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Lanes < sorted[j].Lanes })
+	rows := [][]string{{"lanes", "total_tok_s", "per_lane_tok_s", "ttft_p50_ms", "ttft_p95_ms", "peak_memory_bytes", "cards_completed", "cards_per_hour", "errors", "retries_429", "ttft_samples", "peak_budget_estimate_bytes"}}
+	for _, r := range sorted {
+		p50, p95, memory, budget := "n/a", "n/a", "n/a", "n/a"
+		if r.TTFTSamples > 0 {
+			p50, p95 = fmt.Sprintf("%.1f", r.TTFTP50Ms), fmt.Sprintf("%.1f", r.TTFTP95Ms)
+		}
+		if r.PeakMemoryBytes > 0 {
+			memory = strconv.FormatUint(r.PeakMemoryBytes, 10)
+		}
+		if r.PeakBudgetEstimateBytes > 0 {
+			budget = strconv.FormatUint(r.PeakBudgetEstimateBytes, 10)
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(r.Lanes), fmt.Sprintf("%.2f", r.TotalTokS), fmt.Sprintf("%.2f", r.PerLaneTokS),
+			p50, p95, memory, strconv.Itoa(r.CardsCompleted), fmt.Sprintf("%.1f", r.CardsPerHour),
+			strconv.Itoa(r.Errors), strconv.Itoa(r.Retries429), strconv.Itoa(r.TTFTSamples), budget,
+		})
+	}
+	return rows
+}
+
 // FormatMarkdown renders a Markdown summary table and knee recommendation.
 func FormatMarkdown(rungs []RungMetrics, knee KneeResult) string {
-	sorted := make([]RungMetrics, len(rungs))
-	copy(sorted, rungs)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Lanes < sorted[j].Lanes
-	})
-
 	var b strings.Builder
-	b.WriteString("| lanes | total_tok_s | per_lane_tok_s | ttft_p50_ms | ttft_p95_ms | peak_memory_bytes | cards_completed | cards_per_hour | errors | retries_429 |\n")
-	b.WriteString("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-	for _, r := range sorted {
-		fmt.Fprintf(&b, "| %d | %.2f | %.2f | %.1f | %.1f | %d | %d | %.1f | %d | %d |\n",
-			r.Lanes, r.TotalTokS, r.PerLaneTokS, r.TTFTP50Ms, r.TTFTP95Ms,
-			r.PeakMemoryBytes, r.CardsCompleted, r.CardsPerHour, r.Errors, r.Retries429)
+	for i, row := range summaryRows(rungs) {
+		fmt.Fprintf(&b, "| %s |\n", strings.Join(row, " | "))
+		if i == 0 {
+			b.WriteString("|" + strings.Repeat("---:|", len(row)) + "\n")
+		}
 	}
-	fmt.Fprintf(&b, "\nRecommended default lane count: **%d** (%s)\n", knee.RecommendedLanes, knee.Reason)
+	if knee.RecommendedLanes > 0 {
+		fmt.Fprintf(&b, "\nRecommended default lane count: **%d** (%s)\n", knee.RecommendedLanes, knee.Reason)
+	}
 	return b.String()
 }
 
 // FormatTSV renders a tab-separated summary of all rungs.
 func FormatTSV(rungs []RungMetrics) string {
-	sorted := make([]RungMetrics, len(rungs))
-	copy(sorted, rungs)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Lanes < sorted[j].Lanes
-	})
-
 	var b strings.Builder
-	b.WriteString("lanes\ttotal_tok_s\tper_lane_tok_s\tttft_p50_ms\tttft_p95_ms\tpeak_memory_bytes\tcards_completed\tcards_per_hour\terrors\tretries_429\n")
-	for _, r := range sorted {
-		fmt.Fprintf(&b, "%d\t%.2f\t%.2f\t%.1f\t%.1f\t%d\t%d\t%.1f\t%d\t%d\n",
-			r.Lanes, r.TotalTokS, r.PerLaneTokS, r.TTFTP50Ms, r.TTFTP95Ms,
-			r.PeakMemoryBytes, r.CardsCompleted, r.CardsPerHour, r.Errors, r.Retries429)
+	for _, row := range summaryRows(rungs) {
+		b.WriteString(strings.Join(row, "\t") + "\n")
 	}
 	return b.String()
 }
