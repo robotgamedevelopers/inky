@@ -521,7 +521,8 @@ kernel void k_state_keep(device float * A [[buffer(2)]], device const float * CS
 // ---- K/V row copies between a sliding-window ring (KV, cap keys per group) and the linear prefill scratch (in the arena A).
 // The persistent cache of a sliding-window layer holds exactly its window; a prefill batch attends through a scratch copy
 // [window history | batch keys] and afterwards leaves the last window of keys in the ring. grid (n, NKV), 32 threads.
-struct KvCopyArgs { uint n, pos0, ring_k, ring_v, cap, sk_off, sv_off, scap; int kpos0; uint to_ring, pad0, pad1; };
+enum KvCopyMode : uint { ToScratch = 0, ToRing = 1, ClearScratch = 2 };
+struct KvCopyArgs { uint n, pos0, ring_k, ring_v, cap, sk_off, sv_off, scap; int kpos0; KvCopyMode mode; uint pad0, pad1; };
 // Zero words [r.x, r.x + r.y) of the arena: 4 per thread. The batch's sliding-window K/V scratch is cleared this way at the
 // start of every prefill, because attention reads its guard rows and unfilled history (masked with a zero weight) through
 // the tensor multiply, and a zero weight does not cancel a NaN: those rows must hold finite values whatever was there.
@@ -537,7 +538,9 @@ kernel void k_kvcopy(device float * A [[buffer(2)]], device kv_t * KV [[buffer(3
     const uint ri = (g * a.cap + pos % a.cap) * HD + lane * 4, si = (g * a.scap + (uint) ((int) pos - a.kpos0)) * HD + lane * 4;
     device kvw_t * rk = (device kvw_t *) (KV + a.ring_k + ri), * rv = (device kvw_t *) (KV + a.ring_v + ri);
     device kvw_t * sk = (device kvw_t *) ((device kv_t *) (A + a.sk_off) + si), * sv = (device kvw_t *) ((device kv_t *) (A + a.sv_off) + si);
-    if (a.to_ring) { *rk = *sk; *rv = *sv; } else { *sk = *rk; *sv = *rv; }
+    if (a.mode == ClearScratch) { *sk = kvw_t(0); *sv = kvw_t(0); }
+    else if (a.mode == ToRing) { *rk = *sk; *rv = *sv; }
+    else { *sk = *rk; *sv = *rv; }
 }
 
 // dev: copy 32-bit words from the arena to a side buffer
