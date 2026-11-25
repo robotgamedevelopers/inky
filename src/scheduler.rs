@@ -2609,9 +2609,31 @@ impl ServeStepPlanner {
         self.max_bypass
     }
 
-    pub fn on_admit(&mut self, lane: usize) {
-        self.states[lane] = LaneState::Ready;
+    /// Assign queued work to a free physical lane.
+    pub fn admit_queued(&mut self, lane: usize, queued: LaneState) {
+        assert!(self.states[lane].is_terminal_or_idle());
+        assert_eq!(queued, LaneState::Queued);
+        self.states[lane] = LaneState::Admitted;
         self.wait_ticks[lane] = 0;
+    }
+
+    /// Begin preparing the context, by binding a resident or spilled checkpoint
+    /// when possible, or initializing a cold context.
+    pub fn start_restore(&mut self, lane: usize) {
+        assert_eq!(self.states[lane], LaneState::Admitted);
+        self.states[lane] = LaneState::Restoring;
+    }
+
+    pub fn finish_restore(&mut self, lane: usize) {
+        assert_eq!(self.states[lane], LaneState::Restoring);
+        self.states[lane] = LaneState::Ready;
+    }
+
+    /// Register a prebuilt lane in the standalone planner tests and pool gate.
+    pub fn on_admit(&mut self, lane: usize) {
+        self.admit_queued(lane, LaneState::Queued);
+        self.start_restore(lane);
+        self.finish_restore(lane);
     }
 
     pub fn on_finish(&mut self, lane: usize) {
@@ -2655,13 +2677,13 @@ impl ServeStepPlanner {
         let need_dec: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_decode())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_decode())
             .map(|(i, _)| i)
             .collect();
         let need_pf: Vec<usize> = inputs
             .iter()
             .enumerate()
-            .filter(|&(_, inp)| inp.needs_prefill())
+            .filter(|&(i, inp)| self.states[i] == LaneState::Ready && inp.needs_prefill())
             .map(|(i, _)| i)
             .collect();
 
@@ -2754,6 +2776,33 @@ impl ServeStepPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_lane_is_not_runnable_before_restore_finishes() {
+        let mut planner = ServeStepPlanner::new(1, 16);
+        let inputs = [ServeLaneInput {
+            runnable: true,
+            n_past: 0,
+            pf_end: 64,
+            has_pending_decode: false,
+        }];
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.admit_queued(0, LaneState::Queued);
+        assert_eq!(planner.state(0), LaneState::Admitted);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.start_restore(0);
+        assert_eq!(planner.state(0), LaneState::Restoring);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
+        planner.finish_restore(0);
+        assert_eq!(planner.state(0), LaneState::Ready);
+        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), Some(ServeStepPlan::Prefill(vec![(0, 0, 64)])));
+        assert_eq!(planner.state(0), LaneState::InStep);
+        assert!(!planner.request_cancel(0));
+        assert_eq!(planner.state(0), LaneState::Cancelling);
+        assert_eq!(planner.complete_step(), vec![0]);
+        assert_eq!(planner.state(0), LaneState::Cancelled);
+    }
+
 
     fn small_cfg() -> SchedulerConfig {
         SchedulerConfig {
