@@ -844,14 +844,111 @@ impl BlockPools {
 pub struct BlockTable {
     blocks_per_kind: u32,
     entries: Vec<Option<BlockEntry>>,
+    /// Per-kind inclusive dirty block bounds `[lo, hi]` (`[0]` = Full, `[1]` = Window).
+    dirty: [Option<(u32, u32)>; 2],
+    /// When `true`, the full `0..blocks_per_kind` range for that kind must be synced to GPU.
+    needs_full_sync: [bool; 2],
 }
 
 impl BlockTable {
-    pub fn empty() -> BlockTable { BlockTable { blocks_per_kind: 0, entries: Vec::new() } }
+    #[inline]
+    fn kind_idx(kind: BlockKind) -> usize {
+        match kind {
+            BlockKind::Full => 0,
+            BlockKind::Window => 1,
+        }
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self, kind: BlockKind, block: u32) {
+        let ki = Self::kind_idx(kind);
+        if self.needs_full_sync[ki] {
+            return;
+        }
+        self.dirty[ki] = Some(match self.dirty[ki] {
+            Some((lo, hi)) => (lo.min(block), hi.max(block)),
+            None => (block, block),
+        });
+    }
+
+    /// Force the next GPU sync to rewrite all `0..blocks_per_kind` slots for both kinds.
+    pub fn mark_full_sync(&mut self) {
+        self.dirty = [None; 2];
+        self.needs_full_sync = [true; 2];
+    }
+
+    pub fn needs_full_sync(&self, kind: BlockKind) -> bool {
+        self.needs_full_sync[Self::kind_idx(kind)]
+    }
+
+    /// Inclusive dirty block bounds `[lo, hi]` for `kind`, or `None` when clean.
+    pub fn dirty_range(&self, kind: BlockKind) -> Option<(u32, u32)> {
+        if self.blocks_per_kind == 0 {
+            return None;
+        }
+        let ki = Self::kind_idx(kind);
+        if self.needs_full_sync[ki] {
+            Some((0, self.blocks_per_kind - 1))
+        } else {
+            self.dirty[ki]
+        }
+    }
+
+    /// Clear dirty tracking for `kind` after its GPU block table has been updated.
+    pub fn clear_dirty(&mut self, kind: BlockKind) {
+        let ki = Self::kind_idx(kind);
+        self.dirty[ki] = None;
+        self.needs_full_sync[ki] = false;
+    }
+
+    /// Synchronize only the dirty block range for `kind` into `dst` (length `>= blocks_per_kind`),
+    /// writing `pool.gpu_table_entry(e)` for present entries and `0` for cleared entries, then
+    /// clearing the dirty range. Returns the number of `u64` entries written (0 when clean).
+    pub fn sync_dirty_to_slice(
+        &mut self,
+        kind: BlockKind,
+        pool: &BlockPool,
+        dst: &mut [u64],
+    ) -> Result<usize, BlockError> {
+        let n_blk = self.blocks_per_kind as usize;
+        if dst.len() < n_blk {
+            return Err(BlockError::OutOfRange);
+        }
+        let Some((lo, hi)) = self.dirty_range(kind) else {
+            return Ok(0);
+        };
+        let lo = lo as usize;
+        let hi = (hi as usize).min(n_blk.saturating_sub(1));
+        let mut written = 0usize;
+        for b in lo..=hi {
+            let bi = BlockIndex::new(b as u32);
+            dst[b] = match self.get(kind, bi)? {
+                Some(entry) => pool.gpu_table_entry(entry)?,
+                None => 0,
+            };
+            written += 1;
+        }
+        self.clear_dirty(kind);
+        Ok(written)
+    }
+
+    pub fn empty() -> BlockTable {
+        BlockTable {
+            blocks_per_kind: 0,
+            entries: Vec::new(),
+            dirty: [None; 2],
+            needs_full_sync: [true; 2],
+        }
+    }
 
     pub fn new(blocks_per_kind: u32) -> Result<BlockTable, BlockError> {
         let n = usize::try_from(blocks_per_kind).ok().and_then(|n| n.checked_mul(2)).ok_or(BlockError::Overflow)?;
-        Ok(BlockTable { blocks_per_kind, entries: vec![None; n] })
+        Ok(BlockTable {
+            blocks_per_kind,
+            entries: vec![None; n],
+            dirty: [None; 2],
+            needs_full_sync: [true; 2],
+        })
     }
 
     pub fn get(&self, kind: BlockKind, block: BlockIndex) -> Result<Option<BlockEntry>, BlockError> {
@@ -866,7 +963,10 @@ impl BlockTable {
         if entry.is_some_and(|e| e.kind() != kind) { return Err(BlockError::OutOfRange); }
         let i = table_index(kind, block, self.blocks_per_kind)? as usize;
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
-        *cell = entry;
+        if *cell != entry {
+            *cell = entry;
+            self.mark_dirty(kind, block.get());
+        }
         Ok(())
     }
 
@@ -909,8 +1009,13 @@ impl BlockTable {
         if !same {
             pool.record_mut(slot)?.add_ref()?;
         }
+        let new_entry = BlockEntry::new(slot, generation, offset, pool.kind(), kvb);
+        let changed = prev != Some(new_entry);
         let cell = self.entries.get_mut(i).ok_or(BlockError::OutOfRange)?;
-        *cell = Some(BlockEntry::new(slot, generation, offset, pool.kind(), kvb));
+        *cell = Some(new_entry);
+        if changed {
+            self.mark_dirty(pool.kind(), block.get());
+        }
         Ok(())
     }
 
@@ -922,6 +1027,7 @@ impl BlockTable {
                 pool.record_mut(prev.slot())?.drop_ref()?;
             }
             self.entries[i] = None;
+            self.mark_dirty(pool.kind(), block.get());
         }
         Ok(())
     }
@@ -936,6 +1042,7 @@ impl BlockTable {
                 }
             }
         }
+        self.mark_full_sync();
         Ok(())
     }
 
@@ -1569,5 +1676,171 @@ mod tests {
         t.set(BlockKind::Full, BlockIndex::new(1), None).unwrap();
         assert_eq!(t.entries().count(), 0);
         assert_eq!(t.blocks_per_kind(), 2);
+    }
+
+    #[test]
+    fn dirty_range_initial_full_sync_and_63_clean_decode_steps() {
+        let mut pools = BlockPools::new(8);
+        let mut t = BlockTable::new(32).unwrap();
+        assert!(t.needs_full_sync(BlockKind::Full));
+        assert!(t.needs_full_sync(BlockKind::Window));
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((0, 31)));
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 31)));
+
+        let (sf0, _) = pools.full.take_free().unwrap();
+        let (sw0, _) = pools.window.take_free().unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
+        // Still needs full sync until first upload clears it.
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((0, 31)));
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 31)));
+
+        let mut gpu_full = vec![0xDEAD_BEEF_u64; 32];
+        let mut gpu_win = vec![0xCAFE_BABE_u64; 32];
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 32);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 32);
+        assert!(!t.needs_full_sync(BlockKind::Full));
+        assert!(!t.needs_full_sync(BlockKind::Window));
+        assert_eq!(t.dirty_range(BlockKind::Full), None);
+        assert_eq!(t.dirty_range(BlockKind::Window), None);
+        assert_eq!(gpu_full[0], 0);
+        assert!(gpu_full[1..].iter().all(|&w| w == 0));
+        assert_eq!(gpu_win[0], 0);
+        assert!(gpu_win[1..].iter().all(|&w| w == 0));
+
+        // 63 steady-state decode steps inside block 0 write 0 entries to unified memory.
+        // Place sentinels to prove `sync_dirty_to_slice` does not touch `dst` at all when clean.
+        gpu_full[1] = 0x1111_2222;
+        gpu_win[1] = 0x3333_4444;
+        for _step in 1..64 {
+            assert_eq!(t.dirty_range(BlockKind::Full), None);
+            assert_eq!(t.dirty_range(BlockKind::Window), None);
+            assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 0);
+            assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 0);
+        }
+        assert_eq!(gpu_full[1], 0x1111_2222);
+        assert_eq!(gpu_win[1], 0x3333_4444);
+    }
+
+    #[test]
+    fn dirty_range_single_allocation_coalescing_and_window_pruning() {
+        let mut pools = BlockPools::new(8);
+        let mut t = BlockTable::new(32).unwrap();
+        let mut gpu_full = vec![0u64; 32];
+        let mut gpu_win = vec![0u64; 32];
+        // Initial sync on empty table zeroes everything and clears dirty flags.
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 32);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 32);
+
+        // Allocate block 0 for both kinds (e.g. token 0).
+        let (sf0, _) = pools.full.take_free().unwrap();
+        let (sw0, _) = pools.window.take_free().unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((0, 0)));
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 0)));
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 1);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 1);
+
+        // Allocate single new block at index 1 (token 64).
+        let (sf1, off_f1) = pools.full.take_free().unwrap();
+        let (sw1, off_w1) = pools.window.take_free().unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(1), sf1, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(1), sw1, 1).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((1, 1)));
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((1, 1)));
+
+        // Re-filling the exact same entry is a no-op and does not expand the dirty range.
+        t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((1, 1)));
+        // Failed fill (stale generation) does not dirty.
+        assert_eq!(t.fill(&mut pools.full, BlockIndex::new(5), sf1, 99), Err(BlockError::Stale));
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((1, 1)));
+
+        gpu_full[0] = 0xAAAA;
+        gpu_full[2] = 0xBBBB;
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 1);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 1);
+        assert_eq!(gpu_full[0], 0xAAAA); // untouched
+        assert_eq!(gpu_full[1], off_f1);
+        assert_eq!(gpu_full[2], 0xBBBB); // untouched
+        assert_eq!(gpu_win[1], off_w1);
+
+        // Window block pruning: clearing window block 0 dirties ONLY window block 0 and writes 0 to GPU slot.
+        gpu_win[0] = 0x9999;
+        t.clear_kind_entry(&mut pools.window, BlockIndex::new(0)).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), None);
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 0)));
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 1);
+        assert_eq!(gpu_win[0], 0);
+        assert_eq!(gpu_win[1], off_w1);
+        // Clearing an already-empty entry is a no-op (stays clean).
+        t.clear_kind_entry(&mut pools.window, BlockIndex::new(0)).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Window), None);
+
+        // Coalesced range: mutate block 5 then block 2 -> [2..=5] (4 entries).
+        let (sf5, off_f5) = pools.full.take_free().unwrap();
+        let (sf2, off_f2) = pools.full.take_free().unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(5), sf5, 1).unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(2), sf2, 1).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((2, 5)));
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 4);
+        assert_eq!(gpu_full[2], off_f2);
+        assert_eq!(gpu_full[3], 0);
+        assert_eq!(gpu_full[4], 0);
+        assert_eq!(gpu_full[5], off_f5);
+    }
+
+    #[test]
+    fn dirty_range_full_reset_and_rebind() {
+        let mut pools = BlockPools::new(8);
+        let mut t = BlockTable::new(16).unwrap();
+        let mut gpu_full = vec![0u64; 16];
+        let mut gpu_win = vec![0u64; 16];
+
+        let (sf0, _) = pools.full.take_free().unwrap();
+        let (sf1, off_f1) = pools.full.take_free().unwrap();
+        let (sw0, _) = pools.window.take_free().unwrap();
+        let (sw1, off_w1) = pools.window.take_free().unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        t.fill(&mut pools.full, BlockIndex::new(1), sf1, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(1), sw1, 1).unwrap();
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 16);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 16);
+        assert_eq!(gpu_full[1], off_f1);
+        assert_eq!(gpu_win[1], off_w1);
+
+        // Full reset via `clear_entries` triggers full sync on both kinds.
+        t.clear_entries(&mut pools).unwrap();
+        assert!(t.needs_full_sync(BlockKind::Full));
+        assert!(t.needs_full_sync(BlockKind::Window));
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((0, 15)));
+        assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 15)));
+        assert_eq!(pools.full.record(sf0).unwrap().refs(), 0);
+        assert_eq!(pools.full.record(sf1).unwrap().refs(), 0);
+
+        // Rebind a single prefix block (block 0) before the next sync: still does full sync so stale
+        // GPU slot 1 from the previous request is zeroed out!
+        t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 16);
+        assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 16);
+        assert_eq!(gpu_full[0], 0);
+        assert_eq!(gpu_full[1], 0);
+        assert_eq!(gpu_win[0], 0);
+        assert_eq!(gpu_win[1], 0);
+        assert_eq!(t.dirty_range(BlockKind::Full), None);
+        assert_eq!(t.dirty_range(BlockKind::Window), None);
+
+        // Direct `set` mutation vs no-op `set`.
+        let e = BlockEntry::new(sf1, 1, off_f1, BlockKind::Full, 2);
+        t.set(BlockKind::Full, BlockIndex::new(3), None).unwrap(); // already None -> no-op
+        assert_eq!(t.dirty_range(BlockKind::Full), None);
+        t.set(BlockKind::Full, BlockIndex::new(3), Some(e)).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((3, 3)));
+        t.set(BlockKind::Full, BlockIndex::new(3), Some(e)).unwrap(); // same value -> stays (3, 3)
+        t.set(BlockKind::Full, BlockIndex::new(3), None).unwrap();
+        assert_eq!(t.dirty_range(BlockKind::Full), Some((3, 3)));
     }
 }
