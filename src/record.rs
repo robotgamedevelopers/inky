@@ -931,22 +931,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn recorder_read_only_dir_counts_write_errors_without_panicking() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = temp_dir("ro");
+    fn recorder_counts_unwritable_output_file_errors_without_panicking() {
+        let timestamp = 1_795_543_200_000;
+        let dir = temp_dir("blocked-output");
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // Opening a directory for append fails independently of the test runner's UID.
+        fs::create_dir_all(dir.join(format!("cards-{}.jsonl", yyyymmdd_utc(timestamp)))).unwrap();
 
         let rec = Recorder::with_options(dir.clone(), 16, DEFAULT_MAX_FILE_BYTES);
         let stats = rec.stats.clone();
         for i in 0..4u64 {
             assert!(rec.record(RecordEntry {
                 schema_version: SCHEMA_VERSION,
-                recorded_at_ms: 1_795_543_200_000 + i,
-                card_id: "card-ro".into(),
+                recorded_at_ms: timestamp + i,
+                card_id: "card-blocked".into(),
                 turn_index: i,
                 endpoint: "/v1/chat/completions".into(),
                 request: json!({"messages": [{"role": "user", "content": "hi"}]}),
@@ -964,7 +963,6 @@ mod tests {
             }));
         }
         drop(rec);
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(stats.written.load(Ordering::Relaxed), 0);
         assert_eq!(stats.write_errors.load(Ordering::Relaxed), 4);

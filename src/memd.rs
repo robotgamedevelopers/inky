@@ -690,7 +690,7 @@ fn install_helper() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    // bind_socket temporarily sets process-wide umask(0o177); serialize filesystem tests within this binary.
+    // Coordinate the filesystem fixtures in this module.
     static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
     #[test] fn raised_while_connected_and_restored_after_the_last() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
@@ -811,8 +811,20 @@ mod tests {
     }
     #[test]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
-        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-bind-{}", std::process::id()));
+        // bind_socket changes the process umask around bind. Run the real operation
+        // in its own process so other tests can create directories concurrently.
+        const CHILD: &str = "INKY_TEST_MEMD_BIND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed;"),
+                "isolated socket check failed: {stdout} {}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let base = std::path::PathBuf::from(format!("inky-memd-bind-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let path = base.join("memd.sock");
         let uid = unsafe { libc::geteuid() };
