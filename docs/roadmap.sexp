@@ -716,6 +716,7 @@
    :rows (
      ("au-runner-trust" "The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user")
      ("au-main-ruleset" "main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main")
+     ("au-dead-code" "Remove the dead code the compiler finds once the allow(dead_code) attributes are stripped")
      ("au-nightly-gates" "Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages")
      ("au-go-unit-fast" "The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget")
      ("au-tla-step-fast" "The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget")
@@ -724,11 +725,13 @@
    :cells (
      ("au-runner-trust" "done" "t-au-runner-trust")
      ("au-main-ruleset" "done" "t-au-main-ruleset")
+     ("au-dead-code" "done" "t-au-dead-code")
      ("au-nightly-gates" "done" "t-au-nightly-gates")
      ("au-go-unit-fast" "done" "t-au-go-unit-fast")
      ("au-tla-step-fast" "done" "t-au-tla-step-fast")
    ))
   (:id "t-au-runner-trust" :type :task :title "The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user" :state :todo :evidence (".github/workflows/ci.yml") :severity "high" :audit "U2, U3" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. Fork exclusion for self-hosted M5 is only the if: at .github/workflows/ci.yml:75, inside the PR-supplied file; one approval click runs fork code on the owner's runner. Findings: U2, U3.")
+  (:id "t-au-dead-code" :type :task :title "Remove the dead code the compiler finds once the allow(dead_code) attributes are stripped" :state :todo :evidence ("src/serve.rs" "src/record.rs" "src/main.rs") :severity "low" :note "Rowan Claude, 2026-11-25, on main at 21966b0. With all 45 allow(dead_code) attributes stripped, cargo check --bins gives 218 warnings. A finding pass classed 44 groups: 16 to remove (code only its own unit tests call, such as decode_overwrites_prompt and record::card_id_from_headers), 4 stale attributes, 7 held for open pull requests, 7 reference implementations the trace checks run, 10 to keep. Nothing was removed. Each removal needs two independent checks for users, including open pull request branches.")
   (:id "t-au-main-ruleset" :type :task :title "main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main" :state :todo :evidence ("misc" "scripts/release_ci.py") :severity "high" :audit "U10" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. main still accepts direct pushes without CI (7a27806, 15c3b04 since be82ef3); only releases are now gated by scripts/release_ci.py, not merges or pushes to main. Findings: U10.")
   (:id "t-au-nightly-gates" :type :task :title "Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages" :state :todo :evidence (".github/workflows/nightly.yml" "docs/roadmap.sexp" "tests/nightly.sh" "scripts/release_ci.py" "tests/soak.sh" "tests/soak_faults.sh") :severity "medium" :audit "U42, U49, U113, U131" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. No CI or nightly job runs tests/soak.sh, tests/soak_faults.sh or live tests/fleet_gate.sh (ci.yml:47-48, nightly.yml:18, nightly.sh:11-20); chaos/remote rows rest on manual runs. Findings: U42, U49, U113, U131.")
   (:id "t-au-go-unit-fast" :type :task :title "The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget" :state :todo :evidence ("tests/soak_client_test.go" ".github/workflows/ci.yml" "tests/soak_client.go") :severity "medium" :audit "U121, U323" :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. Per-PR go job (.github/workflows/ci.yml:47-68) still runs loopback/real-time/child-process soak tests with full drain waits (tests/soak_client.go:673,702,980); job now larger, not slimmer. Findings: U121, U323.")

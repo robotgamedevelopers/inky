@@ -282,6 +282,7 @@ The self-hosted runner, branch protection, per-pull-request CI time and the nigh
 |---|:---:|
 | The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user | ❌ |
 | main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main | ❌ |
+| Remove the dead code the compiler finds once the allow(dead_code) attributes are stripped | ❌ |
 | Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ❌ |
 | The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget | ❌ |
 | The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget | ❌ |
