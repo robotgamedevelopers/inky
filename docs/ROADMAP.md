@@ -256,7 +256,7 @@ Gates that do not run, that test a different path from the one served, or that p
 | feature | done |
 |---|:---:|
 | Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ✅ |
-| A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
+| A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#106](https://github.com/robotgamedevelopers/inky/pull/106)) | ❌ |
 | The replay set is real fleet card traffic, and the lane-count knee is derived from it | ❌ |
 | Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans | ❌ |
 | servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug | ❌ |
