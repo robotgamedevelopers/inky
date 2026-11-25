@@ -104,5 +104,5 @@ mutant allow-complete-prompt Lookup serve/block_cache.rs \
     'let mut in_ram = self.tree.deepest_start_in_namespace(namespace, search); // MUTANT_ANCHOR_MATCH_IN_RAM' \
     'let _ = search; let mut in_ram = self.tree.deepest_start_in_namespace(namespace, toks);'
 mutant prefer-shallow-checkpoint Lookup prefix.rs \
-    'if n.starts > 0 { // MUTANT_ANCHOR_DEEPEST_NS' \
+    $'if n.starts > 0 {\n                // MUTANT_ANCHOR_DEEPEST_NS' \
     'if n.starts > 0 && best_len == 0 {'

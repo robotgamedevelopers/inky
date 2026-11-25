@@ -94,8 +94,8 @@ start owned-only-poison check_mutant owned-only-poison \
 # 4. Omitting byte copy in `restore` -> LiveIntact
 start skip-restore-copy check_mutant skip-restore-copy \
     'Invariant LiveIntact is violated.' \
-    'unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), p, n); }' \
-    '{ let _ = (&v, p, n); }'
+    'std::ptr::copy_nonoverlapping(v.as_ptr(), p, n);' \
+    'let _ = (&v, p, n);'
 
 # 5. Stuttering on `Restore` (`note_restored` fired without `restore` running while saved is empty,
 #    or `note_applied` passing empty stepping set) -> ActionConforms
