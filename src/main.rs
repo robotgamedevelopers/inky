@@ -829,10 +829,9 @@ fn binv(o: &Opts) {
 
 /// Compare the same target row through two chunkings of the prefill arithmetic. Every checked end gets its own
 /// span of CROSSPATH_SPAN rows ending at that end (fewer only when the end is shorter), started from one
-/// base lane that never takes part in a comparison: the prefill lane runs the whole span as one multi-row
-/// prefill, the decode lane prefills all but its last row and decodes that row. A one-row prefill would take
-/// the decode path's ring write (`ring = l.swa && t == 1` in engine.rs) and compare decode with itself, so
-/// every span has at least two rows, and a span ending just past a split boundary crosses it.
+/// base lane that never takes part in a comparison: one lane prefills the full multi-row span, while the
+/// other prefills its first rows and last row separately. Every span has at least two rows, and one ending
+/// just past a split boundary crosses it. Decode has a different arithmetic and is not expected to match.
 const CROSSPATH_SPAN: usize = 17;
 const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
 
