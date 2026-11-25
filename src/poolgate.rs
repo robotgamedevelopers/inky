@@ -39,6 +39,10 @@ pub trait StepPath {
     fn new_lane(&self, toks: &[u32], cap: usize) -> LaneId;
     /// The token at `pos` of a lane (greedy decoding writes the next input here).
     fn set_token(&self, lane: LaneId, pos: usize, tok: u32);
+    /// Pre-allocate any target blocks needed by `spans` before `poisoned` snapshots `lane_slots` and applies poison.
+    fn prepare_prefill(&self, _spans: &[(LaneId, usize, usize)]) {}
+    /// Pre-allocate any target blocks needed by `spans` before `poisoned` snapshots `lane_slots` and applies poison.
+    fn prepare_decode(&self, _spans: &[(LaneId, usize)]) {}
     /// One step of prefill spans: (lane, p0, t), positions [p0, p0 + t) of each lane.
     fn prefill(&self, spans: &[(LaneId, usize, usize)]);
     /// One decode step: (lane, pos), one token for each lane.
@@ -135,6 +139,27 @@ pub fn poison_bytes(b: &mut [u8]) {
     for x in &mut b[tail..] { *x = 0x7f; }
 }
 
+/// First byte `(offset, got, expected)` in `b` that differs from `poison_bytes`, or `None` if all bytes match.
+pub fn first_non_poison_byte(b: &[u8]) -> Option<(usize, u8, u8)> {
+    for (i, w) in b.chunks_exact(4).enumerate() {
+        let want = POISON[i & 1].to_ne_bytes();
+        if w != want {
+            for j in 0..4 {
+                if w[j] != want[j] {
+                    return Some((i * 4 + j, w[j], want[j]));
+                }
+            }
+        }
+    }
+    let tail = b.len() & !3;
+    for (j, &x) in b[tail..].iter().enumerate() {
+        if x != 0x7f {
+            return Some((tail + j, x, 0x7f));
+        }
+    }
+    None
+}
+
 fn slot_at(i: usize) -> Slot { Slot::new(u32::try_from(i + 1).expect("pool index fits a slot")).unwrap() }
 
 /// Both kinds' plans for one step. `tables[i]` is live lane i's (kind, slot) list.
@@ -149,13 +174,28 @@ pub fn plans(pool: &dyn PoisonPool, tables: &[Vec<(BlockKind, Slot)>], stepping:
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied { pub saved: usize, pub poisoned: usize, pub absent: usize }
 
-/// Apply the plans: save, then poison. Returns the saved bytes, for `restore`, and what was actually done. A planned
-/// slot with no memory is counted as absent when the pool says it may be (`absent_ok`) and panics, naming the slot,
-/// otherwise; a slot is never skipped without being counted. A slot to save is a live lane's, so it is never absent.
-fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> (Vec<(BlockKind, Slot, Vec<u8>)>, Applied) {
+/// State captured by `apply` for one step: saved bytes of live lanes' poisoned slots, and every
+/// poisoned slot (`(kind, slot, is_saved_non_stepping)`) that no stepping lane owns and therefore
+/// MUST still hold exact `POISON` bytes across its entire stride after the step completes.
+pub struct StepGuard {
+    saved: Vec<(BlockKind, Slot, Vec<u8>)>,
+    checked_poison: Vec<(BlockKind, Slot, bool)>,
+}
+
+/// Apply the plans: save, then poison. Returns the `StepGuard` for `restore`, and what was actually done.
+/// `protected_if_guarded` is `Some(&plans(..., guard = true))` when `plans` was built with `guard = false`
+/// (`INK_POOLGATE_SABOTAGE=1`), so the intentionally sabotaged stepping lane's own active slot is excluded
+/// from stray-write checks while every other poisoned or saved slot is still verified byte-for-byte.
+fn apply_with_guard_ref(
+    pool: &dyn PoisonPool,
+    plans: &[(BlockKind, Plan)],
+    guarded_plans: Option<&[(BlockKind, Plan)]>,
+) -> (StepGuard, Applied) {
     let mut saved = Vec::new();
+    let mut checked_poison = Vec::new();
     let mut n = Applied::default();
-    for (kind, plan) in plans {
+    for (k_idx, (kind, plan)) in plans.iter().enumerate() {
+        let strict_poison = guarded_plans.map_or(&plan.poison, |gp| &gp[k_idx].1.poison);
         for &i in &plan.save {
             let (p, len) = pool.slot_bytes(*kind, slot_at(i)).unwrap_or_else(|| panic!("poolgate: {kind:?} slot {} (pool index {i}) of {} is referenced by a live lane and has no memory", i + 1, pool.slot_count(*kind)));
             saved.push((*kind, slot_at(i), unsafe { std::slice::from_raw_parts(p, len) }.to_vec()));
@@ -163,20 +203,69 @@ fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> (Vec<(BlockKind,
         }
         for &i in &plan.poison {
             match pool.slot_bytes(*kind, slot_at(i)) {
-                Some((p, len)) => { poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, len) }); n.poisoned += 1; }
+                Some((p, len)) => {
+                    poison_bytes(unsafe { std::slice::from_raw_parts_mut(p, len) });
+                    n.poisoned += 1;
+                    if strict_poison.binary_search(&i).is_ok() {
+                        let is_saved = plan.save.binary_search(&i).is_ok();
+                        checked_poison.push((*kind, slot_at(i), is_saved));
+                    }
+                }
                 None if pool.absent_ok(*kind, slot_at(i)) => n.absent += 1,
                 None => panic!("poolgate: {kind:?} slot {} (pool index {i}) of {} has no memory and is not marked absent (an ended lane)", i + 1, pool.slot_count(*kind)),
             }
         }
     }
-    (saved, n)
+    (StepGuard { saved, checked_poison }, n)
 }
 
-fn restore(pool: &dyn PoisonPool, saved: Vec<(BlockKind, Slot, Vec<u8>)>) {
-    for (kind, s, v) in saved {
+#[cfg(test)]
+fn apply(pool: &dyn PoisonPool, plans: &[(BlockKind, Plan)]) -> (StepGuard, Applied) {
+    apply_with_guard_ref(pool, plans, None)
+}
+
+/// Verify before `restore` overwrites saved slots back into the pool that every poisoned slot not
+/// owned by a stepping lane (both unreferenced poisoned slots and non-stepping lanes' saved slots)
+/// still contains exact `POISON` bytes across its entire stride, then restore saved slots and verify
+/// every restored saved slot matches its saved snapshot byte-for-bit.
+fn restore_checked(pool: &dyn PoisonPool, guard: StepGuard) -> Result<(), Vec<String>> {
+    let mut bad = Vec::new();
+    for &(kind, s, is_saved) in &guard.checked_poison {
+        let (p, len) = pool.slot_bytes(kind, s).expect("a poisoned slot lost its memory during the step");
+        let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+        if let Some((off, got, want)) = first_non_poison_byte(bytes) {
+            let role = if is_saved {
+                "non-stepping live lane's saved slot"
+            } else {
+                "unreferenced poisoned slot"
+            };
+            bad.push(format!(
+                "stray write into {role} ({kind:?} slot {}, pool index {}) at byte {off}/{len}: got 0x{got:02x}, expected poison 0x{want:02x}",
+                s.get(),
+                s.pool_index().get()
+            ));
+        }
+    }
+    for (kind, s, v) in guard.saved {
         let (p, n) = pool.slot_bytes(kind, s).expect("a saved slot lost its memory during the step");
         assert_eq!(n, v.len(), "{kind:?} slot {} changed size during the step", s.get());
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), p, n); }
+        let restored = unsafe { std::slice::from_raw_parts(p, n) };
+        if restored != v.as_slice() {
+            bad.push(format!(
+                "restored {kind:?} slot {} (pool index {}) does not match its saved snapshot byte-for-bit",
+                s.get(),
+                s.pool_index().get()
+            ));
+        }
+    }
+    if bad.is_empty() { Ok(()) } else { Err(bad) }
+}
+
+#[cfg(test)]
+fn restore(pool: &dyn PoisonPool, guard: StepGuard) {
+    if let Err(errs) = restore_checked(pool, guard) {
+        panic!("poolgate: {}", errs.join("; "));
     }
 }
 
@@ -232,7 +321,15 @@ pub fn reference(path: &dyn StepPath, w: &Workload) -> Vec<Record> {
 }
 
 /// What the poisoned run saw. `sabotaged`: the lane whose own slots were poisoned, if any.
-pub struct Report { pub records: Vec<Record>, pub steps: usize, pub poisoned: usize, pub saved: usize, pub absent: usize, pub sabotaged: Option<usize> }
+pub struct Report {
+    pub records: Vec<Record>,
+    pub steps: usize,
+    pub poisoned: usize,
+    pub saved: usize,
+    pub absent: usize,
+    pub sabotaged: Option<usize>,
+    pub stray_writes: Vec<String>,
+}
 
 /// The lanes together through `cand`, with the pool poisoned before every step. Lane i starts i % 3 rounds late; a
 /// round is a prefill step of every prefilling lane, then a decode step of every decoding lane. `sabotage` drops the
@@ -244,12 +341,24 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
     let mut next = vec![0usize; n];
     let mut rec = vec![Record::default(); n];
     let (mut steps, mut poisoned, mut saved_n, mut absent, mut sabotaged) = (0, 0, 0, 0, None);
+    let mut stray_writes = Vec::new();
     let mut round = 0;
     while next.iter().any(|&k| k < work.len()) {
         for i in 0..n { if lane[i].is_none() && next[i] == 0 && round >= i % 3 { lane[i] = Some(cand.new_lane(&w.prompts[i], w.len() + 1)); } }
         for dec in [false, true] {
             let who: Vec<usize> = (0..n).filter(|&i| lane[i].is_some() && next[i] < work.len() && work[next[i]].2 == dec).collect();
             if who.is_empty() { continue; }
+            let dec_spans: Vec<(LaneId, usize)> = if dec {
+                who.iter().map(|&i| (lane[i].unwrap(), work[next[i]].0)).collect()
+            } else {
+                Vec::new()
+            };
+            let pf_spans: Vec<(LaneId, usize, usize)> = if !dec {
+                who.iter().map(|&i| { let (p0, t, _) = work[next[i]]; (lane[i].unwrap(), p0, t) }).collect()
+            } else {
+                Vec::new()
+            };
+            if dec { cand.prepare_decode(&dec_spans); } else { cand.prepare_prefill(&pf_spans); }
             let live: Vec<usize> = (0..n).filter(|&i| lane[i].is_some()).collect();
             let tables: Vec<Vec<(BlockKind, Slot)>> = live.iter().map(|&i| cand.lane_slots(lane[i].unwrap())).collect();
             let stepping: Vec<usize> = who.iter().map(|i| live.iter().position(|j| j == i).unwrap()).collect();
@@ -260,11 +369,16 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
                 println!("INK_POOLGATE_SABOTAGE: lane {}'s slots poisoned in its own step at position {}", who[0], work[next[who[0]]].0);
             }
             let ps = plans(cand, &tables, &stepping, !unguard);
-            let (saved, done) = apply(cand, &ps);
+            let strict_ps = unguard.then(|| plans(cand, &tables, &stepping, true));
+            let (saved, done) = apply_with_guard_ref(cand, &ps, strict_ps.as_deref());
             poisoned += done.poisoned; saved_n += done.saved; absent += done.absent;
-            if dec { cand.decode(&who.iter().map(|&i| (lane[i].unwrap(), work[next[i]].0)).collect::<Vec<_>>()); }
-            else { cand.prefill(&who.iter().map(|&i| { let (p0, t, _) = work[next[i]]; (lane[i].unwrap(), p0, t) }).collect::<Vec<_>>()); }
-            restore(cand, saved);
+            if dec { cand.decode(&dec_spans); }
+            else { cand.prefill(&pf_spans); }
+            if let Err(errs) = restore_checked(cand, saved) {
+                for err in errs {
+                    stray_writes.push(format!("step {steps}: {err}"));
+                }
+            }
             steps += 1;
             for (k, &i) in who.iter().enumerate() {
                 let (p0, t, _) = work[next[i]];
@@ -277,7 +391,7 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
         for i in 0..n { if next[i] == work.len() { if let Some(l) = lane[i].take() { cand.end_lane(l); } } }
         round += 1;
     }
-    Report { records: rec, steps, poisoned, saved: saved_n, absent, sabotaged }
+    Report { records: rec, steps, poisoned, saved: saved_n, absent, sabotaged, stray_writes }
 }
 
 /// The lanes other than lane poisoned whose records differ from the reference. A sabotaged run poisons one lane's own
@@ -294,13 +408,13 @@ pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>
     if got.records.len() != want.len() {
         return Err(vec![format!("lane count mismatch: candidate returned {} lanes, reference has {}", got.records.len(), want.len())]);
     }
-    let mut bad = Vec::new();
+    let mut bad = got.stray_writes.clone();
     for (i, (a, b)) in want.iter().zip(&got.records).enumerate() {
         if let Some(s) = a.steps.iter().zip(&b.steps).position(|(x, y)| x != y) { bad.push(format!("lane {i}: logits differ from step {s}")); }
         else if a.steps.len() != b.steps.len() { bad.push(format!("lane {i}: {} steps, reference {}", b.steps.len(), a.steps.len())); }
         else if a.tokens != b.tokens { bad.push(format!("lane {i}: tokens differ")); }
     }
-    if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored, {} planned slots of ended lanes absent): every step's logits and every token identical", want.len(), got.steps, got.poisoned, got.saved, got.absent)]) } else { Err(bad) }
+    if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored, {} planned slots of ended lanes absent): every step's logits and every token identical, zero stray writes", want.len(), got.steps, got.poisoned, got.saved, got.absent)]) } else { Err(bad) }
 }
 
 /// Layer 2's path: each lane owns its own cache buffers. As a pool, lane k's window cache is window slot k + 1 and its
@@ -810,6 +924,22 @@ impl StepPath for Layer3Pool<'_> {
         l3.tokens[pos] = tok;
     }
 
+    fn prepare_prefill(&self, spans: &[(LaneId, usize, usize)]) {
+        self.poison_free_slots();
+        let mut v = self.lanes.borrow_mut();
+        for &(l, p0, t) in spans {
+            self.ensure_span_blocks(v[l].as_mut().expect("live lane"), p0, t);
+        }
+    }
+
+    fn prepare_decode(&self, spans: &[(LaneId, usize)]) {
+        self.poison_free_slots();
+        let mut v = self.lanes.borrow_mut();
+        for &(l, pos) in spans {
+            self.ensure_span_blocks(v[l].as_mut().expect("live lane"), pos, 1);
+        }
+    }
+
     fn prefill(&self, spans: &[(LaneId, usize, usize)]) {
         {
             let mut v = self.lanes.borrow_mut();
@@ -1214,7 +1344,7 @@ mod tests {
     fn leaked_names_every_other_lane_that_differs() {
         let r = |s: u64| Record { steps: vec![1, s], tokens: vec![7] };
         let want = vec![r(2), r(3), r(4)];
-        let got = |v: Vec<Record>| Report { records: v, steps: 0, poisoned: 0, saved: 0, absent: 0, sabotaged: Some(0) };
+        let got = |v: Vec<Record>| Report { records: v, steps: 0, poisoned: 0, saved: 0, absent: 0, sabotaged: Some(0), stray_writes: vec![] };
         assert_eq!(leaked(&want, &got(vec![r(9), r(3), r(4)]), 0), Vec::<usize>::new());
         assert_eq!(leaked(&want, &got(vec![r(9), r(9), r(4)]), 0), vec![1]);
         assert_eq!(leaked(&want, &got(vec![r(2), r(3), Record { steps: vec![1, 4], tokens: vec![8] }]), 1), vec![2]);
@@ -1225,12 +1355,161 @@ mod tests {
         let r0 = Record { steps: vec![1, 2], tokens: vec![10] };
         let r1 = Record { steps: vec![3, 4], tokens: vec![20] };
         let want = vec![r0.clone(), r1.clone()];
-        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
+        let short = Report { records: vec![r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None, stray_writes: vec![] };
         let err = compare(&want, &short).unwrap_err();
         assert!(err[0].contains("lane count mismatch"), "short candidate must fail compare: {err:?}");
-        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
+        let extra = Report { records: vec![r0.clone(), r1.clone(), r0.clone()], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None, stray_writes: vec![] };
         assert!(compare(&want, &extra).is_err(), "extra candidate lanes must fail compare");
-        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None };
+        let exact = Report { records: vec![r0, r1], steps: 2, poisoned: 1, saved: 0, absent: 0, sabotaged: None, stray_writes: vec![] };
         assert!(compare(&want, &exact).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "stray write into unreferenced poisoned slot (Window slot 4, pool index 3) at byte 17/18")]
+    fn restore_catches_stray_write_to_unreferenced_poisoned_slot() {
+        use BlockKind::*;
+        let h = Heap {
+            win: RefCell::new((0..4u8).map(|i| vec![i; 18]).collect()),
+            full: RefCell::new((10..12u8).map(|i| vec![i; 16]).collect()),
+            tables: vec![vec![(Window, sl(1)), (Full, sl(1))], vec![(Window, sl(2)), (Full, sl(1))]],
+            gone: vec![],
+            ended: vec![],
+        };
+        let tables: Vec<_> = (0..2).map(|l| h.lane_slots(l)).collect();
+        let ps = plans(&h, &tables, &[0], true);
+        let (saved, _) = apply(&h, &ps);
+        // Simulate a stray kernel write to the very last tail byte of unreferenced Window slot 4 (pool index 3).
+        h.win.borrow_mut()[3][17] = 0x00;
+        restore(&h, saved);
+    }
+
+    #[test]
+    #[should_panic(expected = "stray write into non-stepping live lane's saved slot (Window slot 2, pool index 1) at byte 5/16")]
+    fn restore_catches_stray_write_to_non_stepping_lanes_saved_slot_before_overwrite() {
+        use BlockKind::*;
+        let h = Heap {
+            win: RefCell::new((0..3u8).map(|i| vec![i + 1; 16]).collect()),
+            full: RefCell::new(vec![vec![9; 16]]),
+            tables: vec![vec![(Window, sl(1)), (Full, sl(1))], vec![(Window, sl(2)), (Full, sl(1))]],
+            gone: vec![],
+            ended: vec![],
+        };
+        let tables: Vec<_> = (0..2).map(|l| h.lane_slots(l)).collect();
+        // Lane 0 steps; lane 1 is live and non-stepping, so Window slot 2 (pool index 1) is saved & poisoned.
+        let ps = plans(&h, &tables, &[0], true);
+        let (saved, _) = apply(&h, &ps);
+        // Simulate a stray write during lane 0's step into non-stepping lane 1's saved slot BEFORE restore runs.
+        h.win.borrow_mut()[1][5] ^= 0x01;
+        restore(&h, saved);
+    }
+
+    #[test]
+    fn poisoned_gate_catches_stray_writes_to_both_unreferenced_and_saved_slots() {
+        use BlockKind::*;
+        struct StrayCand {
+            win: RefCell<Vec<Vec<u8>>>,
+            full: RefCell<Vec<Vec<u8>>>,
+            lanes: RefCell<Vec<Option<Vec<u32>>>>,
+            rows: Cell<usize>,
+            corrupt_saved: bool,
+            corrupt_free: bool,
+            did_corrupt: Cell<bool>,
+        }
+        impl StepPath for StrayCand {
+            fn new_lane(&self, toks: &[u32], _cap: usize) -> LaneId {
+                let mut v = self.lanes.borrow_mut();
+                v.push(Some(toks.to_vec()));
+                v.len() - 1
+            }
+            fn set_token(&self, lane: LaneId, pos: usize, tok: u32) {
+                let mut v = self.lanes.borrow_mut();
+                let t = v[lane].as_mut().unwrap();
+                if pos >= t.len() { t.resize(pos + 1, 0); }
+                t[pos] = tok;
+            }
+            fn prefill(&self, spans: &[(LaneId, usize, usize)]) {
+                self.rows.set(spans.len());
+                if !self.did_corrupt.get() && spans.len() == 1 {
+                    let l = spans[0].0;
+                    // Write legitimately to stepping lane `l`'s own slot (`l`).
+                    self.win.borrow_mut()[l][0] = 0x42;
+                }
+            }
+            fn decode(&self, spans: &[(LaneId, usize)]) {
+                self.rows.set(spans.len());
+                // At round 1 decode, lane 0 decodes while lane 1 is live in prefill (non-stepping!).
+                let live_count = self.lanes.borrow().iter().filter(|x| x.is_some()).count();
+                if !self.did_corrupt.get() && live_count >= 2 && spans.len() == 1 {
+                    self.did_corrupt.set(true);
+                    if self.corrupt_saved {
+                        // Lane 1's Window slot (pool index 1) is a non-stepping live lane's saved slot!
+                        self.win.borrow_mut()[1][12] = 0xAA;
+                    }
+                    if self.corrupt_free {
+                        // Pool index 3 is an unreferenced poisoned slot!
+                        self.full.borrow_mut()[3][8] = 0xBB;
+                    }
+                }
+            }
+            fn logits(&self, row: usize) -> Vec<f32> {
+                assert!(row < self.rows.get());
+                // Deterministic clean logits so `compare` would pass if stray writes were not checked!
+                vec![1.0, 3.0, 2.0, 0.5]
+            }
+            fn end_lane(&self, lane: LaneId) {
+                self.lanes.borrow_mut()[lane] = None;
+            }
+        }
+        impl PoisonPool for StrayCand {
+            fn slot_count(&self, _: BlockKind) -> usize { 4 }
+            fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> {
+                vec![(Window, slot_at(lane)), (Full, slot_at(lane))]
+            }
+            fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
+                let idx = slot.pool_index().get() as usize;
+                let mut v = if kind == Window { self.win.borrow_mut() } else { self.full.borrow_mut() };
+                let s = &mut v[idx];
+                Some((s.as_mut_ptr(), s.len()))
+            }
+        }
+
+        let base: Vec<u32> = (0..128).collect();
+        let w = Workload::from_tokens(&base, 2, vec![4, 4], 2);
+        let mk = |corrupt_saved: bool, corrupt_free: bool| StrayCand {
+            win: RefCell::new(vec![vec![7u8; 16]; 4]),
+            full: RefCell::new(vec![vec![8u8; 16]; 4]),
+            lanes: RefCell::new(Vec::new()),
+            rows: Cell::new(0),
+            corrupt_saved,
+            corrupt_free,
+            did_corrupt: Cell::new(false),
+        };
+        let want = reference(&mk(false, false), &w);
+
+        // 1. Clean candidate passes with zero stray writes.
+        let clean = mk(false, false);
+        let got_clean = poisoned(&clean, &w, false);
+        assert!(got_clean.stray_writes.is_empty());
+        assert!(compare(&want, &got_clean).is_ok());
+
+        // 2. Stray write to non-stepping lane's saved slot fails compare even though logits match.
+        let bad_saved = mk(true, false);
+        let got_saved = poisoned(&bad_saved, &w, false);
+        assert!(bad_saved.did_corrupt.get());
+        let errs_saved = compare(&want, &got_saved).unwrap_err();
+        assert!(
+            errs_saved.iter().any(|e| e.contains("non-stepping live lane's saved slot (Window slot 2, pool index 1)")),
+            "expected saved-slot stray write error, got: {errs_saved:?}"
+        );
+
+        // 3. Stray write to unreferenced poisoned slot fails compare even though logits match.
+        let bad_free = mk(false, true);
+        let got_free = poisoned(&bad_free, &w, false);
+        assert!(bad_free.did_corrupt.get());
+        let errs_free = compare(&want, &got_free).unwrap_err();
+        assert!(
+            errs_free.iter().any(|e| e.contains("unreferenced poisoned slot (Full slot 4, pool index 3)")),
+            "expected unreferenced-slot stray write error, got: {errs_free:?}"
+        );
     }
 }

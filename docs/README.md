@@ -146,10 +146,9 @@ on Apple Silicon: Rust host + hand-fused Metal kernels, reading the LM Studio GG
 LM Studio numbers are from its own bundled `llama-server` (same machine, same file). Sampling mode (`--temp > 0`)
 costs ~3% vs greedy (one CPU round trip per token).
 
-**Correctness.** Logits are checked position-by-position against llama.cpp (`tools/ref_logits.cpp` dumps the reference):
-61/61 argmax agreement on the decode path (max logit diff ~0.005, worst KL 0.0026), 25/25 after a batched
-2379-token prefill (worst KL 0.0069; identical results whether the prompt is one chunk or several), 41/41 after a short one
-(worst KL 0.0001). The tokenizer matches `llama-tokenize` token-for-token on 74K tokens of code/markdown.
+**Correctness.** Logits are checked against llama.cpp (`tools/ref_logits.cpp` dumps the reference; `tests/ci.sh` enforces exact argmax agreement and worst KL <= 0.01 via `inky check`):
+58/58 argmax agreement on the short prompt's decode path, 24/24 across the checked positions after a batched
+2380-token prefill on the long prompt (identical results whether the prompt is one chunk or several; the long prompt's token-by-token decode path is not gated position-by-position, see [DESIGN.md](DESIGN.md)), and 58/58 on the short prompt's `encode_decode` decode-step path. The tokenizer matches `llama-tokenize` token-for-token on 74K tokens of code/markdown.
 
 ## Usage
 

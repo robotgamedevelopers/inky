@@ -544,8 +544,9 @@ pub struct Engine {
     blocked_slab: Rc<RefCell<BlockedSlab>>,
     /// Maximum adaptive LoopCD contrast weight (`0.0` = disabled, `0.0..=4.0`).
     loopcd_omega: Cell<f32>,
-    /// True iff the most recent forward step ran `k_loopcd_blend` (so output logits are already post-softcap).
-    last_step_loopcd: Cell<bool>,
+    /// Bitmask of output rows (`0..MAX_SPANS`) whose logits in the most recent forward step were
+    /// blended and softcapped in-place by `k_loopcd_blend` (`omega_max > 0.0`).
+    loopcd_row_mask: Cell<u128>,
     /// Lazy-allocated GPU buffer for weak-pass logits `z_1` (`n_lanes * vocab_pad * 4` bytes).
     lg_weak: RefCell<Option<Buf>>,
     /// Force `count = 1` groups in Layer 3 `k_attn_grp_dec` (`INK_NO_GRP_DEC=1` for A/B parity testing).
@@ -881,6 +882,15 @@ impl Engine {
 
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
     pub fn cs_image_bytes() -> usize { N_SLOT * NCH * 3 * 4 }
+    /// Byte range within a `get_cs()` image covering cache slots `slots` (e.g. `LOOP_END..N_PHYS` = `18..24`).
+    pub fn cs_slot_byte_range(slots: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        assert!(slots.start <= slots.end && slots.end <= N_SLOT);
+        (slots.start * NCH * 3 * 4)..(slots.end * NCH * 3 * 4)
+    }
+    /// Returns `(is_swa, pass_idx_within_kind)` for cache slot `slot` (`0..N_SLOT`).
+    pub fn slot_kind_pass(&self, slot: usize) -> (bool, usize) {
+        self.slot_kind[slot]
+    }
     /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
     pub fn lane_hash(&self, lane: &Lane) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
@@ -1080,10 +1090,27 @@ impl Engine {
     /// Current default adaptive LoopCD-Logits contrast weight (`0.0` = disabled).
     #[allow(dead_code)]
     pub fn loopcd_omega(&self) -> f32 { self.loopcd_omega.get() }
-    /// Effective softcap for downstream GPU `k_gumbel` or CPU `Sampler` over the last step's logits:
-    /// `0.0` when `k_loopcd_blend` already applied exact softcap in-place, otherwise `self.softcap`.
+    /// True iff output row `span_idx` of the most recent forward step ran `k_loopcd_blend` (`omega > 0.0`).
+    pub fn span_loopcd(&self, span_idx: usize) -> bool {
+        span_idx < u128::BITS as usize && (self.loopcd_row_mask.get() & (1u128 << span_idx)) != 0
+    }
+    /// Effective softcap for downstream GPU `k_gumbel` or CPU `Sampler` on output row `span_idx`:
+    /// `0.0` when `k_loopcd_blend` already applied exact softcap in-place (`omega > 0.0`), else `self.softcap`.
+    pub fn span_effective_sampler_softcap(&self, span_idx: usize) -> f32 {
+        if self.span_loopcd(span_idx) { 0.0 } else { self.softcap }
+    }
+    /// Effective softcap for single-stream or uniform-omega callers (row 0).
     pub fn effective_sampler_softcap(&self) -> f32 {
-        if self.last_step_loopcd.get() { 0.0 } else { self.softcap }
+        self.span_effective_sampler_softcap(0)
+    }
+    /// Dry weak-pass vocabulary row `i` (`z_1`) written during the most recent LoopCD decode step.
+    pub fn span_weak_logits(&self, i: usize) -> &[f32] {
+        let borrow = self.lg_weak.borrow();
+        let buf = borrow.as_ref().expect("span_weak_logits: no LoopCD weak pass has run");
+        let vp = self.vocab_pad();
+        let off = i * vp;
+        assert!((off + self.n_vocab) * 4 <= buf.length(), "span_weak_logits: row {i} out of bounds");
+        unsafe { std::slice::from_raw_parts((buf.contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
     fn ensure_lg_weak(&self, n_rows: usize) -> Buf {
         let need_bytes = n_rows.max(1) * self.vocab_pad() * 4;
@@ -1093,7 +1120,7 @@ impl Engine {
         }
         slot.as_ref().unwrap().clone()
     }
-    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, span_idx: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
         assert!(out_index * 4 < lane.toks.length(), "encode_gumbel: out_index {out_index} out of bounds");
         let sa = SampArgs {
             logits_off,
@@ -1103,7 +1130,7 @@ impl Engine {
             pos: pos as u32,
             ban_tok: ban_tok.unwrap_or(u32::MAX),
             temp,
-            softcap: self.effective_sampler_softcap(),
+            softcap: self.span_effective_sampler_softcap(span_idx),
         };
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
         let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
@@ -1122,7 +1149,7 @@ impl Engine {
         let b = self.ba.get();
         assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
         let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
-        self.encode_gumbel_at(cb, logits_off, lane, out_index, seed, pos, temp, ban_tok);
+        self.encode_gumbel_at(cb, logits_off, span_idx, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// Batched GPU Gumbel-max sampling for multiple batch spans inside a SINGLE `MTLComputeCommandEncoder`:
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
@@ -1146,7 +1173,6 @@ impl Engine {
         }
         let e = Enc::new(cb);
         self.bind_eng(&e);
-        let eff_softcap = self.effective_sampler_softcap();
         let gumbel_grid = (self.n_vocab.div_ceil(256), 1, 1);
         for item in items {
             let logits_off = b.lg + (item.span_idx * vp) as u32;
@@ -1158,7 +1184,7 @@ impl Engine {
                 pos: item.pos as u32,
                 ban_tok: item.ban_tok.unwrap_or(u32::MAX),
                 temp: item.temp,
-                softcap: eff_softcap,
+                softcap: self.span_effective_sampler_softcap(item.span_idx),
             };
             self.go_nb(&e, C_ARGMAX, "k_gumbel", &sa, gumbel_grid, 256);
         }
@@ -1195,7 +1221,7 @@ impl Engine {
     /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
     /// the exact same RNG/sampling kernel for bit-identical `temperature = 1.0` equivalence.
     pub fn encode_gumbel_solo(&self, cb: &CmdBuf, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
-        self.encode_gumbel_at(cb, self.ar.logits, lane, out_index, seed, pos, temp, ban_tok);
+        self.encode_gumbel_at(cb, self.ar.logits, 0, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
@@ -1407,7 +1433,7 @@ impl Engine {
             block_pool,
             blocked_slab,
             loopcd_omega: Cell::new(0.0),
-            last_step_loopcd: Cell::new(false),
+            loopcd_row_mask: Cell::new(0),
             lg_weak: RefCell::new(None),
             no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
         };
@@ -1875,63 +1901,11 @@ impl Engine {
     /// Validate required blocks for span `[p0, p0 + t)` and incrementally upload ONLY the lane's dirty
     /// 64-bit block-table range `[dirty_lo..=dirty_hi]` to GPU memory (0 bytes written on clean decode steps).
     pub fn sync_lane_block_table(&self, lane: &Lane, p0: usize, t: usize) {
-        use crate::blocks::{BlockIndex, BlockKind, BLOCK as KV_BLOCK};
-        assert!(lane.use_blocks.get(), "sync_lane_block_table called on a Layer 2 lane");
-        let mut table = lane.block_table.borrow_mut();
-        let pools = self.block_pool.borrow();
-        let n_blk = table.blocks_per_kind() as usize;
-        assert!(t >= 1 && p0 + t <= n_blk * KV_BLOCK, "Layer 3 span [{p0}, {}) exceeds block table ({} blocks)", p0 + t, n_blk);
-        let lo_span_blk = p0 / KV_BLOCK;
-        let hi_blk = (p0 + t - 1) / KV_BLOCK;
-        let lo_win_blk = p0.saturating_sub(EXT - 1) / KV_BLOCK;
-        for (kind, lo) in [
-            (BlockKind::Full, 0usize),
-            (BlockKind::Window, lo_win_blk),
-        ] {
-            let pool = pools.of(kind);
-            // O(1) boundary validation in release builds; full `[lo..=hi_blk]` verification in debug builds.
-            for check_b in [lo, lo_span_blk, hi_blk] {
-                let bi = BlockIndex::new(check_b as u32);
-                let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
-                    panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {check_b}", p0 + t)
-                });
-                let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
-                    panic!(
-                        "Layer 3 {kind:?} block {check_b} entry invalid for slot {} gen {}: {err}",
-                        entry.slot().get(),
-                        entry.generation()
-                    )
-                });
-            }
-            #[cfg(debug_assertions)]
-            for b in lo..=hi_blk {
-                let bi = BlockIndex::new(b as u32);
-                let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
-                    panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {b}", p0 + t)
-                });
-                let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
-                    panic!(
-                        "Layer 3 {kind:?} block {b} entry invalid for slot {} gen {}: {err}",
-                        entry.slot().get(),
-                        entry.generation()
-                    )
-                });
-            }
-            if table.dirty_range(kind).is_some() {
-                lane.with_bt_buf(kind == BlockKind::Window, |bt_buf, byte_off, cap_blk| {
-                    assert!(n_blk <= cap_blk, "blocked lane GPU table smaller than BlockTable");
-                    let dst = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
-                            n_blk,
-                        )
-                    };
-                    table.sync_dirty_to_slice(kind, pool, dst).unwrap_or_else(|err| {
-                        panic!("Layer 3 {kind:?} dirty block-table sync failed: {err}")
-                    });
-                });
-            }
-        }
+        let _ = self.sync_lane_block_table_counts(lane, p0, t);
+    }
+    /// Same as [`Engine::sync_lane_block_table`], returning `(full_words_written, window_words_written)`.
+    pub fn sync_lane_block_table_counts(&self, lane: &Lane, p0: usize, t: usize) -> (usize, usize) {
+        sync_blocked_lane_table(&self.block_pool.borrow(), lane, p0, t)
     }
     /// bind the engine's buffers: weights, parameters, scratch arenas, counters
     fn bind_eng(&self, e: &Enc) {
@@ -2136,7 +2110,7 @@ impl Engine {
     /// This is the decode-path reference the `dbatch` harness checks (`INK_DB_OLD`), not the serving path:
     /// `inky serve` decodes through `encode_decode`.
     pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
-        self.last_step_loopcd.set(false);
+        self.loopcd_row_mask.set(0);
         let n = lanes.len();
         let (start, tot) = (self.dstart.get(), self.ar.total);
         assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
@@ -2345,7 +2319,7 @@ impl Engine {
     /// preparation and cache writes, attention, the convolutions and their state) runs span by span with that lane's
     /// buffers bound. Optionally computes each span's logits (and argmax, written to the lane's tokens) for its last row:
     /// in the decode arena for a single span (`logits()`), in the batch arena for several (`span_logits`).
-    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None, None); }
+    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None, None, None); }
     /// Verify step. Each span has length `1 + k` (the last committed token again, then `k` drafts). `k` is the
     /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
     /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
@@ -2365,7 +2339,7 @@ impl Engine {
             accepted_end: None,
         }).collect();
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
-        self.encode_spans_x(cb, spans, true, false, false, Some(k), None);
+        self.encode_spans_x(cb, spans, true, false, false, Some(k), None, None);
     }
     /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
     /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
@@ -2475,7 +2449,7 @@ impl Engine {
     /// blocks written by decode steps are never shared (docs/DESIGN.md).
     pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
         assert!(spans.iter().all(|s| s.t == 1));
-        self.encode_spans_x(cb, spans, logits, argmax, true, None, None);
+        self.encode_spans_x(cb, spans, logits, argmax, true, None, None, None);
     }
     /// Encode one decode step with explicit per-span `omega_max` values for adaptive `LoopCD-Logits`
     /// (`0.0` disables LoopCD for that span). When every entry is `0.0`, behaves identically to `encode_decode`
@@ -2483,10 +2457,17 @@ impl Engine {
     pub fn encode_decode_with_omegas(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, omegas: &[f32]) {
         assert!(spans.iter().all(|s| s.t == 1));
         assert_eq!(omegas.len(), spans.len(), "encode_decode_with_omegas: one omega per span");
-        self.encode_spans_x(cb, spans, logits, argmax, true, None, Some(omegas));
+        self.encode_spans_x(cb, spans, logits, argmax, true, None, Some(omegas), None);
     }
-    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>, omegas: Option<&[f32]>) {
-        self.last_step_loopcd.set(false);
+    /// Encode a 1-pass decode step (prelude `0..6` + loop pass 0 `6..18` + coda `18..24` + output mix + `lm_head`)
+    /// into `span_logits`. When `dry_coda` is true, coda layers `18..24` execute with `dry_state = true`
+    /// (the exact LoopCD weak pass, leaving `CS[18..24]` and `KV[18..24]` untouched).
+    pub fn encode_decode_one_pass(&self, cb: &CmdBuf, spans: &[Span], dry_coda: bool) {
+        assert!(spans.iter().all(|s| s.t == 1));
+        self.encode_spans_x(cb, spans, true, false, true, None, Some(&vec![0.0; spans.len()]), Some(dry_coda));
+    }
+    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>, omegas: Option<&[f32]>, one_pass_dry: Option<bool>) {
+        self.loopcd_row_mask.set(0);
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
         let lane_omegas: Vec<f32> = if dec && logits {
             match omegas {
@@ -2683,13 +2664,15 @@ impl Engine {
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
         let mut lg_weak_buf: Option<Buf> = None;
-        for pass in 0..N_PASS {
+        let n_passes = if one_pass_dry.is_some() { 1 } else { N_PASS };
+        let coda_dry = one_pass_dry.unwrap_or(false);
+        for pass in 0..n_passes {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
             for ip in LOOP_START..LOOP_END { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0, false); }
             bank = (blocks[prelude_blocks.len() + 1], cur);
-            if pass == 0 && run_loopcd {
+            if pass == 0 && run_loopcd && one_pass_dry.is_none() {
                 // Exact dry-state weak reference pass (z_1) immediately after pass 0, while CS[18..24] and
                 // KV[18..24] still hold the untouched pos - 1 state.
                 let mut cur_w = cur;
@@ -2715,7 +2698,7 @@ impl Engine {
                 lg_weak_buf = Some(weak_buf);
             }
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], false); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], coda_dry); }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -2761,7 +2744,7 @@ impl Engine {
                 e.bytes_slice(&lane_omegas, 8);
                 e.buf(weak_buf, 0, 9);
                 self.go(&e, C_LMHEAD, "k_loopcd_blend", &la, (1, n, 1), 1024);
-                self.last_step_loopcd.set(true);
+                self.loopcd_row_mask.set(loopcd_mask_for_omegas(&lane_omegas));
             }
             if argmax {
                 for (si, sp) in spans.iter().enumerate() {
@@ -3942,7 +3925,7 @@ impl<'a> Run<'a> {
         cx.e.end();
     }
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
-        self.last_step_loopcd.set(false);
+        self.loopcd_row_mask.set(0);
         let omega = self.loopcd_omega.get();
         let run_loopcd = logits && omega > 0.0;
         assert!(!run_loopcd || !self.tier_on(), "--loopcd cannot be combined with --kv-disk");
@@ -4017,7 +4000,7 @@ impl<'a> Run<'a> {
                 e.bytes_slice(&omegas, 8);
                 e.buf(weak_buf, 0, 9);
                 self.go(e, C_LMHEAD, "k_loopcd_blend", &la, (1, 1, 1), 1024);
-                self.last_step_loopcd.set(true);
+                self.loopcd_row_mask.set(1);
             }
         }
         if logits && argmax {
@@ -4421,23 +4404,95 @@ fn use_fused_topk_route3(hgemm: bool, n: usize) -> bool {
     hgemm && n <= 64
 }
 
+fn sync_blocked_lane_table(pools: &crate::blocks::BlockPools, lane: &Lane, p0: usize, t: usize) -> (usize, usize) {
+    use crate::blocks::{BlockIndex, BlockKind, BLOCK as KV_BLOCK};
+    assert!(lane.use_blocks.get(), "sync_lane_block_table called on a Layer 2 lane");
+    let mut table = lane.block_table.borrow_mut();
+    let n_blk = table.blocks_per_kind() as usize;
+    assert!(t >= 1 && p0 + t <= n_blk * KV_BLOCK, "Layer 3 span [{p0}, {}) exceeds block table ({} blocks)", p0 + t, n_blk);
+    let lo_span_blk = p0 / KV_BLOCK;
+    let hi_blk = (p0 + t - 1) / KV_BLOCK;
+    let lo_win_blk = p0.saturating_sub(EXT - 1) / KV_BLOCK;
+    let mut full_written = 0usize;
+    let mut win_written = 0usize;
+    for (kind, lo) in [
+        (BlockKind::Full, 0usize),
+        (BlockKind::Window, lo_win_blk),
+    ] {
+        let pool = pools.of(kind);
+        // O(1) boundary validation in release builds; full `[lo..=hi_blk]` verification in debug builds.
+        for check_b in [lo, lo_span_blk, hi_blk] {
+            let bi = BlockIndex::new(check_b as u32);
+            let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
+                panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {check_b}", p0 + t)
+            });
+            let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
+                panic!(
+                    "Layer 3 {kind:?} block {check_b} entry invalid for slot {} gen {}: {err}",
+                    entry.slot().get(),
+                    entry.generation()
+                )
+            });
+        }
+        #[cfg(debug_assertions)]
+        for b in lo..=hi_blk {
+            let bi = BlockIndex::new(b as u32);
+            let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
+                panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {b}", p0 + t)
+            });
+            let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
+                panic!(
+                    "Layer 3 {kind:?} block {b} entry invalid for slot {} gen {}: {err}",
+                    entry.slot().get(),
+                    entry.generation()
+                )
+            });
+        }
+        if table.dirty_range(kind).is_some() {
+            let written = lane.with_bt_buf(kind == BlockKind::Window, |bt_buf, byte_off, cap_blk| {
+                assert!(n_blk <= cap_blk, "blocked lane GPU table smaller than BlockTable");
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                        n_blk,
+                    )
+                };
+                table.sync_dirty_to_slice(kind, pool, dst).unwrap_or_else(|err| {
+                    panic!("Layer 3 {kind:?} dirty block-table sync failed: {err}")
+                })
+            });
+            if kind == BlockKind::Window {
+                win_written = written;
+            } else {
+                full_written = written;
+            }
+        }
+    }
+    (full_written, win_written)
+}
+
+fn loopcd_mask_for_omegas(omegas: &[f32]) -> u128 {
+    const { assert!(MAX_SPANS <= u128::BITS as usize); }
+    let mut mask = 0u128;
+    for (i, &w) in omegas.iter().enumerate() {
+        if w > 0.0 {
+            mask |= 1u128 << i;
+        }
+    }
+    mask
+}
+
 /// Pure Rust reference implementation of `k_loopcd_blend` (Liu et al., 2026, arXiv:2610.02185,
 /// Eqs. 3-4 & Appendix A.1-A.3) with exact logit softcapping:
 ///   s3(v) = softcap(z3(v)), s1(v) = softcap(z1(v))
 ///   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
 ///   z3[v] <- s3(v) + omega_t * (s3(v) - s1(v))
-/// Returns the computed adaptive weight `omega_t`.
+/// Returns the computed adaptive weight `omega_t`. Disabled lanes (`omega_max <= 0.0`) stay raw.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32) -> f32 {
     assert_eq!(z3.len(), z1.len(), "loopcd_blend_row: z3 and z1 must have equal length");
     let cap = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
-    if z3.is_empty() {
-        return 0.0;
-    }
-    if omega_max <= 0.0 {
-        if softcap > 0.0 {
-            for x in z3.iter_mut() { *x = cap(*x); }
-        }
+    if z3.is_empty() || omega_max <= 0.0 {
         return 0.0;
     }
     let mut max1 = f32::NEG_INFINITY;
@@ -4463,6 +4518,10 @@ pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32
         0.0
     };
     for (dst, &raw1) in z3.iter_mut().zip(z1.iter()) {
+        if !dst.is_finite() || !raw1.is_finite() {
+            *dst = f32::NAN;
+            continue;
+        }
         let s3 = cap(*dst);
         if omega_t > 0.0 {
             let s1 = cap(raw1);
@@ -5165,15 +5224,14 @@ mod tests {
         let softcap = 20.0f32;
         let cap = |x: f32| softcap * (x / softcap).tanh();
 
-        // 1. omega_max == 0.0 produces exact softcap(z3) with zero contrast.
+        // 1. omega_max == 0.0 leaves raw logits untouched for the downstream sampler.
         let z3_raw = [18.0f32, 12.5, -3.0, -40.0, 0.0];
         let z1_raw = [-5.0f32, 22.0, 10.0, 15.0, 3.0];
         let mut out0 = z3_raw;
         let w0 = loopcd_blend_row(&mut out0, &z1_raw, softcap, 0.0);
         assert_eq!(w0, 0.0);
-        for (got, &raw) in out0.iter().zip(z3_raw.iter()) {
-            assert!((got - cap(raw)).abs() < 1e-6);
-        }
+        assert_eq!(out0, z3_raw);
+        assert_eq!(loopcd_mask_for_omegas(&[0.0, 0.35, 0.0, 0.5]), 0b1010);
 
         // 2. Dominant token (p_{3,(1)} -> 1, p_{3,(2)} -> 0): omega_t -> 0 (deterministic syntax/tool-calls preserved).
         let mut z3_dom = [-50.0f32; 64];
@@ -5372,5 +5430,188 @@ mod tests {
             assert!(max_live < n_vec - 1, "peak non-zero live vectors ({max_live}) must fit within n_vec-1 ({})", n_vec - 1);
             assert_ne!(cur, 0);
         }
+    }
+
+    #[test]
+    fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
+        use crate::blocks::{BlockIndex, BlockKind, BlockPools, BlockTable, BLOCK as KV_BLOCK};
+        use objc2_metal::MTLCreateSystemDefaultDevice;
+
+        if MTLCreateSystemDefaultDevice().is_none() {
+            eprintln!("skipping Metal block-table sync test: no Metal device");
+            return;
+        }
+        let trivial_metal = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_nop() {}\n";
+        let gpu = Gpu::new(trivial_metal, &["k_nop"]);
+        let mut pools = BlockPools::gpu(&gpu.dev, 8, 8, 2);
+        let slab = Rc::new(RefCell::new(BlockedSlab::new(32)));
+        let slot_idx = slab.borrow_mut().alloc_slot(&gpu, 32);
+        let lane = Lane {
+            kv_swa: RefCell::new(gpu.buffer(16)),
+            kv_full: RefCell::new(gpu.buffer(16)),
+            swa_cap: Cell::new(0),
+            full_cap: Cell::new(0),
+            cs_own: None,
+            toks: gpu.buffer(2048 * 4),
+            tier: None,
+            prune: RefCell::new(None),
+            block_table: RefCell::new(BlockTable::new(32).unwrap()),
+            use_blocks: Cell::new(true),
+            blocked_slot: Some(BlockedSlot {
+                slab: slab.clone(),
+                slot_idx,
+                bt_blocks: 32,
+            }),
+        };
+
+        let ensure_blocks = |pools: &mut BlockPools, lane: &Lane, p0: usize, t: usize| {
+            let mut tbl = lane.block_table.borrow_mut();
+            for b in (p0 / KV_BLOCK)..=((p0 + t - 1) / KV_BLOCK) {
+                let bi = BlockIndex::new(b as u32);
+                for kind in [BlockKind::Full, BlockKind::Window] {
+                    if tbl.get(kind, bi).unwrap().is_none() {
+                        let pool = pools.of_mut(kind);
+                        let (s, _) = pool.take_free().unwrap();
+                        let gen = pool.record(s).unwrap().generation();
+                        tbl.fill(pool, bi, s, gen).unwrap();
+                    }
+                }
+            }
+        };
+        let finish_span = |pools: &mut BlockPools, lane: &Lane, p0: usize, t: usize, seal_full: bool| {
+            let end = p0 + t;
+            let tbl = lane.block_table.borrow();
+            for b in (p0 / KV_BLOCK)..=((end - 1) / KV_BLOCK) {
+                let bi = BlockIndex::new(b as u32);
+                let blen = (end - b * KV_BLOCK).min(KV_BLOCK) as u32;
+                for kind in [BlockKind::Full, BlockKind::Window] {
+                    let e = tbl.get(kind, bi).unwrap().unwrap();
+                    let rec = pools.of_mut(kind).record_mut(e.slot()).unwrap();
+                    rec.set_length(blen).unwrap();
+                    if seal_full && blen == KV_BLOCK as u32 {
+                        rec.seal();
+                    }
+                }
+            }
+        };
+
+        // Prefill block 0 (`[0, 64)`): initial full sync writes all 32 entries per kind, sealing block 0.
+        ensure_blocks(&mut pools, &lane, 0, 64);
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((0, 31)));
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((0, 31)));
+        assert_eq!(sync_blocked_lane_table(&pools, &lane, 0, 64), (32, 32));
+        finish_span(&mut pools, &lane, 0, 64, true);
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), None);
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), None);
+
+        // Plant sentinels in unused GPU block-table entries `[2..32)` to prove steady-state sync touches nothing.
+        for swa in [false, true] {
+            lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                        cap_blk,
+                    )
+                };
+                for w in &mut dst[2..32] {
+                    *w = 0xDEAD_BEEF_CAFE_BABEu64;
+                }
+            });
+        }
+
+        // Step across 64 consecutive decode positions `pos = 64..128` (the entire second 64-token block):
+        // - `pos == 64` allocates block 1 -> `dirty_range == Some((1, 1))` -> writes `(1, 1)` table words.
+        // - `pos == 65..128` (63 steady-state decode steps) -> `dirty_range == None` -> writes `(0, 0)` words!
+        for pos in 64..128 {
+            ensure_blocks(&mut pools, &lane, pos, 1);
+            if pos == 64 {
+                assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((1, 1)));
+                assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((1, 1)));
+            } else {
+                assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), None, "pos={pos} must have clean Full table");
+                assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), None, "pos={pos} must have clean Window table");
+            }
+            let written = sync_blocked_lane_table(&pools, &lane, pos, 1);
+            if pos == 64 {
+                assert_eq!(written, (1, 1), "pos=64 must write only newly allocated block 1");
+            } else {
+                assert_eq!(written, (0, 0), "steady-state decode at pos={pos} must write 0 table words");
+            }
+            finish_span(&mut pools, &lane, pos, 1, false);
+        }
+
+        // Sentinels in `[2..32)` are still completely untouched after all 64 decode steps.
+        for swa in [false, true] {
+            lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
+                let dst = unsafe {
+                    std::slice::from_raw_parts(
+                        (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                        cap_blk,
+                    )
+                };
+                assert!(dst[2..32].iter().all(|&w| w == 0xDEAD_BEEF_CAFE_BABEu64));
+            });
+        }
+
+        // Next block boundary at `pos = 128` allocates block 2 -> writes `(1, 1)` table words.
+        ensure_blocks(&mut pools, &lane, 128, 1);
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((2, 2)));
+        assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((2, 2)));
+        assert_eq!(sync_blocked_lane_table(&pools, &lane, 128, 1), (1, 1));
+        let full_b2 = lane.block_table.borrow().get(BlockKind::Full, BlockIndex::new(2)).unwrap().unwrap();
+        assert_eq!(pools.full.record(full_b2.slot()).unwrap().refs(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires Inkling Q4_K_M model and Metal 4"]
+    fn engine_encode_decode_64_positions_syncs_once_then_63_zero_steps() {
+        use crate::blocks::{BlockIndex, BlockKind};
+        use objc2_metal::MTLCommandBuffer;
+
+        let model = std::env::var("INKY_MODEL").unwrap_or_else(|_| crate::default_model());
+        let eng = Engine::load(&model, 256);
+        eng.ensure_batch(64);
+        eng.ensure_dbatch(1);
+        let lane = Lane::new_blocked(&eng, 192);
+        let toks: Vec<u32> = (0..130).map(|i| ((i * 17 + 5) % 500) as u32).collect();
+        eng.on(&lane).set_tokens(0, &toks);
+        let alloc_blk = |b: u32| {
+            let mut pools = eng.block_pool().borrow_mut();
+            let mut tbl = lane.block_table().borrow_mut();
+            let bi = BlockIndex::new(b);
+            for kind in [BlockKind::Full, BlockKind::Window] {
+                let pool = pools.of_mut(kind);
+                let s = pool.lowest_free().unwrap_or_else(|| pool.grow().unwrap());
+                let _ = pool.take(s).unwrap();
+                let gen = pool.record(s).unwrap().generation();
+                tbl.fill(pool, bi, s, gen).unwrap();
+            }
+        };
+        alloc_blk(0);
+        {
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &lane, p0: 0, t: 64 }], false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        alloc_blk(1);
+        for pos in 64..128 {
+            if pos == 64 {
+                assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Full), Some((1, 1)));
+                assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Window), Some((1, 1)));
+                assert_eq!(eng.sync_lane_block_table_counts(&lane, pos, 1), (1, 1));
+            } else {
+                assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Full), None);
+                assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Window), None);
+                assert_eq!(eng.sync_lane_block_table_counts(&lane, pos, 1), (0, 0));
+            }
+            let cb = eng.gpu.cmd();
+            eng.encode_decode(&cb, &[Span { lane: &lane, p0: pos, t: 1 }], true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            assert!(eng.span_logits(0).iter().all(|x| x.is_finite()));
+        }
+        let mut pools = eng.block_pool().borrow_mut();
+        lane.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
     }
 }
