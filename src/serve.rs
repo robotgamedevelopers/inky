@@ -2236,14 +2236,7 @@ pub fn serve(o: ServeOpts) {
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
-    let pool_kv_budget = Engine::capped_serve_kv_budget(
-        budget.available_kv_budget_bytes,
-        eng.kvb as u32,
-        eng.chunk,
-        o.ctx,
-        effective_lanes,
-    );
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(pool_kv_budget, effective_lanes);
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),

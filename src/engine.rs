@@ -758,8 +758,15 @@ impl Engine {
     /// Returns `(n_window, n_full)`.
     pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {
         let max_slab = self.gpu.dev.maxBufferLength() as u64;
-        let (n_window, n_full) = Self::serve_block_pool_counts(
+        let capped_budget = Self::capped_serve_kv_budget(
             kv_budget_bytes,
+            self.kvb as u32,
+            self.chunk,
+            self.max_ctx,
+            max_lanes,
+        );
+        let (n_window, n_full) = Self::serve_block_pool_counts(
+            capped_budget,
             self.kvb as u32,
             self.chunk,
             max_lanes,
