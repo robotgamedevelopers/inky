@@ -21,7 +21,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
         with:
           toolchain: 1.98.1
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.10'
@@ -107,7 +107,7 @@ jobs:
       matrix:
         part: [memmode, blocks, grouped, traces]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Every TLA check and trace mutant must sit in exactly one tier (this file or nightly.yml); the self-test
       # plants a dropped check, a dropped mutant, an unwired trace script and a doubled part, and needs each red.
       - name: TLA tier coverage
@@ -144,7 +144,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: check online M5 self-hosted runner
         env:
           GH_TOKEN: ${{ github.token }}
@@ -159,7 +159,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: verify pinned Rust toolchain
         run: |
           v=$(rustc --version)
@@ -209,7 +209,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: verify pinned Rust toolchain
         run: |
           v=$(rustc --version)
