@@ -190,7 +190,7 @@ check() {
 }
 
 check_nightly() {
-    if [[ -n $nightly_only || -n ${TLC_NIGHTLY:-} || -n ${INKY_TLC_NIGHTLY:-} ]]; then
+    if [[ -n $nightly_only || ${TLA_NIGHTLY:-0} = 1 || -n ${TLC_NIGHTLY:-} ]]; then
         select_check "$@"
     fi
 }
@@ -207,13 +207,10 @@ check PrefixTreeReuseHeld PrefixTree HeldNeverStale
 check PrefixTreeStaleInsert PrefixTree NoBadInsert
 check PrefixTreeTrace PrefixTreeTrace
 # The 21-node full config has at least 6^20 slot assignments. Nightly CI
-# exhausts two slots with up to three sealed nodes and simulates the full config.
+# exhausts bounded branching with slot reuse (PrefixTreeNightly) and simulates
+# the explicit 21-sealed-node PrefixTree.cfg configuration under one switch (TLA_NIGHTLY=1).
 check_nightly PrefixTreeNightly PrefixTree
-if [[ -n ${INKY_TLC_NIGHTLY:-} && -z $nightly_only ]]; then
-    check_nightly PrefixTree PrefixTree
-else
-    check_nightly PrefixTree PrefixTree - simulation
-fi
+check_nightly PrefixTree PrefixTree - simulation
 check_nightly mutant-no-evict PrefixTreeTrace 'Deadlock reached' trace-mutant
 check_nightly mutant-full-match PrefixTreeTrace 'Deadlock reached' trace-mutant
 check_nightly mutant-ref-leak PrefixTreeTrace 'Invariant PoolBooks is violated' trace-mutant
@@ -269,6 +266,11 @@ check AdvanceUnfair GroupedLayout TraversalCompletes temporal
 # Negative control: the redundant-load mutant must keep both output invariants,
 # so only StagedOnce can see it. Restage above proves the same mutant is live.
 check RestageOutputs GroupedLayout
+check SplitArena3 SplitArena
+check SplitArena4 SplitArena
+check SplitArena6 SplitArena
+check SplitEdgeDropped SplitArena CombineReadsOwn
+check SplitRowsUnbounded SplitArena WritesInArena
 check StartTails2 StartTails
 check LaneStaleGen StartTails LaneCovered
 check UnheldWindow StartTails StartRetained

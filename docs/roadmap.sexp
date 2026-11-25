@@ -81,20 +81,20 @@
   (:id "t-audit-cache-window-pruning" :type :task :title "Visit each expired window block once per lane" :state :done
    :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "The decode pruner restarted at block zero on every token. Its loop visits 2,031 old entries at position 131,008, or 64,992 for 32 lanes. Advance a per-lane cursor and reset it on release or rebind.")
-  (:id "t-audit-cache-scheduler-trace" :type :task :title "Replay live scheduler burst and preemption decisions against their own specification" :state :doing
-   :evidence ("src/serve.rs" "src/serve/scheduler_trace.rs" "src/scheduler.rs" "scripts/check-scheduler-traces.sh" "specs/CacheScheduler.tla" "https://github.com/robotgamedevelopers/inky/pull/87")
+  (:id "t-audit-cache-scheduler-trace" :type :task :title "Replay live scheduler burst and preemption decisions against their own specification" :state :done
+   :evidence ("src/serve.rs" "src/serve/scheduler_trace.rs" "src/scheduler.rs" "scripts/check-scheduler-traces.sh" "specs/CacheScheduler.tla" "https://github.com/robotgamedevelopers/inky/pull/87" "src/serve/step_trace.rs: seeded_decisions_are_repeatable" "scripts/check-serve-step-traces.sh")
    :note "The documented test selected zero cases. The CI trace used a different Scheduler whose model requires a maximum-age lane each step. The live planner selected the decoder twice while a prefiller aged and permits 16 consecutive decode steps. Require nonempty traces and independently check phase, spans and wait counters.")
   (:id "t-audit-cache-ownership-trace" :type :task :title "Replay live paged-cache ownership through binds, releases, SSD restore and rollback" :state :todo
    :evidence ("src/serve/block_cache.rs" "src/blocks.rs" "src/spill.rs" "specs/CacheScheduler.tla" "docs/roadmap.sexp")
    :note "The reference scheduler checks resource lifecycle, and the live planner trace checks batch decisions. Extend the existing prefix-storage gate to compare real slot generations, reference ownership and rollback across decisions. Require rejection of an intentionally wrong ownership trace.")
-  (:id "t-audit-cache-layout-runner" :type :task :title "Require a nonempty layout-model run on hosts without zsh" :state :doing
-   :evidence ("scripts/check-tla.sh" "specs/run_tlc.zsh" "https://github.com/robotgamedevelopers/inky/pull/87")
+  (:id "t-audit-cache-layout-runner" :type :task :title "Require a nonempty layout-model run on hosts without zsh" :state :done
+   :evidence ("scripts/check-tla.sh" "specs/run_tlc.zsh" "https://github.com/robotgamedevelopers/inky/pull/87" "tests/check-layout-coverage.sh")
    :note "The shell fallback parsed a removed configuration table and reported success with zero model logs. Run the canonical list on both shell paths and fail closed when an expected result or witness is absent.")
-  (:id "t-audit-cache-prefix-nightly" :type :task :title "Run a tractable branching PrefixTree model and account for every scheduled check" :state :doing
-   :evidence (".github/workflows/nightly.yml" "scripts/check-tla.sh" "specs/run_tlc.zsh" "specs/PrefixTree.cfg" "https://github.com/robotgamedevelopers/inky/pull/87")
+  (:id "t-audit-cache-prefix-nightly" :type :task :title "Run a tractable branching PrefixTree model and account for every scheduled check" :state :done
+   :evidence (".github/workflows/nightly.yml" "scripts/check-tla.sh" "specs/run_tlc.zsh" "specs/PrefixTree.cfg" "https://github.com/robotgamedevelopers/inky/pull/87" "specs/run_tlc.zsh: TLA_NIGHTLY=1" "tests/check-layout-coverage.sh")
    :note "Nightly set TLC_NIGHTLY but the full PrefixTree gate read INKY_TLC_NIGHTLY. Use one switch and require a result for a bounded branching model with slot reuse. Keep the original 21-sealed-node configuration explicit and report its separate execution status.")
-  (:id "t-audit-cache-prefix-pins" :type :task :title "Model per-node pins separately from validity of a complete matched path" :state :doing
-   :evidence ("specs/PrefixTree.tla" "specs/PrefixTree.cfg" "src/prefix.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/87")
+  (:id "t-audit-cache-prefix-pins" :type :task :title "Model per-node pins separately from validity of a complete matched path" :state :done
+   :evidence ("specs/PrefixTree.tla" "specs/PrefixTree.cfg" "src/prefix.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/87" "scripts/check-serve-cache-traces.sh")
    :note "Broader model checking exposed an invariant that treated a child pin as protecting its ancestors. A child can keep its own current entries while an unpinned ancestor slot changes generation. Check node safety, fully pinned path safety, and full-path validation on seek.")
   (:id "t-audit-cache-spill-hardware" :type :task :title "Compare SSD-restored and cold generation on an M5 across eviction, restart and branching" :state :done
    :evidence ("tests/spill_http_m5.rs" "src/spill/store.rs: persist_index, load_persisted_index" "src/serve/block_cache.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/112")
@@ -155,8 +155,8 @@
      ("audit-engine-claim-dispatch" "done" "t-audit-engine-claim-dispatch")
      ("audit-engine-dirty-range" "done" "t-audit-engine-dirty-range")
    ))
-  (:id "t-audit-engine-q8-debug" :type :task :title "Allow Q8 attention in debug decoding" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "src/engine.rs" "src/kernels.metal")
+  (:id "t-audit-engine-q8-debug" :type :task :title "Allow Q8 attention in debug decoding" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "src/engine.rs" "src/kernels.metal" "src/engine/tests.rs: q8_debug_single_token_decode_matches_native_checkpoint")
    :note "The debug segment constructor asserted on supported Q8 projection weights. PR #74 admits Q8 and tests the segment geometry. Run a single-token debug decode with the actual native checkpoint on M5.")
   (:id "t-audit-engine-assistant-parts" :type :task :title "Keep assistant text parts separate in the model prompt" :state :done
    :evidence ("src/serve.rs" "src/tokenizer.rs" "https://github.com/robotgamedevelopers/inky/pull/90" "src/serve/prompt.rs" "src/serve.rs: multipart_assistant_content_matches_the_gguf_template, multipart_assistant_with_empty_parts_and_following_user_turn_preserves_exact_history_tokens, gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token")
@@ -179,26 +179,26 @@
   (:id "t-audit-engine-vocab-control" :type :task :title "Record the pinned tokenizer and GGUF geometry controls" :state :done
    :evidence ("src/tokenizer.rs" "src/gguf.rs" "src/engine.rs" "tools/inkconvert/gguf.go")
    :note "At be82ef3 the production tokenizer matched all 45,073 llama.cpp reference IDs for the 119,312-byte mixed-text corpus, including long BPE pieces. Source review confirmed checked GGUF tensor extents, row divisibility, fixed kernel shapes, vocabulary and embedding bounds, and matching native NV4 and MX8 block widths. Coverage applies to those invariants and this corpus.")
-  (:id "t-audit-engine-loopcd-lanes" :type :task :title "Isolate LoopCD transforms by sampling lane" :state :doing
-   :evidence ("src/engine.rs" "src/kernels.metal" "src/sampler.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
+  (:id "t-audit-engine-loopcd-lanes" :type :task :title "Isolate LoopCD transforms by sampling lane" :state :done
+   :evidence ("src/engine.rs" "src/kernels.metal" "src/sampler.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/86" "src/loopcd_tests.rs" "src/main.rs: loopcdgate" "tests/loopcd-gate.sh")
    :note "A disabled lane was softcapped when a neighbor enabled LoopCD. Two distinct raw logits became equal on M3 Ultra and greedy selection changed. Leave a disabled lane raw, retain per-lane blend status and check standalone and mixed-batch equality, including ties. Confirm on model-backed serving. Johnny Grok, 2026-11-25, read the same split still present on main at d6778fe: the step runs k_loopcd_blend when any lane has omega greater than 0, the omega less-or-equal 0 lane takes Metal precise::tanh and returns (kernels.metal), and last_step_loopcd is one flag for the step (engine.rs), so the CPU sampler's f32::tanh is skipped for every lane. A solo omega-0 lane never enters that kernel. He did not re-run the M3 Ultra flip.")
-  (:id "t-audit-engine-loopcd-first" :type :task :title "Apply LoopCD to the first output token" :state :doing
-   :evidence ("src/engine.rs" "src/serve.rs" "src/session.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
+  (:id "t-audit-engine-loopcd-first" :type :task :title "Apply LoopCD to the first output token" :state :done
+   :evidence ("src/engine.rs" "src/serve.rs" "src/session.rs" "https://github.com/robotgamedevelopers/inky/pull/86" "src/loopcd_tests.rs" "tests/loopcd-gate.sh")
    :note "Terminal prefill bypassed the weak pass in both CLI and serve, so a one-token request could skip LoopCD entirely. Compare the final prompt row with a forced decode at zero and nonzero weights, including both cold and cached prompts. The audit established the call path. The effect on a given generated token requires model execution.")
-  (:id "t-audit-engine-sampling-finite" :type :task :title "Propagate nonfinite GPU sampling rows as job errors" :state :doing
-   :evidence ("src/kernels.metal" "src/serve.rs" "src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
+  (:id "t-audit-engine-sampling-finite" :type :task :title "Propagate nonfinite GPU sampling rows as job errors" :state :done
+   :evidence ("src/kernels.metal" "src/serve.rs" "src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86" "src/engine/sampling_tests.rs")
    :note "Isolated production Gumbel and argmax shaders returned vocabulary IDs for partly and wholly nonfinite rows on M3 Ultra. Check NaN and both infinities on solo and mixed batches, preserve healthy lanes, and exercise both API error paths with a finite control.")
-  (:id "t-audit-engine-sampling-near-zero" :type :task :title "Match CPU sampling at very small positive temperatures" :state :doing
-   :evidence ("src/kernels.metal" "src/sampler.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
+  (:id "t-audit-engine-sampling-near-zero" :type :task :title "Match CPU sampling at very small positive temperatures" :state :done
+   :evidence ("src/kernels.metal" "src/sampler.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/86" "src/engine/sampling_tests.rs")
    :note "Valid small positive temperatures overflowed the GPU logit division and changed the winner on M3 Ultra. Use the same near-zero greedy rule as CPU. Test raw argmax agreement for both APIs, standalone and batched, alongside a finite ordinary-temperature control.")
-  (:id "t-audit-engine-cli-step-status" :type :task :title "Check every CLI Metal step before accepting its result" :state :doing
-   :evidence ("src/session.rs" "src/main.rs" "src/metal.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
+  (:id "t-audit-engine-cli-step-status" :type :task :title "Check every CLI Metal step before accepting its result" :state :done
+   :evidence ("src/session.rs" "src/main.rs" "src/metal.rs" "https://github.com/robotgamedevelopers/inky/pull/83" "src/session.rs: run_chat_turn")
    :note "CLI prefill waited only on the final chunk and decode consumed unchecked results. Exercise failed early and final prefill chunks and both sampled and greedy decode. An error must leave output and chat state consistent for the next turn. The original audit traced this path without injecting a device failure.")
   (:id "t-audit-engine-cli-utf8" :type :task :title "Preserve valid CLI output after malformed bytes" :state :done
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "src/session.rs" "src/serve/reply.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "A malformed leading byte caused the CLI to discard valid following text. Share incremental decoding with serve and flush incomplete sequences at content boundaries and end of stream. Check valid split code points, a malformed prefix followed by valid text, and an incomplete final code point.")
-  (:id "t-audit-engine-spec-topk-ties" :type :task :title "Use identical top-k tie handling in direct and draft sampling" :state :doing
-   :evidence ("src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
+  (:id "t-audit-engine-spec-topk-ties" :type :task :title "Use identical top-k tie handling in direct and draft sampling" :state :done
+   :evidence ("src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86" "src/sampler.rs: checked_argmax, truncate_and_sort_top_k, speculative_verification_matches_direct_sampling_at_topk_ties_and_controls")
    :note "Direct sampling and speculative verification assigned probability to different tokens at a top-k tie in 10,000 draws. Share stable score and token-ID ordering before enabling speculative sampling in production. Recheck target support and a sampling histogram with tied, untied and zero-temperature controls. The audited main path was test-only.")
   (:id "t-audit-engine-route-control" :type :task :title "Record fused routing agreement with the original kernels" :state :done
    :evidence ("src/kernels.metal" "src/engine.rs")
@@ -209,8 +209,8 @@
   (:id "t-audit-engine-dispatch-control" :type :task :title "Record the 32-lane dispatch-count comparison" :state :done
    :evidence ("docs/releases/v0.2.2.md" "src/engine.rs" "src/metal.rs")
    :note "M5 Pro encoded 10,186 paged decode dispatches at v0.2.1 and 843 at v0.2.2. Barrier calls fell from 1,059 to 819. Each tag encoded one warm 32-lane fp16 step at position zero with logits and without argmax. The command buffers were left unsubmitted. The observed 12.08-fold reduction applies to encoded dispatch calls. GPU execution time, sampling cost and tokens per second require separate measurements.")
-  (:id "t-audit-engine-disk-split-window" :type :task :title "Keep disk and resident attention reductions aligned across staging resizes" :state :doing
-   :evidence ("src/engine.rs" "src/session.rs" "tests/golden.sh" "docs/README.md" "https://github.com/robotgamedevelopers/inky/pull/83")
+  (:id "t-audit-engine-disk-split-window" :type :task :title "Keep disk and resident attention reductions aligned across staging resizes" :state :done
+   :evidence ("src/engine.rs" "src/session.rs" "tests/golden.sh" "docs/README.md" "https://github.com/robotgamedevelopers/inky/pull/83" "src/engine/tests.rs" "tests/ci.sh: aligned --kv-disk vs in-memory")
    :note "Default staging reserves 4,096 positions per half at context 32,760. The resident split grows to 4,128 at 32,768, ahead of the disk resize at 32,824. The CPU planner confirmed different key groupings. Cover the full interval in sizing tests, then compare complete disk and resident logits across the transition on M5. That numerical transition remained unmeasured at audit.")
   (:id "t-audit-engine-claim-agreement" :type :task :title "Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss" :state :done
    :evidence ("README.md" "docs/README.md" "docs/DESIGN.md" "src/main.rs: cmd_check, verify_check_verdict" "tests/ci.sh" "https://github.com/robotgamedevelopers/inky/pull/110")
@@ -445,23 +445,23 @@
   (:id "t-audit-pr60-goldens" :type :task :title "PR #60 — Qualify chip goldens on integrated arithmetic" :state :todo
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/60" "https://github.com/robotgamedevelopers/inky/actions/runs/45538544639/job/138951078907")
    :note "PR #60’s six Max hashes corroborate its historical cover-branch arithmetic, not current main. Keep current main baselines until the final integrated commit is measured on both M5 Pro and Max. Compare agreement and crosspath before adopting new goldens.")
-  (:id "t-audit-pr42-port" :type :task :title "PR #42 — Port speculative scheduler verification" :state :todo
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/42" "https://github.com/robotgamedevelopers/inky/pull/80" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/src/serve.rs")
+  (:id "t-audit-pr42-port" :type :task :title "PR #42 — Port speculative scheduler verification" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/42" "https://github.com/robotgamedevelopers/inky/pull/80" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/src/serve.rs" "src/scheduler/verify.rs: SpecEmitState, DraftProducer, NgramDraftProducer, bounded_verify_spans" "src/verify.rs: run_verify_round, rollback_blocked_lane" "src/engine.rs: verify_row_capacity, rollback_lane" "src/main.rs: verify")
    :note "PR #80 repairs the verified row, budget and rollback failures on PR #42’s private contiguous KV implementation. Its planner scheduled 256 verification rows into a 128-row arena and emitted one token from a two-token budget. Bound rows, track each emitted position, and check Metal completion. Paged rollback across window, block and recurrent state, a draft producer and normal scheduler tests are needed for main.")
-  (:id "t-audit-pr51-port" :type :task :title "PR #51 — Port CI scheduling while retaining main gates" :state :todo
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/51" "https://github.com/robotgamedevelopers/inky/actions/runs/45330319069" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/.github/workflows/ci.yml")
+  (:id "t-audit-pr51-port" :type :task :title "PR #51 — Port CI scheduling while retaining main gates" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/51" "https://github.com/robotgamedevelopers/inky/actions/runs/45330319069" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/.github/workflows/ci.yml" ".github/workflows/ci.yml" ".github/workflows/nightly.yml" "scripts/check-tla-tiers.sh")
    :note "PR #51 is clean only against its historical fold target. Port independently onto current main, preserving Go suites, ignored router, full reference counts, strict poolgate, CLI regressions, four Rust-to-model trace drivers, pinned actions and larger nightly model configurations. Seven historical jobs passed. 22–47 seconds execution after pickup was 25m24s wall time including M5 queue.")
-  (:id "t-audit-pr51-inventory" :type :task :title "PR #51 — Make TLA coverage inventory prove execution" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/blob/f05ad44556f8c2bdc0f402b24174ee7012847ffa/scripts/check-tla-tiers.sh" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/scripts/check-tla.sh" "https://github.com/robotgamedevelopers/inky/pull/89")
+  (:id "t-audit-pr51-inventory" :type :task :title "PR #51 — Make TLA coverage inventory prove execution" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/blob/f05ad44556f8c2bdc0f402b24174ee7012847ffa/scripts/check-tla-tiers.sh" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/scripts/check-tla.sh" "https://github.com/robotgamedevelopers/inky/pull/89" "scripts/check-tla-tiers.sh: --self-test" "scripts/check-tla.sh")
    :note "PR #51 credited 40 per-PR and 14 nightly checks after removal of the matrix runner step. Count each test only when the workflow invokes its runner and exercise missing and duplicate invocations.")
-  (:id "t-audit-pr53-port" :type :task :title "PR #53 — Extract and qualify fold changes" :state :todo
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/53" "https://github.com/robotgamedevelopers/inky/actions/runs/45314455382/job/138177816862")
+  (:id "t-audit-pr53-port" :type :task :title "PR #53 — Extract and qualify fold changes" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/53" "https://github.com/robotgamedevelopers/inky/actions/runs/45314455382/job/138177816862" "specs/SplitArena.tla" "src/blocks.rs: walk_grouped_tiles" "scripts/cache-traces.rs" "scripts/check-cache-traces.sh")
    :note "PR #53 conflicts with layer3. Port still-needed arithmetic, split-arena and grouped-layout formal work and runtime trace separately. Make the production paged scheduler emit a nonempty trace. Historical GPU job passed all 12 multi-row comparisons but failed old golden rows.")
-  (:id "t-audit-pr76-check" :type :task :title "PR #76 — Review and qualify GPU completion checks" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/76" "https://github.com/robotgamedevelopers/inky/actions/runs/45551642768")
+  (:id "t-audit-pr76-check" :type :task :title "PR #76 — Review and qualify GPU completion checks" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/76" "https://github.com/robotgamedevelopers/inky/actions/runs/45551642768" "src/main.rs: crosspath, check" "tests/golden-status.sh" "tests/ci.sh")
    :note "PR #76 checks Metal completion in crosspath and reference comparisons and propagates a failed golden producer. Three status tests and a synthetic producer failure passed. The PR targets the historical fold branch. Qualify the port with model-backed comparisons on the integrated engine.")
-  (:id "t-audit-pr59-tail" :type :task :title "PR #59 — Port private sliding-window scratch isolation" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/59" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/src/engine.rs" "https://github.com/robotgamedevelopers/inky/pull/81")
+  (:id "t-audit-pr59-tail" :type :task :title "PR #59 — Port private sliding-window scratch isolation" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/59" "https://github.com/robotgamedevelopers/inky/blob/be82ef36c93672c715312676d40c25e9dfeb6fff/src/engine.rs" "https://github.com/robotgamedevelopers/inky/pull/81" "src/engine.rs" "src/engine/tests.rs: private_prefill_clears_the_last_window_tile_between_lanes" "tests/ci.sh")
    :note "PR #59 conflicts with layer3 and has no head checks. Port the private scratch-tail clear and exercise isolation with both private multi-lane and paged candidates. Bounded models and missing-clear control support the mechanism. Current HTTP contamination was not observed.")
   (:id "audit-prior" :type :roadmap :title "Reconciliation of the 23 earlier findings"
    :rows (
@@ -1169,7 +1169,7 @@
   (:id "t-l3-tree" :type :task :title "A request matches the deepest start point in a prefix tree of sealed blocks" :state :done :evidence ("src/prefix.rs: PrefixTree/EntryTree/LiveTree" "specs/PrefixTree.tla + PrefixTreeTrace in scripts/check-tla.sh"))
   (:id "t-l3-start" :type :task :title "Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads" :state :done :evidence ("src/blockbook.rs" "src/poolgate.rs: verify_prefix_start_points (prompt ends, EVERY@16 blocks, lane heads)"))
   (:id "t-l3-tail" :type :task :title "Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse" :state :done :evidence ("https://github.com/robotgamedevelopers/inky/commit/4a8f00eb90f185caf0989fc62e9048d2a54e310c" "src/blocks.rs: gpu_pool_zero_fills_a_taken_slot" "src/poolgate.rs: Layer3Pool" "specs/StartTails.tla" ".github/workflows/ci.yml" ".github/workflows/nightly.yml" "https://github.com/robotgamedevelopers/inky/pull/115") :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. t-l3-tail (roadmap.sexp:742) cites blocks.rs:1294 gpu_pool_zero_fills_a_taken_slot, which is #[ignore] and run by no tier (ci.yml:83 filters --ignored to the router test). Findings: U8." :audit "U8")
-  (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :doing :evidence ("scripts/check-tla.sh: check-blockbook-traces.sh, check-cache-traces.sh, PrefixTreeTrace, InBlockTrace"))
+  (:id "t-l3-gate-traces" :type :task :title "Gate: the engine's traces are behaviours of both models, checked in CI" :state :done :evidence ("scripts/check-tla.sh: check-blockbook-traces.sh, check-cache-traces.sh, PrefixTreeTrace, InBlockTrace" "scripts/check-tla.sh: check-blockbook-traces.sh, check-cache-traces.sh, check-poisongate-traces.sh, check-serve-cache-traces.sh"))
   (:id "t-l3-gate-identical" :type :task :title "Gate: outputs identical to layer 2 with poisoned pool slots" :state :doing :evidence ("src/main.rs: inky poolgate --ref ref/long.tokens -c 4096 (bit-identical to Layer 2 with poisoned slots)") :note "Rowan Claude, 2026-11-25: audit of be82ef3, re-checked on main at 21966b0. inky poolgate's poisoned multi-lane comparison still builds Layer3Pool (src/main.rs:974), never ServeBlockCache; only a single-lane cold-logit nightly test (spill_model.rs:56) now runs the production cache. Findings: U20, U29." :audit "U20, U29")
   (:id "layer-4" :type :roadmap :title "Layer 4: scheduler, admission and disk tier"
    :rows (
@@ -1376,12 +1376,12 @@
   (:id "t-later-m3" :type :task :title "The M3 Ultra tuning: decode steps on the non-tensor kernels" :state :todo)
   (:id "t-later-attention" :type :task :title "One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths" :state :todo)
   (:id "t-later-fixed-cost" :type :task :title "A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes" :state :todo)
-  (:id "t-later-prefix-reads" :type :task :title "Grouped prefix reads match private fixed-split logits and goldens bit for bit" :state :todo)
+  (:id "t-later-prefix-reads" :type :task :title "Grouped prefix reads match private fixed-split logits and goldens bit for bit" :state :done :evidence ("src/main.rs: sharedkv" "tests/ci.sh: sharedkv + INK_SHAREDKV_SABOTAGE=1"))
   (:id "t-later-prefix-spec" :type :task :title "Shared-prefix design and measured overlap on four concurrent cards" :state :done :evidence ("docs/SHARED-PREFIX.md"))
-  (:id "t-later-prefix-model" :type :task :title "Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails" :state :todo)
-  (:id "t-later-prefix-storage" :type :task :title "Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks" :state :todo)
-  (:id "t-later-prefix-traces" :type :task :title "Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries" :state :todo)
-  (:id "t-later-prefix-gate" :type :task :title "Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time" :state :todo)
+  (:id "t-later-prefix-model" :type :task :title "Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails" :state :done :evidence ("specs/GroupedLayout.tla" "specs/SplitArena.tla" "specs/CacheScheduler.tla" "specs/run_tlc.zsh"))
+  (:id "t-later-prefix-storage" :type :task :title "Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks" :state :done :evidence ("src/poolgate.rs: walk_poisongate_traces" "scripts/check-poisongate-traces.sh" "scripts/check-serve-cache-traces.sh"))
+  (:id "t-later-prefix-traces" :type :task :title "Gate: CI checks grouped tile visits and split partials against BlockLayout and rejects corrupt partial boundaries" :state :done :evidence ("src/blocks.rs: walk_grouped_tiles" "scripts/cache-traces.rs: gl_4" "scripts/check-cache-traces.sh" "specs/GroupedLayout.tla"))
+  (:id "t-later-prefix-gate" :type :task :title "Gate: matched replay measures shared K/V bytes, peak allocation and end-to-end step time" :state :done :evidence ("src/main.rs: prefixbench" "docs/SHARED-PREFIX.md"))
   (:id "t-later-quality" :type :task :title "A quality replay: landed cards run again and compared with a reference route" :state :todo)
   (:id "t-later-effort" :type :task :title "The lowest thinking effort that still lands cards, per kind of card" :state :todo)
   (:id "t-later-kv8" :type :task :title "The 8-bit cache, behind the quality replay" :state :todo)

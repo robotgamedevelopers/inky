@@ -649,13 +649,16 @@ impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Eng
 #[derive(Clone, Copy)]
 pub struct Span<'a> { pub lane: &'a Lane, pub p0: usize, pub t: usize }
 
-/// K/V rows one verify position overwrote, copied before the span ran.
+/// K/V rows one verify or session-checkpoint position overwrote, copied before the span ran.
 #[derive(Clone)]
-struct KvUndo { pos: usize, rows: Vec<u8> }
+pub(crate) struct KvUndo { pub(crate) pos: usize, pub(crate) rows: Vec<u8> }
 struct VerifySpan {
     lane: *const Lane,
     p0: usize,
     kv: Vec<KvUndo>,
+    cs_before: Vec<u8>,
+    tokens_before: Vec<u32>,
+    paged_lengths_before: Vec<(crate::blocks::BlockKind, crate::blocks::BlockIndex, u32)>,
     /// `p0 + n_keep` after rollback. Absent until then. Not a seal of the span's end, and not `cs_at_prompt`.
     accepted_end: Option<usize>,
 }
@@ -859,17 +862,66 @@ impl Engine {
     pub fn slot_kind_pass(&self, slot: usize) -> (bool, usize) {
         self.slot_kind[slot]
     }
-    /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
+    /// dev: a hash of a lane's cache (both buffers, or live Layer 3 paged blocks + lengths + seals)
+    /// and convolution rows, to compare two runs bit for bit
     pub fn lane_hash(&self, lane: &Lane) -> u64 {
+        fn fnv_u64(h: u64, v: u64) -> u64 {
+            (h ^ v).wrapping_mul(0x100000001b3)
+        }
+        fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+            let mut chunks = bytes.chunks_exact(8);
+            for c in &mut chunks {
+                h = fnv_u64(h, u64::from_le_bytes(c.try_into().unwrap()));
+            }
+            for &b in chunks.remainder() {
+                h = fnv_u64(h, u64::from(b));
+            }
+            h
+        }
+        fn fnv_buf_slice(h: u64, b: &Buf, off: usize, len: usize) -> u64 {
+            let s = unsafe { std::slice::from_raw_parts((b.contents().as_ptr() as *const u8).add(off), len) };
+            fnv_bytes(h, s)
+        }
         let mut h = 0xcbf29ce484222325u64;
-        let mut eat_slice = |b: &Buf, off: usize, len: usize| {
-            let p = unsafe { (b.contents().as_ptr() as *const u8).add(off) as *const u64 };
-            for i in 0..len / 8 { h = (h ^ unsafe { *p.add(i) }).wrapping_mul(0x100000001b3); }
-        };
-        { let b = lane.kv_swa.borrow(); eat_slice(&b, 0, b.length()); }
-        { let b = lane.kv_full.borrow(); eat_slice(&b, 0, b.length()); }
-        lane.with_cs_buf(|b, off, len| eat_slice(b, off, len));
+        if lane.use_blocks.get() {
+            let pools = self.block_pool.borrow();
+            let tbl = lane.block_table.borrow();
+            for (bi, entry) in tbl.entries() {
+                let pool = pools.of(entry.kind());
+                let rec = pool.record(entry.slot()).expect("live paged slot record in lane_hash");
+                assert_eq!(rec.generation(), entry.generation(), "stale block entry in lane_hash");
+                let kind_tag = match entry.kind() {
+                    crate::blocks::BlockKind::Full => 1u64,
+                    crate::blocks::BlockKind::Window => 2u64,
+                };
+                h = fnv_u64(
+                    h,
+                    (kind_tag << 48)
+                        | (u64::from(bi.get()) << 16)
+                        | (u64::from(rec.length()) << 1)
+                        | u64::from(rec.sealed()),
+                );
+                h = fnv_bytes(h, pool.slot_bytes(entry.slot()).expect("slot bytes in lane_hash"));
+            }
+        } else {
+            {
+                let b = lane.kv_swa.borrow();
+                h = fnv_buf_slice(h, &b, 0, b.length());
+            }
+            {
+                let b = lane.kv_full.borrow();
+                h = fnv_buf_slice(h, &b, 0, b.length());
+            }
+        }
+        lane.with_cs_buf(|b, off, len| {
+            h = fnv_buf_slice(h, b, off, len);
+        });
         h
+    }
+    /// Maximum vocabulary rows a single `encode_verify` step can fit (`min(chunk, ba.cap, ba.lg_rows)`).
+    pub fn verify_row_capacity(&self) -> usize {
+        let b = self.ba.get();
+        self.chunk.min(b.cap).min(b.lg_rows as usize)
     }
     /// dev: make `dst` a copy of `src` (cache and convolution rows); `dst` must have been reserved to the same capacity
     pub fn copy_lane(&self, src: &Lane, dst: &Lane) {
@@ -2285,54 +2337,147 @@ impl Engine {
         let stride = N_SLOT * NCH * 3;
         let cs = self.gpu.buffer(spans.len() * t * stride * 4);
         unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
-        let kept = spans.iter().map(|sp| VerifySpan {
-            lane: sp.lane as *const Lane,
-            p0: sp.p0,
-            kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
-            accepted_end: None,
+        let kept = spans.iter().map(|sp| {
+            let mut paged_lengths_before = Vec::new();
+            if sp.lane.use_blocks.get() {
+                let pools = self.block_pool.borrow();
+                let tbl = sp.lane.block_table.borrow();
+                let lo_b = sp.p0 / crate::blocks::BLOCK;
+                let hi_b = (sp.p0 + sp.t - 1) / crate::blocks::BLOCK;
+                for b in lo_b..=hi_b {
+                    let bi = crate::blocks::BlockIndex::new(b as u32);
+                    for kind in [crate::blocks::BlockKind::Full, crate::blocks::BlockKind::Window] {
+                        let e = tbl.get(kind, bi).expect("verify block index in range")
+                            .unwrap_or_else(|| panic!("verify paged lane missing {kind:?} block {b}"));
+                        let rec = pools.of(kind).record(e.slot()).expect("verify slot record");
+                        assert_eq!(rec.generation(), e.generation(), "stale {kind:?} block {b} in verify");
+                        assert!(!rec.sealed(), "verify must never write into sealed {kind:?} block {b}");
+                        paged_lengths_before.push((kind, bi, rec.length()));
+                    }
+                }
+            }
+            VerifySpan {
+                lane: sp.lane as *const Lane,
+                p0: sp.p0,
+                kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
+                cs_before: self.on(sp.lane).get_cs(),
+                tokens_before: (sp.p0..sp.p0 + sp.t).map(|i| self.on(sp.lane).token_at(i)).collect(),
+                paged_lengths_before,
+                accepted_end: None,
+            }
         }).collect();
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
         self.encode_spans_x(cb, spans, true, None, false, false, Some(k), None, None);
     }
-    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
-    /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
-    /// the span, so a rejected draft and anything after it do not stay. The recorded length is `p0 + n_keep`, never
-    /// a seal of the span's end. The images live on `verify_keep`, not in serve's `cs_at_prompt`. Nothing may be in
-    /// flight on the GPU. The correction token is not written here: its K and V land when that token is encoded.
+    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (`0..=1+k`).
+    /// `0` aborts the entire span and restores `cs_before`, `tokens_before`, and all `1+k` K/V positions.
+    /// The convolution image at `n_keep - 1` replaces `cs` when `n_keep >= 1`. K/V rows past `p0 + n_keep`
+    /// are restored to their pre-verify bytes on both Layer 2 contiguous and Layer 3 paged lanes, and
+    /// rejected blocks are never sealed.
     pub fn rollback_verify(&self, lane: &Lane, si: usize, n_keep: usize) {
         assert!(lane.tier.is_none(), "verify does not run on a --kv-disk lane");
-        let tail = {
+        let (tail, tokens_tail, cs_before_opt, paged_before, p0, end) = {
             let mut slot = self.verify_keep.borrow_mut();
             let g = slot.as_mut().expect("rollback_verify without encode_verify");
             assert!(si < g.spans.len(), "verify span {si} is out of range");
             let t = g.t;
             let stride = g.stride;
             let cs = g.cs.clone();
-            assert!(n_keep >= 1 && n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
+            assert!(n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
             let rec = &mut g.spans[si];
             assert!(std::ptr::eq(rec.lane, lane), "rollback lane is not the lane encode_verify ran");
-            let end = rec.p0 + n_keep;
-            // Layer 2 has no block table. The only length this step records is the accepted prefix.
+            assert!(rec.accepted_end.is_none(), "verify span already finalized");
+            let p0 = rec.p0;
+            let end = p0 + n_keep;
             rec.accepted_end = Some(end);
-            assert!(end <= rec.p0 + t);
-            if n_keep < t { assert!(end < rec.p0 + t, "a rejected tail is not sealed"); }
+            assert!(end <= p0 + t);
+            if n_keep < t { assert!(end < p0 + t, "a rejected tail is not sealed"); }
             let bytes = stride * 4;
-            lane.with_cs_buf(|dst_buf, dst_off, dst_len| {
-                assert_eq!(bytes, dst_len);
-                unsafe {
-                    let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
-                    std::ptr::copy_nonoverlapping(src, (dst_buf.contents().as_ptr() as *mut u8).add(dst_off), bytes);
-                }
-            });
-            rec.kv.iter().skip(n_keep).cloned().collect::<Vec<_>>()
+            let cs_before_opt = if n_keep == 0 {
+                Some(rec.cs_before.clone())
+            } else {
+                lane.with_cs_buf(|dst_buf, dst_off, dst_len| {
+                    assert_eq!(bytes, dst_len);
+                    unsafe {
+                        let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
+                        std::ptr::copy_nonoverlapping(src, (dst_buf.contents().as_ptr() as *mut u8).add(dst_off), bytes);
+                    }
+                });
+                None
+            };
+            let tail = rec.kv[n_keep..].to_vec();
+            let tokens_tail = rec.tokens_before[n_keep..].to_vec();
+            let paged_before = rec.paged_lengths_before.clone();
+            if g.spans.iter().all(|s| s.accepted_end.is_some()) {
+                *slot = None;
+            }
+            (tail, tokens_tail, cs_before_opt, paged_before, p0, end)
         };
-        for undo in &tail { self.restore_kv_pos(lane, undo); }
+        let run = self.on(lane);
+        if let Some(cs_before) = cs_before_opt {
+            run.set_cs(&cs_before);
+        }
+        if !tokens_tail.is_empty() {
+            run.set_tokens(end, &tokens_tail);
+        }
+        for undo in &tail {
+            self.restore_kv_pos(lane, undo);
+        }
+        if lane.use_blocks.get() {
+            let mut pools = self.block_pool.borrow_mut();
+            let tbl = lane.block_table.borrow();
+            for (kind, bi, pre_len) in paged_before {
+                let Some(entry) = tbl.get(kind, bi).expect("verify block index in range") else { continue };
+                let rec = pools.of_mut(kind).record_mut(entry.slot()).expect("verify slot record");
+                assert!(!rec.sealed(), "verify must never seal {kind:?} block {}", bi.get());
+                let blk_start = (bi.get() as usize) * crate::blocks::BLOCK;
+                let new_len = if n_keep == 0 || end <= blk_start {
+                    let _ = p0;
+                    pre_len
+                } else {
+                    ((end - blk_start).min(crate::blocks::BLOCK)) as u32
+                };
+                rec.set_length(new_len).expect("restore paged block length");
+            }
+        }
     }
     /// Bytes of every slot's K and V row at positions [p0, p0+t), before the span writes them.
-    fn snapshot_kv_positions(&self, lane: &Lane, p0: usize, t: usize) -> Vec<KvUndo> {
+    pub(crate) fn snapshot_kv_positions(&self, lane: &Lane, p0: usize, t: usize) -> Vec<KvUndo> {
         let eb = self.kvb;
         let row = HD * eb;
         let mut out = Vec::with_capacity(t);
+        if lane.use_blocks.get() {
+            let pools = self.block_pool.borrow();
+            let tbl = lane.block_table.borrow();
+            let kvb = eb as u32;
+            for d in 0..t {
+                let pos = p0 + d;
+                let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
+                let mut rows = Vec::with_capacity(N_PHYS * 2 * NKV * row);
+                for ip in 0..N_PHYS {
+                    let (swa, pass_idx) = self.slot_kind[ip];
+                    let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
+                    let entry = tbl.get(kind, bi).expect("paged block in range")
+                        .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
+                    let slot_slice = pools.of(kind).slot_bytes(entry.slot()).expect("paged slot bytes");
+                    for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
+                        for h in 0..NKV as u32 {
+                            let off = crate::blocks::metal_in_slot_byte_offset(
+                                kind,
+                                kvb,
+                                pass_idx as u32,
+                                plane,
+                                h,
+                                pos as u32,
+                            ).expect("in-slot offset") as usize;
+                            rows.extend_from_slice(&slot_slice[off..off + row]);
+                        }
+                    }
+                }
+                out.push(KvUndo { pos, rows });
+            }
+            return out;
+        }
         for d in 0..t {
             let pos = p0 + d;
             let mut rows = Vec::new();
@@ -2356,11 +2501,40 @@ impl Engine {
         }
         out
     }
-    fn restore_kv_pos(&self, lane: &Lane, undo: &KvUndo) {
+    pub(crate) fn restore_kv_pos(&self, lane: &Lane, undo: &KvUndo) {
         let eb = self.kvb;
         let row = HD * eb;
         let pos = undo.pos;
         let mut at = 0usize;
+        if lane.use_blocks.get() {
+            let mut pools = self.block_pool.borrow_mut();
+            let tbl = lane.block_table.borrow();
+            let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
+            let kvb = eb as u32;
+            for ip in 0..N_PHYS {
+                let (swa, pass_idx) = self.slot_kind[ip];
+                let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
+                let entry = tbl.get(kind, bi).expect("paged block in range")
+                    .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
+                let slot_slice = pools.of_mut(kind).slot_bytes_mut(entry.slot()).expect("paged slot bytes mut");
+                for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
+                    for h in 0..NKV as u32 {
+                        let off = crate::blocks::metal_in_slot_byte_offset(
+                            kind,
+                            kvb,
+                            pass_idx as u32,
+                            plane,
+                            h,
+                            pos as u32,
+                        ).expect("in-slot offset") as usize;
+                        slot_slice[off..off + row].copy_from_slice(&undo.rows[at..at + row]);
+                        at += row;
+                    }
+                }
+            }
+            assert_eq!(at, undo.rows.len());
+            return;
+        }
         for slot in 0..N_SLOT {
             let (swa, i) = self.slot_kind[slot];
             let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
@@ -2378,6 +2552,42 @@ impl Engine {
             }
         }
         assert_eq!(at, undo.rows.len());
+    }
+    /// Zero uncommitted Layer 2 K/V positions from `from_pos` to buffer capacity (leaving the live
+    /// sliding-window history `from_pos.saturating_sub(swa_cap)..from_pos` intact).
+    pub(crate) fn clear_kv_tail(&self, lane: &Lane, from_pos: usize) {
+        if lane.use_blocks.get() {
+            return;
+        }
+        let eb = self.kvb;
+        let row = HD * eb;
+        let swa_cap = lane.swa_cap.get();
+        let full_cap = lane.full_cap.get();
+        let live_swa_len = from_pos.min(swa_cap);
+        for slot in 0..N_SLOT {
+            let (swa, i) = self.slot_kind[slot];
+            let cap = if swa { swa_cap } else { full_cap };
+            let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
+            let base = buf.contents().as_ptr() as *mut u8;
+            let k0 = i * 2 * NKV * cap * HD * eb;
+            for which in 0..2 {
+                let b0 = k0 + which * NKV * cap * HD * eb;
+                for g in 0..NKV {
+                    if swa {
+                        if live_swa_len < cap {
+                            for d in live_swa_len..cap {
+                                let idx = (from_pos - live_swa_len + d) % cap;
+                                let off = b0 + (g * cap + idx) * row;
+                                unsafe { std::ptr::write_bytes(base.add(off), 0, row); }
+                            }
+                        }
+                    } else if from_pos < cap {
+                        let off = b0 + (g * cap + from_pos) * row;
+                        unsafe { std::ptr::write_bytes(base.add(off), 0, (cap - from_pos) * row); }
+                    }
+                }
+            }
+        }
     }
     /// Write this conv site's state after every prefix of the span. Runs only while a verify span is recording,
     /// and only before `k_state_upd` overwrites `cs` with the state at the end.
@@ -3269,7 +3479,15 @@ impl<'a> Run<'a> {
     /// bind the K/V buffer a layer's kernels address through buffer 3
     fn bind_kv(&self, e: &Enc, swa: bool) { if swa { e.buf(&self.lane.kv_swa.borrow(), 0, 3); } else { e.buf(&self.lane.kv_full.borrow(), 0, 3); } }
     /// positions the K/V cache can hold right now
-    pub fn kv_capacity(&self) -> usize { if self.lane.swa_cap.get() >= EXT { self.lane.full_cap.get() } else { self.lane.swa_cap.get().min(self.lane.full_cap.get()) } }
+    pub fn kv_capacity(&self) -> usize {
+        if self.lane.use_blocks.get() {
+            (self.lane.block_table.borrow().blocks_per_kind() as usize * crate::blocks::BLOCK).min(self.max_ctx)
+        } else if self.lane.swa_cap.get() >= EXT {
+            self.lane.full_cap.get()
+        } else {
+            self.lane.swa_cap.get().min(self.lane.full_cap.get())
+        }
+    }
     /// first position a generation loop must call `gen_reserve` for (with an idle GPU) before it may run that step
     pub fn gen_capacity(&self) -> usize {
         match &self.lane.tier { Some(t) if t.on.get() => t.next.get(), Some(t) => self.kv_capacity().min(t.min_n), None => self.kv_capacity() }
@@ -4362,6 +4580,40 @@ pub fn decode_batch_extra_floats(n: usize) -> usize {
 /// Build `DecAttnGroup` descriptors for one attention kind (`swa` or `full`) across a decode batch.
 ///
 /// Invariants (matching `specs/GroupedLayout.tla`):
+/// Number of fixed-width `kps` splits touched by `[first, end)` (`specs/SplitArena.tla` `SplitCount`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {
+    if first >= end {
+        0
+    } else {
+        (end - 1) / kps + 1 - first / kps
+    }
+}
+
+/// Split-partials scratch slots per query head for `max_ctx` (`specs/SplitArena.tla` `Slots`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const fn split_scratch_slots(max_ctx: usize) -> usize {
+    let need = max_ctx.div_ceil(256) + 1;
+    if need > MAX_SPLIT { need } else { MAX_SPLIT }
+}
+
+/// `(nsplit_stride, max_rows_per_batch)` for a span ending at `span_end = p0 + t` (`specs/SplitArena.tla`
+/// `NSplit` & `Rows`), reserving the extra sliding-window edge split whenever `swa && span_end > EXT`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const fn fixed_attn_batch(swa: bool, span_end: usize, max_ctx: usize) -> (usize, usize) {
+    let kps = if swa { 64 } else { 256 };
+    let nsplit = if swa && span_end > EXT {
+        (EXT - 1).div_ceil(kps) + 1
+    } else if span_end == 0 {
+        1
+    } else {
+        fixed_split_count(0, span_end, kps)
+    };
+    let slots = split_scratch_slots(max_ctx);
+    let rows = slots / nsplit;
+    (nsplit, rows)
+}
+
 /// - Every `(si, abs_sp)` with `abs_sp in (first_pos / kps)..=(pos / kps)` appears in EXACTLY ONE group.
 /// - Only strictly interior full splits (`first_pos <= abs_sp * kps && pos >= (abs_sp + 1) * kps`, so
 ///   `p == pos` is never in the split and every key in `[abs_sp * kps, (abs_sp + 1) * kps)` is visible)

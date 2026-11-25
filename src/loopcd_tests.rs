@@ -142,3 +142,82 @@ fn loopcd_paged_mixed_lane_state() {
     assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
     assert_eq!(eng.effective_sampler_softcap(1), 0.0);
 }
+
+#[test]
+#[ignore = "needs the Inkling Q4_K_M model and an M5 Metal device"]
+fn loopcd_cached_prompt_first_token_and_mixed_tie_isolation() {
+    use crate::poolgate::{Layer3Pool, StepPath};
+
+    // `t-audit-engine-loopcd-first` (both cold & cached PrefixTree start-point prompts!) +
+    // `t-audit-engine-loopcd-lanes` (disabled lane raw logits & 1-ULP tie preservation alongside enabled neighbor!).
+    let model = std::env::var("INKY_MODEL").unwrap_or_else(|_| default_model());
+    let eng = Engine::load(&model, 256);
+    eng.ensure_batch(128);
+    eng.ensure_dbatch(2);
+    let tk = Tokenizer::load(&eng.g);
+    let mut prompt = tk.encode("In the ancient library beneath the mountain, the archivist opened a", false);
+    while prompt.len() < 72 {
+        prompt.extend(tk.encode(" mysterious leather-bound manuscript filled with star maps and", false));
+    }
+    prompt.truncate(72); // 64-token sealed block 0 + 8-token suffix (final token at pos=71)
+    let last_pos = prompt.len() - 1;
+
+    // 1. Cold paged prefill `[0..71)` + terminal decode at `pos = 71` (`omega = 0` vs `omega = OMEGA`).
+    let pool = Layer3Pool::with_persistent_starts(&eng, 3);
+    // Donor seals block 0 (`[0..64)`) as a PROMPT start point!
+    let (donor, m0) = pool.new_lane_matched(&prompt[..64], 256);
+    assert_eq!(m0, 0);
+    pool.prefill(&[(donor, 0, 64)]);
+    pool.end_lane(donor);
+
+    // Cold lane (`Layer3Pool::new` without prefix match) vs Cached lane (`new_lane_matched` hitting block 0 = 64!):
+    let cold_pool = Layer3Pool::new(&eng, 1);
+    let cold_id = cold_pool.new_lane(&prompt, 256);
+    cold_pool.prefill(&[(cold_id, 0, last_pos)]);
+
+    let (cached_plain_id, m_plain) = pool.new_lane_matched(&prompt, 256);
+    let (cached_guided_id, m_guided) = pool.new_lane_matched(&prompt, 256);
+    assert_eq!(m_plain, 64, "cached prompt must match 64-token start point");
+    assert_eq!(m_guided, 64);
+    pool.prefill(&[(cached_plain_id, 64, last_pos - 64), (cached_guided_id, 64, last_pos - 64)]);
+
+    // Evaluate cold solo at `omega = 0` and `omega = OMEGA`, then mixed `[0.0, OMEGA]` on the cached lanes!
+    cold_pool.decode(&[(cold_id, last_pos)]);
+    let cold_plain_logits = cold_pool.logits(0);
+
+    // Run mixed `[0.0, OMEGA]` on the two cached-prefix lanes (`k_attn_grp_dec` + LoopCD first token!).
+    let cached_lanes_vec = pool.borrow_lane_ptrs(&[cached_plain_id, cached_guided_id]);
+    pool.prepare_decode(&[(cached_plain_id, last_pos), (cached_guided_id, last_pos)]);
+    let cb = eng.gpu.cmd();
+    eng.encode_decode_with_omegas(
+        &cb,
+        &[
+            Span { lane: unsafe { &*cached_lanes_vec[0] }, p0: last_pos, t: 1 },
+            Span { lane: unsafe { &*cached_lanes_vec[1] }, p0: last_pos, t: 1 },
+        ],
+        true,
+        false,
+        &[0.0, OMEGA],
+    );
+    complete(cb);
+    let cached_plain_logits = eng.span_logits(0).to_vec();
+    let cached_guided_logits = eng.span_logits(1).to_vec();
+    assert!(same_row(&cached_plain_logits, &cold_plain_logits), "cached omega=0 first-token logits differ from cold forced decode");
+    assert!(differs_from_plain(&cached_guided_logits, &cold_plain_logits, eng.softcap), "cached guided first-token skipped LoopCD");
+    assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
+    assert_eq!(eng.effective_sampler_softcap(1), 0.0);
+
+    // Verify any two raw logits separated by 1 ULP near the softcap saturation tail on the disabled lane
+    // keep their exact raw bits (whereas premature `tanh` softcapping collapses large raw logits to `softcap`!).
+    let mut synthetic_disabled = cached_plain_logits.clone();
+    synthetic_disabled[10] = 450.0;
+    synthetic_disabled[11] = 460.0; // `30 * tanh(450/30) == 30.0 == 30 * tanh(460/30)` in f32, while raw `460.0 > 450.0`!
+    assert_eq!(crate::sampler::checked_argmax(&synthetic_disabled), Ok(11));
+    let mut greedy = Sampler::new(0.0, 64, 1.0, eng.softcap, 1);
+    assert_eq!(
+        greedy.sample_next_with_ban_and_softcap(&synthetic_disabled, None, eng.effective_sampler_softcap(0)),
+        Ok(11)
+    );
+    pool.shutdown();
+    cold_pool.shutdown();
+}

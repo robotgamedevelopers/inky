@@ -1479,7 +1479,7 @@ impl Scheduler {
                 continue;
             }
             let need = self.need_alloc(d);
-            if used_tokens + 1 <= self.cfg.step_token_budget
+            if used_tokens < self.cfg.step_token_budget
                 && mem_used + alloc_cnt + need <= mem_budget
             {
                 chosen_set.insert(d);
@@ -2566,3 +2566,7 @@ impl ServeStepPlanner {
 
 #[cfg(test)]
 mod tests;
+
+pub mod verify;
+#[allow(unused_imports)]
+pub use verify::*;
