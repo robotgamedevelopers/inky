@@ -125,6 +125,8 @@ impl DecodeStep {
 
 /// process-wide default for `Engine::load`: the opt-in 8-bit K/V cache (`--kv8`)
 pub static KV8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// process-wide override for `Engine::load`: force non-MPP Metal 3 simdgroup kernels (`--no-mpp` / `INKY_DISABLE_MPP=1`)
+pub static DISABLE_MPP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// initial capacity (positions) of the K/V buffers; they grow with the context
 const KV_CAP0: usize = 64;
 /// MoE tile classes of the fp16 prefill path: (kernel, max tokens per tile, threads per threadgroup)
@@ -183,6 +185,19 @@ const C_CTRLA: u32 = 11;
 const C_OMIX: u32 = 12;
 const C_LMHEAD: u32 = 13;
 const C_ARGMAX: u32 = 14;
+
+pub const KERNELS_NON_MPP: &[&str] = &[
+    "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_apply",
+    "k_attn", "k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec", "k_attn_combine", "k_attn_combine_dec",
+    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend", "k_dspark_reject", "k_topk",
+    "k_gemm", "k_moe_gemm", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b",
+    "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk",
+    "k_attn_b", "k_attn_b_blk", "k_ctrl_apply_b", "k_tohalf", "k_kvcopy", "k_devcopy", "k_zero",
+    "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1",
+    "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3",
+    "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4",
+    "k_mix_b_id", "k_touch",
+];
 
 pub const KERNELS: &[&str] = &[
     "k_embed",
@@ -1311,6 +1326,9 @@ pub struct Engine {
     kvb: usize,
     ba: std::cell::Cell<BArena>,
     pub chunk: usize,
+    pub use_mpp: bool,
+    pub kv_window_pct: u64,
+    pub decode_splits: usize,
     pub tensor: bool,
     pub hgemm: bool,
     sep_comb: bool,
@@ -2011,6 +2029,7 @@ impl Engine {
     /// `max_slab_bytes`) cannot hold the single-request hard floor `(min_win, min_full)` for
     /// `(chunk, max_ctx)`. When `Ok((n_window, n_full))` is returned, `n_window >= min_win`,
     /// `n_full >= min_full`, and total pool bytes never exceed `kv_budget_bytes`.
+    #[cfg(test)]
     pub fn checked_serve_block_pool_counts(
         kv_budget_bytes: u64,
         kvb: u32,
@@ -2019,7 +2038,29 @@ impl Engine {
         max_lanes: usize,
         max_slab_bytes: u64,
     ) -> Result<(usize, usize), String> {
+        Self::checked_serve_block_pool_counts_with_window_pct(
+            kv_budget_bytes,
+            kvb,
+            chunk,
+            max_ctx,
+            max_lanes,
+            max_slab_bytes,
+            15,
+        )
+    }
+
+    /// Checked Layer 3 block-pool sizing parameterized by target sliding-window budget share (`kv_window_pct` in `1..=45`).
+    pub fn checked_serve_block_pool_counts_with_window_pct(
+        kv_budget_bytes: u64,
+        kvb: u32,
+        chunk: usize,
+        max_ctx: usize,
+        max_lanes: usize,
+        max_slab_bytes: u64,
+        kv_window_pct: u64,
+    ) -> Result<(usize, usize), String> {
         use crate::blocks::{span_bound, stride_at, BlockKind, MAX_SLABS};
+        let win_pct = kv_window_pct.clamp(1, 45);
         let win_stride = stride_at(BlockKind::Window, kvb).map_err(|_| format!("invalid kvb {kvb}"))?;
         let full_stride = stride_at(BlockKind::Full, kvb).map_err(|_| format!("invalid kvb {kvb}"))?;
         let (min_win, min_full) = Self::serve_pool_floor_counts(chunk, max_ctx);
@@ -2044,7 +2085,7 @@ impl Engine {
         let max_win_preserving_full = ((kv_budget_bytes.saturating_sub(min_full_bytes)) / win_stride) as usize;
         let win_upper = max_win_preserving_full.min(max_win_slab);
         let lanes = max_lanes.max(1);
-        let target_win = ((kv_budget_bytes.saturating_mul(15) / 100) / win_stride) as usize;
+        let target_win = ((kv_budget_bytes.saturating_mul(win_pct) / 100) / win_stride) as usize;
         let desired_min_win = lanes.saturating_mul(span_bound(chunk.min(max_ctx.max(64)))).saturating_add(256);
         let budget_win_cap = ((kv_budget_bytes.saturating_mul(45) / 100) / win_stride) as usize;
         let floor_win = desired_min_win.min(budget_win_cap.max(min_win));
@@ -2126,13 +2167,14 @@ impl Engine {
         let max_slab = self.gpu.dev.maxBufferLength() as u64;
         let capped_budget =
             Self::capped_serve_kv_budget(kv_budget_bytes, self.kvb as u32, self.chunk, self.max_ctx, max_lanes);
-        let (n_window, n_full) = Self::checked_serve_block_pool_counts(
+        let (n_window, n_full) = Self::checked_serve_block_pool_counts_with_window_pct(
             capped_budget,
             self.kvb as u32,
             self.chunk,
             self.max_ctx,
             max_lanes,
             max_slab,
+            self.kv_window_pct,
         )?;
         let pools = crate::blocks::BlockPools::gpu(&self.gpu.dev, n_window, n_full, self.kvb as u32);
         *self.block_pool.borrow_mut() = pools;
@@ -2367,6 +2409,13 @@ impl Engine {
         }
         e.end();
     }
+
+    pub fn split_target(&self) -> usize {
+        configured_split_target_default(std::env::var("INK_SPLITS"), self.decode_splits).unwrap_or_else(|err| {
+            eprintln!("[inky] {err}");
+            std::process::exit(2);
+        })
+    }
     /// GPU Gumbel-max sampling for a single-span prefill whose logits live in `ar.logits`.
     /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
     /// the exact same RNG/sampling kernel for bit-identical `temperature = 1.0` equivalence.
@@ -2397,9 +2446,6 @@ impl Engine {
     /// The server builds a batch from every ready decoding lane. Check the eventual batch size and GPU path
     /// after the prefill arena is allocated and the device's fp16 layout has been probed.
     pub fn check_serve_decode(&self, lanes: usize) -> Result<(), String> {
-        if !self.hgemm {
-            return Err("serve needs the fp16 tensor path for batched decode, which is unavailable".into());
-        }
         if !self.sep_comb {
             return Err("serve needs separate split attention combines; unset INK_FUSE_COMB".into());
         }
@@ -4735,11 +4781,8 @@ impl Engine {
                 );
             }
         }
-        assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
-        assert!(
-            !dec || (self.hgemm && spans.len() <= self.decode_span_limit()),
-            "a decode step needs the fp16 path and room for f32 queries"
-        );
+        assert!(!spans.is_empty(), "encode_spans_x requires at least one span");
+        assert!(!dec || spans.len() <= self.decode_span_limit(), "decode step spans exceed decode batch capacity");
         assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize + decode_batch_extra_floats(spans.len())) * 4),
                 "a decode step keeps each lane's split partials and descriptors in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
@@ -5067,21 +5110,7 @@ impl Engine {
                     );
                 }
                 let n = spans.len();
-                let st_w: Vec<u32> = blocks_w.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur_w))).collect();
-                let mut j = self.mix_job_off(
-                    &st_w,
-                    self.output_res_query as i32,
-                    1,
-                    &[b.fin],
-                    &[self.output_norm as i32],
-                    E as u32,
-                );
-                j.hout[0] = b.xh[0] as i32;
-                j.nof32 = 1;
-                self.mix_t(&e, C_OMIX, &[j], n);
-                let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
-                hs.ldo = self.vocab_pad() as u32;
-                self.gemm_h(&e, C_LMHEAD, &[hs], n);
+                self.encode_decode_logits_head(&e, &blocks_w, cur_w, n, b.lg);
                 let weak_buf = self.expect_lg_weak(n);
                 let n_words = n * self.vocab_pad();
                 let dc = DevCopyArgs { src: b.lg, dst: 0, n: n_words as u32, pad: 0 };
@@ -5137,19 +5166,11 @@ impl Engine {
                 }
             }
         } else if logits && dec {
-            // a decode step: every lane's last row through the output mix and one tensor GEMM over the output matrix (read
+            // a decode step: every lane's last row through the output mix and one GEMM over the output matrix (read
             // once for all lanes, whatever their number); logits in the batch arena (`span_logits`)
             let ar = self.ar;
             let n = spans.len();
-            let st: Vec<u32> = blocks.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur))).collect();
-            let mut j =
-                self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
-            j.hout[0] = b.xh[0] as i32;
-            j.nof32 = 1;
-            self.mix_t(&e, C_OMIX, &[j], n);
-            let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
-            hs.ldo = self.vocab_pad() as u32;
-            self.gemm_h(&e, C_LMHEAD, &[hs], n);
+            self.encode_decode_logits_head(&e, &blocks, cur, n, b.lg);
             if let Some(weak_buf) = lg_weak_buf.as_ref() {
                 let la = LoopCdArgs {
                     logits_off: b.lg,
@@ -5215,6 +5236,27 @@ impl Engine {
             }
         }
         e.end();
+    }
+
+    /// Output depth-mix + LM-head projection for `n` decode lanes into `lg_off` (`ldo = vocab_pad`).
+    /// Uses fp16 MPP `gemm_h` when `self.hgemm`, or f32 Metal 3 simdgroup `gemm` (`k_gemm`) when `!self.hgemm`.
+    fn encode_decode_logits_head(&self, e: &Enc, blocks: &[usize], cur: usize, n: usize, lg_off: u32) {
+        let b = self.ba.get();
+        let st: Vec<u32> = blocks.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur))).collect();
+        let mut j = self.mix_job_off(&st, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
+        if self.hgemm {
+            j.hout[0] = b.xh[0] as i32;
+            j.nof32 = 1;
+            self.mix_t(e, C_OMIX, &[j], n);
+            let mut hs = Engine::hseg(&self.output, b.xh[0], lg_off);
+            hs.ldo = self.vocab_pad() as u32;
+            self.gemm_h(e, C_LMHEAD, &[hs], n);
+        } else {
+            self.mix_t(e, C_OMIX, &[j], n);
+            let mut gs = Engine::gseg(&self.output, b.fin, lg_off);
+            gs.ldo = self.vocab_pad() as u32;
+            self.gemm(e, C_LMHEAD, &[gs], n);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5434,14 +5476,14 @@ impl Engine {
             let ca = CombineDecArgs {
                 desc_off: dm.desc_off,
                 gate_off: b.gate,
-                out_off: if direct_half { b.agh } else { b.qp },
+                out_off: if direct_half { b.agh } else if self.hgemm { b.qp } else { b.attn_g },
                 swa: l.swa as u32,
                 hout: direct_half as u32,
                 pad: [0; 3],
             };
             self.go(e, C_COMB, "k_attn_combine_dec", &ca, (NH, spans.len(), 1), 128);
             e.buf(&self.act.borrow(), 0, 3);
-            if !direct_half {
+            if !direct_half && self.hgemm {
                 // f32 attention outputs -> the half rows the output projection reads
                 self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
                 e.barrier();
@@ -5502,7 +5544,13 @@ impl Engine {
                 };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
                 self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
-                let comb_out = if direct_half { b.agh + (r0 * (NH * HD / 2)) as u32 } else { aa.out_off };
+                let comb_out = if direct_half {
+                    b.agh + (r0 * (NH * HD / 2)) as u32
+                } else if self.hgemm {
+                    aa.out_off
+                } else {
+                    b.attn_g + (r0 * (NH * HD)) as u32
+                };
                 combs.push(CombineArgs {
                     part_off: aa.part_off,
                     nsplit: nsplit as u32,
@@ -5518,7 +5566,7 @@ impl Engine {
             }
             e.barrier();
             e.buf(&self.act.borrow(), 0, 3);
-            if !direct_half {
+            if !direct_half && self.hgemm {
                 // f32 attention outputs -> the half rows the output projection reads
                 self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
                 e.barrier();
@@ -6336,12 +6384,6 @@ impl<'a> Run<'a> {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
     }
-    fn split_target() -> usize {
-        configured_split_target(std::env::var("INK_SPLITS")).unwrap_or_else(|err| {
-            eprintln!("[inky] {err}");
-            std::process::exit(2);
-        })
-    }
     /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
     /// file is a ring of one window)
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
@@ -6703,7 +6745,7 @@ impl<'a> Run<'a> {
                     eprintln!("[inky] --kv-disk: hot ring shorter than a split, sums are grouped differently from the in-memory path");
                 }
                 let spl = |nk: usize| {
-                    let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target());
+                    let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * self.eng.split_target());
                     (kps, nk.div_ceil(kps))
                 };
                 let (mut c, mut sp) = (w0, 0usize);
@@ -7500,7 +7542,7 @@ impl<'a> Run<'a> {
             // dev: far keys from the selection, recent keys from the cache
             let fi = self.slot_kind[slot].1;
             let spl = |nk: usize| {
-                let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target());
+                let kps = KPS_CHUNK * nk.div_ceil(KPS_CHUNK * self.eng.split_target());
                 (kps, nk.div_ceil(kps))
             };
             let nb = if pr.use_sum { pr.rows } else { pr.rows - 1 };
@@ -7762,13 +7804,18 @@ fn validate_distinct_span_lanes(spans: &[Span]) -> Result<(), String> {
     check_distinct_lane_ptrs(&ptrs)
 }
 
-fn configured_split_target(value: Result<String, std::env::VarError>) -> Result<usize, &'static str> {
+fn configured_split_target_default(value: Result<String, std::env::VarError>, default_splits: usize) -> Result<usize, &'static str> {
     let target = match value {
-        Err(std::env::VarError::NotPresent) => Some(8usize),
+        Err(std::env::VarError::NotPresent) => Some(default_splits),
         Ok(v) => v.parse::<usize>().ok(),
         Err(std::env::VarError::NotUnicode(_)) => None,
     };
     target.filter(|&n| (1..=MAX_SPLIT).contains(&n)).ok_or("INK_SPLITS must be an integer between 1 and 256")
+}
+
+#[cfg(test)]
+fn configured_split_target(value: Result<String, std::env::VarError>) -> Result<usize, &'static str> {
+    configured_split_target_default(value, 8)
 }
 
 /// Exact `[start_f32_word, count_f32_words]` range of `BArena`'s Layer 2 sliding-window K/V scratch (`sk` + `sv`),

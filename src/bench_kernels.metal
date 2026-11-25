@@ -192,6 +192,7 @@ kernel void k_touch(device const uchar * W [[buffer(0)]], device float * A [[buf
     if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x9e3779b9u) A[0] = 1.0f;
 }
 
+#ifndef NO_MPP
 // ---- dense GEMM tiling variants (fp16 tensor cores). Y[t][r] = sum_k X[t][k] W[r][k]; weights dequantized to TG memory.
 // bottleneck isolation: MODE 0 = no dequant, X half from device; 2 = dequant, X staged in TG (from half)
 template <int MODE>
@@ -498,4 +499,5 @@ template [[host_name("kgpeak_8_128")]] kernel void kg_peak<8, 128>(device float 
 template [[host_name("kgpeak_8_576")]] kernel void kg_peak<8, 576>(device float *, constant GSeg &, constant uint &, uint2, ushort);
 template [[host_name("kgpeak_1_0")]] kernel void kg_peak<1, 0>(device float *, constant GSeg &, constant uint &, uint2, ushort);
 template [[host_name("kgpeak_4_0")]] kernel void kg_peak<4, 0>(device float *, constant GSeg &, constant uint &, uint2, ushort);
+#endif // NO_MPP
 
