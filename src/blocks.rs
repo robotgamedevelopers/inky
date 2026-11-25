@@ -459,6 +459,11 @@ impl fmt::Debug for BlockPool {
     }
 }
 
+/// Sentinel GPU 64-bit block-table entry written for unmapped/cleared table slots.
+/// Distinct from every valid `(slab_index << 62) | byte_offset` word, including `(slab = 0, Slot(1))`
+/// which encodes as `0`, because every valid `byte_offset` is stride-aligned (`>= 1 MiB`) and `< (1 << 62)`.
+pub const CLEARED_GPU_TABLE_ENTRY: u64 = u64::MAX;
+
 impl BlockPool {
     /// Host bytes at fp16 (`kvb` 2), one contiguous slab, zero-filled. No Metal device.
     pub fn new(kind: BlockKind, n_slots: usize) -> BlockPool {
@@ -639,7 +644,9 @@ impl BlockPool {
         if slab >= MAX_SLABS { return Err(BlockError::Slab); }
         let off = start as u64;
         if off >= (1u64 << 62) { return Err(BlockError::Overflow); }
-        Ok(((slab as u64) << 62) | off)
+        let word = ((slab as u64) << 62) | off;
+        assert_ne!(word, CLEARED_GPU_TABLE_ENTRY, "valid GPU block-table word collided with CLEARED_GPU_TABLE_ENTRY");
+        Ok(word)
     }
 
     /// Raw CPU-visible pointer and byte length of `slot` inside its owning slab.
@@ -902,7 +909,8 @@ impl BlockTable {
     }
 
     /// Synchronize only the dirty block range for `kind` into `dst` (length `>= blocks_per_kind`),
-    /// writing `pool.gpu_table_entry(e)` for present entries and `0` for cleared entries, then
+    /// writing `pool.gpu_table_entry(e)` for present entries and [`CLEARED_GPU_TABLE_ENTRY`]
+    /// (`u64::MAX`, distinct from slab-0 `Slot(1)`'s `0`) for cleared entries, then
     /// clearing the dirty range. Returns the number of `u64` entries written (0 when clean).
     pub fn sync_dirty_to_slice(
         &mut self,
@@ -924,7 +932,7 @@ impl BlockTable {
             let bi = BlockIndex::new(b as u32);
             dst[b] = match self.get(kind, bi)? {
                 Some(entry) => pool.gpu_table_entry(entry)?,
-                None => 0,
+                None => CLEARED_GPU_TABLE_ENTRY,
             };
             written += 1;
         }
@@ -1704,9 +1712,11 @@ mod tests {
         assert_eq!(t.dirty_range(BlockKind::Full), None);
         assert_eq!(t.dirty_range(BlockKind::Window), None);
         assert_eq!(gpu_full[0], 0);
-        assert!(gpu_full[1..].iter().all(|&w| w == 0));
+        assert_ne!(gpu_full[0], CLEARED_GPU_TABLE_ENTRY);
+        assert!(gpu_full[1..].iter().all(|&w| w == CLEARED_GPU_TABLE_ENTRY));
         assert_eq!(gpu_win[0], 0);
-        assert!(gpu_win[1..].iter().all(|&w| w == 0));
+        assert_ne!(gpu_win[0], CLEARED_GPU_TABLE_ENTRY);
+        assert!(gpu_win[1..].iter().all(|&w| w == CLEARED_GPU_TABLE_ENTRY));
 
         // 63 steady-state decode steps inside block 0 write 0 entries to unified memory.
         // Place sentinels to prove `sync_dirty_to_slice` does not touch `dst` at all when clean.
@@ -1728,11 +1738,13 @@ mod tests {
         let mut t = BlockTable::new(32).unwrap();
         let mut gpu_full = vec![0u64; 32];
         let mut gpu_win = vec![0u64; 32];
-        // Initial sync on empty table zeroes everything and clears dirty flags.
+        // Initial sync on empty table marks every cleared slot with CLEARED_GPU_TABLE_ENTRY and clears dirty flags.
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 32);
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 32);
+        assert!(gpu_full.iter().all(|&w| w == CLEARED_GPU_TABLE_ENTRY));
+        assert!(gpu_win.iter().all(|&w| w == CLEARED_GPU_TABLE_ENTRY));
 
-        // Allocate block 0 for both kinds (e.g. token 0).
+        // Allocate block 0 for both kinds (e.g. token 0): Slot(1) in slab 0 encodes as 0 != CLEARED_GPU_TABLE_ENTRY.
         let (sf0, _) = pools.full.take_free().unwrap();
         let (sw0, _) = pools.window.take_free().unwrap();
         t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
@@ -1741,6 +1753,8 @@ mod tests {
         assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 0)));
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 1);
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 1);
+        assert_eq!(gpu_full[0], 0);
+        assert_eq!(gpu_win[0], 0);
 
         // Allocate single new block at index 1 (token 64).
         let (sf1, off_f1) = pools.full.take_free().unwrap();
@@ -1766,13 +1780,13 @@ mod tests {
         assert_eq!(gpu_full[2], 0xBBBB); // untouched
         assert_eq!(gpu_win[1], off_w1);
 
-        // Window block pruning: clearing window block 0 dirties ONLY window block 0 and writes 0 to GPU slot.
+        // Window block pruning: clearing window block 0 dirties ONLY window block 0 and writes CLEARED_GPU_TABLE_ENTRY.
         gpu_win[0] = 0x9999;
         t.clear_kind_entry(&mut pools.window, BlockIndex::new(0)).unwrap();
         assert_eq!(t.dirty_range(BlockKind::Full), None);
         assert_eq!(t.dirty_range(BlockKind::Window), Some((0, 0)));
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 1);
-        assert_eq!(gpu_win[0], 0);
+        assert_eq!(gpu_win[0], CLEARED_GPU_TABLE_ENTRY);
         assert_eq!(gpu_win[1], off_w1);
         // Clearing an already-empty entry is a no-op (stays clean).
         t.clear_kind_entry(&mut pools.window, BlockIndex::new(0)).unwrap();
@@ -1786,8 +1800,8 @@ mod tests {
         assert_eq!(t.dirty_range(BlockKind::Full), Some((2, 5)));
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 4);
         assert_eq!(gpu_full[2], off_f2);
-        assert_eq!(gpu_full[3], 0);
-        assert_eq!(gpu_full[4], 0);
+        assert_eq!(gpu_full[3], CLEARED_GPU_TABLE_ENTRY);
+        assert_eq!(gpu_full[4], CLEARED_GPU_TABLE_ENTRY);
         assert_eq!(gpu_full[5], off_f5);
     }
 
@@ -1821,15 +1835,15 @@ mod tests {
         assert_eq!(pools.full.record(sf1).unwrap().refs(), 0);
 
         // Rebind a single prefix block (block 0) before the next sync: still does full sync so stale
-        // GPU slot 1 from the previous request is zeroed out!
+        // GPU slot 1 from the previous request is overwritten with CLEARED_GPU_TABLE_ENTRY!
         t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
         t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 16);
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 16);
         assert_eq!(gpu_full[0], 0);
-        assert_eq!(gpu_full[1], 0);
+        assert_eq!(gpu_full[1], CLEARED_GPU_TABLE_ENTRY);
         assert_eq!(gpu_win[0], 0);
-        assert_eq!(gpu_win[1], 0);
+        assert_eq!(gpu_win[1], CLEARED_GPU_TABLE_ENTRY);
         assert_eq!(t.dirty_range(BlockKind::Full), None);
         assert_eq!(t.dirty_range(BlockKind::Window), None);
 
@@ -1842,5 +1856,25 @@ mod tests {
         t.set(BlockKind::Full, BlockIndex::new(3), Some(e)).unwrap(); // same value -> stays (3, 3)
         t.set(BlockKind::Full, BlockIndex::new(3), None).unwrap();
         assert_eq!(t.dirty_range(BlockKind::Full), Some((3, 3)));
+    }
+
+    #[test]
+    fn cleared_gpu_table_entry_is_distinct_from_slab_zero_first_slot() {
+        // Multi-slab pool across all 4 slabs: neither slab 0 Slot(1) (`0`) nor any other slot in slabs 0..4
+        // ever encodes as CLEARED_GPU_TABLE_ENTRY (`u64::MAX`).
+        let mut pool = BlockPool::open(BlockKind::Full, 0, KVB_FP16, FULL_STRIDE * 2, None).unwrap();
+        let mut table = BlockTable::new(8).unwrap();
+        for b in 0..8u32 {
+            let slot = pool.grow().unwrap();
+            let off = pool.take(slot).unwrap();
+            let gen = pool.record(slot).unwrap().generation();
+            table.fill(&mut pool, BlockIndex::new(b), slot, gen).unwrap();
+            let entry = BlockEntry::new(slot, gen, off, BlockKind::Full, KVB_FP16);
+            let word = pool.gpu_table_entry(entry).unwrap();
+            if slot.get() == 1 {
+                assert_eq!(word, 0, "slab 0 Slot(1) encodes as 0");
+            }
+            assert_ne!(word, CLEARED_GPU_TABLE_ENTRY);
+        }
     }
 }

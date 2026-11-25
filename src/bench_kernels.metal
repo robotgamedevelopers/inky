@@ -175,12 +175,7 @@ kernel void kd_tg(device const uchar * W [[buffer(0)]], device float * A [[buffe
 
 template [[host_name("kd_dev_4_4")]] kernel void kd_dev<4, 4>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
 template [[host_name("kd_dev_2_4")]] kernel void kd_dev<2, 4>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
-template [[host_name("kd_dev_8_2")]] kernel void kd_dev<8, 2>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
-template [[host_name("kd_dev_8_4")]] kernel void kd_dev<8, 4>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
-template [[host_name("kd_tg_4_8")]] kernel void kd_tg<4, 8>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort, ushort);
 template [[host_name("kd_tg_2_8")]] kernel void kd_tg<2, 8>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort, ushort);
-template [[host_name("kd_tg_4_16")]] kernel void kd_tg<4, 16>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort, ushort);
-template [[host_name("kd_tg_8_8")]] kernel void kd_tg<8, 8>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort, ushort);
 template [[host_name("kd_dev_1_4")]] kernel void kd_dev<1, 4>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
 template [[host_name("kd_dev_2_2")]] kernel void kd_dev<2, 2>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
 template [[host_name("kd_dev_1_8")]] kernel void kd_dev<1, 8>(device const uchar *, device float *, constant MoeArgs &, uint, ushort, ushort);
@@ -198,139 +193,7 @@ kernel void k_touch(device const uchar * W [[buffer(0)]], device float * A [[buf
 }
 
 // ---- dense GEMM tiling variants (fp16 tensor cores). Y[t][r] = sum_k X[t][k] W[r][k]; weights dequantized to TG memory.
-template <int BM, int BK>
-inline void stage_w(device const uchar * wb, constant GSeg & S, uint r0, uint k0, ushort tid, thread half * wv) {
-    constexpr int WPT = BM * BK / 128;
-    for (int c = 0; c < WPT / 16; c++) {
-        const uint idx = tid * WPT + c * 16, row = idx / BK, kk = idx % BK;
-        deq16(wb + (ulong) min(r0 + row, S.nrows - 1) * S.row_bytes, S.wtype, k0 + kk, wv + c * 16);
-    }
-}
-// staged activations (half in TG memory)
-template <int BM, int BN, int BK>
-kernel void kg_s(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant GSeg & S [[buffer(5)]], constant uint & T [[buffer(9)]],
-                 uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup half sa[BM * BK];
-    threadgroup half sb[BN * BK];
-    const uint r0 = tgp.x * BM, t0 = tgp.y * BN, K = S.K;
-    device const uchar * wb = W + (ulong(S.w_hi) << 32 | S.w_lo);
-    constexpr int WPT = BM * BK / 128, XPT = BN * BK / 128;
-    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(BK, BM));
-    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(BK, BN));
-    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(BN, BM, BK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-                              execution_simdgroups<4>> mm;
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-    for (uint k0 = 0; k0 < K; k0 += BK) {
-        half wv[WPT];
-        stage_w<BM, BK>(wb, S, r0, k0, tid, wv);
-        float xv[XPT];
-        for (int i = 0; i < XPT; i++) { const uint idx = tid * XPT + i, tt = idx / BK, kk = idx % BK; xv[i] = A[S.in_off + min(t0 + tt, T - 1) * K + k0 + kk]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = 0; i < WPT; i++) sa[tid * WPT + i] = wv[i];
-        for (int i = 0; i < XPT; i++) sb[tid * XPT + i] = half(xv[i]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mm.run(tB, tA, cT);
-    }
-    auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(BM, (int) (S.nrows - r0)), min(BN, (int) (T - t0))), array<int, 2>({1, (int) S.ldo}));
-    cT.store(tC);
-}
-// activations consumed straight from device memory (f32), relaxed precision (as llama.cpp's dense path)
-template <int BM, int BN, int BK>
-kernel void kg_d(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant GSeg & S [[buffer(5)]], constant uint & T [[buffer(9)]],
-                 uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup half sa[BM * BK];
-    const uint r0 = tgp.x * BM, t0 = tgp.y * BN, K = S.K;
-    device const uchar * wb = W + (ulong(S.w_hi) << 32 | S.w_lo);
-    constexpr int WPT = BM * BK / 128;
-    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(BK, BM));
-    auto tX = tensor(A + S.in_off + (ulong) t0 * K, dextents<int32_t, 2>((int) K, min(BN, (int) (T - t0))), array<int, 2>({1, (int) K}));
-    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(BN, BM, BK, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-                              execution_simdgroups<4>> mm;
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tX), decltype(tA), float>();
-    for (uint k0 = 0; k0 < K; k0 += BK) {
-        half wv[WPT];
-        stage_w<BM, BK>(wb, S, r0, k0, tid, wv);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = 0; i < WPT; i++) sa[tid * WPT + i] = wv[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        auto sx = tX.slice(k0, 0);
-        mm.run(sx, tA, cT);
-    }
-    auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(BM, (int) (S.nrows - r0)), min(BN, (int) (T - t0))), array<int, 2>({1, (int) S.ldo}));
-    cT.store(tC);
-}
-#define KGS(BM, BN, BK) template [[host_name("kg_" #BM "_" #BN "_" #BK "_0")]] kernel void kg_s<BM, BN, BK>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-#define KGD(BM, BN, BK) template [[host_name("kg_" #BM "_" #BN "_" #BK "_1")]] kernel void kg_d<BM, BN, BK>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-KGS(64, 32, 32) KGS(64, 64, 32) KGS(64, 32, 64) KGS(64, 64, 64) KGS(128, 32, 32) KGS(128, 64, 32)
-KGD(64, 32, 32) KGD(64, 64, 32) KGD(64, 64, 64) KGD(128, 64, 32) KGD(128, 64, 64) KGD(128, 128, 32)
-// double-buffered: dequantize tile k+1 (shader ALUs) while the tensor units multiply tile k; one barrier per step
-template <int BM, int BN, int BK>
-kernel void kg_db(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant GSeg & S [[buffer(5)]], constant uint & T [[buffer(9)]],
-                  uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup half sa[2][BM * BK];
-    const uint r0 = tgp.x * BM, t0 = tgp.y * BN, K = S.K;
-    device const uchar * wb = W + (ulong(S.w_hi) << 32 | S.w_lo);
-    constexpr int WPT = BM * BK / 128;
-    auto tA0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(BK, BM));
-    auto tA1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(BK, BM));
-    auto tX = tensor(A + S.in_off + (ulong) t0 * K, dextents<int32_t, 2>((int) K, min(BN, (int) (T - t0))), array<int, 2>({1, (int) K}));
-    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(BN, BM, BK, false, true, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-                              execution_simdgroups<4>> mm;
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
-    half wv[WPT];
-    stage_w<BM, BK>(wb, S, r0, 0, tid, wv);
-    for (int i = 0; i < WPT / 4; i++) ((threadgroup half4 *) (sa[0] + tid * WPT))[i] = ((thread half4 *) wv)[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint buf = 0;
-    for (uint k0 = 0; k0 < K; k0 += BK) {
-        const bool more = k0 + BK < K;
-        if (more) stage_w<BM, BK>(wb, S, r0, k0 + BK, tid, wv);
-        auto sx = tX.slice(k0, 0);
-        if (buf == 0) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
-        if (more) for (int i = 0; i < WPT / 4; i++) ((threadgroup half4 *) (sa[buf ^ 1] + tid * WPT))[i] = ((thread half4 *) wv)[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        buf ^= 1;
-    }
-    auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(BM, (int) (S.nrows - r0)), min(BN, (int) (T - t0))), array<int, 2>({1, (int) S.ldo}));
-    cT.store(tC);
-}
-#define KGB(BM, BN, BK) template [[host_name("kg_" #BM "_" #BN "_" #BK "_2")]] kernel void kg_db<BM, BN, BK>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-KGB(64, 64, 32) KGB(64, 32, 32) KGB(128, 64, 32) KGB(64, 128, 32) KGB(64, 64, 64)
-// activations pre-converted to half in device memory (halves the L2 activation stream); double-buffered weights
-template <int BM, int BN, int BK>
-kernel void kg_h(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant GSeg & S [[buffer(5)]], constant uint & T [[buffer(9)]],
-                 uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup half sa[2][BM * BK];
-    const uint r0 = tgp.x * BM, t0 = tgp.y * BN, K = S.K;
-    device const uchar * wb = W + (ulong(S.w_hi) << 32 | S.w_lo);
-    constexpr int WPT = BM * BK / 128;
-    auto tA0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(BK, BM));
-    auto tA1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(BK, BM));
-    device half * xh = (device half *) (A + S.in_off) + (ulong) t0 * K;
-    auto tX = tensor(xh, dextents<int32_t, 2>((int) K, min(BN, (int) (T - t0))), array<int, 2>({1, (int) K}));
-    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(BN, BM, BK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-                              execution_simdgroups<4>> mm;
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
-    half wv[WPT];
-    stage_w<BM, BK>(wb, S, r0, 0, tid, wv);
-    for (int i = 0; i < WPT / 4; i++) ((threadgroup half4 *) (sa[0] + tid * WPT))[i] = ((thread half4 *) wv)[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint buf = 0;
-    for (uint k0 = 0; k0 < K; k0 += BK) {
-        const bool more = k0 + BK < K;
-        if (more) stage_w<BM, BK>(wb, S, r0, k0 + BK, tid, wv);
-        auto sx = tX.slice(k0, 0);
-        if (buf == 0) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT);
-        if (more) for (int i = 0; i < WPT / 4; i++) ((threadgroup half4 *) (sa[buf ^ 1] + tid * WPT))[i] = ((thread half4 *) wv)[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        buf ^= 1;
-    }
-    auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(BM, (int) (S.nrows - r0)), min(BN, (int) (T - t0))), array<int, 2>({1, (int) S.ldo}));
-    cT.store(tC);
-}
-#define KGH(BM, BN, BK) template [[host_name("kg_" #BM "_" #BN "_" #BK "_3")]] kernel void kg_h<BM, BN, BK>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-KGH(64, 64, 32) KGH(64, 128, 32) KGH(64, 64, 64) KGH(128, 128, 32) KGH(128, 64, 32) KGH(64, 128, 64)
-// bottleneck isolation: MODE 0 = no dequant, X half from device; 1 = no dequant, X staged in TG; 2 = dequant, X staged in TG (from half)
+// bottleneck isolation: MODE 0 = no dequant, X half from device; 2 = dequant, X staged in TG (from half)
 template <int MODE>
 kernel void kg_iso(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant GSeg & S [[buffer(5)]], constant uint & T [[buffer(9)]],
                    uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
@@ -372,7 +235,6 @@ kernel void kg_iso(device const uchar * W [[buffer(0)]], device float * A [[buff
     cT.store(tC);
 }
 template [[host_name("kg_iso0_3")]] kernel void kg_iso<0>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-template [[host_name("kg_iso1_3")]] kernel void kg_iso<1>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
 template [[host_name("kg_iso2_3")]] kernel void kg_iso<2>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
 // big tiles: BM x BN with NSG simdgroups, half X from device, double-buffered dequant
 template <int BM, int BN, int NSG>
@@ -414,7 +276,7 @@ kernel void kg_big(device const uchar * W [[buffer(0)]], device float * A [[buff
     cT.store(tC);
 }
 #define KGBIG(BM, BN, NSG) template [[host_name("kgb_" #BM "_" #BN "_" #NSG)]] kernel void kg_big<BM, BN, NSG>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort);
-KGBIG(128, 128, 8) KGBIG(128, 64, 8) KGBIG(64, 128, 8) KGBIG(64, 64, 4) KGBIG(64, 256, 16) KGBIG(64, 512, 32) KGBIG(128, 128, 16) KGBIG(128, 256, 32) KGBIG(256, 64, 16) KGBIG(64, 32, 2) KGBIG(64, 32, 4) KGBIG(64, 16, 2) KGBIG(64, 64, 8) KGBIG(64, 128, 16) KGBIG(64, 64, 2) KGBIG(64, 128, 4)
+KGBIG(64, 128, 8) KGBIG(64, 64, 4)
 
 // same with swapped grid axes (token tiles on x, row tiles on y)
 // big tiles: BM x BN with NSG simdgroups, half X from device, double-buffered dequant
@@ -567,7 +429,6 @@ kernel void kg_sgf(device const uchar * W [[buffer(0)]], device float * A [[buff
     }
 }
 template [[host_name("kgsgf0_8")]] kernel void kg_sgf<8, 0>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort, ushort);
-template [[host_name("kgsgf1_8")]] kernel void kg_sgf<8, 1>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort, ushort);
 template [[host_name("kgsgf0_4")]] kernel void kg_sgf<4, 0>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort, ushort);
 template [[host_name("kgsgf0_16")]] kernel void kg_sgf<16, 0>(device const uchar *, device float *, constant GSeg &, constant uint &, uint2, ushort, ushort);
 

@@ -355,7 +355,8 @@ impl PoisonPool for Layer2<'_> {
     fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> { KINDS.iter().map(|&k| (k, slot_at(lane))).collect() }
     fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
         let i = slot.pool_index().get() as usize;
-        self.run(|v| v[i].as_ref().map(|l| self.eng.lane_regions(l)[if kind == BlockKind::Window { 0 } else { 1 }]))
+        // SAFETY: `PoisonPool` runs between GPU steps when nothing is in flight and before any reallocation.
+        self.run(|v| v[i].as_ref().map(|l| unsafe { self.eng.lane_regions(l) }[if kind == BlockKind::Window { 0 } else { 1 }]))
     }
     fn absent_ok(&self, _: BlockKind, slot: Slot) -> bool { self.run(|v| v[slot.pool_index().get() as usize].is_none()) }
 }
