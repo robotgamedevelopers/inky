@@ -897,10 +897,71 @@ impl Engine {
         let bt_bytes = self.max_ctx.div_ceil(crate::blocks::BLOCK).saturating_mul(16) as u64;
         base.saturating_add(extra_toks).saturating_add(bt_bytes)
     }
+    /// Minimum `(window_slots, full_slots)` required for `serve` to hold one full request at
+    /// `max_ctx` without degrading below `--ctx` or failing sliding-window rollover.
+    pub fn serve_pool_floor_counts(chunk: usize, max_ctx: usize) -> (usize, usize) {
+        use crate::blocks::{span_bound, BLOCK, WINDOW};
+        let eff_ctx = max_ctx.max(BLOCK);
+        let min_full = eff_ctx.div_ceil(BLOCK).max(1);
+        let min_win = if eff_ctx <= WINDOW {
+            min_full
+        } else {
+            span_bound(chunk.min(eff_ctx)).max((WINDOW / BLOCK) + 2).max(32)
+        };
+        (min_win, min_full)
+    }
+    /// Checked Layer 3 block-pool sizing for `serve`: returns `Err` when `kv_budget_bytes` (or
+    /// `max_slab_bytes`) cannot hold the single-request hard floor `(min_win, min_full)` for
+    /// `(chunk, max_ctx)`. When `Ok((n_window, n_full))` is returned, `n_window >= min_win`,
+    /// `n_full >= min_full`, and total pool bytes never exceed `kv_budget_bytes`.
+    pub fn checked_serve_block_pool_counts(
+        kv_budget_bytes: u64,
+        kvb: u32,
+        chunk: usize,
+        max_ctx: usize,
+        max_lanes: usize,
+        max_slab_bytes: u64,
+    ) -> Result<(usize, usize), String> {
+        use crate::blocks::{span_bound, stride_at, BlockKind, MAX_SLABS};
+        let win_stride = stride_at(BlockKind::Window, kvb).map_err(|_| format!("invalid kvb {kvb}"))?;
+        let full_stride = stride_at(BlockKind::Full, kvb).map_err(|_| format!("invalid kvb {kvb}"))?;
+        let (min_win, min_full) = Self::serve_pool_floor_counts(chunk, max_ctx);
+        let min_win_bytes = (min_win as u64).saturating_mul(win_stride);
+        let min_full_bytes = (min_full as u64).saturating_mul(full_stride);
+        let min_total_bytes = min_win_bytes.saturating_add(min_full_bytes);
+        if kv_budget_bytes < min_total_bytes {
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            return Err(format!(
+                "insufficient Metal K/V pool budget for --ctx {max_ctx} (kvb={kvb}): {:.1} MiB available, need at least {:.1} MiB for the single-request pool floor ({min_win} window + {min_full} full blocks); lower --ctx or pass --kv8",
+                mib(kv_budget_bytes),
+                mib(min_total_bytes),
+            ));
+        }
+        let max_win_slab = MAX_SLABS.saturating_mul((max_slab_bytes / win_stride) as usize);
+        let max_full_slab = MAX_SLABS.saturating_mul((max_slab_bytes / full_stride) as usize);
+        if max_win_slab < min_win || max_full_slab < min_full {
+            return Err(format!(
+                "Metal maxBufferLength ({max_slab_bytes} B) cannot hold the serve pool floor ({min_win} window + {min_full} full blocks)"
+            ));
+        }
+        let max_win_preserving_full = ((kv_budget_bytes.saturating_sub(min_full_bytes)) / win_stride) as usize;
+        let win_upper = max_win_preserving_full.min(max_win_slab);
+        let lanes = max_lanes.max(1);
+        let target_win = ((kv_budget_bytes.saturating_mul(15) / 100) / win_stride) as usize;
+        let desired_min_win = lanes.saturating_mul(span_bound(chunk.min(max_ctx.max(64)))).saturating_add(256);
+        let budget_win_cap = ((kv_budget_bytes.saturating_mul(45) / 100) / win_stride) as usize;
+        let floor_win = desired_min_win.min(budget_win_cap.max(min_win));
+        let n_window = target_win.max(floor_win).clamp(min_win, win_upper);
+        let win_bytes = (n_window as u64).saturating_mul(win_stride);
+        let rem_bytes = kv_budget_bytes.saturating_sub(win_bytes);
+        let n_full = ((rem_bytes / full_stride) as usize).clamp(min_full, max_full_slab);
+        Ok((n_window, n_full))
+    }
     /// Pure Layer 3 block-pool sizing from `kv_budget_bytes`: allocates ~15% to `Window` slots
     /// and ~85% to `Full` slots while ensuring at least `max_lanes * span_bound(chunk) + 256`
     /// window slots when budget permits (capped to 45% of `kv_budget_bytes` so `Full` is never starved,
     /// with a hard floor of `span_bound(chunk)`), bounded by `MAX_SLABS` per kind.
+    #[cfg(test)]
     pub fn serve_block_pool_counts(
         kv_budget_bytes: u64,
         kvb: u32,
@@ -958,9 +1019,9 @@ impl Engine {
             .saturating_add(useful_full.saturating_mul(full_stride));
         kv_budget_bytes.min(useful_bytes)
     }
-    /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`.
-    /// Returns `(n_window, n_full)`.
-    pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {
+    /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`,
+    /// returning `Err` if `kv_budget_bytes` cannot satisfy the single-request pool floor.
+    pub fn try_init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> Result<(usize, usize), String> {
         let max_slab = self.gpu.dev.maxBufferLength() as u64;
         let capped_budget = Self::capped_serve_kv_budget(
             kv_budget_bytes,
@@ -969,16 +1030,24 @@ impl Engine {
             self.max_ctx,
             max_lanes,
         );
-        let (n_window, n_full) = Self::serve_block_pool_counts(
+        let (n_window, n_full) = Self::checked_serve_block_pool_counts(
             capped_budget,
             self.kvb as u32,
             self.chunk,
+            self.max_ctx,
             max_lanes,
             max_slab,
-        );
+        )?;
         let pools = crate::blocks::BlockPools::gpu(&self.gpu.dev, n_window, n_full, self.kvb as u32);
         *self.block_pool.borrow_mut() = pools;
-        (n_window, n_full)
+        Ok((n_window, n_full))
+    }
+    /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`.
+    /// Returns `(n_window, n_full)`.
+    #[allow(dead_code)]
+    pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {
+        self.try_init_serve_block_pools(kv_budget_bytes, max_lanes)
+            .expect("insufficient Metal K/V pool budget for serve block pools")
     }
     /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
     /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
