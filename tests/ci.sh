@@ -106,6 +106,8 @@ $B loopcdgate --ref ref/long.tokens -c 256 2>&1 | tail -1 | tee /dev/stderr | gr
 # negative control: perturbing one lane's blended LoopCD logit must exit 1 AND report LOOPCD GATE DIFFERS
 lc_out=$(INK_LOOPCDGATE_SABOTAGE=1 $B loopcdgate --ref ref/long.tokens -c 256 2>&1) && lc_rc=0 || lc_rc=$?
 if [ "$lc_rc" = 1 ] && print -r -- "$lc_out" | grep -q 'LOOPCD GATE DIFFERS'; then echo "loopcdgate sabotage: detected, as required"; else print -r -- "$lc_out"; echo "FAIL: loopcdgate sabotage not detected (exit $lc_rc)"; fail=1; fi
+verdict verify 0 '^verify gate matches encode_spans of t=1$' "$B" verify
+verdict "verify sabotage" 1 '^VERIFY GATE FAILED$' env INK_VERIFY_SABOTAGE=1 "$B" verify
 if [ "$mode" = pr ]; then
     echo "pr set done; binv, lanes, spans, dbatch, blockedinv (each with sabotage), cli checks and golden run in the nightly workflow (tests/ci.sh full)"
     exit $fail
@@ -134,6 +136,8 @@ verdict dbatch 0 '^dbatch exact' env INK_LANES=1,8,33,65 INK_DECODE=8 "$B" dbatc
 verdict "dbatch sabotage" 1 '^DBATCH NOT EXACT$' env INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 "$B" dbatch --ref ref/long.tokens -c 4096
 verdict blockedinv 0 '^blockedinv exact' "$B" blockedinv --ref ref/long.tokens -c 4160
 verdict "blockedinv sabotage" 1 '^BLOCKED NOT INVARIANT' env INK_BLOCKEDINV_SABOTAGE=1 "$B" blockedinv --ref ref/long.tokens -c 1024
+verdict sharedkv 0 '^sharedkv exact:' env INK_PREFIX=1024 INK_LANES=4,10 INK_DECODE=4 "$B" sharedkv --ref ref/long.tokens -c 2048
+verdict "sharedkv sabotage" 1 '^SHAREDKV PARITY FAILED$' env INK_SHAREDKV_SABOTAGE=1 INK_PREFIX=1024 INK_LANES=4 INK_DECODE=2 "$B" sharedkv --ref ref/long.tokens -c 2048
 verdict temp1 0 '^temp1 equivalent:' env -u INK_TEMP1_SABOTAGE "$B" temp1 --ref ref/long.tokens -c 4096
 verdict "temp1 sabotage" 1 '^TEMP1 NOT EQUIVALENT$' env INK_TEMP1_SABOTAGE=1 "$B" temp1 --ref ref/long.tokens -c 4096
 zero_out=$(mktemp)

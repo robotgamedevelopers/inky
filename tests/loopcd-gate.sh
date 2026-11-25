@@ -5,10 +5,11 @@ cd "${0:A:h}/.."
 unset INKY_TEST_LOOPCD_WRITE_WEAK_STATE
 kernel=engine::tests::loopcd_mixed_batch_preserves_disabled_rows
 cli=loopcd_tests::loopcd_cli_first_token
+cached=loopcd_tests::loopcd_cached_prompt_first_token_and_mixed_tie_isolation
 model=loopcd_tests::loopcd_paged_mixed_lane_state
 fail=0
 report='test result: ok. 1 passed; 0 failed;'
-for fixture in "$kernel" "$cli" "$model"; do
+for fixture in "$kernel" "$cli" "$cached" "$model"; do
     if out=$(cargo test --locked --release --bin inky "$fixture" -- --ignored --exact 2>&1) &&
        [[ "$out" == *"$report"* ]]; then
         print -r -- "$out"

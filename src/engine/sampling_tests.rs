@@ -113,4 +113,21 @@ fn metal_sampling_validates_each_row_and_preserves_greedy_order() {
     rows[0].fill(f32::NAN);
     let tokens = sample_rows(&gpu, &rows, [1.0, 0.5], [u32::MAX; 2]);
     assert_eq!(tokens, [u32::MAX, 12], "all-NaN row");
+
+    // Standalone (1-row) + batched (2-row) near-zero temperature agreement with CPU `Sampler::sample_next`
+    // alongside an ordinary-temperature finite control (`t-audit-engine-sampling-near-zero` & `t-audit-engine-sampling-finite`).
+    let mut cpu_tie_row = [-15.0f32; WIDTH];
+    cpu_tie_row[513] = 420.0;
+    cpu_tie_row[1537] = 425.0; // `30 * tanh(x / 30)` saturates to 30.0 in f32 for both, while raw argmax is 1537!
+    let mut finite_ctrl = [-15.0f32; WIDTH];
+    finite_ctrl[77] = 25.0;
+
+    for temp in [0.0f32, 1.0e-38, 1.25e-38, 1.0e-6] {
+        let mut cpu_sampler = crate::sampler::Sampler::new(temp, 0, 1.0, 30.0, 19);
+        let cpu_tok = cpu_sampler.sample_next(&cpu_tie_row).unwrap();
+        assert_eq!(cpu_tok, 1537, "CPU near-zero raw argmax at temp={temp}");
+        let gpu_pair = sample_rows(&gpu, &[cpu_tie_row, finite_ctrl], [temp, 0.7], [u32::MAX; 2]);
+        assert_eq!(gpu_pair[0], cpu_tok, "GPU batched near-zero mismatch at temp={temp}");
+        assert_eq!(gpu_pair[1], 77, "finite ordinary-temperature control disturbed at temp={temp}");
+    }
 }
