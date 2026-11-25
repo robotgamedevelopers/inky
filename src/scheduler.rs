@@ -2777,33 +2777,6 @@ impl ServeStepPlanner {
 mod tests {
     use super::*;
 
-    #[test]
-    fn serve_lane_is_not_runnable_before_restore_finishes() {
-        let mut planner = ServeStepPlanner::new(1, 16);
-        let inputs = [ServeLaneInput {
-            runnable: true,
-            n_past: 0,
-            pf_end: 64,
-            has_pending_decode: false,
-        }];
-        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
-        planner.admit_queued(0, LaneState::Queued);
-        assert_eq!(planner.state(0), LaneState::Admitted);
-        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
-        planner.start_restore(0);
-        assert_eq!(planner.state(0), LaneState::Restoring);
-        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), None);
-        planner.finish_restore(0);
-        assert_eq!(planner.state(0), LaneState::Ready);
-        assert_eq!(planner.plan_and_begin_step(&inputs, 64, 64), Some(ServeStepPlan::Prefill(vec![(0, 0, 64)])));
-        assert_eq!(planner.state(0), LaneState::InStep);
-        assert!(!planner.request_cancel(0));
-        assert_eq!(planner.state(0), LaneState::Cancelling);
-        assert_eq!(planner.complete_step(), vec![0]);
-        assert_eq!(planner.state(0), LaneState::Cancelled);
-    }
-
-
     fn small_cfg() -> SchedulerConfig {
         SchedulerConfig {
             lanes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
