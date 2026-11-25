@@ -84,6 +84,7 @@ dump_seed() {
 }
 
 cp "$root/src/scheduler.rs" "$work/scheduler.rs"
+cp -R "$root/src/scheduler" "$work/scheduler"
 compile
 "$work/driver" --exact serve::scheduler_trace::seeded_decisions_are_repeatable | tee "$work/driver.log"
 grep -Fq "1 passed; 0 failed" "$work/driver.log"

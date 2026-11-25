@@ -30,6 +30,8 @@ check_production() {
     local dir=$work/production
     mkdir -p "$dir"
     cp "$orig_sched" "$dir/scheduler.rs"
+    mkdir -p "$dir/scheduler"
+    cp "$root/src/scheduler/trace.rs" "$dir/scheduler/"
     cp "$driver" "$dir/main.rs"
     rustc --edition=2021 -O "$dir/main.rs" -o "$dir/generate"
     "$dir/generate" "$dir/bundle" 2> "$dir/walk.log"
@@ -52,6 +54,8 @@ check_mutant() {
     local name=$1 old=$2 new=$3
     local dir=$work/$name status
     mkdir -p "$dir"
+    mkdir -p "$dir/scheduler"
+    cp "$root/src/scheduler/trace.rs" "$dir/scheduler/"
     cp "$driver" "$dir/main.rs"
     python3 - "$orig_sched" "$dir/scheduler.rs" "$old" "$new" <<'PY'
 import pathlib, sys
