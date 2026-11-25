@@ -102,10 +102,15 @@ start drop-step-bypass-tick check_mutant drop-step-bypass-tick \
     'self.lanes[w].wait_ticks += 1; // MUTANT_ANCHOR_STEP_BYPASS' \
     'let _ = w;'
 
-# 4. Reversed witness: dropping wait_ticks increment on bypassed older queued lanes in admit -> Conforms
+# 4. Reversed witness: dropping wait_ticks increment on bypassed older queued lanes in admit -> BypassBoundHolds / ActionConforms
 start drop-admit-bypass-tick check_mutant drop-admit-bypass-tick \
     'self.lanes[q].wait_ticks += 1; // MUTANT_ANCHOR_ADMIT_BYPASS' \
     'let _ = q;'
+
+# 5. Reversed witness (`U68`): silent no-op stutter on RestoreBlock must be rejected by ActionConforms
+start noop-restore-stutter check_mutant noop-restore-stutter \
+    'rec.tier = BlockTier::Both; // MUTANT_ANCHOR_SCHED_RESTORE_BLOCK' \
+    'let _ = rec;'
 
 failed=0
 for i in "${!pids[@]}"; do

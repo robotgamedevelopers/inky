@@ -152,6 +152,11 @@ start priv-tail-dirty check_mutant priv-tail-dirty cache_scheduler.rs cs CacheSc
     '                    data: vec![0; bsz as usize], // MUTANT_ANCHOR_PRIV_ZERO' \
     '                    data: vec![1; bsz as usize],'
 
+# 8. Silent no-op stutter on RestoreBlock (state unchanged despite claiming RestoreBlock) -> rejected by ActionConforms
+start noop-restore-block check_mutant noop-restore-block cache_scheduler.rs cs CacheScheduler.tla \
+    '        b.tier = "both"; // MUTANT_ANCHOR_RESTORE_BLOCK' \
+    '        let _ = &b;'
+
 failed=0
 for i in "${!pids[@]}"; do
     if wait "${pids[$i]}"; then

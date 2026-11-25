@@ -118,6 +118,7 @@ pub enum BlockId {
     Priv {
         lane: usize,
         kind: BlockKind,
+        idx: u32,
     },
 }
 
@@ -145,13 +146,24 @@ impl BlockRecord {
     }
 }
 
-/// Retained prefix start point at a block-aligned boundary.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// Retained prefix start point at a block-aligned prefill boundary (`U57` + `U58`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartPoint {
     pub kept: bool,
-    pub state_kept: bool,
+    pub state_tier: BlockTier,
     pub full: BTreeSet<BlockId>,
     pub win: BTreeSet<BlockId>,
+}
+
+impl Default for StartPoint {
+    fn default() -> Self {
+        Self {
+            kept: false,
+            state_tier: BlockTier::None,
+            full: BTreeSet::new(),
+            win: BTreeSet::new(),
+        }
+    }
 }
 
 /// Per-lane scheduler state.
@@ -167,6 +179,8 @@ pub struct LaneSlot {
     pub reservation: u32,
     pub admit_budget: u32,
     pub wait_ticks: u32,
+    /// Independent unclamped pass-over ghost counter (`U59`).
+    pub ghost_bypass: u32,
     /// Pending async restore disk I/O block (if any). While `Some`, cancelling a
     /// `Restoring` lane enters `Cancelling` and holds slot + blocks until I/O finishes.
     pub restore_io_block: Option<BlockId>,
@@ -220,8 +234,8 @@ impl SchedulerConfig {
                 return Err(SchedError::InvalidConfig("each request length must be in 1..=max_pos and block-aligned"));
             }
         }
-        if self.max_span == 0 || self.max_span > self.block_size {
-            return Err(SchedError::InvalidConfig("max_span must be in 1..=block_size"));
+        if self.max_span == 0 || self.max_span > self.max_pos {
+            return Err(SchedError::InvalidConfig("max_span must be in 1..=max_pos"));
         }
         if self.step_token_budget < self.max_span {
             return Err(SchedError::InvalidConfig("step_token_budget must be >= max_span"));
@@ -335,7 +349,7 @@ pub fn history_indices(n: u32, window_size: u32, block_size: u32) -> BTreeSet<u3
     if n == 0 {
         return BTreeSet::new();
     }
-    let lo = n.saturating_sub(window_size);
+    let lo = if n >= window_size { n - window_size + 1 } else { 0 };
     window_indices(lo, n - 1, block_size)
 }
 
@@ -405,6 +419,7 @@ impl Scheduler {
                 reservation: 0,
                 admit_budget: 0,
                 wait_ticks: 0,
+                ghost_bypass: 0,
                 restore_io_block: None,
             })
             .collect();
@@ -483,6 +498,65 @@ impl Scheduler {
 
     pub fn disk_used(&self) -> u32 {
         self.blocks.values().filter(|b| b.tier.on_disk()).count() as u32
+    }
+
+    pub fn state_mem_budget(&self) -> u32 {
+        let max_span_bnds = ceil_div(self.cfg.max_span, self.cfg.block_size);
+        2u32.max((self.lanes.len().saturating_sub(1) as u32) + max_span_bnds)
+    }
+
+    pub fn state_disk_budget(&self) -> u32 {
+        self.cfg.disk_budget.max(self.state_mem_budget())
+    }
+
+    pub fn state_mem_used(&self) -> u32 {
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && sp.state_tier.in_memory())
+            .count() as u32
+    }
+
+    pub fn state_disk_used(&self) -> u32 {
+        self.start_points
+            .values()
+            .filter(|sp| sp.kept && sp.state_tier.on_disk())
+            .count() as u32
+    }
+
+    pub fn state_in_mem(&self, prefix: &str, boundary: u32) -> bool {
+        self.start_points
+            .get(&(prefix.to_string(), boundary))
+            .is_some_and(|sp| sp.kept && sp.state_tier.in_memory())
+    }
+
+    pub fn start_state_ready(&self, l: usize) -> bool {
+        let slot = &self.lanes[l];
+        slot.pos == 0 || self.state_in_mem(&slot.prefix, slot.pos)
+    }
+
+    fn restoring_start_need(&self) -> BTreeSet<(String, u32)> {
+        (0..self.lanes.len())
+            .filter(|&r| self.lanes[r].state == LaneState::Restoring && self.lanes[r].pos > 0)
+            .map(|r| (self.lanes[r].prefix.clone(), self.lanes[r].pos))
+            .collect()
+    }
+
+    pub fn cold_mem_states(&self) -> Vec<(String, u32)> {
+        let need = self.restoring_start_need();
+        self.start_points
+            .iter()
+            .filter(|(pk, sp)| sp.kept && sp.state_tier.in_memory() && !need.contains(*pk))
+            .map(|(pk, _)| pk.clone())
+            .collect()
+    }
+
+    pub fn cold_disk_states(&self) -> Vec<(String, u32)> {
+        let need = self.restoring_start_need();
+        self.start_points
+            .iter()
+            .filter(|(pk, sp)| sp.kept && sp.state_tier.on_disk() && !need.contains(*pk))
+            .map(|(pk, _)| pk.clone())
+            .collect()
     }
 
     pub fn reserved_total(&self) -> u32 {
@@ -587,15 +661,97 @@ impl Scheduler {
         slot.state == LaneState::Ready && slot.pos < slot.target
     }
 
+    pub fn window_pruned(&self, l: usize) -> bool {
+        let keep = history_indices(self.lanes[l].pos, self.cfg.window_size, self.cfg.block_size);
+        self.lanes[l].win.keys().all(|bi| keep.contains(bi))
+    }
+
+    pub fn need_full_for_span(&self, l: usize, c: u32) -> BTreeSet<u32> {
+        if c == 0 {
+            return BTreeSet::new();
+        }
+        let slot = &self.lanes[l];
+        let bsz = self.cfg.block_size;
+        let hi = (slot.pos + c - 1) / bsz;
+        let lo = if slot.pos > 0 && slot.full.len() == (slot.pos / bsz) as usize {
+            slot.pos / bsz
+        } else {
+            0
+        };
+        (lo..=hi).filter(|bi| !slot.full.contains_key(bi)).collect()
+    }
+
+    pub fn need_win_for_span(&self, l: usize, c: u32) -> BTreeSet<u32> {
+        span_window_indices(self.lanes[l].pos, c, self.cfg.window_size, self.cfg.block_size)
+            .into_iter()
+            .filter(|bi| !self.lanes[l].win.contains_key(bi))
+            .collect()
+    }
+
+    pub fn span_alloc_count(&self, l: usize, c: u32) -> u32 {
+        (self.need_full_for_span(l, c).len() + self.need_win_for_span(l, c).len()) as u32
+    }
+
+    pub fn max_legal_span(&self, l: usize) -> u32 {
+        if self.is_decoding(l) {
+            1
+        } else {
+            let slot = &self.lanes[l];
+            let pe = prompt_end(slot.target, self.cfg.block_size);
+            self.cfg
+                .max_span
+                .min(self.cfg.step_token_budget)
+                .min(pe.saturating_sub(slot.pos))
+        }
+    }
+
     pub fn need_alloc(&self, l: usize) -> u32 {
         if !self.is_steppable_ready(l) {
             return 0;
         }
+        self.span_alloc_count(l, 1)
+    }
+
+    pub fn max_span_alloc(&self, l: usize) -> u32 {
+        if !self.is_steppable_ready(l) {
+            return 0;
+        }
+        self.span_alloc_count(l, self.max_legal_span(l))
+    }
+
+    fn new_boundaries_in_span(&self, l: usize, c: u32) -> Vec<(String, u32)> {
+        if c == 0 {
+            return Vec::new();
+        }
         let slot = &self.lanes[l];
-        let bi = slot.pos / self.cfg.block_size;
-        let nf = u32::from(!slot.full.contains_key(&bi));
-        let nw = u32::from(!slot.win.contains_key(&bi));
-        nf + nw
+        let bsz = self.cfg.block_size;
+        let pe = prompt_end(slot.target, bsz);
+        let stride = self.cfg.start_point_stride_blocks;
+        let lo_bi = slot.pos / bsz;
+        let hi_bi = ((slot.pos + c).min(pe) / bsz).min(self.cfg.num_blocks());
+        (lo_bi..hi_bi)
+            .filter_map(|bi| {
+                let bnd = (bi + 1) * bsz;
+                let blk_cnt = bi + 1;
+                let keep_bnd = bnd == pe || blk_cnt % stride == 0;
+                if keep_bnd && bnd > slot.pos && bnd <= slot.pos + c && bnd <= pe {
+                    Some((slot.prefix.clone(), bnd))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn new_state_mem_need(&self, l: usize) -> u32 {
+        if !self.is_steppable_ready(l) {
+            return 0;
+        }
+        let c = self.max_legal_span(l);
+        self.new_boundaries_in_span(l, c)
+            .into_iter()
+            .filter(|(p, k)| !self.state_in_mem(p, *k))
+            .count() as u32
     }
 
     pub fn current_working_set(&self, l: usize) -> u32 {
@@ -658,10 +814,32 @@ impl Scheduler {
             });
         let steppable_need: u32 = (0..self.lanes.len())
             .filter(|&l| self.is_steppable_ready(l))
-            .map(|l| self.need_alloc(l))
+            .map(|l| self.max_span_alloc(l))
             .sum();
         let ready_blocked = (0..self.lanes.len()).any(|l| self.is_steppable_ready(l))
             && self.mem_used() + steppable_need > self.cfg.mem_budget;
+        restore_blocked || ready_blocked
+    }
+
+    pub fn state_mem_pressure(&self) -> bool {
+        if self.cold_mem_states().is_empty() {
+            return false;
+        }
+        let restore_blocked = self.state_mem_used() >= self.state_mem_budget()
+            && (0..self.lanes.len()).any(|l| {
+                self.lanes[l].state == LaneState::Restoring
+                    && self.lanes[l].pos > 0
+                    && self
+                        .start_points
+                        .get(&(self.lanes[l].prefix.clone(), self.lanes[l].pos))
+                        .is_some_and(|sp| sp.state_tier == BlockTier::Disk)
+            });
+        let steppable_need: u32 = (0..self.lanes.len())
+            .filter(|&l| self.is_steppable_ready(l))
+            .map(|l| self.new_state_mem_need(l))
+            .sum();
+        let ready_blocked = (0..self.lanes.len()).any(|l| self.is_steppable_ready(l))
+            && self.state_mem_used() + steppable_need > self.state_mem_budget();
         restore_blocked || ready_blocked
     }
 
@@ -717,7 +895,29 @@ impl Scheduler {
             .lane_block_set(l)
             .iter()
             .all(|b| self.block_tier(b).in_memory());
-        all_in_mem || self.mem_used() < self.cfg.mem_budget || !self.cold_mem_blocks().is_empty()
+        let blk_ok = all_in_mem
+            || self.mem_used() < self.cfg.mem_budget
+            || !self.cold_mem_blocks().is_empty();
+        let st_ok = self.start_state_ready(l)
+            || self.state_mem_used() < self.state_mem_budget()
+            || !self.cold_mem_states().is_empty();
+        blk_ok && st_ok
+    }
+
+    fn is_active_restoring(&self, r: usize) -> bool {
+        if self.lanes[r].state != LaneState::Restoring {
+            return false;
+        }
+        let need_blk = self
+            .lane_block_set(r)
+            .iter()
+            .any(|rb| self.block_tier(rb) == BlockTier::Disk);
+        let need_st = self.lanes[r].pos > 0
+            && self
+                .start_points
+                .get(&(self.lanes[r].prefix.clone(), self.lanes[r].pos))
+                .is_some_and(|sp| sp.state_tier == BlockTier::Disk);
+        need_blk || need_st
     }
 
     /// All waiting lanes across `Ready`, `Restoring`, `Admitted`, and `Queued` that can
@@ -797,6 +997,7 @@ impl Scheduler {
             slot.reservation = 0;
             slot.admit_budget = 0;
             slot.wait_ticks = 0;
+            slot.ghost_bypass = 0;
             slot.restore_io_block = None;
             self.queue_seq.push(lane);
             Ok(ArriveOutcome::Queued)
@@ -804,6 +1005,7 @@ impl Scheduler {
             let queued_snapshot: Vec<usize> = self.queue_seq.clone();
             for q in queued_snapshot {
                 self.lanes[q].wait_ticks += 1;
+                self.lanes[q].ghost_bypass += 1;
             }
             let slot = &mut self.lanes[lane];
             slot.state = LaneState::Admitted;
@@ -815,6 +1017,7 @@ impl Scheduler {
             slot.reservation = 0;
             slot.admit_budget = wc;
             slot.wait_ticks = 0;
+            slot.ghost_bypass = 0;
             slot.restore_io_block = None;
             Ok(ArriveOutcome::DirectAdmitted)
         } else {
@@ -830,13 +1033,14 @@ impl Scheduler {
             slot.reservation = 0;
             slot.admit_budget = 0;
             slot.wait_ticks = 0;
+            slot.ghost_bypass = 0;
             slot.restore_io_block = None;
             Ok(ArriveOutcome::Refused429)
         }
     }
 
     /// Admit a `Queued` lane (`Queued -> Admitted`), preserving its `wait_ticks` and
-    /// incrementing `wait_ticks` on any older queued lanes it bypassed.
+    /// incrementing `wait_ticks` + unclamped `ghost_bypass` on older queued lanes it bypassed.
     pub fn admit(&mut self, lane: usize) -> Result<(), SchedError> {
         self.check_lane_idx(lane)?;
         if self.lanes[lane].state != LaneState::Queued {
@@ -850,20 +1054,24 @@ impl Scheduler {
             return Err(SchedError::Precondition("lane is not eligible to admit now"));
         }
         let wc = self.worst_case(self.lanes[lane].target);
-        let bypassed: Vec<usize> = self
+        let older_queued: Vec<usize> = self
             .queue_seq
             .iter()
             .copied()
-            .filter(|&q| {
-                q != lane
-                    && self.older_queued(q, lane)
-                    && self.lanes[q].wait_ticks < self.cfg.max_bypass
-            })
+            .filter(|&q| q != lane && self.older_queued(q, lane))
+            .collect();
+        let bypassed: Vec<usize> = older_queued
+            .iter()
+            .copied()
+            .filter(|&q| self.lanes[q].wait_ticks < self.cfg.max_bypass)
             .collect();
         self.lanes[lane].state = LaneState::Admitted;
         self.lanes[lane].admit_budget = wc;
         for q in bypassed {
             self.lanes[q].wait_ticks += 1; // MUTANT_ANCHOR_ADMIT_BYPASS
+        }
+        for q in older_queued {
+            self.lanes[q].ghost_bypass += 1;
         }
         self.queue_seq.retain(|&q| q != lane);
         Ok(())
@@ -900,7 +1108,7 @@ impl Scheduler {
         if self.reserved_total() + wc > self.cfg.mem_budget {
             return Err(SchedError::Precondition("insufficient memory budget for atomic restore reservation"));
         }
-        let k = self.best_boundary(&prefix, target);
+        let k = self.best_boundary(&prefix, prompt_end(target, self.cfg.block_size));
         let mut nf = BTreeMap::new();
         let mut nw = BTreeMap::new();
         if k > 0 {
@@ -950,13 +1158,7 @@ impl Scheduler {
         }
         let wl = self.lanes[lane].wait_ticks;
         let active_max = (0..self.lanes.len())
-            .filter(|&r| {
-                self.lanes[r].state == LaneState::Restoring
-                    && self
-                        .lane_block_set(r)
-                        .iter()
-                        .any(|rb| self.block_tier(rb) == BlockTier::Disk)
-            })
+            .filter(|&r| self.is_active_restoring(r))
             .map(|r| self.lanes[r].wait_ticks)
             .max()
             .unwrap_or(0);
@@ -964,7 +1166,46 @@ impl Scheduler {
             return Err(SchedError::Precondition("longer-waiting restoring lane must read first"));
         }
         if let Some(rec) = self.blocks.get_mut(block) {
-            rec.tier = BlockTier::Both;
+            rec.tier = BlockTier::Both; // MUTANT_ANCHOR_SCHED_RESTORE_BLOCK
+        }
+        Ok(())
+    }
+
+    /// Restore a spilled recurrent start-point state from disk into memory (`U57`).
+    pub fn restore_start_state(&mut self, lane: usize) -> Result<(), SchedError> {
+        self.check_lane_idx(lane)?;
+        if self.lanes[lane].state != LaneState::Restoring {
+            return Err(SchedError::InvalidState {
+                lane,
+                expected: "Restoring",
+                actual: self.lanes[lane].state,
+            });
+        }
+        let pos = self.lanes[lane].pos;
+        if pos == 0 || pos % self.cfg.block_size != 0 {
+            return Err(SchedError::Precondition("lane has no start-point boundary to restore"));
+        }
+        let pk = (self.lanes[lane].prefix.clone(), pos);
+        let Some(sp) = self.start_points.get(&pk) else {
+            return Err(SchedError::Precondition("start point not kept"));
+        };
+        if !sp.kept || sp.state_tier != BlockTier::Disk {
+            return Err(SchedError::Precondition("start-point state is not disk-only"));
+        }
+        if self.state_mem_used() >= self.state_mem_budget() {
+            return Err(SchedError::Precondition("state memory budget full during restore"));
+        }
+        let wl = self.lanes[lane].wait_ticks;
+        let active_max = (0..self.lanes.len())
+            .filter(|&r| self.is_active_restoring(r))
+            .map(|r| self.lanes[r].wait_ticks)
+            .max()
+            .unwrap_or(0);
+        if wl < active_max {
+            return Err(SchedError::Precondition("longer-waiting restoring lane must read first"));
+        }
+        if let Some(sp_mut) = self.start_points.get_mut(&pk) {
+            sp_mut.state_tier = BlockTier::Both;
         }
         Ok(())
     }
@@ -1047,37 +1288,48 @@ impl Scheduler {
         {
             return Err(SchedError::Precondition("not all lane blocks are in memory"));
         }
+        if !self.start_state_ready(lane) {
+            return Err(SchedError::Precondition("start-point recurrent state not in memory"));
+        }
         self.lanes[lane].state = LaneState::Ready;
         Ok(())
     }
 
-    /// Maximum single-step prefill span allowed for a prefilling lane under `max_span`,
-    /// block boundary alignment, and `prompt_end`.
+    /// Maximum single-step prefill span allowed for a prefilling lane under `max_span`
+    /// and `prompt_end` (`U56`: spans may cross block boundaries).
     fn max_prefill_span(&self, lane: usize) -> u32 {
         let slot = &self.lanes[lane];
         let pe = prompt_end(slot.target, self.cfg.block_size);
         let to_pe = pe.saturating_sub(slot.pos);
-        let to_blk = self.cfg.block_size - (slot.pos % self.cfg.block_size);
-        self.cfg.max_span.min(to_pe).min(to_blk)
+        self.cfg.max_span.min(to_pe)
     }
 
     fn violates_bypass_ceiling(&self, bypassed: &BTreeSet<usize>) -> bool {
         bypassed.iter().any(|&w| self.lanes[w].wait_ticks >= self.cfg.max_bypass) // MUTANT_ANCHOR_BYPASS_CEILING
     }
 
+    fn count_new_state_mem(&self, spans: &BTreeMap<usize, u32>) -> u32 {
+        let mut bnds: BTreeSet<(String, u32)> = BTreeSet::new();
+        for (&l, &sp) in spans {
+            for pk in self.new_boundaries_in_span(l, sp) {
+                if !self.state_in_mem(&pk.0, pk.1) {
+                    bnds.insert(pk);
+                }
+            }
+        }
+        bnds.len() as u32
+    }
+
     /// Deterministically plan and launch the next step (`Ready -> InStep`):
-    /// 1. Block step launch if any non-Ready actionable waiting lane (`Queued`, `Admitted`,
-    ///    `Restoring`) has reached the starvation ceiling `W` (`max_bypass`).
+    /// 1. Guard against active step or in-flight cold writeback (`step_io`, `U61`), and require
+    ///    chosen lanes to have pruned windows (`SlideWindow` runs explicitly before `BuildStep`).
     /// 2. Pick the longest-waiting fitting `Ready` lane as leader (decoders win ties at `max_w`),
     ///    plus every other `Ready` lane at `wait_ticks >= W`.
     /// 3. Pack all remaining fitting 1-token decoding lanes up to `step_token_budget`.
-    /// 4. Fill remaining `step_token_budget` with prefill chunks without starving fitting decoders.
-    ///
-    /// Returns `Ok(None)` when no valid step can start right now (e.g. step already active,
-    /// no steppable ready lanes, a non-Ready lane hit `W` and must advance first, or memory
-    /// reclaim is needed before allocating private tail blocks).
+    /// 4. Fill remaining `step_token_budget` with (possibly multi-block, `U56`) prefill chunks
+    ///    without starving fitting decoders or exceeding `mem_budget` / `state_mem_budget`.
     pub fn build_step(&mut self) -> Result<Option<BuiltStep>, SchedError> {
-        if self.step_active {
+        if self.step_active || !self.step_io.is_empty() {
             return Ok(None);
         }
         let steppable: Vec<usize> = (0..self.lanes.len())
@@ -1089,6 +1341,8 @@ impl Scheduler {
 
         let mem_used = self.mem_used();
         let mem_budget = self.cfg.mem_budget;
+        let st_mem_used = self.state_mem_used();
+        let st_mem_budget = self.state_mem_budget();
         let max_w = steppable
             .iter()
             .map(|&l| self.lanes[l].wait_ticks)
@@ -1101,16 +1355,17 @@ impl Scheduler {
                 && mem_used + self.need_alloc(l) <= mem_budget
         });
 
-        // 1. Leader: longest-waiting fitting Ready lane (decoder preferred on tie at max_w).
+        // 1. Leader: longest-waiting fitting pruned Ready lane (decoder preferred on tie at max_w).
         let leader = steppable
             .iter()
             .copied()
             .filter(|&l| {
-                self.lanes[l].wait_ticks == max_w
+                self.window_pruned(l)
+                    && self.lanes[l].wait_ticks == max_w
                     && mem_used + self.need_alloc(l) <= mem_budget
                     && (!has_max_decoder || self.is_decoding(l))
             })
-            .min(); // lowest lane index tie-breaker
+            .min();
         let Some(leader) = leader else {
             return Ok(None);
         };
@@ -1121,7 +1376,12 @@ impl Scheduler {
         let mut used_tokens: u32 = 0;
         let mut alloc_cnt: u32 = 0;
 
-        // Helper closure-style additions: reserve 1 token first for leader and ceiling lanes.
+        let mut init_spans = BTreeMap::new();
+        init_spans.insert(leader, 1);
+        if st_mem_used + self.count_new_state_mem(&init_spans) > st_mem_budget {
+            return Ok(None);
+        }
+
         chosen_set.insert(leader);
         chosen_order.push(leader);
         spans.insert(leader, 1);
@@ -1142,15 +1402,21 @@ impl Scheduler {
             )
         });
         for l in ceiling_ready {
+            if !self.window_pruned(l) {
+                return Ok(None);
+            }
             let need = self.need_alloc(l);
+            let mut trial = spans.clone();
+            trial.insert(l, 1);
             if used_tokens + 1 > self.cfg.step_token_budget
                 || mem_used + alloc_cnt + need > mem_budget
+                || st_mem_used + self.count_new_state_mem(&trial) > st_mem_budget
             {
                 break;
             }
             chosen_set.insert(l);
             chosen_order.push(l);
-            spans.insert(l, 1);
+            spans = trial;
             used_tokens += 1;
             alloc_cnt += need;
         }
@@ -1163,6 +1429,12 @@ impl Scheduler {
             .collect();
         decoders.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
         for d in decoders {
+            if !self.window_pruned(d) {
+                if mem_used + alloc_cnt + self.need_alloc(d) <= mem_budget {
+                    return Ok(None);
+                }
+                continue;
+            }
             let need = self.need_alloc(d);
             if used_tokens + 1 <= self.cfg.step_token_budget
                 && mem_used + alloc_cnt + need <= mem_budget
@@ -1184,42 +1456,57 @@ impl Scheduler {
 
         // 4. Prefill chunks sliced up to step_token_budget (only when no fitting decoder is starved).
         if !any_fit_unchosen_decoder {
-            // Expand already-chosen prefill lanes first (leader, then ceiling lanes).
             for &l in &chosen_order {
                 if self.is_prefilling(l) && used_tokens < self.cfg.step_token_budget {
                     let rem = self.cfg.step_token_budget - used_tokens;
                     let cur = spans[&l];
-                    let cap = self.max_prefill_span(l);
-                    let extra = cap.saturating_sub(cur).min(rem);
-                    if extra > 0 {
-                        spans.insert(l, cur + extra);
-                        used_tokens += extra;
+                    let cap = self.max_prefill_span(l).min(cur + rem);
+                    let cur_alloc = self.span_alloc_count(l, cur);
+                    for cand in (cur + 1..=cap).rev() {
+                        let cand_alloc = self.span_alloc_count(l, cand);
+                        if mem_used + (alloc_cnt - cur_alloc + cand_alloc) > mem_budget {
+                            continue;
+                        }
+                        let mut trial = spans.clone();
+                        trial.insert(l, cand);
+                        if st_mem_used + self.count_new_state_mem(&trial) <= st_mem_budget {
+                            used_tokens += cand - cur;
+                            alloc_cnt = alloc_cnt - cur_alloc + cand_alloc;
+                            spans = trial;
+                            break;
+                        }
                     }
                 }
             }
-            // Add additional ready prefill lanes up to token & memory budget.
             let mut prefillers: Vec<usize> = steppable
                 .iter()
                 .copied()
-                .filter(|&l| !chosen_set.contains(&l) && self.is_prefilling(l))
+                .filter(|&l| {
+                    !chosen_set.contains(&l) && self.is_prefilling(l) && self.window_pruned(l)
+                })
                 .collect();
             prefillers.sort_by_key(|&l| (std::cmp::Reverse(self.lanes[l].wait_ticks), l));
             for p in prefillers {
                 if used_tokens >= self.cfg.step_token_budget {
                     break;
                 }
-                let need = self.need_alloc(p);
-                if mem_used + alloc_cnt + need > mem_budget {
-                    continue;
-                }
                 let rem = self.cfg.step_token_budget - used_tokens;
-                let span = self.max_prefill_span(p).min(rem);
-                if span > 0 {
-                    chosen_set.insert(p);
-                    chosen_order.push(p);
-                    spans.insert(p, span);
-                    used_tokens += span;
-                    alloc_cnt += need;
+                let cap = self.max_prefill_span(p).min(rem);
+                for cand in (1..=cap).rev() {
+                    let cand_alloc = self.span_alloc_count(p, cand);
+                    if mem_used + alloc_cnt + cand_alloc > mem_budget {
+                        continue;
+                    }
+                    let mut trial = spans.clone();
+                    trial.insert(p, cand);
+                    if st_mem_used + self.count_new_state_mem(&trial) <= st_mem_budget {
+                        chosen_set.insert(p);
+                        chosen_order.push(p);
+                        spans = trial;
+                        used_tokens += cand;
+                        alloc_cnt += cand_alloc;
+                        break;
+                    }
                 }
             }
         }
@@ -1230,22 +1517,22 @@ impl Scheduler {
             return Ok(None);
         }
 
-        // Allocate private unsealed zero-padded tail blocks for chosen lanes that need them.
+        // Allocate private unsealed zero-padded blocks across each chosen lane's span (`U56`).
         let bsz = self.cfg.block_size;
         let mut new_ids: Vec<(usize, BlockId, u32)> = Vec::new();
         for &l in &chosen_set {
-            let bi = self.lanes[l].pos / bsz;
-            if !self.lanes[l].full.contains_key(&bi) {
-                let id = BlockId::Priv { lane: l, kind: BlockKind::Full };
+            let sp = spans[&l];
+            for bi in self.need_full_for_span(l, sp) {
+                let id = BlockId::Priv { lane: l, kind: BlockKind::Full, idx: bi };
                 if self.block_tier(&id).is_present() {
-                    return Err(SchedError::Precondition("private full tail already allocated"));
+                    return Err(SchedError::Precondition("private full block already allocated"));
                 }
                 new_ids.push((l, id, bi));
             }
-            if !self.lanes[l].win.contains_key(&bi) {
-                let id = BlockId::Priv { lane: l, kind: BlockKind::Window };
+            for bi in self.need_win_for_span(l, sp) {
+                let id = BlockId::Priv { lane: l, kind: BlockKind::Window, idx: bi };
                 if self.block_tier(&id).is_present() {
-                    return Err(SchedError::Precondition("private window tail already allocated"));
+                    return Err(SchedError::Precondition("private window block already allocated"));
                 }
                 new_ids.push((l, id, bi));
             }
@@ -1278,6 +1565,7 @@ impl Scheduler {
         for &l in &chosen_set {
             self.lanes[l].state = LaneState::InStep;
             self.lanes[l].wait_ticks = 0;
+            self.lanes[l].ghost_bypass = 0;
             let pos = self.lanes[l].pos;
             let sp = spans[&l];
             for bi in full_indices(pos + sp, bsz) {
@@ -1292,11 +1580,12 @@ impl Scheduler {
             }
         }
 
-        // Increment wait_ticks on every bypassed actionable waiting lane.
+        // Increment wait_ticks and unclamped ghost_bypass on every bypassed actionable waiting lane.
         for w in bypassed {
             if self.lanes[w].wait_ticks <= self.cfg.max_bypass {
                 self.lanes[w].wait_ticks += 1; // MUTANT_ANCHOR_STEP_BYPASS
             }
+            self.lanes[w].ghost_bypass += 1;
         }
 
         self.sync_ref_counts();
@@ -1317,8 +1606,7 @@ impl Scheduler {
         }))
     }
 
-    /// Execute the GPU work of the active step, populating `[off..off+cnt]` in each chosen
-    /// lane's private tail blocks and setting `gpu_done = true`.
+    /// Execute the GPU work of the active step across single- or multi-block spans (`U56`).
     pub fn gpu_execute(&mut self) -> Result<(), SchedError> {
         if !self.step_active || self.gpu_done {
             return Err(SchedError::Precondition("gpu_execute requires active step with gpu_done == false"));
@@ -1327,18 +1615,28 @@ impl Scheduler {
         let step_lanes: Vec<usize> = self.step_lanes.iter().copied().collect();
         for l in step_lanes {
             let pos = self.lanes[l].pos;
-            let bi = pos / bsz;
-            let off = (pos % bsz) as usize;
-            let cnt = self.step_span[l] as usize;
-            for bid in [self.lanes[l].full.get(&bi).cloned(), self.lanes[l].win.get(&bi).cloned()]
-                .into_iter()
-                .flatten()
-            {
-                if let Some(rec) = self.blocks.get_mut(&bid) {
-                    if rec.tier.is_present() && !rec.sealed {
-                        rec.length = (off + cnt) as u32;
-                        for v in &mut rec.data[off..off + cnt] {
-                            *v = 1;
+            let span = self.step_span[l];
+            if span == 0 {
+                continue;
+            }
+            let end_pos = pos + span - 1;
+            for bi in window_indices(pos, end_pos, bsz) {
+                let lo_in_blk = if bi == pos / bsz { (pos % bsz) as usize } else { 0 };
+                let hi_excl = if bi == end_pos / bsz {
+                    ((end_pos % bsz) + 1) as usize
+                } else {
+                    bsz as usize
+                };
+                for bid in [self.lanes[l].full.get(&bi).cloned(), self.lanes[l].win.get(&bi).cloned()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(rec) = self.blocks.get_mut(&bid) {
+                        if rec.tier.is_present() && !rec.sealed {
+                            rec.length = hi_excl as u32;
+                            for v in &mut rec.data[lo_in_blk..hi_excl] {
+                                *v = 1;
+                            }
                         }
                     }
                 }
@@ -1397,28 +1695,44 @@ impl Scheduler {
             .filter(|&l| self.lanes[l].state == LaneState::Cancelling)
             .collect();
 
+        let num_blks = self.cfg.num_blocks();
+        let mut sealed_per_lane: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         let mut boundary_lanes: Vec<(usize, u32)> = Vec::new();
         for &l in &surviving {
-            let npos = self.lanes[l].pos + self.step_span[l];
-            if npos % bsz == 0 {
-                boundary_lanes.push((l, npos));
+            let old_pos = self.lanes[l].pos;
+            let npos = old_pos + self.step_span[l];
+            let pe = prompt_end(self.lanes[l].target, bsz);
+            let lo_bi = old_pos / bsz;
+            let hi_bi = (npos.min(pe) / bsz).min(num_blks);
+            let mut bis = Vec::new();
+            for bi in lo_bi..hi_bi {
+                let bnd = (bi + 1) * bsz;
+                if bnd > old_pos && bnd <= npos && bnd <= pe {
+                    bis.push(bi);
+                    boundary_lanes.push((l, bnd));
+                }
             }
+            sealed_per_lane.insert(l, bis);
         }
 
-        // Publish sealed tree blocks for boundary lanes and retire private tails.
+        // Publish sealed prefill tree blocks (`<= PromptEnd`, Decision 4 / `U58`) and retire private blocks.
         let mut published_tree: BTreeSet<BlockId> = BTreeSet::new();
         let mut retired_priv: BTreeSet<BlockId> = BTreeSet::new();
-        for &(l, npos) in &boundary_lanes {
-            let bi = (npos / bsz) - 1;
+        for &l in &surviving {
             let pfx = self.lanes[l].prefix.clone();
-            published_tree.insert(BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi });
-            published_tree.insert(BlockId::Tree { prefix: pfx, kind: BlockKind::Window, idx: bi });
-            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Full });
-            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Window });
+            for &bi in &sealed_per_lane[&l] {
+                published_tree.insert(BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi });
+                published_tree.insert(BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: bi });
+                retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Full, idx: bi });
+                retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Window, idx: bi });
+            }
         }
         for &l in &cancelling {
-            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Full });
-            retired_priv.insert(BlockId::Priv { lane: l, kind: BlockKind::Window });
+            for b in self.lanes[l].full.values().chain(self.lanes[l].win.values()) {
+                if matches!(b, BlockId::Priv { .. }) {
+                    retired_priv.insert(b.clone());
+                }
+            }
         }
 
         for id in &retired_priv {
@@ -1448,13 +1762,13 @@ impl Scheduler {
             );
         }
 
-        // Update surviving lanes: advance position, bind sealed blocks, prune window to History(npos).
+        // Update surviving lanes: advance position and bind sealed prefill blocks (`laneWin` stays
+        // unpruned here so `slide_window` executes as an explicit transition before `build_step`).
         for &l in &surviving {
             let npos = self.lanes[l].pos + self.step_span[l];
             let pfx = self.lanes[l].prefix.clone();
             self.lanes[l].pos = npos;
-            if npos % bsz == 0 {
-                let bi = (npos / bsz) - 1;
+            for &bi in &sealed_per_lane[&l] {
                 self.lanes[l].full.insert(
                     bi,
                     BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: bi },
@@ -1464,31 +1778,38 @@ impl Scheduler {
                     BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: bi },
                 );
             }
-            let keep = history_indices(npos, wsz, bsz);
-            self.lanes[l].win.retain(|bi, _| keep.contains(bi));
             self.lanes[l].state = LaneState::Ready;
         }
 
-        // Record kept start points at configured block stride and prompt ends.
+        // Record kept start points ONLY on prefill boundaries (`<= PromptEnd`, `U58`) with `state_tier` (`U57`).
         let stride = self.cfg.start_point_stride_blocks;
-        for &(l, npos) in &boundary_lanes {
-            let blk_cnt = npos / bsz;
-            let at_prompt_end = npos == prompt_end(self.lanes[l].target, bsz) || npos == self.lanes[l].target;
+        for &(l, bnd) in &boundary_lanes {
+            let blk_cnt = bnd / bsz;
+            let at_prompt_end = bnd == prompt_end(self.lanes[l].target, bsz);
             if !at_prompt_end && blk_cnt % stride != 0 {
                 continue;
             }
             let pfx = self.lanes[l].prefix.clone();
-            let full = full_indices(npos, bsz)
+            let prev_st = self
+                .start_points
+                .get(&(pfx.clone(), bnd))
+                .map_or(BlockTier::None, |sp| sp.state_tier);
+            let next_st = if prev_st.on_disk() {
+                BlockTier::Both
+            } else {
+                BlockTier::Memory
+            };
+            let full = full_indices(bnd, bsz)
                 .into_iter()
                 .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Full, idx: i })
                 .collect();
-            let win = history_indices(npos, wsz, bsz)
+            let win = history_indices(bnd, wsz, bsz)
                 .into_iter()
                 .map(|i| BlockId::Tree { prefix: pfx.clone(), kind: BlockKind::Window, idx: i })
                 .collect();
             self.start_points.insert(
-                (pfx, npos),
-                StartPoint { kept: true, state_kept: true, full, win },
+                (pfx, bnd),
+                StartPoint { kept: true, state_tier: next_st, full, win },
             );
         }
 
@@ -1505,6 +1826,8 @@ impl Scheduler {
             slot.win.clear();
             slot.reservation = 0;
             slot.admit_budget = 0;
+            slot.wait_ticks = 0;
+            slot.ghost_bypass = 0;
             slot.restore_io_block = None;
         }
 
@@ -1585,30 +1908,32 @@ impl Scheduler {
         slot.reservation = 0;
         slot.admit_budget = 0;
         slot.wait_ticks = 0;
+        slot.ghost_bypass = 0;
         slot.restore_io_block = None;
         self.sync_ref_counts();
     }
 
     // ---- Memory Pressure, Cold Spill & Window Maintenance -----------------------------------
 
-    pub fn evict_clean_or_unref_mem(&mut self) -> bool {
+    pub fn evict_clean_or_unref_mem_id(&mut self) -> Option<BlockId> {
         if !self.mem_pressure() {
-            return false;
+            return None;
         }
-        let victim = self.cold_mem_blocks().into_iter().find(|id| {
+        let id = self.cold_mem_blocks().into_iter().find(|id| {
             let rec = &self.blocks[id];
             rec.tier.on_disk() || rec.ref_count == 0
-        });
-        let Some(id) = victim else {
-            return false;
-        };
+        })?;
         let rec = &self.blocks[&id];
         if rec.ref_count == 0 && !rec.tier.on_disk() {
             self.blocks.remove(&id);
         } else if let Some(r) = self.blocks.get_mut(&id) {
             r.tier = BlockTier::Disk;
         }
-        true
+        Some(id)
+    }
+
+    pub fn evict_clean_or_unref_mem(&mut self) -> bool {
+        self.evict_clean_or_unref_mem_id().is_some()
     }
 
     pub fn start_cold_writeback(&mut self) -> Option<BlockId> {
@@ -1630,42 +1955,91 @@ impl Scheduler {
         Some(victim)
     }
 
-    pub fn reclaim_cold_disk(&mut self) -> bool {
-        if self.disk_used() + (self.step_io.len() as u32) < self.cfg.disk_budget {
-            return false;
+    pub fn evict_clean_start_state(&mut self) -> Option<(String, u32)> {
+        if !self.state_mem_pressure() {
+            return None;
         }
-        let cold_disk = self.cold_disk_blocks();
-        let has_unref_disk = cold_disk.iter().any(|id| self.blocks[id].ref_count == 0);
-        if !self.mem_pressure() && !has_unref_disk {
-            return false;
+        let pk = self
+            .cold_mem_states()
+            .into_iter()
+            .find(|pk| self.start_points[pk].state_tier.on_disk())?;
+        if let Some(sp) = self.start_points.get_mut(&pk) {
+            sp.state_tier = BlockTier::Disk;
         }
-        if let Some(id) = cold_disk.into_iter().find(|id| self.blocks[id].ref_count == 0) {
-            if self.blocks[&id].tier.in_memory() {
-                self.blocks.get_mut(&id).unwrap().tier = BlockTier::Memory;
-            } else {
-                self.blocks.remove(&id);
-            }
-            return true;
+        Some(pk)
+    }
+
+    pub fn spill_start_state(&mut self) -> Option<(String, u32)> {
+        if !self.state_mem_pressure() {
+            return None;
         }
-        let cold_mem: BTreeSet<BlockId> = self.cold_mem_blocks().into_iter().collect();
-        let cold_disk_set: BTreeSet<BlockId> = self.cold_disk_blocks().into_iter().collect();
-        let victim_pk = self
-            .start_points
+        let has_clean = self
+            .cold_mem_states()
             .iter()
-            .find(|(_, sp)| {
-                sp.kept
-                    && sp.full.iter().chain(&sp.win).all(|b| !self.step_io.contains(b))
-                    && sp
-                        .full
-                        .iter()
-                        .chain(&sp.win)
-                        .any(|b| cold_disk_set.contains(b) || cold_mem.contains(b))
-            })
-            .map(|(pk, _)| pk.clone());
-        if let Some(pk) = victim_pk {
-            self.start_points.remove(&pk);
-            self.sync_ref_counts();
-            return true;
+            .any(|pk| self.start_points[pk].state_tier.on_disk());
+        if has_clean || self.state_disk_used() >= self.state_disk_budget() {
+            return None;
+        }
+        let pk = self
+            .cold_mem_states()
+            .into_iter()
+            .find(|pk| self.start_points[pk].state_tier == BlockTier::Memory)?;
+        if let Some(sp) = self.start_points.get_mut(&pk) {
+            sp.state_tier = BlockTier::Disk;
+        }
+        Some(pk)
+    }
+
+    pub fn reclaim_cold_disk(&mut self) -> bool {
+        let need_start = self.restoring_start_need();
+        if self.disk_used() + (self.step_io.len() as u32) >= self.cfg.disk_budget {
+            let cold_disk = self.cold_disk_blocks();
+            let has_unref_disk = cold_disk.iter().any(|id| self.blocks[id].ref_count == 0);
+            if self.mem_pressure() || has_unref_disk {
+                if let Some(id) = cold_disk.into_iter().find(|id| self.blocks[id].ref_count == 0) {
+                    if self.blocks[&id].tier.in_memory() {
+                        self.blocks.get_mut(&id).unwrap().tier = BlockTier::Memory;
+                    } else {
+                        self.blocks.remove(&id);
+                    }
+                    return true;
+                }
+                let cold_mem: BTreeSet<BlockId> = self.cold_mem_blocks().into_iter().collect();
+                let cold_disk_set: BTreeSet<BlockId> = self.cold_disk_blocks().into_iter().collect();
+                let victim_pk = self
+                    .start_points
+                    .iter()
+                    .find(|(pk, sp)| {
+                        sp.kept
+                            && !need_start.contains(*pk)
+                            && sp.full.iter().chain(&sp.win).all(|b| !self.step_io.contains(b))
+                            && sp
+                                .full
+                                .iter()
+                                .chain(&sp.win)
+                                .any(|b| cold_disk_set.contains(b) || cold_mem.contains(b))
+                    })
+                    .map(|(pk, _)| pk.clone());
+                if let Some(pk) = victim_pk {
+                    self.start_points.remove(&pk);
+                    self.sync_ref_counts();
+                    return true;
+                }
+            }
+        }
+        if self.state_disk_used() >= self.state_disk_budget() && self.state_mem_pressure() {
+            let mut cands: BTreeSet<(String, u32)> =
+                self.cold_disk_states().into_iter().collect();
+            cands.extend(self.cold_mem_states());
+            if let Some(pk) = cands.into_iter().find(|pk| {
+                self.start_points
+                    .get(pk)
+                    .is_some_and(|sp| sp.full.iter().chain(&sp.win).all(|b| !self.step_io.contains(b)))
+            }) {
+                self.start_points.remove(&pk);
+                self.sync_ref_counts();
+                return true;
+            }
         }
         false
     }
@@ -1717,12 +2091,44 @@ impl Scheduler {
         if self.disk_used() > self.cfg.disk_budget {
             return Err(format!("DiskUsed {} > DiskBudget {}", self.disk_used(), self.cfg.disk_budget));
         }
+        if self.state_mem_used() > self.state_mem_budget() {
+            return Err(format!(
+                "StateMemUsed {} > StateMemBudget {}",
+                self.state_mem_used(),
+                self.state_mem_budget()
+            ));
+        }
+        if self.state_disk_used() > self.state_disk_budget() {
+            return Err(format!(
+                "StateDiskUsed {} > StateDiskBudget {}",
+                self.state_disk_used(),
+                self.state_disk_budget()
+            ));
+        }
         if self.reserved_total() > self.cfg.mem_budget {
             return Err(format!(
                 "ReservedTotal {} > MemBudget {}",
                 self.reserved_total(),
                 self.cfg.mem_budget
             ));
+        }
+        let max_pf_bnd = self
+            .cfg
+            .request_lengths
+            .iter()
+            .copied()
+            .map(|r| prompt_end(r, bsz))
+            .max()
+            .unwrap_or(0);
+        for ((pfx, bnd), sp) in &self.start_points {
+            if sp.kept {
+                if !sp.state_tier.is_present() {
+                    return Err(format!("start point ({pfx}, {bnd}) kept without state_tier"));
+                }
+                if *bnd > max_pf_bnd {
+                    return Err(format!("decode boundary ({pfx}, {bnd}) illegally sealed as start point"));
+                }
+            }
         }
 
         // 2. BypassBoundHolds
@@ -1732,6 +2138,18 @@ impl Scheduler {
                     "lane {i} ({:?}) wait_ticks {} > max_bypass {}",
                     slot.state, slot.wait_ticks, self.cfg.max_bypass
                 ));
+            }
+            if slot.state.is_mem_holding() {
+                let dec_bi = prompt_end(slot.target, bsz) / bsz;
+                for (&bi, bid) in slot.full.iter().chain(&slot.win) {
+                    if bi >= dec_bi {
+                        if !matches!(bid, BlockId::Priv { .. })
+                            || self.blocks.get(bid).is_some_and(|r| r.sealed)
+                        {
+                            return Err(format!("lane {i} decode block {bi} ({bid:?}) sealed"));
+                        }
+                    }
+                }
             }
             if matches!(slot.state, LaneState::Restoring | LaneState::Ready | LaneState::InStep) {
                 let ws = self.current_working_set(i);
@@ -1866,10 +2284,66 @@ impl Scheduler {
 
 // ---- TLA+ Trace Capture & Bundle Rendering (`specs/CacheScheduler.tla`) ---------------------
 
+/// Named scheduler transition and arguments bound into `TraceCheck.tla::DispatchStep` (`U68`)
+/// so a recorded step that leaves state unchanged (stutter) or fires the wrong action is rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceAction {
+    Init,
+    Arrive { lane: usize, prefix: String, target: u32 },
+    Refuse429 { lane: usize },
+    Admit { lane: usize },
+    BeginRestore { lane: usize },
+    RestoreBlock { lane: usize, block: BlockId },
+    RestoreStartState { lane: usize },
+    FinishRestore { lane: usize },
+    EvictCleanOrUnrefMem { block: BlockId },
+    StartColdWriteback { block: BlockId },
+    EvictCleanStartState { prefix: String, boundary: u32 },
+    SpillStartState { prefix: String, boundary: u32 },
+    ReclaimColdDisk,
+    DropUnreferenced { block: BlockId },
+    SlideWindow { lane: usize },
+    FinishReady { lane: usize },
+    BuildStep { spans: BTreeMap<usize, u32> },
+    GpuExecute,
+    CompleteStepIO,
+    FinishStep,
+    Cancel { lane: usize },
+}
+
+impl TraceAction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Init => "Init",
+            Self::Arrive { .. } => "Arrive",
+            Self::Refuse429 { .. } => "Refuse429",
+            Self::Admit { .. } => "Admit",
+            Self::BeginRestore { .. } => "BeginRestore",
+            Self::RestoreBlock { .. } => "RestoreBlock",
+            Self::RestoreStartState { .. } => "RestoreStartState",
+            Self::FinishRestore { .. } => "FinishRestore",
+            Self::EvictCleanOrUnrefMem { .. } => "EvictCleanOrUnrefMem",
+            Self::StartColdWriteback { .. } => "StartColdWriteback",
+            Self::EvictCleanStartState { .. } => "EvictCleanStartState",
+            Self::SpillStartState { .. } => "SpillStartState",
+            Self::ReclaimColdDisk => "ReclaimColdDisk",
+            Self::DropUnreferenced { .. } => "DropUnreferenced",
+            Self::SlideWindow { .. } => "SlideWindow",
+            Self::FinishReady { .. } => "FinishReady",
+            Self::BuildStep { .. } => "BuildStep",
+            Self::GpuExecute => "GpuExecute",
+            Self::CompleteStepIO => "CompleteStepIO",
+            Self::FinishStep => "FinishStep",
+            Self::Cancel { .. } => "Cancel",
+        }
+    }
+}
+
 /// One recorded state snapshot for TLC trace conformance checking.
 #[derive(Clone, Debug)]
 pub struct TraceStep {
     pub action: String,
+    pub trace_action: TraceAction,
     pub blocks: BTreeMap<BlockId, BlockRecord>,
     pub start_points: BTreeMap<(String, u32), StartPoint>,
     pub lanes: Vec<LaneSlot>,
@@ -1894,13 +2368,14 @@ impl SchedulerTrace {
             config: sched.cfg.clone(),
             steps: Vec::new(),
         };
-        t.record("Init", sched);
+        t.record_action(TraceAction::Init, sched);
         t
     }
 
-    pub fn record(&mut self, action: &str, sched: &Scheduler) {
+    pub fn record_action(&mut self, trace_action: TraceAction, sched: &Scheduler) {
         self.steps.push(TraceStep {
-            action: action.to_string(),
+            action: trace_action.name().to_string(),
+            trace_action,
             blocks: sched.blocks.clone(),
             start_points: sched.start_points.clone(),
             lanes: sched.lanes.clone(),
@@ -1924,9 +2399,60 @@ fn tla_block_id(id: &BlockId, lane_names: &[String]) -> String {
         BlockId::Tree { prefix, kind, idx } => {
             format!("<<\"tree\", \"{}\", \"{}\", {}>>", prefix, kind.as_tla(), idx)
         }
-        BlockId::Priv { lane, kind } => {
-            format!("<<\"priv\", \"{}\", \"{}\">>", lane_names[*lane], kind.as_tla())
+        BlockId::Priv { lane, kind, idx } => {
+            format!("<<\"priv\", \"{}\", \"{}\", {}>>", lane_names[*lane], kind.as_tla(), idx)
         }
+    }
+}
+
+fn tla_trace_action(act: &TraceAction, cfg: &SchedulerConfig) -> String {
+    let ln = &cfg.lanes;
+    match act {
+        TraceAction::Init => "<<\"Init\">>".into(),
+        TraceAction::Arrive { lane, prefix, target } => {
+            format!("<<\"Arrive\", \"{}\", \"{}\", {}>>", ln[*lane], prefix, target)
+        }
+        TraceAction::Refuse429 { lane }
+        | TraceAction::Admit { lane }
+        | TraceAction::BeginRestore { lane }
+        | TraceAction::RestoreStartState { lane }
+        | TraceAction::FinishRestore { lane }
+        | TraceAction::SlideWindow { lane }
+        | TraceAction::FinishReady { lane }
+        | TraceAction::Cancel { lane } => {
+            format!("<<\"{}\", \"{}\">>", act.name(), ln[*lane])
+        }
+        TraceAction::RestoreBlock { lane, block } => {
+            format!("<<\"RestoreBlock\", \"{}\", {}>>", ln[*lane], tla_block_id(block, ln))
+        }
+        TraceAction::EvictCleanOrUnrefMem { block }
+        | TraceAction::StartColdWriteback { block }
+        | TraceAction::DropUnreferenced { block } => {
+            format!("<<\"{}\", {}>>", act.name(), tla_block_id(block, ln))
+        }
+        TraceAction::EvictCleanStartState { prefix, boundary }
+        | TraceAction::SpillStartState { prefix, boundary } => {
+            format!("<<\"{}\", \"{}\", {}>>", act.name(), prefix, boundary)
+        }
+        TraceAction::BuildStep { spans } => {
+            let chosen: Vec<String> = spans
+                .iter()
+                .filter(|(_, &tok)| tok > 0)
+                .map(|(&l, _)| tla_str(&ln[l]))
+                .collect();
+            let sp_seq: Vec<String> = (0..ln.len())
+                .map(|l| spans.get(&l).copied().unwrap_or(0).to_string())
+                .collect();
+            format!(
+                "<<\"BuildStep\", {{{}}}, <<{}>>>>",
+                chosen.join(", "),
+                sp_seq.join(", ")
+            )
+        }
+        TraceAction::ReclaimColdDisk
+        | TraceAction::GpuExecute
+        | TraceAction::CompleteStepIO
+        | TraceAction::FinishStep => format!("<<\"{}\">>", act.name()),
     }
 }
 
@@ -1948,7 +2474,6 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
     let ln = &cfg.lanes;
     let n_blks = cfg.num_blocks();
 
-    // Only serialize present blocks as an association tuple; TraceCheck hydrates the full domain.
     let mut blk_entries = Vec::new();
     for (id, rec) in &step.blocks {
         if !rec.tier.is_present() {
@@ -1973,10 +2498,10 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
             continue;
         }
         sp_entries.push(format!(
-            "[prefix |-> \"{}\", boundary |-> {}, stateKept |-> {}, full |-> {}, win |-> {}]",
+            "[prefix |-> \"{}\", boundary |-> {}, stateTier |-> \"{}\", full |-> {}, win |-> {}]",
             pfx,
             k,
-            if sp.state_kept { "TRUE" } else { "FALSE" },
+            sp.state_tier.as_tla(),
             tla_block_set(&sp.full, ln),
             tla_block_set(&sp.win, ln)
         ));
@@ -1999,7 +2524,7 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
             })
             .collect();
         lane_entries.push(format!(
-            "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, stepSpan |-> {}]",
+            "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, ghostBypass |-> {}, stepSpan |-> {}]",
             slot.state.as_tla(),
             slot.prefix,
             slot.target,
@@ -2009,6 +2534,7 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
             slot.reservation,
             slot.admit_budget,
             slot.wait_ticks,
+            slot.ghost_bypass,
             step.step_span[i]
         ));
     }
@@ -2016,7 +2542,8 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
     let q_items: Vec<String> = step.queue_seq.iter().map(|&l| tla_str(&ln[l])).collect();
 
     format!(
-        "[blocks |-> {{{}}}, startPoints |-> {{{}}}, lanes |-> {}, queueSeq |-> {}, stepActive |-> {}, stepLanes |-> {}, stepPins |-> {}, stepIO |-> {}, gpuDone |-> {}]",
+        "[act |-> {}, blocks |-> {{{}}}, startPoints |-> {{{}}}, lanes |-> {}, queueSeq |-> {}, stepActive |-> {}, stepLanes |-> {}, stepPins |-> {}, stepIO |-> {}, gpuDone |-> {}]",
+        tla_trace_action(&step.trace_action, cfg),
         blk_entries.join(", "),
         sp_entries.join(", "),
         tla_seq_strings(&lane_entries),
@@ -2030,8 +2557,8 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
 }
 
 /// Render `(TraceData.tla, TraceCheck.tla, TraceCheck.cfg)` verifying one or more concrete
-/// `SchedulerTrace` runs directly against `specs/CacheScheduler.tla` (`Init /\ [][Next]_vars`
-/// plus all 12 safety invariants and 4 action properties).
+/// `SchedulerTrace` runs directly against `specs/CacheScheduler.tla` (`Init /\ [][Next]_vars`,
+/// step-exact `ActionConforms`, all 13 safety invariants, and all 5 action properties).
 pub fn render_cache_scheduler_tla_bundle(
     traces: &[SchedulerTrace],
 ) -> Result<(String, String, String), SchedError> {
@@ -2115,7 +2642,7 @@ pub fn render_cache_scheduler_tla_bundle(
              [pk \\in Prefixes \\X Boundaries |->\n\
                  IF \\E e \\in sps : e.prefix = pk[1] /\\ e.boundary = pk[2]\n\
                  THEN LET e == CHOOSE x \\in sps : x.prefix = pk[1] /\\ x.boundary = pk[2]\n\
-                      IN [kept |-> TRUE, stateKept |-> e.stateKept, full |-> e.full, win |-> e.win]\n\
+                      IN [kept |-> TRUE, stateTier |-> e.stateTier, full |-> e.full, win |-> e.win]\n\
                  ELSE EmptyStart]\n\
          \n\
          ApplyStep(s) ==\n\
@@ -2130,6 +2657,7 @@ pub fn render_cache_scheduler_tla_bundle(
              /\\ reservation = [l \\in Lanes |-> s.lanes[LaneIdx(l)].reservation]\n\
              /\\ admitBudget = [l \\in Lanes |-> s.lanes[LaneIdx(l)].admitBudget]\n\
              /\\ waitTicks   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].waitTicks]\n\
+             /\\ ghostBypass = [l \\in Lanes |-> s.lanes[LaneIdx(l)].ghostBypass]\n\
              /\\ queueSeq    = s.queueSeq\n\
              /\\ stepActive  = s.stepActive\n\
              /\\ stepLanes   = s.stepLanes\n\
@@ -2150,6 +2678,7 @@ pub fn render_cache_scheduler_tla_bundle(
              /\\ reservation' = [l \\in Lanes |-> s.lanes[LaneIdx(l)].reservation]\n\
              /\\ admitBudget' = [l \\in Lanes |-> s.lanes[LaneIdx(l)].admitBudget]\n\
              /\\ waitTicks'   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].waitTicks]\n\
+             /\\ ghostBypass' = [l \\in Lanes |-> s.lanes[LaneIdx(l)].ghostBypass]\n\
              /\\ queueSeq'    = s.queueSeq\n\
              /\\ stepActive'  = s.stepActive\n\
              /\\ stepLanes'   = s.stepLanes\n\
@@ -2169,8 +2698,36 @@ pub fn render_cache_scheduler_tla_bundle(
              /\\ stepIdx' = stepIdx + 1\n\
              /\\ ApplyNext(Traces[traceIdx][stepIdx + 1])\n\
          \n\
+         DispatchStep(act) ==\n\
+             IF act[1] = \"Arrive\"                    THEN Arrive(act[2], act[3], act[4])\n\
+             ELSE IF act[1] = \"Refuse429\"            THEN Refuse429(act[2])\n\
+             ELSE IF act[1] = \"Admit\"                THEN Admit(act[2])\n\
+             ELSE IF act[1] = \"BeginRestore\"         THEN BeginRestore(act[2])\n\
+             ELSE IF act[1] = \"RestoreBlock\"         THEN RestoreBlock(act[2], act[3])\n\
+             ELSE IF act[1] = \"RestoreStartState\"    THEN RestoreStartState(act[2])\n\
+             ELSE IF act[1] = \"FinishRestore\"        THEN FinishRestore(act[2])\n\
+             ELSE IF act[1] = \"EvictCleanOrUnrefMem\" THEN (EvictCleanOrUnrefMem /\\ InMemory(act[2]) /\\ blocks'[act[2]].tier \\notin {{\"memory\", \"both\"}})\n\
+             ELSE IF act[1] = \"StartColdWriteback\"   THEN (StartColdWriteback /\\ stepIO' = {{act[2]}})\n\
+             ELSE IF act[1] = \"EvictCleanStartState\" THEN (EvictCleanStartState /\\ StateInMem(<<act[2], act[3]>>) /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")\n\
+             ELSE IF act[1] = \"SpillStartState\"      THEN (SpillStartState /\\ startPoints[<<act[2], act[3]>>].stateTier = \"memory\" /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")\n\
+             ELSE IF act[1] = \"ReclaimColdDisk\"      THEN ReclaimColdDisk\n\
+             ELSE IF act[1] = \"DropUnreferenced\"     THEN DropUnreferenced(act[2])\n\
+             ELSE IF act[1] = \"SlideWindow\"          THEN SlideWindow(act[2])\n\
+             ELSE IF act[1] = \"FinishReady\"          THEN FinishReady(act[2])\n\
+             ELSE IF act[1] = \"BuildStep\"            THEN BuildStep(act[2], [l \\in Lanes |-> act[3][LaneIdx(l)]])\n\
+             ELSE IF act[1] = \"GpuExecute\"           THEN GpuExecute\n\
+             ELSE IF act[1] = \"CompleteStepIO\"       THEN CompleteStepIO\n\
+             ELSE IF act[1] = \"FinishStep\"           THEN FinishStep\n\
+             ELSE IF act[1] = \"Cancel\"               THEN Cancel(act[2])\n\
+             ELSE FALSE\n\
+         \n\
+         StepActionCheck ==\n\
+             (stepIdx' = stepIdx + 1) =>\n\
+                 \\E act \\in {{Traces[traceIdx][stepIdx + 1].act}} : DispatchStep(act)\n\
+         \n\
          ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>\n\
          Conforms == Init /\\ [][Next]_vars\n\
+         ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>\n\
          =============================================================================\n"
     );
 
@@ -2195,6 +2752,7 @@ pub fn render_cache_scheduler_tla_bundle(
           TypeOK\n\
           StepBlocksInMemoryAndOwned\n\
           SealedValid\n\
+          NoDecodeBlocksSealed\n\
           UnsealedPrivateInvisibleZero\n\
           LaneHistoryCovered\n\
           RefCountMatchesReferrers\n\
@@ -2206,9 +2764,11 @@ pub fn render_cache_scheduler_tla_bundle(
           QueueBounded\n\
          PROPERTIES\n\
           Conforms\n\
+          ActionConforms\n\
           ActionSealedImmutable\n\
           ActionNoQueuedRefusal\n\
           ActionLazyColdWriteback\n\
+          ActionWritebackProtected\n\
           ActionDecodePriority\n",
         cfg.block_size,
         cfg.window_size,
@@ -2255,11 +2815,12 @@ pub struct WalkStats {
     pub finished: usize,
     pub cold_writebacks: usize,
     pub disk_restores: usize,
+    pub slide_windows: usize,
     pub max_wait_ticks_seen: u32,
 }
 
 /// Run one deterministic multi-lane workload walk on `Scheduler`, recording every state
-/// transition into a `SchedulerTrace` for TLC verification.
+/// transition and named `TraceAction` into a `SchedulerTrace` for TLC verification.
 pub fn walk_scheduler_trace(
     cfg: SchedulerConfig,
     seed: u64,
@@ -2283,26 +2844,25 @@ pub fn walk_scheduler_trace(
                         .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                     {
                         sched.cancel(victim)?;
-                        trace.record("CancelInStep", &sched);
+                        trace.record_action(TraceAction::Cancel { lane: victim }, &sched);
                         stats.cancel_in_step += 1;
                         continue;
                     }
                 }
                 sched.gpu_execute()?;
-                trace.record("GpuExecute", &sched);
+                trace.record_action(TraceAction::GpuExecute, &sched);
                 continue;
             }
             if !sched.step_io().is_empty() {
                 if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
                     sched.complete_step_io()?;
-                    trace.record("CompleteStepIO", &sched);
+                    trace.record_action(TraceAction::CompleteStepIO, &sched);
                     continue;
                 } else if sched.reclaim_cold_disk() {
-                    trace.record("ReclaimColdDisk", &sched);
+                    trace.record_action(TraceAction::ReclaimColdDisk, &sched);
                     continue;
                 }
             }
-            // Occasionally cancel right after gpu_done before FinishStep too.
             if rng.pick(9) == 0 {
                 if let Some(&victim) = sched
                     .step_lanes()
@@ -2310,13 +2870,13 @@ pub fn walk_scheduler_trace(
                     .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                 {
                     sched.cancel(victim)?;
-                    trace.record("CancelInStep", &sched);
+                    trace.record_action(TraceAction::Cancel { lane: victim }, &sched);
                     stats.cancel_in_step += 1;
                     continue;
                 }
             }
             sched.complete_step()?;
-            trace.record("FinishStep", &sched);
+            trace.record_action(TraceAction::FinishStep, &sched);
             continue;
         }
 
@@ -2324,44 +2884,68 @@ pub fn walk_scheduler_trace(
         if !sched.step_io().is_empty() {
             if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
                 sched.complete_step_io()?;
-                trace.record("CompleteStepIO", &sched);
+                trace.record_action(TraceAction::CompleteStepIO, &sched);
                 continue;
             } else if sched.reclaim_cold_disk() {
-                trace.record("ReclaimColdDisk", &sched);
+                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
                 continue;
             }
         }
 
         // 2. Finish any Ready lane that has reached its target.
-        if let Some(l) = (0..n_lanes)
-            .find(|&i| sched.lanes()[i].state == LaneState::Ready && sched.lanes()[i].pos == sched.lanes()[i].target)
-        {
+        if let Some(l) = (0..n_lanes).find(|&i| {
+            sched.lanes()[i].state == LaneState::Ready
+                && sched.lanes()[i].pos == sched.lanes()[i].target
+        }) {
             sched.finish_ready(l)?;
-            trace.record("FinishReady", &sched);
+            trace.record_action(TraceAction::FinishReady { lane: l }, &sched);
             stats.finished += 1;
             continue;
         }
 
-        // 3. Relieve memory pressure lazily (evict clean/unref, cold writeback, or reclaim cold disk).
-        if sched.mem_pressure() {
-            if sched.evict_clean_or_unref_mem() {
-                trace.record("EvictCleanOrUnrefMem", &sched);
-                continue;
-            }
-            if sched.start_cold_writeback().is_some() {
-                trace.record("StartColdWriteback", &sched);
-                stats.cold_writebacks += 1;
-                continue;
-            }
-            if sched.reclaim_cold_disk() {
-                trace.record("ReclaimColdDisk", &sched);
+        // Prune any Ready lane whose window holds blocks older than `History(pos)` (`SlideWindow`).
+        if let Some(l) = (0..n_lanes)
+            .find(|&i| sched.lanes()[i].state == LaneState::Ready && !sched.window_pruned(i))
+        {
+            if sched.slide_window(l) {
+                trace.record_action(TraceAction::SlideWindow { lane: l }, &sched);
+                stats.slide_windows += 1;
                 continue;
             }
         }
 
-        // 4. Try building a step first when Ready lanes exist and another waiting lane is at W
-        //    so `build_step` enforces the bypass ceiling itself (returning Ok(None) cleanly in
-        //    production, and immediately tripping BypassBoundHolds if the ceiling check is mutated).
+        // 3. Relieve memory or start-state pressure lazily.
+        if sched.mem_pressure() {
+            if let Some(block) = sched.evict_clean_or_unref_mem_id() {
+                trace.record_action(TraceAction::EvictCleanOrUnrefMem { block }, &sched);
+                continue;
+            }
+            if let Some(block) = sched.start_cold_writeback() {
+                trace.record_action(TraceAction::StartColdWriteback { block }, &sched);
+                stats.cold_writebacks += 1;
+                continue;
+            }
+            if sched.reclaim_cold_disk() {
+                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                continue;
+            }
+        }
+        if sched.state_mem_pressure() {
+            if let Some((prefix, boundary)) = sched.evict_clean_start_state() {
+                trace.record_action(TraceAction::EvictCleanStartState { prefix, boundary }, &sched);
+                continue;
+            }
+            if let Some((prefix, boundary)) = sched.spill_start_state() {
+                trace.record_action(TraceAction::SpillStartState { prefix, boundary }, &sched);
+                continue;
+            }
+            if sched.reclaim_cold_disk() {
+                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                continue;
+            }
+        }
+
+        // 4. Try building a step first when Ready lanes exist and another waiting lane is at W.
         let has_non_ready_ceiling = (0..n_lanes).any(|i| {
             !sched.is_steppable_ready(i)
                 && sched.lanes()[i].state.is_waiting()
@@ -2369,14 +2953,14 @@ pub fn walk_scheduler_trace(
         });
         if has_non_ready_ceiling {
             let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
-            if sched.build_step()?.is_some() {
+            if let Some(built) = sched.build_step()? {
                 for (i, l) in sched.lanes().iter().enumerate() {
                     if l.wait_ticks > before_waits[i] {
                         stats.step_bypasses += 1;
                     }
                     stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
                 }
-                trace.record("BuildStep", &sched);
+                trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
                 continue;
             }
         }
@@ -2393,12 +2977,20 @@ pub fn walk_scheduler_trace(
                 .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
                 if sched.restore_block(l, &b).is_ok() {
-                    trace.record("RestoreBlock", &sched);
+                    trace.record_action(
+                        TraceAction::RestoreBlock { lane: l, block: b },
+                        &sched,
+                    );
                     stats.disk_restores += 1;
                     advanced_ceiling = true;
                 }
+            } else if !sched.start_state_ready(l) {
+                if sched.restore_start_state(l).is_ok() {
+                    trace.record_action(TraceAction::RestoreStartState { lane: l }, &sched);
+                    advanced_ceiling = true;
+                }
             } else if sched.finish_restore(l).is_ok() {
-                trace.record("FinishRestore", &sched);
+                trace.record_action(TraceAction::FinishRestore { lane: l }, &sched);
                 advanced_ceiling = true;
             }
         }
@@ -2411,7 +3003,7 @@ pub fn walk_scheduler_trace(
                 && sched.can_advance_admitted(i)
         }) {
             sched.begin_restore(l)?;
-            trace.record("BeginRestore", &sched);
+            trace.record_action(TraceAction::BeginRestore { lane: l }, &sched);
             continue;
         }
         if let Some(l) = sched
@@ -2421,7 +3013,7 @@ pub fn walk_scheduler_trace(
             .find(|&q| sched.lanes()[q].wait_ticks >= cfg.max_bypass && sched.can_admit_now(q))
         {
             sched.admit(l)?;
-            trace.record("Admit", &sched);
+            trace.record_action(TraceAction::Admit { lane: l }, &sched);
             stats.admits += 1;
             continue;
         }
@@ -2439,7 +3031,10 @@ pub fn walk_scheduler_trace(
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                trace.record("Arrive", &sched);
+                trace.record_action(
+                    TraceAction::Arrive { lane: l, prefix: pfx, target: len },
+                    &sched,
+                );
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;
@@ -2448,18 +3043,16 @@ pub fn walk_scheduler_trace(
             }
         }
 
-        // Prefer building a step frequently when Ready lanes exist AND other lanes are waiting
-        // so bypass increments and decode priority are thoroughly exercised!
         if roll < 68 {
             let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
-            if sched.build_step()?.is_some() {
+            if let Some(built) = sched.build_step()? {
                 for (i, l) in sched.lanes().iter().enumerate() {
                     if l.wait_ticks > before_waits[i] {
                         stats.step_bypasses += 1;
                     }
                     stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
                 }
-                trace.record("BuildStep", &sched);
+                trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
                 continue;
             }
         }
@@ -2477,13 +3070,22 @@ pub fn walk_scheduler_trace(
                 .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
                 if sched.restore_block(l, &b).is_ok() {
-                    trace.record("RestoreBlock", &sched);
+                    trace.record_action(
+                        TraceAction::RestoreBlock { lane: l, block: b },
+                        &sched,
+                    );
                     stats.disk_restores += 1;
                     did_restore = true;
                     break;
                 }
+            } else if !sched.start_state_ready(l) {
+                if sched.restore_start_state(l).is_ok() {
+                    trace.record_action(TraceAction::RestoreStartState { lane: l }, &sched);
+                    did_restore = true;
+                    break;
+                }
             } else if sched.finish_restore(l).is_ok() {
-                trace.record("FinishRestore", &sched);
+                trace.record_action(TraceAction::FinishRestore { lane: l }, &sched);
                 did_restore = true;
                 break;
             }
@@ -2495,44 +3097,46 @@ pub fn walk_scheduler_trace(
         // Advance Admitted -> Restoring.
         if let Some(l) = (0..n_lanes).find(|&i| sched.can_advance_admitted(i)) {
             sched.begin_restore(l)?;
-            trace.record("BeginRestore", &sched);
+            trace.record_action(TraceAction::BeginRestore { lane: l }, &sched);
             continue;
         }
 
         // Admit next eligible Queued lane.
         let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
-        if sched.admit_next()?.is_some() {
+        if let Some(admitted) = sched.admit_next()? {
             for (i, l) in sched.lanes().iter().enumerate() {
                 if l.state == LaneState::Queued && l.wait_ticks > before_waits[i] {
                     stats.admit_bypasses += 1;
                 }
                 stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
             }
-            trace.record("Admit", &sched);
+            trace.record_action(TraceAction::Admit { lane: admitted }, &sched);
             stats.admits += 1;
             continue;
         }
 
         // Fallback: build a step if possible.
         let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
-        if sched.build_step()?.is_some() {
+        if let Some(built) = sched.build_step()? {
             for (i, l) in sched.lanes().iter().enumerate() {
                 if l.wait_ticks > before_waits[i] {
                     stats.step_bypasses += 1;
                 }
                 stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
             }
-            trace.record("BuildStep", &sched);
+            trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
             continue;
         }
 
-        // Otherwise arrive into an idle lane if not draining, or cancel a stuck lane.
         if !draining {
             if let Some(l) = (0..n_lanes).find(|&i| sched.lanes()[i].state.is_terminal_or_idle()) {
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                trace.record("Arrive", &sched);
+                trace.record_action(
+                    TraceAction::Arrive { lane: l, prefix: pfx, target: len },
+                    &sched,
+                );
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;
@@ -2793,7 +3397,11 @@ mod tests {
         assert_eq!(s.lanes()[0].state, LaneState::Ready);
 
         // Run through prefill (pos 0->2) and decode (pos 2->3->4) to Finished.
+        let mut slid = 0usize;
         while s.lanes()[0].pos < s.lanes()[0].target {
+            if s.slide_window(0) {
+                slid += 1;
+            }
             let step = s.build_step().unwrap().expect("step built");
             assert_eq!(step.lanes, vec![0]);
             assert_eq!(s.lanes()[0].state, LaneState::InStep);
@@ -2805,6 +3413,7 @@ mod tests {
             assert_eq!(s.lanes()[0].state, LaneState::Ready);
             s.check_invariants().unwrap();
         }
+        assert!(slid >= 1, "explicit slide_window exercised during decode");
         s.finish_ready(0).unwrap();
         assert_eq!(s.lanes()[0].state, LaneState::Finished);
         assert_eq!(s.reserved_total(), 0);
@@ -2861,18 +3470,15 @@ mod tests {
         cfg.disk_budget = 4;
         let mut s = Scheduler::new(cfg).unwrap();
 
-        // Seed a kept start point at (p1, 2) and force its blocks to disk via cold writeback.
-        s.arrive(0, "p1", 2).unwrap();
+        // Seed a kept prefill start point at (p1, 2) (`target = 4` -> `PromptEnd = 2`) and spill its blocks to disk.
+        s.arrive(0, "p1", 4).unwrap();
         s.admit(0).unwrap();
         s.begin_restore(0).unwrap();
         s.finish_restore(0).unwrap();
         s.build_step().unwrap();
         s.gpu_execute().unwrap();
         s.complete_step().unwrap();
-        s.build_step().unwrap();
-        s.gpu_execute().unwrap();
-        s.complete_step().unwrap();
-        s.finish_ready(0).unwrap();
+        s.cancel(0).unwrap();
 
         // Fill memory with p2 on lane 1 so p1's cold blocks spill to disk under pressure.
         s.arrive(1, "p2", 4).unwrap();
@@ -2946,6 +3552,9 @@ mod tests {
             }
             if s.lanes().iter().all(|l| l.state == LaneState::Finished) {
                 break;
+            }
+            for l in 0..4 {
+                s.slide_window(l);
             }
             let _step = s.build_step().unwrap().expect("step built");
             for l in s.lanes() {
@@ -3042,6 +3651,7 @@ mod tests {
         // Now run steps with mid-step client disconnects (lanes 1, 5, 6 disconnect mid-step!)
         // and new 2K arrivals attempting to leapfrog lane 4 while it sits at wait_ticks == W.
         let mut mid_step_cancels = 0usize;
+        let mut disconnected_once = BTreeSet::new();
         let mut completed_2k = 0usize;
         let mut completed_64k = 0usize;
         let mut max_wait_observed = 0u32;
@@ -3095,13 +3705,25 @@ mod tests {
                 }
             }
 
-            // Evict cold memory blocks lazily if under pressure.
+            // Evict cold memory blocks and start-point states lazily if under pressure.
             while s.mem_pressure() {
                 if s.evict_clean_or_unref_mem() {
                     continue;
                 }
                 if s.start_cold_writeback().is_some() {
                     s.complete_step_io().unwrap();
+                    continue;
+                }
+                if s.reclaim_cold_disk() {
+                    continue;
+                }
+                break;
+            }
+            while s.state_mem_pressure() {
+                if s.evict_clean_start_state().is_some() {
+                    continue;
+                }
+                if s.spill_start_state().is_some() {
                     continue;
                 }
                 if s.reclaim_cold_disk() {
@@ -3121,6 +3743,31 @@ mod tests {
                     s.begin_restore(l).unwrap();
                 }
                 if s.lanes()[l].state == LaneState::Restoring {
+                    for b in s.lane_block_set(l) {
+                        if s.blocks().get(&b).is_some_and(|r| r.tier == BlockTier::Disk) {
+                            while s.mem_used() >= s.config().mem_budget {
+                                if !s.evict_clean_or_unref_mem() {
+                                    if s.start_cold_writeback().is_some() {
+                                        s.complete_step_io().unwrap();
+                                    } else if !s.reclaim_cold_disk() {
+                                        break;
+                                    }
+                                }
+                            }
+                            s.restore_block(l, &b).unwrap();
+                        }
+                    }
+                    if !s.start_state_ready(l) {
+                        while s.state_mem_used() >= s.state_mem_budget() {
+                            if s.evict_clean_start_state().is_none()
+                                && s.spill_start_state().is_none()
+                                && !s.reclaim_cold_disk()
+                            {
+                                break;
+                            }
+                        }
+                        s.restore_start_state(l).unwrap();
+                    }
                     s.finish_restore(l).unwrap();
                 }
             }
@@ -3129,6 +3776,9 @@ mod tests {
             if s.lanes().iter().all(|l| l.state.is_terminal_or_idle()) {
                 break;
             }
+            for l in 0..8 {
+                s.slide_window(l);
+            }
 
             // Build & execute one step, injecting mid-step disconnects on lanes 1, 5, 6 and
             // on a second 64K request if desired.
@@ -3136,12 +3786,14 @@ mod tests {
                 panic!("deadlock at tick {tick}: no lane could make progress");
             };
 
-            // Inject mid-step disconnects while lanes are InStep (before gpu_execute!).
+            // Inject mid-step disconnects once per victim while InStep (before gpu_execute!).
             for &victim in &[1usize, 5, 6] {
-                if step.lanes.contains(&victim)
+                if !disconnected_once.contains(&victim)
+                    && step.lanes.contains(&victim)
                     && s.lanes()[victim].state == LaneState::InStep
                     && s.lanes()[victim].pos >= 128
                 {
+                    disconnected_once.insert(victim);
                     assert_eq!(s.cancel(victim).unwrap(), LaneState::Cancelling);
                     // Verify barrier: slot & reservation remain held while Cancelling!
                     assert!(s.lanes()[victim].reservation > 0);
@@ -3364,19 +4016,77 @@ mod tests {
         let cfg = small_cfg();
         let mut total_cancel = 0;
         let mut total_step_bypass = 0;
+        let mut total_slide = 0;
         for seed in 0..8 {
             let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 120).unwrap();
             assert!(trace.steps.len() >= 10);
             assert!(stats.max_wait_ticks_seen <= cfg.max_bypass);
             total_cancel += stats.cancel_in_step;
             total_step_bypass += stats.step_bypasses;
+            total_slide += stats.slide_windows;
         }
         assert!(total_cancel > 0, "walks must exercise cancel-in-step");
         assert!(total_step_bypass > 0, "walks must exercise step bypass");
+        assert!(total_slide > 0, "walks must exercise explicit slide_window");
         let (tr, _) = walk_scheduler_trace(cfg, 0, 60).unwrap();
         let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
         assert!(data.contains("MODULE TraceData"));
         assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
+        assert!(check.contains("ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>"));
         assert!(tlc_cfg.contains("BypassBoundHolds"));
+        assert!(tlc_cfg.contains("NoDecodeBlocksSealed"));
+        assert!(tlc_cfg.contains("ActionConforms"));
+    }
+
+    #[test]
+    fn multi_block_prefill_span_decode_unsealed_and_start_state_tier() {
+        let cfg = SchedulerConfig {
+            lanes: vec!["a".into(), "b".into(), "c".into()],
+            prefixes: vec!["p1".into(), "p2".into(), "p3".into()],
+            request_lengths: vec![6],
+            block_size: 2,
+            window_size: 2,
+            max_pos: 6,
+            max_span: 4, // crosses 2 blocks (4 tokens) in a single prefill step (`U56`)!
+            step_token_budget: 4,
+            mem_budget: 8,
+            disk_budget: 6,
+            max_queue: 1,
+            max_bypass: 2,
+            start_point_stride_blocks: 1,
+        };
+        let mut s = Scheduler::new(cfg).unwrap();
+        s.arrive(0, "p1", 6).unwrap();
+        s.admit(0).unwrap();
+        s.begin_restore(0).unwrap();
+        s.finish_restore(0).unwrap();
+
+        // Single prefill step advances 0 -> 4 (`PromptEnd(6) = 4`), sealing BOTH (p1, 2) and (p1, 4)!
+        let step = s.build_step().unwrap().unwrap();
+        assert_eq!(step.spans[&0], 4);
+        // Guard `build_step` on in-flight writeback (`U61`) once step completes.
+        s.gpu_execute().unwrap();
+        let done = s.complete_step().unwrap();
+        assert_eq!(done.sealed_boundaries, vec![(0, 2), (0, 4)]);
+        assert!(s.start_points()[&("p1".into(), 2)].kept);
+        assert!(s.start_points()[&("p1".into(), 4)].kept);
+        assert_eq!(s.start_points()[&("p1".into(), 4)].state_tier, BlockTier::Memory);
+
+        // Slide window at pos 4 (`History(4) = {1}`, pruning block 0) before decode steps 4->5->6.
+        assert!(s.slide_window(0));
+        for expected_pos in [5u32, 6] {
+            s.slide_window(0);
+            let dstep = s.build_step().unwrap().unwrap();
+            assert_eq!(dstep.spans[&0], 1);
+            s.gpu_execute().unwrap();
+            let ddone = s.complete_step().unwrap();
+            assert!(ddone.sealed_boundaries.is_empty(), "decode blocks must NEVER seal (U58)");
+            assert_eq!(s.lanes()[0].pos, expected_pos);
+            assert!(!s.start_points().contains_key(&("p1".into(), 6)));
+            assert!(matches!(s.lanes()[0].full.get(&2), Some(BlockId::Priv { lane: 0, idx: 2, .. })));
+            s.check_invariants().unwrap();
+        }
+        s.finish_ready(0).unwrap();
+        s.check_invariants().unwrap();
     }
 }

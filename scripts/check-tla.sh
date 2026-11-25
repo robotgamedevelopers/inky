@@ -26,6 +26,11 @@ trace_scripts='memmode blockbook cache scheduler'
 grouped_modules=GroupedLayout,PoisonGate,ScratchTail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+if command -v zsh >/dev/null 2>&1; then
+    tlc_shell=zsh
+else
+    tlc_shell=bash
+fi
 
 listing=
 if [ "${1:-}" = --list ]; then
@@ -63,7 +68,7 @@ if [ -n "$listing" ]; then
             memmode) echo "$memmode_checks" | while read -r name _; do echo "memmode:$name"; done ;;
             blocks|grouped|layout-nightly)
                 [ -f "$root/specs/BlockLayout.tla" ] || continue
-                env $(layout_sel "$p") zsh "$root/specs/run_tlc.zsh" --list | sed 's/^/layout:/' ;;
+                env $(layout_sel "$p") "$tlc_shell" "$root/specs/run_tlc.zsh" --list | sed 's/^/layout:/' ;;
             scheduler)
                 [ -f "$root/specs/CacheScheduler.tla" ] || continue
                 sh "$root/specs/run_cache_scheduler.sh" --list | sed 's/^/scheduler:/' ;;
@@ -181,7 +186,7 @@ fi
 for p in blocks grouped; do
     want "$p" && [ -f "$root/specs/BlockLayout.tla" ] || continue
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
-    env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" zsh "$root/specs/run_tlc.zsh" || {
+    env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" "$tlc_shell" "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout-$p" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
     }
@@ -191,7 +196,7 @@ if want layout-nightly && [ -f "$root/specs/BlockLayout.tla" ]; then
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
     case "${TLA_NIGHTLY:-0}" in
         1)
-            env $(layout_sel layout-nightly) TLC_OUTPUT="$work/block-layout-nightly" zsh "$root/specs/run_tlc.zsh" || {
+            env $(layout_sel layout-nightly) TLC_OUTPUT="$work/block-layout-nightly" "$tlc_shell" "$root/specs/run_tlc.zsh" || {
                 find "$work/block-layout-nightly" -name '*.log' -exec tail -n 60 {} \; >&2
                 exit 1
             }

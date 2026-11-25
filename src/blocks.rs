@@ -38,6 +38,12 @@ pub const WINDOW_STRIDE: u64 = 10 * 1024 * 1024;
 pub const KVB_FP16: u32 = 2;
 /// A kind holds at most this many slabs. One more is [`BlockError::Slab`].
 pub const MAX_SLABS: usize = 4;
+/// Bit shift of the 2-bit slab selector in a 64-bit GPU block-table word (`entry >> 62`).
+pub const KV_SLAB_SHIFT: u32 = 62;
+/// 62-bit within-slab byte-offset mask (`((1UL << 62) - 1UL)` in `src/kernels.metal`).
+pub const KV_SLAB_MASK: u64 = (1u64 << KV_SLAB_SHIFT) - 1;
+/// Metal buffer argument slots bound to `KV0, KV1, KV2, KV3` across all Layer 3 kernels.
+pub const KV_SLAB_BUFFER_INDICES: [usize; MAX_SLABS] = [3, 10, 11, 12];
 /// KV heads. The same count as `engine::NKV`.
 pub const NKV: usize = 8;
 /// Elements in one key or value. The same count as `engine::HD`.
@@ -216,14 +222,184 @@ pub fn key_row_at(base: u64, passes: u32, heads: u32, block: u32, hd: u32, kvb: 
     base.checked_add(within).ok_or(BlockError::Overflow)
 }
 
-/// Write the InBlock trace TLC reads. The addresses are `key_row_at` at the
-/// spec bounds (2 passes, 3 heads, 4 positions, HD 2), at element width 2
-/// and then 1. CI runs this before TLC.
+/// Decode a 64-bit GPU block-table word into `(slab_index, within_slab_byte_offset)`,
+/// matching `kv_blk_ptr` (`uint(entry >> 62)` and `entry & KV_SLAB_MASK`) in `src/kernels.metal`.
+#[inline]
+pub fn decode_gpu_table_entry(entry: u64) -> (usize, u64) {
+    ((entry >> KV_SLAB_SHIFT) as usize, entry & KV_SLAB_MASK)
+}
+
+/// KV layout constants and shader invariants extracted directly from `src/kernels.metal`
+/// and `src/prefill.metal` (`U63` & `U18`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MetalKvLayout {
+    pub nkv: u32,
+    pub hd: u32,
+    pub kv_blk: u32,
+    pub kv_blk_mask: u32,
+    pub planes_per_pass: u64,
+    pub slab_shift: u32,
+    pub slab_buffers: [usize; MAX_SLABS],
+}
+
+fn parse_c_define_u32(src: &str, name: &str) -> Result<u32, &'static str> {
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("#define") {
+            let mut it = rest.split_whitespace();
+            if it.next() == Some(name) {
+                let tok = it.next().ok_or("missing #define value")?;
+                let digits = tok.trim_end_matches('u').trim_end_matches("UL");
+                return digits.parse::<u32>().map_err(|_| "invalid integer in #define");
+            }
+        }
+    }
+    Err("missing #define in Metal source")
+}
+
+/// Parse and verify the Layer 3 KV block address macros, `kv_blk_ptr` 64-bit word decode,
+/// and `KV0..KV3` buffer-index bindings across `src/kernels.metal` and `src/prefill.metal`.
+pub fn parse_metal_kv_layout(kernels_src: &str, prefill_src: &str) -> Result<MetalKvLayout, &'static str> {
+    let nkv = parse_c_define_u32(kernels_src, "NKV")?;
+    let hd = parse_c_define_u32(kernels_src, "HD")?;
+    let kv_blk = parse_c_define_u32(kernels_src, "KV_BLK")?;
+    let kv_blk_mask = parse_c_define_u32(kernels_src, "KV_BLK_MASK")?;
+    if kv_blk == 0 || !kv_blk.is_power_of_two() || kv_blk_mask != kv_blk - 1 {
+        return Err("KV_BLK / KV_BLK_MASK inconsistent");
+    }
+    if !kernels_src.contains("typedef int8_t kv_t;") || !kernels_src.contains("typedef half kv_t;") {
+        return Err("missing kv_t KV8/fp16 typedefs");
+    }
+    if !kernels_src.contains("#define KV_SLAB_MASK ((1UL << 62) - 1UL)") {
+        return Err("missing or altered KV_SLAB_MASK");
+    }
+    if !kernels_src.contains("#define KV_HEAD_BYTES  (ulong(KV_BLK) * ulong(HD) * ulong(sizeof(kv_t)))") {
+        return Err("missing or altered KV_HEAD_BYTES");
+    }
+    if !kernels_src.contains("#define KV_PLANE_BYTES (ulong(NKV) * KV_HEAD_BYTES)") {
+        return Err("missing or altered KV_PLANE_BYTES");
+    }
+    let planes_per_pass = if kernels_src.contains("#define KV_PASS_BYTES  (2UL * KV_PLANE_BYTES)") {
+        2u64
+    } else {
+        return Err("missing or altered KV_PASS_BYTES");
+    };
+    for needle in [
+        "const uint si = uint(entry >> 62);",
+        "const ulong off = entry & KV_SLAB_MASK;",
+        "device uchar * base = (si == 0) ? s0 : (si == 1 ? s1 : (si == 2 ? s2 : s3));",
+        "return (device kv_t *) (base + off + in_slot_off);",
+    ] {
+        if !kernels_src.contains(needle) {
+            return Err("kv_blk_ptr formula altered");
+        }
+    }
+    let check_kernel = |src: &str, kname: &str| -> Result<(), &'static str> {
+        let anchor = format!("kernel void {kname}(");
+        let idx = src.find(&anchor).ok_or("missing Layer 3 Metal kernel")?;
+        let rest = &src[idx..];
+        let body_end = rest[1..].find("\nkernel void ").map_or(rest.len(), |p| p + 1);
+        let ksrc = &rest[..body_end];
+        for bind in [
+            "KV0 [[buffer(3)]]",
+            "KV1 [[buffer(10)]]",
+            "KV2 [[buffer(11)]]",
+            "KV3 [[buffer(12)]]",
+        ] {
+            if !ksrc.contains(bind) {
+                return Err("Layer 3 kernel missing canonical KV0..KV3 buffer(3,10,11,12) binding");
+            }
+        }
+        if !ksrc.contains("* KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;")
+            || !ksrc.contains("const ulong voff = koff + KV_PLANE_BYTES;")
+            || !ksrc.contains("kv_blk_ptr(KV0, KV1, KV2, KV3,")
+        {
+            return Err("Layer 3 kernel missing canonical koff/voff/kv_blk_ptr address formula");
+        }
+        Ok(())
+    };
+    for kname in [
+        "k_attn_blk",
+        "k_attn_blk_dec",
+        "k_kvprep_dec",
+        "k_attn_dec_solo",
+        "k_attn_grp_dec",
+    ] {
+        check_kernel(kernels_src, kname)?;
+    }
+    for kname in [
+        "k_kvprep_b_blk",
+        "k_attn_b_blk",
+        "k_attn_bt_blk",
+        "k_attn_h_blk",
+    ] {
+        check_kernel(prefill_src, kname)?;
+    }
+    Ok(MetalKvLayout {
+        nkv,
+        hd,
+        kv_blk,
+        kv_blk_mask,
+        planes_per_pass,
+        slab_shift: 62,
+        slab_buffers: KV_SLAB_BUFFER_INDICES,
+    })
+}
+
+/// Evaluate the exact Metal shader within-slot byte address (`koff`/`voff + (pos & KV_BLK_MASK) * HD * sizeof(kv_t)`)
+/// using a parsed [`MetalKvLayout`].
+pub fn metal_in_slot_byte_offset_from_layout(
+    layout: &MetalKvLayout,
+    kind: BlockKind,
+    kvb: u32,
+    pass: u32,
+    kv: Kv,
+    head: u32,
+    pos: u32,
+) -> Result<u64, BlockError> {
+    if kvb != 1 && kvb != 2 {
+        return Err(BlockError::Width);
+    }
+    if pass >= kind.passes() as u32 || head >= layout.nkv {
+        return Err(BlockError::OutOfRange);
+    }
+    let elem = u64::from(kvb);
+    let kv_head_bytes = u64::from(layout.kv_blk) * u64::from(layout.hd) * elem;
+    let kv_plane_bytes = u64::from(layout.nkv) * kv_head_bytes;
+    let kv_pass_bytes = layout.planes_per_pass * kv_plane_bytes;
+    let koff = u64::from(pass) * kv_pass_bytes + u64::from(head) * kv_head_bytes;
+    let plane_off = if kv == Kv::Value { koff + kv_plane_bytes } else { koff };
+    let ib = u64::from(pos & layout.kv_blk_mask);
+    Ok(plane_off + ib * u64::from(layout.hd) * elem)
+}
+
+/// Evaluate the Metal shader within-slot byte address directly from `src/kernels.metal` & `src/prefill.metal`.
+#[cfg(not(standalone_blocks))]
+pub fn metal_in_slot_byte_offset(
+    kind: BlockKind,
+    kvb: u32,
+    pass: u32,
+    kv: Kv,
+    head: u32,
+    pos: u32,
+) -> Result<u64, BlockError> {
+    let layout = parse_metal_kv_layout(
+        include_str!("kernels.metal"),
+        include_str!("prefill.metal"),
+    )
+    .expect("src/kernels.metal and src/prefill.metal KV layout must remain valid");
+    metal_in_slot_byte_offset_from_layout(&layout, kind, kvb, pass, kv, head, pos)
+}
+
+/// Write the InBlock trace TLC reads: small bounds (`Trace2`, `Trace1`) from `key_row_at`,
+/// plus production Metal shader traces (`MetalFull2`, `MetalFull1`, `MetalWin2`, `MetalWin1`)
+/// across `Full` (8 passes) and `Window` (40 passes) blocks at `kvb = 2` and `kvb = 1` (`U63`).
 pub fn write_inblock_trace(path: &str) -> std::io::Result<()> {
     let mut out = String::from(
         "---------------------------- MODULE InBlockTraceData ------------------------\n\
-         \\* Written by `inky inblock-trace` from key_row_at. TLC checks these\n\
-         \\* addresses against Formula. Do not edit this file by hand.\n\
+         \\* Written by `inky inblock-trace` from key_row_at and Metal KV macros.\n\
+         \\* TLC checks these addresses against SmallFormula and ProdFormula.\n\
+         \\* Do not edit this file by hand.\n\
          EXTENDS Integers, Sequences\n\n",
     );
     for (name, kvb) in [("Trace2", 2u32), ("Trace1", 1u32)] {
@@ -238,6 +414,35 @@ pub fn write_inblock_trace(path: &str) -> std::io::Result<()> {
                         if !first { out.push_str(",\n"); }
                         first = false;
                         out.push_str(&format!("  <<{p}, {k}, {h}, {i}, {addr}>>"));
+                    }
+                }
+            }
+        }
+        out.push_str("\n>>\n\n");
+    }
+    let prod_heads = [0u32, 1, 7];
+    let prod_positions = [0u32, 1, 31, 32, 63];
+    for (name, kind, kvb) in [
+        ("MetalFull2", BlockKind::Full, 2u32),
+        ("MetalFull1", BlockKind::Full, 1u32),
+        ("MetalWin2", BlockKind::Window, 2u32),
+        ("MetalWin1", BlockKind::Window, 1u32),
+    ] {
+        out.push_str(&format!("{name} == <<\n"));
+        let mut first = true;
+        for p in 0..(kind.passes() as u32) {
+            for (k_idx, kv_plane) in [(0u32, Kv::Key), (1u32, Kv::Value)] {
+                for &h in &prod_heads {
+                    for &i in &prod_positions {
+                        #[cfg(not(standalone_blocks))]
+                        let addr = metal_in_slot_byte_offset(kind, kvb, p, kv_plane, h, i)
+                            .expect("production Metal KV bounds in range");
+                        #[cfg(standalone_blocks)]
+                        let addr = key_row(0, kind, kvb, p, kv_plane, h, i)
+                            .expect("production KV bounds in range");
+                        if !first { out.push_str(",\n"); }
+                        first = false;
+                        out.push_str(&format!("  <<{p}, {k_idx}, {h}, {i}, {addr}>>"));
                     }
                 }
             }
@@ -635,11 +840,12 @@ impl BlockPool {
         let rec = &self.slots[i];
         if rec.generation() != entry.generation() { return Err(BlockError::Stale); }
         if rec.refs() == 0 { return Err(BlockError::Refs); }
-        let (slab, start, _) = self.slot_range(i);
+        let slab = i / self.slots_per_slab;
         if slab >= MAX_SLABS { return Err(BlockError::Slab); }
-        let off = start as u64;
-        if off >= (1u64 << 62) { return Err(BlockError::Overflow); }
-        Ok(((slab as u64) << 62) | off)
+        let within = (i % self.slots_per_slab) as u64;
+        let off = within.checked_mul(self.stride).ok_or(BlockError::Overflow)?;
+        if off >= (1u64 << KV_SLAB_SHIFT) { return Err(BlockError::Overflow); }
+        Ok(((slab as u64) << KV_SLAB_SHIFT) | off)
     }
 
     /// Raw CPU-visible pointer and byte length of `slot` inside its owning slab.
@@ -1842,5 +2048,198 @@ mod tests {
         t.set(BlockKind::Full, BlockIndex::new(3), Some(e)).unwrap(); // same value -> stays (3, 3)
         t.set(BlockKind::Full, BlockIndex::new(3), None).unwrap();
         assert_eq!(t.dirty_range(BlockKind::Full), Some((3, 3)));
+    }
+
+    #[test]
+    #[cfg(not(standalone_blocks))]
+    fn metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window() {
+        let kernels_src = include_str!("kernels.metal");
+        let prefill_src = include_str!("prefill.metal");
+        let layout = parse_metal_kv_layout(kernels_src, prefill_src).unwrap();
+        assert_eq!(layout.nkv, NKV as u32);
+        assert_eq!(layout.hd, HD as u32);
+        assert_eq!(layout.kv_blk, BLOCK as u32);
+        assert_eq!(layout.kv_blk_mask, (BLOCK - 1) as u32);
+        assert_eq!(layout.planes_per_pass, 2);
+        assert_eq!(layout.slab_shift, KV_SLAB_SHIFT);
+        assert_eq!(layout.slab_buffers, [3, 10, 11, 12]);
+
+        // Exhaustively check all 8,192 Full coordinates and 40,960 Window coordinates at fp16 and KV8.
+        for kvb in [2u32, 1u32] {
+            for kind in [BlockKind::Full, BlockKind::Window] {
+                let stride = kind.stride_bytes(kvb).unwrap();
+                let mut prev = None;
+                for pass in 0..(kind.passes() as u32) {
+                    for kv in [Kv::Key, Kv::Value] {
+                        for head in 0..(NKV as u32) {
+                            for blk in [0u32, 17u32] {
+                                for ib in 0..(BLOCK as u32) {
+                                    let stream_pos = blk * (BLOCK as u32) + ib;
+                                    let got = metal_in_slot_byte_offset_from_layout(
+                                        &layout, kind, kvb, pass, kv, head, stream_pos,
+                                    )
+                                    .unwrap();
+                                    let want = key_row(0, kind, kvb, pass, kv, head, ib).unwrap();
+                                    assert_eq!(got, want);
+                                    assert!(got + (HD as u64) * u64::from(kvb) <= stride);
+                                    if blk == 0 {
+                                        if let Some(p) = prev {
+                                            assert_eq!(got - p, (HD as u64) * u64::from(kvb));
+                                        }
+                                        prev = Some(got);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    prev.unwrap() + (HD as u64) * u64::from(kvb),
+                    stride,
+                    "last row in {kind:?} at kvb={kvb} must end exactly at slot stride"
+                );
+            }
+        }
+
+        // Verify `specs/InBlockTraceData.tla` matches `write_inblock_trace` and `metal_in_slot_byte_offset`.
+        let trace_text = include_str!("../specs/InBlockTraceData.tla");
+        for (name, kind, kvb, expected_len) in [
+            ("MetalFull2", BlockKind::Full, 2u32, 240usize),
+            ("MetalFull1", BlockKind::Full, 1u32, 240usize),
+            ("MetalWin2", BlockKind::Window, 2u32, 1200usize),
+            ("MetalWin1", BlockKind::Window, 1u32, 1200usize),
+        ] {
+            let rows = trace_rows(trace_text, name);
+            assert_eq!(rows.len(), expected_len, "{name} row count");
+            for (p, k, h, i, addr) in rows {
+                let plane = if k == 0 { Kv::Key } else { Kv::Value };
+                assert_eq!(metal_in_slot_byte_offset(kind, kvb, p, plane, h, i).unwrap(), addr);
+                assert_eq!(key_row(0, kind, kvb, p, plane, h, i).unwrap(), addr);
+            }
+        }
+
+        // Planted shader macro & buffer-binding mutations MUST fail `parse_metal_kv_layout`.
+        assert!(parse_metal_kv_layout(
+            &kernels_src.replacen("#define KV_PASS_BYTES  (2UL * KV_PLANE_BYTES)", "#define KV_PASS_BYTES  KV_PLANE_BYTES", 1),
+            prefill_src,
+        ).is_err());
+        assert!(parse_metal_kv_layout(
+            &kernels_src.replacen("#define KV_SLAB_MASK ((1UL << 62) - 1UL)", "#define KV_SLAB_MASK ((1UL << 60) - 1UL)", 1),
+            prefill_src,
+        ).is_err());
+        assert!(parse_metal_kv_layout(
+            kernels_src,
+            &prefill_src.replacen("KV1 [[buffer(10)]]", "KV1 [[buffer(9)]]", 1),
+        ).is_err());
+    }
+
+    #[test]
+    fn multi_slab_gpu_table_entry_packs_all_four_slabs_decodes_shader_ptr_and_refuses_overflow() {
+        // 1. Allocate across all 4 slabs (`KV0..KV3`, 2 slots per slab -> 8 slots total) at fp16 and KV8.
+        for kvb in [2u32, 1u32] {
+            let stride = stride_at(BlockKind::Full, kvb).unwrap();
+            let mut pool = BlockPool::open_host(BlockKind::Full, 0, kvb, stride * 2).unwrap();
+            let mut table = BlockTable::new(8).unwrap();
+            let mut slots = Vec::new();
+            for bi in 0..8u32 {
+                let (slot, logical_off) = pool.take_free().unwrap();
+                assert_eq!(logical_off, u64::from(bi) * stride);
+                let gen = pool.record(slot).unwrap().generation();
+                table.fill(&mut pool, BlockIndex::new(bi), slot, gen).unwrap();
+                // Stamp a unique 8-byte tag at the start and end of each slot's backing storage.
+                let tag = 0xA500_0000_0000_0000u64 | (u64::from(kvb) << 16) | u64::from(bi + 1);
+                let sb = pool.slot_bytes_mut(slot).unwrap();
+                sb[..8].copy_from_slice(&tag.to_le_bytes());
+                let end = sb.len() - 8;
+                sb[end..].copy_from_slice(&(tag ^ 0xFFFF).to_le_bytes());
+                slots.push(slot);
+            }
+            assert_eq!(pool.slab_count(), MAX_SLABS);
+            // A 9th slot requires a 5th slab (`KV4`), which MUST be refused with `BlockError::Slab`.
+            assert_eq!(pool.grow(), Err(BlockError::Slab));
+
+            // Upload all 8 entries via `sync_dirty_to_slice` and decode every word with `kv_blk_ptr` bit logic.
+            let mut gpu_bt = vec![0u64; 8];
+            assert_eq!(table.sync_dirty_to_slice(BlockKind::Full, &pool, &mut gpu_bt).unwrap(), 8);
+
+            // Collect raw slab base slices (`s0, s1, s2, s3` bound at buffers `3, 10, 11, 12`).
+            assert_eq!(KV_SLAB_BUFFER_INDICES, [3, 10, 11, 12]);
+            for bi in 0..8usize {
+                let expected_slab = bi / 2;
+                let expected_off = ((bi % 2) as u64) * stride;
+                let word = gpu_bt[bi];
+                assert_eq!(word, ((expected_slab as u64) << 62) | expected_off);
+                let (si, off) = decode_gpu_table_entry(word);
+                assert_eq!(si, expected_slab);
+                assert_eq!(off, expected_off);
+                assert!(off + stride <= stride * 2);
+
+                // Verify `base + off + in_slot_off` resolves to the exact stamped slot without aliasing.
+                let slab_first_slot = slots[si * 2];
+                let (s_ptr, _) = pool.slot_raw_region(slab_first_slot).unwrap();
+                let resolved_start = unsafe { std::slice::from_raw_parts(s_ptr.add(off as usize), 8) };
+                let resolved_end = unsafe {
+                    std::slice::from_raw_parts(s_ptr.add((off + stride - 8) as usize), 8)
+                };
+                let want_tag = 0xA500_0000_0000_0000u64 | (u64::from(kvb) << 16) | ((bi as u64) + 1);
+                assert_eq!(u64::from_le_bytes(resolved_start.try_into().unwrap()), want_tag);
+                assert_eq!(u64::from_le_bytes(resolved_end.try_into().unwrap()), want_tag ^ 0xFFFF);
+            }
+        }
+
+        // 2. Boundary & 62-bit overflow checks on `gpu_table_entry` (`NoOffsetClobbersSlab` in `SlabWord.tla`).
+        let stride = FULL_STRIDE; // 2 MiB (`1 << 21`)
+        let max_valid_within = ((1u64 << KV_SLAB_SHIFT) / stride - 1) as usize; // `(1 << 41) - 1`
+        let overflow_within = (1u64 << KV_SLAB_SHIFT) / stride; // `1 << 41` -> `off == 1 << 62`!
+        let slots_per_slab = (overflow_within as usize) + 2;
+
+        // Construct a lightweight metadata-only pool at the 62-bit boundary (`slab = 1` and `slab = 2`).
+        let boundary_slots = vec![
+            (0usize, max_valid_within),                  // slab 0, highest valid 62-bit offset `(1<<62) - 2 MiB`
+            (1usize, max_valid_within),                  // slab 1, highest valid 62-bit offset
+            (2usize, overflow_within as usize),          // slab 2, `off == 1<<62` -> MUST refuse `Overflow`!
+        ];
+        for (slab_i, within_i) in boundary_slots {
+            // Shift `slots` sparse window by testing a 1-slot custom `BlockPool` via `slots_per_slab`?
+            // Note `i = slot.pool_index()`, so for `slab = 0` at `max_valid_within` we can test directly
+            // with a custom `stride` where `slots_per_slab = 4`:
+            let _ = (slab_i, within_i, slots_per_slab);
+        }
+        let half_limit = 1u64 << 61; // 2 EiB stride -> within=0 is 0, within=1 is 2 EiB (< 2^62), within=2 is 4 EiB (== 2^62)!
+        let mut synthetic = BlockPool {
+            kind: BlockKind::Full,
+            kvb: 2,
+            stride: half_limit,
+            slots_per_slab: 3, // within \in {0, 1, 2}, where within=2 hits `1 << 62`!
+            slots: vec![SlotRecord::fresh(BlockKind::Full); 12],
+            slabs: Vec::new(),
+            #[cfg(not(standalone_blocks))]
+            device: None,
+        };
+        for idx in 1..=12u32 {
+            let s = Slot::new(idx).unwrap();
+            synthetic.record_mut(s).unwrap().bump_generation().unwrap();
+            synthetic.record_mut(s).unwrap().add_ref().unwrap();
+        }
+        // For every slab 0..4: `within = 0` and `within = 1` (`off = 1 << 61`) succeed and preserve `slab << 62`,
+        // while `within = 2` (`off = 1 << 62`) is refused with `BlockError::Overflow`!
+        for slab in 0..MAX_SLABS {
+            for within in 0..3usize {
+                let s = Slot::new((slab * 3 + within + 1) as u32).unwrap();
+                let entry = BlockEntry::new(s, 1, 0, BlockKind::Full, 2);
+                let res = synthetic.gpu_table_entry(entry);
+                if within < 2 {
+                    let word = res.expect("valid < 2^62 offset");
+                    assert_eq!(decode_gpu_table_entry(word), (slab, (within as u64) * half_limit));
+                } else {
+                    assert_eq!(res, Err(BlockError::Overflow), "offset >= 2^62 must be refused");
+                }
+            }
+        }
+        // Also verify `within * stride` wrapping past `2^64` is caught via `checked_mul` -> `BlockError::Overflow`.
+        synthetic.stride = (1u64 << 63) + 1024; // within=2 would wrap modulo 2^64 to `2048 < 2^62` without checked_mul!
+        let wrap_slot = Slot::new(3).unwrap(); // i = 2 -> within = 2
+        let wrap_entry = BlockEntry::new(wrap_slot, 1, 0, BlockKind::Full, 2);
+        assert_eq!(synthetic.gpu_table_entry(wrap_entry), Err(BlockError::Overflow));
     }
 }

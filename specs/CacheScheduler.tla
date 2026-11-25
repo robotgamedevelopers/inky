@@ -7,9 +7,10 @@
 \*   - BlockSize (B in BlockLayout), WindowSize (W in BlockLayout): positions
 \*     per block and sliding-window width in positions;
 \*   - Window, History, SpanWindow, Full, SpanBound: exact logical block sets;
-\*   - start point, span, pin, sealed block, unsealed tail, memory/disk tiers;
-\*   - MaxBypass: the scheduler's bypass bound W covering Ready, Restoring,
-\*     and Queued lanes.
+\*   - start point (KV blocks + recurrent `stateTier`), multi-block prefill span,
+\*     pin, prefill-only sealed blocks, decode-private unsealed blocks, RAM/SSD tiers;
+\*   - MaxBypass + independent unclamped `ghostBypass`: starvation bound W covering
+\*     Ready, Restoring, Admitted, and Queued lanes.
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
@@ -17,16 +18,16 @@ CONSTANTS
     Lanes,          \* Set of lane slots, e.g. {a, b}
     Prefixes,       \* Set of token prefixes, e.g. {p1, p2}
     RequestLengths, \* Allowed request target lengths, e.g. {2, 4}
-    BlockSize,      \* Positions per block (64 in production, 2 here)
-    WindowSize,     \* Sliding-window positions (1024 in production, 2 here)
-    MaxPos,          \* Maximum context positions (4 or 8 here)
-    MaxSpan,         \* Maximum tokens per prefill span (2 here)
-    StepTokenBudget, \* Aggregate token budget across all spans in one step
-    MemBudget,       \* Memory budget in blocks
-    DiskBudget,      \* Disk budget in blocks
-    MaxQueue,        \* Queue limit before 429 refusal
-    MaxBypass,       \* Bypass bound W for Ready, Restoring, and Queued lanes
-    Bug              \* "none" or reversed-witness selector (see ASSUME below)
+    BlockSize,      \* Positions per block (64 in production, 1 or 2 here)
+    WindowSize,     \* Sliding-window positions (1024 in production, 1..3 here)
+    MaxPos,         \* Maximum context positions (4 or 8 here)
+    MaxSpan,        \* Maximum tokens per prefill span (may cross block boundaries!)
+    StepTokenBudget,\* Aggregate token budget across all spans in one step
+    MemBudget,      \* Memory budget in KV blocks
+    DiskBudget,     \* Disk budget in KV blocks
+    MaxQueue,       \* Queue limit before 429 refusal
+    MaxBypass,      \* Bypass bound W for Ready, Restoring, Admitted, and Queued lanes
+    Bug             \* "none" or reversed-witness selector (see ASSUME below)
 
 ASSUME
     /\ BlockSize > 0
@@ -35,7 +36,7 @@ ASSUME
     /\ MaxPos % BlockSize = 0
     /\ RequestLengths # {}
     /\ \A r \in RequestLengths : r \in 1..MaxPos /\ r % BlockSize = 0
-    /\ MaxSpan \in 1..BlockSize
+    /\ MaxSpan \in 1..MaxPos
     /\ StepTokenBudget >= MaxSpan
     /\ MemBudget >= 2
     /\ DiskBudget >= 2
@@ -50,7 +51,11 @@ ASSUME
            "no_decode_priority",
            "queued_bypass",
            "deferred_tied_429",
-           "eager_hot_writeback"
+           "eager_hot_writeback",
+           "drop_start_state",
+           "seal_decode",
+           "writeback_clobber",
+           "no_spill"
        }
 
 Kinds == {"full", "window"}
@@ -61,21 +66,25 @@ DefaultPrefix == CHOOSE p \in Prefixes : TRUE
 DefaultTarget == CHOOSE r \in RequestLengths : TRUE
 ProbeLane == CHOOSE l \in Lanes : TRUE
 
+Max(a, b) == IF a >= b THEN a ELSE b
+Min(a, b) == IF a <= b THEN a ELSE b
+
 \* Canonical block identifiers:
-\*   - TreeIds: sealed blocks in the shared prefix tree, keyed by (prefix, kind, idx);
-\*   - PrivIds: private unsealed tail blocks being written by one lane (lane, kind).
+\*   - TreeIds: sealed prefill blocks in the shared prefix tree, keyed by (prefix, kind, idx);
+\*   - PrivIds: private unsealed blocks written by one lane (lane, kind, idx), supporting
+\*     both multi-block prefill spans and unsealed decode-written blocks (Decision 4).
 TreeIds == {<<"tree", p, k, i>> : p \in Prefixes, k \in Kinds, i \in BlkIdx}
-PrivIds == {<<"priv", l, k>> : l \in Lanes, k \in Kinds}
+PrivIds == {<<"priv", l, k, i>> : l \in Lanes, k \in Kinds, i \in BlkIdx}
 BlockIds == TreeIds \cup PrivIds
 NoBlock == <<"none">>
 
 BlockKind(b) == b[3]
 
-\* Logical block-range helpers (identical to specs/BlockLayout.tla).
+\* Logical block-range helpers (identical to specs/BlockLayout.tla and serve/block_cache.rs:100).
 Ceil(n, d) == (n + d - 1) \div d
 SpanBound(c) == Ceil(WindowSize - 1 + c, BlockSize) + 1
 Window(lo, hi) == IF hi < lo THEN {} ELSE {p \div BlockSize : p \in lo..hi}
-History(n) == Window(IF n > WindowSize THEN n - WindowSize ELSE 0, n - 1)
+History(n) == Window(IF n >= WindowSize THEN n - WindowSize + 1 ELSE 0, n - 1)
 SpanWindow(n, c) == Window(IF n >= WindowSize THEN n - WindowSize + 1 ELSE 0, n + c - 1)
 Full(n) == Window(0, n - 1)
 
@@ -85,6 +94,11 @@ MaxWinBlocks(m) ==
         allW  == Cardinality(Full(m))
     IN IF bound < allW THEN bound ELSE allW
 WorstCaseBlocks(m) == TotalFullBlocks(m) + MaxWinBlocks(m)
+
+\* Dedicated RAM and SSD budgets for kept start-point recurrent states (`cs`).
+MaxSpanBoundaries == Ceil(MaxSpan, BlockSize)
+StateMemBudget == Max(2, (Cardinality(Lanes) - 1) + MaxSpanBoundaries)
+StateDiskBudget == Max(DiskBudget, StateMemBudget)
 
 EmptyData == [i \in 0..(BlockSize - 1) |-> 0]
 FullData  == [i \in 0..(BlockSize - 1) |-> 1]
@@ -99,7 +113,7 @@ EmptyBlock == [
 EmptyBlkMap == [i \in BlkIdx |-> NoBlock]
 EmptyStart == [
     kept      |-> FALSE,
-    stateKept |-> FALSE,
+    stateTier |-> "none",
     full      |-> {},
     win       |-> {}
 ]
@@ -129,19 +143,20 @@ VARIABLES
     laneWin,        \* [Lanes -> [BlkIdx -> BlockIds \cup {NoBlock}]]
     reservation,    \* [Lanes -> 0..MemBudget]
     admitBudget,    \* [Lanes -> 0..MemBudget]
-    waitTicks,      \* [Lanes -> 0..(MaxBypass + 1)]
+    waitTicks,      \* [Lanes -> 0..(MaxBypass + 1)] scheduler's own counter
+    ghostBypass,    \* [Lanes -> Nat] independent unclamped pass-over ghost counter
     queueSeq,       \* Seq(Lanes): FIFO arrival order of currently Queued lanes (no duplicates)
     stepActive,     \* BOOLEAN: one step in flight
     stepLanes,      \* Subset of Lanes in the current step
     stepSpan,       \* [Lanes -> 0..MaxSpan]
     stepPins,       \* Subset of BlockIds pinned in memory by the step's spans
-    stepIO,         \* Subset of BlockIds with pending disk I/O in this step
+    stepIO,         \* Subset of BlockIds with pending disk I/O
     gpuDone         \* BOOLEAN: GPU work of the in-flight step has completed
 
 vars == <<
     blocks, startPoints,
     laneState, lanePrefix, laneTarget, lanePos, laneFull, laneWin,
-    reservation, admitBudget, waitTicks, queueSeq,
+    reservation, admitBudget, waitTicks, ghostBypass, queueSeq,
     stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone
 >>
 
@@ -155,8 +170,14 @@ InMemory(b) == blocks[b].tier \in {"memory", "both"}
 OnDisk(b)   == blocks[b].tier \in {"disk", "both"}
 Present(b)  == blocks[b].tier # "none"
 
-MemUsed  == Cardinality({b \in BlockIds : InMemory(b)})
-DiskUsed == Cardinality({b \in BlockIds : OnDisk(b)})
+StateInMem(pk)   == IF pk \in DOMAIN startPoints THEN startPoints[pk].stateTier \in {"memory", "both"} ELSE FALSE
+StateOnDisk(pk)  == IF pk \in DOMAIN startPoints THEN startPoints[pk].stateTier \in {"disk", "both"} ELSE FALSE
+StatePresent(pk) == IF pk \in DOMAIN startPoints THEN startPoints[pk].stateTier # "none" ELSE FALSE
+
+MemUsed       == Cardinality({b \in BlockIds : InMemory(b)})
+DiskUsed      == Cardinality({b \in BlockIds : OnDisk(b)})
+StateMemUsed  == Cardinality({pk \in Prefixes \X Boundaries : startPoints[pk].kept /\ StateInMem(pk)})
+StateDiskUsed == Cardinality({pk \in Prefixes \X Boundaries : startPoints[pk].kept /\ StateOnDisk(pk)})
 
 LaneBlockSet(f, w) ==
     ({f[i] : i \in BlkIdx} \cup {w[i] : i \in BlkIdx}) \ {NoBlock}
@@ -190,19 +211,38 @@ AdmittedTotal       == SumBy({l \in Lanes : laneState[l] \in AdmittedStates}, ad
 QueuedLanes         == {l \in Lanes : laneState[l] = "Queued"}
 ReadyLanes          == {l \in Lanes : laneState[l] = "Ready"}
 RestoringLanes      == {l \in Lanes : laneState[l] = "Restoring"}
-ActiveRestoring     == {r \in RestoringLanes : \E rb \in LaneBlocks(r) : blocks[rb].tier = "disk"}
+RestoringStartNeed  == {<<lanePrefix[r], lanePos[r]>> : r \in {q \in RestoringLanes : lanePos[q] > 0}}
+ActiveRestoring     == {r \in RestoringLanes :
+                            (\E rb \in LaneBlocks(r) : blocks[rb].tier = "disk")
+                            \/ (StateOnDisk(<<lanePrefix[r], lanePos[r]>>)
+                                /\ ~StateInMem(<<lanePrefix[r], lanePos[r]>>))}
 SteppableReady      == {l \in ReadyLanes : lanePos[l] < laneTarget[l]}
+WindowPruned(l)     == \A i \in BlkIdx : laneWin[l][i] # NoBlock => i \in History(lanePos[l])
 
 \* Positions below PromptEnd(t) are prompt prefill (spans up to MaxSpan);
 \* positions at or above PromptEnd(t) are token-by-token decode (1-token spans).
+\* Decision 4: decode-written blocks are NEVER sealed into TreeIds or kept as start points.
 PromptEnd(t)    == IF t > BlockSize THEN t - BlockSize ELSE 0
+MatchCeiling(t) == IF Bug = "seal_decode" THEN t ELSE PromptEnd(t)
 IsPrefilling(l) == laneState[l] = "Ready" /\ lanePos[l] < PromptEnd(laneTarget[l])
 IsDecoding(l)   == laneState[l] = "Ready" /\ lanePos[l] >= PromptEnd(laneTarget[l]) /\ lanePos[l] < laneTarget[l]
 
+NeedFullForSpan(l, c) == {i \in Full(lanePos[l] + c) : laneFull[l][i] = NoBlock}
+NeedWinForSpan(l, c)  == {i \in SpanWindow(lanePos[l], c) : laneWin[l][i] = NoBlock}
+SpanAllocCount(l, c)  == Cardinality(NeedFullForSpan(l, c)) + Cardinality(NeedWinForSpan(l, c))
+
+MaxLegalSpan(l) ==
+    IF IsDecoding(l) THEN 1
+    ELSE Min(MaxSpan, Min(StepTokenBudget, PromptEnd(laneTarget[l]) - lanePos[l]))
+
 NeedAllocMap == [l \in Lanes |->
     IF laneState[l] = "Ready" /\ lanePos[l] < laneTarget[l]
-    THEN (IF laneFull[l][lanePos[l] \div BlockSize] = NoBlock THEN 1 ELSE 0) +
-         (IF laneWin[l][lanePos[l] \div BlockSize] = NoBlock THEN 1 ELSE 0)
+    THEN SpanAllocCount(l, 1)
+    ELSE 0]
+
+MaxSpanAllocMap == [l \in Lanes |->
+    IF laneState[l] = "Ready" /\ lanePos[l] < laneTarget[l]
+    THEN SpanAllocCount(l, MaxLegalSpan(l))
     ELSE 0]
 
 CurrentWorkingSet(l) ==
@@ -217,6 +257,14 @@ ColdMemBlocks ==
 
 ColdDiskBlocks ==
     {b \in BlockIds : OnDisk(b) /\ LaneReferrers(b) = {} /\ b \notin stepIO}
+
+ColdMemStates ==
+    {pk \in Prefixes \X Boundaries :
+        startPoints[pk].kept /\ StateInMem(pk) /\ pk \notin RestoringStartNeed}
+
+ColdDiskStates ==
+    {pk \in Prefixes \X Boundaries :
+        startPoints[pk].kept /\ StateOnDisk(pk) /\ pk \notin RestoringStartNeed}
 
 MatchingBoundaries(p, maxP) ==
     {k \in Boundaries : k <= maxP /\ startPoints[<<p, k>>].kept}
@@ -240,6 +288,7 @@ Init ==
     /\ reservation = [l \in Lanes |-> 0]
     /\ admitBudget = [l \in Lanes |-> 0]
     /\ waitTicks   = [l \in Lanes |-> 0]
+    /\ ghostBypass = [l \in Lanes |-> 0]
     /\ queueSeq    = << >>
     /\ stepActive  = FALSE
     /\ stepLanes   = {}
@@ -250,8 +299,8 @@ Init ==
 
 \* ---- Request Arrival, Queueing, Admission & 429 Refusal -------------------
 
-DiskStartCount(p, maxP) ==
-    LET k == BestBoundary(p, maxP)
+DiskStartCount(p, reqLen) ==
+    LET k == BestBoundary(p, MatchCeiling(reqLen))
     IN IF k = 0 THEN 0
        ELSE Cardinality({b \in startPoints[<<p, k>>].full \cup startPoints[<<p, k>>].win : blocks[b].tier = "disk"})
 
@@ -266,9 +315,6 @@ CanFitAdmit(l) == CanFitRequest(lanePrefix[l], laneTarget[l])
 
 CanAdmitNow(l) ==
     /\ CanFitAdmit(l)
-    \* Longest-waiting fitting Queued lane first, with FIFO arrival order (queueSeq)
-    \* breaking ties; once any older Queued lane hits MaxBypass, no younger arrival
-    \* may leapfrog it (even if both are clamped at MaxBypass).
     /\ \A q \in (QueuedLanes \ {l}) :
            CanFitAdmit(q) =>
                (waitTicks[l] > waitTicks[q] \/ (waitTicks[l] = waitTicks[q] /\ OlderQueued(l, q)))
@@ -281,15 +327,20 @@ CanAdvanceAdmitted(l) ==
     /\ (   (Bug = "restore_split" /\ DiskStartCount(lanePrefix[l], laneTarget[l]) >= 2)
         \/ ReservedTotal + WorstCaseBlocks(laneTarget[l]) <= MemBudget)
 
+StartStateReady(l) ==
+    IF lanePos[l] = 0 THEN TRUE ELSE StateInMem(<<lanePrefix[l], lanePos[l]>>)
+
 CanAdvanceRestoring(l) ==
     /\ laneState[l] = "Restoring"
     /\ (   \A b \in LaneBlocks(l) : InMemory(b)
         \/ MemUsed < MemBudget
         \/ ColdMemBlocks # {})
+    /\ (   StartStateReady(l)
+        \/ StateMemUsed < StateMemBudget
+        \/ ColdMemStates # {})
+    /\ (((\A b \in LaneBlocks(l) : InMemory(b)) /\ StartStateReady(l) /\ Bug = "restore_split")
+           => ReservedTotal + (WorstCaseBlocks(laneTarget[l]) - reservation[l]) <= MemBudget)
 
-\* Waiting lanes across Ready, Restoring, Admitted, and Queued that can advance
-\* without waiting for running lanes to finish and release admission budget;
-\* passing any of them over in BuildStep consumes one tick of its MaxBypass budget.
 ActionableWaiting ==
     SteppableReady
         \cup {l \in Lanes : CanAdvanceAdmitted(l)}
@@ -298,10 +349,6 @@ ActionableWaiting ==
 
 StepBypassed(chosen) == ActionableWaiting \ chosen
 
-\* Atomic arrival capacity check (matching serve.rs): requests within MaxQueue
-\* enqueue into "Queued" (and when MaxQueue is reached, a fitting request that
-\* respects queued bypass bounds admits directly); requests beyond capacity or
-\* over MemBudget receive immediate HTTP 429 ("Refused") without entering "Queued".
 Arrive(l, p, reqLen) ==
     /\ laneState[l] \in {"Idle", "Refused", "Cancelled", "Finished"}
     /\ p \in Prefixes
@@ -316,6 +363,7 @@ Arrive(l, p, reqLen) ==
             /\ reservation' = [reservation EXCEPT ![l] = 0]
             /\ admitBudget' = [admitBudget EXCEPT ![l] = 0]
             /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+            /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
             /\ queueSeq'    = Append(queueSeq, l)
        ELSE LET wc       == WorstCaseBlocks(reqLen)
                 splitBug == Bug = "restore_split" /\ DiskStartCount(p, reqLen) >= 2
@@ -335,6 +383,7 @@ Arrive(l, p, reqLen) ==
                     /\ reservation' = [reservation EXCEPT ![l] = 0]
                     /\ admitBudget' = [admitBudget EXCEPT ![l] = 0]
                     /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+                    /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
                     /\ queueSeq'    = Append(queueSeq, l)
                ELSE IF canDirectAdmit
                THEN /\ laneState'   = [laneState EXCEPT ![l] = "Admitted"]
@@ -349,21 +398,24 @@ Arrive(l, p, reqLen) ==
                                         IF q = l THEN 0
                                         ELSE IF q \in QueuedLanes THEN waitTicks[q] + 1
                                         ELSE waitTicks[q]]
+                    /\ ghostBypass' = [q \in Lanes |->
+                                        IF q = l THEN 0
+                                        ELSE IF q \in QueuedLanes THEN ghostBypass[q] + 1
+                                        ELSE ghostBypass[q]]
                     /\ UNCHANGED queueSeq
                ELSE /\ laneState'   = [laneState EXCEPT ![l] = "Refused"]
                     /\ lanePrefix'  = [lanePrefix EXCEPT ![l] = DefaultPrefix]
-                    /\ laneTarget' = [laneTarget EXCEPT ![l] = DefaultTarget]
+                    /\ laneTarget'  = [laneTarget EXCEPT ![l] = DefaultTarget]
                     /\ lanePos'     = [lanePos EXCEPT ![l] = 0]
                     /\ laneFull'    = [laneFull EXCEPT ![l] = EmptyBlkMap]
                     /\ laneWin'     = [laneWin EXCEPT ![l] = EmptyBlkMap]
                     /\ reservation' = [reservation EXCEPT ![l] = 0]
                     /\ admitBudget' = [admitBudget EXCEPT ![l] = 0]
                     /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+                    /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
                     /\ UNCHANGED queueSeq
     /\ UNCHANGED <<blocks, startPoints, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
-\* Reversed-witness action only (Bug = "deferred_tied_429"): models deferred overflow
-\* queueing where tied waitTicks can retroactively 429 an already-queued request.
 Refuse429(l) ==
     /\ Bug = "deferred_tied_429"
     /\ laneState[l] = "Queued"
@@ -371,12 +423,13 @@ Refuse429(l) ==
     /\ \/ WorstCaseBlocks(laneTarget[l]) > MemBudget
        \/ /\ Cardinality(QueuedLanes) > MaxQueue
           /\ \A q \in QueuedLanes : waitTicks[l] <= waitTicks[q]
-    /\ laneState'  = [laneState EXCEPT ![l] = "Refused"]
-    /\ lanePrefix' = [lanePrefix EXCEPT ![l] = DefaultPrefix]
-    /\ laneTarget' = [laneTarget EXCEPT ![l] = DefaultTarget]
-    /\ lanePos'    = [lanePos EXCEPT ![l] = 0]
-    /\ waitTicks'  = [waitTicks EXCEPT ![l] = 0]
-    /\ queueSeq'   = RemoveLane(queueSeq, l)
+    /\ laneState'   = [laneState EXCEPT ![l] = "Refused"]
+    /\ lanePrefix'  = [lanePrefix EXCEPT ![l] = DefaultPrefix]
+    /\ laneTarget'  = [laneTarget EXCEPT ![l] = DefaultTarget]
+    /\ lanePos'     = [lanePos EXCEPT ![l] = 0]
+    /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+    /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
+    /\ queueSeq'    = RemoveLane(queueSeq, l)
     /\ UNCHANGED <<blocks, startPoints, laneFull, laneWin, reservation, admitBudget,
                    stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
@@ -389,11 +442,15 @@ Admit(l) ==
                             OlderQueued(q, l) /\ waitTicks[q] < MaxBypass}
        IN /\ laneState'   = [laneState EXCEPT ![l] = "Admitted"]
           /\ admitBudget' = [admitBudget EXCEPT ![l] = IF splitBug THEN 1 ELSE wc]
-          \* Preserve waitTicks[l] across Queued -> Admitted so queued age carries forward.
           /\ waitTicks'   = [q \in Lanes |->
                                 IF q = l THEN waitTicks[l]
                                 ELSE IF q \in bypassed THEN waitTicks[q] + 1
                                 ELSE waitTicks[q]]
+          \* Independent unclamped ghost count of every older queued lane overtaken by `l`:
+          /\ ghostBypass' = [q \in Lanes |->
+                                IF q = l THEN ghostBypass[l]
+                                ELSE IF q \in QueuedLanes /\ OlderQueued(q, l) THEN ghostBypass[q] + 1
+                                ELSE ghostBypass[q]]
           /\ queueSeq'    = RemoveLane(queueSeq, l)
     /\ UNCHANGED <<blocks, startPoints, lanePrefix, laneTarget, lanePos,
                    laneFull, laneWin, reservation,
@@ -405,7 +462,7 @@ BeginRestore(l) ==
     /\ laneState[l] = "Admitted"
     /\ LET p        == lanePrefix[l]
            wc       == WorstCaseBlocks(laneTarget[l])
-           k        == BestBoundary(p, laneTarget[l])
+           k        == BestBoundary(p, MatchCeiling(laneTarget[l]))
            sp       == IF k = 0 THEN EmptyStart ELSE startPoints[<<p, k>>]
            diskCnt  == Cardinality({b \in sp.full \cup sp.win : blocks[b].tier = "disk"})
            splitBug == Bug = "restore_split" /\ diskCnt >= 2
@@ -430,17 +487,14 @@ BeginRestore(l) ==
           /\ laneWin'     = nlw
           /\ reservation' = [reservation EXCEPT ![l] = res]
           /\ blocks'      = SyncRefCounts(blocks, nst, nlf, nlw, startPoints)
-    \* Preserve waitTicks[l] across Admitted -> Restoring so queued age carries forward.
-    /\ UNCHANGED <<startPoints, lanePrefix, laneTarget, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+    /\ UNCHANGED <<startPoints, lanePrefix, laneTarget, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 RestoreBlock(l, b) ==
     /\ laneState[l] = "Restoring"
     /\ b \in LaneBlocks(l)
     /\ blocks[b].tier = "disk"
     /\ MemUsed < MemBudget
-    \* Longest-waiting restoring lane reads first; waitTicks counts bypassed step ticks
-    \* and stays intact across Restoring -> Ready until the lane joins BuildStep.
     /\ \A r \in ActiveRestoring : waitTicks[l] >= waitTicks[r]
     /\ blocks' = [blocks EXCEPT ![b].tier = "both"]
     /\ reservation' = [reservation EXCEPT ![l] =
@@ -448,24 +502,61 @@ RestoreBlock(l, b) ==
                         THEN @ + 1
                         ELSE @]
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, admitBudget, waitTicks, queueSeq,
+                   laneFull, laneWin, admitBudget, waitTicks, ghostBypass, queueSeq,
                    stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+
+RestoreStartState(l) ==
+    /\ laneState[l] = "Restoring"
+    /\ lanePos[l] \in Boundaries
+    /\ LET pk == <<lanePrefix[l], lanePos[l]>>
+       IN /\ startPoints[pk].kept
+          /\ startPoints[pk].stateTier = "disk"
+          /\ StateMemUsed < StateMemBudget
+          /\ \A r \in ActiveRestoring : waitTicks[l] >= waitTicks[r]
+          /\ startPoints' = [startPoints EXCEPT ![pk].stateTier = "both"]
+    /\ UNCHANGED <<blocks, laneState, lanePrefix, laneTarget, lanePos,
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 FinishRestore(l) ==
     /\ laneState[l] = "Restoring"
     /\ \A b \in LaneBlocks(l) : InMemory(b)
-    /\ laneState' = [laneState EXCEPT ![l] = "Ready"]
-    \* Preserve waitTicks[l] across Restoring -> Ready so waiting age carries into BuildStep.
+    /\ StartStateReady(l)
+    /\ (Bug = "restore_split" =>
+            ReservedTotal + (WorstCaseBlocks(laneTarget[l]) - reservation[l]) <= MemBudget)
+    /\ laneState'   = [laneState EXCEPT ![l] = "Ready"]
+    /\ reservation' = [reservation EXCEPT ![l] =
+                        IF Bug = "restore_split" THEN WorstCaseBlocks(laneTarget[l]) ELSE @]
     /\ UNCHANGED <<blocks, startPoints, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+                   laneFull, laneWin, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 \* ---- Lazy Spill & Tier Eviction Under Memory / Disk Pressure --------------
 
 MemPressure ==
     /\ ColdMemBlocks # {}
     /\ \/ (MemUsed >= MemBudget /\ \E l \in RestoringLanes : \E b \in LaneBlocks(l) : ~InMemory(b))
-       \/ (SteppableReady # {} /\ MemUsed + SumBy(SteppableReady, NeedAllocMap) > MemBudget)
+       \/ (SteppableReady # {} /\ MemUsed + SumBy(SteppableReady, MaxSpanAllocMap) > MemBudget)
+
+NewBoundariesInSpan(l, c) ==
+    {<<lanePrefix[l], (bi + 1) * BlockSize>> :
+        bi \in {x \in BlkIdx :
+            (x + 1) * BlockSize > lanePos[l]
+            /\ (x + 1) * BlockSize <= lanePos[l] + c
+            /\ (x + 1) * BlockSize <= MatchCeiling(laneTarget[l])}}
+
+NewStateMemNeedMap == [l \in Lanes |->
+    IF laneState[l] = "Ready" /\ lanePos[l] < laneTarget[l]
+    THEN Cardinality({pk \in NewBoundariesInSpan(l, MaxLegalSpan(l)) : ~StateInMem(pk)})
+    ELSE 0]
+
+StateMemPressure ==
+    /\ ColdMemStates # {}
+    /\ \/ (StateMemUsed >= StateMemBudget
+           /\ \E l \in RestoringLanes :
+                StateOnDisk(<<lanePrefix[l], lanePos[l]>>)
+                /\ ~StateInMem(<<lanePrefix[l], lanePos[l]>>))
+       \/ (SteppableReady # {} /\ StateMemUsed + SumBy(SteppableReady, NewStateMemNeedMap) > StateMemBudget)
 
 EvictCleanOrUnrefMem ==
     /\ MemPressure
@@ -475,14 +566,11 @@ EvictCleanOrUnrefMem ==
                         IF nextTier = "none" THEN EmptyBlock
                         ELSE [@ EXCEPT !.tier = "disk"]]
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
-\* Cold tree blocks (LaneReferrers = {}) are written to SSD lazily ONLY under
-\* MemPressure and dropped from memory once on disk. Victim selection among
-\* eligible cold blocks uses nondeterministic \E choice, soundly over-approximating
-\* production LRU order without recency-timestamp state explosion.
 StartColdWriteback ==
+    /\ Bug # "no_spill"
     /\ stepIO = {}
     /\ MemPressure
     /\ {b \in ColdMemBlocks : OnDisk(b) \/ blocks[b].refCount = 0} = {}
@@ -490,30 +578,57 @@ StartColdWriteback ==
     /\ \E b \in {d \in ColdMemBlocks : blocks[d].tier = "memory" /\ blocks[d].sealed} :
         stepIO' = {b}
     /\ UNCHANGED <<blocks, startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, gpuDone>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, gpuDone>>
+
+EvictCleanStartState ==
+    /\ StateMemPressure
+    /\ \E pk \in {x \in ColdMemStates : StateOnDisk(x)} :
+        startPoints' = [startPoints EXCEPT ![pk].stateTier = "disk"]
+    /\ UNCHANGED <<blocks, laneState, lanePrefix, laneTarget, lanePos,
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+
+SpillStartState ==
+    /\ StateMemPressure
+    /\ {x \in ColdMemStates : StateOnDisk(x)} = {}
+    /\ StateDiskUsed < StateDiskBudget
+    /\ \E pk \in {x \in ColdMemStates : startPoints[x].stateTier = "memory"} :
+        startPoints' = [startPoints EXCEPT ![pk].stateTier =
+                            IF Bug = "drop_start_state" THEN "none" ELSE "disk"]
+    /\ UNCHANGED <<blocks, laneState, lanePrefix, laneTarget, lanePos,
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 ReclaimColdDisk ==
-    /\ DiskUsed + Cardinality(stepIO) >= DiskBudget
-    /\ (MemPressure \/ \E b \in ColdDiskBlocks : blocks[b].refCount = 0)
-    /\ \/ /\ \E b \in {d \in ColdDiskBlocks : blocks[d].refCount = 0} :
-                LET nextTier == IF InMemory(b) THEN "memory" ELSE "none"
-                IN blocks' = [blocks EXCEPT ![b] =
-                                IF nextTier = "none" THEN EmptyBlock
-                                ELSE [@ EXCEPT !.tier = "memory"]]
-          /\ UNCHANGED startPoints
-       \/ /\ ~\E b \in ColdDiskBlocks : blocks[b].refCount = 0
-          /\ \E pk \in DOMAIN startPoints :
-                /\ startPoints[pk].kept
+    /\ \/ /\ DiskUsed + Cardinality(stepIO) >= DiskBudget
+          /\ (MemPressure \/ \E b \in ColdDiskBlocks : blocks[b].refCount = 0)
+          /\ \/ /\ \E b \in {d \in ColdDiskBlocks : blocks[d].refCount = 0} :
+                      LET nextTier == IF InMemory(b) THEN "memory" ELSE "none"
+                      IN blocks' = [blocks EXCEPT ![b] =
+                                      IF nextTier = "none" THEN EmptyBlock
+                                      ELSE [@ EXCEPT !.tier = "memory"]]
+                /\ UNCHANGED startPoints
+             \/ /\ ~\E b \in ColdDiskBlocks : blocks[b].refCount = 0
+                /\ \E pk \in DOMAIN startPoints :
+                      /\ startPoints[pk].kept
+                      /\ pk \notin RestoringStartNeed
+                      /\ ((startPoints[pk].full \cup startPoints[pk].win) \cap stepIO) = {}
+                      /\ \E b \in startPoints[pk].full \cup startPoints[pk].win :
+                              b \in ColdDiskBlocks \cup ColdMemBlocks
+                      /\ LET nsp == [startPoints EXCEPT ![pk] = EmptyStart]
+                         IN /\ startPoints' = nsp
+                            /\ blocks' = SyncRefCounts(blocks, laneState, laneFull, laneWin, nsp)
+       \/ /\ StateDiskUsed >= StateDiskBudget
+          /\ StateMemPressure
+          /\ \E pk \in ColdDiskStates \cup ColdMemStates :
                 /\ ((startPoints[pk].full \cup startPoints[pk].win) \cap stepIO) = {}
-                /\ \E b \in startPoints[pk].full \cup startPoints[pk].win :
-                        b \in ColdDiskBlocks \cup ColdMemBlocks
                 /\ LET nsp == [startPoints EXCEPT ![pk] = EmptyStart]
                    IN /\ startPoints' = nsp
                       /\ blocks' = SyncRefCounts(blocks, laneState, laneFull, laneWin, nsp)
     /\ UNCHANGED <<laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 DropUnreferenced(b) ==
     /\ Present(b)
@@ -521,8 +636,8 @@ DropUnreferenced(b) ==
     /\ b \notin stepPins \cup stepIO
     /\ blocks' = [blocks EXCEPT ![b] = EmptyBlock]
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 \* ---- Window Sliding & Lane Completion -------------------------------------
 
@@ -534,8 +649,8 @@ SlideWindow(l) ==
           /\ laneWin' = [laneWin EXCEPT ![l] = nw]
           /\ blocks'  = SyncRefCounts(blocks, laneState, laneFull, [laneWin EXCEPT ![l] = nw], startPoints)
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
+                   laneFull, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
 FinishReady(l) ==
     /\ laneState[l] = "Ready"
@@ -552,6 +667,7 @@ FinishReady(l) ==
           /\ reservation' = [reservation EXCEPT ![l] = 0]
           /\ admitBudget' = [admitBudget EXCEPT ![l] = 0]
           /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+          /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
           /\ blocks'      = SyncRefCounts(blocks, nst, nlf, nlw, startPoints)
     /\ UNCHANGED <<startPoints, queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
 
@@ -563,24 +679,25 @@ SpanSize(l, c) ==
     ELSE /\ IsPrefilling(l)
          /\ c \in 1..MaxSpan
          /\ lanePos[l] + c <= PromptEnd(laneTarget[l])
-         /\ c <= BlockSize - (lanePos[l] % BlockSize)
+         /\ (Bug = "restore_split" => c = MaxLegalSpan(l))
 
 BuildStep(chosen, spans) ==
     /\ ~stepActive
+    /\ (Bug = "writeback_clobber" \/ stepIO = {})
     /\ chosen # {}
     /\ chosen \subseteq SteppableReady
     /\ SumBy(chosen, spans) <= StepTokenBudget
     /\ \A l \in chosen : SpanSize(l, spans[l])
+    /\ \A l \in chosen : (Bug = "unpruned_window" \/ WindowPruned(l))
     /\ \A l \in (Lanes \ chosen) : spans[l] = 0
     /\ LET maxW       == CHOOSE w \in {waitTicks[r] : r \in SteppableReady} :
                              \A u \in {waitTicks[r] : r \in SteppableReady} : w >= u
-           NeedFullAlloc(l) == laneFull[l][lanePos[l] \div BlockSize] = NoBlock
-           NeedWinAlloc(l)  == laneWin[l][lanePos[l] \div BlockSize] = NoBlock
-           NewFullIds == {<<"priv", l, "full">>   : l \in {q \in chosen : NeedFullAlloc(q)}}
-           NewWinIds  == {<<"priv", l, "window">> : l \in {q \in chosen : NeedWinAlloc(q)}}
+           NewFullIds == UNION {{<<"priv", l, "full", i>>   : i \in NeedFullForSpan(l, spans[l])} : l \in chosen}
+           NewWinIds  == UNION {{<<"priv", l, "window", i>> : i \in NeedWinForSpan(l, spans[l])}  : l \in chosen}
            NewIds     == NewFullIds \cup NewWinIds
            allocCnt   == Cardinality(NewIds)
-           \* Ready decoders excluded from chosen whose private tail blocks fit in memory.
+           NewBnds    == UNION {NewBoundariesInSpan(l, spans[l]) : l \in chosen}
+           newStMem   == Cardinality({pk \in NewBnds : ~StateInMem(pk)})
            FitUnchosenDecoders ==
                {d \in (SteppableReady \ chosen) :
                    IsDecoding(d) /\ MemUsed + allocCnt + NeedAllocMap[d] <= MemBudget}
@@ -606,21 +723,27 @@ BuildStep(chosen, spans) ==
              ELSE \A w \in StepBypassed(chosen) : waitTicks[w] < MaxBypass
           /\ \A b \in NewIds : blocks[b].tier = "none"
           /\ MemUsed + allocCnt <= MemBudget
+          /\ StateMemUsed + newStMem <= StateMemBudget
           /\ LET nlf == [l \in Lanes |->
-                            IF l \in chosen /\ NeedFullAlloc(l)
-                            THEN [laneFull[l] EXCEPT ![lanePos[l] \div BlockSize] = <<"priv", l, "full">>]
+                            IF l \in chosen
+                            THEN [i \in BlkIdx |->
+                                    IF i \in NeedFullForSpan(l, spans[l])
+                                    THEN <<"priv", l, "full", i>>
+                                    ELSE laneFull[l][i]]
                             ELSE laneFull[l]]
                  nlw == [l \in Lanes |->
-                            IF l \in chosen /\ NeedWinAlloc(l)
-                            THEN [laneWin[l] EXCEPT ![lanePos[l] \div BlockSize] = <<"priv", l, "window">>]
+                            IF l \in chosen
+                            THEN [i \in BlkIdx |->
+                                    IF i \in NeedWinForSpan(l, spans[l])
+                                    THEN <<"priv", l, "window", i>>
+                                    ELSE laneWin[l][i]]
                             ELSE laneWin[l]]
                  nst == [l \in Lanes |-> IF l \in chosen THEN "InStep" ELSE laneState[l]]
                  blks1 == [b \in BlockIds |->
                             IF b \in NewIds
-                            THEN LET owner == b[2]
-                                 IN [tier |-> "memory", sealed |-> FALSE,
-                                     idx |-> lanePos[owner] \div BlockSize,
-                                     length |-> 0, data |-> EmptyData, refCount |-> 1]
+                            THEN [tier |-> "memory", sealed |-> FALSE,
+                                  idx |-> b[4],
+                                  length |-> 0, data |-> EmptyData, refCount |-> 1]
                             ELSE blocks[b]]
                  blks2 == SyncRefCounts(blks1, nst, nlf, nlw, startPoints)
                  PinsFor(l) ==
@@ -630,24 +753,30 @@ BuildStep(chosen, spans) ==
                  ioCand == {b \in allPins : blks2[b].sealed /\ blks2[b].tier = "memory"}
                  pendIO == IF Bug = "eager_hot_writeback" /\ ioCand # {} /\ DiskUsed < DiskBudget
                            THEN {CHOOSE b \in ioCand : TRUE}
-                           ELSE {}
+                           ELSE IF Bug = "writeback_clobber"
+                           THEN {}
+                           ELSE stepIO
              IN /\ NoBlock \notin allPins
                 /\ \A b \in allPins : blks2[b].tier \in {"memory", "both"}
-                /\ blocks'     = blks2
-                /\ laneFull'   = nlf
-                /\ laneWin'    = nlw
-                /\ laneState'  = nst
-                /\ stepActive' = TRUE
-                /\ stepLanes'  = chosen
-                /\ stepSpan'   = spans
-                /\ stepPins'   = allPins
-                /\ stepIO'     = pendIO
-                /\ gpuDone'    = FALSE
-                /\ waitTicks'  = [q \in Lanes |->
+                /\ blocks'      = blks2
+                /\ laneFull'    = nlf
+                /\ laneWin'     = nlw
+                /\ laneState'   = nst
+                /\ stepActive'  = TRUE
+                /\ stepLanes'   = chosen
+                /\ stepSpan'    = spans
+                /\ stepPins'    = allPins
+                /\ stepIO'      = pendIO
+                /\ gpuDone'     = FALSE
+                /\ waitTicks'   = [q \in Lanes |->
                                     IF q \in chosen THEN 0
                                     ELSE IF q \in StepBypassed(chosen)
                                     THEN IF waitTicks[q] <= MaxBypass THEN waitTicks[q] + 1 ELSE waitTicks[q]
                                     ELSE waitTicks[q]]
+                /\ ghostBypass' = [q \in Lanes |->
+                                    IF q \in chosen THEN 0
+                                    ELSE IF q \in StepBypassed(chosen) THEN ghostBypass[q] + 1
+                                    ELSE ghostBypass[q]]
     /\ UNCHANGED <<startPoints, lanePrefix, laneTarget, lanePos, reservation, admitBudget, queueSeq>>
 
 GpuExecute ==
@@ -655,23 +784,26 @@ GpuExecute ==
     /\ ~gpuDone
     /\ blocks' = [b \in BlockIds |->
         IF \E l \in stepLanes :
-            /\ b \in {laneFull[l][lanePos[l] \div BlockSize], laneWin[l][lanePos[l] \div BlockSize]}
+            /\ b[4] \in Window(lanePos[l], lanePos[l] + stepSpan[l] - 1)
+            /\ b \in {laneFull[l][b[4]], laneWin[l][b[4]]}
             /\ Present(b)
             /\ ~blocks[b].sealed
-        THEN LET l   == CHOOSE q \in stepLanes :
-                            b \in {laneFull[q][lanePos[q] \div BlockSize],
-                                   laneWin[q][lanePos[q] \div BlockSize]}
-                 off == lanePos[l] % BlockSize
-                 cnt == stepSpan[l]
+        THEN LET l       == CHOOSE q \in stepLanes :
+                                /\ b[4] \in Window(lanePos[q], lanePos[q] + stepSpan[q] - 1)
+                                /\ b \in {laneFull[q][b[4]], laneWin[q][b[4]]}
+                 bi      == b[4]
+                 endPos  == lanePos[l] + stepSpan[l] - 1
+                 loInBlk == IF bi = (lanePos[l] \div BlockSize) THEN lanePos[l] % BlockSize ELSE 0
+                 hiExcl  == IF bi = (endPos \div BlockSize) THEN (endPos % BlockSize) + 1 ELSE BlockSize
              IN [blocks[b] EXCEPT
-                    !.length = off + cnt,
+                    !.length = hiExcl,
                     !.data   = [i \in 0..(BlockSize - 1) |->
-                                  IF i >= off /\ i < off + cnt THEN 1 ELSE blocks[b].data[i]]]
+                                  IF i >= loInBlk /\ i < hiExcl THEN 1 ELSE blocks[b].data[i]]]
         ELSE blocks[b]]
     /\ gpuDone' = TRUE
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, stepIO>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, stepIO>>
 
 CompleteStepIO ==
     /\ stepIO # {}
@@ -685,8 +817,8 @@ CompleteStepIO ==
                     ELSE blocks[b]]
     /\ stepIO' = {}
     /\ UNCHANGED <<startPoints, laneState, lanePrefix, laneTarget, lanePos,
-                   laneFull, laneWin, reservation, admitBudget, waitTicks, queueSeq,
-                   stepActive, stepLanes, stepSpan, stepPins, gpuDone>>
+                   laneFull, laneWin, reservation, admitBudget, waitTicks, ghostBypass,
+                   queueSeq, stepActive, stepLanes, stepSpan, stepPins, gpuDone>>
 
 FinishStep ==
     /\ stepActive
@@ -694,35 +826,49 @@ FinishStep ==
     /\ stepIO = {}
     /\ LET Surviving     == {l \in stepLanes : laneState[l] = "InStep"}
            CancellingSet == {l \in stepLanes : laneState[l] = "Cancelling"}
-           BoundaryLanes == {l \in Surviving : (lanePos[l] + stepSpan[l]) % BlockSize = 0}
-           PublishedTreeIds ==
-               UNION {{<<"tree", lanePrefix[l], "full",   ((lanePos[l] + stepSpan[l]) \div BlockSize) - 1>>,
-                       <<"tree", lanePrefix[l], "window", ((lanePos[l] + stepSpan[l]) \div BlockSize) - 1>>} :
-                      l \in BoundaryLanes}
-           RetiredPrivIds ==
-               UNION {{<<"priv", l, "full">>, <<"priv", l, "window">>} : l \in BoundaryLanes \cup CancellingSet}
            npos == [l \in Lanes |->
                     IF l \in CancellingSet THEN 0
                     ELSE IF l \in Surviving THEN lanePos[l] + stepSpan[l]
                     ELSE lanePos[l]]
+           SealBlkIndices(l) ==
+               {bi \in BlkIdx :
+                    /\ (bi + 1) * BlockSize > lanePos[l]
+                    /\ (bi + 1) * BlockSize <= npos[l]
+                    /\ (bi + 1) * BlockSize <= MatchCeiling(laneTarget[l])}
+           PublishedTreeIds ==
+               UNION { { <<"tree", lanePrefix[l], "full", bi>>   : bi \in SealBlkIndices(l) }
+                       \cup
+                       { <<"tree", lanePrefix[l], "window", bi>> : bi \in SealBlkIndices(l) } :
+                      l \in Surviving }
+           RetiredPrivIds ==
+               (UNION { { <<"priv", l, "full", bi>>   : bi \in SealBlkIndices(l) }
+                        \cup
+                        { <<"priv", l, "window", bi>> : bi \in SealBlkIndices(l) } :
+                       l \in Surviving })
+               \cup
+               (UNION { { <<"priv", l, "full", i>>   : i \in BlkIdx }
+                        \cup
+                        { <<"priv", l, "window", i>> : i \in BlkIdx } :
+                       l \in CancellingSet })
            npfx == [l \in Lanes |-> IF l \in CancellingSet THEN DefaultPrefix ELSE lanePrefix[l]]
            ntgt == [l \in Lanes |-> IF l \in CancellingSet THEN DefaultTarget ELSE laneTarget[l]]
            nlf == [l \in Lanes |->
                     IF l \in CancellingSet THEN EmptyBlkMap
-                    ELSE IF l \in BoundaryLanes
-                    THEN LET bi == (npos[l] \div BlockSize) - 1
-                         IN [laneFull[l] EXCEPT ![bi] = <<"tree", lanePrefix[l], "full", bi>>]
+                    ELSE IF l \in Surviving
+                    THEN [i \in BlkIdx |->
+                            IF i \in SealBlkIndices(l)
+                            THEN <<"tree", lanePrefix[l], "full", i>>
+                            ELSE laneFull[l][i]]
                     ELSE laneFull[l]]
+           \* Leave `laneWin[l]` unpruned in FinishStep so `SlideWindow(l)` executes as an
+           \* explicit transition before the next `BuildStep` when blocks leave `History(npos[l])`.
            nlw == [l \in Lanes |->
                     IF l \in CancellingSet THEN EmptyBlkMap
                     ELSE IF l \in Surviving
-                    THEN LET rawW == IF l \in BoundaryLanes
-                                     THEN LET bi == (npos[l] \div BlockSize) - 1
-                                          IN [laneWin[l] EXCEPT ![bi] = <<"tree", lanePrefix[l], "window", bi>>]
-                                     ELSE laneWin[l]
-                         IN IF Bug = "unpruned_window"
-                            THEN rawW
-                            ELSE [i \in BlkIdx |-> IF i \in History(npos[l]) THEN rawW[i] ELSE NoBlock]
+                    THEN [i \in BlkIdx |->
+                            IF i \in SealBlkIndices(l)
+                            THEN <<"tree", lanePrefix[l], "window", i>>
+                            ELSE laneWin[l][i]]
                     ELSE laneWin[l]]
            blksSealed == [b \in BlockIds |->
                             IF b \in RetiredPrivIds THEN EmptyBlock
@@ -735,9 +881,10 @@ FinishStep ==
                                   refCount |-> blocks[b].refCount]
                             ELSE blocks[b]]
            nsp == [pk \in Prefixes \X Boundaries |->
-                    IF \E l \in BoundaryLanes : lanePrefix[l] = pk[1] /\ npos[l] = pk[2]
+                    IF \E l \in Surviving :
+                        lanePrefix[l] = pk[1] /\ \E bi \in SealBlkIndices(l) : (bi + 1) * BlockSize = pk[2]
                     THEN [kept      |-> TRUE,
-                          stateKept |-> TRUE,
+                          stateTier |-> IF startPoints[pk].stateTier \in {"disk", "both"} THEN "both" ELSE "memory",
                           full      |-> {<<"tree", pk[1], "full", i>>   : i \in Full(pk[2])},
                           win       |-> {<<"tree", pk[1], "window", i>> : i \in History(pk[2])}]
                     ELSE startPoints[pk]]
@@ -747,6 +894,8 @@ FinishStep ==
                     ELSE laneState[l]]
            nres == [l \in Lanes |-> IF l \in CancellingSet THEN 0 ELSE reservation[l]]
            nadm == [l \in Lanes |-> IF l \in CancellingSet THEN 0 ELSE admitBudget[l]]
+           ngho == [l \in Lanes |-> IF l \in CancellingSet THEN 0 ELSE ghostBypass[l]]
+           nwai == [l \in Lanes |-> IF l \in CancellingSet THEN 0 ELSE waitTicks[l]]
            blksFinal == SyncRefCounts(blksSealed, nst, nlf, nlw, nsp)
        IN /\ blocks'      = blksFinal
           /\ startPoints' = nsp
@@ -758,21 +907,24 @@ FinishStep ==
           /\ laneWin'     = nlw
           /\ reservation' = nres
           /\ admitBudget' = nadm
+          /\ waitTicks'   = nwai
+          /\ ghostBypass' = ngho
           /\ stepActive'  = FALSE
           /\ stepLanes'   = {}
           /\ stepSpan'    = [l \in Lanes |-> 0]
           /\ stepPins'    = {}
           /\ gpuDone'     = FALSE
-    /\ UNCHANGED <<waitTicks, queueSeq, stepIO>>
+    /\ UNCHANGED <<queueSeq, stepIO>>
 
 \* ---- Client Disconnect / Cancellation -------------------------------------
 
 Cancel(l) ==
+    /\ Bug # "restore_split"
     /\ laneState[l] \in {"Queued", "Admitted", "Restoring", "Ready", "InStep"}
     /\ IF laneState[l] = "InStep" /\ Bug # "cancel_in_step"
        THEN /\ laneState' = [laneState EXCEPT ![l] = "Cancelling"]
             /\ UNCHANGED <<blocks, lanePrefix, laneTarget, lanePos, laneFull, laneWin,
-                           reservation, admitBudget, waitTicks, queueSeq>>
+                           reservation, admitBudget, waitTicks, ghostBypass, queueSeq>>
        ELSE LET nst == [laneState EXCEPT ![l] = "Cancelled"]
                 nlf == [laneFull EXCEPT ![l] = EmptyBlkMap]
                 nlw == [laneWin EXCEPT ![l] = EmptyBlkMap]
@@ -786,6 +938,7 @@ Cancel(l) ==
                /\ reservation' = [reservation EXCEPT ![l] = 0]
                /\ admitBudget' = [admitBudget EXCEPT ![l] = 0]
                /\ waitTicks'   = [waitTicks EXCEPT ![l] = 0]
+               /\ ghostBypass' = [ghostBypass EXCEPT ![l] = 0]
                /\ queueSeq'    = IF laneState[l] = "Queued" THEN RemoveLane(queueSeq, l) ELSE queueSeq
                /\ blocks'      = blks1
     /\ UNCHANGED <<startPoints, stepActive, stepLanes, stepSpan, stepPins, stepIO, gpuDone>>
@@ -797,12 +950,16 @@ AdvanceLane(l) ==
     \/ Admit(l)
     \/ BeginRestore(l)
     \/ (\E b \in BlockIds : RestoreBlock(l, b))
+    \/ RestoreStartState(l)
     \/ FinishRestore(l)
+    \/ (Bug # "unpruned_window" /\ SlideWindow(l))
     \/ FinishReady(l)
 
 MemReclaim ==
     \/ EvictCleanOrUnrefMem
     \/ StartColdWriteback
+    \/ EvictCleanStartState
+    \/ SpillStartState
     \/ ReclaimColdDisk
 
 AnyBuildStep ==
@@ -821,7 +978,7 @@ FairSchedulerActions ==
 
 UnfairEnvActions ==
     \/ (\E l \in Lanes, p \in Prefixes, r \in RequestLengths : Arrive(l, p, r))
-    \/ (\E l \in Lanes : SlideWindow(l) \/ Cancel(l))
+    \/ (\E l \in Lanes : Cancel(l))
     \/ (\E b \in BlockIds : DropUnreferenced(b))
 
 Next == FairSchedulerActions \/ UnfairEnvActions
@@ -848,7 +1005,7 @@ TypeOK ==
         /\ blocks[b].refCount \in Nat
     /\ \A pk \in Prefixes \X Boundaries :
         /\ startPoints[pk].kept \in BOOLEAN
-        /\ startPoints[pk].stateKept \in BOOLEAN
+        /\ startPoints[pk].stateTier \in Tiers
         /\ startPoints[pk].full \subseteq TreeIds
         /\ startPoints[pk].win \subseteq TreeIds
     /\ laneState \in [Lanes -> SlotStates]
@@ -858,6 +1015,7 @@ TypeOK ==
     /\ reservation \in [Lanes -> 0..MemBudget]
     /\ admitBudget \in [Lanes -> 0..MemBudget]
     /\ waitTicks \in [Lanes -> 0..(MaxBypass + 1)]
+    /\ ghostBypass \in [Lanes -> Nat]
     /\ queueSeq \in Seq(Lanes)
     /\ Len(queueSeq) = Cardinality(QueuedLanes)
     /\ \A i \in 1..Len(queueSeq) : queueSeq[i] \in QueuedLanes
@@ -892,6 +1050,24 @@ SealedValid ==
             /\ blocks[b].length = BlockSize
             /\ blocks[b].data = FullData
 
+MaxPrefillBoundary ==
+    LET maxR == CHOOSE r \in RequestLengths : \A q \in RequestLengths : r >= q
+    IN PromptEnd(maxR)
+
+\* Decision 4 (`docs/DESIGN.md`): decode-written blocks (`>= PromptEnd`) are never
+\* sealed into shared `TreeIds` and never kept as start points.
+NoDecodeBlocksSealed ==
+    /\ \A l \in Lanes :
+        laneState[l] \in MemHoldingStates =>
+            \A i \in BlkIdx :
+                i >= (PromptEnd(laneTarget[l]) \div BlockSize) =>
+                    /\ (laneFull[l][i] # NoBlock => laneFull[l][i] \in PrivIds /\ ~blocks[laneFull[l][i]].sealed)
+                    /\ (laneWin[l][i] # NoBlock  => laneWin[l][i] \in PrivIds  /\ ~blocks[laneWin[l][i]].sealed)
+    /\ \A pk \in Prefixes \X Boundaries :
+        startPoints[pk].kept => pk[2] <= MaxPrefillBoundary
+    /\ \A b \in TreeIds :
+        Present(b) => (b[4] + 1) * BlockSize <= MaxPrefillBoundary
+
 SealedNeverWritten ==
     \A b \in BlockIds :
         (Present(b) /\ blocks[b].sealed /\ blocks'[b].tier # "none") =>
@@ -908,7 +1084,8 @@ UnsealedPrivateInvisibleZero ==
             /\ StartReferrers(b) = {}
             /\ blocks[b].tier = "memory"
             /\ blocks[b].length <= BlockSize
-            /\ (~stepActive => blocks[b].length < BlockSize)
+            /\ ((~stepActive /\ b[4] < (PromptEnd(laneTarget[b[2]]) \div BlockSize)) =>
+                    blocks[b].length < BlockSize)
             /\ \A i \in blocks[b].length..(BlockSize - 1) : blocks[b].data[i] = 0
 
 RefCountMatchesReferrers ==
@@ -920,7 +1097,7 @@ RefCountMatchesReferrers ==
 StartPointsKept ==
     \A pk \in Prefixes \X Boundaries :
         startPoints[pk].kept =>
-            /\ startPoints[pk].stateKept = TRUE
+            /\ startPoints[pk].stateTier \in {"memory", "disk", "both"}
             /\ Cardinality(startPoints[pk].full) = Cardinality(Full(pk[2]))
             /\ Cardinality(startPoints[pk].win) = Cardinality(History(pk[2]))
             /\ \A i \in Full(pk[2]) :
@@ -941,25 +1118,30 @@ LaneHistoryCovered ==
 BudgetsAndReservations ==
     /\ MemUsed <= MemBudget
     /\ DiskUsed <= DiskBudget
+    /\ StateMemUsed <= StateMemBudget
+    /\ StateDiskUsed <= StateDiskBudget
     /\ ReservedTotal <= MemBudget
     /\ \A l \in Lanes :
         laneState[l] \in {"Restoring", "Ready", "InStep"} =>
             reservation[l] >= CurrentWorkingSet(l)
 
+\* Non-tautological spillability invariant (`U62`): whenever cold blocks sit in memory
+\* under `MemPressure` with no writeback in flight, `MemReclaim` MUST be enabled to
+\* evict, spill (`StartColdWriteback`), or reclaim disk space for them.
 ColdBlocksSpillable ==
-    \A b \in BlockIds :
+    /\ \A b \in BlockIds :
         (InMemory(b) /\ LaneReferrers(b) = {} /\ b \notin stepIO) =>
             /\ blocks[b].sealed = TRUE
             /\ b \notin stepPins
-            /\ \/ OnDisk(b)
-               \/ blocks[b].refCount = 0
-               \/ DiskUsed + Cardinality(stepIO) < DiskBudget
-               \/ ColdDiskBlocks # {}
-               \/ StartReferrers(b) # {}
+    /\ (MemPressure /\ stepIO = {}) => ENABLED MemReclaim
 
+\* Independent unclamped ghost pass-over counter (`U59`): verifies both the ceiling
+\* `ghostBypass[l] <= MaxBypass` and agreement with the scheduler's `waitTicks[l]`.
 BypassBoundHolds ==
     \A l \in Lanes :
-        laneState[l] \in WaitingStates => waitTicks[l] <= MaxBypass
+        laneState[l] \in WaitingStates =>
+            /\ ghostBypass[l] <= MaxBypass
+            /\ waitTicks[l] = ghostBypass[l]
 
 StepBudgetHolds ==
     stepActive =>
@@ -972,13 +1154,6 @@ QueueBounded ==
     /\ \A q \in QueuedLanes : WorstCaseBlocks(laneTarget[q]) <= MemBudget
 
 \* ---- Temporal Properties (Action Safety + Liveness) -----------------------
-\* Every `l \in Lanes` is symmetric in `Init`, `Next`, and `Fairness`. Moreover,
-\* the only exits from `"Queued"` are `{"Admitted", "Refused", "Cancelled"}`, and
-\* no transition from `AdmittedStates` can reach `"Refused"` without first hitting
-\* `{"Finished", "Cancelled"}`. Hence `LiveRequestResolves` on `ProbeLane` holds
-\* iff BOTH (a) every queued request is admitted, refused, or cancelled AND
-\* (b) every admitted/restoring lane finishes or is cancelled, while keeping a
-\* minimal 2-state Buchi tableau in TLC.
 
 ActionSealedImmutable == [][SealedNeverWritten]_vars
 
@@ -1004,11 +1179,20 @@ LazyColdWritebackStep ==
 
 ActionLazyColdWriteback == [][LazyColdWritebackStep]_vars
 
+\* An in-flight cold writeback (`b \in stepIO`) is never dropped or clobbered by
+\* `BuildStep` or any other transition until `CompleteStepIO` lands it `OnDisk` (`U61`).
+WritebackProtectedStep ==
+    \A b \in stepIO :
+        b \in stepIO' \/ (OnDisk(b))'
+
+ActionWritebackProtected == [][WritebackProtectedStep]_vars
+
 DecodePriorityStep ==
     (~stepActive /\ stepActive') =>
         LET maxW == CHOOSE w \in {waitTicks[r] : r \in SteppableReady} :
                         \A u \in {waitTicks[r] : r \in SteppableReady} : w >= u
-            stepAlloc == SumBy(stepLanes', NeedAllocMap)
+            stepAlloc == SumBy(stepLanes', [q \in Lanes |->
+                            IF q \in stepLanes' THEN SpanAllocCount(q, stepSpan'[q]) ELSE 0])
             FitUnchosenDecoders ==
                 {d \in (SteppableReady \ stepLanes') :
                     IsDecoding(d) /\ MemUsed + stepAlloc + NeedAllocMap[d] <= MemBudget}

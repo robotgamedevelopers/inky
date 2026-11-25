@@ -106,6 +106,8 @@ fn gen_cs(out_root: &Path, name: &str) {
     let mut step_bypass = 0usize;
     let mut cancel_cnt = 0usize;
     let mut refuse_cnt = 0usize;
+    let mut restore_cnt = 0usize;
+    let mut slide_cnt = 0usize;
 
     for seed in 0..16 {
         let mut ev = MemorySink::new();
@@ -123,6 +125,12 @@ fn gen_cs(out_root: &Path, name: &str) {
         }
         if let Ok(t) = parse_cache_scheduler_jsonl(&st.to_jsonl()) {
             for w in t.steps.windows(2) {
+                if w[1].action == "RestoreBlock" {
+                    restore_cnt += 1;
+                }
+                if w[1].action == "SlideWindow" {
+                    slide_cnt += 1;
+                }
                 if w[1].action == "Admit" {
                     for (l0, l1) in w[0].state.lanes.iter().zip(&w[1].state.lanes) {
                         if l0.state == "Queued" && l1.state == "Queued" && l1.wait_ticks > l0.wait_ticks {
@@ -145,13 +153,20 @@ fn gen_cs(out_root: &Path, name: &str) {
             walk_errs += 1;
         }
     }
-    if walk_errs > 0 || admit_bypass == 0 || step_bypass == 0 || cancel_cnt == 0 || refuse_cnt == 0 {
+    if walk_errs > 0
+        || admit_bypass == 0
+        || step_bypass == 0
+        || cancel_cnt == 0
+        || refuse_cnt == 0
+        || restore_cnt == 0
+        || slide_cnt == 0
+    {
         eprintln!(
-            "COVERAGE GAP {name}: walk_errs={walk_errs} admit_bypass={admit_bypass} step_bypass={step_bypass} cancel={cancel_cnt} refuse429={refuse_cnt}"
+            "COVERAGE GAP {name}: walk_errs={walk_errs} admit_bypass={admit_bypass} step_bypass={step_bypass} cancel={cancel_cnt} refuse429={refuse_cnt} restore={restore_cnt} slide={slide_cnt}"
         );
     } else {
         eprintln!(
-            "{name}: {} walks, admit_bypass={admit_bypass}, step_bypass={step_bypass}, cancel={cancel_cnt}, refuse429={refuse_cnt}",
+            "{name}: {} walks, admit_bypass={admit_bypass}, step_bypass={step_bypass}, cancel={cancel_cnt}, refuse429={refuse_cnt}, restore={restore_cnt}, slide={slide_cnt}",
             traces.len()
         );
     }
