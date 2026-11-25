@@ -9,6 +9,127 @@
 
 use std::collections::VecDeque;
 
+/// Supported `--draft-k` bounds for opt-in DSpark speculative decoding in `inky serve`.
+pub const MIN_DRAFT_K: usize = 1;
+pub const MAX_DRAFT_K: usize = 4;
+pub const DEFAULT_DRAFT_K: usize = 3;
+
+/// Reason a candidate speculative verify batch fell back cleanly to standard 1-token decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyFallbackReason {
+    CapacityExceeded {
+        spans: usize,
+        k: usize,
+        needed_rows: usize,
+        lg_rows: usize,
+    },
+    IneligibleLane,
+    ZeroDraftBudget,
+    MultiSpanRequiresHgemm,
+}
+
+/// Per-lane eligibility snapshot for speculative verification on a planned decode batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyLaneEligibility {
+    pub lane: usize,
+    pub p0: usize,
+    pub max_k: usize,
+    pub kv_cap: usize,
+    pub eligible: bool,
+}
+
+/// Scheduler dispatch decision for a planned decode batch when `--dspark` is enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeStepDispatch {
+    /// Execute a GPU speculative verify step with shared draft length `k` (`1..=MAX_DRAFT_K`).
+    Verify { lanes: Vec<usize>, k: usize },
+    /// Fall back cleanly to standard 1-token `encode_decode` for every lane in the batch without failing lanes.
+    FallbackDecode {
+        lanes: Vec<usize>,
+        reason: VerifyFallbackReason,
+    },
+}
+
+/// Check the `spans * (1 + k) <= lg_rows` batch logits arena invariant before encoding a verify step.
+pub fn check_verify_rows_fit(
+    spans: usize,
+    k: usize,
+    lg_rows: usize,
+) -> Result<usize, VerifyFallbackReason> {
+    let step_len = 1usize.saturating_add(k);
+    let needed_rows = spans.saturating_mul(step_len);
+    if spans == 0 || needed_rows > lg_rows {
+        return Err(VerifyFallbackReason::CapacityExceeded {
+            spans,
+            k,
+            needed_rows,
+            lg_rows,
+        });
+    }
+    Ok(needed_rows)
+}
+
+/// Decide whether a planned `ServeStepPlan::Decode` batch runs as a speculative verify step or
+/// falls back cleanly to standard 1-token decode:
+/// - Every lane in `dec_lanes` must be eligible (`eligible == true`, `clamp_k >= 1`).
+/// - Shared `k` is the minimum clamped `k` across the batch (`1..=requested_k`).
+/// - Enforces `dec_lanes.len() * (1 + k) <= lg_rows` (128): if exceeded, falls back to standard
+///   1-token decode for that step without failing or dropping any lane.
+/// - Requires `hgemm` whenever `dec_lanes.len() > 1`.
+pub fn select_verify_or_decode_fallback(
+    dec_lanes: &[usize],
+    elig: &[VerifyLaneEligibility],
+    requested_k: usize,
+    lg_rows: usize,
+    hgemm: bool,
+) -> DecodeStepDispatch {
+    let lanes = dec_lanes.to_vec();
+    if lanes.is_empty() || requested_k == 0 {
+        return DecodeStepDispatch::FallbackDecode {
+            lanes,
+            reason: VerifyFallbackReason::ZeroDraftBudget,
+        };
+    }
+    if lanes.len() > 1 && !hgemm {
+        return DecodeStepDispatch::FallbackDecode {
+            lanes,
+            reason: VerifyFallbackReason::MultiSpanRequiresHgemm,
+        };
+    }
+    if elig.len() != lanes.len() {
+        return DecodeStepDispatch::FallbackDecode {
+            lanes,
+            reason: VerifyFallbackReason::IneligibleLane,
+        };
+    }
+    let mut shared_k = requested_k;
+    for (idx, c) in elig.iter().enumerate() {
+        if c.lane != lanes[idx] || !c.eligible {
+            return DecodeStepDispatch::FallbackDecode {
+                lanes,
+                reason: VerifyFallbackReason::IneligibleLane,
+            };
+        }
+        let Some(clamped) = clamp_k(c.p0, c.max_k.min(requested_k), c.kv_cap) else {
+            return DecodeStepDispatch::FallbackDecode {
+                lanes,
+                reason: VerifyFallbackReason::ZeroDraftBudget,
+            };
+        };
+        if clamped == 0 {
+            return DecodeStepDispatch::FallbackDecode {
+                lanes,
+                reason: VerifyFallbackReason::ZeroDraftBudget,
+            };
+        }
+        shared_k = shared_k.min(clamped);
+    }
+    if let Err(reason) = check_verify_rows_fit(lanes.len(), shared_k, lg_rows) {
+        return DecodeStepDispatch::FallbackDecode { lanes, reason };
+    }
+    DecodeStepDispatch::Verify { lanes, k: shared_k }
+}
+
 /// FNV-1a over the raw IEEE-754 bits of one vocabulary row.
 pub fn logit_hash(row: &[f32]) -> u64 {
     let mut h = 0u64;
@@ -377,5 +498,98 @@ mod verify_planner_tests {
             ]
         );
         assert!(planner.complete_step().is_empty());
+    }
+
+    #[test]
+    fn serve_verify_capacity_guard_falls_back_cleanly_to_one_token_decode() {
+        let make_elig = |n: usize, p0: usize, max_k: usize, kv_cap: usize| -> (Vec<usize>, Vec<VerifyLaneEligibility>) {
+            let lanes: Vec<usize> = (0..n).collect();
+            let elig = lanes
+                .iter()
+                .map(|&lane| VerifyLaneEligibility {
+                    lane,
+                    p0,
+                    max_k,
+                    kv_cap,
+                    eligible: true,
+                })
+                .collect();
+            (lanes, elig)
+        };
+
+        // 32 lanes * (1 + 3) = 128 <= lg_rows(128): runs verify with k = 3.
+        let (l32, e32) = make_elig(32, 64, 3, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l32, &e32, 3, 128, true),
+            DecodeStepDispatch::Verify { lanes: l32, k: 3 }
+        );
+
+        // 33 lanes * (1 + 3) = 132 > lg_rows(128): cleanly falls back to 1-token decode without failing lanes.
+        let (l33, e33) = make_elig(33, 64, 3, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l33, &e33, 3, 128, true),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l33,
+                reason: VerifyFallbackReason::CapacityExceeded {
+                    spans: 33,
+                    k: 3,
+                    needed_rows: 132,
+                    lg_rows: 128,
+                },
+            }
+        );
+
+        // k = 4: 25 * 5 = 125 fits; 26 * 5 = 130 falls back cleanly.
+        let (l25, e25) = make_elig(25, 64, 4, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l25, &e25, 4, 128, true),
+            DecodeStepDispatch::Verify { lanes: l25, k: 4 }
+        );
+        let (l26, e26) = make_elig(26, 64, 4, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l26, &e26, 4, 128, true),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l26,
+                reason: VerifyFallbackReason::CapacityExceeded {
+                    spans: 26,
+                    k: 4,
+                    needed_rows: 130,
+                    lg_rows: 128,
+                },
+            }
+        );
+
+        // Near KV boundary clamps shared k across the batch (p0=61, kv_cap=64 -> k=2).
+        let (l2, mut e2) = make_elig(2, 10, 4, 64);
+        e2[1].p0 = 61;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 4, 128, true),
+            DecodeStepDispatch::Verify { lanes: l2.clone(), k: 2 }
+        );
+
+        // Ineligible lane (e.g., active LoopCD or JSON grammar) falls back cleanly.
+        e2[1].eligible = false;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 3, 128, true),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l2.clone(),
+                reason: VerifyFallbackReason::IneligibleLane,
+            }
+        );
+
+        // Multi-span without hgemm falls back cleanly; single-span without hgemm verifies.
+        e2[1].eligible = true;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 3, 128, false),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l2,
+                reason: VerifyFallbackReason::MultiSpanRequiresHgemm,
+            }
+        );
+        let (l1, e1) = make_elig(1, 10, 3, 64);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l1, &e1, 3, 128, false),
+            DecodeStepDispatch::Verify { lanes: l1, k: 3 }
+        );
     }
 }

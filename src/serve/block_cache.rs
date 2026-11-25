@@ -3000,6 +3000,20 @@ impl ServeBlockCache {
         t: usize,
     ) -> Result<(), CacheError> {
         self.try_ensure_span_blocks_with(pools, tbl, p0, t, |_, _| Ok(()))
+            .map(|_| ())
+    }
+
+    /// Transactional `ensure_span_blocks` returning the list of `(BlockKind, BlockIndex)` blocks
+    /// newly allocated for `[p0, p0 + t)` so a speculative verify step can release any rejected
+    /// draft blocks strictly past `p0 + n_keep` without violating `ServeOwnershipTrace` ref counts.
+    pub fn ensure_span_blocks_tracking(
+        &mut self,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        p0: usize,
+        t: usize,
+    ) -> Result<Vec<(BlockKind, BlockIndex)>, CacheError> {
+        self.try_ensure_span_blocks_with(pools, tbl, p0, t, |_, _| Ok(()))
     }
 
     fn try_ensure_span_blocks_with<F>(
@@ -3009,7 +3023,7 @@ impl ServeBlockCache {
         p0: usize,
         t: usize,
         mut pre_step: F,
-    ) -> Result<(), CacheError>
+    ) -> Result<Vec<(BlockKind, BlockIndex)>, CacheError>
     where
         F: FnMut(usize, BlockKind) -> Result<(), CacheError>,
     {
@@ -3038,7 +3052,7 @@ impl ServeBlockCache {
             }
         }
         if missing.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Phase 1: Upfront bounded capacity check + minimal victim selection BEFORE any eviction/spill.
@@ -3098,7 +3112,7 @@ impl ServeBlockCache {
             }
         }
 
-        Ok(())
+        Ok(newly_allocated)
     }
 
     fn prune_expired_window(&mut self, pools: &mut BlockPools, tbl: &mut BlockTable, start: usize, end: usize) {
@@ -3273,6 +3287,53 @@ impl ServeBlockCache {
                 .expect("set decode length");
         }
         self.prune_expired_window(pools, tbl, pos, end);
+    }
+
+    /// Post-verify bookkeeping after `Engine::rollback_verify(..., n_keep)`:
+    /// - Releases any newly allocated unsealed draft blocks strictly past `p0 + n_keep`
+    ///   (or all newly allocated blocks when `n_keep == 0`) back to `BlockPools`, preserving
+    ///   `ServeOwnershipTrace` `PoolRefConservation` identically.
+    /// - Updates unsealed `SlotRecord::length` for retained blocks in `[p0, p0 + n_keep)` without
+    ///   ever sealing speculative/decode blocks into `EntryTree`.
+    /// - Prunes expired `Window` blocks ONLY up to `p0 + n_keep` (never to the rejected draft end).
+    pub fn finish_verify_span(
+        &mut self,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        allocated: &[(BlockKind, BlockIndex)],
+        p0: usize,
+        n_keep: usize,
+    ) {
+        if n_keep == 0 {
+            for &(kind, bi) in allocated.iter().rev() {
+                tbl.clear_kind_entry(pools.of_mut(kind), bi)
+                    .expect("release aborted verify draft block");
+            }
+            return;
+        }
+        let accepted_end = p0 + n_keep;
+        for &(kind, bi) in allocated.iter().rev() {
+            let blk_start = (bi.get() as usize) * BLOCK;
+            if blk_start >= accepted_end {
+                tbl.clear_kind_entry(pools.of_mut(kind), bi)
+                    .expect("release rejected verify draft block");
+            }
+        }
+        let lo_blk = p0 / BLOCK;
+        let hi_blk = (accepted_end - 1) / BLOCK;
+        for b in lo_blk..=hi_blk {
+            let bi = BlockIndex::new(b as u32);
+            let block_len = (accepted_end - b * BLOCK).min(BLOCK) as u32;
+            for kind in KINDS {
+                let e = tbl.get(kind, bi).unwrap().expect("retained verify block entry");
+                let rec = pools.of_mut(kind).record_mut(e.slot()).unwrap();
+                assert!(!rec.sealed(), "verify must never seal {kind:?} block {b}");
+                rec.set_length(block_len).expect("set verify block length");
+            }
+        }
+        state.written = accepted_end;
+        self.prune_expired_window(pools, tbl, p0, accepted_end);
     }
 
     /// Release a lane's block-table references and unpin its `EntryTree` path so private/unsealed
@@ -4709,6 +4770,53 @@ mod tests {
         cache.release_lane(&mut pools, &mut tbl0, &mut st0);
         cache.release_lane(&mut pools, &mut tbl1, &mut st1);
         cache.release_lane(&mut pools, &mut tbl2, &mut st2);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn verify_span_tracking_and_rollback_preserve_ownership_across_block_and_window_boundaries() {
+        let mut pools = BlockPools::with_capacities(32, 32, 2).unwrap();
+        let mut cache = ServeBlockCache::new();
+        let mut tbl = BlockTable::new(32).unwrap();
+        let mut st = LaneBlockState::default();
+
+        // Prefill 1022 tokens (just before WINDOW = 1024 and block 16 boundary).
+        let prompt: Vec<u32> = (0..1022).map(|i| (i % 997) as u32 + 1).collect();
+        let _ = cache.begin_admit_bind(&mut pools, 0, &mut tbl, &mut st, &prompt);
+        cache.ensure_span_blocks(&mut pools, &mut tbl, 0, 1022).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &prompt, 0, 1022, || fake_cs(1));
+        assert_eq!(st.written, 1022);
+        // Window block 0 must still be present at pos 1022.
+        assert!(tbl.get(BlockKind::Window, BlockIndex::new(0)).unwrap().is_some());
+
+        // Speculative verify span `[1022, 1026)` (k = 3) crosses both block 16 (pos 1024) and WINDOW = 1024!
+        let alloc = cache.ensure_span_blocks_tracking(&mut pools, &mut tbl, 1022, 4).unwrap();
+        assert_eq!(alloc.len(), 2, "must track newly allocated Full + Window block 16");
+        assert!(tbl.get(BlockKind::Full, BlockIndex::new(16)).unwrap().is_some());
+        assert!(tbl.get(BlockKind::Window, BlockIndex::new(16)).unwrap().is_some());
+
+        // Reject drafts at pos 1024..1026 (`n_keep = 2`, accepted_end = 1024):
+        // Block 16 (start=1024 >= accepted_end=1024) MUST be released back to BlockPools,
+        // block 15 stays unsealed with length 64, and Window block 0 is NOT prematurely pruned!
+        cache.finish_verify_span(&mut pools, &mut tbl, &mut st, &alloc, 1022, 2);
+        assert_eq!(st.written, 1024);
+        assert!(tbl.get(BlockKind::Full, BlockIndex::new(16)).unwrap().is_none());
+        assert!(tbl.get(BlockKind::Window, BlockIndex::new(16)).unwrap().is_none());
+        let b15_full = tbl.get(BlockKind::Full, BlockIndex::new(15)).unwrap().unwrap();
+        let rec15 = pools.full.record(b15_full.slot()).unwrap();
+        assert!(!rec15.sealed(), "verify must never seal block 15");
+        assert_eq!(rec15.length(), 64);
+
+        // Full abort (`n_keep = 0`) on `[1024, 1028)` releases all newly allocated blocks and leaves written=1024.
+        let alloc2 = cache.ensure_span_blocks_tracking(&mut pools, &mut tbl, 1024, 4).unwrap();
+        assert_eq!(alloc2.len(), 2);
+        cache.finish_verify_span(&mut pools, &mut tbl, &mut st, &alloc2, 1024, 0);
+        assert_eq!(st.written, 1024);
+        assert!(tbl.get(BlockKind::Full, BlockIndex::new(16)).unwrap().is_none());
+        assert!(tbl.get(BlockKind::Window, BlockIndex::new(16)).unwrap().is_none());
+
+        cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
         assert_zero_pool_leaks(&pools);
     }

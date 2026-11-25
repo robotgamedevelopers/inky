@@ -3,6 +3,7 @@ mod cache_scheduler;
 mod cache_trace;
 #[allow(dead_code)]
 mod blockbook;
+mod dspark;
 mod engine;
 mod gguf;
 mod json_grammar;
@@ -88,6 +89,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
+  --dspark PATH     opt-in DSpark drafter GGUF for speculative decoding (default: off)
+  --draft-k N       draft tokens per speculative verify step in 1..=4 (default 3)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -141,6 +144,24 @@ fn parse_loopcd_omega(flag: &str, value: &str) -> Result<f32, String> {
         return Err(format!("{flag} must be a finite number between 0 and 4"));
     }
     Ok(omega)
+}
+
+fn parse_draft_k(flag: &str, value: &str) -> Result<usize, String> {
+    let k: usize = value.parse().map_err(|_| {
+        format!(
+            "{flag} must be an integer between {} and {}",
+            scheduler::MIN_DRAFT_K,
+            scheduler::MAX_DRAFT_K
+        )
+    })?;
+    if !(scheduler::MIN_DRAFT_K..=scheduler::MAX_DRAFT_K).contains(&k) {
+        return Err(format!(
+            "{flag} must be an integer between {} and {}",
+            scheduler::MIN_DRAFT_K,
+            scheduler::MAX_DRAFT_K
+        ));
+    }
+    Ok(k)
 }
 
 fn parse_temp(flag: &str, value: &str) -> Result<f32, String> {
@@ -237,6 +258,8 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
         kv8: false,
+        dspark: None,
+        draft_k: scheduler::DEFAULT_DRAFT_K,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -270,6 +293,8 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
             "--kv8" => o.kv8 = true,
+            "--dspark" => o.dspark = Some(std::path::PathBuf::from(value()?)),
+            "--draft-k" => o.draft_k = parse_draft_k(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -355,6 +380,11 @@ mod cli_tests {
             (&["--loopcd", "-inf"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "5.0"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "abc"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--dspark"], "missing value for --dspark"),
+            (&["--draft-k"], "missing value for --draft-k"),
+            (&["--draft-k", "0"], "--draft-k must be an integer between 1 and 4"),
+            (&["--draft-k", "5"], "--draft-k must be an integer between 1 and 4"),
+            (&["--draft-k", "abc"], "--draft-k must be an integer between 1 and 4"),
             (&["--typo"], "unknown serve option --typo"),
         ] {
             let err = serve_args(args).err().unwrap();
@@ -374,6 +404,12 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
         assert!(!serve_args(&[]).unwrap().kv8);
         assert!(serve_args(&["--kv8"]).unwrap().kv8);
+        assert_eq!(serve_args(&[]).unwrap().dspark, None);
+        assert_eq!(serve_args(&[]).unwrap().draft_k, 3);
+        let dspark = serve_args(&["--dspark", "mtp.gguf", "--draft-k", "4"]).unwrap();
+        assert_eq!(dspark.dspark, Some(std::path::PathBuf::from("mtp.gguf")));
+        assert_eq!(dspark.draft_k, 4);
+        assert_eq!(serve_args(&["--draft-k", "1"]).unwrap().draft_k, 1);
         let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576", "--kv8"]).unwrap();
         assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
         assert_eq!(spilled.max_spill_bytes, 1_048_576);

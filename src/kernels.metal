@@ -1782,4 +1782,319 @@ kernel void k_attn_grp_dec(device const uchar * PB [[buffer(1)]], device float *
         }
     }
 }
+
+#pragma clang fp contract(off) reassociate(off)
+// DSpark speculative rejection sampling (`k_dspark_reject`):
+// Grid: (1, n_spans, 1), 1024 threads (32 simdgroups).
+// Supports both greedy verification (`eff_temp < 1e-5f`, raw-logit argmax match) and exact
+// stochastic speculative rejection sampling (`eff_temp >= 1e-5f`, accept with min(1, p_t / p_q),
+// else resample from normalized [p_t - p_q]_+ via Gumbel-max, or draw bonus row k from p_t).
+struct DSparkSpanDesc {
+    uint  target_off;
+    uint  draft_lg_off;
+    uint  draft_tok_off;
+    uint  out_off;
+    uint  k;
+    uint  seed_lo;
+    uint  seed_hi;
+    uint  base_pos;
+    uint  ban_tok;
+    float temp;
+    uint  pad1, pad2;
+};
+
+struct DSparkRejectArgs {
+    uint  n_vocab;
+    uint  target_stride;
+    uint  draft_stride;
+    float temp;
+    float target_softcap;
+    float draft_softcap;
+    uint  pad0, pad1;
+};
+
+inline float dspark_uniform(uint stream_key, uint pos, uint seed_lo, uint seed_hi) {
+    const uint h = mix32(mix32(mix32(mix32(stream_key) ^ pos) ^ seed_lo) ^ seed_hi);
+    return (float(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
+}
+
+inline float dspark_softcap(float raw, float cap) {
+    return cap > 0.0f ? (cap * precise::tanh(raw / cap)) : raw;
+}
+
+inline void dspark_argmax_reduce(
+    thread float & val,
+    thread int & idx,
+    ushort sg,
+    ushort lane,
+    threadgroup float * bv,
+    threadgroup int * bi,
+    threadgroup uint & out_tok,
+    threadgroup float & out_val,
+    uint n_vocab
+) {
+    const float m = simd_max(val);
+    int c = (val == m) ? idx : 0x7fffffff;
+    c = simd_min(c);
+    if (lane == 0) { bv[sg] = m; bi[sg] = c; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const float v2 = bv[lane];
+        const int i2 = bi[lane];
+        const float m2 = simd_max(v2);
+        int c2 = (v2 == m2) ? i2 : 0x7fffffff;
+        c2 = simd_min(c2);
+        if (lane == 0) {
+            out_val = m2;
+            out_tok = uint(c2) < n_vocab ? uint(c2) : 0u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void k_dspark_reject(
+    device const float * A [[buffer(2)]],
+    constant DSparkRejectArgs & a [[buffer(5)]],
+    device const DSparkSpanDesc * DESCS [[buffer(6)]],
+    device const uint * DRAFT_TOKS [[buffer(8)]],
+    device const float * DRAFT_LG [[buffer(9)]],
+    device uint * OUT [[buffer(10)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float bv[32], bq[32];
+    threadgroup int   bi[32];
+    threadgroup uint  bu[32];
+    threadgroup float sh_f[4];
+    threadgroup uint  sh_u[4];
+    threadgroup uint  chosen_tok;
+    threadgroup float chosen_val;
+
+    const uint si = tgp.y;
+    const DSparkSpanDesc desc = DESCS[si];
+    const uint n = a.n_vocab;
+    if (n == 0u) {
+        if (tid == 0) { OUT[desc.out_off] = 1u; OUT[desc.out_off + 1] = 0u; }
+        return;
+    }
+
+    const float eff_temp = (desc.temp >= 0.0f) ? desc.temp : a.temp;
+
+    // ---- Greedy verification (`eff_temp < 1e-5f`): exact raw-logit target argmax match ----
+    if (eff_temp < 1e-5f) {
+        for (uint d = 0u; d <= desc.k; d++) {
+            device const float * ZT = A + ulong(desc.target_off) + ulong(d) * ulong(a.target_stride);
+            float best = -INFINITY;
+            int best_i = 0x7fffffff;
+            uint bad = 0u;
+            for (uint v = tid; v < n; v += 1024u) {
+                const float raw = ZT[v];
+                if (isnan(raw) || isinf(raw)) { bad = 1u; continue; }
+                if (v == desc.ban_tok) continue;
+                if (raw > best || (raw == best && int(v) < best_i)) { best = raw; best_i = int(v); }
+            }
+            const uint sg_bad = simd_or(bad);
+            if (lane == 0) bu[sg] = sg_bad;
+            dspark_argmax_reduce(best, best_i, sg, lane, bv, bi, chosen_tok, chosen_val, n);
+            if (sg == 0) {
+                const uint all_bad = simd_or(bu[lane]);
+                if (lane == 0) sh_u[0] = (all_bad != 0u || chosen_val == -INFINITY) ? 1u : 0u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sh_u[0] != 0u) {
+                if (tid == 0) { OUT[desc.out_off] = 1u; OUT[desc.out_off + 1] = 0u; }
+                return;
+            }
+            const uint star = chosen_tok;
+            if (d < desc.k) {
+                const uint dx = DRAFT_TOKS[desc.draft_tok_off + d];
+                if (dx >= n) {
+                    if (tid == 0) { OUT[desc.out_off] = 2u; OUT[desc.out_off + 1] = 0u; }
+                    return;
+                }
+                if (dx == star) {
+                    if (tid == 0) OUT[desc.out_off + 2u + d] = dx;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    continue;
+                }
+                if (tid == 0) {
+                    OUT[desc.out_off + 0u] = 0u;
+                    OUT[desc.out_off + 1u] = d;
+                    OUT[desc.out_off + 2u + d] = star;
+                }
+                return;
+            } else {
+                if (tid == 0) {
+                    OUT[desc.out_off + 0u] = 0u;
+                    OUT[desc.out_off + 1u] = desc.k;
+                    OUT[desc.out_off + 2u + desc.k] = star;
+                }
+                return;
+            }
+        }
+        return;
+    }
+
+    // ---- Stochastic exact speculative rejection sampling (`eff_temp >= 1e-5f`) ----
+    const float inv_temp = 1.0f / eff_temp;
+    for (uint d = 0u; d < desc.k; d++) {
+        const uint dx = DRAFT_TOKS[desc.draft_tok_off + d];
+        if (dx >= n) {
+            if (tid == 0) { OUT[desc.out_off] = 2u; OUT[desc.out_off + 1] = 0u; }
+            return;
+        }
+        device const float * ZT = A + ulong(desc.target_off) + ulong(d) * ulong(a.target_stride);
+        device const float * ZQ = DRAFT_LG + ulong(desc.draft_lg_off) + ulong(d) * ulong(a.draft_stride);
+
+        // Pass 1: global max of scaled target & draft logits + non-finite guard.
+        float mt = -INFINITY, mq = -INFINITY;
+        uint bad = 0u;
+        for (uint v = tid; v < n; v += 1024u) {
+            const float rt = ZT[v], rq = ZQ[v];
+            if (isnan(rt) || isinf(rt)) { bad |= 1u; continue; }
+            if (isnan(rq) || isinf(rq)) { bad |= 2u; continue; }
+            if (v == desc.ban_tok) continue;
+            mt = max(mt, dspark_softcap(rt, a.target_softcap) * inv_temp);
+            mq = max(mq, dspark_softcap(rq, a.draft_softcap) * inv_temp);
+        }
+        const float smt = simd_max(mt), smq = simd_max(mq);
+        const uint sbad = simd_or(bad);
+        if (lane == 0) { bv[sg] = smt; bq[sg] = smq; bu[sg] = sbad; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const float gmt = simd_max(bv[lane]);
+            const float gmq = simd_max(bq[lane]);
+            const uint gbad = simd_or(bu[lane]);
+            if (lane == 0) {
+                sh_f[0] = gmt;
+                sh_f[1] = gmq;
+                sh_u[0] = gbad != 0u ? ((gbad & 1u) != 0u ? 1u : 2u) : ((gmt == -INFINITY || gmq == -INFINITY) ? 1u : 0u);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sh_u[0] != 0u) {
+            if (tid == 0) { OUT[desc.out_off] = sh_u[0]; OUT[desc.out_off + 1] = 0u; }
+            return;
+        }
+        const float max_t = sh_f[0], max_q = sh_f[1];
+
+        // Pass 2: exact softmax partition sums Z_t and Z_q.
+        float sum_t = 0.0f, sum_q = 0.0f;
+        for (uint v = tid; v < n; v += 1024u) {
+            if (v == desc.ban_tok) continue;
+            const float st = dspark_softcap(ZT[v], a.target_softcap) * inv_temp;
+            const float sq = dspark_softcap(ZQ[v], a.draft_softcap) * inv_temp;
+            sum_t += precise::exp(st - max_t);
+            sum_q += precise::exp(sq - max_q);
+        }
+        const float sgt = simd_sum(sum_t), sgq = simd_sum(sum_q);
+        if (lane == 0) { bv[sg] = sgt; bq[sg] = sgq; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const float zt = simd_sum(bv[lane]);
+            const float zq = simd_sum(bq[lane]);
+            if (lane == 0) {
+                sh_f[2] = zt;
+                sh_f[3] = zq;
+                const bool ok_z = !isnan(zt) && !isinf(zt) && zt > 0.0f && !isnan(zq) && !isinf(zq) && zq > 0.0f;
+                if (!ok_z) {
+                    sh_u[0] = 1u;
+                    sh_u[1] = 0u;
+                } else {
+                    const float ptx = (dx == desc.ban_tok)
+                        ? 0.0f
+                        : (precise::exp(dspark_softcap(ZT[dx], a.target_softcap) * inv_temp - max_t) / zt);
+                    const float pqx = (dx == desc.ban_tok)
+                        ? 0.0f
+                        : (precise::exp(dspark_softcap(ZQ[dx], a.draft_softcap) * inv_temp - max_q) / zq);
+                    const float u_acc = dspark_uniform(0xA5A55A5Au ^ d, desc.base_pos + d, desc.seed_lo, desc.seed_hi);
+                    const bool accept = (pqx <= 0.0f) ? (ptx > 0.0f) : (u_acc * pqx < min(pqx, ptx));
+                    sh_u[0] = 0u;
+                    sh_u[1] = accept ? 1u : 0u;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sh_u[0] != 0u) {
+            if (tid == 0) { OUT[desc.out_off] = sh_u[0]; OUT[desc.out_off + 1] = 0u; }
+            return;
+        }
+        if (sh_u[1] != 0u) {
+            if (tid == 0) OUT[desc.out_off + 2u + d] = dx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+
+        // Rejected at d: resample from normalized [p_target - p_draft]_+ via exact Gumbel-max.
+        const float inv_zt = 1.0f / sh_f[2];
+        const float inv_zq = 1.0f / sh_f[3];
+        float best = -INFINITY;
+        int best_i = 0x7fffffff;
+        for (uint v = tid; v < n; v += 1024u) {
+            if (v == desc.ban_tok) continue;
+            const float st = dspark_softcap(ZT[v], a.target_softcap) * inv_temp;
+            const float sq = dspark_softcap(ZQ[v], a.draft_softcap) * inv_temp;
+            const float diff = precise::exp(st - max_t) * inv_zt - precise::exp(sq - max_q) * inv_zq;
+            if (diff > 0.0f) {
+                const float uv = dspark_uniform(v ^ 0x6C8E9CF5u, desc.base_pos + d, desc.seed_lo, desc.seed_hi);
+                const float g = precise::log(diff) - precise::log(-precise::log(uv));
+                if (g > best || (g == best && int(v) < best_i)) { best = g; best_i = int(v); }
+            }
+        }
+        dspark_argmax_reduce(best, best_i, sg, lane, bv, bi, chosen_tok, chosen_val, n);
+        if (chosen_val == -INFINITY) {
+            // Degenerate zero-residual fallback (identical p_target == p_draft): Gumbel-max over p_target.
+            float fbest = -INFINITY;
+            int fbest_i = 0x7fffffff;
+            for (uint v = tid; v < n; v += 1024u) {
+                if (v == desc.ban_tok) continue;
+                const float st = dspark_softcap(ZT[v], a.target_softcap) * inv_temp;
+                const float uv = dspark_uniform(v ^ 0x9e3779b9u, desc.base_pos + d, desc.seed_lo, desc.seed_hi);
+                const float g = st - precise::log(-precise::log(uv));
+                if (g > fbest || (g == fbest && int(v) < fbest_i)) { fbest = g; fbest_i = int(v); }
+            }
+            dspark_argmax_reduce(fbest, fbest_i, sg, lane, bv, bi, chosen_tok, chosen_val, n);
+        }
+        if (tid == 0) {
+            OUT[desc.out_off + 0u] = 0u;
+            OUT[desc.out_off + 1u] = d;
+            OUT[desc.out_off + 2u + d] = chosen_tok;
+        }
+        return;
+    }
+
+    // All `k` draft tokens accepted: draw bonus token at row `k` from p_target via exact Gumbel-max.
+    device const float * ZTK = A + ulong(desc.target_off) + ulong(desc.k) * ulong(a.target_stride);
+    float best = -INFINITY;
+    int best_i = 0x7fffffff;
+    uint bad = 0u;
+    for (uint v = tid; v < n; v += 1024u) {
+        const float rt = ZTK[v];
+        if (isnan(rt) || isinf(rt)) { bad = 1u; continue; }
+        if (v == desc.ban_tok) continue;
+        const float st = dspark_softcap(rt, a.target_softcap) * inv_temp;
+        const float uv = dspark_uniform(v ^ 0x9e3779b9u, desc.base_pos + desc.k, desc.seed_lo, desc.seed_hi);
+        const float g = st - precise::log(-precise::log(uv));
+        if (g > best || (g == best && int(v) < best_i)) { best = g; best_i = int(v); }
+    }
+    const uint sbad = simd_or(bad);
+    if (lane == 0) bu[sg] = sbad;
+    dspark_argmax_reduce(best, best_i, sg, lane, bv, bi, chosen_tok, chosen_val, n);
+    if (sg == 0) {
+        const uint gbad = simd_or(bu[lane]);
+        if (lane == 0) sh_u[0] = (gbad != 0u || chosen_val == -INFINITY) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sh_u[0] != 0u) {
+        if (tid == 0) { OUT[desc.out_off] = 1u; OUT[desc.out_off + 1] = 0u; }
+        return;
+    }
+    if (tid == 0) {
+        OUT[desc.out_off + 0u] = 0u;
+        OUT[desc.out_off + 1u] = desc.k;
+        OUT[desc.out_off + 2u + desc.k] = chosen_tok;
+    }
+}
 #pragma clang fp contract(fast) reassociate(on)
