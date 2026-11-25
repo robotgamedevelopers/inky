@@ -179,8 +179,8 @@ func (g *gate) canary(ctx context.Context, start time.Time) error {
 }
 
 func (g *gate) cancelJobs() {
-	g.run("stream disconnect frees a lane", func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	g.run("stream disconnect frees a lane", func(g *gate) error {
+		ctx, cancel := context.WithTimeout(g.ctx, 20*time.Second)
 		defer cancel()
 		offset, e := g.logOffset()
 		if e != nil {
@@ -201,7 +201,7 @@ func (g *gate) cancelJobs() {
 		}
 		return g.confirmFreed(offset, false, 256)
 	})
-	g.run("nonstream disconnect frees a lane during decode and prefill", func() error {
+	g.run("nonstream disconnect frees a lane during decode and prefill", func(g *gate) error {
 		for _, prefill := range []bool{false, true} {
 			if e := g.cancelBuffered(prefill); e != nil {
 				return fmt.Errorf("prefill=%v: %w", prefill, e)
@@ -212,7 +212,7 @@ func (g *gate) cancelJobs() {
 }
 
 func (g *gate) cancelBuffered(prefill bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 25*time.Second)
 	defer cancel()
 	prompt, limit := countPrompt, 4000
 	if prefill {
@@ -304,8 +304,8 @@ func (r queueResult) check() error {
 func (g *gate) queueJobs() {
 	var fifth queueResult
 	var firstPass bool
-	g.run("two lanes and one queued request", func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	g.run("two lanes and one queued request", func(g *gate) error {
+		ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
 		defer cancel()
 		var streams []*jobStream
 		for _, limit := range []int{256, 256} {
@@ -331,7 +331,7 @@ func (g *gate) queueJobs() {
 		}()
 		waitDeadline := time.Now().Add(5 * time.Second)
 		observedQueued := false
-		for time.Now().Before(waitDeadline) {
+		for ctx.Err() == nil && time.Now().Before(waitDeadline) {
 			code, snap, err := g.fetchHealth("/health")
 			if err == nil && code == http.StatusOK &&
 				snap.ActiveLanes != nil && *snap.ActiveLanes == 2 &&
@@ -381,7 +381,7 @@ func (g *gate) queueJobs() {
 		firstPass = true
 		return nil
 	})
-	g.run("fifth request rejected and capacity restored", func() error {
+	g.run("fifth request rejected and capacity restored", func(g *gate) error {
 		if !firstPass {
 			return fmt.Errorf("first three requests did not complete")
 		}
@@ -391,7 +391,7 @@ func (g *gate) queueJobs() {
 		if e := fifth.check(); e != nil {
 			return e
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(g.ctx, 20*time.Second)
 		defer cancel()
 		errs := make(chan error, 3)
 		for range 3 {

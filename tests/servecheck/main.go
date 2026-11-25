@@ -17,7 +17,13 @@ import (
 	"time"
 )
 
+const (
+	checkTimeout = 2 * time.Minute
+	suiteTimeout = 12 * time.Minute
+)
+
 type gate struct {
+	ctx           context.Context
 	url, key, log string
 	sabotage      string
 	failed        bool
@@ -27,8 +33,20 @@ func (g *gate) sabotageEnabled(probe string) bool {
 	return g.sabotage == "all" || g.sabotage == probe
 }
 
-func (g *gate) run(name string, fn func() error) {
-	if err := fn(); err != nil {
+func (g *gate) run(name string, fn func(*gate) error) {
+	// Each check owns its context, including any concurrent requests it starts.
+	check := *g
+	ctx, cancel := context.WithTimeout(g.ctx, checkTimeout)
+	defer cancel()
+	check.ctx = ctx
+	err := ctx.Err()
+	if err == nil {
+		err = fn(&check)
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
+	if err != nil {
 		fmt.Printf("FAIL %s: %v\n", name, err)
 		g.failed = true
 		return
@@ -76,14 +94,14 @@ func readyURL(output string) (string, error) {
 	return "", nil
 }
 
-func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue int, checks func()) error {
+func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue int, checks func(*gate)) error {
 	g.log = filepath.Join(dir, fmt.Sprintf("lanes-%d.log", lanes))
 	log, err := os.Create(g.log)
 	if err != nil {
 		return err
 	}
 	defer log.Close()
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "serve", "-m", model, "-c", "6144", "-n", "4096", "--lanes", strconv.Itoa(lanes), "--queue", strconv.Itoa(queue), "--key-env", "INKY_SERVE_TEST_KEY", "--effort", "none", "--bind", "127.0.0.1:0")
 	cmd.Env = append(os.Environ(), "INKY_SERVE_TEST_KEY="+g.key, "INK_CHUNK=64")
@@ -101,7 +119,12 @@ func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue 
 	defer tick.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-done:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			data, _ := os.ReadFile(g.log)
 			return fmt.Errorf("server startup: %v\n%s", processErr, data)
 		case <-deadline.C:
@@ -116,12 +139,20 @@ func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue 
 				return err
 			}
 			if url != "" {
-				g.url = url
-				checks()
+				server := *g
+				server.ctx, server.url = ctx, url
+				checks(&server)
+				g.failed = server.failed
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				return nil
+				select {
+				case <-done:
+					data, _ := os.ReadFile(g.log)
+					return fmt.Errorf("server exited during checks: %v\n%s", processErr, data)
+				default:
+					return nil
+				}
 			}
 		}
 	}
@@ -138,6 +169,8 @@ func execute() error {
 	defer os.RemoveAll(dir)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, suiteTimeout)
+	defer cancel()
 	// Redirects and proxies would take functional requests outside this test server.
 	http.DefaultTransport.(*http.Transport).Proxy = nil
 	http.DefaultClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -147,27 +180,27 @@ func execute() error {
 	default:
 		return fmt.Errorf("unknown SERVECHECK_SABOTAGE probe %q", sabotage)
 	}
-	g := gate{key: "local-gate-test", sabotage: sabotage}
+	g := gate{ctx: ctx, key: "local-gate-test", sabotage: sabotage}
 	bin, model := os.Args[1], os.Args[2]
-	g.run("lane limit checked before model load", func() error { return checkLaneRange(ctx, bin, dir) })
-	if err = g.server(ctx, bin, model, dir, 1, 1, func() {
+	g.run("lane limit checked before model load", func(g *gate) error { return checkLaneRange(g.ctx, bin, dir) })
+	if err = g.server(ctx, bin, model, dir, 1, 1, func(g *gate) {
 		g.validation(1)
 		g.cancelJobs()
-		g.run("disconnect in mid-thinking stops generation", g.disconnectMidThinking)
-		g.run("follow-up after window overwrite matches cold generation", g.overwrittenWindow)
+		g.run("disconnect in mid-thinking stops generation", (*gate).disconnectMidThinking)
+		g.run("follow-up after window overwrite matches cold generation", (*gate).overwrittenWindow)
 	}); err != nil {
 		return err
 	}
-	if err = g.server(ctx, bin, model, dir, 2, 1, func() {
+	if err = g.server(ctx, bin, model, dir, 2, 1, func(g *gate) {
 		g.replies()
-		g.run("claude harness /v1/messages multi-turn tool loop and timing", g.claudeHarnessMessagesLoop)
-		g.run("opencode harness /v1/chat/completions include_usage and tool loop", g.opencodeHarnessChatLoop)
+		g.run("claude harness /v1/messages multi-turn tool loop and timing", (*gate).claudeHarnessMessagesLoop)
+		g.run("opencode harness /v1/chat/completions include_usage and tool loop", (*gate).opencodeHarnessChatLoop)
 		g.queueJobs()
 	}); err != nil {
 		return err
 	}
-	if err = g.server(ctx, bin, model, dir, 4, 2, func() {
-		g.run("concurrent identical tool calls", g.concurrentToolCalls)
+	if err = g.server(ctx, bin, model, dir, 4, 2, func(g *gate) {
+		g.run("concurrent identical tool calls", (*gate).concurrentToolCalls)
 	}); err != nil {
 		return err
 	}

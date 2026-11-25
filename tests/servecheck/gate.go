@@ -252,7 +252,7 @@ func verifyConcurrentToolCalls(wantName string, ref toolSample, got []toolSample
 
 func (g *gate) concurrentToolCalls() error {
 	const concurrency = 4
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 90*time.Second)
 	defer cancel()
 	nonStreamBody, err := toolCallRequestBody(false)
 	if err != nil {
@@ -335,7 +335,7 @@ func verifyDisconnectMidThinking(logBytes []byte, maxTokens int, drained healthS
 
 func (g *gate) disconnectMidThinking() error {
 	const thinkMaxTokens = 512
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
 	defer cancel()
 	// Solo seeded reference before the disconnect trial (same 1-lane server guarantees exact lane reuse).
 	refBody := `{"messages":[{"role":"user","content":"What is 17 times 23? Answer with only the integer."}],"max_tokens":32,"seed":9001,"temperature":0.8,"reasoning_effort":"none","stream":false}`
