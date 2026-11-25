@@ -45,7 +45,7 @@ func parseAnthropicSSE(r io.Reader) (anthropicStreamSummary, error) {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		if ev, ok := strings.CutPrefix(line, "event: "); ok {
@@ -159,7 +159,7 @@ func parseOpenAIUsageStream(r io.Reader) (openAIUsageStreamSummary, error) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		data, ok := strings.CutPrefix(line, "data: ")

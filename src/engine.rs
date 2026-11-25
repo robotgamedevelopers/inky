@@ -845,26 +845,8 @@ impl Lane {
     #[allow(dead_code)]
     pub fn is_blocked(&self) -> bool { self.use_blocks.get() }
 
-    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
+    /// The lane's block table. Interior mutability: callers borrow through the `RefCell`.
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
-
-    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
-    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
-    /// is `NoSlots`. Does not allocate a GPU buffer.
-    #[allow(dead_code)]
-    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
-        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
-    }
-
-    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
-    /// The slot base comes from the lane table. The width is the pool's `kvb`.
-    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
-    #[allow(dead_code)]
-    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
-        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
-    }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
@@ -975,10 +957,57 @@ impl Engine {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         let n_full = N_SLOT - n_swa;
         let working_ctx = self.max_ctx.min(32768);
-        let base = Self::lane_worst_case_bytes_for(n_swa, n_full, working_ctx, self.kvb, self.ar.total as usize);
-        let extra_toks = self.max_ctx.saturating_sub(working_ctx).saturating_mul(4) as u64;
-        let bt_bytes = self.max_ctx.div_ceil(crate::blocks::BLOCK).saturating_mul(16) as u64;
-        base.saturating_add(extra_toks).saturating_add(bt_bytes)
+        let kv_row = 2usize.saturating_mul(NKV).saturating_mul(HD).saturating_mul(self.kvb);
+        let swa_kv = n_swa.saturating_mul(working_ctx.min(EXT)).saturating_mul(kv_row) as u64;
+        let full_kv = n_full.saturating_mul(working_ctx).saturating_mul(kv_row) as u64;
+        let non_kv = Self::serve_non_kv_bytes_for(
+            1,
+            self.max_ctx,
+            self.ar.total as usize,
+            self.vocab_pad(),
+            self.loopcd_omega.get() > 0.0,
+        );
+        swa_kv.saturating_add(full_kv).saturating_add(non_kv)
+    }
+    /// Pure non-KV GPU allocation required by `lanes` Layer 3 `serve` lanes after `ensure_batch`:
+    /// decode-batch arena slice + shared decode descriptors, `BlockedSlab` (`cs_buf` + `bt_buf`),
+    /// per-lane `toks` (+ stub buffers), and `lg_weak` when LoopCD is enabled.
+    pub fn serve_non_kv_bytes_for(
+        lanes: usize,
+        max_ctx: usize,
+        arena_floats: usize,
+        vocab_padded: usize,
+        loopcd_enabled: bool,
+    ) -> u64 {
+        let n = lanes.max(1);
+        let dbatch_bytes = n
+            .saturating_mul(arena_floats)
+            .saturating_add(decode_batch_extra_floats(n))
+            .saturating_mul(4) as u64;
+        let blocks = max_ctx.div_ceil(crate::blocks::BLOCK).max(1);
+        let slab_cs = (n as u64).saturating_mul(Self::cs_image_bytes() as u64);
+        let slab_bt = (n as u64).saturating_mul(blocks as u64).saturating_mul(16);
+        let toks_and_stubs = (n as u64).saturating_mul((max_ctx.saturating_add(8).saturating_mul(4) + 32) as u64);
+        let loopcd_bytes = if loopcd_enabled {
+            (n as u64).saturating_mul(vocab_padded as u64).saturating_mul(4)
+        } else {
+            0
+        };
+        dbatch_bytes
+            .saturating_add(slab_cs)
+            .saturating_add(slab_bt)
+            .saturating_add(toks_and_stubs)
+            .saturating_add(loopcd_bytes)
+    }
+    /// Non-KV GPU bytes consumed by `lanes` Layer 3 `serve` lanes beyond `model_and_scratch_bytes()`.
+    pub fn serve_non_kv_bytes(&self, lanes: usize) -> u64 {
+        Self::serve_non_kv_bytes_for(
+            lanes,
+            self.max_ctx,
+            self.ar.total as usize,
+            self.vocab_pad(),
+            self.loopcd_omega.get() > 0.0,
+        )
     }
     /// Pure Layer 3 block-pool sizing from `kv_budget_bytes`: allocates ~15% to `Window` slots
     /// and ~85% to `Full` slots while ensuring at least `max_lanes * span_bound(chunk) + 256`
@@ -2520,6 +2549,45 @@ impl Engine {
         let mut row0 = Vec::with_capacity(spans.len());
         { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
         let e = Enc::new(cb);
+        if blocked {
+            // Clear any reused GPU block-pool slots that will NOT be completely overwritten
+            // by a 64-token prefill chunk on the GPU via `k_zero`, avoiding 2-10 MiB host CPU memsets.
+            let mut pending_zeros: Vec<(Buf, usize, u32)> = Vec::new();
+            {
+                let mut pools = self.block_pool.borrow_mut();
+                for sp in spans {
+                    let tbl = sp.lane.block_table.borrow();
+                    let lo_blk = sp.p0 / crate::blocks::BLOCK;
+                    let hi_blk = (sp.p0 + sp.t - 1) / crate::blocks::BLOCK;
+                    for b in lo_blk..=hi_blk {
+                        let full_overwrite = !dec
+                            && verify_k.is_none()
+                            && sp.p0 <= b * crate::blocks::BLOCK
+                            && sp.p0 + sp.t >= (b + 1) * crate::blocks::BLOCK;
+                        let bi = crate::blocks::BlockIndex::new(b as u32);
+                        for kind in [crate::blocks::BlockKind::Window, crate::blocks::BlockKind::Full] {
+                            let Some(entry) = tbl.get(kind, bi).ok().flatten() else { continue };
+                            let pool = pools.of_mut(kind);
+                            if pool.take_gpu_zero_pending(entry.slot()) && !full_overwrite {
+                                if let Ok(Some((buf, off, len))) = pool.gpu_slot_region(entry.slot()) {
+                                    pending_zeros.push((buf.clone(), off, (len / 4) as u32));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_zeros.is_empty() {
+                e.pso(&self.gpu.pso("k_zero"));
+                for (buf, off, words) in &pending_zeros {
+                    let zr = [0u32, *words];
+                    e.buf(buf, *off, 2);
+                    e.bytes(&zr, 5);
+                    e.dispatch(((*words as usize).div_ceil(1024), 1, 1), 256);
+                }
+                e.barrier();
+            }
+        }
         self.bind_eng(&e);
         let b = self.ba.get();
         let dec_meta = if dec && blocked {
@@ -3305,7 +3373,7 @@ impl<'a> Run<'a> {
     }
     /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
     /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
-    /// table. A block-cache key address is `Lane::attn_key_offset`, a `u64` from the table.
+    /// table. A block-cache key address comes from `BlockPool::gpu_table_entry` and `key_row_at`.
     fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
         let (swa, i) = self.slot_kind[slot];
         let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };

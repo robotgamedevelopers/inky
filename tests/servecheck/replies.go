@@ -78,7 +78,7 @@ func (g *gate) sampleReply(body string, stream bool, first func(string)) (replyS
 		done := false
 		for lines.Scan() {
 			line := lines.Text()
-			if line == "" {
+			if line == "" || strings.HasPrefix(line, ":") {
 				continue
 			}
 			data, ok := strings.CutPrefix(line, "data: ")

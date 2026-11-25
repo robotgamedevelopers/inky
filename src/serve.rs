@@ -17,8 +17,8 @@ use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +53,13 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
+
+impl Specials {
+    #[inline]
+    fn is_role_stop(&self, t: u32) -> bool {
+        t == self.msg_user || t == self.msg_system || t == self.msg_tool
+    }
+}
 
 fn special(tk: &Tokenizer, s: &str) -> u32 {
     let v = tk.encode(s, true);
@@ -173,8 +180,11 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                     marks(&mut t, &[sp.msg_tool])?;
                     text(&mut t, &name)?;
                     marks(&mut t, &[sp.c_text])?;
-                    if is_error && i == 0 { text(&mut t, "Error: ")?; }
-                    text(&mut t, p)?;
+                    if is_error && i == 0 {
+                        text(&mut t, &format!("Error: {p}"))?;
+                    } else {
+                        text(&mut t, p)?;
+                    }
                     marks(&mut t, &[sp.end])?;
                 }
             }
@@ -244,13 +254,25 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
     #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
     let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
     let mut p = Parsed { text: String::new(), thinking: String::new(), calls: vec![] };
+    let flush_open = |mode: &M, cur: &mut Vec<u8>, p: &mut Parsed| {
+        if matches!(mode, M::Think | M::Text) && !cur.is_empty() {
+            let s = take_stream_text(cur, true);
+            match mode { M::Think => p.thinking += &s, M::Text => p.text += &s, _ => {} }
+        }
+        cur.clear();
+    };
     for &t in toks {
-        if t == sp.msg_model { mode = M::Header; header.clear(); cur.clear(); continue; }
-        if t == sp.c_think { mode = M::Think; cur.clear(); continue; }
-        if t == sp.c_text { mode = M::Text; cur.clear(); continue; }
-        if t == sp.c_tool { mode = M::Tool; cur.clear(); continue; }
+        if sp.is_role_stop(t) {
+            flush_open(&mode, &mut cur, &mut p);
+            mode = M::None;
+            break;
+        }
+        if t == sp.msg_model { flush_open(&mode, &mut cur, &mut p); mode = M::Header; header.clear(); continue; }
+        if t == sp.c_think { flush_open(&mode, &mut cur, &mut p); mode = M::Think; continue; }
+        if t == sp.c_text { flush_open(&mode, &mut cur, &mut p); mode = M::Text; continue; }
+        if t == sp.c_tool { flush_open(&mode, &mut cur, &mut p); mode = M::Tool; continue; }
         if t == sp.end || t == sp.end_sampling || t == tk.eos {
-            let s = String::from_utf8_lossy(&cur).to_string();
+            let s = take_stream_text(&mut cur, true);
             match mode {
                 M::Think => p.thinking += &s, M::Text => p.text += &s,
                 M::Tool => { let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
@@ -263,8 +285,7 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
         let b = tk.decode_bytes(t);
         match mode { M::Header => header.extend(b), M::None => {}, _ => cur.extend(b) }
     }
-    let s = String::from_utf8_lossy(&cur).to_string();
-    match mode { M::Text => p.text += &s, M::Think => p.thinking += &s, _ => {} }
+    flush_open(&mode, &mut cur, &mut p);
     p
 }
 
@@ -496,10 +517,10 @@ fn take_stream_text(pend: &mut Vec<u8>, end: bool) -> String {
 /// decodes; a tool call is buffered to its end and sent whole, since its JSON wraps the arguments
 /// the block must stream on their own. Thinking tokens open no block.
 struct BlockStream { nonce: String, seq: u64, next: usize, calls: usize, text_index: usize, open_text: bool,
-                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool }
+                     mode: u8, pend: Vec<u8>, header: Vec<u8>, tool: Vec<u8>, in_header: bool, stopped: bool }
 impl BlockStream {
     fn new(nonce: &str, seq: u64) -> BlockStream {
-        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false }
+        BlockStream { nonce: nonce.to_string(), seq, next: 0, calls: 0, text_index: 0, open_text: false, mode: 0, pend: vec![], header: vec![], tool: vec![], in_header: false, stopped: false }
     }
     fn flush_text(&mut self, out: &mut Vec<String>) {
         if !self.open_text { self.pend.clear(); return; }
@@ -536,11 +557,26 @@ impl BlockStream {
         self.tool.clear();
     }
     fn on_token(&mut self, tk: &Tokenizer, sp: &Specials, t: u32) -> Vec<String> {
+        if self.stopped { return Vec::new(); }
         let mut out = Vec::new();
+        if sp.is_role_stop(t) {
+            if self.mode == 3 { self.tool.clear(); }
+            self.close_text(&mut out);
+            self.mode = 0;
+            self.in_header = false;
+            self.stopped = true;
+            return out;
+        }
         if t == sp.msg_model { self.close_text(&mut out); self.mode = 0; self.in_header = true; self.header.clear(); return out; }
         if t == sp.c_think { self.close_text(&mut out); self.mode = 1; self.in_header = false; return out; }
         if t == sp.c_text {
-            if !self.open_text {
+            if self.open_text {
+                let text = take_stream_text(&mut self.pend, true);
+                if !text.is_empty() {
+                    out.push(sse_text("content_block_delta", &json!({"type": "content_block_delta", "index": self.text_index,
+                        "delta": {"type": "text_delta", "text": text}})));
+                }
+            } else {
                 self.text_index = self.next; self.next += 1; self.open_text = true;
                 out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": self.text_index,
                     "content_block": {"type": "text", "text": ""}})));
@@ -793,17 +829,189 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
 #[allow(dead_code)]
 fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
 
-/// Wait for an already-committed `MTLCommandBuffer` and inspect its completion status.
-fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
-    cb.waitUntilCompleted();
-    let status = cb.status();
-    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
-    if let Some(error) = cb.error() {
-        eprintln!("[serve] Metal {stage} failed ({status:?}): {}", error.localizedDescription());
-    } else {
-        eprintln!("[serve] Metal {stage} failed ({status:?})");
+const DEFAULT_GPU_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SCHEDULER_STALL_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Shared atomic scheduler heartbeat and active-step stall monitor exposed through `/health`.
+/// Distinguishes idle waiting on `rx.recv()` (`in_step == false`) from an active GPU/spill step
+/// (`in_step == true`) that has exceeded `stall_threshold`.
+struct SchedulerHealth {
+    origin: Instant,
+    in_step: AtomicBool,
+    step_started_ns: AtomicU64,
+    last_heartbeat_ns: AtomicU64,
+    scheduler_stopped: AtomicBool,
+    stall_threshold_ns: AtomicU64,
+    gpu_step_timeout_ns: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl Default for SchedulerHealth {
+    fn default() -> Self {
+        Self::new(Instant::now())
     }
-    Err(format!("Metal {stage} failed"))
+}
+
+impl SchedulerHealth {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            in_step: AtomicBool::new(false),
+            step_started_ns: AtomicU64::new(0),
+            last_heartbeat_ns: AtomicU64::new(0),
+            scheduler_stopped: AtomicBool::new(false),
+            stall_threshold_ns: AtomicU64::new(DEFAULT_SCHEDULER_STALL_THRESHOLD.as_nanos() as u64),
+            gpu_step_timeout_ns: AtomicU64::new(DEFAULT_GPU_STEP_TIMEOUT.as_nanos() as u64),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_thresholds(origin: Instant, stall_threshold: Duration, gpu_step_timeout: Duration) -> Self {
+        let h = Self::new(origin);
+        h.stall_threshold_ns.store(stall_threshold.as_nanos() as u64, Ordering::Relaxed);
+        h.gpu_step_timeout_ns.store(gpu_step_timeout.as_nanos() as u64, Ordering::Relaxed);
+        h
+    }
+
+    fn rel_ns(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin).as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn gpu_step_timeout(&self) -> Duration {
+        Duration::from_nanos(self.gpu_step_timeout_ns.load(Ordering::Relaxed))
+    }
+
+    fn mark_idle(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+    }
+
+    fn begin_step(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.step_started_ns.store(ns, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        self.in_step.store(true, Ordering::Release);
+    }
+
+    fn end_step_ok(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn end_step_failed(&self, now: Instant, reason: String) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    }
+
+    fn mark_stopped(&self) {
+        self.in_step.store(false, Ordering::Release);
+        self.scheduler_stopped.store(true, Ordering::Release);
+    }
+
+    fn check(&self, now: Instant) -> (bool, Option<String>) {
+        if self.scheduler_stopped.load(Ordering::Acquire) {
+            return (false, Some("scheduler stopped".into()));
+        }
+        if self.in_step.load(Ordering::Acquire) {
+            let started = self.step_started_ns.load(Ordering::Acquire);
+            let elapsed_ns = self.rel_ns(now).saturating_sub(started);
+            let threshold_ns = self.stall_threshold_ns.load(Ordering::Relaxed);
+            if elapsed_ns > threshold_ns {
+                return (
+                    false,
+                    Some(format!("scheduler stalled in active step for {}ms", elapsed_ns / 1_000_000)),
+                );
+            }
+        }
+        if let Some(err) = self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return (false, Some(err));
+        }
+        (true, None)
+    }
+}
+
+#[derive(Default)]
+struct DeferralCounters {
+    admit_pool_deferrals: AtomicU64,
+    step_pool_deferrals: AtomicU64,
+}
+
+fn wait_for_gpu_completion(
+    stage: &str,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut() -> (MTLCommandBufferStatus, Option<String>),
+    mut sleep_fn: impl FnMut(Duration),
+) -> Result<(), String> {
+    let start = now();
+    let deadline = start + timeout;
+    loop {
+        let (status, err_desc) = poll();
+        match status {
+            MTLCommandBufferStatus::Completed => return Ok(()),
+            MTLCommandBufferStatus::Error => {
+                if let Some(desc) = err_desc {
+                    eprintln!("[serve] Metal {stage} failed ({status:?}): {desc}");
+                } else {
+                    eprintln!("[serve] Metal {stage} failed ({status:?})");
+                }
+                return Err(format!("Metal {stage} failed"));
+            }
+            _ => {
+                let cur = now();
+                if cur >= deadline {
+                    let msg = format!("Metal {stage} timed out after {}ms", timeout.as_millis());
+                    eprintln!("[serve] {msg} ({status:?})");
+                    return Err(msg);
+                }
+                let rem = deadline.saturating_duration_since(cur);
+                sleep_fn(Duration::from_micros(100).min(rem));
+            }
+        }
+    }
+}
+
+/// Wait for an already-committed `MTLCommandBuffer` up to `DEFAULT_GPU_STEP_TIMEOUT`.
+fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
+    wait_committed_step_bounded(cb, stage, DEFAULT_GPU_STEP_TIMEOUT, None)
+}
+
+/// Wait for an already-committed `MTLCommandBuffer` up to `timeout` and inspect its completion status.
+fn wait_committed_step_bounded(
+    cb: &CmdBuf,
+    stage: &str,
+    timeout: Duration,
+    health: Option<&SchedulerHealth>,
+) -> Result<(), String> {
+    let res = wait_for_gpu_completion(
+        stage,
+        timeout,
+        Instant::now,
+        || {
+            let st = cb.status();
+            let desc = if st == MTLCommandBufferStatus::Error {
+                cb.error().map(|e| e.localizedDescription().to_string())
+            } else {
+                None
+            };
+            (st, desc)
+        },
+        std::thread::sleep,
+    );
+    if let Some(health) = health {
+        match &res {
+            Ok(()) => health.end_step_ok(Instant::now()),
+            Err(msg) if msg.contains("timed out") => health.end_step_failed(Instant::now(), msg.clone()),
+            Err(_) => health.end_step_ok(Instant::now()),
+        }
+    }
+    res
 }
 
 /// Safe non-GPU host work overlapped while a committed `MTLCommandBuffer` executes on GPU:
@@ -946,6 +1154,19 @@ fn partition_pool_exhausted(
     (to_defer, vec![victim])
 }
 
+fn span_exceeds_pool_capacity(pools: &crate::blocks::BlockPools, p0: usize, t: usize) -> bool {
+    let need_blocks = (p0 + t - 1) / crate::blocks::BLOCK - p0 / crate::blocks::BLOCK + 1;
+    let usable = |pool: &crate::blocks::BlockPool| {
+        (1..=pool.len())
+            .filter(|&idx| {
+                pool.record(crate::blocks::Slot::new(idx as u32).expect("valid slot"))
+                    .is_ok_and(|r| r.generation() < u32::MAX)
+            })
+            .count()
+    };
+    need_blocks > usable(&pools.full) || need_blocks > usable(&pools.window)
+}
+
 fn scheduler(
     eng: &Engine,
     tk: &Tokenizer,
@@ -955,6 +1176,9 @@ fn scheduler(
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
     spill_store: Option<crate::spill::SpillStore>,
+    retained_host_budget_bytes: u64,
+    health: Arc<SchedulerHealth>,
+    deferrals: Arc<DeferralCounters>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
         .enumerate()
@@ -969,43 +1193,61 @@ fn scheduler(
         Some(store) => ServeBlockCache::with_spill(store),
         None => ServeBlockCache::new(),
     };
+    cache.set_max_retained_host_bytes(retained_host_budget_bytes);
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
-    let stop = [tk.eos, sp.end_sampling];
+    let stop = [tk.eos, sp.end_sampling, sp.msg_user, sp.msg_system, sp.msg_tool];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
     let (context, window_slots) = {
         let pools = eng.block_pool().borrow();
         (pooled_context(eng.max_ctx, pools.full.len(), pools.window.len()), pools.window.len())
     };
     let mut pool_deferred = vec![false; nlanes];
-    let mut prev_lanes_released = cache.stats().lanes_released;
-    let mut prev_window_pruned = cache.stats().window_pruned;
+    let mut prev_pool_epoch = (
+        cache.stats().lanes_released,
+        cache.stats().window_pruned,
+        cache.stats().start_points_evicted,
+        cache.stats().singleflight_rebinds,
+    );
+    let mut last_admit_deferred: Option<(u64, (u64, u64, u64, u64), usize)> = None;
     let mut checkpoints_sealed = false;
     loop {
         let cur_stats = cache.stats();
-        if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
+        deferrals.admit_pool_deferrals.store(cur_stats.admit_deferred_pool_pressure, Ordering::Relaxed);
+        deferrals.step_pool_deferrals.store(cur_stats.step_deferred_pool_pressure, Ordering::Relaxed);
+        let cur_epoch = (
+            cur_stats.lanes_released,
+            cur_stats.window_pruned,
+            cur_stats.start_points_evicted,
+            cur_stats.singleflight_rebinds,
+        );
+        if cur_epoch != prev_pool_epoch {
             pool_deferred.fill(false);
-            prev_lanes_released = cur_stats.lanes_released;
-            prev_window_pruned = cur_stats.window_pruned;
+            prev_pool_epoch = cur_epoch;
+            last_admit_deferred = None;
         }
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
         // take new requests: block only when there is nothing to do
         let busy = busy_count > 0;
         if !busy && queue.is_empty() {
+            health.mark_idle(Instant::now());
             match rx.recv() {
                 Ok(j) => queue.push_back(j),
                 Err(_) => {
+                    health.mark_stopped();
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
                 }
             }
         }
+        health.mark_idle(Instant::now());
         loop {
             match rx.try_recv() {
                 Ok(j) => queue.push_back(j),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    health.mark_stopped();
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
                 }
@@ -1049,6 +1291,10 @@ fn scheduler(
                 continue;
             }
             {
+                let cur_busy = lanes.iter().filter(|l| l.job.is_some()).count();
+                if last_admit_deferred == Some((j.seq, prev_pool_epoch, cur_busy)) {
+                    break;
+                }
                 let pools = eng.block_pool().borrow();
                 let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
                     .iter()
@@ -1070,13 +1316,19 @@ fn scheduler(
                     })
                     .collect();
                 if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
+                    let c = cache.stats().admit_deferred_pool_pressure;
+                    deferrals.admit_pool_deferrals.store(c, Ordering::Relaxed);
+                    metrics.lock().unwrap_or_else(|e| e.into_inner()).admit_deferrals = c;
+                    last_admit_deferred = Some((j.seq, prev_pool_epoch, cur_busy));
                     break;
                 }
+                last_admit_deferred = None;
             }
             let j = queue.pop_front().unwrap();
             // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
             let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
             let prep_began = Instant::now();
+            health.begin_step(prep_began);
             let start = {
                 let l = &mut lanes[i];
                 let mut pools = eng.block_pool().borrow_mut();
@@ -1096,6 +1348,7 @@ fn scheduler(
                 }
             };
             eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
+            health.end_step_ok(Instant::now());
             timing.prep = prep_began.elapsed();
             let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
             // once per request, not per round and not per emitted token
@@ -1128,10 +1381,17 @@ fn scheduler(
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.rebind_if_deeper_match(&mut pools, &mut tbl, &mut l.blocks, &a.job.toks, a.n_past)
                     };
-                    if let Some((matched_at, cs)) = rebound {
-                        eng.on(&l.lane).set_cs(&cs);
-                        a.n_past = matched_at;
-                        a.cached = matched_at;
+                    match rebound {
+                        Some((matched_at, cs)) => {
+                            debug_assert!(matched_at > a.n_past && l.blocks.written == matched_at);
+                            eng.on(&l.lane).set_cs(&cs);
+                            a.n_past = matched_at;
+                            a.cached = matched_at;
+                        }
+                        None => {
+                            // Failed or skipped rebind must leave the lane's prior bindings consistent.
+                            assert_eq!(l.blocks.written, a.n_past, "failed rebind corrupted lane written position");
+                        }
                     }
                 }
             }
@@ -1175,27 +1435,42 @@ fn scheduler(
         let step_plan = planner.plan_and_begin_step(&step_inputs, eng.chunk, 64);
         match step_plan {
             Some(crate::scheduler::ServeStepPlan::Prefill(sp_list)) => {
+                health.begin_step(Instant::now());
                 let mut live_sp: Vec<(usize, usize, usize)> = Vec::with_capacity(sp_list.len());
                 let mut exhausted: Vec<(usize, String)> = Vec::new();
+                let mut impossible: Vec<(usize, String)> = Vec::new();
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &(i, p0, t) in &sp_list {
                         let mut tbl = lanes[i].lane.block_table().borrow_mut();
                         match cache.ensure_span_blocks(&mut pools, &mut tbl, p0, t) {
                             Ok(()) => live_sp.push((i, p0, t)),
-                            Err(err) => exhausted.push((i, err.to_string())),
+                            Err(err) => {
+                                if span_exceeds_pool_capacity(&pools, p0, t) {
+                                    impossible.push((i, err.to_string()));
+                                } else {
+                                    exhausted.push((i, err.to_string()));
+                                }
+                            }
                         }
                     }
                 }
+                for (i, msg) in impossible {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
                 if !exhausted.is_empty() {
-                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                    let other_progressing_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !sp_list.iter().any(|&(k, _, _)| k == j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && l.job.as_ref().is_some_and(|a| !a.job.out.cancelled() && !pool_deferred[j] && !deferred_by_singleflight[j])
                     });
                     let (to_defer, to_fail) =
-                        partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_runnable_exists);
+                        partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_progressing_exists);
                     for i in to_defer {
                         cache.record_step_deferred_pool_pressure();
+                        let s = cache.stats().step_deferred_pool_pressure;
+                        deferrals.step_pool_deferrals.store(s, Ordering::Relaxed);
+                        metrics.lock().unwrap_or_else(|e| e.into_inner()).step_deferrals = s;
                         pool_deferred[i] = true;
                     }
                     for (i, msg) in to_fail {
@@ -1204,6 +1479,7 @@ fn scheduler(
                     }
                 }
                 if live_sp.is_empty() {
+                    health.end_step_ok(Instant::now());
                     for cancelled_i in planner.complete_step() {
                         if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                             a.log_cancellation(cancelled_i);
@@ -1247,7 +1523,7 @@ fn scheduler(
                 }
                 cb.commit();
                 let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
-                if let Err(e) = wait_committed_step(&cb, "prefill") {
+                if let Err(e) = wait_committed_step_bounded(&cb, "prefill", health.gpu_step_timeout(), Some(&health)) {
                     fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for &(i, _, _) in &live_sp { planner.on_finish(i); }
@@ -1317,8 +1593,10 @@ fn scheduler(
                 release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             Some(crate::scheduler::ServeStepPlan::Decode(need_dec)) => {
+                health.begin_step(Instant::now());
                 let mut live_dec: Vec<usize> = Vec::with_capacity(need_dec.len());
                 let mut exhausted: Vec<(usize, String)> = Vec::new();
+                let mut impossible: Vec<(usize, String)> = Vec::new();
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &i in &need_dec {
@@ -1326,19 +1604,32 @@ fn scheduler(
                         let mut tbl = lanes[i].lane.block_table().borrow_mut();
                         match cache.ensure_span_blocks(&mut pools, &mut tbl, pos, 1) {
                             Ok(()) => live_dec.push(i),
-                            Err(err) => exhausted.push((i, err.to_string())),
+                            Err(err) => {
+                                if span_exceeds_pool_capacity(&pools, pos, 1) {
+                                    impossible.push((i, err.to_string()));
+                                } else {
+                                    exhausted.push((i, err.to_string()));
+                                }
+                            }
                         }
                     }
                 }
+                for (i, msg) in impossible {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
                 if !exhausted.is_empty() {
-                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                    let other_progressing_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !need_dec.contains(&j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && l.job.as_ref().is_some_and(|a| !a.job.out.cancelled() && !pool_deferred[j] && !deferred_by_singleflight[j])
                     });
                     let (to_defer, to_fail) =
-                        partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_runnable_exists);
+                        partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_progressing_exists);
                     for i in to_defer {
                         cache.record_step_deferred_pool_pressure();
+                        let s = cache.stats().step_deferred_pool_pressure;
+                        deferrals.step_pool_deferrals.store(s, Ordering::Relaxed);
+                        metrics.lock().unwrap_or_else(|e| e.into_inner()).step_deferrals = s;
                         pool_deferred[i] = true;
                     }
                     for (i, msg) in to_fail {
@@ -1347,6 +1638,7 @@ fn scheduler(
                     }
                 }
                 if live_dec.is_empty() {
+                    health.end_step_ok(Instant::now());
                     for cancelled_i in planner.complete_step() {
                         if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                             a.log_cancellation(cancelled_i);
@@ -1387,7 +1679,7 @@ fn scheduler(
                 eng.encode_gumbel_spans(&cb, &gumbels);
                 cb.commit();
                 let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
-                if let Err(e) = wait_committed_step(&cb, "decode") {
+                if let Err(e) = wait_committed_step_bounded(&cb, "decode", health.gpu_step_timeout(), Some(&health)) {
                     fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for i in live_dec { planner.on_finish(i); }
@@ -1439,6 +1731,7 @@ fn scheduler(
                         Ok(job) => queue.push_back(job),
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
+                            health.mark_stopped();
                             cleanup_scheduler(eng, &mut lanes, &mut cache);
                             return;
                         }
@@ -1521,8 +1814,11 @@ fn models_body() -> String {
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
-const MAX_FRAMING: usize = 64 << 10;
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CHUNK_LINE: usize = 8192;
+const MAX_TRAILER_BYTES: usize = 64 << 10;
+const MAX_ERROR_DRAIN_BYTES: usize = 256 << 10;
+const ERROR_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+const PREAUTH_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
@@ -1593,22 +1889,26 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
 enum BodyError { TooLarge, Malformed(String) }
 
 /// A chunked request body decoded under `max`: chunk sizes are hex with
-/// optional extensions, each chunk is followed by CRLF, the zero chunk is
-/// followed by header-like trailers and an empty line. Anything else fails
-/// closed; the cap is checked before a chunk's bytes are read.
+/// optional extensions (bounded per line), each chunk is followed by CRLF, the
+/// zero chunk is followed by bounded header-like trailers and an empty line.
+/// Valid bodies split across arbitrarily many small chunks under `max` are accepted;
+/// anything over `max` or malformed fails closed before reading past the cap.
 fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
     let bad = |m: &str| BodyError::Malformed(m.to_string());
     let mut body = Vec::new();
-    let mut framing = 0usize;
     loop {
-        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
-        framing += line.len();
+        let line = read_bounded_line(r, MAX_CHUNK_LINE).map_err(|e| bad(&format!("chunk size: {e}")))?;
         let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
         let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
         if n == 0 {
+            let mut trailer_bytes = 0usize;
             for _ in 0..128 {
-                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("trailer: {e}")))?;
-                framing += t.len();
+                let rem_trailer = MAX_TRAILER_BYTES.saturating_sub(trailer_bytes);
+                if rem_trailer == 0 {
+                    return Err(bad("trailers too large"));
+                }
+                let t = read_bounded_line(r, 16384.min(rem_trailer)).map_err(|e| bad(&format!("trailer: {e}")))?;
+                trailer_bytes += t.len();
                 if t == "\r\n" || t == "\n" { return Ok(body); }
                 if !t.contains(':') { return Err(bad("bad trailer")); }
             }
@@ -1620,13 +1920,40 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
         r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
         let mut eol = [0u8; 1];
         r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
-        let eol_len = if eol[0] == b'\r' {
+        if eol[0] == b'\r' {
             r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
-            2
-        } else { 1 };
+        }
         if eol[0] != b'\n' { return Err(bad("chunk not followed by CRLF")); }
-        framing = framing.checked_add(eol_len).filter(|&n| n <= MAX_FRAMING).ok_or_else(|| bad("too much chunk framing"))?;
     }
+}
+
+/// Drain up to `max_bytes` from `r` so unread request bytes do not trigger a kernel TCP RST
+/// before the client reads an early `400` / `401` / `413` HTTP error response.
+fn drain_unread_bounded(r: &mut impl Read, max_bytes: usize) -> usize {
+    let mut total = 0usize;
+    let mut buf = [0u8; 4096];
+    while total < max_bytes {
+        let want = buf.len().min(max_bytes - total);
+        match r.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    total
+}
+
+fn send_error_and_drain(
+    s: &mut TcpStream,
+    send_resp: impl FnOnce(&mut TcpStream) -> std::io::Result<()>,
+) {
+    let _ = send_resp(s);
+    let _ = s.shutdown(Shutdown::Write);
+    let _ = s.set_read_timeout(Some(ERROR_DRAIN_TIMEOUT));
+    let deadline = Instant::now() + ERROR_DRAIN_TIMEOUT;
+    let mut dr = DeadlineReader::new(&*s, deadline, Instant::now, |d| s.set_read_timeout(Some(d)));
+    let _ = drain_unread_bounded(&mut dr, MAX_ERROR_DRAIN_BYTES);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1667,31 +1994,39 @@ fn same_key(a: &str, b: &str) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// What a sequence of peek results means for the peer: closed (0 read) or a hard error is gone; data or
-/// `WouldBlock` is present. `Interrupted` is transient: the probe is retried a few times, and if it persists
-/// the client is treated as still present.
-fn gone_from_peek(mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> bool {
-    let mut b = [0u8; 1];
-    let mut tries = 0;
+/// Probe whether a `Connection: close` peer whose request head and body have already been
+/// consumed has closed its write side (`SHUT_WR` -> `Ok(0)` EOF), reset, or sent trailing/pipelined
+/// bytes followed by close. Draining up to a bounded 8 KiB in non-blocking mode ensures trailing
+/// `\r\n` or pipelined bytes after the body never mask an `EOF` behind them (`Ok(n)` then `Ok(0)` -> gone,
+/// `Ok(n)` then `WouldBlock` -> still connected).
+fn gone_from_nonblocking_read(mut read_fn: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> bool {
+    let mut b = [0u8; 512];
+    let mut chunks = 0usize;
+    let mut intr_tries = 0usize;
     loop {
-        match peek(&mut b) {
+        match read_fn(&mut b) {
             Ok(0) => return true,
-            Ok(_) => return false,
+            Ok(_) => {
+                chunks += 1;
+                intr_tries = 0;
+                if chunks >= 16 {
+                    // > 8 KiB of unsolicited post-body data on a Connection: close request.
+                    return true;
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 3 => { tries += 1; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && intr_tries < 3 => {
+                intr_tries += 1;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return false,
             Err(_) => return true,
         }
     }
 }
 
-/// The client closed its end (checked without blocking or consuming anything). A peek error other than
-/// `WouldBlock` is treated as gone: failing toward cancellation is the safe direction (it frees the lane and the
-/// client can retry) rather than holding a lane for a peer that may be dead. `Interrupted` is transient, so the
-/// probe is retried a few times and, if it persists, the client is treated as still present.
-fn peer_gone(s: &TcpStream) -> bool {
+fn peer_gone(mut s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() { return true; }
-    let gone = gone_from_peek(|b| s.peek(b));
+    let gone = gone_from_nonblocking_read(|b| s.read(b));
     let _ = s.set_nonblocking(false);
     gone
 }
@@ -1893,16 +2228,21 @@ impl AdmissionGate {
                 cvar.notify_all();
                 return Ok(LanePermit { inner: self.inner.clone() });
             }
+            // Probe client socket outside the admission mutex so non-blocking syscalls never
+            // serialize or stall other connection threads acquiring or releasing permits.
+            drop(st);
             if is_gone() {
-                drop(st);
                 drop(guard);
                 return Err(AdmissionReject::ClientGone);
             }
             let rem = deadline.saturating_duration_since(Instant::now());
             if rem.is_zero() {
-                drop(st);
                 drop(guard);
                 return Err(AdmissionReject::QueueTimeout);
+            }
+            st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if st.waiters.front() == Some(&ticket) && st.admitted < st.max_lanes {
+                continue;
             }
             let wait = rem.min(self.poll_interval);
             let (next_st, _) = cvar.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
@@ -1938,18 +2278,62 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              active_lanes: Arc<AtomicUsize>,
              /// connection threads alive; at most MAX_CONNS
              conns: Arc<AtomicUsize>,
+             /// unauthenticated handshakes alive on non-loopback binds; at most MAX_UNAUTH_CONNS
+             unauth_conns: Arc<AtomicUsize>,
+             /// scheduler step heartbeat and stall detector
+             health: Arc<SchedulerHealth>,
+             /// pool-pressure deferral telemetry
+             deferrals: Arc<DeferralCounters>,
+             /// SSE poll / keepalive interval (250ms in production; injectable in unit tests)
+             stream_poll_interval: Duration,
              /// opt-in non-blocking JSONL card traffic recorder
              recorder: Option<Arc<crate::record::Recorder>> }
 const MAX_CONNS: usize = 512;
+const MAX_UNAUTH_CONNS: usize = 64;
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
 
 const QUEUE_FULL: &str = "inky is busy: the request queue is full";
 const QUEUE_TIMED_OUT: &str = "inky is busy: timed out waiting for an inference lane";
 const PREPROCESS_BUSY: &str = "inky is busy: all prompt processors are in use";
+
+struct UnauthConnGuard {
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl UnauthConnGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>, enforce: bool, limit: usize) -> Option<Self> {
+        if !enforce {
+            return Some(Self { counter: None });
+        }
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed) {
+                Ok(_) => return Some(Self { counter: Some(counter.clone()) }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release_authenticated(&mut self) {
+        if let Some(c) = self.counter.take() {
+            c.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for UnauthConnGuard {
+    fn drop(&mut self) {
+        self.release_authenticated();
+    }
+}
 
 struct PermitPool {
     used: Arc<AtomicUsize>,
@@ -1975,10 +2359,11 @@ impl PermitPool {
     }
 }
 
-fn health_body(cx: &Ctx) -> String {
+fn health_response(cx: &Ctx, now: Instant) -> (u16, String) {
+    let (ok, reason) = cx.health.check(now);
     let kv_bytes_per_elem: u32 = if cx.kv8 { 1 } else { 2 };
     let mut obj = serde_json::Map::from_iter([
-        ("ok".into(), json!(true)),
+        ("ok".into(), json!(ok)),
         ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
         ("inflight".into(), json!(cx.admission.inflight())),
         ("recommended_working_set_bytes".into(), json!(cx.budget.recommended_working_set_bytes)),
@@ -1989,13 +2374,27 @@ fn health_body(cx: &Ctx) -> String {
         ("kv8".into(), json!(cx.kv8)),
         ("kv_bytes_per_elem".into(), json!(kv_bytes_per_elem)),
     ]);
+    let admit_def = cx.deferrals.admit_pool_deferrals.load(Ordering::Relaxed);
+    let step_def = cx.deferrals.step_pool_deferrals.load(Ordering::Relaxed);
+    if admit_def > 0 || step_def > 0 {
+        obj.insert("admit_deferrals".into(), json!(admit_def));
+        obj.insert("step_deferrals".into(), json!(step_def));
+    }
+    if let Some(reason) = reason {
+        obj.insert("reason".into(), json!(reason));
+    }
     if let Some(rec) = &cx.recorder {
         obj.insert("record_written".into(), json!(rec.written_count()));
         obj.insert("record_dropped".into(), json!(rec.dropped_count()));
         obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
         obj.insert("record_rotations".into(), json!(rec.rotation_count()));
     }
-    Value::Object(obj).to_string()
+    (if ok { 200 } else { 503 }, Value::Object(obj).to_string())
+}
+
+#[cfg(test)]
+fn health_body(cx: &Ctx) -> String {
+    health_response(cx, Instant::now()).1
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -2237,22 +2636,34 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     let id = format!("chatcmpl-{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+    let send_sse = |s: &mut W, payload: &Value| -> std::io::Result<()> {
+        let frame = format!("data: {payload}\n\n");
+        s.write_all(frame.as_bytes())?;
+        s.flush()
+    };
     if stream {
-        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-        write!(s, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), Value::Null))?;
-        s.flush()?;
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        send_sse(s, &chunk(json!({"role": "assistant", "content": ""}), Value::Null))?;
     }
     let sp = cx.sp;
+    let poll_interval = cx.stream_poll_interval;
+    let mut last_sse_write = Instant::now();
+    let mut role_stopped = false;
     let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
     loop {
         // wait for the scheduler, watching the client: a client gone drops `rx`, and the scheduler's next send to this
         // request fails and frees its lane (prefill steps send Alive, decode steps a token)
-        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        let ev = match rx.recv_timeout(poll_interval) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if s.client_gone() {
                     record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
                     return Ok(());
+                }
+                if stream {
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
                 }
                 continue;
             }
@@ -2264,6 +2675,11 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                     record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
                     return Ok(());
                 }
+                if stream {
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
+                }
             }
             Ev::Tok(t) => {
                 if first_tok.is_none() { first_tok = Some(Instant::now()); }
@@ -2273,27 +2689,57 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                     return Ok(());
                 }
                 if !stream { continue; }
-                if t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
+                if role_stopped {
+                    if last_sse_write.elapsed() >= poll_interval {
+                        if s.client_gone() {
+                            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                            return Ok(());
+                        }
+                        s.write_all(b": keepalive\n\n")?;
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    }
+                    continue;
+                }
+                let mut wrote_event = false;
+                if sp.is_role_stop(t) || t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
+                        last_sse_write = Instant::now();
+                        wrote_event = true;
                     }
                 }
-                if t == sp.c_think { mode = 1; continue; }
-                if t == sp.c_text { mode = 2; continue; }
-                if t == sp.c_tool { mode = 3; continue; }
-                if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); continue; }
-                if mode == 1 || mode == 2 {
+                if sp.is_role_stop(t) {
+                    mode = 0;
+                    pend.clear();
+                    role_stopped = true;
+                    continue;
+                }
+                if t == sp.c_think { mode = 1; }
+                else if t == sp.c_text { mode = 2; }
+                else if t == sp.c_tool { mode = 3; }
+                else if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); }
+                else if mode == 1 || mode == 2 {
                     pend.extend(cx.tk.decode_bytes(t));
                     let text = take_stream_text(&mut pend, false);
                     if !text.is_empty() {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
                         // a failed write drops `rx`: the scheduler sees the client gone and cancels the lane
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
+                        last_sse_write = Instant::now();
+                        wrote_event = true;
                     }
+                }
+                if !wrote_event && last_sse_write.elapsed() >= poll_interval {
+                    if s.client_gone() {
+                        record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                        return Ok(());
+                    }
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
                 }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
@@ -2308,17 +2754,21 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
                     }
-                    if !calls.is_empty() { write!(s, "data: {}\n\n", chunk(json!({"tool_calls": calls}), Value::Null))?; }
+                    if !calls.is_empty() {
+                        send_sse(s, &chunk(json!({"tool_calls": calls}), Value::Null))?;
+                    }
                     if include_usage {
-                        write!(s, "data: {}\n\n", chunk(json!({}), json!(finish)))?;
+                        send_sse(s, &chunk(json!({}), json!(finish)))?;
                         let usage_chunk = json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [], "usage": usage});
-                        write!(s, "data: {usage_chunk}\n\ndata: [DONE]\n\n")?;
+                        send_sse(s, &usage_chunk)?;
                     } else {
-                        let mut last = chunk(json!({}), json!(finish)); last["usage"] = usage;
-                        write!(s, "data: {last}\n\ndata: [DONE]\n\n")?;
+                        let mut last = chunk(json!({}), json!(finish));
+                        last["usage"] = usage;
+                        send_sse(s, &last)?;
                     }
+                    s.write_all(b"data: [DONE]\n\n")?;
                     return s.flush();
                 }
                 let mut msg = json!({"role": "assistant", "content": p.text});
@@ -2331,7 +2781,8 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, kind, code);
                 let error = json!({"error": {"type": kind, "message": message}});
                 if stream {
-                    write!(s, "data: {error}\n\n")?;
+                    let frame = format!("data: {error}\n\n");
+                    s.write_all(frame.as_bytes())?;
                     return s.flush();
                 }
                 return respond(s, code, &error.to_string());
@@ -2442,55 +2893,77 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let sp = cx.sp;
+    let poll_interval = cx.stream_poll_interval;
     if stream {
-        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-        write!(s, "{}", sse_text("message_start", &json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        let start_ev = sse_text("message_start", &json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
             "model": model, "content": [], "stop_reason": null, "stop_sequence": null,
-            "usage": {"input_tokens": prompt_len, "output_tokens": 0}}})))?;
+            "usage": {"input_tokens": prompt_len, "output_tokens": 0}}}));
+        s.write_all(start_ev.as_bytes())?;
         s.flush()?;
+        let ping_bytes = sse_text("ping", &json!({"type": "ping"})).into_bytes();
+        let mut last_sse_write = Instant::now();
         let mut bs = BlockStream::new(&cx.nonce, seq);
         let mut received = 0usize;
         loop {
-            let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            let ev = match rx.recv_timeout(poll_interval) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
-                    write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
+                    s.write_all(&ping_bytes)?; s.flush()?; last_sse_write = Instant::now(); continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     record_err(first_tok, 500, "api_error", received);
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
             };
             match ev {
-                Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => {
+                    if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    s.write_all(&ping_bytes)?; s.flush()?; last_sse_write = Instant::now();
+                }
                 Ev::Tok(t) => {
                     if first_tok.is_none() { first_tok = Some(Instant::now()); }
                     received += 1;
                     if received % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
-                    for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
+                    let events = bs.on_token(&cx.tk, &sp, t);
+                    if !events.is_empty() {
+                        for text in events { s.write_all(text.as_bytes())?; }
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    } else if last_sse_write.elapsed() >= poll_interval {
+                        if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                        s.write_all(&ping_bytes)?;
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    }
                 }
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
-                    for text in bs.close_all() { write!(s, "{text}")?; }
+                    for text in bs.close_all() { s.write_all(text.as_bytes())?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
                     record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {}", timing.summary, calls = bs.calls);
-                    write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
+                    let delta_ev = sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
-                        "usage": streaming_delta_usage(prompt, cached, ng)})))?;
-                    write!(s, "{}", sse_text("message_stop", &json!({"type": "message_stop"})))?;
+                        "usage": streaming_delta_usage(prompt, cached, ng)}));
+                    let stop_ev = sse_text("message_stop", &json!({"type": "message_stop"}));
+                    s.write_all(delta_ev.as_bytes())?;
+                    s.write_all(stop_ev.as_bytes())?;
                     return s.flush();
                 }
                 Ev::Err(e) => {
                     record_err(first_tok, 400, "invalid_request_error", received);
-                    for text in bs.close_all() { write!(s, "{text}")?; }
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
+                    for text in bs.close_all() { s.write_all(text.as_bytes())?; }
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
                 Ev::Failed(message) => {
                     record_err(first_tok, 500, "api_error", received);
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
             }
@@ -2498,7 +2971,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     }
     let mut gen = Vec::<u32>::new();
     loop {
-        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        let ev = match rx.recv_timeout(poll_interval) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } continue; }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
@@ -2574,8 +3047,12 @@ pub fn serve(o: ServeOpts) {
     );
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
+    let non_kv_serve_bytes = eng.serve_non_kv_bytes(effective_lanes);
+    let after_non_kv_budget = budget.available_kv_budget_bytes.saturating_sub(non_kv_serve_bytes);
+    let retained_host_budget_bytes = ServeBlockCache::recommended_host_budget_bytes(after_non_kv_budget);
+    let kv_pool_budget_bytes = after_non_kv_budget.saturating_sub(retained_host_budget_bytes);
     eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(kv_pool_budget_bytes, effective_lanes);
     let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -2587,6 +3064,8 @@ pub fn serve(o: ServeOpts) {
     let (jtx, jrx) = channel::<Job>();
     let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
+    let health = Arc::new(SchedulerHealth::new(Instant::now()));
+    let deferrals = Arc::new(DeferralCounters::default());
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
     let spill_store = if let Some(spill_dir) = &o.spill_dir {
@@ -2615,7 +3094,7 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), unauth_conns: Default::default(), health: health.clone(), deferrals: deferrals.clone(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2659,21 +3138,30 @@ pub fn serve(o: ServeOpts) {
         eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+    let bound_non_loopback = !addr.ip().to_canonical().is_loopback();
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
+            let _ = s.set_nodelay(true);
             if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
             let cx = cx.clone();
+            let enforce_unauth_cap = bound_non_loopback
+                && s.peer_addr().map(|a| !a.ip().to_canonical().is_loopback()).unwrap_or(true);
+            let Some(mut unauth_guard) = UnauthConnGuard::try_acquire(&cx.unauth_conns, enforce_unauth_cap, MAX_UNAUTH_CONNS) else {
+                send_error_and_drain(&mut s, |st| respond(st, 503, &json!({"error": {"message": "too many unauthenticated connections"}}).to_string()));
+                continue;
+            };
             if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
                 cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+                drop(unauth_guard);
+                send_error_and_drain(&mut s, |st| respond(st, 503, &json!({"error": {"message": "too many connections"}}).to_string()));
                 continue;
             }
             std::thread::spawn(move || {
                 struct Conn(Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
                 let _conn = Conn(cx.conns.clone());
-                let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
+                let header_deadline = Instant::now() + PREAUTH_HEADER_TIMEOUT;
                 let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
                 let Ok(h) = read_head(&mut r) else { return };
                 r.get_mut().clear_deadline();
@@ -2683,18 +3171,31 @@ pub fn serve(o: ServeOpts) {
                 // the key is checked before any body is read
                 if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
                     drop(r);
-                    let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message) }
-                            else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                            else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
+                    drop(unauth_guard);
+                    send_error_and_drain(&mut s, |st| {
+                        if path.starts_with("/v1/messages") {
+                            anthropic_error(st, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message)
+                        } else if code == 401 {
+                            respond(st, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string())
+                        } else {
+                            respond(st, code, &json!({"error": {"message": message}}).to_string())
+                        }
+                    });
                     return;
                 }
+                // Release the pre-auth handshake slot as soon as authentication succeeds so
+                // authenticated sessions never consume `MAX_UNAUTH_CONNS`.
+                unauth_guard.release_authenticated();
                 // Routes that do not use a body can answer without waiting for one.
                 let route = route(&method, &path);
                 if matches!(route, Route::Models | Route::Health | Route::NotFound) {
                     drop(r);
                     let result = match route {
                         Route::Models => respond(&mut s, 200, &models_body()),
-                        Route::Health => respond(&mut s, 200, &health_body(&cx)),
+                        Route::Health => {
+                            let (code, body) = health_response(&cx, Instant::now());
+                            respond(&mut s, code, &body)
+                        }
                         Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
                         Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
                         _ => unreachable!("body routes are handled below"),
@@ -2706,8 +3207,30 @@ pub fn serve(o: ServeOpts) {
                 let body = if h.chunked {
                     match read_chunked(&mut r, MAX_BODY) {
                         Ok(b) => b,
-                        Err(BodyError::TooLarge) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
-                        Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
+                        Err(BodyError::TooLarge) => {
+                            drop(r);
+                            let msg = format!("the body is over {} bytes", MAX_BODY);
+                            send_error_and_drain(&mut s, |st| {
+                                if path.starts_with("/v1/messages") {
+                                    anthropic_error(st, 413, "request_too_large", &msg)
+                                } else {
+                                    respond(st, 413, &json!({"error": {"message": msg}}).to_string())
+                                }
+                            });
+                            return;
+                        }
+                        Err(BodyError::Malformed(m)) => {
+                            drop(r);
+                            let msg = format!("malformed chunked body: {m}");
+                            send_error_and_drain(&mut s, |st| {
+                                if path.starts_with("/v1/messages") {
+                                    anthropic_error(st, 400, "invalid_request_error", &msg)
+                                } else {
+                                    respond(st, 400, &json!({"error": {"message": msg}}).to_string())
+                                }
+                            });
+                            return;
+                        }
                     }
                 } else {
                     let mut body = vec![0u8; h.len];
@@ -2720,15 +3243,24 @@ pub fn serve(o: ServeOpts) {
                 let r = match route {
                     Route::Chat => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
+                        Err(e) => {
+                            send_error_and_drain(&mut s, |st| respond(st, 400, &json!({"error": {"message": e.to_string()}}).to_string()));
+                            Ok(())
+                        }
                     },
                     Route::Messages => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
+                        Err(e) => {
+                            send_error_and_drain(&mut s, |st| anthropic_error(st, 400, "invalid_request_error", &e.to_string()));
+                            Ok(())
+                        }
                     },
                     Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => count_tokens(&cx, &v, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
+                        Err(e) => {
+                            send_error_and_drain(&mut s, |st| anthropic_error(st, 400, "invalid_request_error", &e.to_string()));
+                            Ok(())
+                        }
                     },
                     _ => unreachable!("bodyless routes were handled above"),
                 };
@@ -2736,7 +3268,7 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
-    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
+    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store, retained_host_budget_bytes, health, deferrals);
 }
 
 #[cfg(test)]
@@ -2782,7 +3314,14 @@ mod tests {
                 DEFAULT_RETRY_AFTER_SECS,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit),
+            active_lanes: Default::default(),
+            conns: Default::default(),
+            unauth_conns: Default::default(),
+            health: Default::default(),
+            deferrals: Default::default(),
+            stream_poll_interval: STREAM_POLL_INTERVAL,
+            recorder: None,
         };
         (cx, rx)
     }
@@ -2967,9 +3506,18 @@ mod tests {
         for _ in 0..128 { trailers.extend_from_slice(b"X: y\r\n"); }
         trailers.extend_from_slice(b"\r\n");
         assert!(chunk(trailers).is_err());
-        let mut framing = Vec::new();
-        for _ in 0..(MAX_FRAMING / 3 + 1) { framing.extend_from_slice(b"1\na\n"); }
-        assert!(matches!(read_chunked(&mut Cursor::new(framing), MAX_FRAMING), Err(BodyError::Malformed(_))));
+        let mut unterm = Vec::new();
+        for _ in 0..(MAX_TRAILER_BYTES / 3 + 1) { unterm.extend_from_slice(b"1\na\n"); }
+        assert!(matches!(read_chunked(&mut Cursor::new(unterm), MAX_BODY), Err(BodyError::Malformed(_))));
+        // Valid sub-cap body split across 10,000 4-byte chunks (~100 KiB of chunk framing > 64 KiB) succeeds!
+        let mut many_chunks = Vec::with_capacity(110_000);
+        for _ in 0..10_000 {
+            many_chunks.extend_from_slice(b"4\r\nabcd\r\n");
+        }
+        many_chunks.extend_from_slice(b"0\r\n\r\n");
+        let decoded = read_chunked(&mut Cursor::new(many_chunks), MAX_BODY).expect("10,000 4-byte chunks under cap must decode");
+        assert_eq!(decoded.len(), 40_000);
+        assert!(decoded.chunks_exact(4).all(|c| c == b"abcd"));
     }
 
     #[test] fn routes_distinguish_body_and_bodyless_handlers() {
@@ -3308,7 +3856,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3331,7 +3879,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -3370,7 +3918,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -3398,7 +3946,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -3439,7 +3987,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -3461,7 +4009,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3541,7 +4089,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -3589,12 +4137,13 @@ mod tests {
     #[test] fn peek_results_decide_whether_the_peer_is_gone() {
         use std::io::{Error, ErrorKind};
         let script = |v: Vec<std::io::Result<usize>>| { let mut q = VecDeque::from(v); move |_: &mut [u8]| q.pop_front().unwrap() };
-        assert!(gone_from_peek(script(vec![Ok(0)])), "a closed end is gone");
-        assert!(!gone_from_peek(script(vec![Ok(1)])), "data waiting is present");
-        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::WouldBlock))])), "nothing waiting yet is present");
-        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
-        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
-        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
+        assert!(gone_from_nonblocking_read(script(vec![Ok(0)])), "a closed end is gone");
+        assert!(!gone_from_nonblocking_read(script(vec![Ok(1), Err(Error::from(ErrorKind::WouldBlock))])), "trailing data with open peer is present");
+        assert!(gone_from_nonblocking_read(script(vec![Ok(1), Ok(0)])), "trailing data followed by close is gone");
+        assert!(!gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::WouldBlock))])), "nothing waiting yet is present");
+        assert!(gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
+        assert!(!gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
+        assert!(gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
     }
 
     #[test] fn thinking_budget_soft_closes_and_bans_reentry() {
@@ -3814,7 +4363,7 @@ mod tests {
         let timeouts = std::cell::RefCell::new(Vec::new());
         let dr = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
-            start + HEADER_READ_TIMEOUT,
+            start + PREAUTH_HEADER_TIMEOUT,
             || { let cur = clock.get(); clock.set(cur + Duration::from_secs(1)); cur },
             |d| { timeouts.borrow_mut().push(d); Ok(()) },
         );
@@ -3827,7 +4376,7 @@ mod tests {
         let fast_clock = std::cell::Cell::new(start);
         let dr_ok = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
-            start + HEADER_READ_TIMEOUT,
+            start + PREAUTH_HEADER_TIMEOUT,
             || { let cur = fast_clock.get(); fast_clock.set(cur + Duration::from_millis(10)); cur },
             |_| Ok(()),
         );
@@ -4031,7 +4580,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: Some(rec.clone()),
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -4231,7 +4780,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4291,7 +4840,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None,
         });
 
         let req = json!({
@@ -4592,7 +5141,19 @@ mod tests {
             (turn2, turn3, t1_out, t2_out, t3_out)
         });
 
-        scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None);
+        scheduler(
+            &eng,
+            &tk,
+            sp,
+            4,
+            jrx,
+            active_lanes,
+            &metrics,
+            None,
+            block_cache::DEFAULT_MAX_RETAINED_HOST_BYTES,
+            Arc::new(SchedulerHealth::new(Instant::now())),
+            Arc::new(DeferralCounters::default()),
+        );
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
 
         // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!
@@ -4951,5 +5512,433 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn error_tool_result_tokenizes_whole_role_markers_stop_and_parsers_agree() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+
+        // 1. U275: error tool-result text must be joined with "Error: " BEFORE BPE tokenization
+        //    so trailing space + first word merges identically to whole-string tokenization.
+        for payload in ["timeout while connecting", " Boom", "404 Not Found", ""] {
+            let err_req = json!({
+                "messages": [
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "is_error": true, "content": payload}
+                ]
+            });
+            let joined_req = json!({
+                "messages": [
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "is_error": false, "content": format!("Error: {payload}")}
+                ]
+            });
+            assert_eq!(
+                render(&tk, &sp, &err_req, "medium").unwrap(),
+                render(&tk, &sp, &joined_req, "medium").unwrap(),
+                "is_error tool result for {payload:?} must tokenize identically to joined 'Error: ...'"
+            );
+        }
+
+        // 2. U276 + U277: generated role markers (`msg_user`, `msg_system`, `msg_tool`) end the reply,
+        //    drop unclosed tool calls, and `parse`, `chat` SSE streaming, and `BlockStream` agree 100%.
+        let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        cx.ctx = 512;
+        let cx = Arc::new(cx);
+
+        for role_stop in [sp.msg_user, sp.msg_system, sp.msg_tool] {
+            // Stream with: thinking without sp.end -> msg_model + text -> completed tool call -> more text -> unclosed tool call -> raw role marker -> hallucinated trailing text!
+            let mut toks = vec![sp.msg_model, sp.c_think];
+            toks.extend(tk.encode("step1", false));
+            // Transition straight to msg_model + c_text without sp.end (exercises U277 flush parity!):
+            toks.extend([sp.msg_model, sp.c_text]);
+            toks.extend(tk.encode("Hi ", false));
+            toks.push(sp.c_text);
+            toks.extend(tk.encode("there!", false));
+            toks.push(sp.end);
+            toks.push(sp.msg_model);
+            toks.extend(tk.encode("lookup", false));
+            toks.push(sp.c_tool);
+            toks.extend(tk.encode("{\"name\":\"lookup\",\"args\":{\"q\":\"rust\"}}", false));
+            toks.push(sp.end);
+            // Start an unclosed tool call, then hit raw role marker followed by fake user text:
+            toks.push(sp.msg_model);
+            toks.extend(tk.encode("aborted_tool", false));
+            toks.push(sp.c_tool);
+            toks.extend(tk.encode("{\"name\":\"aborted_tool\",\"args\":", false));
+            toks.push(role_stop);
+            toks.push(sp.c_text);
+            toks.extend(tk.encode("INJECTED_FAKE_TURN", false));
+
+            let p = parse(&tk, &sp, &toks);
+            assert_eq!(p.thinking, "step1");
+            assert_eq!(p.text, "Hi there!");
+            assert_eq!(p.calls, vec![("lookup".to_string(), json!({"q": "rust"}))]);
+
+            // Verify BlockStream (`messages` streaming) produces exact same text and completed calls!
+            let mut bs = BlockStream::new("n", 1);
+            let mut bs_events: Vec<Value> = Vec::new();
+            for &t in &toks {
+                for raw in bs.on_token(&tk, &sp, t) {
+                    let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+                    bs_events.push(serde_json::from_str(data).unwrap());
+                }
+            }
+            for raw in bs.close_all() {
+                let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+                bs_events.push(serde_json::from_str(data).unwrap());
+            }
+            let bs_text: String = bs_events
+                .iter()
+                .filter(|e| e["delta"]["type"] == "text_delta")
+                .map(|e| e["delta"]["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(bs_text, p.text);
+            assert_eq!(bs.calls, 1);
+
+            // Verify `chat` streaming SSE deltas match `parse` (non-streaming)!
+            let cx2 = cx.clone();
+            let worker = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                chat(&cx2, &json!({"stream": true, "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+                out
+            });
+            let job = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+            for &t in &toks {
+                job.out.send(Ev::Tok(t)).unwrap();
+            }
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: toks.len(), reason: "stop", timing: Default::default() }).unwrap();
+            let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+            let mut sse_think = String::new();
+            let mut sse_text_acc = String::new();
+            let mut sse_calls = Vec::new();
+            for line in resp.split("\r\n\r\n").nth(1).unwrap().lines() {
+                let Some(d) = line.strip_prefix("data: ") else { continue };
+                if d == "[DONE]" { break; }
+                let v: Value = serde_json::from_str(d).unwrap();
+                if let Some(r) = v["choices"][0]["delta"]["reasoning_content"].as_str() { sse_think += r; }
+                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() { sse_text_acc += c; }
+                if let Some(arr) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+                    for tc in arr {
+                        sse_calls.push((
+                            tc["function"]["name"].as_str().unwrap().to_string(),
+                            serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap()).unwrap(),
+                        ));
+                    }
+                }
+            }
+            assert_eq!(sse_think, p.thinking);
+            assert_eq!(sse_text_acc, p.text);
+            assert_eq!(sse_calls, p.calls);
+        }
+    }
+
+    #[test]
+    fn chat_sse_writes_each_event_in_one_send_and_both_apis_emit_keepalives() {
+        struct CountingWriter {
+            buf: Vec<u8>,
+            writes: Vec<Vec<u8>>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(data.to_vec());
+                self.buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for CountingWriter {
+            fn client_gone(&self) -> bool { false }
+        }
+
+        let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        cx.ctx = 512;
+        cx.stream_poll_interval = Duration::from_millis(5);
+        let cx = Arc::new(cx);
+
+        // 1. OpenAI Chat SSE: 1 write per SSE event + `: keepalive\n\n` during prefill, silent header/thinking, and buffered tool calls!
+        let cx_chat = cx.clone();
+        let chat_worker = std::thread::spawn(move || {
+            let mut cw = CountingWriter { buf: Vec::new(), writes: Vec::new() };
+            chat(
+                &cx_chat,
+                &json!({"stream": true, "stream_options": {"include_usage": true}, "max_tokens": 32, "messages": [{"role": "user", "content": "ping?"}]}),
+                &mut cw,
+            )
+            .unwrap();
+            cw
+        });
+        let job = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Prefill keepalive via Ev::Alive AND via poll timeout:
+        job.out.send(Ev::Alive).unwrap();
+        std::thread::sleep(Duration::from_millis(12));
+        // Buffered tool-call phase (`c_tool` + silent JSON tokens taking > poll_interval):
+        job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.c_text)).unwrap();
+        for tok in cx.tk.encode("ok", false) {
+            job.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.c_tool)).unwrap();
+        let tool_toks = cx.tk.encode("{\"name\":\"fn1\",\"args\":{\"a\":1}}", false);
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in tool_toks {
+            job.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 10, reason: "stop", timing: Default::default() }).unwrap();
+
+        let cw = chat_worker.join().unwrap();
+        assert!(!cw.writes.is_empty());
+        assert!(cw.writes[0].starts_with(b"HTTP/1.1 200 OK\r\n"), "write[0] is the HTTP response header");
+        let mut keepalives = 0usize;
+        for (idx, w) in cw.writes.iter().enumerate().skip(1) {
+            let s = std::str::from_utf8(w).expect("valid UTF-8 SSE frame");
+            assert!(
+                (s.starts_with("data: ") || s == ": keepalive\n\n") && s.ends_with("\n\n"),
+                "write[{idx}] must be one complete self-contained SSE frame, got: {s:?}"
+            );
+            assert_eq!(
+                s.matches("\n\n").count(),
+                1,
+                "write[{idx}] must contain exactly 1 SSE event per write syscall, got: {s:?}"
+            );
+            if s == ": keepalive\n\n" {
+                keepalives += 1;
+            }
+        }
+        assert!(keepalives >= 3, "expected >= 3 Chat keepalives across Alive, prefill timeout, and buffered tool call; got {keepalives}");
+
+        // 2. Anthropic Messages SSE: emits `event: ping` during prefill, hidden thinking (`mode == 1`), and buffered tool call (`mode == 3`)!
+        let cx_msg = cx.clone();
+        let msg_worker = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            messages(
+                &cx_msg,
+                &json!({"stream": true, "max_tokens": 32, "messages": [{"role": "user", "content": "ping?"}]}),
+                &mut out,
+            )
+            .unwrap();
+            out
+        });
+        let job2 = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+        job2.out.send(Ev::Alive).unwrap();
+        // Hidden thinking phase (tokens arrive without opening any Anthropic block):
+        job2.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job2.out.send(Ev::Tok(cx.sp.c_think)).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in cx.tk.encode("long hidden thought", false) {
+            job2.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job2.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        // Buffered tool-call phase:
+        job2.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job2.out.send(Ev::Tok(cx.sp.c_tool)).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in cx.tk.encode("{\"name\":\"fn2\",\"args\":{}}", false) {
+            job2.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job2.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job2.out.send(Ev::Done { prompt: job2.toks.len(), cached: 0, gen: 12, reason: "stop", timing: Default::default() }).unwrap();
+
+        let msg_resp = String::from_utf8(msg_worker.join().unwrap()).unwrap();
+        let ping_count = msg_resp.matches("event: ping\ndata: {\"type\":\"ping\"}\n\n").count();
+        assert!(ping_count >= 3, "expected >= 3 Messages pings across Alive, hidden thinking, and buffered tool call; got {ping_count}");
+    }
+
+    #[test]
+    fn disconnect_probing_handles_half_close_and_trailing_bytes_and_error_drain_bounds() {
+        use std::collections::VecDeque as VD;
+
+        // 1. Open idle socket (`WouldBlock`) -> NOT gone.
+        assert!(!gone_from_nonblocking_read(|_| Err(std::io::ErrorKind::WouldBlock.into())));
+        // 2. TCP half-close (`SHUT_WR` -> `Ok(0)` EOF) -> gone!
+        assert!(gone_from_nonblocking_read(|_| Ok(0)));
+        // 3. Trailing `\r\n` after body while client stays open (`Ok(2)` then `WouldBlock`) -> NOT gone!
+        let mut seq_open: VD<std::io::Result<usize>> = VD::from([Ok(2), Err(std::io::ErrorKind::WouldBlock.into())]);
+        assert!(!gone_from_nonblocking_read(|buf| {
+            let r = seq_open.pop_front().unwrap();
+            if let Ok(n) = r { buf[..n].copy_from_slice(b"\r\n"); }
+            r
+        }));
+        // 4. Trailing `\r\n` / pipelined bytes after body followed by close (`Ok(16)` then `Ok(0)`) -> gone immediately!
+        let mut seq_closed: VD<std::io::Result<usize>> = VD::from([Ok(16), Ok(0)]);
+        assert!(gone_from_nonblocking_read(|_| seq_closed.pop_front().unwrap()));
+        // 5. > 8 KiB unsolicited post-body flood on Connection: close -> gone!
+        assert!(gone_from_nonblocking_read(|b| Ok(b.len())));
+
+        // 6. Bounded unread body drain helper consumes up to `max_bytes` and leaves zero panic on EOF/WouldBlock.
+        let mut unread = std::io::Cursor::new(vec![b'x'; 20_000]);
+        assert_eq!(drain_unread_bounded(&mut unread, 8192), 8192);
+        assert_eq!(unread.position(), 8192);
+    }
+
+    #[test]
+    fn preauth_connection_budget_and_admission_gate_many_waiters_outside_lock() {
+        // 1. Rowan C3: pre-auth header deadline is 5s and unauth handshake budget caps non-loopback peers
+        //    at MAX_UNAUTH_CONNS (64 < MAX_CONNS = 512), releasing immediately once authenticated!
+        assert_eq!(PREAUTH_HEADER_TIMEOUT, Duration::from_secs(5));
+        assert!(MAX_UNAUTH_CONNS <= MAX_CONNS / 2);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut guards: Vec<UnauthConnGuard> = (0..4)
+            .map(|_| UnauthConnGuard::try_acquire(&counter, true, 4).expect("within unauth budget"))
+            .collect();
+        assert!(UnauthConnGuard::try_acquire(&counter, true, 4).is_none(), "5th unauth peer refused");
+        assert!(UnauthConnGuard::try_acquire(&counter, false, 4).is_some(), "loopback peer bypasses non-loopback unauth cap");
+        guards[0].release_authenticated();
+        assert_eq!(counter.load(Ordering::SeqCst), 3, "authenticated connection frees its pre-auth slot immediately");
+        let _fifth = UnauthConnGuard::try_acquire(&counter, true, 4).expect("freed pre-auth slot admits next handshake");
+        drop(guards);
+        drop(_fifth);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // 2. U287 + U288: `is_gone` runs OUTSIDE `AdmissionGate` mutex (re-entering `gate.queued()` / `gate.inflight()`
+        //    inside `is_gone` does not deadlock!) and >= 8 queued waiters preserve strict FIFO across mid-queue cancels!
+        let gate = Arc::new(AdmissionGate::with_timings(
+            1,
+            16,
+            Duration::from_secs(5),
+            Duration::from_millis(2),
+            5,
+        ));
+        let initial_permit = gate.try_acquire().unwrap();
+        let n_waiters = 10usize;
+        let cancel_flags: Arc<Vec<AtomicBool>> = Arc::new((0..n_waiters).map(|_| AtomicBool::new(false)).collect());
+        let lock_free_probed = Arc::new(AtomicUsize::new(0));
+        let admitted_order = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let mut handles = Vec::with_capacity(n_waiters);
+        for idx in 0..n_waiters {
+            let g = gate.clone();
+            let cf = cancel_flags.clone();
+            let probed = lock_free_probed.clone();
+            let order = admitted_order.clone();
+            let rx = release_rx.clone();
+            handles.push(std::thread::spawn(move || {
+                let res = g.acquire_with_cancel(|| {
+                    // Would deadlock immediately on non-reentrant std::sync::Mutex if `st` were still held!
+                    let q = g.queued();
+                    let inf = g.inflight();
+                    assert!(inf >= q);
+                    probed.fetch_add(1, Ordering::Relaxed);
+                    cf[idx].load(Ordering::Acquire)
+                });
+                if let Ok(permit) = res {
+                    order.lock().unwrap().push(idx);
+                    rx.lock().unwrap().recv().unwrap();
+                    drop(permit);
+                    true
+                } else {
+                    false
+                }
+            }));
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while gate.queued() < idx + 1 {
+                assert!(Instant::now() < wait_deadline, "waiter {idx} did not enqueue in time");
+                std::thread::yield_now();
+            }
+        }
+        assert!(lock_free_probed.load(Ordering::Relaxed) >= n_waiters);
+
+        // Cancel mid-queue waiters 2, 5, and 7 while initial_permit is still held:
+        for &c in &[2usize, 5, 7] {
+            cancel_flags[c].store(true, Ordering::Release);
+        }
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while gate.queued() != n_waiters - 3 {
+            assert!(Instant::now() < cancel_deadline, "cancelled waiters did not drain from queue");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Release initial_permit and step each remaining waiter through in strict FIFO order!
+        drop(initial_permit);
+        for expected_len in 1..=(n_waiters - 3) {
+            let step_deadline = Instant::now() + Duration::from_secs(2);
+            while admitted_order.lock().unwrap().len() < expected_len {
+                assert!(Instant::now() < step_deadline, "waiter #{expected_len} did not wake");
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+        }
+        for (idx, h) in handles.into_iter().enumerate() {
+            let got = h.join().unwrap();
+            assert_eq!(got, ![2usize, 5, 7].contains(&idx));
+        }
+        assert_eq!(*admitted_order.lock().unwrap(), vec![0, 1, 3, 4, 6, 8, 9]);
+        assert_eq!(gate.queued(), 0);
+        assert_eq!(gate.inflight(), 0);
+    }
+
+    #[test]
+    fn scheduler_health_reports_503_on_stalled_step_or_gpu_timeout_and_200_when_idle() {
+        let t0 = Instant::now();
+        let (mut cx, _jrx) = admission_test_ctx_with(2, 2, Duration::from_secs(1), 2);
+        cx.health = Arc::new(SchedulerHealth::with_thresholds(
+            t0,
+            Duration::from_millis(50),
+            Duration::from_millis(25),
+        ));
+
+        // Idle waiting on channel for hours is healthy (200 ok:true):
+        cx.health.mark_idle(t0);
+        let (code_idle, body_idle) = health_response(&cx, t0 + Duration::from_secs(7200));
+        assert_eq!(code_idle, 200);
+        let v_idle: Value = serde_json::from_str(&body_idle).unwrap();
+        assert_eq!(v_idle["ok"], true);
+
+        // Active step within threshold is healthy (200), past threshold is unhealthy (503 ok:false + reason):
+        cx.health.begin_step(t0 + Duration::from_millis(100));
+        let (code_in_step, _) = health_response(&cx, t0 + Duration::from_millis(130));
+        assert_eq!(code_in_step, 200);
+        let (code_stalled, body_stalled) = health_response(&cx, t0 + Duration::from_millis(160));
+        assert_eq!(code_stalled, 503);
+        let v_stalled: Value = serde_json::from_str(&body_stalled).unwrap();
+        assert_eq!(v_stalled["ok"], false);
+        assert!(v_stalled["reason"].as_str().unwrap().contains("stalled in active step"));
+
+        // Completing step restores 200 ok:true:
+        cx.health.end_step_ok(t0 + Duration::from_millis(170));
+        assert_eq!(health_response(&cx, t0 + Duration::from_millis(500)).0, 200);
+
+        // GPU step deadline helper times out deterministically with fake clock and zero real sleep:
+        let fake_now = std::cell::Cell::new(t0);
+        let timeout_err = wait_for_gpu_completion(
+            "prefill",
+            Duration::from_millis(25),
+            || fake_now.get(),
+            || (MTLCommandBufferStatus::Committed, None),
+            |_| fake_now.set(fake_now.get() + Duration::from_millis(10)),
+        )
+        .unwrap_err();
+        assert!(timeout_err.contains("Metal prefill timed out after 25ms"), "got: {timeout_err}");
+        cx.health.end_step_failed(fake_now.get(), timeout_err);
+        let (code_failed, body_failed) = health_response(&cx, fake_now.get());
+        assert_eq!(code_failed, 503);
+        let v_failed: Value = serde_json::from_str(&body_failed).unwrap();
+        assert_eq!(v_failed["ok"], false);
+        assert!(v_failed["reason"].as_str().unwrap().contains("timed out"));
+
+        // Deferral counters appear in /health when non-zero, and non-KV + LoopCD bytes are counted once:
+        cx.health.end_step_ok(fake_now.get());
+        cx.deferrals.admit_pool_deferrals.store(3, Ordering::Relaxed);
+        cx.deferrals.step_pool_deferrals.store(2, Ordering::Relaxed);
+        let (code_def, body_def) = health_response(&cx, fake_now.get());
+        assert_eq!(code_def, 200);
+        let v_def: Value = serde_json::from_str(&body_def).unwrap();
+        assert_eq!(v_def["admit_deferrals"], 3);
+        assert_eq!(v_def["step_deferrals"], 2);
+
+        let non_kv_plain = Engine::serve_non_kv_bytes_for(8, 65536, 1_000_000, 262_144, false);
+        let non_kv_loopcd = Engine::serve_non_kv_bytes_for(8, 65536, 1_000_000, 262_144, true);
+        assert_eq!(non_kv_loopcd - non_kv_plain, 8 * 262_144 * 4);
+        let pools_small = crate::blocks::BlockPools::with_capacities(4, 4, 1).unwrap();
+        assert!(!span_exceeds_pool_capacity(&pools_small, 0, 256));
+        assert!(span_exceeds_pool_capacity(&pools_small, 0, 257));
     }
 }

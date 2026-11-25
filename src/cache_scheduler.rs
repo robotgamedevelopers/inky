@@ -9,7 +9,7 @@ use std::fmt;
 use crate::blockbook::Geometry;
 use crate::blocks::{
     block_length, byte_offset, BlockEntry, BlockError, BlockIndex, BlockKind, BlockPools,
-    BlockTable, Slot, BLOCK, WINDOW,
+    BlockTable, Slot,
 };
 use crate::cache_trace::{
     emit_block_layout_config, emit_block_layout_event, emit_block_layout_step,
@@ -136,102 +136,6 @@ pub fn worst_case_blocks_checked(
         .checked_add(win)
         .ok_or(SchedulerError::Block(BlockError::Overflow))?;
     Ok((full, win, total))
-}
-
-/// Cache memory budget derived from Metal's `recommendedMaxWorkingSetSize` at startup
-/// (`DESIGN.md`: never passed by hand) and parameterized by element width `kvb` (`1` for `--kv8`, `2` for fp16).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WorkingSetBudget {
-    pub recommended_working_set_bytes: u64,
-    pub fixed_non_cache_bytes: u64,
-    pub safety_headroom_bytes: u64,
-    pub cache_budget_bytes: u64,
-    pub kvb: u32,
-    pub full_stride_bytes: u64,
-    pub window_stride_bytes: u64,
-}
-
-impl WorkingSetBudget {
-    pub fn from_recommended_working_set_bytes(
-        recommended_working_set_bytes: u64,
-        fixed_non_cache_bytes: u64,
-        safety_headroom_bytes: u64,
-        kvb: u32,
-    ) -> Result<WorkingSetBudget, SchedulerError> {
-        let full_stride_bytes = BlockKind::Full.stride_bytes(kvb)?;
-        let window_stride_bytes = BlockKind::Window.stride_bytes(kvb)?;
-        let reserved = fixed_non_cache_bytes
-            .checked_add(safety_headroom_bytes)
-            .ok_or(SchedulerError::InvalidConfig("working-set reservation overflow"))?;
-        let cache_budget_bytes = recommended_working_set_bytes
-            .checked_sub(reserved)
-            .ok_or(SchedulerError::InvalidConfig(
-                "recommended working set smaller than non-cache footprint",
-            ))?;
-        let min_pair = full_stride_bytes
-            .checked_add(window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        if cache_budget_bytes < min_pair {
-            return Err(SchedulerError::InvalidConfig(
-                "remaining cache working-set budget cannot hold one full + one window block",
-            ));
-        }
-        Ok(WorkingSetBudget {
-            recommended_working_set_bytes,
-            fixed_non_cache_bytes,
-            safety_headroom_bytes,
-            cache_budget_bytes,
-            kvb,
-            full_stride_bytes,
-            window_stride_bytes,
-        })
-    }
-
-    /// Checked worst-case GPU byte demand (`full * full_stride(kvb) + window * window_stride(kvb)`).
-    /// Refuses zero `target_positions`, zero `max_span_tokens`, and any `u32`/`u64` overflow.
-    pub fn worst_case_request_bytes(
-        &self,
-        target_positions: u32,
-        max_span_tokens: u32,
-    ) -> Result<u64, SchedulerError> {
-        let (full, win, _) = worst_case_blocks_checked(
-            target_positions,
-            max_span_tokens,
-            BLOCK as u32,
-            WINDOW as u32,
-        )?;
-        let full_bytes = u64::from(full)
-            .checked_mul(self.full_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        let win_bytes = u64::from(win)
-            .checked_mul(self.window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        full_bytes
-            .checked_add(win_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))
-    }
-
-    /// Partition `cache_budget_bytes` into `(full_slots, window_slots)` at this pool's `kvb`.
-    /// Refuses `desired_window_slots == 0` and budgets that leave zero full slots.
-    pub fn partition_pools(&self, desired_window_slots: u32) -> Result<(u32, u32), SchedulerError> {
-        if desired_window_slots == 0 {
-            return Err(SchedulerError::InvalidConfig("desired_window_slots must be at least 1"));
-        }
-        let win_bytes = u64::from(desired_window_slots)
-            .checked_mul(self.window_stride_bytes)
-            .ok_or(SchedulerError::Block(BlockError::Overflow))?;
-        if win_bytes >= self.cache_budget_bytes {
-            return Err(SchedulerError::InvalidConfig("window pool exhausts entire cache budget"));
-        }
-        let rem = self.cache_budget_bytes - win_bytes;
-        let full_slots64 = rem / self.full_stride_bytes;
-        if full_slots64 == 0 {
-            return Err(SchedulerError::InvalidConfig("zero full-block slots left after window pool"));
-        }
-        let full_slots = u32::try_from(full_slots64)
-            .map_err(|_| SchedulerError::Block(BlockError::Overflow))?;
-        Ok((full_slots, desired_window_slots))
-    }
 }
 
 // ---- Part A: `TrackedBlockAllocator` (`specs/BlockLayout.tla` over `src/blocks.rs`) ----
@@ -3045,39 +2949,18 @@ mod tests {
     };
 
     #[test]
-    fn working_set_budget_handles_dynamic_kvb_and_refuses_zero_or_overflow() {
-        let g = 1u64 << 30;
-        let fp16 = WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 20 * g, 2 * g, 2).unwrap();
-        assert_eq!(fp16.cache_budget_bytes, 42 * g);
-        assert_eq!(fp16.full_stride_bytes, FULL_STRIDE);
-        assert_eq!(fp16.window_stride_bytes, WINDOW_STRIDE);
-        assert_eq!(
-            fp16.worst_case_request_bytes(4096, 512).unwrap(),
-            64 * FULL_STRIDE + 25 * WINDOW_STRIDE
-        );
+    fn worst_case_blocks_and_span_bounds_handle_kvb_and_refuse_zero_or_overflow() {
+        assert_eq!(BlockKind::Full.stride_bytes(2).unwrap(), FULL_STRIDE);
+        assert_eq!(BlockKind::Window.stride_bytes(2).unwrap(), WINDOW_STRIDE);
+        assert_eq!(BlockKind::Full.stride_bytes(1).unwrap(), FULL_STRIDE / 2);
+        assert_eq!(BlockKind::Window.stride_bytes(1).unwrap(), WINDOW_STRIDE / 2);
+        assert!(BlockKind::Full.stride_bytes(0).is_err());
+        assert!(BlockKind::Full.stride_bytes(3).is_err());
 
-        // --kv8 (`kvb = 1`) uses half the stride per block:
-        let kv8 = WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 20 * g, 2 * g, 1).unwrap();
-        assert_eq!(kv8.full_stride_bytes, FULL_STRIDE / 2);
-        assert_eq!(kv8.window_stride_bytes, WINDOW_STRIDE / 2);
-        assert_eq!(
-            kv8.worst_case_request_bytes(4096, 512).unwrap(),
-            64 * (FULL_STRIDE / 2) + 25 * (WINDOW_STRIDE / 2)
-        );
-        assert!(kv8.partition_pools(256).unwrap().0 > fp16.partition_pools(256).unwrap().0);
-
-        // Invalid kvb, underflow, overflow, and zero inputs are all refused cleanly (never panic or wrap):
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 0, 0, 0).is_err());
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(64 * g, 0, 0, 3).is_err());
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(u64::MAX, u64::MAX, 1, 2).is_err());
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(100, 200, 0, 2).is_err());
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(12 * 1024 * 1024 - 1, 0, 0, 2).is_err());
-        assert!(WorkingSetBudget::from_recommended_working_set_bytes(6 * 1024 * 1024, 0, 0, 1).is_ok());
-
-        assert!(fp16.worst_case_request_bytes(0, 512).is_err());
-        assert!(fp16.worst_case_request_bytes(4096, 0).is_err());
-        assert!(fp16.worst_case_request_bytes(1 << 20, u32::MAX).is_err());
-        assert!(fp16.partition_pools(0).is_err());
+        assert_eq!(worst_case_blocks_checked(4096, 512, 64, 1024).unwrap(), (64, 25, 89));
+        assert!(worst_case_blocks_checked(0, 512, 64, 1024).is_err());
+        assert!(worst_case_blocks_checked(4096, 0, 64, 1024).is_err());
+        assert!(worst_case_blocks_checked(1 << 20, u32::MAX, 64, 1024).is_err());
         assert!(span_bound_blocks(0, 64, 1024).is_err());
         assert!(span_bound_blocks(1, 0, 1024).is_err());
         assert!(span_bound_blocks(1, 64, 0).is_err());

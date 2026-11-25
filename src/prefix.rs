@@ -370,10 +370,11 @@ impl<B: Copy> Default for PrefixTree<B> {
 
 impl<B: Copy> PrefixMatch<B> for PrefixTree<B> {
     fn deepest_start(&self, tokens: &[u32]) -> StartMatch<B> {
-        let mut best = StartMatch { at: 0, start: None, ids: Vec::new(), blocks: Vec::new() };
         let mut parent = None;
         let mut ids: Vec<SealedId> = Vec::new();
         let mut chain: Vec<B> = Vec::new();
+        let mut best_len = 0usize;
+        let mut best_start = None;
         let mut at = 0usize;
         while tokens.len() - at >= BLOCK {
             let Some(id) = self.child(parent, at, &tokens[at..at + BLOCK]) else { break };
@@ -383,10 +384,17 @@ impl<B: Copy> PrefixMatch<B> for PrefixTree<B> {
             at += BLOCK;
             parent = Some(id);
             if n.starts > 0 {
-                best = StartMatch { at, start: Some(id), ids: ids.clone(), blocks: chain.clone() };
+                best_len = ids.len();
+                best_start = Some(id);
             }
         }
-        best
+        if let Some(start) = best_start {
+            ids.truncate(best_len);
+            chain.truncate(best_len);
+            StartMatch { at: best_len * BLOCK, start: Some(start), ids, blocks: chain }
+        } else {
+            StartMatch { at: 0, start: None, ids: Vec::new(), blocks: Vec::new() }
+        }
     }
 }
 
@@ -1291,5 +1299,52 @@ mod tests {
         assert_eq!(m.blocks[0].window(), Some(win), "the Window entry rides on the same node");
         assert_eq!(m.blocks[0].window().unwrap().generation(), 2);
         assert_eq!(m.blocks[1].window(), None);
+    }
+
+    #[test]
+    fn deepest_start_materializes_path_once_without_intermediate_clones() {
+        let mut tree: PrefixTree<u32> = PrefixTree::new();
+        let depth = 384usize;
+        let mut tokens = Vec::with_capacity((depth + 2) * BLOCK);
+        let mut parent = None;
+        let mut expected_ids = Vec::with_capacity(depth);
+        let mut expected_handles = Vec::with_capacity(depth);
+        for b in 0..depth {
+            let blk = block((b + 1) as u32);
+            tokens.extend_from_slice(&blk);
+            let id = tree.insert(parent, b * BLOCK, &blk, b as u32).unwrap();
+            // Retain a start point at EVERY block so the old O(depth * starts) clone loop
+            // would have cloned `ids` and `chain` 384 times (~73,920 elements copied).
+            tree.retain_start(id).unwrap();
+            expected_ids.push(id);
+            expected_handles.push(b as u32);
+            parent = Some(id);
+        }
+        // Append two unretained blocks + a non-matching tail block: deepest_start must
+        // truncate cleanly back to `depth` without cloning at intermediate checkpoints.
+        for extra in 0..2usize {
+            let b = depth + extra;
+            let blk = block((b + 1) as u32);
+            tokens.extend_from_slice(&blk);
+            let id = tree.insert(parent, b * BLOCK, &blk, b as u32).unwrap();
+            parent = Some(id);
+        }
+        tokens.extend_from_slice(&block(999_999));
+
+        let m = tree.deepest_start(&tokens);
+        assert_eq!(m.at, depth * BLOCK);
+        assert_eq!(m.start, expected_ids.last().copied());
+        assert_eq!(m.ids, expected_ids);
+        assert_eq!(m.blocks, expected_handles);
+
+        // No retained starts along a matched chain -> empty Vecs with zero capacity retained.
+        let mut no_starts: PrefixTree<u32> = PrefixTree::new();
+        let a = no_starts.insert(None, 0, &block(7), 7).unwrap();
+        let _b = no_starts.insert(Some(a), BLOCK, &block(8), 8).unwrap();
+        let miss = no_starts.deepest_start(&[block(7), block(8)].concat());
+        assert_eq!(miss.at, 0);
+        assert_eq!(miss.start, None);
+        assert!(miss.ids.is_empty() && miss.ids.capacity() == 0);
+        assert!(miss.blocks.is_empty() && miss.blocks.capacity() == 0);
     }
 }
