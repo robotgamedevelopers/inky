@@ -27,6 +27,8 @@ jobs:
           java-version: '21'
       - name: TLA models, witnesses and production traces
         run: scripts/check-tla.sh
+      - name: soak qualification shell tests
+        run: tests/soak_qualification_test.sh
       - name: build
         run: cargo build --release
       - name: unit and integration tests (debug assertions)

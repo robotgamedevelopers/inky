@@ -198,7 +198,7 @@ func TestDriftDetection(t *testing.T) {
 
 func TestSoakVerdict(t *testing.T) {
 	if os.Getenv("SOAK_TEST_CHILD") == "1" {
-		os.Args = []string{"soak", "-url", os.Getenv("SOAK_TEST_URL"), "-duration", "1", "-clients", "1", "-lanes", "1", "-disconnect-pct", "0"}
+		os.Args = []string{"soak", "-url", os.Getenv("SOAK_TEST_URL"), "-duration", "1", "-clients", "1", "-lanes", "1", "-disconnect-pct", "0", "-max-tokens", "16,32,64"}
 		main()
 		return
 	}
@@ -242,6 +242,9 @@ func TestSoakVerdict(t *testing.T) {
 			if (err == nil) != tc.success {
 				t.Fatalf("err=%v output=%s", err, out)
 			}
+			if tc.success && !strings.Contains(string(out), "\nmax_tokens=16,32,64\n") {
+				t.Fatalf("receipt did not report configured token mix: %s", out)
+			}
 			if count.Load() < 2 {
 				t.Fatalf("missing workload/recovery requests")
 			}
@@ -249,19 +252,55 @@ func TestSoakVerdict(t *testing.T) {
 	}
 }
 
+func TestObservedDecodeMilestones(t *testing.T) {
+	event := func(delta string) string {
+		return fmt.Sprintf("data: {\"choices\":[{\"delta\":%s}]}\n\n", delta)
+	}
+	end := "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	role := event(`{"role":"assistant","content":""}`)
+	reason := event(`{"reasoning_content":"a"}`)
+	text := event(`{"content":"a"}`)
+	for _, tc := range []struct {
+		stage   disconnectStage
+		stream  string
+		reached bool
+	}{
+		{stageTTFT, role + end, false},
+		{stageTTFT, role + text, true},
+		{stageMidThinking, event(`{"content":"reasoning_content"}`) + end, false},
+		{stageMidThinking, reason, true},
+		{stageMidDecode, reason + text + end, false},
+		{stageMidDecode, reason + text + text, true},
+	} {
+		got, err := readStreamUntil(strings.NewReader(tc.stream), tc.stage)
+		if err != nil || got != tc.reached {
+			t.Errorf("stage %s got (%v, %v), want %v on %q", tc.stage, got, err, tc.reached, tc.stream)
+		}
+	}
+}
+
 func TestDisconnectStormVerdict(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		corruptAfter bool
-		leakHealth   bool
-		wantCode     int
+		name            string
+		corruptAfter    bool
+		leakHealth      bool
+		rejectWorkload  bool
+		rejectControls  bool
+		noThinking      bool
+		breakConnection bool
+		wantCode        int
 	}{
-		{"clean storm drains and matches reference", false, false, 0},
-		{"corrupted post-storm reply fails", true, false, 1},
-		{"leaked health after storm fails", false, true, 1},
+		{name: "clean storm drains and matches reference"},
+		{name: "corrupted post-storm reply fails", corruptAfter: true, wantCode: 1},
+		{name: "leaked health after storm fails", leakHealth: true, wantCode: 1},
+		{name: "all 429 workload fails despite healthy controls", rejectWorkload: true, wantCode: 1},
+		{name: "no completed storm control fails", rejectControls: true, wantCode: 1},
+		{name: "missing reasoning milestone fails", noThinking: true, wantCode: 1},
+		{name: "one transport failure fails despite reaching every phase", breakConnection: true, wantCode: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var reqCount atomic.Int64
+			var brokeConnection atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/health" {
 					w.Header().Set("Content-Type", "application/json")
@@ -284,14 +323,30 @@ func TestDisconnectStormVerdict(t *testing.T) {
 					fmt.Fprintf(w, `{"choices":[{"finish_reason":"stop","message":{"content":%q}}],"usage":{"prompt_tokens":12,"completion_tokens":3}}`, content)
 					return
 				}
+				// Workload seeds encode the storm index. Every tenth request is a completion control.
+				if req.MaxTokens != 8 && (tc.rejectWorkload || (tc.rejectControls && (req.Seed^42)%10 == 9)) {
+					w.WriteHeader(http.StatusTooManyRequests)
+					return
+				}
+				if tc.breakConnection && req.MaxTokens != 8 && brokeConnection.CompareAndSwap(false, true) {
+					c, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					c.Close()
+					return
+				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				flusher, _ := w.(http.Flusher)
-				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think...\"},\"finish_reason\":null}]}\n\n")
+				if !tc.noThinking {
+					fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think...\"},\"finish_reason\":null}]}\n\n")
+				}
 				if flusher != nil {
 					flusher.Flush()
 				}
 				time.Sleep(5 * time.Millisecond)
-				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -370,5 +425,66 @@ func TestFaultCheckAndReferenceCheck(t *testing.T) {
 	replyValue.Store(999)
 	if got := runReferenceCheck(newSoakHTTPClient(), refCfg); got != 1 {
 		t.Fatalf("mismatched post-restart reference check should fail, got %d", got)
+	}
+}
+
+func TestSoakProbeVerdict(t *testing.T) {
+	validDir := t.TempDir()
+	missingDir := filepath.Join(validDir, "missing")
+	const absent = -1
+	for _, tc := range []struct {
+		name                       string
+		pid                        int
+		rss                        int64
+		rssErr                     error
+		recordDir, spillDir        string
+		initialSpills, finalSpills int
+		epochs, warmup             int
+		want                       int
+	}{
+		{name: "RSS sampler error", pid: 42, rss: 100, rssErr: os.ErrPermission, epochs: 2, want: 1},
+		{name: "zero RSS sample", pid: 42, epochs: 2, want: 1},
+		{name: "RSS has only warmup", pid: 42, rss: 100, epochs: 2, warmup: 2, want: 1},
+		{name: "RSS has one steady sample", pid: 42, rss: 100, epochs: 2, warmup: 1, want: 1},
+		{name: "RSS has two steady samples", pid: 42, rss: 100, epochs: 3, warmup: 1},
+		{name: "record directory missing", recordDir: missingDir, epochs: 2, want: 1},
+		{name: "spill directory missing", spillDir: missingDir, finalSpills: 1, epochs: 3, want: 1},
+		{name: "initial spill counter missing", spillDir: validDir, initialSpills: absent, finalSpills: 1, epochs: 3, want: 1},
+		{name: "final spill counter missing", spillDir: validDir, finalSpills: absent, epochs: 3, want: 1},
+		{name: "old spill activity", spillDir: validDir, initialSpills: 7, finalSpills: 7, epochs: 3, want: 1},
+		{name: "spills during soak", spillDir: validDir, initialSpills: 7, finalSpills: 8, epochs: 3},
+		{name: "too few steady spill samples", spillDir: validDir, finalSpills: 1, epochs: 3, warmup: 1, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var workloadStarted atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					counter := tc.initialSpills
+					if workloadStarted.Load() {
+						counter = tc.finalSpills
+					}
+					h := map[string]any{"ok": true, "active_lanes": 0, "inflight": 0}
+					if counter != absent {
+						h["starts_spilled"] = counter
+					}
+					json.NewEncoder(w).Encode(h)
+					return
+				}
+				workloadStarted.Store(true)
+				fmt.Fprint(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer server.Close()
+			// Force exactly the requested epochs even when the race detector slows HTTP.
+			cfg := clientConfig{
+				chatURL: server.URL + "/v1/chat/completions", clients: 1, lanes: 1,
+				duration: 10 * time.Millisecond, epoch: 10 * time.Millisecond,
+				minEpochs: tc.epochs, warmupEpochs: tc.warmup,
+				serverPID: tc.pid, recordDir: tc.recordDir, spillDir: tc.spillDir,
+			}
+			code := runSoak(server.Client(), cfg, func(int) (int64, error) { return tc.rss, tc.rssErr })
+			if code != tc.want {
+				t.Fatalf("soak exited %d, want %d", code, tc.want)
+			}
+		})
 	}
 }

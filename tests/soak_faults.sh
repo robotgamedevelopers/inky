@@ -10,6 +10,7 @@ set -eu
 setopt pipefail
 
 cd "${0:A:h}/.."
+source tests/soak_qualification.zsh
 
 inky=
 model=
@@ -276,16 +277,10 @@ start_serve "$crash_rec" 1048576 "$log4a" "$memd_sock"
     -disconnect-pct 0 >"$work/crash-load.out" 2>&1 &
 bg_pid=$!
 
-for i in {1..100}; do
-    h=$(curl -sf -m 1 "http://$bind/health" || true)
-    if [[ $h == *'"active_lanes":'[1-9]* ]]; then
-        break
-    fi
-    sleep 0.05
-done
-sleep 0.2
-kill -KILL "$serve_pid"
-wait "$serve_pid" 2>/dev/null || true
+crash_active_server "$serve_pid" "http://$bind/health" 100
+crash_status=0
+wait "$serve_pid" 2>/dev/null || crash_status=$?
+(( crash_status == 137 )) || { print -r -- "FAIL: expected SIGKILL, server exited $crash_status"; exit 1 }
 serve_pid=0
 stop_pid "$bg_pid" KILL
 bg_pid=0
