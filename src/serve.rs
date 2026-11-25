@@ -24,11 +24,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod block_cache;
+#[cfg(test)]
+mod scheduler_trace;
+mod step;
 mod timing;
 use block_cache::{
     effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
     ServeBlockCache,
 };
+use step::SERVE_STEP_MAX_BYPASS;
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAddr>, pub lanes: usize, pub effort: String, pub max_tokens: usize,
@@ -880,8 +884,6 @@ fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCa
     cache.shutdown(&mut pools);
 }
 
-const SERVE_STEP_MAX_BYPASS: u32 = 16;
-
 /// Partition `ensure_span_blocks` failures into `(to_defer, to_fail)`.
 /// When any lane in the current step succeeded (`live_any`) or another runnable lane outside the
 /// step can still make progress and free blocks (`other_runnable_exists`), all exhausted lanes
@@ -1127,7 +1129,7 @@ fn scheduler(
         for input in &mut step_inputs {
             input.pf_end = input.pf_end.min(window_span_end(input.n_past, window_slots));
         }
-        let step_plan = planner.plan_and_begin_step(&step_inputs, eng.chunk, 64);
+        let step_plan = step::plan(&mut planner, &step_inputs, eng.chunk, crate::blocks::BLOCK);
         match step_plan {
             Some(crate::scheduler::ServeStepPlan::Prefill(sp_list)) => {
                 let mut live_sp: Vec<(usize, usize, usize)> = Vec::with_capacity(sp_list.len());
@@ -4556,7 +4558,9 @@ mod tests {
             (turn2, turn3, t1_out, t2_out, t3_out)
         });
 
-        scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None);
+        scheduler_trace::capture_if_requested(|| {
+            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None)
+        });
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
 
         // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!

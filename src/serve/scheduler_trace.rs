@@ -1,198 +1,175 @@
-//! Test driver for the real scheduler. The workload advances only at tick boundaries;
-//! receiver drops exercise the same output-channel failure as a disconnected client.
-use super::*;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! Test-only observation of the step selected by the serving scheduler, including its
+//! runnable inputs and the ages either side of the call. The standalone TLC gate compiles
+//! this module and the same production planning entry point on hosts without Metal.
+use crate::scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+use std::cell::RefCell;
+use std::io::{BufWriter, Write};
 
-const LANES: usize = 2;
-const QUEUE: usize = 1;
-const CHUNK: usize = 2;
-const CONTEXT: usize = 32;
-const REQUESTS: u64 = 32;
-
-/// The scheduler still samples, updates positions, and decides when each lane is done.
-/// Only the GPU work is substituted. Token 1 always wins; the two stop tokens are 2, 3.
-struct FakeEngine;
-impl backend::SchedulerEngine for FakeEngine {
-    type Lane = ();
-    fn new_lane(&self) -> Self::Lane {}
-    fn max_ctx(&self) -> usize { CONTEXT }
-    fn chunk(&self) -> usize { CHUNK }
-    fn softcap(&self) -> f32 { 0.0 }
-    fn tier_on(&self, _: &()) -> bool { false }
-    fn prepare(&self, _: &[LaneS<()>], _: Admission, _: &Job) {}
-    fn prefill(&self, _: &[LaneS<()>], _: &[(usize, usize, usize)]) -> Duration { Duration::ZERO }
-    fn decode(&self, _: &[LaneS<()>], _: &[usize]) -> Duration { Duration::ZERO }
-    fn save_state(&self, _: &()) -> Vec<u8> { vec![] }
-    fn result_logits(&self, _: Option<usize>) -> &[f32] { &[0.0, 1.0] }
+thread_local! {
+    static FRAMES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
-struct Workload<'a> {
-    random: u64,
-    tick: usize,
-    submitted: u64,
-    outstanding: usize,
-    jobs: Option<Sender<Job>>,
-    clients: BTreeMap<u64, (Receiver<Ev>, InFlight<'a>)>,
-    inflight: &'a AtomicUsize,
-    metrics: &'a Mutex<Counters>,
-    events: Vec<Value>,
+pub(super) fn snapshot(planner: &ServeStepPlanner, lanes: usize) -> Option<Vec<u32>> {
+    FRAMES.with_borrow(|frames| {
+        frames
+            .as_ref()
+            .map(|_| (0..lanes).map(|i| planner.wait_ticks(i)).collect())
+    })
 }
 
-impl Workload<'_> {
-    fn pick(&mut self, choices: usize) -> usize {
-        self.random = self.random.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (self.random >> 32) as usize % choices
-    }
-
-    fn arrive(&mut self) {
-        self.submitted += 1;
-        let job = self.submitted;
-        let prompt = 1 + self.pick(7);
-        let max = 2 + self.pick(4);
-        self.events.push(json!({"event":"arrive","job":job,"prompt":prompt,"max":max}));
-        let Some(slot) = try_slot(self.inflight, LANES + QUEUE) else {
-            self.events.push(json!({"event":"refuse429","job":job}));
-            return;
-        };
-        let (out, rx) = channel();
-        self.clients.insert(job, (rx, slot));
-        self.outstanding += 1;
-        self.metrics.lock().unwrap().queued += 1;
-        // A unique leading token keeps this bounded scheduling workload cold.
-        self.jobs.as_ref().unwrap().send(Job {
-            seq: job, queued_at: Instant::now(), toks: vec![job as u32; prompt],
-            max, temp: 0.0, top_p: 1.0, seed: self.random, out,
-        }).unwrap();
-    }
-}
-
-impl Trace for Workload<'_> {
-    fn boundary(&mut self) {
-        self.tick += 1;
-        assert!(self.tick < 512, "scheduler did not drain the seeded workload");
-        self.clients.retain(|_, (rx, _)| !rx.try_iter().any(|ev| matches!(ev, Ev::Done { .. })));
-        if self.submitted == REQUESTS && self.outstanding == 0 {
-            self.jobs.take();
-            return;
-        }
-        if !self.clients.is_empty() && (self.tick == 2 || self.pick(8) == 0) {
-            let index = self.pick(self.clients.len());
-            let job = *self.clients.keys().nth(index).unwrap();
-            self.clients.remove(&job);
-            self.events.push(json!({"event":"disconnect","job":job}));
-        }
-        let arrivals = if self.tick == 1 { LANES + QUEUE + 1 } else if self.outstanding == 0 {
-            // An idle scheduler blocks until a real request arrives.
-            1
-        } else {
-            self.pick(3)
-        };
-        for _ in 0..arrivals.min((REQUESTS - self.submitted) as usize) { self.arrive(); }
-    }
-
-    fn admit(&mut self, job: u64, lane: usize, cached: usize) {
-        self.events.push(json!({"event":"admit","job":job,"lane":lane,"cached":cached}));
-    }
-    fn step(&mut self, mode: &str, spans: impl Iterator<Item = (u64,usize,usize,usize)>) {
-        let spans: Vec<_> = spans.map(|(job,lane,pos,tokens)| json!({
-            "job":job, "lane":lane, "pos":pos, "tokens":tokens,
-        })).collect();
-        self.events.push(json!({"event":"build_step","mode":mode,"spans":spans}));
-    }
-    fn step_finished(&mut self) { self.events.push(json!({"event":"finish_step"})); }
-    fn terminal(&mut self, job: u64, lane: usize, reason: &str, generated: usize) {
-        self.outstanding -= 1;
-        if reason == "cancelled" {
-            self.events.push(json!({"event":"cancel","job":job,"lane":lane,"generated":generated}));
-        } else {
-            self.events.push(json!({"event":"finish","job":job,"lane":lane,"reason":reason,"generated":generated}));
-        }
-    }
-}
-
-fn walk(seed: u64) -> Vec<Value> {
-    let inflight = AtomicUsize::new(0);
-    let metrics = Mutex::new(Counters::new(Instant::now()));
-    let (sender, receiver) = channel();
-    let mut workload = Workload {
-        random:seed, tick:0, submitted:0, outstanding:0, jobs:Some(sender),
-        clients:BTreeMap::new(), inflight:&inflight, metrics:&metrics,
-        events:vec![json!({"event":"config","version":1,"seed":seed,"lanes":LANES,"queue":QUEUE,"chunk":CHUNK,"context":CONTEXT})],
+pub(super) fn record(
+    planner: &ServeStepPlanner,
+    inputs: &[ServeLaneInput],
+    budget: usize,
+    align: usize,
+    before: &[u32],
+    plan: Option<&ServeStepPlan>,
+) {
+    let lanes = inputs.len();
+    let mut spans = vec![0; lanes];
+    let mut starts = vec![0; lanes];
+    let mut select = |i: usize, p0: usize, len: usize| {
+        assert!(
+            len > 0 && spans[i] == 0,
+            "invalid or duplicate span in the step"
+        );
+        spans[i] = len;
+        starts[i] = p0;
     };
-    run_scheduler(&FakeEngine, [2, 3], LANES, receiver, &metrics, &mut workload);
-    assert_eq!(inflight.load(Ordering::SeqCst), 0);
-    assert_eq!(metrics.lock().unwrap().queued, 0);
-    workload.events
+    let mode = match plan {
+        None => "idle",
+        Some(ServeStepPlan::Decode(chosen)) => {
+            for &i in chosen {
+                select(i, inputs[i].n_past, 1);
+            }
+            "decode"
+        }
+        Some(ServeStepPlan::Prefill(chosen)) => {
+            for &(i, p0, len) in chosen {
+                select(i, p0, len);
+            }
+            "prefill"
+        }
+    };
+    let runnable: Vec<_> = inputs.iter().map(|i| i.runnable).collect();
+    let pending: Vec<_> = inputs.iter().map(|i| i.has_pending_decode).collect();
+    let pos: Vec<_> = inputs.iter().map(|i| i.n_past).collect();
+    let end: Vec<_> = inputs.iter().map(|i| i.pf_end).collect();
+    let after: Vec<_> = (0..lanes).map(|i| planner.wait_ticks(i)).collect();
+    // All interpolated arrays contain integers or booleans. Keep this gate usable with rustc alone.
+    let frame = format!(
+        r#"{{"version":2,"runnable":{runnable:?},"pending":{pending:?},"pos":{pos:?},"endPos":{end:?},"before":{before:?},"after":{after:?},"starts":{starts:?},"spans":{spans:?},"mode":"{mode}","budget":{budget},"align":{align},"ceiling":{}}}"#,
+        planner.max_bypass(),
+    );
+    FRAMES.with_borrow_mut(|frames| frames.as_mut().unwrap().push(frame));
 }
 
-#[test]
-fn seeded_decisions_are_repeatable_and_drain() {
-    use std::collections::{BTreeSet, HashMap};
-    for seed in (0..32).chain([u64::MAX]) {
-        let trace = walk(seed);
-        assert_eq!(trace, walk(seed));
-        let mut pending = BTreeSet::new();
-        let mut lanes = [None; LANES];
-        let mut phases = BTreeSet::new();
-        let mut cases = HashMap::new();
-        let mut executing = false;
-        for ev in &trace[1..] {
-            let kind = ev["event"].as_str().unwrap();
-            *cases.entry(kind).or_insert(0) += 1;
-            match kind {
-                "arrive" => assert!(pending.insert(ev["job"].as_u64().unwrap())),
-                "refuse429" => assert!(pending.remove(&ev["job"].as_u64().unwrap())),
-                "admit" => {
-                    let job = ev["job"].as_u64().unwrap();
-                    assert!(pending.remove(&job));
-                    let lane = ev["lane"].as_u64().unwrap() as usize;
-                    assert!(lanes[lane].replace((job, ev["cached"].as_u64().unwrap())).is_none());
-                }
-                "build_step" => {
-                    assert!(!executing);
-                    executing = true;
-                    let phase = ev["mode"].as_str().unwrap();
-                    phases.insert(phase);
-                    let mut chosen = BTreeSet::new();
-                    let mut total = 0;
-                    for span in ev["spans"].as_array().unwrap() {
-                        let lane = span["lane"].as_u64().unwrap() as usize;
-                        assert!(chosen.insert(lane));
-                        let (job, pos) = lanes[lane].as_mut().unwrap();
-                        assert_eq!((*job, *pos), (span["job"].as_u64().unwrap(), span["pos"].as_u64().unwrap()));
-                        let n = span["tokens"].as_u64().unwrap();
-                        assert!(n > 0);
-                        if phase == "decode" { assert_eq!(n, 1); }
-                        *pos += n;
-                        total += n;
-                    }
-                    assert!(!chosen.is_empty());
-                    if phase == "prefill" { assert!(total <= CHUNK as u64); }
-                }
-                "finish_step" => { assert!(executing); executing = false; }
-                "finish" | "cancel" => {
-                    assert!(!executing);
-                    let lane = ev["lane"].as_u64().unwrap() as usize;
-                    assert_eq!(lanes[lane].take().unwrap().0, ev["job"].as_u64().unwrap());
-                }
-                "disconnect" => {}
-                other => panic!("unexpected trace event {other}"),
+fn capture(work: impl FnOnce()) -> Vec<String> {
+    FRAMES.with_borrow_mut(|frames| assert!(frames.replace(Vec::new()).is_none()));
+    work();
+    let frames = FRAMES.with_borrow_mut(Option::take).unwrap();
+    assert!(
+        !frames.is_empty(),
+        "workload did not reach the serving planner"
+    );
+    frames
+}
+
+fn write_trace(frames: &[String]) {
+    let path = std::env::var_os("INKY_SCHED_TRACE_OUT").expect("set INKY_SCHED_TRACE_OUT");
+    let mut out = BufWriter::new(std::fs::File::create(path).unwrap());
+    for frame in frames {
+        writeln!(out, "{frame}").unwrap();
+    }
+    out.flush().unwrap();
+}
+
+/// Capture the real GPU-backed scheduler only when the hardware test requests a trace.
+pub(super) fn capture_if_requested(work: impl FnOnce()) {
+    if std::env::var_os("INKY_SCHED_TRACE_OUT").is_some() {
+        write_trace(&capture(work));
+    } else {
+        work();
+    }
+}
+
+fn walk(mut seed: u64) -> Vec<String> {
+    use super::step::{plan, SERVE_STEP_MAX_BYPASS};
+    const LANES: usize = 4;
+    const ALIGN: usize = 64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 32) as usize
+    };
+    capture(|| {
+        let mut planner = ServeStepPlanner::new(LANES, SERVE_STEP_MAX_BYPASS);
+        let mut inputs = [ServeLaneInput {
+            runnable: true,
+            n_past: 0,
+            pf_end: 0,
+            has_pending_decode: true,
+        }; LANES];
+        for (i, input) in inputs.iter_mut().enumerate() {
+            planner.on_admit(i);
+            if i >= 2 {
+                input.pf_end = 512 + next() % 256;
             }
         }
-        assert!(pending.is_empty() && lanes.iter().all(Option::is_none) && !executing);
-        assert_eq!(phases, BTreeSet::from(["decode", "prefill"]));
-        assert_eq!(cases["arrive"], REQUESTS);
-        for kind in ["finish", "cancel", "refuse429"] { assert!(cases[kind] > 0); }
+        for tick in 0..64 {
+            // A full W=16 burst followed by two urgent prefillers, then variable
+            // backpressure and token budgets. Restart some lanes as new prompts.
+            let random = tick > SERVE_STEP_MAX_BYPASS;
+            for (i, lane) in inputs.iter_mut().enumerate() {
+                lane.runnable = tick != 63 && (!random || next() % 4 != 0);
+                if random && lane.n_past >= lane.pf_end && next() % 5 == 0 {
+                    planner.on_finish(i);
+                    planner.on_admit(i);
+                    lane.n_past = next() % ALIGN;
+                    lane.pf_end = lane.n_past + 1 + next() % 256;
+                }
+                lane.has_pending_decode =
+                    lane.n_past >= lane.pf_end && (!random || next() % 4 != 0);
+            }
+            let budget = if random { next() % 160 } else { 128 };
+            match plan(&mut planner, &inputs, budget, ALIGN) {
+                Some(ServeStepPlan::Decode(chosen)) => {
+                    for i in chosen {
+                        inputs[i].n_past += 1;
+                    }
+                }
+                Some(ServeStepPlan::Prefill(spans)) => {
+                    for (i, _, len) in spans {
+                        inputs[i].n_past += len;
+                    }
+                }
+                None => {}
+            }
+            planner.complete_step();
+        }
+    })
+}
+
+#[test]
+fn seeded_decisions_are_repeatable() {
+    for seed in (0..32).chain([u64::MAX]) {
+        let frames = walk(seed);
+        assert_eq!(frames.len(), 64);
+        let burst = super::step::SERVE_STEP_MAX_BYPASS as usize;
+        assert!(frames[..burst]
+            .iter()
+            .all(|f| f.contains(r#""mode":"decode""#)));
+        assert!(frames[burst].contains(r#""mode":"prefill""#));
+        assert!(frames.last().unwrap().contains(r#""mode":"idle""#));
+        assert_eq!(frames, walk(seed));
     }
 }
 
 #[test]
-#[ignore = "writes versioned scheduler JSONL to INKY_SCHED_TRACE_OUT"]
+#[ignore = "writes serve planner observations to INKY_SCHED_TRACE_OUT"]
 fn dump() {
-    let path = std::env::var_os("INKY_SCHED_TRACE_OUT").expect("set INKY_SCHED_TRACE_OUT");
-    let seed = std::env::var("INKY_SCHED_TRACE_SEED").map(|s| s.parse().expect("seed must be a u64")).unwrap_or(1);
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
-    for event in walk(seed) { writeln!(out, "{event}").unwrap(); }
-    out.flush().unwrap();
+    let out = match std::env::var("INKY_SCHED_TRACE_SEED") {
+        Ok(seed) => walk(seed.parse().expect("seed must be a u64")),
+        Err(_) => (0..32).chain([u64::MAX]).flat_map(walk).collect(),
+    };
+    write_trace(&out);
 }

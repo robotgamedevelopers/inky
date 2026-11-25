@@ -10,6 +10,15 @@ B=./target/release/inky
 fail=0
 INK_POOLGATE_LANES=17 INK_POOLGATE_CHUNKS=31,1,23,7,17,1,29,64,127,61,1,256 INK_POOLGATE_DECODE=64 \
     $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
+# A fresh path makes a skipped test or a disconnected trace hook fail the replay.
+trace_work=$(mktemp -d "${TMPDIR:-/tmp}/inky-nightly-serve.XXXXXX")
+trap 'rm -rf "$trace_work"' EXIT
+if ! INKY_SCHED_TRACE_OUT="$trace_work/serve.jsonl" cargo test --locked --release \
+        serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo -- --ignored --exact ||
+   ! scripts/check-tla.sh --serve-trace "$trace_work/serve.jsonl"; then
+    echo "FAIL: three-turn serve trace"
+    fail=1
+fi
 # Verify a real SSD restore and early prefix fork against both sets of cold model logits.
 spill_test=serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits
 if spill_result=$(cargo test --locked --release --bin inky "$spill_test" -- --ignored --exact --nocapture 2>&1); then
