@@ -12,9 +12,9 @@ REPOSITORY = "robotgamedevelopers/inky"
 SHA = r"[0-9a-f]{40}"
 
 
-def api(path, *args):
+def api(path):
     return json.loads(subprocess.check_output(
-        ["gh", "api", f"repos/{REPOSITORY}/{path}", *args], text=True,
+        ["gh", "api", f"repos/{REPOSITORY}/{path}"], text=True,
     ))
 
 
@@ -31,8 +31,8 @@ def resolve_candidate(event, request=api):
         raise ValueError("the command must be on a pull request")
 
     permission = request(f"collaborators/{quote(reviewer, safe='')}/permission")
-    if permission["permission"] not in {"admin", "maintain", "write"}:
-        raise ValueError("the reviewer must have repository write access")
+    if permission["permission"] != "admin":
+        raise ValueError("the approval command requires repository administrator access")
 
     pull_path = f"pulls/{number}"
     pull = request(pull_path)
@@ -40,28 +40,23 @@ def resolve_candidate(event, request=api):
         "open", False, REPOSITORY, "main",
     ):
         raise ValueError("the pull request must be open, ready for review and targeting Inky main")
-    if pull["user"]["login"].casefold() == reviewer.casefold():
-        raise ValueError("the pull request author cannot authorize their own run")
     if pull["head"]["sha"] != approved_head:
         raise ValueError("the approved SHA must match the current pull request head")
-
-    latest_review = None
-    for page in request(f"{pull_path}/reviews?per_page=100", "--paginate", "--slurp"):
-        for review in page:
-            if (review["user"]["login"].casefold() == reviewer.casefold() and
-                review["state"] in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}):
-                latest_review = review
-    if (latest_review is None or latest_review["state"] != "APPROVED" or
-        latest_review["commit_id"] != approved_head):
-        raise ValueError("submit a fresh approving review on the specified head before testing")
 
     candidate = pull["merge_commit_sha"]
     if pull["mergeable"] is not True or not candidate or not re.fullmatch(SHA, candidate):
         raise ValueError("GitHub has no merge candidate yet, retry after it computes mergeability")
     base = request("git/ref/heads/main")["object"]["sha"]
-    parents = [parent["sha"] for parent in request(f"git/commits/{candidate}")["parents"]]
+    relation = request(f"compare/{base}...{approved_head}?per_page=1")
+    if relation["behind_by"] != 0 or relation["merge_base_commit"]["sha"] != base:
+        raise ValueError("update the pull request head to include current main before reviewing")
+    merge = request(f"git/commits/{candidate}")
+    parents = [parent["sha"] for parent in merge["parents"]]
     if parents != [base, approved_head]:
         raise ValueError("the merge candidate does not combine current main and the approved head")
+    head = request(f"git/commits/{approved_head}")
+    if merge["tree"]["sha"] != head["tree"]["sha"]:
+        raise ValueError("the reviewed head and merge candidate have different trees")
     # Fail closed if a fresh read sees the PR change while the candidate was being resolved.
     current = request(pull_path)
     if (current["state"], current["draft"], current["base"]["ref"],
@@ -69,14 +64,14 @@ def resolve_candidate(event, request=api):
         "open", False, "main", approved_head, candidate,
     ):
         raise ValueError("the pull request changed while resolving the merge candidate")
-    return candidate
+    return approved_head, candidate
 
 
 def main():
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
-        candidate = resolve_candidate(json.load(event_file))
+        head, candidate = resolve_candidate(json.load(event_file))
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-        print(f"candidate={candidate}", file=output)
+        print(f"head={head}\ncandidate={candidate}", file=output)
 
 
 if __name__ == "__main__":

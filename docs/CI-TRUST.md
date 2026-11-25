@@ -1,13 +1,18 @@
 # Inky CI trust and main protection
 
 GitHub-hosted `unit`, `go`, and the four `tla` checks run on ordinary pull
-requests and main pushes. On a ready pull request to main, a maintainer with
-write access other than the author submits an approving review and comments
-`/test-m5 <full PR head SHA>`. The main workflow checks the review, confirms
-the exact GitHub merge candidate combines the reviewed head and current main,
-and tests that immutable candidate on the M5 pair. If the head or base changes,
-review and request the current candidate again. For retries, submit a fresh
-comment for the same reviewed revision.
+requests and main pushes. A repository administrator reviews the exact
+revision of an up-to-date PR to main and comments `/test-m5 <full PR head SHA>`.
+This comment is the approval and works when the PR was opened under the
+administrator's own GitHub identity. Post it from the administrator account
+after reviewing and use a fresh comment for a retry.
+
+The main workflow checks the administrator's current permission and confirms
+the requested SHA is still the PR head. It builds GitHub's immutable merge
+candidate only if it includes current main and has the same Git tree as the
+approved head. The hosted check runs and the M5 receipt are both attached to
+the PR head. If advancing main renders the branch out of date, update the
+branch and review its new head before posting another approval.
 
 The two M5 jobs also run on main pushes. Scheduled or manually dispatched
 nightlies use the M5 runner group from main only. Manual dispatch on main is
@@ -47,15 +52,15 @@ actual main-push CI and its individual jobs.
    Disable and unregister all Inky repository-scoped runners, including
    offline registrations. Leave unrelated projects' listeners alone.
    Confirm other organization groups available to Inky contain no
-   general-purpose self-hosted runners. Protect main with the final rules
-   below minus `m5-reviewed`, then merge the reviewed workflow PR through
-   that transitional rule. Confirm the resulting main-push `m5-gpu` and
+   general-purpose self-hosted runners. Protect main with the temporary
+   contexts described in [Main ruleset](MAIN-RULESET.md), then merge this
+   workflow through that rule. Confirm the resulting main-push `m5-gpu` and
    `m5-serve` jobs use the new group and complete successfully.
 
-5. From a benign PR, run hosted CI and ask a second maintainer to approve and
-   comment the exact PR head SHA. Verify both M5 jobs checked out GitHub's
+5. From a benign, up-to-date PR, run hosted CI and have a repository
+   administrator review and comment its exact head SHA. Verify both M5 jobs checked out GitHub's
    same test merge commit, passed on the dedicated account, and that
-   `m5-reviewed` on that commit was published by the dedicated App. Confirm
+   `m5-reviewed` on the PR head was published by the dedicated App. Confirm
    ordinary PR events and non-main dispatches do not get M5 runners, and
    approval for an earlier head produces no candidate. Then add
    `m5-reviewed` to the required checks and verify merging is blocked
@@ -67,28 +72,4 @@ A failed cutover leaves the unsafe registrations disabled. Restore CI by
 repairing the restricted group or attestations and rerunning the same
 verification before enabling the final check.
 
-## Final ruleset
-
-In repository **Settings → Rules → Rulesets**, create an active branch ruleset
-targeting only `refs/heads/main`. Use an empty bypass list. Restrict deletion
-and non-fast-forward updates. Require a pull request, one approving review,
-dismiss stale approvals, and require approval from someone other than the
-last person to push. Require status checks and require the branch to be
-up to date before merging. Select these exact contexts and source apps.
-[Available ruleset rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
-
-| Context | Expected source |
-| --- | --- |
-| `unit` | GitHub Actions |
-| `go` | GitHub Actions |
-| `tla (memmode)` | GitHub Actions |
-| `tla (blocks)` | GitHub Actions |
-| `tla (grouped)` | GitHub Actions |
-| `tla (traces)` | GitHub Actions |
-| `m5-reviewed` | Dedicated Inky M5 App |
-
-The `m5-reviewed` check succeeds only when both M5 jobs succeed for its
-merge commit. The review also covers changes to the hosted test definitions.
-The native `m5-gpu` and `m5-serve` jobs are main-push release checks. The
-hosted PR workflow skips those jobs, and GitHub treats a skipped native job
-as passing for branch protection.
+See [Main ruleset](MAIN-RULESET.md) for the required checks and verification.

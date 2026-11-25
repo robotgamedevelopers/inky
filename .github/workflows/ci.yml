@@ -119,6 +119,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      head: ${{ steps.approval.outputs.head }}
       candidate: ${{ steps.approval.outputs.candidate }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -215,9 +216,10 @@ jobs:
           app-id: ${{ vars.INKY_M5_APP_ID }}
           private-key: ${{ secrets.INKY_M5_APP_PRIVATE_KEY }}
           permission-checks: write
-      - name: report the reviewed M5 result on the merge candidate
+      - name: report the reviewed M5 result on the pull request head
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          HEAD_SHA: ${{ needs.m5-approval.outputs.head }}
           CANDIDATE: ${{ needs.m5-approval.outputs.candidate }}
           M5_GPU: ${{ needs.m5-gpu.result }}
           M5_SERVE: ${{ needs.m5-serve.result }}
@@ -229,7 +231,9 @@ jobs:
             conclusion=success
           fi
           gh api "repos/$GITHUB_REPOSITORY/check-runs" \
-            -f name=m5-reviewed -f head_sha="$CANDIDATE" -f status=completed \
+            -f name=m5-reviewed -f head_sha="$HEAD_SHA" -f status=completed \
+            -f "output[title]=M5 GPU and serving gates" \
+            -f "output[summary]=Tested merge candidate $CANDIDATE, with the same tree as the reviewed head." \
             -f conclusion="$conclusion" \
             -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --silent

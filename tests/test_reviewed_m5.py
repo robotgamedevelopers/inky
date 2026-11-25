@@ -8,69 +8,70 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from reviewed_m5 import REPOSITORY, resolve_candidate
 
 
-HEAD, BASE, MERGE = "a" * 40, "b" * 40, "c" * 40
+HEAD, BASE, MERGE, TREE = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 
 
 class ReviewedM5Tests(unittest.TestCase):
     def setUp(self):
         self.event = {
             "comment": {"body": f"/test-m5 {HEAD}", "user": {"login": "reviewer", "type": "User"}},
-            "issue": {"number": 41, "pull_request": {}},
+            "issue": {"number": 41, "pull_request": {"url": "https://api.github.com/pulls/41"}},
         }
-        self.event["issue"]["pull_request"]["url"] = "https://api.github.com/pulls/41"
         self.pull = {
             "state": "open", "draft": False, "base": {"repo": {"full_name": REPOSITORY}, "ref": "main"},
             "head": {"sha": HEAD}, "user": {"login": "author"},
             "merge_commit_sha": MERGE, "mergeable": True,
         }
-        self.approval = {"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": HEAD}
         self.path = "pulls/41"
         self.responses = {
-            "collaborators/reviewer/permission": {"permission": "write"},
+            "collaborators/reviewer/permission": {"permission": "admin"},
             self.path: self.pull,
-            f"{self.path}/reviews?per_page=100": [[self.approval]],
             "git/ref/heads/main": {"object": {"sha": BASE}},
-            f"git/commits/{MERGE}": {"parents": [{"sha": BASE}, {"sha": HEAD}]},
+            f"compare/{BASE}...{HEAD}?per_page=1": {"behind_by": 0, "merge_base_commit": {"sha": BASE}},
+            f"git/commits/{MERGE}": {"parents": [{"sha": BASE}, {"sha": HEAD}], "tree": {"sha": TREE}},
+            f"git/commits/{HEAD}": {"tree": {"sha": TREE}},
         }
 
-    def request(self, path, *args):
-        if path.endswith("/reviews?per_page=100"):
-            self.assertEqual(args, ("--paginate", "--slurp"))
+    def request(self, path):
         return copy.deepcopy(self.responses[path])
 
     def resolve(self):
         return resolve_candidate(self.event, self.request)
 
     def test_approved_exact_merge_candidate(self):
-        self.assertEqual(self.resolve(), MERGE)
+        self.assertEqual(self.resolve(), (HEAD, MERGE))
 
     def test_changed_head_or_base_refused(self):
         self.pull["head"]["sha"] = "d" * 40
         with self.assertRaisesRegex(ValueError, "current pull request head"):
             self.resolve()
         self.pull["head"]["sha"] = HEAD
-        self.responses["git/ref/heads/main"]["object"]["sha"] = "e" * 40
+        self.responses[f"git/commits/{MERGE}"]["parents"][0]["sha"] = "e" * 40
         with self.assertRaisesRegex(ValueError, "current main"):
             self.resolve()
 
-    def test_missing_foreign_or_stale_approval_refused(self):
-        key = f"{self.path}/reviews?per_page=100"
-        for pages in ([], [[dict(self.approval, commit_id="e" * 40)]],
-                      [[dict(self.approval, user={"login": "other"})]],
-                      [[self.approval], [dict(self.approval, state="CHANGES_REQUESTED")]],
-                      [[dict(self.approval, state="DISMISSED")]]):
-            with self.subTest(reviews=pages), self.assertRaisesRegex(ValueError, "fresh approving review"):
-                self.responses[key] = pages
-                self.resolve()
-
-    def test_read_only_reviewer_and_self_approval_refused(self):
-        permission = self.responses["collaborators/reviewer/permission"]
-        permission["permission"] = "read"
-        with self.assertRaisesRegex(ValueError, "write access"):
+    def test_stale_branch_and_mismatched_tree_refused(self):
+        relation = self.responses[f"compare/{BASE}...{HEAD}?per_page=1"]
+        relation["behind_by"] = 1
+        with self.assertRaisesRegex(ValueError, "include current main"):
             self.resolve()
-        permission["permission"] = "write"
+        relation["behind_by"] = 0
+        self.responses[f"git/commits/{HEAD}"]["tree"]["sha"] = "e" * 40
+        with self.assertRaisesRegex(ValueError, "different trees"):
+            self.resolve()
+
+    def test_same_account_admin_allowed_non_admin_and_bot_refused(self):
         self.pull["user"]["login"] = "Reviewer"
-        with self.assertRaisesRegex(ValueError, "author cannot"):
+        self.assertEqual(self.resolve(), (HEAD, MERGE))
+        permission = self.responses["collaborators/reviewer/permission"]
+        for role in ("read", "write", "maintain", "none"):
+            with self.subTest(role=role):
+                permission["permission"] = role
+                with self.assertRaisesRegex(ValueError, "administrator access"):
+                    self.resolve()
+        permission["permission"] = "admin"
+        self.event["comment"]["user"]["type"] = "Bot"
+        with self.assertRaisesRegex(ValueError, "human reviewer"):
             self.resolve()
 
     def test_malformed_command_refused_without_api_call(self):
@@ -79,8 +80,8 @@ class ReviewedM5Tests(unittest.TestCase):
             resolve_candidate(self.event, lambda *_: self.fail("unexpected API call"))
 
     def test_racing_update_refused(self):
-        def request(path, *args):
-            response = self.request(path, *args)
+        def request(path):
+            response = self.request(path)
             if path.startswith("git/commits/"):
                 self.pull["head"]["sha"] = "f" * 40
             return response
@@ -110,6 +111,10 @@ class ReviewedM5Tests(unittest.TestCase):
         self.assertEqual(publisher["environment"], "inky-m5-attestation")
         self.assertEqual(publisher["permissions"], {})
         self.assertEqual(set(publisher["needs"]), {"m5-approval", "m5-gpu", "m5-serve"})
+        step = publisher["steps"][-1]
+        self.assertEqual(step["env"]["HEAD_SHA"], "${{ needs.m5-approval.outputs.head }}")
+        self.assertIn('-f head_sha="$HEAD_SHA"', step["run"])
+        self.assertIn('[[ "$M5_GPU" = success && "$M5_SERVE" = success ]]', step["run"])
 
 
 if __name__ == "__main__":
