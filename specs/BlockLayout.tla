@@ -2,10 +2,10 @@
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Lanes, FullCapacity, WindowCapacity, B, W, MaxPos, MaxSpan, MaxGeneration, SlotBase, Kvb, Bug
-ASSUME /\ FullCapacity >= 1 /\ WindowCapacity >= 1 /\ FullCapacity + WindowCapacity >= 3
+ASSUME /\ FullCapacity >= 2 /\ WindowCapacity >= 2
        /\ B >= 2 /\ W > 0 /\ Kvb \in {1, 2}
        /\ MaxPos > B /\ MaxSpan > 0 /\ MaxGeneration > 1 /\ SlotBase >= 0
-       /\ Bug \in {"none", "stale", "window", "span", "start", "trunc32", "overlap"}
+       /\ Bug \in {"none", "stale", "window", "dropfull", "span", "start", "nozero", "badidx", "trunc32", "overlap"}
 
 Kinds == {"full", "window"}
 Cap(kind) == IF kind = "full" THEN FullCapacity ELSE WindowCapacity
@@ -118,8 +118,10 @@ Alloc(l, k, s) ==
  /\ \A r \in 1..(s-1) : ~Free(k[1], r) \/ pool[k[1]][r].generation = MaxGeneration
  /\ LET kind == k[1]
         g == pool[kind][s].generation + 1
+        recBlk == IF Bug = "badidx" THEN 0 ELSE k[2]
+        recData == IF Bug = "nozero" THEN pool[kind][s].data ELSE [i \in 0..(B-1) |-> 0]
     IN /\ pool' = [pool EXCEPT ![kind][s] =
-            [generation |-> g, kind |-> kind, block |-> k[2], length |-> 0, data |-> [i \in 0..(B-1) |-> 0]]]
+            [generation |-> g, kind |-> kind, block |-> recBlk, length |-> 0, data |-> recData]]
        /\ table' = [table EXCEPT ![l][k] =
             [slot |-> s, generation |-> g, offset |-> EntryOffset(kind, s), kind |-> kind, kvb |-> Kvb]]
  /\ UNCHANGED <<pos, phase, target, spanStart, budget, pin,
@@ -155,7 +157,8 @@ SlideWindow(l) ==
  /\ LET keep == IF Bug = "window" /\ pos[l] >= W
                 THEN Window(pos[l] - W + 2, pos[l] - 1)
                 ELSE History(pos[l])
-        t == Restrict(table[l], ({"full"} \X Blocks) \cup ({"window"} \X keep))
+        fullKeep == IF Bug = "dropfull" THEN keep ELSE Blocks
+        t == Restrict(table[l], ({"full"} \X fullKeep) \cup ({"window"} \X keep))
     IN /\ table[l] # t /\ table' = [table EXCEPT ![l] = t]
  /\ UNCHANGED <<pool, pos, phase, target, spanStart, budget, pin,
                  startKept, startPos, startTable, startState>>
@@ -204,9 +207,21 @@ WindowCovered == \A l \in Lanes : phase[l] # "done" =>
  \A b \in History(pos[l]) : table[l][<<"window",b>>] # NoEntry
 FullCovered == \A l \in Lanes : phase[l] # "done" =>
  \A b \in Full(pos[l]) : table[l][<<"full",b>>] # NoEntry
+\* Ground-truth per-query pinning check (`U169`): every query `q` in `[spanStart..target)`
+\* independently checks that every full key `0..q` and every window key `max(0, q+1-W)..q`
+\* maps to a live pinned handle in `pin[l]`, and that the actual pinned window handles do
+\* not exceed the lane's window reservation `budget[l]` (never comparing `SpanBound` or
+\* `Needed` against itself).
+QueryWinStart(q) == IF q + 1 >= W THEN q + 1 - W ELSE 0
 SpanPinned == \A l \in Lanes : phase[l] = "step" =>
- /\ budget[l] >= SpanBound(target[l]-spanStart[l])
- /\ Handles(Restrict(table[l], Needed(spanStart[l],target[l]-spanStart[l]))) \subseteq pin[l]
+ /\ Cardinality({h \in pin[l] : h[1] = "window"}) <= budget[l]
+ /\ \A q \in spanStart[l]..(target[l] - 1) :
+      /\ \A p \in 0..q :
+           /\ table[l][<<"full", p \div B>>] # NoEntry
+           /\ Handle(table[l][<<"full", p \div B>>]) \in pin[l]
+      /\ \A p \in QueryWinStart(q)..q :
+           /\ table[l][<<"window", p \div B>>] # NoEntry
+           /\ Handle(table[l][<<"window", p \div B>>]) \in pin[l]
  /\ \A h \in pin[l] : h[3] = pool[h[1]][h[2]].generation
 StartRetained == startKept =>
  /\ startState = startPos

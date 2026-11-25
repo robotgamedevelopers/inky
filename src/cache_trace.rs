@@ -573,8 +573,10 @@ impl BlockLayoutConfig {
         if uniq.len() != self.lanes.len() {
             return Err(TraceError::InvalidSchema("block_layout.lanes contains duplicates".into()));
         }
-        if self.full_capacity == 0 || self.window_capacity == 0 || self.full_capacity + self.window_capacity < 3 {
-            return Err(TraceError::InvalidSchema("invalid pool capacities".into()));
+        if self.full_capacity < 2 || self.window_capacity < 2 {
+            return Err(TraceError::InvalidSchema(
+                "block_layout capacities must hold at least 2 full and 2 window slots".into(),
+            ));
         }
         if self.block_size < 2 || self.window_size == 0 || self.max_pos <= self.block_size {
             return Err(TraceError::InvalidSchema("invalid block_size/window_size/max_pos".into()));
@@ -1416,7 +1418,8 @@ ReplayNext ==
        /\\ startTable' = nxt.startTable /\\ startState' = nxt.startState
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+InitConforms == (stepIdx = 1) => Init
+StepConforms == [][Next]_vars
 
 DispatchStep(act) ==
   IF act[1] = \"Prepare\"          THEN Prepare(act[2], act[3])
@@ -1458,6 +1461,7 @@ CONSTANTS
  Bug = \"none\"
 INVARIANTS
  TypeOK
+ InitConforms
  GenerationMatches
  WindowCovered
  FullCovered
@@ -1467,7 +1471,7 @@ INVARIANTS
  TableIndex
  Address64
 PROPERTIES
- Conforms
+ StepConforms
  ActionConforms
 ",
         cfg.full_capacity,
@@ -1709,6 +1713,7 @@ pub struct CacheBlockSnapshot {
     pub length: u32,
     pub data: Vec<u8>,
     pub ref_count: u32,
+    pub last_used_tick: u64,
 }
 
 impl CacheBlockSnapshot {
@@ -1724,6 +1729,7 @@ impl CacheBlockSnapshot {
             JsonVal::Arr(self.data.iter().map(|&d| JsonVal::uint(d)).collect()),
         );
         m.insert("ref_count".into(), JsonVal::uint(self.ref_count));
+        m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
     }
 }
@@ -1736,6 +1742,7 @@ pub struct StartPointSnapshot {
     pub state_tier: String,
     pub full: Vec<CacheBlockId>,
     pub win: Vec<CacheBlockId>,
+    pub last_used_tick: u64,
 }
 
 impl StartPointSnapshot {
@@ -1753,6 +1760,7 @@ impl StartPointSnapshot {
             "win".into(),
             JsonVal::Arr(self.win.iter().map(|b| JsonVal::str(b.encode())).collect()),
         );
+        m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
     }
 }
@@ -2004,31 +2012,47 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                 data.push(v as u8);
             }
             let ref_count = req_field(bobj, "ref_count")?.as_u32()?;
-            blocks.push(CacheBlockSnapshot { id, tier, sealed, idx, length, data, ref_count });
+            let last_used_tick = req_field(bobj, "last_used_tick")?.as_u64()?;
+            blocks.push(CacheBlockSnapshot {
+                id,
+                tier,
+                sealed,
+                idx,
+                length,
+                data,
+                ref_count,
+                last_used_tick,
+            });
         }
 
+        let valid_boundaries: BTreeSet<u32> = config.boundaries().into_iter().collect();
         let mut start_points = Vec::new();
+        let mut seen_starts = BTreeSet::new();
         for item in req_field(st_obj, "start_points")?.as_arr()? {
             let sobj = item.as_obj()?;
             let prefix = req_field(sobj, "prefix")?.as_str()?.to_owned();
+            if !config.prefixes.contains(&prefix) {
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point unknown prefix {prefix:?}"
+                )));
+            }
             let boundary = req_field(sobj, "boundary")?.as_u32()?;
+            if !valid_boundaries.contains(&boundary) {
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point invalid boundary {boundary}"
+                )));
+            }
+            if !seen_starts.insert((prefix.clone(), boundary)) {
+                return Err(TraceError::InvalidSchema("duplicate start_point record in step".into()));
+            }
             let state_kept = req_field(sobj, "state_kept")?.as_bool()?;
-            let state_tier = match sobj.get("state_tier") {
-                Some(v) => {
-                    let t = v.as_str()?.to_owned();
-                    if !matches!(t.as_str(), "none" | "memory" | "disk" | "both") {
-                        return Err(TraceError::InvalidSchema(format!("invalid start_point state_tier {t:?}")));
-                    }
-                    t
-                }
-                None => {
-                    if state_kept {
-                        "memory".to_owned()
-                    } else {
-                        "none".to_owned()
-                    }
-                }
-            };
+            let state_tier = req_field(sobj, "state_tier")?.as_str()?.to_owned();
+            if !matches!(state_tier.as_str(), "none" | "memory" | "disk" | "both") {
+                return Err(TraceError::InvalidSchema(format!(
+                    "invalid start_point state_tier {state_tier:?}"
+                )));
+            }
+            let last_used_tick = req_field(sobj, "last_used_tick")?.as_u64()?;
             let full = req_field(sobj, "full")?
                 .as_arr()?
                 .iter()
@@ -2039,7 +2063,15 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                 .iter()
                 .map(|v| parse_id(v.as_str()?))
                 .collect::<Result<Vec<_>, _>>()?;
-            start_points.push(StartPointSnapshot { prefix, boundary, state_kept, state_tier, full, win });
+            start_points.push(StartPointSnapshot {
+                prefix,
+                boundary,
+                state_kept,
+                state_tier,
+                full,
+                win,
+                last_used_tick,
+            });
         }
 
         let lanes_arr = req_field(st_obj, "lanes")?.as_arr()?;
@@ -2066,15 +2098,32 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                     })
                     .collect()
             };
+            let state_str = req_field(lobj, "state")?.as_str()?.to_owned();
+            if !matches!(
+                state_str.as_str(),
+                "Idle"
+                    | "Refused"
+                    | "Queued"
+                    | "Admitted"
+                    | "Restoring"
+                    | "Ready"
+                    | "InStep"
+                    | "Cancelling"
+                    | "Cancelled"
+                    | "Finished"
+            ) {
+                return Err(TraceError::InvalidSchema(format!("invalid lane state {state_str:?}")));
+            }
+            let pfx_str = req_field(lobj, "prefix")?.as_str()?.to_owned();
+            if !config.prefixes.contains(&pfx_str) {
+                return Err(TraceError::InvalidSchema(format!("lane unknown prefix {pfx_str:?}")));
+            }
             let wait_ticks = req_field(lobj, "wait_ticks")?.as_u32()?;
-            let ghost_bypass = match lobj.get("ghost_bypass") {
-                Some(v) => v.as_u32()?,
-                None => wait_ticks,
-            };
+            let ghost_bypass = req_field(lobj, "ghost_bypass")?.as_u32()?;
             lanes.push(CacheLaneSnapshot {
                 lane,
-                state: req_field(lobj, "state")?.as_str()?.to_owned(),
-                prefix: req_field(lobj, "prefix")?.as_str()?.to_owned(),
+                state: state_str,
+                prefix: pfx_str,
                 target: req_field(lobj, "target")?.as_u32()?,
                 pos: req_field(lobj, "pos")?.as_u32()?,
                 full: parse_blk_map(req_field(lobj, "full")?.as_arr()?)?,
@@ -2089,10 +2138,23 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
         let step_lanes = req_field(st_obj, "step_lanes")?
             .as_arr()?
             .iter()
-            .map(|v| v.as_str().map(str::to_owned))
+            .map(|v| {
+                let s = v.as_str()?.to_owned();
+                if !config.lanes.contains(&s) {
+                    return Err(TraceError::InvalidSchema(format!("step_lanes unknown lane {s:?}")));
+                }
+                Ok(s)
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        let step_span_obj = req_field(st_obj, "step_span")?.as_obj()?;
+        if step_span_obj.len() != config.lanes.len() {
+            return Err(TraceError::InvalidSchema("step_span must contain every declared lane".into()));
+        }
         let mut step_span = BTreeMap::new();
-        for (k, v) in req_field(st_obj, "step_span")?.as_obj()? {
+        for (k, v) in step_span_obj {
+            if !config.lanes.contains(k) {
+                return Err(TraceError::InvalidSchema(format!("step_span unknown lane {k:?}")));
+            }
             step_span.insert(k.clone(), v.as_u32()?);
         }
         let step_pins = req_field(st_obj, "step_pins")?
@@ -2106,14 +2168,17 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             .map(|v| parse_id(v.as_str()?))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let queue_seq = match st_obj.get("queue_seq") {
-            Some(v) => v
-                .as_arr()?
-                .iter()
-                .map(|x| x.as_str().map(str::to_owned))
-                .collect::<Result<Vec<_>, _>>()?,
-            None => Vec::new(),
-        };
+        let queue_seq = req_field(st_obj, "queue_seq")?
+            .as_arr()?
+            .iter()
+            .map(|x| {
+                let s = x.as_str()?.to_owned();
+                if !config.lanes.contains(&s) {
+                    return Err(TraceError::InvalidSchema(format!("queue_seq unknown lane {s:?}")));
+                }
+                Ok(s)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let state = CacheSchedulerState {
             blocks,
             start_points,
@@ -2164,8 +2229,8 @@ pub fn render_cache_scheduler_tla_bundle(
     let empty_data = (0..cfg.block_size).map(|_| "0").collect::<Vec<_>>().join(", ");
     let mut data = String::from("---------------------------- MODULE TraceData ----------------------------\n");
     let _ = writeln!(data, "ED == <<{empty_data}>>");
-    data.push_str("EB == <<0, FALSE, 0, 0, ED, 0>>\n");
-    data.push_str("ES == <<FALSE, 0, {}, {}>>\n");
+    data.push_str("EB == <<0, FALSE, 0, 0, ED, 0, 0>>\n");
+    data.push_str("ES == <<FALSE, 0, {}, {}, 0>>\n");
     data.push_str("Traces == <<\n");
 
     let tier_code = |t: &str| -> u8 {
@@ -2311,7 +2376,7 @@ pub fn render_cache_scheduler_tla_bundle(
                             }
                             let _ = write!(data, "{dv}");
                         }
-                        let _ = write!(data, ">>, {}>>", b.ref_count);
+                        let _ = write!(data, ">>, {}, {}>>", b.ref_count, b.last_used_tick);
                     }
                 } else {
                     data.push_str("EB");
@@ -2341,7 +2406,11 @@ pub fn render_cache_scheduler_tla_bundle(
                             .map(|id| id_to_code[id].to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let _ = write!(data, "<<TRUE, {st_code}, {{{f_codes}}}, {{{w_codes}}}>>");
+                        let _ = write!(
+                            data,
+                            "<<TRUE, {st_code}, {{{f_codes}}}, {{{w_codes}}}, {}>>",
+                            sp.last_used_tick
+                        );
                     } else {
                         data.push_str("ES");
                     }
@@ -2557,7 +2626,8 @@ Lift(s) == [
   stepPins    |-> DecodeBlockSet(s[16]),
   stepIO      |-> DecodeBlockSet(s[17]),
   gpuDone     |-> s[18],
-  queueSeq    |-> s[19]
+  queueSeq    |-> s[19],
+  restoreIO   |-> [l \\in Lanes |-> NoBlock]
 ]
 
 VARIABLES traceIdx, stepIdx
@@ -2572,7 +2642,7 @@ Matches(st) ==
   /\\ stepActive = st.stepActive
   /\\ stepLanes = st.stepLanes /\\ stepSpan = st.stepSpan
   /\\ stepPins = st.stepPins /\\ stepIO = st.stepIO
-  /\\ gpuDone = st.gpuDone
+  /\\ gpuDone = st.gpuDone /\\ restoreIO = st.restoreIO
 
 ReplayInit ==
   /\\ traceIdx \\in 1..Len(Traces)
@@ -2593,10 +2663,11 @@ ReplayNext ==
        /\\ queueSeq' = nxt.queueSeq /\\ stepActive' = nxt.stepActive
        /\\ stepLanes' = nxt.stepLanes /\\ stepSpan' = nxt.stepSpan
        /\\ stepPins' = nxt.stepPins /\\ stepIO' = nxt.stepIO
-       /\\ gpuDone' = nxt.gpuDone
+       /\\ gpuDone' = nxt.gpuDone /\\ restoreIO' = nxt.restoreIO
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+InitConforms == (stepIdx = 1) => Init
+StepConforms == [][Next]_vars
 
 DispatchStep(act) ==
   IF act[1] = \"Arrive\"                    THEN Arrive(act[2], act[3], act[4])
@@ -2634,6 +2705,31 @@ StepActionCheck ==
     \\E act \\in {{Traces[traceIdx][stepIdx + 1][20]}} : DispatchStep(act)
 
 ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>
+
+BlkTick(s, b) == s[1][BlockIdxOf(b)][7]
+StartTick(s, pk) == s[2][PrefixIdx(pk[1])][BoundaryIdx(pk[2])][5]
+
+LruCheck(s, act) ==
+  IF act[1] = \"EvictCleanOrUnrefMem\"
+  THEN \\A c \\in {{d \\in ColdMemBlocks : OnDisk(d) \\/ blocks[d].refCount = 0}} :
+         BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
+  ELSE IF act[1] = \"StartColdWriteback\"
+  THEN \\A c \\in {{d \\in ColdMemBlocks : blocks[d].tier = \"memory\" /\\ blocks[d].sealed}} :
+         BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
+  ELSE IF act[1] = \"EvictCleanStartState\"
+  THEN \\A c \\in {{x \\in ColdMemStates : StateOnDisk(x)}} :
+         StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
+  ELSE IF act[1] = \"SpillStartState\"
+  THEN \\A c \\in {{x \\in ColdMemStates : startPoints[x].stateTier = \"memory\"}} :
+         StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
+  ELSE TRUE
+
+StepLruCheck ==
+  (stepIdx' = stepIdx + 1) =>
+    \\E prev \\in {{Traces[traceIdx][stepIdx]}}, act \\in {{Traces[traceIdx][stepIdx + 1][20]}} :
+      LruCheck(prev, act)
+
+ActionLruOrder == [][StepLruCheck]_<<vars, traceIdx, stepIdx>>
 =============================================================================
 "
     );
@@ -2654,9 +2750,11 @@ CONSTANTS
  DiskBudget = {}
  MaxQueue = {}
  MaxBypass = {}
+ AsyncRestore = TRUE
  Bug = \"none\"
 INVARIANTS
  TypeOK
+ InitConforms
  StepBlocksInMemoryAndOwned
  SealedValid
  NoDecodeBlocksSealed
@@ -2670,8 +2768,9 @@ INVARIANTS
  StepBudgetHolds
  QueueBounded
 PROPERTIES
- Conforms
+ StepConforms
  ActionConforms
+ ActionLruOrder
  ActionSealedImmutable
  ActionNoQueuedRefusal
  ActionLazyColdWriteback
@@ -3029,7 +3128,7 @@ mod tests {
         let cfg = BlockLayoutConfig {
             lanes: vec!["a".into(), "b".into()],
             full_capacity: 2,
-            window_capacity: 1,
+            window_capacity: 2,
             block_size: 2,
             window_size: 2,
             max_pos: 4,
@@ -3060,14 +3159,16 @@ mod tests {
                     data: vec![0, 0],
                 })
                 .collect(),
-            window_pool: vec![PoolSlotSnapshot {
-                slot: 1,
-                generation: 0,
-                kind: BlockKind::Window,
-                block: 0,
-                length: 0,
-                data: vec![0, 0],
-            }],
+            window_pool: (1..=2)
+                .map(|s| PoolSlotSnapshot {
+                    slot: s,
+                    generation: 0,
+                    kind: BlockKind::Window,
+                    block: 0,
+                    length: 0,
+                    data: vec![0, 0],
+                })
+                .collect(),
             table: [("a".into(), vec![]), ("b".into(), vec![])].into_iter().collect(),
             pos: [("a".into(), 0), ("b".into(), 0)].into_iter().collect(),
             phase: [("a".into(), "idle".into()), ("b".into(), "idle".into())].into_iter().collect(),
@@ -3128,7 +3229,7 @@ mod tests {
         let bl_cfg = BlockLayoutConfig {
             lanes: vec!["a".into()],
             full_capacity: 2,
-            window_capacity: 1,
+            window_capacity: 2,
             block_size: 2,
             window_size: 2,
             max_pos: 4,
@@ -3148,14 +3249,16 @@ mod tests {
                     data: vec![0, 0],
                 })
                 .collect(),
-            window_pool: vec![PoolSlotSnapshot {
-                slot: 1,
-                generation: 0,
-                kind: BlockKind::Window,
-                block: 0,
-                length: 0,
-                data: vec![0, 0],
-            }],
+            window_pool: (1..=2)
+                .map(|s| PoolSlotSnapshot {
+                    slot: s,
+                    generation: 0,
+                    kind: BlockKind::Window,
+                    block: 0,
+                    length: 0,
+                    data: vec![0, 0],
+                })
+                .collect(),
             table: [("a".into(), vec![])].into_iter().collect(),
             pos: [("a".into(), 0)].into_iter().collect(),
             phase: [("a".into(), "idle".into())].into_iter().collect(),
@@ -3193,5 +3296,122 @@ mod tests {
             ],
         };
         assert!(render_block_layout_tla_bundle(&[bad_trace]).is_err());
+    }
+
+    #[test]
+    fn cache_scheduler_parser_rejects_every_missing_required_field_or_bad_domain() {
+        let cfg = CacheSchedulerConfig {
+            lanes: vec!["a".into(), "b".into()],
+            prefixes: vec!["p1".into()],
+            request_lengths: vec![2, 4],
+            block_size: 2,
+            window_size: 2,
+            max_pos: 4,
+            max_span: 2,
+            step_token_budget: 2,
+            mem_budget: 4,
+            disk_budget: 3,
+            max_queue: 1,
+            max_bypass: 2,
+        };
+        let mut sink = MemorySink::new();
+        emit_cache_scheduler_config(&mut sink, &cfg).unwrap();
+        let bid = CacheBlockId::Tree { prefix: "p1".into(), kind: BlockKind::Full, idx: 0 };
+        let wbid = CacheBlockId::Tree { prefix: "p1".into(), kind: BlockKind::Window, idx: 0 };
+        let st = CacheSchedulerState {
+            blocks: vec![
+                CacheBlockSnapshot {
+                    id: bid.clone(),
+                    tier: "memory".into(),
+                    sealed: true,
+                    idx: 0,
+                    length: 2,
+                    data: vec![1, 1],
+                    ref_count: 1,
+                    last_used_tick: 7,
+                },
+                CacheBlockSnapshot {
+                    id: wbid.clone(),
+                    tier: "memory".into(),
+                    sealed: true,
+                    idx: 0,
+                    length: 2,
+                    data: vec![1, 1],
+                    ref_count: 1,
+                    last_used_tick: 7,
+                },
+            ],
+            start_points: vec![StartPointSnapshot {
+                prefix: "p1".into(),
+                boundary: 2,
+                state_kept: true,
+                state_tier: "memory".into(),
+                full: vec![bid],
+                win: vec![wbid],
+                last_used_tick: 7,
+            }],
+            lanes: vec![
+                CacheLaneSnapshot {
+                    lane: "a".into(),
+                    state: "Idle".into(),
+                    prefix: "p1".into(),
+                    target: 2,
+                    pos: 0,
+                    full: vec![None, None],
+                    win: vec![None, None],
+                    reservation: 0,
+                    admit_budget: 0,
+                    wait_ticks: 0,
+                    ghost_bypass: 0,
+                },
+                CacheLaneSnapshot {
+                    lane: "b".into(),
+                    state: "Idle".into(),
+                    prefix: "p1".into(),
+                    target: 2,
+                    pos: 0,
+                    full: vec![None, None],
+                    win: vec![None, None],
+                    reservation: 0,
+                    admit_budget: 0,
+                    wait_ticks: 0,
+                    ghost_bypass: 0,
+                },
+            ],
+            queue_seq: vec![],
+            step_active: false,
+            step_lanes: vec![],
+            step_span: [("a".into(), 0), ("b".into(), 0)].into_iter().collect(),
+            step_pins: vec![],
+            step_io: vec![],
+            gpu_done: false,
+        };
+        emit_cache_scheduler_step(
+            &mut sink,
+            &CacheSchedulerStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: st },
+        )
+        .unwrap();
+        let valid = sink.to_jsonl();
+        assert!(parse_cache_scheduler_jsonl(&valid).is_ok());
+
+        for needle in [
+            "\"last_used_tick\":7,",
+            "\"state_tier\":\"memory\",",
+            "\"ghost_bypass\":0,",
+            "\"queue_seq\":[],",
+            "\"a\":0,",
+        ] {
+            let dropped = valid.replacen(needle, "", 1);
+            assert_ne!(dropped, valid, "failed to strip {needle}");
+            assert!(
+                parse_cache_scheduler_jsonl(&dropped).is_err(),
+                "parser silently accepted trace missing {needle}"
+            );
+        }
+
+        let bad_lane_state = valid.replacen("\"state\":\"Idle\"", "\"state\":\"Bogus\"", 1);
+        assert!(parse_cache_scheduler_jsonl(&bad_lane_state).is_err());
+        let bad_prefix = valid.replacen("\"prefix\":\"p1\"", "\"prefix\":\"p99\"", 1);
+        assert!(parse_cache_scheduler_jsonl(&bad_prefix).is_err());
     }
 }

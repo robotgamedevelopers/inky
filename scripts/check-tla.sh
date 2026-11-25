@@ -22,7 +22,7 @@ parts='memmode blocks grouped layout-nightly scheduler traces'
 # The trace-conformance scripts, scripts/check-<name>-traces.sh: memmode, blockbook, cache and scheduler
 # all live on main and run in parallel. A check-*-traces.sh that is not named here fails the traces part
 # and the tier check.
-trace_scripts='memmode blockbook cache scheduler'
+trace_scripts='memmode blockbook cache scheduler poisongate'
 grouped_modules=GroupedLayout,PoisonGate,ScratchTail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -44,14 +44,17 @@ case $section in
 esac
 want() { [ "$section" = all ] || [ "$section" = "$1" ] || { [ "$section" = layout ] && { [ "$1" = blocks ] || [ "$1" = grouped ]; }; }; }
 
-# The memmode model checks: config name, then the invariant its witness must violate (none for a passing run).
+# The memmode model checks: config name, expected property/invariant, and optional kind (temporal).
 memmode_checks='MemMode
 RestoreDefault RestoredWhenIdle
 ReleaseEarly RaisedWhileConnected
 NoPersist RestoredWhenIdle
 LostSeed SavedIsOwner
 StaleSaved RestoredWhenIdle
-NoRollback RefusedRollbackSafe'
+StaleSavedOwed SavedIsOwed
+NoRollback RefusedRollbackSafe
+NoRollbackAttempted RollbackAttempted
+UnfairRestart EventuallyRestored temporal'
 
 layout_sel() {
     case $1 in
@@ -133,10 +136,11 @@ export TLA2TOOLS_JAR="$jar" TLC_JAR="$jar" TLC_JAVA="$java_bin"
 export TLC_WORKERS="${TLC_WORKERS:-2}"
 
 memmode=$root/specs/memmode
-# check_memmode NAME [INVARIANT]: one TLC run of specs/memmode/NAME.cfg; its line goes to $work/memmode-NAME.result.
+# check_memmode NAME [EXPECTED [KIND]]: one TLC run of specs/memmode/NAME.cfg; its line goes to $work/memmode-NAME.result.
 check_memmode() {
     name=$1
     expected=${2:-}
+    kind=${3:-invariant}
     log=$work/memmode-$name.log
     if (cd "$work" && "$java_bin" -Xmx2g -cp "$jar" tlc2.TLC \
         -noGenerateSpecTE -workers 1 -metadir "$work/memmode-$name-states" \
@@ -154,6 +158,18 @@ check_memmode() {
             exit 1
         fi
         echo "MemMode $name: PASS" > "$work/memmode-$name.result"
+    elif [ "$kind" = temporal ]; then
+        if [ "$rc" -eq 0 ] || \
+            { ! grep -Fxq "Error: Temporal property $expected was violated." "$log" && \
+              { ! grep -Fxq 'Error: Temporal properties were violated.' "$log" || \
+                ! grep -Fxq "PROPERTY $expected" "$memmode/$name.cfg"; }; } || \
+            ! grep -Fxq 'Error: The following behavior constitutes a counter-example:' "$log" || \
+            ! grep -Eq '^[0-9,]+ states generated, [0-9,]+ distinct states found' "$log"; then
+            cat "$log" >&2
+            echo "MemMode $name did not show the $expected temporal witness" >&2
+            exit 1
+        fi
+        echo "MemMode $name: expected $expected temporal violation" > "$work/memmode-$name.result"
     else
         if [ "$rc" -eq 0 ] || ! grep -Fxq "Error: Invariant $expected is violated." "$log" || \
             ! grep -Fxq 'Error: The behavior up to this point is:' "$log" || \
@@ -168,10 +184,10 @@ check_memmode() {
 }
 
 if want memmode; then
-    # The seven runs are independent and small: all at once, then the results in order.
+    # The runs are independent and small: all at once, then the results in order.
     pids=
-    while read -r name expected; do
-        check_memmode "$name" "$expected" &
+    while read -r name expected kind; do
+        check_memmode "$name" "$expected" "${kind:-invariant}" &
         pids="$pids $!"
     done <<EOF
 $memmode_checks

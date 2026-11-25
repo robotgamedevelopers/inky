@@ -1,274 +1,267 @@
-# Block layout models
+# TLA+ specifications, witnesses, and trace bindings
 
-Read against the **Blocks** and **Models** sections of design revision PR #7
-(`f46a55d`). These are bounded safety models, not a proof of the engine or of
-scheduler liveness. `CacheScheduler` owns admission, cancellation fences,
-parking, restore reservations, sealed-write immutability and liveness.
-BlockLayout does not assert that sealed payloads are never written; that
-transition property belongs to CacheScheduler.
+Read against [docs/DESIGN.md](../docs/DESIGN.md) and [CACHE_SCHEDULER.md](CACHE_SCHEDULER.md).
+These are bounded safety, action-property, and fairness/liveness models paired with
+reversed witnesses and deterministic Rust trace conformance checks—not an unbounded
+proof of GPU arithmetic or wall-clock timing.
 
-Run on the designated **mini-m5 bench**, never the engine's MacBook. With Java and
-[tla2tools.jar](https://github.com/tlaplus/tlaplus/releases) installed:
+Run on a designated Linux or Apple Silicon M5 bench, never a laptop.
+Every check, `.cfg` file, trace script, and mutation is verified by
+`scripts/check-tla-tiers.sh` (and `scripts/check-tla-tiers.sh --self-test`) to run in
+**exactly one** CI tier (`137` checks and mutants: `105` per pull request, `32` nightly):
+
+- **Pull-request tier (`.github/workflows/ci.yml`, `tla` matrix)**:
+  - `scripts/check-tla.sh memmode` — `specs/memmode/MemMode.tla` (`1` positive + `9` reversed witnesses, including temporal liveness `UnfairRestart`), plus `scripts/check-tla-tiers.sh` and `--self-test`.
+  - `scripts/check-tla.sh blocks` — `specs/run_tlc.zsh` non-grouped PR checks (`66` runs across `PrefixTree`, `PrefixTreeTrace`, `BlockLayout`, `SlabWord`, `BlockedSlab`, `VecAlloc`, `VerifyRollback`, `KvDiskTier`, `SwaRing`, `SpanPins`, `StartTails`, `InBlock`, `InBlockTrace`).
+  - `scripts/check-tla.sh grouped` — `specs/run_tlc.zsh` grouped PR checks (`19` runs across `GroupedLayout`, `PoisonGate`, `ScratchTail`).
+  - `scripts/check-tla.sh traces` — all five CPU-only trace-conformance scripts in parallel (`check-memmode-traces.sh`, `check-blockbook-traces.sh`, `check-cache-traces.sh`, `check-scheduler-traces.sh`, `check-poisongate-traces.sh`), each pinning every single-line Rust mutation to the exact TLA+ invariant or action property it violates.
+- **Nightly tier (`.github/workflows/nightly.yml`, `TLA_NIGHTLY=1`)**:
+  - `scripts/check-tla.sh layout-nightly` — exhaustive `PrefixTree` (`MaxGen = 2`, plus three `src/prefix.rs` trace mutants `no-evict`, `full-match`, `ref-leak` on macOS) and `StartTails3` (`Capacity = 3` per kind).
+  - `scripts/check-tla.sh scheduler` (`specs/run_cache_scheduler.sh`) — `30` exhaustive `CacheScheduler` runs (`11` positive safety + liveness + action-property configs and `19` reversed witnesses; `-Xmx8g` on Linux).
+
+With Java 21 and the pinned `v1.8.0` `tla2tools.jar`
+(`fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713`):
 
 ```sh
-TLC_OUTPUT=/tmp/block-layout-results zsh specs/run_tlc.zsh
+TLA_JAR_CACHE=~/.cache/inky-tla sh scripts/check-tla.sh
+TLC_OUTPUT=/var/tmp/block-layout-results zsh specs/run_tlc.zsh
+TLA_NIGHTLY=1 TLC_WORKERS=8 TLA_JAR_CACHE=~/.cache/inky-tla sh scripts/check-tla.sh scheduler
 ```
 
-The runner defaults to `~/sdk/bin/java` and `~/sdk/tla/tla2tools.jar`;
-set `TLC_JAVA` or `TLC_JAR` to override those paths.
-The runner requires complete successful output for positive runs and the exact
-expected invariant failure for each witness. It keeps full TLC output, including
-counterexamples, in the output directory. For an individual run, from `specs/`:
+Results and timings are recorded in [RESULTS.md](RESULTS.md) and [CACHE_SCHEDULER.md](CACHE_SCHEDULER.md).
 
-```sh
-~/sdk/bin/java -XX:+UseParallelGC -Xmx4g -cp ~/sdk/tla/tla2tools.jar tlc2.TLC \
-  -workers 1 -config BlockLayout3.cfg BlockLayout.tla
-```
+## Wired-memory helper (`MemMode`)
 
-`InBlock` is the order inside one slot: `[pass][K|V][head][position][HD]`, 2 passes, 3 heads, 4 positions, `HD = 2`. The action walks the coordinates in that order and inlines the address, then appends it to `seen`. `Ordered` compares the stored address to `Formula`, which the action does not call. `Inside` says one row stays inside the slot. `NoCollision` says the addresses in `seen` are unique. `InBlock` uses `kvb = 2` and `InBlockKv8` uses `kvb = 1`. `InBlockMajor` must violate `Ordered`. `InBlockMajorCollide` and `InBlockAddrCol` must violate `NoCollision` on a reached state. `InBlockTraceData` is written by `inky inblock-trace` from `key_row_at`, and `InBlockTrace` checks that behaviour at `kvb` 2 and at `kvb` 1.
+`specs/memmode/MemMode.tla` models `src/memd.rs`: the helper daemon that raises
+`iogpu.wired_limit_mb` while any `inky` client is connected, persists the owner's
+previous limit on disk before raising, rolls back refused raises, and restores the
+saved limit when the last connection closes or after a daemon restart.
 
-## Bounds and vocabulary
+- **Checked properties**: `TypeOK`, `RaisedWhileConnected`, `RestoredWhenIdle`,
+  `SavedIsOwner`, `SavedIsOwed`, `RefusedRollbackSafe`, `RollbackAttempted`, and
+  liveness `EventuallyRestored` (under weak fairness of `Restart` and `RetryRestore`).
+- **Reversed witnesses (`9`)**: `RestoreDefault` (`RestoredWhenIdle`), `ReleaseEarly`
+  (`RaisedWhileConnected`), `NoPersist` (`RestoredWhenIdle`), `LostSeed` (`SavedIsOwner`),
+  `StaleSaved` (`RestoredWhenIdle`), `StaleSavedOwed` (`SavedIsOwed`), `NoRollback`
+  (`RefusedRollbackSafe`), `NoRollbackAttempted` (`RollbackAttempted`), and temporal
+  `UnfairRestart` (`SpecUnfair`, `EventuallyRestored`).
+- **Trace binding**: `scripts/check-memmode-traces.sh` replays 32 deterministic random
+  walks of 192 operations over `src/memd.rs` through `specs/memmode/TraceCheck.tla`
+  (`InitConforms` + `StepConforms`) and pins 5 mutations (`early-release`, `no-rollback`,
+  `no-readback`, `lost-seed`, `skip-keep`) to their exact TLC violation strings.
 
-`BlockLayout` has two lanes, **one pool per kind** (`FullCapacity=2` with `WindowCapacity=1` or `2`, giving **3 or 4 slots total**), blocks of
-**2 positions**, a window of **2 positions**, spans of **1 or 2 tokens**, maximum
-position **4**, element width **`Kvb` (`1` or `2`)**, and **2 generations per slot**. Matching `src/blocks.rs` (PR #49 / #54), each kind owns a separate pool starting at byte offset 0 (`Kvb` MiB full stride, `5 * Kvb` MiB window stride), and each table entry carries `(slot, generation, offset, kind, kvb)`.
-The next allocation chooses the
-lowest available non-exhausted slot; we explore all action interleavings, not
-all allocator placement policies. Generation exhaustion disables further reuse;
-this is not a generation-wrap proof. Finite completed/exhausted states are
-allowed, so deadlock checking is disabled. No state constraint prunes the search. The four-slot run reaches a window
-straddling two blocks while retaining two full blocks; the three-slot run cannot
-fit that state, so the off-by-one witness uses four slots.
+## Prefix tree (`PrefixTree` and `PrefixTreeTrace`)
 
-- A **block** is `(kind, slot, generation)`. Pool entries also record logical
-  block index, initialized length and data. A length of `B` means sealed.
-- A lane's **table** maps `(kind, logical block index)` to a slot, generation and
-  offset. `TableIndex` checks the logical index independently of slot selection;
-  `GenerationMatches` checks every stored entry, including stale entries.
-- A **span** prepares a target, allocates its missing blocks, pins all needed
-  handles, writes tokens in order, then releases its pins. `budget` records the
-  conservative window reservation `ceil((W-1+C)/B)+1`. The reservation can exceed
-  the number of actual handles at early positions or favorable alignments.
-- A **pin** prevents reuse until `EndStep`. It is a use of the lane's ownership,
-  not a second writer/referrer to a private tail. GPU/I/O ordering belongs to
-  `CacheScheduler`.
-- A **start point** retains a state marker, all full blocks, and the window blocks
-  before its boundary. Matching shares only those sealed blocks. The single
-  start-point record abstracts a cache with one retained start point; its state
-  marker abstracts recurrent contents, not their numerical correctness.
-- An unsealed **tail** has at most one lane owner (exactly one while referenced),
-  cannot be matched, and is zero past its initialized length. Finishing clears
-  all lane references; an unreferenced pool cell may retain data until allocation
-  zeroes it, including reuse of a previously written slot.
+`specs/PrefixTree.tla` models `src/prefix.rs` (`PrefixTree` and `LiveTree`): matching
+a request to the deepest live retained start point in a tree of sealed blocks. Blocks
+carry token sequences (`BlockLen = 2` over `Alphabet`), Full slot/generation (`slotOf`,
+`genOf`), optional Window slot/generation (`winSlotOf`, `winGenOf`), current pool
+generations (`poolGen`), pin counts (`refs`, where `refs = 0` is cached/evictable and
+`refs = 1` holds a pool reference), and start-point holder counts (`starts`). `Seek`
+evicts every stale block (and its subtree) before matching and steps back one block on
+an exact full-request match so at least one token remains to prefill (`ExpectedResult`).
 
-`History(n)` covers the last `W` written positions. A span starting at `n` reads
-from `max(0,n-W+1)` through `n+C-1`, inclusively. Allocation can prepare several
-blocks ahead; these remain private to the writing lane. Sliding is a separate
-idle-lane action, so both delayed and immediate reclamation are explored.
+- **Positive configs**: `PrefixTreeFast` and `PrefixTreeEvictFast` (`Bug = "evict"`,
+  lifting the `Reuse` guard to exercise stale eviction under `NoStaleAfterSeek`) run per
+  pull request; `PrefixTree` (`MaxGen = 2`) runs nightly in `layout-nightly`.
+- **Reversed witnesses (`8`)**: `PrefixTreeShallow` (`DeepestStart`), `PrefixTreeStale`
+  (`ResultLive`), `PrefixTreeFirstToken` (`MatchExact`), `PrefixTreeAnyParent`
+  (`ResultIsStart`), `PrefixTreePartial` (`StartOnBoundary`), `PrefixTreeLeak`
+  (`RefsSettledAfterSeek`), `PrefixTreeReuseHeld` (`HeldNeverStale`), and
+  `PrefixTreeStaleInsert` (`NoBadInsert`).
+- **Trace binding**: `PrefixTreeTrace.tla` replays `prefix::tests::prefix_trace_dump`
+  (`specs/PrefixTreeTraceData.tla`) step-by-step against `StepOp(row)` and `PoolBooks`
+  (slot reference counts equal live pinned Full + Window blocks), and `layout-nightly`
+  checks three `src/prefix.rs` mutations (`no-evict`, `full-match`, `ref-leak`).
 
-TLC uses signed 32-bit integers. Plain `u64` byte offsets from base 0 (`(SlotBase + (slot - 1)) * stride_bytes(kind, Kvb)`) are represented losslessly in 32-bit-safe limbs `[hi |-> u64 >> 32, mib |-> (u64 >> 20) % 4096, sub |-> u64 % 2^20]`. `BlockLayout3` and `BlockLayout4` run at `SlotBase=0, Kvb=2`; `BlockLayoutHigh` runs at `SlotBase=2048, Kvb=2` (`>= 4 GiB` in both pools); `BlockLayoutKv8` runs at `SlotBase=4096, Kvb=1` (`>= 4 GiB` in both `--kv8` pools); and `Truncate32` drops `hi` at `SlotBase=2048` to prove accidental 32-bit truncation violates `Address64`. `Address64` checks pool bounds, non-zero high limbs above 4 GiB, strict within-block `AddBytes` progression, and pairwise byte-range non-overlap across distinct live slots.
+## Block layout, span pins, and GPU slab addressing
 
-`SpanPins` separately checks the **production dimensions** `B=64, W=1024, C=512`
-at every one of the 64 possible start alignments. The maximum is exactly 25
-window blocks. This avoids pretending that a tiny pool can hold a production
-span. It checks logical pin coverage; the bounded pool model checks pin lifetime.
+`BlockLayout` models two lanes with **one pool per kind** (`FullCapacity >= 2` and
+`WindowCapacity >= 2` on every configuration so both pools allocate multiple blocks and
+the sliding window genuinely slides), blocks of `B = 2` positions, window `W = 2`,
+spans up to `MaxSpan` (`1` in `BlockLayout3`, `2` in `BlockLayout4`, `BlockLayoutHigh`,
+and `BlockLayoutKv8`), `MaxPos = 4`, element width `Kvb \in {1, 2}`, and `2` generations
+per slot. Plain `u64` byte offsets `(SlotBase + (slot - 1)) * stride_bytes(kind, Kvb)`
+are represented losslessly in 32-bit-safe limbs `[hi, mib, sub]`; `BlockLayoutHigh`
+(`SlotBase = 2048, Kvb = 2`) and `BlockLayoutKv8` (`SlotBase = 4096, Kvb = 1`) cross
+`4 GiB` in both pools.
 
-## Reversed witnesses
-
-Each configuration changes only the named defect (the full-scale pin witness
-also selects the worst alignment). Healthy configurations enable every invariant.
+`SpanPinned` checks each active span against an independent per-query-token ground truth
+(`QueryWinStart(q)..q` for every query position `q` in the span, plus `<= budget[l]`
+pinned window handles), rather than comparing `SpanWindow` with itself.
 
 | Configuration | Expected failure | Counterexample |
 | --- | --- | --- |
 | `StaleEntry` | `GenerationMatches` | Finish leaves a table entry behind; another lane reuses its slot at generation 2 while the entry still holds generation 1. |
-| `WindowOffByOne` | `WindowCovered` | At position 3, sliding drops logical block 0, although the last two positions are 1 and 2 and still cross blocks 0 and 1. |
-| `SpanTooSmall` | `SpanPinned` | A two-token span reserves the single-token budget 2, below the specified bound 3. This is a reservation-contract failure, not a claim that this tiny alignment reads three blocks. |
-| `StartReleased` | `StartRetained` | Keep a boundary-2 start point, finish its lane, then reuse its window slot; its full block remains retained but the window generation changes. |
-| `Truncate32` | `Address64` | At `SlotBase = 2048` (`>= 4 GiB` in both pools), dropping the upper 32 bits (`hi = 0`) aliases a high-pool slot onto offset 0 and violates `Address64`. |
-| `SpanPins17` | `Covered` | At offset 63, a 512-token span reads logical blocks 0 through 24; pinning 0 through 16 leaves eight blocks unpinned. |
+| `WindowOffByOne` | `WindowCovered` | Sliding drops an active window block still covered by `History(pos)`. |
+| `FullDropped` | `FullCovered` | Sliding drops a full-attention block `< pos`. |
+| `SpanTooSmall` | `SpanPinned` | At `FullCapacity = 3, WindowCapacity = 3, MaxPos = 5, MaxSpan = 3`, a 3-token span pins 3 window blocks while reserving `budget = 2`. |
+| `StartReleased` | `StartRetained` | Finish releases a kept start point's window slot so another lane reuses it at generation 2. |
+| `TailNotZeroed` | `TailPrivateZero` | Reusing a previously written slot without zeroing leaves non-zero tail elements past `length = 0`. |
+| `WrongTableIndex` | `TableIndex` | Allocation records logical index `b + 1` in the pool cell for table entry `b`. |
+| `Truncate32` | `Address64` | Dropping the upper 32-bit limb (`hi = 0`) at `SlotBase = 2048` aliases a `>= 4 GiB` slot onto low memory. |
+| `SlotOverlap` | `Address64` | Collapsing slot stride (`slot - 1 -> 0`) aliases distinct live slots onto byte offset 0. |
 
-Results and timings from mini-m5 are recorded in [RESULTS.md](RESULTS.md).
+### `SpanPins` (`B = 64, W = 1024, C = 512`)
 
-## Grouped tile traversal
+`SpanPins` checks production span-pinning dimensions across all `64` block alignments:
+every query position's sliding-window history is covered (`Covered`), the conservative
+reservation `Bound = 25` is never exceeded (`BoundHolds`), and worst-case alignment `63`
+requires `25` window blocks (`MaximumIs25`). Witness configs `SpanPins17` (`Covered`),
+`SpanPinsOverBound` (`BoundHolds`), and `SpanPinsMax24` (`MaximumIs25`) each fail on
+their named invariant. `src/blocks.rs` (`span_window_blocks` and
+`BlockTable::pinned_span_entries`) is bound to `SpanPins.tla` by `sp_512` and pinned
+mutant `cap17-span-pins` in `scripts/check-cache-traces.sh`.
+
+### Supporting engine and KV layout models (`blocks` PR job)
+
+- **`InBlock` and `InBlockTrace`** (`specs/InBlock.tla`, `specs/InBlockTrace.tla`,
+  `src/blocks.rs`, `src/kernels.metal`, `src/prefill.metal`): checks the in-slot byte
+  order `[pass][K|V][head][position][HD]` (`Ordered`, `Inside`, `NoCollision`) at
+  `kvb = 2` (`InBlock`) and `kvb = 1` (`InBlockKv8`), with witnesses `InBlockMajor`
+  (`Ordered`), `InBlockMajorCollide` (`NoCollision`), and `InBlockAddrCol`
+  (`NoCollision`). `inky inblock-trace` generates `1,488` coordinates across `Full` and
+  `Window` blocks at `fp16` and `KV8`, verified by `InBlockTrace` and `InBlockTraceKv8`.
+- **`SlabWord`** (`specs/SlabWord.tla`, `src/blocks.rs`): models the 64-bit packed GPU
+  block-table word `(slab << 62) | byte_offset` across up to 4 slabs (`KV0..KV3`), with
+  `SlabWord` (`kvb = 2`), `SlabWordKv8` (`kvb = 1`), and witnesses `SlabWordUnmasked`
+  (`ShaderPtrResolves`), `SlabWordWrongBind` (`ShaderPtrResolves`), `SlabWordOverflow`
+  (`NoOffsetClobbersSlab`), and `SlabWordFifthSlab` (`SlabCountBounded`).
+- **`BlockedSlab`** (`specs/BlockedSlab.tla`, `src/engine.rs`): models slot allocation,
+  free-list reuse, `(slot * 2 + swa) * stride` non-aliasing, stride growth/re-layout,
+  and incremental `[dirty_lo..=dirty_hi]` GPU table upload (`BlockedSlab3`,
+  `BlockedSlab4`, plus witnesses `BlockedSlabFlatGrow`, `BlockedSlabNoReuseZero`,
+  `BlockedSlabMissedDirty`).
+- **`VecAlloc`** (`specs/VecAlloc.tla`, `src/engine.rs`): models pinned activation banks
+  and LoopCD dry-weak pass vector liveness (`VecAlloc10`, `VecAlloc7`, plus witnesses
+  `VecAlloc6` -> `NoPoolExhaustion` and `VecAllocUnpinnedWeak` -> `NeverOverwritesLive`).
+- **`VerifyRollback`** (`specs/VerifyRollback.tla`, `src/engine.rs`): models speculative
+  `encode_verify` snapshot and `rollback_verify` `n_keep` convolution-state and KV
+  restoration without sealing rejected tails (`VerifyRollback`, plus witnesses
+  `VerifyOffByOneCs`, `VerifyKeepRejectedKv`, `VerifySealRejected`).
+- **`KvDiskTier` and `SwaRing`** (`specs/KvDiskTier.tla`, `specs/SwaRing.tla`,
+  `src/engine.rs`): model `--kv-disk` hot-ring split alignment and double-buffered
+  staging (`KvDiskTier`, `KvDiskNoOverlap`, `KvDiskStagingRace`) and sliding-window ring
+  writeback (`SwaRing`, `SwaRingShortWriteback`).
+
+## Grouped tile traversal (`GroupedLayout`)
 
 `GroupedLayout` checks the layout part of [the shared-prefix model gate](../docs/SHARED-PREFIX.md#gates-in-landing-order)
-for a single attention pass over two pinned lane tables. It enumerates all
-positive row lengths and complete shared-prefix lengths that fit in three or
-four physical slots. Each block holds two keys and each split holds four keys.
-A tile is one block in this model. Production uses 64-key blocks, and the
-[private fixed-split kernel](https://github.com/robotgamedevelopers/inky/pull/37)
-uses 256-key full splits and 64-key window splits. A grouped kernel may stage
-several tiles per block. Its tile width and block crossings need their own
-kernel and trace checks. TLC requires that each modeled split contains whole
-tiles.
+for a single attention pass over two pinned lane tables (`GroupedLayout3`,
+`GroupedLayout4`). A shared block occupies one slot across both rows; after divergence,
+each row needs a separate slot for each block, including its tail. Under weak fairness
+of the enabled traversal action, each snapshot finishes (`TraversalCompletes`).
 
-A shared block occupies one slot across both rows; after divergence, each row
-needs a separate slot for each block, including its tail.
-
-For each tile, TLC explores staging the distinct physical slots in either order.
-A staged slot serves the rows that reference it. Each row applies its own causal
-end and either full attention or a three-key sliding window. At completion TLC
-compares the sequence of key positions, physical identities and split indices
-with an independent scalar enumeration. It also compares the sequence of
-emitted partials, including the last key of each visible split. A split can
-start on a shared tile and finish on a private tile. A staging trace records
-the physical slot and tile of every load. Each pair must occur once, and the
-completed trace must cover every pair expected by the private rows.
-
-Under weak fairness of the enabled traversal action, each snapshot must finish.
-Two liveness witnesses fail in different ways. `StalledTraversal` blocks the
-first advance after its tile's loads finish, so no step is possible. That
-configuration turns off TLC's earlier deadlock diagnostic so the checker
-reports the infinite stutter that violates traversal completion. It shows that
-the property catches a lost enabling condition that no fairness can repair.
-`AdvanceUnfair` keeps every step and deadlock checking, and narrows weak
-fairness to staging alone. TLC then finds a behavior that stutters forever
-while Advance is enabled. It shows that completion depends on fairness of the
-advance step.
-
-The negative control `RestageOutputs` runs the redundant-load mutant against
-both output invariants only. It must pass. Only `StagedOnce` can see that
-mutant, and `Restage` shows that the same mutant violates it.
-
-| Witness | Checked property | What changes |
+| Witness / Control | Checked property | What changes |
 | --- | --- | --- |
-| `LocalMatch` | `VisitedKeys` | Two complete blocks have the same local tokens after their parents diverged. Row 2 reads row 1's slot. |
+| `LocalMatch` | `VisitedKeys` | Two complete blocks share local tokens after their parents diverged; row 2 reads row 1's slot. |
 | `DonorWindow` | `VisitedKeys` | Row 2 applies row 1's window start and visits the wrong keys. |
 | `TilePartial` | `OrderedPartials` | Emitting at the first tile end produces an extra partial inside a split. |
-| `Restage` | `StagedOnce` | A physical slot is loaded twice. The row's visited keys and emitted partials stay unchanged. |
-| `StalledTraversal` | `TraversalCompletes` | Both rows can finish their loads, yet the traversal stays on tile zero forever. |
-| `AdvanceUnfair` | `TraversalCompletes` | Weak fairness covers staging only. Advance stays enabled and is never taken. |
+| `Restage` | `StagedOnce` | A physical slot is loaded twice while visited keys and partials stay unchanged. |
+| `StalledTraversal` | `TraversalCompletes` | Both rows finish their loads, yet traversal stays on tile zero forever. |
+| `AdvanceUnfair` | `TraversalCompletes` | Weak fairness covers staging only; `Advance` stays enabled and stutters forever. |
+| `RestageOutputs` | PASS (negative control) | Runs the redundant-load mutant against `VisitedKeys` and `OrderedPartials` only, proving only `StagedOnce` detects it. |
 
-The ordered keys represent logical position and mask membership. SIMD lane
-assignment, floating-point operations and Metal execution require the kernel's
-bitwise tests. Block allocation and lifetime are checked in their own models.
+## Start points and unsealed tails (`StartTails`)
 
-## Start points and unsealed tails
+`StartTails` checks `src/blockbook.rs`: which blocks a start point holds (`Retained(n)`),
+when start points are kept and dropped (`head`, `prompt`, and `every`), what attention
+may read of an unsealed tail (`Visible(n, b)`), and zeroing on reuse. Decode steps past
+`Floor(prompt)` never keep a start point (Decision 4).
 
-`StartTails` checks the bookkeeping in `src/blockbook.rs`: which blocks a start
-point holds, when start points are kept and dropped, what attention may read of a
-tail, and zeroing on reuse. As in `src/blocks.rs`, each kind has its own pool of
-1-based slots, and a slot record holds a generation, a length and a sealed flag.
-Reference counts are derived from the tables, never stored. The step in flight and
-its pins stay in `BlockLayout`; tiers, budgets and the scheduler stay in
-`CacheScheduler`. Its start-point record (state, full blocks, window blocks of a
-boundary) is the same record as `CacheScheduler.startPoints`.
-
-- A **start point** at boundary `n` holds the recurrent state at `n`, every full
-  block before `n` and the window blocks of `History(n)`, each as a reference on
-  its slot. Pruning the lane's window drops only the lane's reference.
-- A **step** writes its positions through the lane's table, seals what it filled,
-  prunes the window to `History`, and, when it ends a prefill on a block boundary,
-  keeps a start point. The point's reasons are `head`, `prompt` at the prompt's
-  last block boundary, and `every` at every `Every`-th block (16 in production).
-  A lane has one head: the previous head loses that reason first, and a point left
-  without one is dropped. `Finish` drops the head reason, so prompt and every
-  points outlive the request. Decode never keeps a point (decision 4).
-- **Tails** are allocated a block at a time, full and window together, each in
-  the lowest usable slot of its pool, at the next generation, zeroed. Neither is
-  taken unless both can be. A tail is referenced by its lane alone, is never in a
-  start point, and is free once its lane finishes. Attention reads block `b` of a
-  lane at `n` only up to `Seen(n, b)`.
-
-Bounds: two lanes, **two slots per kind** in CI (four in all) and three per kind
-nightly, blocks and windows of 2 positions, maximum position 4, spans up to 2,
-start points every 2 blocks, one start-point id (a new head can reuse its
-predecessor's id) and 2 generations per slot.
+Bounds (`StartTails2` in PR CI, `StartTails3` nightly): two symmetric lanes
+(`Lanes = {a, b}`, `SYMMETRY SymLanes`), **two slots per kind** in CI and **three per
+kind** nightly, `B = 2, W = 2, Every = 2`, **`MaxPos = 6`**, **`MaxStarts = 2`**, and
+`MaxGeneration = 2`. With `MaxPos = 6` and `MaxStarts = 2`, two start points are live
+simultaneously and an `"every"` point (`pos = 4` on `prompt = 6`, reasons
+`{"head", "every"}`) is distinct from a `"prompt"` point (`pos = 6`, reasons
+`{"head", "prompt"}`).
 
 | Configuration | Expected failure | Counterexample |
 | --- | --- | --- |
-| `UnheldWindow` | `StartRetained` | A start point holds only its full blocks. Lane 1 keeps a prompt point at 2 and finishes; lane 0 takes window slot 1 at generation 2 while the point still holds generation 1. |
-| `PrunedUnderStart` | `StartRetained` | Pruning releases a window slot outright. Lane 1 keeps a prompt point at 2, steps to 4 and prunes window block 0; lane 0 takes that slot at generation 2 under the live point. |
-| `TailOverread` | `ReadsWritten` | Attention reads one position past the lane: block 0 just allocated at position 0, read length 1, written length 0. |
-| `ReuseNotZeroed` | `TailPrivateZero` | Lane 0 writes position 0 and finishes; the next request takes the same slot at generation 2 with length 0 and position 0 still set. |
+| `LaneStaleGen` | `LaneCovered` | `Finish` leaves a lane's table populated while `running = FALSE`. |
+| `UnheldWindow` | `StartRetained` | Start point holds only its full blocks; another lane reuses its window slot at generation 2. |
+| `PrunedUnderStart` | `StartRetained` | Window pruning releases a window slot outright underneath a live start point. |
+| `TailOverread` | `ReadsWritten` | Attention reads one position past `Seen(n, b)` on an unsealed block. |
+| `ReuseNotZeroed` | `TailPrivateZero` | Reusing a dropped tail slot at generation 2 leaves stale data past `length = 0`. |
+| `DanglingHead` | `HeadsConsistent` | Retiring a start point leaves a running lane's `head[l]` pointing to a dead start id. |
 
-**Binding the code.** `scripts/check-blockbook-traces.sh` compiles
-`scripts/blockbook-traces.rs` with the production `src/blocks.rs` and
-`src/blockbook.rs` (rustc only, no Cargo or Metal). Twenty deterministic random
-walks of 90 operations drive three lanes over five slots per kind, with a fake GPU
-side that writes through the lane's table, zeroes on `zero` and records kept
-states. Each call is one recorded state. `StartTailsTrace` replays them: the first
-state must be `Init` and each call must be a `StartTails` step or change nothing
-(`Conforms`), with every model invariant, plus `RefsMatch` (each slot record's
-count equals its lane and start-point referrers), `ReadsMatch` (each read the
-code reports equals `Visible`) and `StatesMatch` (each kept state belongs to a
-live point). The walks must reach every witnessed case (a resumed lane, a reused
-slot, a window pruned under a live point, a partial tail read, a retired point,
-a finished tail, prompt and every points, a full pool) or the check fails. Six
-one-line mutations of `src/blockbook.rs` must each be rejected by TLC:
-`unheld-window` and `pruned-under-start` (a), `overread` (b), `no-zero` (c),
-`kept-tail` and `every-off`.
+**Trace binding**: `scripts/check-blockbook-traces.sh` compiles `scripts/blockbook-traces.rs`
+against `src/blocks.rs` and `src/blockbook.rs`, replays 20 walks of 90 operations through
+`specs/StartTailsTrace.tla` (`InitConforms`, `StepConforms`, `StatesMatch`, `RefsMatch`,
+`ReadsMatch`, plus all `StartTails` invariants), verifies coverage of all 8 scenarios,
+and pins 6 mutations (`unheld-window`, `pruned-under-start`, `overread`, `no-zero`,
+`kept-tail`, `every-off`) to their exact TLC violations.
 
-## Serve scheduler traces
+## `CacheScheduler`, trace checkers, and the HTTP 429 rule
 
-On a Mac with the Rust toolchain, write one deterministic trace from the serve
-scheduler. The test uses a fake inference engine and an in-process client
-workload. It opens no sockets and loads no model.
+See [CACHE_SCHEDULER.md](CACHE_SCHEDULER.md) for the full `CacheScheduler.tla` model
+(`11` positive configs and `19` reversed witnesses in `specs/run_cache_scheduler.sh`).
 
-```sh
-INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl \
-  cargo test --locked serve::scheduler_trace::dump -- --ignored --exact
-```
+- **HTTP 429 capacity refusal vs 60-second queue-wait timeout**:
+  1. *Capacity / queue-limit refusal*: `CacheScheduler.tla` models atomic arrival refusal
+     in `Arrive` (`WorstCaseBlocks(reqLen) > MemBudget`, or `Cardinality(QueuedLanes) = MaxQueue`
+     without direct-admit headroom -> `"Refused"`). Inside that untimed model,
+     `ActionNoQueuedRefusal` proves capacity accounting never retroactively evicts an
+     accepted `"Queued"` request to `"Refused"`.
+  2. *Wall-clock queue timeout in `src/serve.rs`*: `AdmissionGate::acquire_with_cancel`
+     (`QUEUE_WAIT_TIMEOUT = 60s`) returns HTTP 429 immediately on `QueueFull` **and**
+     returns HTTP 429 (`QUEUE_TIMED_OUT`) if a queued HTTP waiter's 60-second wall-clock
+     deadline expires before a lane permit opens. Real-time HTTP deadlines sit outside
+     the untimed `CacheScheduler` specification and remove the waiter from the queue cleanly
+     just like client `Cancel`.
+- **Cache and layout trace conformance (`scripts/check-cache-traces.sh`)**: compiles
+  `scripts/cache-traces.rs` (`src/blocks.rs`, `src/cache_scheduler.rs`, `src/cache_trace.rs`)
+  with `rustc`, requires non-zero coverage of `spill`, `restore`, `drop` (`drop_unreferenced`),
+  `slide` (`slide_window`), `reclaim`, `admit_bypass`, `step_bypass`, `cancel`, and
+  `refuse429`, exposes `last_used_tick` so `ActionLruOrder` rejects out-of-LRU eviction,
+  checks all 5 bundles (`bl_base0`, `bl_high_fp16`, `bl_high_kv8`, `cs`, `sp_512`) in TLC,
+  and pins 10 production mutations (`trunc-real-byte-offset`, `off1-byte-offset`,
+  `reissue-gen-reset`, `stale-finish`, `admit-wait-dropped`, `step-bypass-dropped`,
+  `priv-tail-dirty`, `noop-restore-block`, `non-lru-writeback`, `cap17-span-pins`).
+- **Scheduler twin trace conformance (`scripts/check-scheduler-traces.sh`)**: compiles
+  `scripts/scheduler-traces.rs` + `src/scheduler.rs`, checks `check_invariants()` after
+  every step and `is_drained()` at completion across 18 traces (never dropping short
+  walks), requires non-zero coverage of `cold_writebacks`, `disk_restores`, `refused_429`,
+  `cancel_in_step`, `cancel_in_restore` (`BeginRestoreIO -> Cancel -> Cancelling -> CompleteRestoreIO`),
+  `admit_bypasses`, `step_bypasses`, `slide_windows`, and `finished`, and pins 6
+  mutations (`cancel-in-step-early-free`, `cancel-in-restore-early-free`,
+  `bypass-bound-exceeded`, `drop-step-bypass-tick`, `drop-admit-bypass-tick`,
+  `noop-restore-stutter`).
+- **In-process `serve` harness (`src/serve/scheduler_trace.rs`)**: on macOS,
+  `INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl cargo test --locked serve::scheduler_trace::dump -- --ignored --exact`
+  drives `src/serve.rs` over a fake engine (`SCHEMA_VERSION = 2`: `arrive`, `refuse429`,
+  `admit`, `refuse_ctx`, `build_step`, `finish_step`, `disconnect`, `cancel`, `finish`)
+  and verifies drain across 33 seeds in unit tests.
 
-The first JSON line records the schema version (currently 2), seed, lane count, queue limit,
-prefill chunk budget and context. Each subsequent line records one event in
-execution order. Request IDs (`job`) identify arrivals through termination.
-Lane indices and token positions start at zero.
+## Poisoned-slot gate (`PoisonGate` and `PoisonGateTrace`)
 
-| Event | Observation |
-| --- | --- |
-| `arrive`, `refuse429` | The client submits a request with prompt length and generation limit. A refusal is the outcome of the same atomic capacity claim used by both HTTP handlers. |
-| `admit` | The scheduler assigns a request to a free lane (`lane`) and records its cached prefix length (`cached`) and where that prefix comes from: `source` is `cold` (nothing cached, `cached` is 0), `own` (the lane's own kept prompt) or `copy` (copied from the busy lane `from`, whose prefill has just finished). `from` equals `lane` unless `source` is `copy`. |
-| `refuse_ctx` | The request reached a free lane but its prompt plus generation limit plus two reserved tokens exceeds one lane's context. The scheduler refuses it; this ends the request. |
-| `build_step` | The scheduler submits a prefill or decode batch. Each span names its lane, request, starting position and token count. |
-| `finish_step` | The submitted batch has completed. This is the engine fence for that step. |
-| `disconnect`, `cancel` | The simulated client drops its receiver; the scheduler observes delivery failure and releases the lane. These can occur on different ticks. |
-| `finish` | The request reaches its stop or length condition. The event includes the generated token count. |
+`PoisonGate` models `src/poolgate.rs` (`poison_plan`, `apply`, `restore`, `poisoned`):
+before each step every slot of a kind's pool that no stepping lane references is
+poisoned, non-stepping live lanes' poisoned slots are saved first and restored after the
+step, and lanes `Take` (zeroed), `Share`, and `Release` slots both between steps
+(`phase = "idle"`) and inside a step's poisoned phase (`phase = "poisoned"` for pre-GPU
+`ensure_span_blocks` `Take` and GPU `Write`; `phase = "finish"` for post-GPU canonical
+`Share` and duplicate/window `Release` before `Restore`). `PoisonGate4` uses
+`SYMMETRY SymLanes` over `3` lanes and `4` slots.
 
-The fake supplies cache state and logits at the engine boundary. The production
-scheduler still chooses lanes and builds batches, samples tokens, sends events
-and observes disconnects. The trace covers the current serving decisions.
-The default test repeats 33 seeds with two lanes and one queued request and
-checks that the trace drains. Some prompts extend the previous prompt, so the
-seeds cover cold, own-lane and cross-lane admissions; each walk also submits one
-request too long for a lane, which ends in `refuse_ctx`. A constant winning
-token means normal generation ends at the requested length. Model output and GPU
-execution have separate tests. A TLC replay against
-CacheScheduler is a separate verification step.
+- **Invariants**: `NoFalsePoison`, `Coverage`, `LiveIntact`.
+- **Reversed witnesses (`4`)**: `PoisonUnguarded` (`NoFalsePoison`), `PoisonNoSave`
+  (`LiveIntact`), `PoisonOwnedOnly` (`Coverage`), and `PoisonNoZero` (`NoFalsePoison`,
+  when a slot taken during the poisoned phase is not zeroed).
+- **Trace binding**: `scripts/check-poisongate-traces.sh` compiles
+  `scripts/poisongate-traces.rs` against `src/poolgate.rs` and `src/blocks.rs`, replays
+  `poolgate::poisoned` walks through `specs/PoisonGateTrace.tla` (`InitConforms` +
+  `ActionConforms` + `NoFalsePoison` + `Coverage` + `LiveIntact`), requires non-zero
+  idle and in-phase `take`/`share`/`release` plus `saved_slots`, and pins 5 mutations
+  (`unguarded-stepping`, `no-save-live`, `owned-only-poison`, `skip-restore-copy`,
+  `empty-stepping-action`).
 
-## Poisoned-slot gate
+## Sliding-window scratch tail (`ScratchTail`)
 
-`PoisonGate` models the slot arithmetic of layer 3's output gate
-(`src/poolgate.rs`, `inky poolgate`): before each step every slot of a kind's
-pool that no stepping lane references is poisoned, the poisoned slots a live
-lane references are saved first and restored after the step, and free slots
-stay poisoned until the pool zeroes them on reuse. One pool, 3 or 4 slots, two
-or three lanes that take, share and release slots between steps, one write per
-slot. The code runs the plan once per kind; the kinds share no slots.
-
-- `NoFalsePoison`: no slot a stepping lane reads holds poison.
-- `Coverage`: every slot the step must not read holds poison.
-- `LiveIntact`: between steps every referenced slot holds what its lanes wrote.
-
-Reversed witnesses (`Bug`): `unguarded` (the first stepping lane is not
-protected; the same switch as `INK_POOLGATE_SABOTAGE`), `nosave` and
-`ownedonly`. The unit tests in `src/poolgate.rs` check `poison_plan` against
-the same three properties on every two-lane, three-slot table assignment.
-
-## Sliding-window scratch tail
-
-`ScratchTail` models the row layout of the sliding-window K/V scratch in a
-prefill step of several spans (`src/engine.rs` `layer_b`; `k_zero`,
-`k_kvcopy`, `k_kvprep_b`, `k_attn_h`). `k_zero` clears it once per step; every
-span of every sliding-window layer then copies its window history below row 0,
-writes its keys into rows `0 .. t - 1`, and attends in whole tiles of `AK` key
-positions, which reach past its last key to the next multiple of `AK`. Masked
-keys get a zero weight, and a zero weight does not cancel a NaN or an infinity.
-
-- `NoForeignRead`: every row a span's attention reads is its own or zero.
-- `InBounds`: every row read lies in the scratch (the `KGUARD` sizing).
-
-Reversed witness: `notail` (the code before the tail rows were zeroed): a span
-with a longer `t` leaves its keys in the next span's last tile.
-`ScratchTailOneSpan` runs that same code with one span per step and passes:
-the zeroing is needed only when a step has more than one span.
+`ScratchTail` models the row layout of sliding-window K/V scratch across multi-span
+prefill steps (`src/engine.rs` `layer_b`; `k_zero`, `k_kvcopy`, `k_kvprep_b`,
+`k_attn_h`), checking `NoForeignRead` and `InBounds` across `ScratchTail3` and
+`ScratchTail4`, witness `ScratchTailNoZero` (`NoForeignRead`), and negative control
+`ScratchTailOneSpan` (`Bug = "notail"` with one span per step, proving tail zeroing is
+needed specifically when multiple spans share a step).

@@ -20,12 +20,22 @@
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
+#[cfg(not(standalone_blocks))]
 use crate::blockbook::{EVERY, HEAD, PROMPT};
-use crate::blocks::{BlockEntry, BlockIndex, BlockKind, BlockTable, Slot, BLOCK, WINDOW};
+#[cfg(not(standalone_blocks))]
+use crate::blocks::BlockEntry;
+use crate::blocks::{BlockIndex, BlockKind, BlockTable, Slot};
+#[cfg(not(standalone_blocks))]
+use crate::blocks::{BLOCK, WINDOW};
+#[cfg(not(standalone_blocks))]
 use crate::engine::{Engine, Lane, Span, EXT};
+#[cfg(not(standalone_blocks))]
 use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, SealedId};
+#[cfg(not(standalone_blocks))]
 use objc2_metal::MTLCommandBuffer;
+#[cfg(not(standalone_blocks))]
 use std::cell::{Cell, RefCell};
+#[cfg(not(standalone_blocks))]
 use std::collections::HashMap;
 
 /// A lane's handle, chosen by the path that made it.
@@ -65,6 +75,10 @@ pub trait PoisonPool {
     /// this so the intentionally poisoned lane never publishes corrupted blocks into its shared prefix tree for other
     /// lanes to adopt; any remaining divergence on another lane proves a genuine cross-lane leak in the engine.
     fn note_sabotaged(&self, _lane: LaneId) {}
+    /// Called immediately after `apply` saves non-stepping live slots and poisons unguarded slots.
+    fn note_applied(&self, _stepping_lanes: &[LaneId], _saved: &[(BlockKind, Slot, Vec<u8>)]) {}
+    /// Called immediately after `restore` copies saved slot bytes back into the pool.
+    fn note_restored(&self) {}
 }
 
 /// The candidate is a path with a pool.
@@ -261,10 +275,13 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             }
             let ps = plans(cand, &tables, &stepping, !unguard);
             let (saved, done) = apply(cand, &ps);
+            let stepping_ids: Vec<LaneId> = who.iter().map(|&i| lane[i].unwrap()).collect();
+            cand.note_applied(&stepping_ids, &saved);
             poisoned += done.poisoned; saved_n += done.saved; absent += done.absent;
             if dec { cand.decode(&who.iter().map(|&i| (lane[i].unwrap(), work[next[i]].0)).collect::<Vec<_>>()); }
             else { cand.prefill(&who.iter().map(|&i| { let (p0, t, _) = work[next[i]]; (lane[i].unwrap(), p0, t) }).collect::<Vec<_>>()); }
             restore(cand, saved);
+            cand.note_restored();
             steps += 1;
             for (k, &i) in who.iter().enumerate() {
                 let (p0, t, _) = work[next[i]];
@@ -302,6 +319,10 @@ pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>
     }
     if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored, {} planned slots of ended lanes absent): every step's logits and every token identical", want.len(), got.steps, got.poisoned, got.saved, got.absent)]) } else { Err(bad) }
 }
+
+#[cfg(not(standalone_blocks))]
+mod gpu_paths {
+use super::*;
 
 /// Layer 2's path: each lane owns its own cache buffers. As a pool, lane k's window cache is window slot k + 1 and its
 /// full cache is full slot k + 1; an ended lane's slots have no memory.
@@ -1046,10 +1067,15 @@ pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize) -> Res
         st.start_matches, st.start_points_saved, st.window_pruned, st.slots_reused
     ))
 }
+}
+
+#[cfg(not(standalone_blocks))]
+pub use gpu_paths::{verify_prefix_start_points, Layer2, Layer3Pool};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     // Slot arithmetic only: no GPU, no time, no files.
     fn check(n: usize, tables: &[Vec<usize>], stepping: &[usize]) {

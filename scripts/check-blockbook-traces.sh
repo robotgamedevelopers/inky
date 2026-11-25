@@ -25,10 +25,10 @@ run_trace() {
         -config StartTailsTrace.cfg StartTailsTrace.tla) > "$dir/tlc.log" 2>&1
 }
 
-# check_mutant NAME OLD NEW: replace one line of the production file, never the
-# oracle, and require TLC to reject the walk with a counterexample.
+# check_mutant NAME EXPECTED OLD NEW: replace one line of the production file,
+# never the oracle, and require TLC to reject the walk on the exact named property.
 check_mutant() {
-    local name=$1 old=$2 new=$3 dir=$work/$1 src status
+    local name=$1 expected=$2 old=$3 new=$4 dir=$work/$1 status
     mkdir "$dir"
     python3 -c 'import pathlib, sys
 orig, dst, old, new = sys.argv[1:5]
@@ -39,10 +39,10 @@ pathlib.Path(dst).write_text(s.replace(old, new, 1))
 ' "$original" "$dir/blockbook.rs" "$old" "$new" || { echo "ERROR: $name target is not one line of src/blockbook.rs" >&2; return 1; }
     if cmp -s "$dir/blockbook.rs" "$original"; then echo "ERROR: $name changed nothing" >&2; return 1; fi
     if run_trace "$dir"; then echo "ERROR: $name passed trace checking" >&2; return 1; else status=$?; fi
-    if [[ $status != 12 && $status != 13 ]] || ! grep -Eq 'Action property .* is violated|Temporal properties were violated|Invariant .* is violated' "$dir/tlc.log"; then
-        cat "$dir/tlc.log" "$dir/walk.log" >&2; echo "ERROR: $name failed without a conformance counterexample (exit $status)" >&2; return 1
+    if [[ $status != 12 && $status != 13 ]] || ! grep -Fxq "Error: $expected" "$dir/tlc.log"; then
+        cat "$dir/tlc.log" "$dir/walk.log" >&2; echo "ERROR: $name did not fail with pinned 'Error: $expected' (exit $status)" >&2; return 1
     fi
-    echo "$name rejected: $(grep -Em1 'is violated|were violated' "$dir/tlc.log")" > "$dir/result"
+    echo "$name rejected: Error: $expected" > "$dir/result"
 }
 
 check_production() {
@@ -59,21 +59,27 @@ names=() pids=()
 start() { names+=("$1"); "${@:2}" & pids+=($!); }
 start production check_production
 # (a) a start point that does not hold its window blocks
-start unheld-window check_mutant unheld-window 'for (_, e) in table.entries() { self.hold(e)?; }' \
+start unheld-window check_mutant unheld-window 'Invariant RefsMatch is violated.' \
+    'for (_, e) in table.entries() { self.hold(e)?; }' \
     'for (_, e) in table.entries() { if e.kind() == BlockKind::Full { self.hold(e)?; } }'
 # (a) pruning that releases a window slot outright, under a live start point
-start pruned-under-start check_mutant pruned-under-start 'for (b, e) in pruned { self.lanes[lane].table.set(BlockKind::Window, b, None)?; self.release(e)?; }' \
+start pruned-under-start check_mutant pruned-under-start 'Invariant RefsMatch is violated.' \
+    'for (b, e) in pruned { self.lanes[lane].table.set(BlockKind::Window, b, None)?; self.release(e)?; }' \
     'for (b, e) in pruned { self.lanes[lane].table.set(BlockKind::Window, b, None)?; while self.pools.of(e.kind()).record(e.slot())?.refs() > 0 { self.release(e)?; } }'
 # (b) a read one position past what the lane wrote
-start overread check_mutant overread 'Ok(Some(l.pos.saturating_sub(start).min(self.geo.block)))' \
+start overread check_mutant overread 'Invariant ReadsMatch is violated.' \
+    'Ok(Some(l.pos.saturating_sub(start).min(self.geo.block)))' \
     'Ok(Some((l.pos.saturating_sub(start) + 1).min(self.geo.block)))'
 # (c) a reused slot handed out without zeroing
-start no-zero check_mutant no-zero 'gpu.zero(kind, slot);' '{}'
+start no-zero check_mutant no-zero 'Invariant TailPrivateZero is violated.' \
+    'gpu.zero(kind, slot);' '{}'
 # a finished lane that keeps its tails
-start kept-tail check_mutant kept-tail '        self.release_table(&table)?;' \
+start kept-tail check_mutant kept-tail 'Invariant RefsMatch is violated.' \
+    '        self.release_table(&table)?;' \
     '        for (_, e) in table.entries() { if self.pools.of(e.kind()).record(e.slot())?.sealed() { self.release(e)?; } }'
 # every-16 points on the wrong boundaries
-start every-off check_mutant every-off 'if (n / geo.block) % geo.every == 0 { reasons |= EVERY; }' \
+start every-off check_mutant every-off 'Action property StepConforms is violated.' \
+    'if (n / geo.block) % geo.every == 0 { reasons |= EVERY; }' \
     'if (n / geo.block) % geo.every == 1 { reasons |= EVERY; }'
 
 failed=0

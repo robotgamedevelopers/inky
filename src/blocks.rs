@@ -229,6 +229,30 @@ pub fn decode_gpu_table_entry(entry: u64) -> (usize, u64) {
     ((entry >> KV_SLAB_SHIFT) as usize, entry & KV_SLAB_MASK)
 }
 
+/// Logical window block indices `[oldest / block ..= end / block]` required across a span
+/// `[pos, pos + len)` at block size `block` and sliding-window width `window` (`U170`,
+/// bound by trace to `specs/SpanPins.tla`).
+pub fn span_window_blocks_at(
+    pos: usize,
+    len: usize,
+    block: usize,
+    window: usize,
+) -> Result<Vec<BlockIndex>, BlockError> {
+    if len == 0 || block == 0 || window == 0 {
+        return Err(BlockError::OutOfRange);
+    }
+    let end = pos.checked_add(len - 1).ok_or(BlockError::Overflow)?;
+    let oldest = pos.saturating_sub(window - 1);
+    let lo_blk = u32::try_from(oldest / block).map_err(|_| BlockError::Overflow)?;
+    let hi_blk = u32::try_from(end / block).map_err(|_| BlockError::Overflow)?;
+    Ok((lo_blk..=hi_blk).map(BlockIndex::new).collect()) // MUTANT_ANCHOR_SPAN_WIN_BLOCKS
+}
+
+/// Production `(BLOCK = 64, WINDOW = 1024)` window blocks required across `[pos, pos + len)`.
+pub fn span_window_blocks(pos: usize, len: usize) -> Result<Vec<BlockIndex>, BlockError> {
+    span_window_blocks_at(pos, len, BLOCK, WINDOW)
+}
+
 /// KV layout constants and shader invariants extracted directly from `src/kernels.metal`
 /// and `src/prefill.metal` (`U63` & `U18`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1180,6 +1204,32 @@ impl BlockTable {
     /// blocks ascending.
     pub fn entries(&self) -> impl Iterator<Item = (BlockIndex, BlockEntry)> + '_ {
         self.entries.iter().enumerate().filter_map(|(i, e)| e.map(|e| (BlockIndex::new((i / 2) as u32), e)))
+    }
+
+    /// Resolve every `(BlockKind::Full, b, entry)` in `0..=(pos + len - 1) / BLOCK` and
+    /// `(BlockKind::Window, b, entry)` in `span_window_blocks(pos, len)` that a step over
+    /// `[pos, pos + len)` reads (`U170`, bound to `specs/SpanPins.tla`).
+    pub fn pinned_span_entries(
+        &self,
+        pos: usize,
+        len: usize,
+    ) -> Result<Vec<(BlockKind, BlockIndex, BlockEntry)>, BlockError> {
+        if len == 0 {
+            return Err(BlockError::OutOfRange);
+        }
+        let end = pos.checked_add(len - 1).ok_or(BlockError::Overflow)?;
+        let hi_full = u32::try_from(end / BLOCK).map_err(|_| BlockError::Overflow)?;
+        let mut out = Vec::new();
+        for b in 0..=hi_full {
+            let bi = BlockIndex::new(b);
+            let entry = self.get(BlockKind::Full, bi)?.ok_or(BlockError::NoEntry)?;
+            out.push((BlockKind::Full, bi, entry));
+        }
+        for bi in span_window_blocks(pos, len)? {
+            let entry = self.get(BlockKind::Window, bi)?.ok_or(BlockError::NoEntry)?;
+            out.push((BlockKind::Window, bi, entry));
+        }
+        Ok(out)
     }
 
     /// Write one entry. The stored offset is `byte_offset` at the pool's `kvb`.
@@ -2241,5 +2291,39 @@ mod tests {
         let wrap_slot = Slot::new(3).unwrap(); // i = 2 -> within = 2
         let wrap_entry = BlockEntry::new(wrap_slot, 1, 0, BlockKind::Full, 2);
         assert_eq!(synthetic.gpu_table_entry(wrap_entry), Err(BlockError::Overflow));
+    }
+
+    #[test]
+    fn span_window_blocks_and_table_pinning_reach_25_at_worst_alignment() {
+        let mut pools = BlockPools::new(32);
+        let mut tbl = BlockTable::new(32).unwrap();
+        for b in 0..32u32 {
+            let slot = Slot::new(b + 1).unwrap();
+            let _ = pools.full.take(slot).unwrap();
+            let _ = pools.window.take(slot).unwrap();
+            tbl.fill(&mut pools.full, BlockIndex::new(b), slot, 1).unwrap();
+            tbl.fill(&mut pools.window, BlockIndex::new(b), slot, 1).unwrap();
+        }
+        let mut max_win = 0usize;
+        for offset in 0..BLOCK {
+            let pos = (WINDOW - 1) + offset;
+            let win_blks = span_window_blocks(pos, 512).unwrap();
+            let pinned = tbl.pinned_span_entries(pos, 512).unwrap();
+            let table_win: Vec<u32> = pinned
+                .iter()
+                .filter(|(k, _, _)| *k == BlockKind::Window)
+                .map(|(_, bi, _)| bi.get())
+                .collect();
+            let direct_win: Vec<u32> = win_blks.iter().map(|bi| bi.get()).collect();
+            assert_eq!(table_win, direct_win);
+            assert!(table_win.len() <= 25, "alignment {offset} exceeded 25 window blocks");
+            max_win = max_win.max(table_win.len());
+            if offset == BLOCK - 1 {
+                let expected: Vec<u32> = (0..=24).collect();
+                assert_eq!(table_win, expected, "offset 63 must pin blocks 0..=24 (25 blocks, not 17)");
+            }
+        }
+        assert_eq!(max_win, 25);
+        assert_eq!(span_window_blocks(0, 0), Err(BlockError::OutOfRange));
     }
 }

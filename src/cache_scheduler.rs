@@ -1503,7 +1503,7 @@ impl CacheScheduler {
             .filter(|(id, b)| b.in_memory() && self.lane_referrers(id).is_empty() && !self.step_io.contains(id))
             .map(|(id, _)| id.clone())
             .collect();
-        v.sort_by_key(|id| (self.blocks[id].last_used_tick, id.clone()));
+        v.sort_by_key(|id| (self.blocks[id].last_used_tick, id.clone())); // MUTANT_ANCHOR_LRU_COLD_MEM
         v
     }
 
@@ -3060,6 +3060,7 @@ impl CacheScheduler {
                 length: b.length,
                 data: b.data.clone(),
                 ref_count: b.ref_count,
+                last_used_tick: b.last_used_tick,
             })
             .collect();
         let start_points = self
@@ -3073,6 +3074,7 @@ impl CacheScheduler {
                 state_tier: sp.state_tier.into(),
                 full: sp.full.iter().cloned().collect(),
                 win: sp.win.iter().cloned().collect(),
+                last_used_tick: sp.last_used_tick,
             })
             .collect();
         let lanes = self
@@ -3314,10 +3316,20 @@ pub fn walk_block_layout(
     Ok(())
 }
 
+fn allow_precond<T>(res: Result<T, SchedulerError>) -> Result<Option<T>, SchedulerError> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(SchedulerError::Precondition(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Execute a deterministic seeded `CacheScheduler` walk exercising:
 ///   - `MaxQueue >= 2` admit bypass (fitting smaller request bypassing larger queued request and incrementing its `wait_ticks`),
 ///   - `BuildStep` `StepBypassed` `wait_ticks` increment on unchosen actionable lanes,
-///   - HTTP 429 refusals, start-point matching, cold SSD spills & restores, mid-step `Cancelling` fence, and completions.
+///   - LRU cold SSD spill order (`p2` older tick evicted before `p1` newer tick),
+///   - `ReclaimColdDisk`, `DropUnreferenced`, `SlideWindow`, `RestoreBlock`, HTTP 429 refusals,
+///     mid-step `Cancelling` fence, and completions, propagating every `Trace`/`InvariantViolation` error (`U194`).
 pub fn walk_cache_scheduler(
     cfg: CacheSchedulerConfig,
     seed: u64,
@@ -3333,9 +3345,58 @@ pub fn walk_cache_scheduler(
     let min_len = *req_lens.iter().min().unwrap();
     let max_len = *req_lens.iter().max().unwrap();
 
-    // Opening scenario when `max_queue >= 2` and `lanes.len() >= 3` and `max_len > min_len`:
-    // deterministically exercise BOTH `admit` queue-bypass (`wait_ticks += 1`) AND `build_step` `StepBypassed` (`wait_ticks += 1`).
-    if seed % 2 == 0
+    let seal_prefix_on = |sched: &mut CacheScheduler,
+                          ln: &str,
+                          pfx: &str,
+                          ev: &mut dyn TraceSink,
+                          st: &mut dyn TraceSink|
+     -> Result<(), SchedulerError> {
+        sched.arrive(ln, pfx, max_len, ev, st)?;
+        sched.admit(ln, ev, st)?;
+        sched.begin_restore(ln, ev, st)?;
+        sched.finish_restore(ln, ev, st)?;
+        while sched.lanes[ln].pos < sched.prompt_end_of(max_len) {
+            let _ = sched.slide_window(ln, ev, st)?;
+            let Some(plan) = sched.plan_step() else { break };
+            sched.build_step(&plan, ev, st)?;
+            sched.gpu_execute(ev, st)?;
+            sched.finish_step(ev, st)?;
+        }
+        Ok(())
+    };
+
+    if seed == 2
+        && lanes.len() >= 2
+        && prefixes.len() >= 2
+        && max_len >= cfg.block_size * 2
+        && sched.worst_case_for(max_len) <= cfg.mem_budget
+    {
+        // Seed 2 (`U193`): seal `p1` ("p2") FIRST (older `last_used_tick`) and `p0` ("p1") SECOND
+        // (newer `last_used_tick`, lexicographically smaller), cancel so BOTH prefixes sit cold in
+        // memory simultaneously, then trigger `StartColdWriteback` — LRU MUST pick `"p2"`!
+        let p0 = &prefixes[0];
+        let p1 = &prefixes[1];
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+
+        sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[0], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
+        while sched.mem_pressure() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
+        }
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+    } else if seed % 2 == 0
         && cfg.max_queue >= 2
         && lanes.len() >= 3
         && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget
@@ -3343,25 +3404,18 @@ pub fn walk_cache_scheduler(
     {
         let p0 = &prefixes[0];
         let p1 = prefixes.get(1).unwrap_or(p0);
-        // l0 admitted with min_len -> holds half the admission budget:
         sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
         sched.admit(&lanes[0], event_sink, state_sink)?;
         sched.begin_restore(&lanes[0], event_sink, state_sink)?;
         sched.finish_restore(&lanes[0], event_sink, state_sink)?;
-        // l1 queued with max_len (cannot fit while l0 is active) + l2 queued with min_len (CAN fit!):
         sched.arrive(&lanes[1], p1, max_len, event_sink, state_sink)?;
         sched.arrive(&lanes[2], p0, min_len, event_sink, state_sink)?;
         if lanes.len() >= 4 && cfg.max_queue == 2 {
-            // Queue full + max_len cannot direct-admit -> 429 Refused!
             let _ = sched.arrive(&lanes[3], p1, max_len, event_sink, state_sink)?;
         }
-        // Admit l2: bypasses queued l1 -> increments l1.wait_ticks!
         sched.admit(&lanes[2], event_sink, state_sink)?;
         sched.begin_restore(&lanes[2], event_sink, state_sink)?;
         sched.finish_restore(&lanes[2], event_sink, state_sink)?;
-        // Step ONLY l0 (when step_token_budget == 1 or l2 is prefilling; with decode priority, if l2 is also decoding and fits step_token_budget >= 2, make l2 prefilling or step both then bypass queued l1!):
-        // Wait: in BuildStep, FitUnchosenDecoders requires SumBy(chosen, spans) == StepTokenBudget!
-        // So if l0 has max_len (prefilling, span = 2 == step_token_budget!) or if l2 is prefilling:
         if let Some(plan) = sched.plan_step() {
             sched.build_step(&plan, event_sink, state_sink)?;
             sched.gpu_execute(event_sink, state_sink)?;
@@ -3373,41 +3427,20 @@ pub fn walk_cache_scheduler(
         && max_len >= cfg.block_size * 2
         && sched.worst_case_for(max_len) <= cfg.mem_budget
     {
-        // Deterministic cold-spill + RestoreBlock + SlideWindow opening on seed 1:
+        // Seed 1: cold spill + `RestoreBlock` + `SlideWindow`:
         let p0 = &prefixes[0];
         let p1 = &prefixes[1];
-        sched.arrive(&lanes[0], p0, max_len, event_sink, state_sink)?;
-        sched.admit(&lanes[0], event_sink, state_sink)?;
-        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
-        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
-        while sched.lanes[&lanes[0]].pos < sched.prompt_end_of(max_len) {
-            let _ = sched.slide_window(&lanes[0], event_sink, state_sink)?;
-            let Some(plan) = sched.plan_step() else { break };
-            sched.build_step(&plan, event_sink, state_sink)?;
-            sched.gpu_execute(event_sink, state_sink)?;
-            sched.finish_step(event_sink, state_sink)?;
-        }
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
         sched.cancel(&lanes[0], event_sink, state_sink)?;
-
-        sched.arrive(&lanes[0], p1, max_len, event_sink, state_sink)?;
-        sched.admit(&lanes[0], event_sink, state_sink)?;
-        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
-        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
-        while sched.lanes[&lanes[0]].pos < sched.prompt_end_of(max_len) {
-            let _ = sched.slide_window(&lanes[0], event_sink, state_sink)?;
-            let Some(plan) = sched.plan_step() else { break };
-            sched.build_step(&plan, event_sink, state_sink)?;
-            sched.gpu_execute(event_sink, state_sink)?;
-            sched.finish_step(event_sink, state_sink)?;
-        }
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
         while sched.mem_pressure() {
-            if sched.evict_clean_or_unref_mem(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
                 continue;
             }
             if sched.disk_used() >= cfg.disk_budget {
-                let _ = sched.reclaim_cold_disk(event_sink, state_sink);
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
             }
-            if sched.start_cold_writeback(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
                 sched.complete_step_io(event_sink, state_sink)?;
             } else {
                 break;
@@ -3424,7 +3457,7 @@ pub fn walk_cache_scheduler(
             .collect();
         for b in disk_blks {
             if sched.mem_used() < cfg.mem_budget {
-                let _ = sched.restore_block(&lanes[2], &b, event_sink, state_sink);
+                let _ = allow_precond(sched.restore_block(&lanes[2], &b, event_sink, state_sink))?;
             }
         }
         if CacheScheduler::lane_blocks_of(&sched.lanes[&lanes[2]])
@@ -3433,6 +3466,65 @@ pub fn walk_cache_scheduler(
             && sched.start_state_ready(&sched.lanes[&lanes[2]])
         {
             sched.finish_restore(&lanes[2], event_sink, state_sink)?;
+        }
+    } else if seed == 3
+        && lanes.len() >= 2
+        && prefixes.len() >= 2
+        && max_len >= cfg.block_size * 2
+        && sched.worst_case_for(max_len) <= cfg.mem_budget
+        && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget
+    {
+        // Seed 3 (`U159, U162`): fill `disk_budget`, run `ReclaimColdDisk` to retire the oldest
+        // start point, and explicitly call `DropUnreferenced` on the orphaned disk blocks!
+        let p0 = &prefixes[0];
+        let p1 = &prefixes[1];
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
+        while sched.mem_pressure() {
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
+        }
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+
+        sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[0], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
+        sched.arrive(&lanes[1], p1, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[1], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[1], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[1], event_sink, state_sink)?;
+
+        while sched.mem_pressure() {
+            if sched.disk_used() >= cfg.disk_budget {
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+                let unref_ids: Vec<CacheBlockId> = sched
+                    .blocks
+                    .iter()
+                    .filter(|(id, b)| {
+                        b.present()
+                            && b.ref_count == 0
+                            && !sched.step_pins.contains(*id)
+                            && !sched.step_io.contains(*id)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in unref_ids {
+                    let _ = allow_precond(sched.drop_unreferenced(&id, event_sink, state_sink))?;
+                }
+            }
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
         }
     }
 
@@ -3504,18 +3596,33 @@ pub fn walk_cache_scheduler(
             if !sched.step_io.is_empty() {
                 sched.complete_step_io(event_sink, state_sink)?;
             }
+            let unref_ids: Vec<CacheBlockId> = sched
+                .blocks
+                .iter()
+                .filter(|(id, b)| {
+                    b.present()
+                        && b.ref_count == 0
+                        && !sched.step_pins.contains(*id)
+                        && !sched.step_io.contains(*id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in unref_ids {
+                let _ = allow_precond(sched.drop_unreferenced(&id, event_sink, state_sink))?;
+            }
             if !sched.mem_pressure() {
                 break;
             }
-            if sched.evict_clean_or_unref_mem(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
                 continue;
             }
             if sched.disk_used() >= cfg.disk_budget {
-                let _ = sched.reclaim_cold_disk(event_sink, state_sink);
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+                continue;
             }
-            if sched.start_cold_writeback(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
                 sched.complete_step_io(event_sink, state_sink)?;
-                let _ = sched.evict_clean_or_unref_mem(event_sink, state_sink);
+                let _ = allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?;
             } else {
                 break;
             }
@@ -3529,13 +3636,13 @@ pub fn walk_cache_scheduler(
                     .collect();
                 for b in disk_blks {
                     if sched.mem_used() < cfg.mem_budget {
-                        let _ = sched.restore_block(ln, &b, event_sink, state_sink);
+                        let _ = allow_precond(sched.restore_block(ln, &b, event_sink, state_sink))?;
                     }
                 }
                 if !sched.start_state_ready(&sched.lanes[ln])
                     && sched.state_mem_used() < sched.state_mem_budget()
                 {
-                    let _ = sched.restore_start_state(ln, event_sink, state_sink);
+                    let _ = allow_precond(sched.restore_start_state(ln, event_sink, state_sink))?;
                 }
                 if CacheScheduler::lane_blocks_of(&sched.lanes[ln])
                     .iter()
@@ -3551,13 +3658,13 @@ pub fn walk_cache_scheduler(
             if !sched.state_mem_pressure() {
                 break;
             }
-            if sched.evict_clean_start_state(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.evict_clean_start_state(event_sink, state_sink))?.is_some() {
                 continue;
             }
             if sched.state_disk_used() >= sched.state_disk_budget() {
-                let _ = sched.reclaim_cold_disk(event_sink, state_sink);
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
             }
-            if sched.spill_start_state(event_sink, state_sink).is_err() {
+            if allow_precond(sched.spill_start_state(event_sink, state_sink))?.is_none() {
                 break;
             }
         }
@@ -3807,6 +3914,75 @@ mod tests {
         sched.restore_block("c", &spilled2, &mut ev_sink, &mut st_sink).unwrap();
         sched.finish_restore("c", &mut ev_sink, &mut st_sink).unwrap();
         sched.cancel("c", &mut ev_sink, &mut st_sink).unwrap();
+    }
+
+    #[test]
+    fn walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill() {
+        struct FailAtSink {
+            remaining: usize,
+        }
+        impl TraceSink for FailAtSink {
+            fn emit_line(&mut self, _json_line: &str) -> Result<(), crate::cache_trace::TraceError> {
+                if self.remaining == 0 {
+                    return Err(crate::cache_trace::TraceError::Io("injected sink failure".into()));
+                }
+                self.remaining -= 1;
+                Ok(())
+            }
+        }
+
+        let cfg = CacheSchedulerConfig {
+            lanes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            prefixes: vec!["p1".into(), "p2".into()],
+            request_lengths: vec![2, 4],
+            block_size: 2,
+            window_size: 2,
+            max_pos: 4,
+            max_span: 2,
+            step_token_budget: 2,
+            mem_budget: 4,
+            disk_budget: 3,
+            max_queue: 2,
+            max_bypass: 2,
+        };
+
+        let mut st_full = MemorySink::new();
+        walk_cache_scheduler(cfg.clone(), 1, &mut NullSink, &mut st_full).unwrap();
+        let total_lines = st_full.lines().len();
+        assert!(total_lines > 12);
+
+        // Inject a sink failure at every single step of seed 1 (covering writeback, reclaim, and
+        // restore_block) and seed 3 (covering drop_unreferenced) — NONE may be swallowed!
+        for seed in [1u64, 3u64] {
+            let mut probe = MemorySink::new();
+            walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut probe).unwrap();
+            for fail_idx in 0..probe.lines().len() {
+                let mut failing = FailAtSink { remaining: fail_idx };
+                let err = walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut failing)
+                    .expect_err("walk_cache_scheduler must propagate sink error immediately");
+                assert!(matches!(err, SchedulerError::Trace(_)), "unexpected error {err:?}");
+            }
+        }
+
+        let mut saw_spill = false;
+        let mut saw_restore = false;
+        let mut saw_drop = false;
+        let mut saw_slide = false;
+        for seed in [1u64, 2u64, 3u64] {
+            let mut st = MemorySink::new();
+            walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut st).unwrap();
+            let parsed = parse_cache_scheduler_jsonl(&st.to_jsonl()).unwrap();
+            for step in &parsed.steps {
+                match step.action.as_str() {
+                    "StartColdWriteback" => saw_spill = true,
+                    "RestoreBlock" => saw_restore = true,
+                    "DropUnreferenced" => saw_drop = true,
+                    "SlideWindow" => saw_slide = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_spill && saw_restore && saw_drop && saw_slide);
     }
 
     #[test]

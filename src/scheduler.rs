@@ -299,6 +299,7 @@ pub enum SchedError {
     InvalidTarget(u32),
     InvalidState { lane: usize, expected: &'static str, actual: LaneState },
     Precondition(&'static str),
+    Invariant(String),
 }
 
 impl fmt::Display for SchedError {
@@ -312,6 +313,7 @@ impl fmt::Display for SchedError {
                 write!(f, "lane {lane} expected {expected}, found {actual:?}")
             }
             Self::Precondition(m) => write!(f, "scheduler precondition failed: {m}"),
+            Self::Invariant(m) => write!(f, "scheduler invariant violated: {m}"),
         }
     }
 }
@@ -486,6 +488,16 @@ impl Scheduler {
         self.gpu_done
     }
 
+    pub fn is_drained(&self) -> bool {
+        !self.step_active
+            && self.step_io.is_empty()
+            && self.queue_seq.is_empty()
+            && self
+                .lanes
+                .iter()
+                .all(|l| l.state.is_terminal_or_idle() && l.restore_io_block.is_none())
+    }
+
     // ---- Queries ----------------------------------------------------------------------------
 
     pub fn worst_case(&self, target: u32) -> u32 {
@@ -584,7 +596,7 @@ impl Scheduler {
         s
     }
 
-    fn block_tier(&self, id: &BlockId) -> BlockTier {
+    pub fn block_tier(&self, id: &BlockId) -> BlockTier {
         self.blocks.get(id).map_or(BlockTier::None, |b| b.tier)
     }
 
@@ -1150,6 +1162,9 @@ impl Scheduler {
         if !self.lane_block_set(lane).contains(block) {
             return Err(SchedError::Precondition("block not owned by restoring lane"));
         }
+        if self.lanes[lane].restore_io_block.is_some() {
+            return Err(SchedError::Precondition("restore I/O already in flight for lane"));
+        }
         if self.block_tier(block) != BlockTier::Disk {
             return Err(SchedError::Precondition("block is not disk-only"));
         }
@@ -1180,6 +1195,9 @@ impl Scheduler {
                 expected: "Restoring",
                 actual: self.lanes[lane].state,
             });
+        }
+        if self.lanes[lane].restore_io_block.is_some() {
+            return Err(SchedError::Precondition("restore I/O already in flight for lane"));
         }
         let pos = self.lanes[lane].pos;
         if pos == 0 || pos % self.cfg.block_size != 0 {
@@ -1234,6 +1252,15 @@ impl Scheduler {
         if self.mem_used() >= self.cfg.mem_budget {
             return Err(SchedError::Precondition("memory budget full during restore"));
         }
+        let wl = self.lanes[lane].wait_ticks;
+        let active_max = (0..self.lanes.len())
+            .filter(|&r| self.is_active_restoring(r))
+            .map(|r| self.lanes[r].wait_ticks)
+            .max()
+            .unwrap_or(0);
+        if wl < active_max {
+            return Err(SchedError::Precondition("longer-waiting restoring lane must read first"));
+        }
         self.lanes[lane].restore_io_block = Some(block.clone());
         Ok(())
     }
@@ -1243,11 +1270,15 @@ impl Scheduler {
     /// reservation, and block references.
     pub fn complete_restore_io(&mut self, lane: usize) -> Result<LaneState, SchedError> {
         self.check_lane_idx(lane)?;
-        let Some(block) = self.lanes[lane].restore_io_block.take() else {
+        let Some(block) = self.lanes[lane].restore_io_block.clone() else {
             return Err(SchedError::Precondition("no restore I/O in flight for lane"));
         };
         match self.lanes[lane].state {
             LaneState::Restoring => {
+                if self.block_tier(&block) == BlockTier::Disk && self.mem_used() >= self.cfg.mem_budget {
+                    return Err(SchedError::Precondition("memory budget full on complete_restore_io"));
+                }
+                self.lanes[lane].restore_io_block = None;
                 if let Some(rec) = self.blocks.get_mut(&block) {
                     if rec.tier == BlockTier::Disk {
                         rec.tier = BlockTier::Both;
@@ -1256,6 +1287,10 @@ impl Scheduler {
                 Ok(LaneState::Restoring)
             }
             LaneState::Cancelling => {
+                if self.step_lanes.contains(&lane) {
+                    return Err(SchedError::Precondition("lane is in active GPU step"));
+                }
+                self.lanes[lane].restore_io_block = None;
                 self.release_lane_to(lane, LaneState::Cancelled);
                 Ok(LaneState::Cancelled)
             }
@@ -1860,7 +1895,7 @@ impl Scheduler {
                 Ok(LaneState::Cancelling)
             }
             LaneState::Restoring if self.lanes[lane].restore_io_block.is_some() => {
-                self.lanes[lane].state = LaneState::Cancelling;
+                self.lanes[lane].state = LaneState::Cancelling; // MUTANT_ANCHOR_CANCEL_IN_RESTORE
                 Ok(LaneState::Cancelling)
             }
             LaneState::Queued | LaneState::Admitted | LaneState::Restoring | LaneState::Ready => {
@@ -2139,6 +2174,17 @@ impl Scheduler {
                     slot.state, slot.wait_ticks, self.cfg.max_bypass
                 ));
             }
+            if let Some(ref bio) = slot.restore_io_block {
+                if !matches!(slot.state, LaneState::Restoring | LaneState::Cancelling)
+                    || !self.lane_block_set(i).contains(bio)
+                    || !self.block_tier(bio).is_present()
+                {
+                    return Err(format!(
+                        "lane {i} restore_io_block {bio:?} orphaned in state {:?}",
+                        slot.state
+                    ));
+                }
+            }
             if slot.state.is_mem_holding() {
                 let dec_bi = prompt_end(slot.target, bsz) / bsz;
                 for (&bi, bid) in slot.full.iter().chain(&slot.win) {
@@ -2294,6 +2340,8 @@ pub enum TraceAction {
     Admit { lane: usize },
     BeginRestore { lane: usize },
     RestoreBlock { lane: usize, block: BlockId },
+    BeginRestoreIO { lane: usize, block: BlockId },
+    CompleteRestoreIO { lane: usize },
     RestoreStartState { lane: usize },
     FinishRestore { lane: usize },
     EvictCleanOrUnrefMem { block: BlockId },
@@ -2320,6 +2368,8 @@ impl TraceAction {
             Self::Admit { .. } => "Admit",
             Self::BeginRestore { .. } => "BeginRestore",
             Self::RestoreBlock { .. } => "RestoreBlock",
+            Self::BeginRestoreIO { .. } => "BeginRestoreIO",
+            Self::CompleteRestoreIO { .. } => "CompleteRestoreIO",
             Self::RestoreStartState { .. } => "RestoreStartState",
             Self::FinishRestore { .. } => "FinishRestore",
             Self::EvictCleanOrUnrefMem { .. } => "EvictCleanOrUnrefMem",
@@ -2415,6 +2465,7 @@ fn tla_trace_action(act: &TraceAction, cfg: &SchedulerConfig) -> String {
         TraceAction::Refuse429 { lane }
         | TraceAction::Admit { lane }
         | TraceAction::BeginRestore { lane }
+        | TraceAction::CompleteRestoreIO { lane }
         | TraceAction::RestoreStartState { lane }
         | TraceAction::FinishRestore { lane }
         | TraceAction::SlideWindow { lane }
@@ -2422,8 +2473,9 @@ fn tla_trace_action(act: &TraceAction, cfg: &SchedulerConfig) -> String {
         | TraceAction::Cancel { lane } => {
             format!("<<\"{}\", \"{}\">>", act.name(), ln[*lane])
         }
-        TraceAction::RestoreBlock { lane, block } => {
-            format!("<<\"RestoreBlock\", \"{}\", {}>>", ln[*lane], tla_block_id(block, ln))
+        TraceAction::RestoreBlock { lane, block }
+        | TraceAction::BeginRestoreIO { lane, block } => {
+            format!("<<\"{}\", \"{}\", {}>>", act.name(), ln[*lane], tla_block_id(block, ln))
         }
         TraceAction::EvictCleanOrUnrefMem { block }
         | TraceAction::StartColdWriteback { block }
@@ -2523,8 +2575,12 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
                     .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln))
             })
             .collect();
+        let rio = slot
+            .restore_io_block
+            .as_ref()
+            .map_or_else(|| "<<\"none\">>".to_string(), |b| tla_block_id(b, ln));
         lane_entries.push(format!(
-            "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, ghostBypass |-> {}, stepSpan |-> {}]",
+            "[state |-> \"{}\", prefix |-> \"{}\", target |-> {}, pos |-> {}, full |-> {}, win |-> {}, reservation |-> {}, admitBudget |-> {}, waitTicks |-> {}, ghostBypass |-> {}, stepSpan |-> {}, restoreIO |-> {}]",
             slot.state.as_tla(),
             slot.prefix,
             slot.target,
@@ -2535,7 +2591,8 @@ fn render_trace_step(cfg: &SchedulerConfig, step: &TraceStep) -> String {
             slot.admit_budget,
             slot.wait_ticks,
             slot.ghost_bypass,
-            step.step_span[i]
+            step.step_span[i],
+            rio
         ));
     }
 
@@ -2665,6 +2722,7 @@ pub fn render_cache_scheduler_tla_bundle(
              /\\ stepPins    = s.stepPins\n\
              /\\ stepIO      = s.stepIO\n\
              /\\ gpuDone     = s.gpuDone\n\
+             /\\ restoreIO   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].restoreIO]\n\
          \n\
          ApplyNext(s) ==\n\
              /\\ blocks'      = HydrateBlocks(s.blocks)\n\
@@ -2686,6 +2744,7 @@ pub fn render_cache_scheduler_tla_bundle(
              /\\ stepPins'    = s.stepPins\n\
              /\\ stepIO'      = s.stepIO\n\
              /\\ gpuDone'     = s.gpuDone\n\
+             /\\ restoreIO'   = [l \\in Lanes |-> s.lanes[LaneIdx(l)].restoreIO]\n\
          \n\
          ReplayInit ==\n\
              /\\ traceIdx \\in 1..Len(Traces)\n\
@@ -2704,6 +2763,8 @@ pub fn render_cache_scheduler_tla_bundle(
              ELSE IF act[1] = \"Admit\"                THEN Admit(act[2])\n\
              ELSE IF act[1] = \"BeginRestore\"         THEN BeginRestore(act[2])\n\
              ELSE IF act[1] = \"RestoreBlock\"         THEN RestoreBlock(act[2], act[3])\n\
+             ELSE IF act[1] = \"BeginRestoreIO\"       THEN BeginRestoreIO(act[2], act[3])\n\
+             ELSE IF act[1] = \"CompleteRestoreIO\"    THEN CompleteRestoreIO(act[2])\n\
              ELSE IF act[1] = \"RestoreStartState\"    THEN RestoreStartState(act[2])\n\
              ELSE IF act[1] = \"FinishRestore\"        THEN FinishRestore(act[2])\n\
              ELSE IF act[1] = \"EvictCleanOrUnrefMem\" THEN (EvictCleanOrUnrefMem /\\ InMemory(act[2]) /\\ blocks'[act[2]].tier \\notin {{\"memory\", \"both\"}})\n\
@@ -2726,7 +2787,8 @@ pub fn render_cache_scheduler_tla_bundle(
                  \\E act \\in {{Traces[traceIdx][stepIdx + 1].act}} : DispatchStep(act)\n\
          \n\
          ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>\n\
-         Conforms == Init /\\ [][Next]_vars\n\
+         InitConforms == (stepIdx = 1) => Init\n\
+         StepConforms == [][Next]_vars\n\
          ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>\n\
          =============================================================================\n"
     );
@@ -2747,9 +2809,11 @@ pub fn render_cache_scheduler_tla_bundle(
           DiskBudget = {}\n\
           MaxQueue = {}\n\
           MaxBypass = {}\n\
+          AsyncRestore = TRUE\n\
           Bug = \"none\"\n\
          INVARIANTS\n\
           TypeOK\n\
+          InitConforms\n\
           StepBlocksInMemoryAndOwned\n\
           SealedValid\n\
           NoDecodeBlocksSealed\n\
@@ -2763,7 +2827,7 @@ pub fn render_cache_scheduler_tla_bundle(
           StepBudgetHolds\n\
           QueueBounded\n\
          PROPERTIES\n\
-          Conforms\n\
+          StepConforms\n\
           ActionConforms\n\
           ActionSealedImmutable\n\
           ActionNoQueuedRefusal\n\
@@ -2812,6 +2876,7 @@ pub struct WalkStats {
     pub admit_bypasses: usize,
     pub step_bypasses: usize,
     pub cancel_in_step: usize,
+    pub cancel_in_restore: usize,
     pub finished: usize,
     pub cold_writebacks: usize,
     pub disk_restores: usize,
@@ -2819,64 +2884,123 @@ pub struct WalkStats {
     pub max_wait_ticks_seen: u32,
 }
 
-/// Run one deterministic multi-lane workload walk on `Scheduler`, recording every state
-/// transition and named `TraceAction` into a `SchedulerTrace` for TLC verification.
+/// Run one deterministic multi-lane workload walk on `Scheduler`, checking every runtime
+/// invariant at every step and draining all active requests, step I/O, and restore I/O
+/// to completion (`U88, U265, U266, U268`).
 pub fn walk_scheduler_trace(
     cfg: SchedulerConfig,
     seed: u64,
     max_ops: usize,
 ) -> Result<(SchedulerTrace, WalkStats), SchedError> {
+    walk_scheduler_trace_opts(cfg, seed, max_ops, true)
+}
+
+pub fn walk_scheduler_trace_opts(
+    cfg: SchedulerConfig,
+    seed: u64,
+    max_ops: usize,
+    verify_invariants: bool,
+) -> Result<(SchedulerTrace, WalkStats), SchedError> {
     let mut sched = Scheduler::new(cfg.clone())?;
+    if verify_invariants {
+        sched.check_invariants().map_err(SchedError::Invariant)?;
+    }
     let mut trace = SchedulerTrace::new(&sched);
     let mut rng = SplitMix::new(seed);
     let mut stats = WalkStats::default();
     let n_lanes = cfg.lanes.len();
 
-    for op in 0..max_ops {
+    let record_checked = |trace: &mut SchedulerTrace,
+                          act: TraceAction,
+                          sched: &Scheduler|
+     -> Result<(), SchedError> {
+        trace.record_action(act, sched);
+        if verify_invariants {
+            sched.check_invariants().map_err(SchedError::Invariant)?;
+        }
+        Ok(())
+    };
+
+    // Total iterations = `max_ops` active workload steps + up to 512 pure drain steps so
+    // every walk deterministically drains to idle/terminal state.
+    for op in 0..(max_ops + 512) {
+        let draining = op >= max_ops;
+        if draining && sched.is_drained() {
+            break;
+        }
+
+        // 0. Complete or cancel any in-flight async restore I/O (`restore_io_block`).
+        if let Some(l) = (0..n_lanes).find(|&i| sched.lanes()[i].restore_io_block.is_some()) {
+            if !matches!(sched.lanes()[l].state, LaneState::Restoring | LaneState::Cancelling) {
+                break;
+            }
+            if !draining && sched.lanes()[l].state == LaneState::Restoring && rng.pick(2) == 0 {
+                sched.cancel(l)?;
+                record_checked(&mut trace, TraceAction::Cancel { lane: l }, &sched)?;
+                stats.cancel_in_restore += 1;
+                continue;
+            }
+            if sched.lanes()[l].state == LaneState::Cancelling
+                || sched.mem_used() < cfg.mem_budget
+                || sched.lanes()[l]
+                    .restore_io_block
+                    .as_ref()
+                    .is_some_and(|b| sched.block_tier(b) != BlockTier::Disk)
+            {
+                let was_restoring = sched.lanes()[l].state == LaneState::Restoring;
+                sched.complete_restore_io(l)?;
+                record_checked(&mut trace, TraceAction::CompleteRestoreIO { lane: l }, &sched)?;
+                if was_restoring {
+                    stats.disk_restores += 1;
+                }
+                continue;
+            }
+        }
+
         // 1. If a step is active: occasionally cancel an InStep lane BEFORE gpu_done or FinishStep
         //    to exercise the InStep -> Cancelling -> Cancelled barrier!
         if sched.step_active() {
             if !sched.gpu_done() {
-                if rng.pick(5) == 0 {
+                if !draining && rng.pick(5) == 0 {
                     if let Some(&victim) = sched
                         .step_lanes()
                         .iter()
                         .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                     {
                         sched.cancel(victim)?;
-                        trace.record_action(TraceAction::Cancel { lane: victim }, &sched);
+                        record_checked(&mut trace, TraceAction::Cancel { lane: victim }, &sched)?;
                         stats.cancel_in_step += 1;
                         continue;
                     }
                 }
                 sched.gpu_execute()?;
-                trace.record_action(TraceAction::GpuExecute, &sched);
+                record_checked(&mut trace, TraceAction::GpuExecute, &sched)?;
                 continue;
             }
             if !sched.step_io().is_empty() {
                 if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
                     sched.complete_step_io()?;
-                    trace.record_action(TraceAction::CompleteStepIO, &sched);
+                    record_checked(&mut trace, TraceAction::CompleteStepIO, &sched)?;
                     continue;
                 } else if sched.reclaim_cold_disk() {
-                    trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                    record_checked(&mut trace, TraceAction::ReclaimColdDisk, &sched)?;
                     continue;
                 }
             }
-            if rng.pick(9) == 0 {
+            if !draining && rng.pick(9) == 0 {
                 if let Some(&victim) = sched
                     .step_lanes()
                     .iter()
                     .find(|&&l| sched.lanes()[l].state == LaneState::InStep)
                 {
                     sched.cancel(victim)?;
-                    trace.record_action(TraceAction::Cancel { lane: victim }, &sched);
+                    record_checked(&mut trace, TraceAction::Cancel { lane: victim }, &sched)?;
                     stats.cancel_in_step += 1;
                     continue;
                 }
             }
             sched.complete_step()?;
-            trace.record_action(TraceAction::FinishStep, &sched);
+            record_checked(&mut trace, TraceAction::FinishStep, &sched)?;
             continue;
         }
 
@@ -2884,10 +3008,10 @@ pub fn walk_scheduler_trace(
         if !sched.step_io().is_empty() {
             if sched.disk_used() + sched.step_io().len() as u32 <= cfg.disk_budget {
                 sched.complete_step_io()?;
-                trace.record_action(TraceAction::CompleteStepIO, &sched);
+                record_checked(&mut trace, TraceAction::CompleteStepIO, &sched)?;
                 continue;
             } else if sched.reclaim_cold_disk() {
-                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                record_checked(&mut trace, TraceAction::ReclaimColdDisk, &sched)?;
                 continue;
             }
         }
@@ -2898,7 +3022,7 @@ pub fn walk_scheduler_trace(
                 && sched.lanes()[i].pos == sched.lanes()[i].target
         }) {
             sched.finish_ready(l)?;
-            trace.record_action(TraceAction::FinishReady { lane: l }, &sched);
+            record_checked(&mut trace, TraceAction::FinishReady { lane: l }, &sched)?;
             stats.finished += 1;
             continue;
         }
@@ -2908,7 +3032,7 @@ pub fn walk_scheduler_trace(
             .find(|&i| sched.lanes()[i].state == LaneState::Ready && !sched.window_pruned(i))
         {
             if sched.slide_window(l) {
-                trace.record_action(TraceAction::SlideWindow { lane: l }, &sched);
+                record_checked(&mut trace, TraceAction::SlideWindow { lane: l }, &sched)?;
                 stats.slide_windows += 1;
                 continue;
             }
@@ -2917,30 +3041,38 @@ pub fn walk_scheduler_trace(
         // 3. Relieve memory or start-state pressure lazily.
         if sched.mem_pressure() {
             if let Some(block) = sched.evict_clean_or_unref_mem_id() {
-                trace.record_action(TraceAction::EvictCleanOrUnrefMem { block }, &sched);
+                record_checked(&mut trace, TraceAction::EvictCleanOrUnrefMem { block }, &sched)?;
                 continue;
             }
             if let Some(block) = sched.start_cold_writeback() {
-                trace.record_action(TraceAction::StartColdWriteback { block }, &sched);
+                record_checked(&mut trace, TraceAction::StartColdWriteback { block }, &sched)?;
                 stats.cold_writebacks += 1;
                 continue;
             }
             if sched.reclaim_cold_disk() {
-                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                record_checked(&mut trace, TraceAction::ReclaimColdDisk, &sched)?;
                 continue;
             }
         }
         if sched.state_mem_pressure() {
             if let Some((prefix, boundary)) = sched.evict_clean_start_state() {
-                trace.record_action(TraceAction::EvictCleanStartState { prefix, boundary }, &sched);
+                record_checked(
+                    &mut trace,
+                    TraceAction::EvictCleanStartState { prefix, boundary },
+                    &sched,
+                )?;
                 continue;
             }
             if let Some((prefix, boundary)) = sched.spill_start_state() {
-                trace.record_action(TraceAction::SpillStartState { prefix, boundary }, &sched);
+                record_checked(
+                    &mut trace,
+                    TraceAction::SpillStartState { prefix, boundary },
+                    &sched,
+                )?;
                 continue;
             }
             if sched.reclaim_cold_disk() {
-                trace.record_action(TraceAction::ReclaimColdDisk, &sched);
+                record_checked(&mut trace, TraceAction::ReclaimColdDisk, &sched)?;
                 continue;
             }
         }
@@ -2960,7 +3092,7 @@ pub fn walk_scheduler_trace(
                     }
                     stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
                 }
-                trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
+                record_checked(&mut trace, TraceAction::BuildStep { spans: built.spans }, &sched)?;
                 continue;
             }
         }
@@ -2969,6 +3101,7 @@ pub fn walk_scheduler_trace(
         let mut advanced_ceiling = false;
         if let Some(l) = (0..n_lanes).find(|&i| {
             sched.lanes()[i].state == LaneState::Restoring
+                && sched.lanes()[i].restore_io_block.is_none()
                 && sched.lanes()[i].wait_ticks >= cfg.max_bypass
         }) {
             let disk_blk = sched
@@ -2976,21 +3109,32 @@ pub fn walk_scheduler_trace(
                 .into_iter()
                 .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
-                if sched.restore_block(l, &b).is_ok() {
-                    trace.record_action(
-                        TraceAction::RestoreBlock { lane: l, block: b },
+                if !draining && rng.pick(2) == 0 && sched.begin_restore_io(l, &b).is_ok() {
+                    record_checked(
+                        &mut trace,
+                        TraceAction::BeginRestoreIO { lane: l, block: b },
                         &sched,
-                    );
+                    )?;
+                    advanced_ceiling = true;
+                } else if sched.restore_block(l, &b).is_ok() {
+                    record_checked(
+                        &mut trace,
+                        TraceAction::RestoreBlock { lane: l, block: b.clone() },
+                        &sched,
+                    )?;
                     stats.disk_restores += 1;
+                    if !verify_invariants && sched.block_tier(&b) == BlockTier::Disk {
+                        break;
+                    }
                     advanced_ceiling = true;
                 }
             } else if !sched.start_state_ready(l) {
                 if sched.restore_start_state(l).is_ok() {
-                    trace.record_action(TraceAction::RestoreStartState { lane: l }, &sched);
+                    record_checked(&mut trace, TraceAction::RestoreStartState { lane: l }, &sched)?;
                     advanced_ceiling = true;
                 }
             } else if sched.finish_restore(l).is_ok() {
-                trace.record_action(TraceAction::FinishRestore { lane: l }, &sched);
+                record_checked(&mut trace, TraceAction::FinishRestore { lane: l }, &sched)?;
                 advanced_ceiling = true;
             }
         }
@@ -3003,7 +3147,7 @@ pub fn walk_scheduler_trace(
                 && sched.can_advance_admitted(i)
         }) {
             sched.begin_restore(l)?;
-            trace.record_action(TraceAction::BeginRestore { lane: l }, &sched);
+            record_checked(&mut trace, TraceAction::BeginRestore { lane: l }, &sched)?;
             continue;
         }
         if let Some(l) = sched
@@ -3012,17 +3156,23 @@ pub fn walk_scheduler_trace(
             .copied()
             .find(|&q| sched.lanes()[q].wait_ticks >= cfg.max_bypass && sched.can_admit_now(q))
         {
+            let before_waits: Vec<u32> = sched.lanes().iter().map(|slot| slot.wait_ticks).collect();
             sched.admit(l)?;
-            trace.record_action(TraceAction::Admit { lane: l }, &sched);
+            for (i, slot) in sched.lanes().iter().enumerate() {
+                if slot.state == LaneState::Queued && slot.wait_ticks > before_waits[i] {
+                    stats.admit_bypasses += 1;
+                }
+                stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(slot.wait_ticks);
+            }
+            record_checked(&mut trace, TraceAction::Admit { lane: l }, &sched)?;
             stats.admits += 1;
             continue;
         }
 
-        // 5. Mix arrivals, admissions, restores, and steps deterministically (draining near end).
-        let draining = op + 36 >= max_ops;
+        // 5. Mix arrivals, admissions, restores, and steps deterministically (draining after `max_ops`).
         let roll = rng.pick(100);
 
-        if !draining && roll < 32 {
+        if !draining && (op < 2 || roll < 36) {
             let idle: Vec<usize> = (0..n_lanes)
                 .filter(|&i| sched.lanes()[i].state.is_terminal_or_idle())
                 .collect();
@@ -3031,10 +3181,11 @@ pub fn walk_scheduler_trace(
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                trace.record_action(
+                record_checked(
+                    &mut trace,
                     TraceAction::Arrive { lane: l, prefix: pfx, target: len },
                     &sched,
-                );
+                )?;
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;
@@ -3043,7 +3194,7 @@ pub fn walk_scheduler_trace(
             }
         }
 
-        if roll < 68 {
+        if !draining && roll < 68 {
             let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
             if let Some(built) = sched.build_step()? {
                 for (i, l) in sched.lanes().iter().enumerate() {
@@ -3052,43 +3203,63 @@ pub fn walk_scheduler_trace(
                     }
                     stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
                 }
-                trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
+                record_checked(&mut trace, TraceAction::BuildStep { spans: built.spans }, &sched)?;
                 continue;
             }
         }
 
         // Advance Restoring lanes (longest-waiting first).
         let mut restoring: Vec<usize> = (0..n_lanes)
-            .filter(|&i| sched.lanes()[i].state == LaneState::Restoring)
+            .filter(|&i| {
+                sched.lanes()[i].state == LaneState::Restoring
+                    && sched.lanes()[i].restore_io_block.is_none()
+            })
             .collect();
         restoring.sort_by_key(|&i| (std::cmp::Reverse(sched.lanes()[i].wait_ticks), i));
         let mut did_restore = false;
+        let mut stuttered = false;
         for l in restoring {
             let disk_blk = sched
                 .lane_block_set(l)
                 .into_iter()
                 .find(|b| sched.block_tier(b) == BlockTier::Disk);
             if let Some(b) = disk_blk {
-                if sched.restore_block(l, &b).is_ok() {
-                    trace.record_action(
-                        TraceAction::RestoreBlock { lane: l, block: b },
+                if !draining && rng.pick(2) == 0 && sched.begin_restore_io(l, &b).is_ok() {
+                    record_checked(
+                        &mut trace,
+                        TraceAction::BeginRestoreIO { lane: l, block: b },
                         &sched,
-                    );
+                    )?;
+                    did_restore = true;
+                    break;
+                } else if sched.restore_block(l, &b).is_ok() {
+                    record_checked(
+                        &mut trace,
+                        TraceAction::RestoreBlock { lane: l, block: b.clone() },
+                        &sched,
+                    )?;
                     stats.disk_restores += 1;
+                    if !verify_invariants && sched.block_tier(&b) == BlockTier::Disk {
+                        stuttered = true;
+                        break;
+                    }
                     did_restore = true;
                     break;
                 }
             } else if !sched.start_state_ready(l) {
                 if sched.restore_start_state(l).is_ok() {
-                    trace.record_action(TraceAction::RestoreStartState { lane: l }, &sched);
+                    record_checked(&mut trace, TraceAction::RestoreStartState { lane: l }, &sched)?;
                     did_restore = true;
                     break;
                 }
             } else if sched.finish_restore(l).is_ok() {
-                trace.record_action(TraceAction::FinishRestore { lane: l }, &sched);
+                record_checked(&mut trace, TraceAction::FinishRestore { lane: l }, &sched)?;
                 did_restore = true;
                 break;
             }
+        }
+        if stuttered {
+            break;
         }
         if did_restore {
             continue;
@@ -3097,7 +3268,7 @@ pub fn walk_scheduler_trace(
         // Advance Admitted -> Restoring.
         if let Some(l) = (0..n_lanes).find(|&i| sched.can_advance_admitted(i)) {
             sched.begin_restore(l)?;
-            trace.record_action(TraceAction::BeginRestore { lane: l }, &sched);
+            record_checked(&mut trace, TraceAction::BeginRestore { lane: l }, &sched)?;
             continue;
         }
 
@@ -3110,12 +3281,12 @@ pub fn walk_scheduler_trace(
                 }
                 stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
             }
-            trace.record_action(TraceAction::Admit { lane: admitted }, &sched);
+            record_checked(&mut trace, TraceAction::Admit { lane: admitted }, &sched)?;
             stats.admits += 1;
             continue;
         }
 
-        // Fallback: build a step if possible.
+        // Build a step if possible.
         let before_waits: Vec<u32> = sched.lanes().iter().map(|l| l.wait_ticks).collect();
         if let Some(built) = sched.build_step()? {
             for (i, l) in sched.lanes().iter().enumerate() {
@@ -3124,7 +3295,7 @@ pub fn walk_scheduler_trace(
                 }
                 stats.max_wait_ticks_seen = stats.max_wait_ticks_seen.max(l.wait_ticks);
             }
-            trace.record_action(TraceAction::BuildStep { spans: built.spans }, &sched);
+            record_checked(&mut trace, TraceAction::BuildStep { spans: built.spans }, &sched)?;
             continue;
         }
 
@@ -3133,10 +3304,11 @@ pub fn walk_scheduler_trace(
                 let pfx = cfg.prefixes[rng.pick(cfg.prefixes.len())].clone();
                 let len = cfg.request_lengths[rng.pick(cfg.request_lengths.len())];
                 let outcome = sched.arrive(l, &pfx, len)?;
-                trace.record_action(
+                record_checked(
+                    &mut trace,
                     TraceAction::Arrive { lane: l, prefix: pfx, target: len },
                     &sched,
-                );
+                )?;
                 stats.arrivals += 1;
                 if outcome == ArriveOutcome::Refused429 {
                     stats.refused_429 += 1;
@@ -3147,6 +3319,9 @@ pub fn walk_scheduler_trace(
         break;
     }
 
+    if verify_invariants && !sched.is_drained() {
+        return Err(SchedError::Invariant("scheduler walk failed to drain completely".into()));
+    }
     stats.steps = trace.steps.len();
     Ok((trace, stats))
 }
@@ -4031,7 +4206,8 @@ mod tests {
         let (tr, _) = walk_scheduler_trace(cfg, 0, 60).unwrap();
         let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
         assert!(data.contains("MODULE TraceData"));
-        assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
+        assert!(check.contains("InitConforms == (stepIdx = 1) => Init"));
+        assert!(check.contains("StepConforms == [][Next]_vars"));
         assert!(check.contains("ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>"));
         assert!(tlc_cfg.contains("BypassBoundHolds"));
         assert!(tlc_cfg.contains("NoDecodeBlocksSealed"));

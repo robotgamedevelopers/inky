@@ -92,6 +92,9 @@ Restart == /\ rollback' = NoRollback /\ ~alive /\ alive' = TRUE
            /\ UNCHANGED <<conns, owner>>
 Next == (\E c \in Clients : Connect(c) \/ Close(c)) \/ (\E v \in Values : OwnerSets(v)) \/ Crash \/ Restart
 Spec == Init /\ [][Next]_vars /\ WF_vars(Restart) /\ WF_vars(\E c \in Clients : Close(c))
+\* Reversed liveness witness (`UnfairRestart.cfg`): omitting weak fairness of
+\* `Restart` lets a crashed helper stay down forever with the limit raised.
+SpecUnfair == Init /\ [][Next]_vars /\ WF_vars(\E c \in Clients : Close(c))
 
 \* in inky mode exactly while someone is connected to a running helper
 RaisedWhileConnected == alive /\ conns # {} => limit = Target

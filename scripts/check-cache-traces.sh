@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Bind `src/blocks.rs`, `src/cache_trace.rs`, and `src/cache_scheduler.rs` to
 # `specs/BlockLayout.tla` and `specs/CacheScheduler.tla`: replay deterministic
-# walks through pinned TLC, and require single-line mutations of the production
-# files to be rejected by TLC with a counterexample. CPU-only: rustc and Java.
+# walks through pinned TLC (requiring non-zero spill, restore, drop, slide,
+# reclaim, admit-bypass, step-bypass, cancel, and 429 coverage), and pin every
+# single-line production mutation to the exact TLA+ property it violates.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 : "${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR to the pinned tla2tools.jar}"
@@ -56,8 +57,13 @@ check_production() {
         cat "$dir/cs/tlc.log" >&2
         return 1
     }
+    run_tlc_bundle "$dir/sp_512" "$root/specs/SpanPins.tla" || { cat "$dir/sp_512/tlc.log" >&2; return 1; }
+    grep -Fq 'Model checking completed. No error has been found.' "$dir/sp_512/tlc.log" || {
+        cat "$dir/sp_512/tlc.log" >&2
+        return 1
+    }
     {
-        for b in bl_base0 bl_high_fp16 bl_high_kv8 cs; do
+        for b in bl_base0 bl_high_fp16 bl_high_kv8 cs sp_512; do
             echo "$b: $(grep -Em1 '^[0-9,]+ states generated' "$dir/$b/tlc.log")"
         done
         cat "$dir/walk.log"
@@ -65,8 +71,8 @@ check_production() {
 }
 
 check_mutant() {
-    local name=$1 target_file=$2 bundle=$3 spec_name=$4 old=$5 new=$6
-    local dir=$work/$name status src orig
+    local name=$1 expected=$2 target_file=$3 bundle=$4 spec_name=$5 old=$6 new=$7
+    local dir=$work/$name status orig
     mkdir -p "$dir"
     cp "$orig_blocks" "$dir/blocks.rs"
     cp "$orig_sched" "$dir/cache_scheduler.rs"
@@ -91,7 +97,7 @@ pathlib.Path(dst).write_text(s.replace(old, new, 1))
         return 1
     fi
     compile_gen "$dir" || return 1
-    "$dir/generate" "$dir" "$bundle" 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
+    "$dir/generate" "$dir" "$bundle" --mutant 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
     [[ -f "$dir/$bundle/TraceCheck.tla" ]] || {
         cat "$dir/walk.log" >&2
         echo "ERROR: $name produced no TraceCheck.tla" >&2
@@ -103,13 +109,12 @@ pathlib.Path(dst).write_text(s.replace(old, new, 1))
     else
         status=$?
     fi
-    if [[ $status != 12 && $status != 13 ]] || \
-        ! grep -Eq 'Action property .* is violated|Temporal properties were violated|Invariant .* is violated' "$dir/$bundle/tlc.log"; then
+    if [[ $status != 12 && $status != 13 ]] || ! grep -Fxq "Error: $expected" "$dir/$bundle/tlc.log"; then
         cat "$dir/$bundle/tlc.log" "$dir/walk.log" >&2
-        echo "ERROR: $name failed without a TLC conformance counterexample (exit $status)" >&2
+        echo "ERROR: $name did not fail with pinned 'Error: $expected' (exit $status)" >&2
         return 1
     fi
-    echo "$name rejected: $(grep -Em1 'is violated|were violated' "$dir/$bundle/tlc.log")" > "$dir/result"
+    echo "$name rejected: Error: $expected" > "$dir/result"
 }
 
 names=() pids=()
@@ -117,45 +122,65 @@ start() { names+=("$1"); "${@:2}" & pids+=($!); }
 
 start production check_production
 
-# 1. Real blocks::byte_offset 32-bit truncation on >= 4 GiB slot -> rejected by Address64
-start trunc-real-byte-offset check_mutant trunc-real-byte-offset blocks.rs bl_high_fp16 BlockLayout.tla \
+# 1. Real blocks::byte_offset 32-bit truncation on >= 4 GiB slot -> Address64
+start trunc-real-byte-offset check_mutant trunc-real-byte-offset \
+    'Invariant Address64 is violated.' blocks.rs bl_high_fp16 BlockLayout.tla \
     'mul_offset(u64::from(slot.pool_index().get()), kind.stride_bytes(kvb)?)' \
     'mul_offset(u64::from(slot.pool_index().get()), kind.stride_bytes(kvb)?).map(|o| o & 0xffff_ffff)'
 
-# 2. Real blocks::byte_offset 1-based off-by-one (slot.get() instead of pool_index()) -> rejected by Address64
-start off1-byte-offset check_mutant off1-byte-offset blocks.rs bl_base0 BlockLayout.tla \
+# 2. Real blocks::byte_offset 1-based off-by-one (slot.get() instead of pool_index()) -> Address64
+start off1-byte-offset check_mutant off1-byte-offset \
+    'Invariant Address64 is violated.' blocks.rs bl_base0 BlockLayout.tla \
     'mul_offset(u64::from(slot.pool_index().get()), kind.stride_bytes(kvb)?)' \
     'mul_offset(u64::from(slot.get()), kind.stride_bytes(kvb)?)'
 
-# 3. SlotRecord::reissue resetting generation to 1 instead of bumping -> rejected by Conforms
-start reissue-gen-reset check_mutant reissue-gen-reset blocks.rs bl_base0 BlockLayout.tla \
+# 3. SlotRecord::reissue resetting generation to 1 instead of bumping -> StepConforms
+start reissue-gen-reset check_mutant reissue-gen-reset \
+    'Action property StepConforms is violated.' blocks.rs bl_base0 BlockLayout.tla \
     '        self.bump_generation()?;' \
     '        self.generation = 1;'
 
-# 4. Finish leaving stale entries in done lane's table while releasing refs -> rejected by GenerationMatches
-start stale-finish check_mutant stale-finish cache_scheduler.rs bl_base0 BlockLayout.tla \
+# 4. Finish leaving stale entries in done lane's table while releasing refs -> StepConforms
+start stale-finish check_mutant stale-finish \
+    'Action property StepConforms is violated.' cache_scheduler.rs bl_base0 BlockLayout.tla \
     '            l.table = BlockTable::new(num_blocks)?; // MUTANT_ANCHOR_CLEAR_TABLE' \
     '            let _ = num_blocks;'
 
-# 5. Admit dropping wait_ticks increment on bypassed queued lane (MaxQueue=2) -> rejected by Conforms
-start admit-wait-dropped check_mutant admit-wait-dropped cache_scheduler.rs cs CacheScheduler.tla \
+# 5. Admit dropping wait_ticks increment on bypassed queued lane (MaxQueue=2) -> BypassBoundHolds
+start admit-wait-dropped check_mutant admit-wait-dropped \
+    'Invariant BypassBoundHolds is violated.' cache_scheduler.rs cs CacheScheduler.tla \
     '                q.wait_ticks += 1; // MUTANT_ANCHOR_ADMIT_BYPASS' \
     '                let _ = 0;'
 
-# 6. BuildStep dropping wait_ticks increment on StepBypassed lane -> rejected by Conforms
-start step-bypass-dropped check_mutant step-bypass-dropped cache_scheduler.rs cs CacheScheduler.tla \
+# 6. BuildStep dropping wait_ticks increment on StepBypassed lane -> BypassBoundHolds
+start step-bypass-dropped check_mutant step-bypass-dropped \
+    'Invariant BypassBoundHolds is violated.' cache_scheduler.rs cs CacheScheduler.tla \
     '                q.wait_ticks += 1; // MUTANT_ANCHOR_STEP_BYPASS' \
     '                let _ = 0;'
 
-# 7. Allocating unsealed private tail with non-zero payload -> rejected by UnsealedPrivateInvisibleZero
-start priv-tail-dirty check_mutant priv-tail-dirty cache_scheduler.rs cs CacheScheduler.tla \
+# 7. Allocating unsealed private tail with non-zero payload -> UnsealedPrivateInvisibleZero
+start priv-tail-dirty check_mutant priv-tail-dirty \
+    'Invariant UnsealedPrivateInvisibleZero is violated.' cache_scheduler.rs cs CacheScheduler.tla \
     '                    data: vec![0; bsz as usize], // MUTANT_ANCHOR_PRIV_ZERO' \
     '                    data: vec![1; bsz as usize],'
 
-# 8. Silent no-op stutter on RestoreBlock (state unchanged despite claiming RestoreBlock) -> rejected by ActionConforms
-start noop-restore-block check_mutant noop-restore-block cache_scheduler.rs cs CacheScheduler.tla \
+# 8. Silent no-op stutter on RestoreBlock (`U68`) -> ActionConforms
+start noop-restore-block check_mutant noop-restore-block \
+    'Action property ActionConforms is violated.' cache_scheduler.rs cs CacheScheduler.tla \
     '        b.tier = "both"; // MUTANT_ANCHOR_RESTORE_BLOCK' \
     '        let _ = &b;'
+
+# 9. Non-LRU cold-block victim order (`U193`: lexicographic prefix order instead of oldest tick) -> ActionLruOrder
+start non-lru-writeback check_mutant non-lru-writeback \
+    'Action property ActionLruOrder is violated.' cache_scheduler.rs cs CacheScheduler.tla \
+    '        v.sort_by_key(|id| (self.blocks[id].last_used_tick, id.clone())); // MUTANT_ANCHOR_LRU_COLD_MEM' \
+    '        v.sort_by_key(|id| id.clone());'
+
+# 10. Real blocks::span_window_blocks capped at 17 instead of 25 (`U170`, DESIGN.md '17 instead of 25') -> Covered
+start cap17-span-pins check_mutant cap17-span-pins \
+    'Invariant Covered is violated.' blocks.rs sp_512 SpanPins.tla \
+    '    Ok((lo_blk..=hi_blk).map(BlockIndex::new).collect()) // MUTANT_ANCHOR_SPAN_WIN_BLOCKS' \
+    '    Ok((lo_blk..=hi_blk.min(16)).map(BlockIndex::new).collect())'
 
 failed=0
 for i in "${!pids[@]}"; do
@@ -167,4 +192,4 @@ for i in "${!pids[@]}"; do
     fi
 done
 [[ $failed = 0 ]] || exit 1
-echo "cache traces conform to BlockLayout and CacheScheduler; all $(( ${#names[@]} - 1 )) production mutations rejected."
+echo "cache traces conform to BlockLayout and CacheScheduler; all $(( ${#names[@]} - 1 )) pinned production mutations rejected."

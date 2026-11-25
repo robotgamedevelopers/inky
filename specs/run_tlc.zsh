@@ -147,8 +147,11 @@ check BlockLayoutHigh BlockLayout
 check BlockLayoutKv8 BlockLayout
 check StaleEntry BlockLayout GenerationMatches
 check WindowOffByOne BlockLayout WindowCovered
+check FullDropped BlockLayout FullCovered
 check SpanTooSmall BlockLayout SpanPinned
 check StartReleased BlockLayout StartRetained
+check TailNotZeroed BlockLayout TailPrivateZero
+check WrongTableIndex BlockLayout TableIndex
 check Truncate32 BlockLayout Address64
 check SlotOverlap BlockLayout Address64
 check SlabWord SlabWord
@@ -177,6 +180,8 @@ check SwaRing SwaRing
 check SwaRingShortWriteback SwaRing RingHoldsExactWindow
 check SpanPins512 SpanPins
 check SpanPins17 SpanPins Covered
+check SpanPinsOverBound SpanPins BoundHolds
+check SpanPinsMax24 SpanPins MaximumIs25
 check GroupedLayout3 GroupedLayout
 check GroupedLayout4 GroupedLayout
 check LocalMatch GroupedLayout VisitedKeys
@@ -189,10 +194,12 @@ check AdvanceUnfair GroupedLayout TraversalCompletes temporal
 # so only StagedOnce can see it. Restage above proves the same mutant is live.
 check RestageOutputs GroupedLayout
 check StartTails2 StartTails
+check LaneStaleGen StartTails LaneCovered
 check UnheldWindow StartTails StartRetained
 check PrunedUnderStart StartTails StartRetained
 check TailOverread StartTails ReadsWritten
 check ReuseNotZeroed StartTails TailPrivateZero
+check DanglingHead StartTails HeadsConsistent
 # Three slots per kind takes about a minute on one worker: the nightly workflow runs it via layout-nightly.
 check_nightly StartTails3 StartTails
 check PoisonGate3 PoisonGate
@@ -200,6 +207,7 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+check PoisonNoZero PoisonGate NoFalsePoison
 check ScratchTail3 ScratchTail
 check ScratchTail4 ScratchTail
 check ScratchTailOneSpan ScratchTail

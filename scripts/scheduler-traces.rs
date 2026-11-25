@@ -9,8 +9,8 @@ use std::fs;
 use std::path::Path;
 
 use scheduler::{
-    render_cache_scheduler_tla_bundle, walk_scheduler_trace, ArriveOutcome, BlockTier, LaneState,
-    Scheduler, SchedulerConfig, SchedulerTrace, TraceAction,
+    render_cache_scheduler_tla_bundle, walk_scheduler_trace_opts, ArriveOutcome, BlockTier,
+    LaneState, Scheduler, SchedulerConfig, SchedulerTrace, TraceAction, WalkStats,
 };
 
 fn trace_cfg() -> SchedulerConfig {
@@ -31,199 +31,319 @@ fn trace_cfg() -> SchedulerConfig {
     }
 }
 
+fn rec(t: &mut SchedulerTrace, act: TraceAction, s: &Scheduler, strict: bool) {
+    t.record_action(act, s);
+    if strict {
+        s.check_invariants().expect("scheduler runtime invariant violated during trace");
+    }
+}
+
+fn drain_to_idle(t: &mut SchedulerTrace, s: &mut Scheduler, strict: bool) {
+    let n_lanes = s.lanes().len();
+    for _ in 0..128 {
+        if s.is_drained() {
+            break;
+        }
+        if let Some(l) = (0..n_lanes).find(|&i| s.lanes()[i].restore_io_block.is_some()) {
+            s.complete_restore_io(l).unwrap();
+            rec(t, TraceAction::CompleteRestoreIO { lane: l }, s, strict);
+            continue;
+        }
+        if s.step_active() {
+            if !s.gpu_done() {
+                s.gpu_execute().unwrap();
+                rec(t, TraceAction::GpuExecute, s, strict);
+                continue;
+            }
+            if !s.step_io().is_empty() {
+                s.complete_step_io().unwrap();
+                rec(t, TraceAction::CompleteStepIO, s, strict);
+                continue;
+            }
+            s.complete_step().unwrap();
+            rec(t, TraceAction::FinishStep, s, strict);
+            continue;
+        }
+        if !s.step_io().is_empty() {
+            s.complete_step_io().unwrap();
+            rec(t, TraceAction::CompleteStepIO, s, strict);
+            continue;
+        }
+        if let Some(l) = (0..n_lanes).find(|&i| {
+            s.lanes()[i].state == LaneState::Ready && s.lanes()[i].pos == s.lanes()[i].target
+        }) {
+            s.finish_ready(l).unwrap();
+            rec(t, TraceAction::FinishReady { lane: l }, s, strict);
+            continue;
+        }
+        if let Some(l) =
+            (0..n_lanes).find(|&i| s.lanes()[i].state == LaneState::Ready && !s.window_pruned(i))
+        {
+            if s.slide_window(l) {
+                rec(t, TraceAction::SlideWindow { lane: l }, s, strict);
+                continue;
+            }
+        }
+        if s.mem_pressure() {
+            if let Some(block) = s.evict_clean_or_unref_mem_id() {
+                rec(t, TraceAction::EvictCleanOrUnrefMem { block }, s, strict);
+                continue;
+            }
+            if let Some(block) = s.start_cold_writeback() {
+                rec(t, TraceAction::StartColdWriteback { block }, s, strict);
+                continue;
+            }
+            if s.reclaim_cold_disk() {
+                rec(t, TraceAction::ReclaimColdDisk, s, strict);
+                continue;
+            }
+        }
+        if let Some(l) = (0..n_lanes).find(|&i| s.lanes()[i].state == LaneState::Restoring) {
+            let disk_blk = s
+                .lane_block_set(l)
+                .into_iter()
+                .find(|b| s.block_tier(b) == BlockTier::Disk);
+            if let Some(b) = disk_blk {
+                s.restore_block(l, &b).unwrap();
+                rec(t, TraceAction::RestoreBlock { lane: l, block: b }, s, strict);
+                continue;
+            }
+            if !s.start_state_ready(l) {
+                s.restore_start_state(l).unwrap();
+                rec(t, TraceAction::RestoreStartState { lane: l }, s, strict);
+                continue;
+            }
+            s.finish_restore(l).unwrap();
+            rec(t, TraceAction::FinishRestore { lane: l }, s, strict);
+            continue;
+        }
+        if let Some(l) = (0..n_lanes).find(|&i| s.can_advance_admitted(i)) {
+            s.begin_restore(l).unwrap();
+            rec(t, TraceAction::BeginRestore { lane: l }, s, strict);
+            continue;
+        }
+        if let Some(l) = s.admit_next().unwrap() {
+            rec(t, TraceAction::Admit { lane: l }, s, strict);
+            continue;
+        }
+        if let Some(built) = s.build_step().unwrap() {
+            rec(t, TraceAction::BuildStep { spans: built.spans }, s, strict);
+            continue;
+        }
+        break;
+    }
+    if strict {
+        assert!(s.is_drained(), "targeted scheduler trace failed to drain completely");
+    }
+}
+
 /// Deterministic targeted trace that explicitly exercises:
-/// - Admit bypass (`Queued` lane 0 of len 4 bypassed by younger `Queued` lane 1 of len 2),
+/// - Admit bypass (`Queued` lane 1 of len 4 bypassed by younger `Queued` lane 2 of len 2),
 /// - Step bypass up to ceiling `W = 2` (and verifying `build_step` refuses to bypass past `W`),
-/// - Cancel-in-step barrier (`InStep -> Cancelling -> Cancelled` across `gpu_execute` + `complete_step`).
-fn targeted_edge_trace(cfg: SchedulerConfig) -> SchedulerTrace {
+/// - Cancel-in-step barrier (`InStep -> Cancelling -> Cancelled` across `gpu_execute` + `complete_step`),
+/// - Full drain to terminal/idle state.
+fn targeted_edge_trace(cfg: SchedulerConfig, strict: bool) -> SchedulerTrace {
     let mut s = Scheduler::new(cfg).expect("init scheduler");
+    if strict {
+        s.check_invariants().unwrap();
+    }
     let mut t = SchedulerTrace::new(&s);
 
-    // 1. Lane a arrives with len 2 (wc=2), admits, restores, becomes Ready.
     assert_eq!(s.arrive(0, "p1", 2).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 2 }, &s);
+    rec(&mut t, TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 2 }, &s, strict);
     s.admit(0).unwrap();
-    t.record_action(TraceAction::Admit { lane: 0 }, &s);
+    rec(&mut t, TraceAction::Admit { lane: 0 }, &s, strict);
     s.begin_restore(0).unwrap();
-    t.record_action(TraceAction::BeginRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::BeginRestore { lane: 0 }, &s, strict);
     s.finish_restore(0).unwrap();
-    t.record_action(TraceAction::FinishRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::FinishRestore { lane: 0 }, &s, strict);
 
-    // 2. Lane b arrives with len 4 (wc=4 -> cannot fit while lane a holds 2 of 4 blocks),
-    //    then younger lane c arrives with len 2 (wc=2 -> fits and leapfrogs lane b!).
     assert_eq!(s.arrive(1, "p2", 4).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 1, prefix: "p2".into(), target: 4 }, &s);
+    rec(&mut t, TraceAction::Arrive { lane: 1, prefix: "p2".into(), target: 4 }, &s, strict);
     assert_eq!(s.arrive(2, "p1", 2).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 2, prefix: "p1".into(), target: 2 }, &s);
-    // Admit lane c -> bypasses older queued lane b (b.wait_ticks becomes 1).
+    rec(&mut t, TraceAction::Arrive { lane: 2, prefix: "p1".into(), target: 2 }, &s, strict);
     s.admit(2).unwrap();
-    t.record_action(TraceAction::Admit { lane: 2 }, &s);
+    rec(&mut t, TraceAction::Admit { lane: 2 }, &s, strict);
 
-    // 3. Lane c is now Admitted (can_advance_admitted == true, wait_ticks == 0).
-    //    Run 2 steps on lane a while lane c stays Admitted -> c.wait_ticks reaches 1, then 2 (= W)!
     if let Some(built) = s.build_step().unwrap() {
-        t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
+        rec(&mut t, TraceAction::BuildStep { spans: built.spans }, &s, strict);
         s.gpu_execute().unwrap();
-        t.record_action(TraceAction::GpuExecute, &s);
+        rec(&mut t, TraceAction::GpuExecute, &s, strict);
         s.complete_step().unwrap();
-        t.record_action(TraceAction::FinishStep, &s);
+        rec(&mut t, TraceAction::FinishStep, &s, strict);
     }
     if s.slide_window(0) {
-        t.record_action(TraceAction::SlideWindow { lane: 0 }, &s);
+        rec(&mut t, TraceAction::SlideWindow { lane: 0 }, &s, strict);
     }
     if let Some(built) = s.build_step().unwrap() {
-        t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
-        // Cancel lane a mid-step before gpu_execute -> exercises InStep -> Cancelling -> Cancelled!
+        rec(&mut t, TraceAction::BuildStep { spans: built.spans }, &s, strict);
         let _ = s.cancel(0).unwrap();
-        t.record_action(TraceAction::Cancel { lane: 0 }, &s);
+        rec(&mut t, TraceAction::Cancel { lane: 0 }, &s, strict);
         s.gpu_execute().unwrap();
-        t.record_action(TraceAction::GpuExecute, &s);
+        rec(&mut t, TraceAction::GpuExecute, &s, strict);
         s.complete_step().unwrap();
-        t.record_action(TraceAction::FinishStep, &s);
+        rec(&mut t, TraceAction::FinishStep, &s, strict);
     }
 
-    // 4. Now lane c has wait_ticks == 2 (== W). Bring lane a back Ready and attempt build_step
-    //    while lane c is still Admitted at W: production build_step MUST refuse (Ok(None)),
-    //    whereas bypass-ceiling mutant will bypass c to wait_ticks == 3 (> W) -> TLC violation!
     assert_eq!(s.arrive(0, "p1", 2).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 2 }, &s);
+    rec(&mut t, TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 2 }, &s, strict);
     s.admit(0).unwrap();
-    t.record_action(TraceAction::Admit { lane: 0 }, &s);
+    rec(&mut t, TraceAction::Admit { lane: 0 }, &s, strict);
     s.begin_restore(0).unwrap();
-    t.record_action(TraceAction::BeginRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::BeginRestore { lane: 0 }, &s, strict);
     s.finish_restore(0).unwrap();
-    t.record_action(TraceAction::FinishRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::FinishRestore { lane: 0 }, &s, strict);
 
     if let Some(built) = s.build_step().unwrap() {
         // Only taken if bypass-ceiling check was sabotaged!
-        t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
+        rec(&mut t, TraceAction::BuildStep { spans: built.spans }, &s, strict);
         s.gpu_execute().unwrap();
-        t.record_action(TraceAction::GpuExecute, &s);
+        rec(&mut t, TraceAction::GpuExecute, &s, strict);
         s.complete_step().unwrap();
-        t.record_action(TraceAction::FinishStep, &s);
+        rec(&mut t, TraceAction::FinishStep, &s, strict);
     } else {
-        // Production path: advance lane c at ceiling W first.
         s.begin_restore(2).unwrap();
-        t.record_action(TraceAction::BeginRestore { lane: 2 }, &s);
+        rec(&mut t, TraceAction::BeginRestore { lane: 2 }, &s, strict);
         s.finish_restore(2).unwrap();
-        t.record_action(TraceAction::FinishRestore { lane: 2 }, &s);
-        if let Some(built) = s.build_step().unwrap() {
-            t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
-            s.gpu_execute().unwrap();
-            t.record_action(TraceAction::GpuExecute, &s);
-            s.complete_step().unwrap();
-            t.record_action(TraceAction::FinishStep, &s);
-        }
+        rec(&mut t, TraceAction::FinishRestore { lane: 2 }, &s, strict);
+        drain_to_idle(&mut t, &mut s, strict);
     }
-
-    let _ = LaneState::Cancelled;
     t
 }
 
-/// Deterministic cold-spill + explicit `SlideWindow` + disk `RestoreBlock` trace (`U68` + coverage):
-/// seals `(p1, 2)` via prefill, exercises `SlideWindow` during decode, spills `(p1, 2)` to disk
-/// under memory pressure on `p2`, and restores `(p1, 2)` from disk via `RestoreBlock`.
-fn cold_spill_and_slide_trace(cfg: SchedulerConfig) -> SchedulerTrace {
+/// Deterministic cold-spill + `SlideWindow` + cancel-during-restore (`BeginRestoreIO -> Cancel ->
+/// CompleteRestoreIO`) + atomic `RestoreBlock` + full drain (`U88, U265, U266, U268`).
+fn cold_spill_and_slide_trace(cfg: SchedulerConfig, strict: bool) -> SchedulerTrace {
     let mut s = Scheduler::new(cfg).expect("init scheduler");
+    if strict {
+        s.check_invariants().unwrap();
+    }
     let mut t = SchedulerTrace::new(&s);
 
-    // 1. Lane a runs p1 (len 4): prefill 0->2 (seals (p1, 2)), decode 2->3, SlideWindow, decode 3->4, FinishReady.
     assert_eq!(s.arrive(0, "p1", 4).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 4 }, &s);
+    rec(&mut t, TraceAction::Arrive { lane: 0, prefix: "p1".into(), target: 4 }, &s, strict);
     s.admit(0).unwrap();
-    t.record_action(TraceAction::Admit { lane: 0 }, &s);
+    rec(&mut t, TraceAction::Admit { lane: 0 }, &s, strict);
     s.begin_restore(0).unwrap();
-    t.record_action(TraceAction::BeginRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::BeginRestore { lane: 0 }, &s, strict);
     s.finish_restore(0).unwrap();
-    t.record_action(TraceAction::FinishRestore { lane: 0 }, &s);
+    rec(&mut t, TraceAction::FinishRestore { lane: 0 }, &s, strict);
 
     while s.lanes()[0].pos < 4 {
         if s.slide_window(0) {
-            t.record_action(TraceAction::SlideWindow { lane: 0 }, &s);
+            rec(&mut t, TraceAction::SlideWindow { lane: 0 }, &s, strict);
         }
         let built = s.build_step().unwrap().expect("lane a step");
-        t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
+        rec(&mut t, TraceAction::BuildStep { spans: built.spans }, &s, strict);
         s.gpu_execute().unwrap();
-        t.record_action(TraceAction::GpuExecute, &s);
+        rec(&mut t, TraceAction::GpuExecute, &s, strict);
         s.complete_step().unwrap();
-        t.record_action(TraceAction::FinishStep, &s);
+        rec(&mut t, TraceAction::FinishStep, &s, strict);
     }
     s.finish_ready(0).unwrap();
-    t.record_action(TraceAction::FinishReady { lane: 0 }, &s);
+    rec(&mut t, TraceAction::FinishReady { lane: 0 }, &s, strict);
 
-    // 2. Lane b runs p2 (len 4): prefill 0->2 fills MemBudget=4 (2 cold p1 blocks + 2 p2 blocks).
     assert_eq!(s.arrive(1, "p2", 4).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 1, prefix: "p2".into(), target: 4 }, &s);
+    rec(&mut t, TraceAction::Arrive { lane: 1, prefix: "p2".into(), target: 4 }, &s, strict);
     s.admit(1).unwrap();
-    t.record_action(TraceAction::Admit { lane: 1 }, &s);
+    rec(&mut t, TraceAction::Admit { lane: 1 }, &s, strict);
     s.begin_restore(1).unwrap();
-    t.record_action(TraceAction::BeginRestore { lane: 1 }, &s);
+    rec(&mut t, TraceAction::BeginRestore { lane: 1 }, &s, strict);
     s.finish_restore(1).unwrap();
-    t.record_action(TraceAction::FinishRestore { lane: 1 }, &s);
+    rec(&mut t, TraceAction::FinishRestore { lane: 1 }, &s, strict);
 
     let built = s.build_step().unwrap().expect("lane b prefill");
-    t.record_action(TraceAction::BuildStep { spans: built.spans }, &s);
+    rec(&mut t, TraceAction::BuildStep { spans: built.spans }, &s, strict);
     s.gpu_execute().unwrap();
-    t.record_action(TraceAction::GpuExecute, &s);
+    rec(&mut t, TraceAction::GpuExecute, &s, strict);
     s.complete_step().unwrap();
-    t.record_action(TraceAction::FinishStep, &s);
+    rec(&mut t, TraceAction::FinishStep, &s, strict);
 
     assert!(s.mem_pressure(), "cold p1 blocks must face memory pressure before lane b decode");
     let wb = s.start_cold_writeback().expect("cold writeback");
-    t.record_action(TraceAction::StartColdWriteback { block: wb.clone() }, &s);
+    rec(&mut t, TraceAction::StartColdWriteback { block: wb.clone() }, &s, strict);
     s.complete_step_io().unwrap();
-    t.record_action(TraceAction::CompleteStepIO, &s);
+    rec(&mut t, TraceAction::CompleteStepIO, &s, strict);
 
-    // Cancel lane b and restore p1 on lane c from disk via `RestoreBlock`!
     s.cancel(1).unwrap();
-    t.record_action(TraceAction::Cancel { lane: 1 }, &s);
-    assert_eq!(s.arrive(2, "p1", 4).unwrap(), ArriveOutcome::Queued);
-    t.record_action(TraceAction::Arrive { lane: 2, prefix: "p1".into(), target: 4 }, &s);
-    s.admit(2).unwrap();
-    t.record_action(TraceAction::Admit { lane: 2 }, &s);
-    s.begin_restore(2).unwrap();
-    t.record_action(TraceAction::BeginRestore { lane: 2 }, &s);
+    rec(&mut t, TraceAction::Cancel { lane: 1 }, &s, strict);
 
-    s.restore_block(2, &wb).unwrap();
-    t.record_action(TraceAction::RestoreBlock { lane: 2, block: wb.clone() }, &s);
-    // If a mutant turned `restore_block` into a silent no-op stutter, stop here so TLC rejects it via `ActionConforms`!
+    // Exercise cancel-during-restore (`BeginRestoreIO -> Cancel -> Cancelling -> CompleteRestoreIO -> Cancelled`)!
+    assert_eq!(s.arrive(2, "p1", 4).unwrap(), ArriveOutcome::Queued);
+    rec(&mut t, TraceAction::Arrive { lane: 2, prefix: "p1".into(), target: 4 }, &s, strict);
+    s.admit(2).unwrap();
+    rec(&mut t, TraceAction::Admit { lane: 2 }, &s, strict);
+    s.begin_restore(2).unwrap();
+    rec(&mut t, TraceAction::BeginRestore { lane: 2 }, &s, strict);
+    s.begin_restore_io(2, &wb).unwrap();
+    rec(&mut t, TraceAction::BeginRestoreIO { lane: 2, block: wb.clone() }, &s, strict);
+    let cancel_res = s.cancel(2).unwrap();
+    rec(&mut t, TraceAction::Cancel { lane: 2 }, &s, strict);
+    if cancel_res == LaneState::Cancelling {
+        s.complete_restore_io(2).unwrap();
+        rec(&mut t, TraceAction::CompleteRestoreIO { lane: 2 }, &s, strict);
+    } else {
+        // Sabotaged `cancel-in-restore-early-free` mutant skipped `Cancelling` while `restore_io_block` remained set!
+        return t;
+    }
+
+    // Now restore `p1` on lane 3 from disk via atomic `RestoreBlock` and drain cleanly!
+    assert_eq!(s.arrive(3, "p1", 4).unwrap(), ArriveOutcome::Queued);
+    rec(&mut t, TraceAction::Arrive { lane: 3, prefix: "p1".into(), target: 4 }, &s, strict);
+    s.admit(3).unwrap();
+    rec(&mut t, TraceAction::Admit { lane: 3 }, &s, strict);
+    s.begin_restore(3).unwrap();
+    rec(&mut t, TraceAction::BeginRestore { lane: 3 }, &s, strict);
+    s.restore_block(3, &wb).unwrap();
+    rec(&mut t, TraceAction::RestoreBlock { lane: 3, block: wb.clone() }, &s, strict);
     if s.blocks().get(&wb).is_some_and(|r| r.tier != BlockTier::Disk) {
-        s.finish_restore(2).unwrap();
-        t.record_action(TraceAction::FinishRestore { lane: 2 }, &s);
+        s.finish_restore(3).unwrap();
+        rec(&mut t, TraceAction::FinishRestore { lane: 3 }, &s, strict);
+        drain_to_idle(&mut t, &mut s, strict);
     }
     t
+}
+
+fn add_stats(dst: &mut WalkStats, src: &WalkStats) {
+    dst.steps += src.steps;
+    dst.arrivals += src.arrivals;
+    dst.refused_429 += src.refused_429;
+    dst.admits += src.admits;
+    dst.admit_bypasses += src.admit_bypasses;
+    dst.step_bypasses += src.step_bypasses;
+    dst.cancel_in_step += src.cancel_in_step;
+    dst.cancel_in_restore += src.cancel_in_restore;
+    dst.finished += src.finished;
+    dst.cold_writebacks += src.cold_writebacks;
+    dst.disk_restores += src.disk_restores;
+    dst.slide_windows += src.slide_windows;
+    dst.max_wait_ticks_seen = dst.max_wait_ticks_seen.max(src.max_wait_ticks_seen);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let out_dir = Path::new(args.get(1).map(String::as_str).unwrap_or("."));
+    let strict = args.get(2).map(String::as_str) != Some("--mutant");
     let cfg = trace_cfg();
 
     let mut traces = Vec::new();
-    traces.push(targeted_edge_trace(cfg.clone()));
-    traces.push(cold_spill_and_slide_trace(cfg.clone()));
+    traces.push(targeted_edge_trace(cfg.clone(), strict));
+    traces.push(cold_spill_and_slide_trace(cfg.clone(), strict));
 
-    let mut total_steps = traces[0].steps.len() + traces[1].steps.len();
-    let mut total_cancel = 0usize;
-    let mut total_step_bypass = 0usize;
-    let mut total_admit_bypass = 0usize;
-    let mut total_refuse = 0usize;
-    let mut total_finished = 0usize;
-    let mut total_slide = 0usize;
+    let mut agg = WalkStats::default();
+    agg.steps = traces[0].steps.len() + traces[1].steps.len();
 
-    for seed in 0..12u64 {
-        let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 140)
+    // Seeded walks ONLY — never silently drop short walks (`U265`)!
+    for seed in 0..16u64 {
+        let (trace, stats) = walk_scheduler_trace_opts(cfg.clone(), seed, 160, strict)
             .unwrap_or_else(|e| panic!("walk seed {seed} failed: {e}"));
-        total_steps += trace.steps.len();
-        total_cancel += stats.cancel_in_step;
-        total_step_bypass += stats.step_bypasses;
-        total_admit_bypass += stats.admit_bypasses;
-        total_refuse += stats.refused_429;
-        total_finished += stats.finished;
-        total_slide += stats.slide_windows;
-        if trace.steps.len() >= 2 {
-            traces.push(trace);
-        }
+        assert!(
+            trace.steps.len() >= 2,
+            "walk seed {seed} produced fewer than 2 steps ({})",
+            trace.steps.len()
+        );
+        add_stats(&mut agg, &stats);
+        traces.push(trace);
     }
 
     let (data, check, tlc_cfg) =
@@ -233,15 +353,35 @@ fn main() {
     fs::write(out_dir.join("TraceCheck.tla"), check).expect("write TraceCheck.tla");
     fs::write(out_dir.join("TraceCheck.cfg"), tlc_cfg).expect("write TraceCheck.cfg");
 
+    let required = [
+        ("cold_writebacks", agg.cold_writebacks),
+        ("disk_restores", agg.disk_restores),
+        ("refused_429", agg.refused_429),
+        ("cancel_in_step", agg.cancel_in_step),
+        ("cancel_in_restore", agg.cancel_in_restore),
+        ("admit_bypasses", agg.admit_bypasses),
+        ("step_bypasses", agg.step_bypasses),
+        ("slide_windows", agg.slide_windows),
+        ("finished", agg.finished),
+    ];
+    let summary: Vec<String> = required.iter().map(|(k, v)| format!("{k}={v}")).collect();
     eprintln!(
-        "scheduler-traces: {} traces, {} states, cancel_in_step={}, step_bypass={}, admit_bypass={}, refuse429={}, slide_window={}, finished={}",
+        "scheduler-traces: {} traces, {} states; {}",
         traces.len(),
-        total_steps,
-        total_cancel,
-        total_step_bypass,
-        total_admit_bypass,
-        total_refuse,
-        total_slide,
-        total_finished
+        agg.steps,
+        summary.join(", ")
     );
+
+    if strict {
+        let mut gap = false;
+        for (name, count) in required {
+            if count == 0 {
+                eprintln!("COVERAGE GAP: seeded scheduler walks never reached {name}");
+                gap = true;
+            }
+        }
+        if gap {
+            std::process::exit(1);
+        }
+    }
 }

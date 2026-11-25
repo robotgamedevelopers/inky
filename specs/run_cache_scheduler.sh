@@ -124,7 +124,10 @@ check_run CacheSchedulerDecodePriority CacheScheduler pass
 check_run CacheSchedulerQueuedBypass CacheScheduler pass
 check_run CacheSchedulerBypass2 CacheScheduler pass
 check_run CacheSchedulerMultiBlockSpan CacheScheduler pass
+check_run CacheSchedulerOversizeWindow CacheScheduler pass
+check_run CacheSchedulerCancelRestore CacheScheduler pass
 check_run CancelInStep CacheScheduler invariant StepBlocksInMemoryAndOwned
+check_run CancelInRestore CacheScheduler invariant StepBlocksInMemoryAndOwned
 check_run RestoreSplitBudget CacheScheduler temporal 'a :> "Restoring" @@ b :> "Restoring"'
 check_run BoundaryWindowDropped CacheScheduler invariant LaneHistoryCovered
 check_run UnprunedWindow CacheScheduler invariant BudgetsAndReservations
@@ -136,3 +139,9 @@ check_run StartStateDropped CacheScheduler invariant StartPointsKept
 check_run DecodeBlockSealed CacheScheduler invariant NoDecodeBlocksSealed
 check_run WritebackClobbered CacheScheduler action ActionWritebackProtected
 check_run SpillDisabled CacheScheduler invariant ColdBlocksSpillable
+check_run SealedShortLength CacheScheduler invariant SealedValid
+check_run DirtyPrivTail CacheScheduler invariant UnsealedPrivateInvisibleZero
+check_run StaleRefCount CacheScheduler invariant RefCountMatchesReferrers
+check_run StepOverBudget CacheScheduler invariant StepBudgetHolds
+check_run QueueOverflow CacheScheduler invariant QueueBounded
+check_run SealedMutated CacheScheduler action ActionSealedImmutable
