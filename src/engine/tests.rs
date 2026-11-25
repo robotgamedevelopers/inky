@@ -2143,12 +2143,16 @@ fn dspark_verify_capacity_guard_bounds_lg_rows_and_struct_layouts() {
 
     let b128 = BArena::new(0, 4096, true, 2, N_VOCAB_PAD);
     assert_eq!(b128.lg_rows, MAX_SPANS as u32);
+    // 32 spans x (1 + 3) = 128 rows fits; 33 spans x (1 + 3) = 132 > 128 fails cleanly.
+    assert_eq!(32 * (1 + 3), b128.lg_rows as usize);
+    assert!(33 * (1 + 3) > b128.lg_rows as usize);
     // 16 spans x (1 + 7) = 128 rows fits exactly; 17 spans x (1 + 7) = 136 > 128 fails cleanly.
     assert_eq!(16 * (1 + 7), b128.lg_rows as usize);
     assert!(17 * (1 + 7) > b128.lg_rows as usize);
 
     let b64 = BArena::new(0, 64, true, 2, N_VOCAB_PAD);
     assert_eq!(b64.lg_rows, 64);
+    assert!(17 * (1 + 3) > b64.lg_rows as usize);
     assert!(9 * (1 + 7) > b64.lg_rows as usize);
 }
 

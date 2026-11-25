@@ -75,7 +75,11 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// report `0` cached prompt tokens in HTTP usage fields (`--hide-cached-tokens`)
                       pub hide_cached_tokens: bool,
                       /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
-                      pub kv8: bool }
+                      pub kv8: bool,
+                      /// opt-in DSpark drafter GGUF path (`--dspark`; `None` keeps standard 1-token decode)
+                      pub dspark: Option<std::path::PathBuf>,
+                      /// draft tokens per speculative verify step in `1..=4` (`--draft-k`, default 3)
+                      pub draft_k: usize }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -226,6 +230,31 @@ impl SpillTelemetry {
             self.bytes_used.store(store.used_bytes(), Ordering::Relaxed);
         }
     }
+}
+
+#[derive(Default)]
+struct DsparkTelemetry {
+    draft_k: AtomicUsize,
+    verify_steps: AtomicU64,
+    capacity_fallbacks: AtomicU64,
+    draft_tokens_proposed: AtomicU64,
+    draft_tokens_accepted: AtomicU64,
+    tokens_emitted_verify: AtomicU64,
+}
+
+impl DsparkTelemetry {
+    fn new(draft_k: usize) -> Self {
+        Self {
+            draft_k: AtomicUsize::new(draft_k),
+            ..Self::default()
+        }
+    }
+}
+
+struct DsparkRuntime {
+    drafter: crate::dspark::DsparkDrafter,
+    draft_k: usize,
+    telemetry: Arc<DsparkTelemetry>,
 }
 
 /// Hard thinking-token budget state machine (chadlyb/erisinky): after `budget` tokens inside
@@ -388,11 +417,16 @@ struct Active {
     sampler: Sampler,
     /// Draft stream, seeded once per request (`seed ^ DRAFT_SEED_MIX`). A verify round advances it.
     /// Greedy serve does not read it. It is not the stream `sampler.sample` draws emitted tokens from.
-    #[allow(dead_code)]
     draft_sampler: Sampler,
     think: ThinkBudget,
     tool_grammar: Option<crate::json_grammar::ToolCallGrammar>,
     pending: Option<u32>,
+    /// Multi-token output queue populated by speculative verify steps (`1..=1+k` tokens).
+    /// Empty on standard 1-token decode.
+    emit_q: VecDeque<u32>,
+    /// Committed token history `[prompt..., generated...]` tracked only when `--dspark` is enabled.
+    history: Vec<u32>,
+    track_history: bool,
 }
 
 impl Active {
@@ -441,12 +475,15 @@ impl Active {
                 eos,
             );
         }
+        if self.track_history {
+            self.history.push(tok);
+        }
         self.pending = Some(tok);
     }
 
     fn step_input(&self, runnable: bool) -> crate::scheduler::ServeLaneInput {
         let mut prefill_target = effective_pf_target(self.n_past, self.pf_end);
-        let mut decode = self.pending.is_some() && self.n_past < self.pf_end + self.gen;
+        let mut decode = self.pending.is_some() && self.emit_q.is_empty() && self.n_past < self.pf_end + self.gen;
         if self.job.loopcd_omega > 0.0 {
             // The final prompt token produces the first guided distribution. Its decode-written
             // KV stays private; only ordinary prefill rows can enter a shared checkpoint.
@@ -644,12 +681,6 @@ fn wait_for_gpu_completion(
             }
         }
     }
-}
-
-/// Wait for an already-committed `MTLCommandBuffer` up to `DEFAULT_GPU_STEP_TIMEOUT`.
-#[cfg(test)]
-fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
-    wait_committed_step_bounded(cb, stage, DEFAULT_GPU_STEP_TIMEOUT, None)
 }
 
 /// Wait for an already-committed `MTLCommandBuffer` up to `timeout` and inspect its completion status.
@@ -1013,6 +1044,7 @@ fn scheduler(
     spill_telemetry: Option<&SpillTelemetry>,
     health: Arc<SchedulerHealth>,
     deferrals: Arc<DeferralCounters>,
+    dspark_rt: Option<&DsparkRuntime>,
     #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
@@ -1270,6 +1302,8 @@ fn scheduler(
                     .tool_catalog
                     .as_ref()
                     .map(|cat| crate::json_grammar::ToolCallGrammar::new(cat.clone()));
+                let track_history = dspark_rt.is_some();
+                let history = if track_history { j.toks.to_vec() } else { Vec::new() };
                 lanes[i].job = Some(Active {
                     pf_end: j_len,
                     n_past: start,
@@ -1282,6 +1316,9 @@ fn scheduler(
                     think,
                     tool_grammar,
                     pending: None,
+                    emit_q: VecDeque::new(),
+                    history,
+                    track_history,
                     job: j,
                 });
                 pool_deferred[i] = false;
@@ -1604,6 +1641,442 @@ fn scheduler(
             }
             Some(crate::scheduler::ServeStepPlan::Decode(need_dec)) => {
                 health.begin_step(Instant::now());
+                // Opt-in DSpark speculative verification (`--dspark`):
+                // Enforces `check_verify_capacity` (`spans * (1 + k) <= lg_rows = 128`); any capacity
+                // overflow, ineligible lane, or block-pool pressure falls back cleanly to standard
+                // 1-token `encode_decode` for that step without failing or dropping any lane.
+                let mut ran_verify = false;
+                if let Some(ds_rt) = dspark_rt {
+                    use crate::scheduler::{
+                        select_verify_or_decode_fallback, DecodeStepDispatch, VerifyFallbackReason,
+                        VerifyLaneEligibility,
+                    };
+                    let elig: Vec<VerifyLaneEligibility> = need_dec
+                        .iter()
+                        .map(|&i| {
+                            let a = lanes[i].job.as_ref().unwrap();
+                            let p0 = a.n_past;
+                            let rem_tokens = a.job.max.saturating_sub(a.gen);
+                            let rem_ctx = eng.max_ctx.saturating_sub(p0 + 2);
+                            let max_k = rem_tokens.saturating_sub(1).min(rem_ctx).min(ds_rt.draft_k);
+                            let think_ok = a.think.budget == 0
+                                || !a.think.in_think
+                                || a.think.used + ds_rt.draft_k < a.think.budget;
+                            let grammar_ok = !a.tool_grammar.as_ref().is_some_and(|g| g.is_in_json());
+                            let eligible = a.n_past >= a.pf_end
+                                && a.pending.is_some()
+                                && a.job.loopcd_omega == 0.0
+                                && think_ok
+                                && grammar_ok
+                                && max_k >= 1;
+                            VerifyLaneEligibility {
+                                lane: i,
+                                p0,
+                                max_k,
+                                kv_cap: eng.max_ctx,
+                                eligible,
+                            }
+                        })
+                        .collect();
+                    match select_verify_or_decode_fallback(
+                        &need_dec,
+                        &elig,
+                        ds_rt.draft_k,
+                        eng.verify_row_capacity(),
+                        eng.hgemm,
+                    ) {
+                        DecodeStepDispatch::FallbackDecode { reason, .. } => {
+                            if matches!(reason, VerifyFallbackReason::CapacityExceeded { .. }) {
+                                ds_rt.telemetry.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        DecodeStepDispatch::Verify { lanes: v_lanes, k } => {
+                            if eng.check_verify_capacity(v_lanes.len(), k).is_err() {
+                                ds_rt.telemetry.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                let mut allocated_per_lane: Vec<(
+                                    usize,
+                                    Vec<(crate::blocks::BlockKind, crate::blocks::BlockIndex)>,
+                                )> = Vec::with_capacity(v_lanes.len());
+                                let mut alloc_ok = true;
+                                {
+                                    let mut pools = eng.block_pool().borrow_mut();
+                                    for &i in &v_lanes {
+                                        let p0 = lanes[i].job.as_ref().unwrap().n_past;
+                                        let mut tbl = lanes[i].lane.block_table().borrow_mut();
+                                        match cache.ensure_span_blocks_tracking(&mut pools, &mut tbl, p0, 1 + k) {
+                                            Ok(alloc) => allocated_per_lane.push((i, alloc)),
+                                            Err(_) => {
+                                                alloc_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !alloc_ok {
+                                        for (i, alloc) in allocated_per_lane.drain(..).rev() {
+                                            let mut tbl = lanes[i].lane.block_table().borrow_mut();
+                                            for &(kind, bi) in alloc.iter().rev() {
+                                                tbl.clear_kind_entry(pools.of_mut(kind), bi)
+                                                    .expect("rollback verify pool-pressure allocation");
+                                            }
+                                        }
+                                    }
+                                }
+                                if alloc_ok {
+                                    let mut proposals = Vec::with_capacity(v_lanes.len());
+                                    for &i in &v_lanes {
+                                        let a = lanes[i].job.as_mut().unwrap();
+                                        let anchor = a.pending.unwrap();
+                                        let p0 = a.n_past;
+                                        let need_logits = !a.sampler.greedy();
+                                        let ban = a.think.ban_token(&sp);
+                                        let prop = ds_rt.drafter.propose(
+                                            &a.history,
+                                            k,
+                                            need_logits,
+                                            ban,
+                                            &mut a.draft_sampler,
+                                        );
+                                        eng.on(&lanes[i].lane).set_tokens(p0, &[anchor]);
+                                        proposals.push((p0, ban, prop));
+                                    }
+                                    let spans: Vec<Span> = v_lanes
+                                        .iter()
+                                        .zip(&proposals)
+                                        .map(|(&i, &(p0, _, _))| Span {
+                                            lane: &lanes[i].lane,
+                                            p0,
+                                            t: 1 + k,
+                                        })
+                                        .collect();
+                                    let began = Instant::now();
+                                    let cb = eng.gpu.cmd();
+                                    if eng.try_encode_verify(&cb, &spans, k).is_err() {
+                                        // Capacity or precondition fallback: release draft blocks and fall back cleanly.
+                                        {
+                                            let mut pools = eng.block_pool().borrow_mut();
+                                            for (i, alloc) in allocated_per_lane.into_iter().rev() {
+                                                let mut tbl = lanes[i].lane.block_table().borrow_mut();
+                                                for &(kind, bi) in alloc.iter().rev() {
+                                                    tbl.clear_kind_entry(pools.of_mut(kind), bi)
+                                                        .expect("rollback verify precondition allocation");
+                                                }
+                                            }
+                                        }
+                                        ds_rt.telemetry.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        ran_verify = true;
+                                        for (&i, &(p0, _, ref prop)) in v_lanes.iter().zip(&proposals) {
+                                            eng.on(&lanes[i].lane).set_tokens(p0 + 1, &prop.tokens);
+                                        }
+                                        cb.commit();
+                                        let waiting_cancelled = overlap_host_work_during_gpu(
+                                            &rx,
+                                            &mut queue,
+                                            &lanes,
+                                            &mut planner,
+                                            &mut cache,
+                                            metrics,
+                                        );
+                                        if let Err(e) = wait_committed_step_bounded(&cb, "verify", health.gpu_step_timeout(), Some(&health)) {
+                                            {
+                                                let mut pools = eng.block_pool().borrow_mut();
+                                                for (si, (i, alloc)) in allocated_per_lane.into_iter().enumerate() {
+                                                    let p0 = proposals[si].0;
+                                                    let l = &mut lanes[i];
+                                                    eng.rollback_verify(&l.lane, si, 0);
+                                                    let mut tbl = l.lane.block_table().borrow_mut();
+                                                    cache.finish_verify_span(
+                                                        &mut pools,
+                                                        &mut tbl,
+                                                        &mut l.blocks,
+                                                        &alloc,
+                                                        p0,
+                                                        0,
+                                                    );
+                                                }
+                                            }
+                                            fail_step(eng, &mut cache, &mut lanes, v_lanes.iter().copied(), e, metrics, &mut tick_seq);
+                                            let _ = planner.complete_step();
+                                            for i in v_lanes {
+                                                planner.on_finish(i);
+                                            }
+                                            release_cancelled_waiting(
+                                                &waiting_cancelled,
+                                                eng,
+                                                &mut cache,
+                                                &mut lanes,
+                                                &mut planner,
+                                                metrics,
+                                                &mut tick_seq,
+                                            );
+                                            continue;
+                                        }
+                                        let elapsed = began.elapsed();
+
+                                        // Verify every lane via GPU `k_dspark_reject` (greedy `temp < 1e-5`
+                                        // or full-vocab stochastic `uses_gpu_gumbel`) or exact CPU
+                                        // `Sampler::verify_round` (stochastic with `top_k > 0 || top_p < 1.0`).
+                                        let all_gpu_reject = v_lanes.iter().all(|&i| {
+                                            let a = lanes[i].job.as_ref().unwrap();
+                                            a.sampler.greedy() || a.uses_gpu_gumbel()
+                                        });
+                                        let mut span_decisions: Vec<Result<Vec<u32>, String>> =
+                                            Vec::with_capacity(v_lanes.len());
+                                        if all_gpu_reject {
+                                            let any_stoch = v_lanes
+                                                .iter()
+                                                .any(|&i| !lanes[i].job.as_ref().unwrap().sampler.greedy());
+                                            let nv = eng.n_vocab;
+                                            let mut dtoks_flat = Vec::with_capacity(v_lanes.len() * k);
+                                            let mut dlg_flat = Vec::with_capacity(if any_stoch {
+                                                v_lanes.len() * k * nv
+                                            } else {
+                                                0
+                                            });
+                                            let mut params = Vec::with_capacity(v_lanes.len());
+                                            for (&i, &(p0, ban, ref prop)) in v_lanes.iter().zip(&proposals) {
+                                                let a = lanes[i].job.as_ref().unwrap();
+                                                dtoks_flat.extend_from_slice(&prop.tokens);
+                                                if any_stoch {
+                                                    if !prop.logits.is_empty() {
+                                                        dlg_flat.extend_from_slice(&prop.logits);
+                                                    } else {
+                                                        dlg_flat.resize(dlg_flat.len() + k * nv, 0.0);
+                                                    }
+                                                }
+                                                params.push(crate::engine::DSparkRejectSpanParams {
+                                                    seed: a.job.seed,
+                                                    base_pos: (p0 + 1) as u32,
+                                                    ban_tok: ban,
+                                                    temp: a.job.temp,
+                                                });
+                                            }
+                                            match eng.reject_sample_verify_batch_gpu(
+                                                nv,
+                                                k,
+                                                &dtoks_flat,
+                                                &dlg_flat,
+                                                &params,
+                                                eng.softcap,
+                                            ) {
+                                                Ok(outs) => {
+                                                    for o in outs {
+                                                        span_decisions.push(Ok(o.emitted));
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    for _ in 0..v_lanes.len() {
+                                                        span_decisions.push(Err(err.clone()));
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            for (si, (&i, &(p0, ban, ref prop))) in
+                                                v_lanes.iter().zip(&proposals).enumerate()
+                                            {
+                                                let a = lanes[i].job.as_mut().unwrap();
+                                                let base = si * (1 + k);
+                                                if a.sampler.greedy() || a.uses_gpu_gumbel() {
+                                                    let param = crate::engine::DSparkRejectSpanParams {
+                                                        seed: a.job.seed,
+                                                        base_pos: (p0 + 1) as u32,
+                                                        ban_tok: ban,
+                                                        temp: a.job.temp,
+                                                    };
+                                                    let act_buf_rows: Vec<Vec<f32>> =
+                                                        (0..=k).map(|r| eng.span_logits(base + r).to_vec()).collect();
+                                                    let mut flat_t = Vec::with_capacity((1 + k) * eng.vocab_pad());
+                                                    for row in &act_buf_rows {
+                                                        flat_t.extend_from_slice(row);
+                                                        flat_t.resize(flat_t.len() + eng.vocab_pad() - row.len(), 0.0);
+                                                    }
+                                                    let t_bytes: &[u8] = unsafe {
+                                                        std::slice::from_raw_parts(
+                                                            flat_t.as_ptr() as *const u8,
+                                                            flat_t.len() * 4,
+                                                        )
+                                                    };
+                                                    let t_buf = eng.gpu.buffer_with(t_bytes);
+                                                    let res = eng
+                                                        .reject_sample_gpu_spans(
+                                                            &t_buf,
+                                                            0,
+                                                            eng.vocab_pad(),
+                                                            eng.n_vocab,
+                                                            k,
+                                                            &prop.tokens,
+                                                            &prop.logits,
+                                                            &[param],
+                                                            eng.softcap,
+                                                            eng.softcap,
+                                                        )
+                                                        .map(|mut v| v.pop().unwrap().emitted);
+                                                    span_decisions.push(res);
+                                                } else {
+                                                    let t_rows: Vec<Vec<f32>> =
+                                                        (0..=k).map(|r| eng.span_logits(base + r).to_vec()).collect();
+                                                    let finite_ok = t_rows
+                                                        .iter()
+                                                        .all(|row| row.iter().all(|x| x.is_finite()));
+                                                    if !finite_ok {
+                                                        span_decisions
+                                                            .push(Err("model returned non-finite logits".into()));
+                                                    } else {
+                                                        let t_refs: Vec<&[f32]> =
+                                                            t_rows.iter().map(Vec::as_slice).collect();
+                                                        let nv = eng.n_vocab;
+                                                        let d_refs: Vec<&[f32]> = (0..k)
+                                                            .map(|d| &prop.logits[d * nv..(d + 1) * nv])
+                                                            .collect();
+                                                        let emitted =
+                                                            a.sampler.verify_round(&prop.tokens, &t_refs, &d_refs);
+                                                        span_decisions.push(Ok(emitted));
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        for (si, ((i, alloc), decision)) in
+                                            allocated_per_lane.into_iter().zip(span_decisions).enumerate()
+                                        {
+                                            let p0 = proposals[si].0;
+                                            let l = &mut lanes[i];
+                                            let a = l.job.as_mut().unwrap();
+                                            let cancelled = a.job.out.cancelled()
+                                                || planner.state(i) == crate::scheduler::LaneState::Cancelling;
+                                            if cancelled {
+                                                eng.rollback_verify(&l.lane, si, 0);
+                                                {
+                                                    let mut pools = eng.block_pool().borrow_mut();
+                                                    let mut tbl = l.lane.block_table().borrow_mut();
+                                                    cache.finish_verify_span(
+                                                        &mut pools,
+                                                        &mut tbl,
+                                                        &mut l.blocks,
+                                                        &alloc,
+                                                        p0,
+                                                        0,
+                                                    );
+                                                }
+                                                let _ = planner.request_cancel(i);
+                                                continue;
+                                            }
+                                            match decision {
+                                                Ok(raw_emitted) => {
+                                                    let mut final_emitted = Vec::with_capacity(raw_emitted.len());
+                                                    let rem_budget = a
+                                                        .job
+                                                        .max
+                                                        .saturating_sub(a.gen)
+                                                        .min(eng.max_ctx.saturating_sub(p0 + 1));
+                                                    for &raw_tok in &raw_emitted {
+                                                        let obs = a.think.observe(raw_tok, &sp);
+                                                        if let Some(grammar) = &mut a.tool_grammar {
+                                                            grammar.observe_token(
+                                                                obs,
+                                                                &vocab_bytes,
+                                                                sp.msg_model,
+                                                                sp.c_think,
+                                                                sp.c_text,
+                                                                sp.c_tool,
+                                                                sp.end,
+                                                                sp.end_sampling,
+                                                                tk.eos,
+                                                            );
+                                                        }
+                                                        final_emitted.push(obs);
+                                                        let entered_json = a
+                                                            .tool_grammar
+                                                            .as_ref()
+                                                            .is_some_and(|g| g.is_in_json());
+                                                        if obs != raw_tok
+                                                            || stop.contains(&obs)
+                                                            || entered_json
+                                                            || final_emitted.len() >= rem_budget.max(1)
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                    let n_keep = final_emitted.len().clamp(1, 1 + k);
+                                                    let n_acc_final = n_keep.saturating_sub(1);
+                                                    eng.rollback_verify(&l.lane, si, n_keep);
+                                                    {
+                                                        let mut pools = eng.block_pool().borrow_mut();
+                                                        let mut tbl = l.lane.block_table().borrow_mut();
+                                                        cache.finish_verify_span(
+                                                            &mut pools,
+                                                            &mut tbl,
+                                                            &mut l.blocks,
+                                                            &alloc,
+                                                            p0,
+                                                            n_keep,
+                                                        );
+                                                    }
+                                                    eng.sync_lane_block_table(&l.lane, p0 + n_keep - 1, 1);
+                                                    a.timing.generation.add(n_keep, elapsed);
+                                                    a.n_past = p0 + n_keep;
+                                                    a.pending = final_emitted.last().copied();
+                                                    if a.track_history {
+                                                        a.history.extend_from_slice(&final_emitted);
+                                                    }
+                                                    a.emit_q.extend(final_emitted);
+                                                    ds_rt.telemetry.verify_steps.fetch_add(1, Ordering::Relaxed);
+                                                    ds_rt
+                                                        .telemetry
+                                                        .draft_tokens_proposed
+                                                        .fetch_add(k as u64, Ordering::Relaxed);
+                                                    ds_rt
+                                                        .telemetry
+                                                        .draft_tokens_accepted
+                                                        .fetch_add(n_acc_final as u64, Ordering::Relaxed);
+                                                    ds_rt
+                                                        .telemetry
+                                                        .tokens_emitted_verify
+                                                        .fetch_add(n_keep as u64, Ordering::Relaxed);
+                                                }
+                                                Err(err) => {
+                                                    eng.rollback_verify(&l.lane, si, 0);
+                                                    {
+                                                        let mut pools = eng.block_pool().borrow_mut();
+                                                        let mut tbl = l.lane.block_table().borrow_mut();
+                                                        cache.finish_verify_span(
+                                                            &mut pools,
+                                                            &mut tbl,
+                                                            &mut l.blocks,
+                                                            &alloc,
+                                                            p0,
+                                                            0,
+                                                        );
+                                                    }
+                                                    l.fail(eng, &mut cache, err, metrics, &mut tick_seq);
+                                                    planner.on_finish(i);
+                                                }
+                                            }
+                                        }
+                                        for cancelled_i in planner.complete_step() {
+                                            if let Some(a) =
+                                                lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq)
+                                            {
+                                                a.log_cancellation(cancelled_i);
+                                            }
+                                        }
+                                        release_cancelled_waiting(
+                                            &waiting_cancelled,
+                                            eng,
+                                            &mut cache,
+                                            &mut lanes,
+                                            &mut planner,
+                                            metrics,
+                                            &mut tick_seq,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ran_verify {
                 let mut live_dec: Vec<usize> = Vec::with_capacity(need_dec.len());
                 let mut exhausted: Vec<(usize, String)> = Vec::new();
                 let mut impossible: Vec<(usize, String)> = Vec::new();
@@ -1755,6 +2228,7 @@ fn scheduler(
                     }
                 }
                 release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
+                }
             }
             None => {
                 // No GPU work can proceed right now (e.g. cold SSD restore in flight or every
@@ -1779,18 +2253,42 @@ fn scheduler(
         for (i, l) in lanes.iter_mut().enumerate() {
             let reason = {
                 let Some(a) = l.job.as_mut() else { continue };
-                let Some(tok) = a.pending else { continue };
-                if a.n_past < a.pf_end { continue; }
-                // a token is emitted once, right after it is sampled: then n_past - pf_end == gen
-                let fresh = a.n_past == a.pf_end + a.gen;
-                if !fresh || a.job.out.backpressured() { continue; }
-                let gone = a.job.out.send(Ev::Tok(tok)).is_err();
-                a.gen += 1;
-                outputs += 1;
-                if gone { Some("cancelled") }
-                else if stop.contains(&tok) { Some("stop") }
-                else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") }
-                else { None }
+                if !a.emit_q.is_empty() {
+                    let mut done_reason = None;
+                    while !a.job.out.backpressured() {
+                        let Some(tok) = a.emit_q.pop_front() else { break };
+                        let gone = a.job.out.send(Ev::Tok(tok)).is_err();
+                        a.gen += 1;
+                        outputs += 1;
+                        if gone {
+                            a.emit_q.clear();
+                            done_reason = Some("cancelled");
+                            break;
+                        } else if stop.contains(&tok) {
+                            a.emit_q.clear();
+                            done_reason = Some("stop");
+                            break;
+                        } else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx {
+                            a.emit_q.clear();
+                            done_reason = Some("length");
+                            break;
+                        }
+                    }
+                    done_reason
+                } else {
+                    let Some(tok) = a.pending else { continue };
+                    if a.n_past < a.pf_end { continue; }
+                    // a token is emitted once, right after it is sampled: then n_past - pf_end == gen
+                    let fresh = a.n_past == a.pf_end + a.gen;
+                    if !fresh || a.job.out.backpressured() { continue; }
+                    let gone = a.job.out.send(Ev::Tok(tok)).is_err();
+                    a.gen += 1;
+                    outputs += 1;
+                    if gone { Some("cancelled") }
+                    else if stop.contains(&tok) { Some("stop") }
+                    else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") }
+                    else { None }
+                }
             };
             if let Some(r) = reason {
                 if let Some(a) = l.release_job(eng, &mut cache, metrics, &mut tick_seq) {
@@ -2883,7 +3381,9 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              /// opt-in Layer 4 SSD spill telemetry (`--spill-dir`)
              spill_telemetry: Option<Arc<SpillTelemetry>>,
              /// cache isolation and client-visible cached-token reporting policy
-             cache_policy: CachePolicy }
+             cache_policy: CachePolicy,
+             /// opt-in DSpark speculative decoding telemetry (`--dspark`)
+             dspark_telemetry: Option<Arc<DsparkTelemetry>> }
 const MAX_CONNS: usize = 512;
 const MAX_PEER_CONNS: usize = 128;
 const MAX_UNAUTH_CONNS: usize = 64;
@@ -3082,6 +3582,23 @@ fn health_response(cx: &Ctx, now: Instant) -> (u16, String) {
         obj.insert("spill_writes_committed".into(), json!(sp.writes_committed.load(Ordering::Relaxed)));
         obj.insert("spill_reads_hit".into(), json!(sp.reads_hit.load(Ordering::Relaxed)));
         obj.insert("spill_bytes_used".into(), json!(sp.bytes_used.load(Ordering::Relaxed)));
+    }
+    if let Some(ds) = &cx.dspark_telemetry {
+        let steps = ds.verify_steps.load(Ordering::Relaxed);
+        let proposed = ds.draft_tokens_proposed.load(Ordering::Relaxed);
+        let accepted = ds.draft_tokens_accepted.load(Ordering::Relaxed);
+        let emitted = ds.tokens_emitted_verify.load(Ordering::Relaxed);
+        let tokens_per_step = if steps > 0 { emitted as f64 / steps as f64 } else { 0.0 };
+        let accept_rate = if proposed > 0 { accepted as f64 / proposed as f64 } else { 0.0 };
+        obj.insert("dspark_enabled".into(), json!(true));
+        obj.insert("dspark_draft_k".into(), json!(ds.draft_k.load(Ordering::Relaxed)));
+        obj.insert("dspark_verify_steps".into(), json!(steps));
+        obj.insert("dspark_capacity_fallbacks".into(), json!(ds.capacity_fallbacks.load(Ordering::Relaxed)));
+        obj.insert("dspark_draft_tokens_proposed".into(), json!(proposed));
+        obj.insert("dspark_draft_tokens_accepted".into(), json!(accepted));
+        obj.insert("dspark_tokens_emitted_verify".into(), json!(emitted));
+        obj.insert("dspark_accepted_tokens_per_verify_step".into(), json!(tokens_per_step));
+        obj.insert("dspark_draft_acceptance_rate".into(), json!(accept_rate));
     }
     (if ok { 200 } else { 503 }, Value::Object(obj).to_string())
 }
@@ -4233,6 +4750,16 @@ fn validate_serve_pre_mode(o: &ServeOpts) -> Result<PreModeServe, (i32, String)>
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS {
         return Err((2, format!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS)));
     }
+    if !(crate::scheduler::MIN_DRAFT_K..=crate::scheduler::MAX_DRAFT_K).contains(&o.draft_k) {
+        return Err((
+            2,
+            format!(
+                "--draft-k must be between {} and {}",
+                crate::scheduler::MIN_DRAFT_K,
+                crate::scheduler::MAX_DRAFT_K
+            ),
+        ));
+    }
     if o.bind.is_empty() || o.bind.iter().any(|a| !is_private_ip(a.ip())) {
         return Err((2, "--bind must resolve only to loopback or private/Tailscale network addresses".into()));
     }
@@ -4384,6 +4911,33 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
         st.sync_from(&cache);
         st
     });
+    let dspark_rt = if let Some(dspark_path) = &o.dspark {
+        match crate::dspark::DsparkDrafter::load(dspark_path, eng.n_vocab, crate::engine::E, tk.eos) {
+            Ok(drafter) => {
+                let meta = drafter.meta().clone();
+                eprintln!(
+                    "[serve] DSpark speculative decoding enabled: {} ({}, layers={}, k={}, lg_rows={})",
+                    dspark_path.display(),
+                    meta.format.as_str(),
+                    meta.n_layers,
+                    o.draft_k,
+                    eng.verify_row_capacity()
+                );
+                Some(DsparkRuntime {
+                    drafter,
+                    draft_k: o.draft_k,
+                    telemetry: Arc::new(DsparkTelemetry::new(o.draft_k)),
+                })
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    let dspark_telemetry = dspark_rt.as_ref().map(|rt| rt.telemetry.clone());
     let cx = Arc::new(Ctx {
         metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens,
         thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
@@ -4401,6 +4955,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
         recorder,
         spill_telemetry: spill_telemetry.clone(),
         cache_policy: CachePolicy { isolate_cache: o.isolate_cache, hide_cached_tokens: o.hide_cached_tokens },
+        dspark_telemetry,
     });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
@@ -4460,6 +5015,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
         spill_telemetry.as_deref(),
         health,
         deferrals,
+        dspark_rt.as_ref(),
         #[cfg(test)]
         None,
     );
@@ -4643,6 +5199,7 @@ mod tests {
             recorder: None,
             spill_telemetry: None,
             cache_policy: CachePolicy::default(),
+            dspark_telemetry: None,
         };
         (cx, rx)
     }
@@ -5646,7 +6203,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -5669,7 +6226,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -5751,6 +6308,7 @@ mod tests {
                 recorder: None,
                 spill_telemetry: None,
                 cache_policy: CachePolicy::default(),
+                dspark_telemetry: None,
             };
             let (done_tx, done_rx) = channel::<()>();
             let scheduler = std::thread::spawn(move || {
@@ -5806,7 +6364,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv().expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -5847,7 +6405,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -5870,7 +6428,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None });
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -5984,7 +6542,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default() };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv().expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -6174,6 +6732,9 @@ mod tests {
                     think: ThinkBudget::new(0),
                     tool_grammar: None,
                     pending: None,
+                    emit_q: VecDeque::new(),
+                    history: Vec::new(),
+                    track_history: false,
                 };
                 assert_eq!(a.step_input(true).needs_decode(), want > 0.0);
                 assert_eq!(a.step_input(true).needs_prefill(), want == 0.0);
@@ -6394,6 +6955,25 @@ mod tests {
         assert_eq!(drained["active_lanes"], 0);
         assert_eq!(drained["inflight"], 0);
         assert_eq!(drained["queued_requests"], 0);
+        assert!(drained.get("dspark_enabled").is_none());
+
+        let ds = Arc::new(DsparkTelemetry::new(3));
+        ds.verify_steps.store(4, Ordering::Relaxed);
+        ds.capacity_fallbacks.store(1, Ordering::Relaxed);
+        ds.draft_tokens_proposed.store(12, Ordering::Relaxed);
+        ds.draft_tokens_accepted.store(9, Ordering::Relaxed);
+        ds.tokens_emitted_verify.store(13, Ordering::Relaxed);
+        cx.dspark_telemetry = Some(ds);
+        let ds_snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        assert_eq!(ds_snap["dspark_enabled"], true);
+        assert_eq!(ds_snap["dspark_draft_k"], 3);
+        assert_eq!(ds_snap["dspark_verify_steps"], 4);
+        assert_eq!(ds_snap["dspark_capacity_fallbacks"], 1);
+        assert_eq!(ds_snap["dspark_draft_tokens_proposed"], 12);
+        assert_eq!(ds_snap["dspark_draft_tokens_accepted"], 9);
+        assert_eq!(ds_snap["dspark_tokens_emitted_verify"], 13);
+        assert!((ds_snap["dspark_accepted_tokens_per_verify_step"].as_f64().unwrap() - 3.25).abs() < 1e-9);
+        assert!((ds_snap["dspark_draft_acceptance_rate"].as_f64().unwrap() - 0.75).abs() < 1e-9);
     }
 
     #[test] fn memory_budget_caps_lanes_from_metal_working_set_and_floors_at_one() {
@@ -6550,7 +7130,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: Some(rec.clone()), spill_telemetry: None, cache_policy: CachePolicy::default(),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: Some(rec.clone()), spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None,
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -6756,7 +7336,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(),
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -6817,7 +7397,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(),
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, spill_telemetry: None, cache_policy: CachePolicy::default(), dspark_telemetry: None,
         });
 
         let req = json!({
@@ -7267,6 +7847,7 @@ mod tests {
                 None,
                 Arc::new(SchedulerHealth::new(Instant::now())),
                 Arc::new(DeferralCounters::default()),
+                None,
                 Some(&mut admissions),
             )
         });
@@ -7484,6 +8065,9 @@ mod tests {
             think: ThinkBudget::new(0),
             tool_grammar: None,
             pending: Some(42),
+            emit_q: VecDeque::new(),
+            history: Vec::new(),
+            track_history: false,
         };
 
         let mut p0_toks: Vec<u32> = (1..=64u32).collect();
@@ -7628,6 +8212,9 @@ mod tests {
             think: ThinkBudget::new(0),
             tool_grammar: None,
             pending: Some(7),
+            emit_q: VecDeque::new(),
+            history: Vec::new(),
+            track_history: false,
         };
 
         let mut planner = ServeStepPlanner::new(2, SERVE_STEP_MAX_BYPASS);
@@ -9089,6 +9676,9 @@ mod tests {
             think: ThinkBudget::new(0),
             tool_grammar: Some(crate::json_grammar::ToolCallGrammar::new(catalog)),
             pending: None,
+            emit_q: VecDeque::new(),
+            history: Vec::new(),
+            track_history: false,
             job,
         };
 
@@ -9321,6 +9911,9 @@ mod tests {
                 think: ThinkBudget::new(0),
                 tool_grammar: None,
                 pending: None,
+                emit_q: VecDeque::new(),
+                history: Vec::new(),
+                track_history: false,
                 job,
             };
             (act, ev)

@@ -347,10 +347,67 @@ struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32,
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct LoopCdArgs { logits_off: u32, n: u32, stride: u32, pad0: u32, softcap: f32, pad1: u32, pad2: u32, pad3: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
+struct DSparkSpanDesc {
+    target_off: u32,
+    draft_lg_off: u32,
+    draft_tok_off: u32,
+    out_off: u32,
+    k: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    base_pos: u32,
+    ban_tok: u32,
+    temp: f32,
+    pad1: u32,
+    pad2: u32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct DSparkRejectArgs {
+    n_vocab: u32,
+    target_stride: u32,
+    draft_stride: u32,
+    temp: f32,
+    target_softcap: f32,
+    draft_softcap: f32,
+    pad0: u32,
+    pad1: u32,
+}
+
+/// Per-span input to [`Engine::verify_speculative_gpu`]: verifies `draft_toks` (length `k`) starting
+/// from the anchor token placed at `p0` (with `draft_toks` placed at `p0 + 1 .. p0 + 1 + k`).
+#[allow(dead_code)]
+pub struct SpeculativeVerifySpan<'a> {
+    pub lane: &'a Lane,
+    pub p0: usize,
+    pub draft_toks: &'a [u32],
+    /// Contiguous `[k][draft_stride]` f32 draft logits when `temp > 0.0` (may be empty when `temp <= 0.0` or `k == 0`).
+    pub draft_logits: &'a [f32],
+    pub draft_stride: usize,
+    pub seed: u64,
+    pub ban_tok: Option<u32>,
+}
+
+/// Output of GPU speculative rejection sampling for one span: `n_accepted` (`0..=k`) accepted draft
+/// tokens, and `emitted` of length `n_accepted + 1` (`draft_toks[..n_accepted]` + resampled/bonus token).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeculativeVerifyOut {
+    pub n_accepted: usize,
+    pub emitted: Vec<u32>,
+}
+
+/// Per-span GPU rejection-sampling parameters for mixed-temperature verify batches in `serve`.
+#[derive(Clone, Copy, Debug)]
+pub struct DSparkRejectSpanParams {
+    pub seed: u64,
+    pub base_pos: u32,
+    pub ban_tok: Option<u32>,
+    /// Per-span temperature (`< 1e-5` = greedy raw argmax, `>= 1e-5` = stochastic rejection sampling).
+    pub temp: f32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
 struct BenchArgs { w_lo: u32, w_hi: u32, row_bytes: u32, nrows: u32, k: u32, x_off: u32, out_off: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct TouchArgs { lo: u32, hi: u32, n16: u32, pad: u32 }
-#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct DSparkSpanDesc {
     target_off: u32,
@@ -362,11 +419,10 @@ struct DSparkSpanDesc {
     seed_hi: u32,
     base_pos: u32,
     ban_tok: u32,
-    pad0: u32,
+    temp: f32,
     pad1: u32,
     pad2: u32,
 }
-#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct DSparkRejectArgs {
     n_vocab: u32,
@@ -395,7 +451,6 @@ pub struct SpeculativeVerifySpan<'a> {
 
 /// Output of GPU speculative rejection sampling for one span: `n_accepted` (`0..=k`) accepted draft
 /// tokens, and `emitted` of length `n_accepted + 1` (`draft_toks[..n_accepted]` + resampled/bonus token).
-#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeculativeVerifyOut {
     pub n_accepted: usize,
@@ -875,7 +930,7 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
-    fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
+    pub fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
     /// Shared Layer 3 `Window` and `Full` GPU block pools (`init_serve_block_pools` sizes multi-slab pools for
     /// `inky serve` and `Layer3Pool`). Interior mutability: callers borrow through the `RefCell`.
     pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
@@ -2399,10 +2454,6 @@ impl Engine {
         let any_logits = span_logits.iter().copied().any(|x| x);
         self.encode_spans_x(cb, spans, any_logits, Some(span_logits), argmax, false, None, None, None);
     }
-    /// Verify step. Each span has length `1 + k` (the last committed token again, then `k` drafts). `k` is the
-    /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
-    /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
-    /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
     /// Validate that a speculative verify batch of `n_spans` spans with `k` draft tokens each
     /// (`n_spans * (1 + k)` total positions and logits rows) fits within `MAX_SPANS`, `chunk`,
     /// `ba.cap`, and the batch logits arena `ba.lg_rows` (`<= 128`).
@@ -2413,7 +2464,9 @@ impl Engine {
         if n_spans > MAX_SPANS {
             return Err(format!("verify span count {n_spans} exceeds MAX_SPANS ({MAX_SPANS})"));
         }
-        let step_len = 1usize.checked_add(k).ok_or_else(|| "verify 1 + k overflowed usize".to_string())?;
+        let step_len = 1usize
+            .checked_add(k)
+            .ok_or_else(|| "verify 1 + k overflowed usize".to_string())?;
         let total_rows = n_spans
             .checked_mul(step_len)
             .ok_or_else(|| "verify total_rows overflowed usize".to_string())?;
@@ -2434,7 +2487,8 @@ impl Engine {
     }
 
     /// Fallible speculative verify step: checks arena row capacity (`spans.len() * (1 + k) <= lg_rows`),
-    /// span lengths, distinct non-tiered lanes, and KV reserve BEFORE allocating snapshots or encoding GPU work.
+    /// span lengths, distinct non-tiered lanes, and Layer 2/3 block/KV preconditions BEFORE allocating
+    /// snapshots or encoding GPU work.
     pub fn try_encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) -> Result<(), String> {
         let _total_rows = self.check_verify_capacity(spans.len(), k)?;
         let t = 1 + k;
@@ -2444,11 +2498,9 @@ impl Engine {
         if spans.iter().any(|s| s.lane.tier.is_some()) {
             return Err("verify does not run on a --kv-disk lane".into());
         }
-        if let Some(first) = spans.first() {
-            let blocked = first.lane.use_blocks.get();
-            if spans.iter().any(|s| s.lane.use_blocks.get() != blocked) {
-                return Err("cannot mix Layer 2 and Layer 3 lanes in one verify step".into());
-            }
+        let blocked = spans[0].lane.use_blocks.get();
+        if spans.iter().any(|s| s.lane.use_blocks.get() != blocked) {
+            return Err("cannot mix Layer 2 and Layer 3 lanes in one verify step".into());
         }
         if spans.len() > 1 && !self.hgemm {
             return Err("multi-span verify requires the fp16 tensor path".into());
@@ -2459,18 +2511,21 @@ impl Engine {
                     return Err(format!("verify spans {i} and {j} reference the same lane"));
                 }
             }
-            let kv_cap = self.on(spans[i].lane).kv_capacity();
-            if spans[i].p0.saturating_add(t) > kv_cap {
-                return Err(format!(
-                    "verify span {i} end {} exceeds lane K/V capacity {kv_cap}: call reserve() first",
-                    spans[i].p0.saturating_add(t)
-                ));
+            if !blocked {
+                let kv_cap = self.on(spans[i].lane).kv_capacity();
+                if spans[i].p0.saturating_add(t) > kv_cap {
+                    return Err(format!(
+                        "verify span {i} end {} exceeds lane K/V capacity {kv_cap}: call reserve() first",
+                        spans[i].p0.saturating_add(t)
+                    ));
+                }
             }
         }
         let stride = N_SLOT * NCH * 3;
         let cs = self.gpu.buffer(spans.len() * t * stride * 4);
         unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
-        let kept = spans.iter().map(|sp| {
+        let mut kept = Vec::with_capacity(spans.len());
+        for sp in spans {
             let mut paged_lengths_before = Vec::new();
             if sp.lane.use_blocks.get() {
                 let pools = self.block_pool.borrow();
@@ -2480,16 +2535,25 @@ impl Engine {
                 for b in lo_b..=hi_b {
                     let bi = crate::blocks::BlockIndex::new(b as u32);
                     for kind in [crate::blocks::BlockKind::Full, crate::blocks::BlockKind::Window] {
-                        let e = tbl.get(kind, bi).expect("verify block index in range")
-                            .unwrap_or_else(|| panic!("verify paged lane missing {kind:?} block {b}"));
-                        let rec = pools.of(kind).record(e.slot()).expect("verify slot record");
-                        assert_eq!(rec.generation(), e.generation(), "stale {kind:?} block {b} in verify");
-                        assert!(!rec.sealed(), "verify must never write into sealed {kind:?} block {b}");
+                        let e = tbl
+                            .get(kind, bi)
+                            .map_err(|err| format!("verify block index {b} out of range: {err}"))?
+                            .ok_or_else(|| format!("verify paged lane missing {kind:?} block {b}"))?;
+                        let rec = pools
+                            .of(kind)
+                            .record(e.slot())
+                            .map_err(|err| format!("verify missing slot record for {kind:?} block {b}: {err}"))?;
+                        if rec.generation() != e.generation() {
+                            return Err(format!("stale {kind:?} block {b} in verify"));
+                        }
+                        if rec.sealed() {
+                            return Err(format!("verify must never write into sealed {kind:?} block {b}"));
+                        }
                         paged_lengths_before.push((kind, bi, rec.length()));
                     }
                 }
             }
-            VerifySpan {
+            kept.push(VerifySpan {
                 lane: sp.lane as *const Lane,
                 p0: sp.p0,
                 kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
@@ -2497,21 +2561,26 @@ impl Engine {
                 tokens_before: (sp.p0..sp.p0 + sp.t).map(|i| self.on(sp.lane).token_at(i)).collect(),
                 paged_lengths_before,
                 accepted_end: None,
-            }
-        }).collect();
+            });
+        }
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
         self.encode_spans_x(cb, spans, true, None, false, false, Some(k), None, None);
         Ok(())
     }
 
+    /// Verify step. Each span has length `1 + k` (the anchor token, then `k` drafts). `k` is the
+    /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
+    /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
+    /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
     pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
         self.try_encode_verify(cb, spans, k).unwrap_or_else(|e| panic!("{e}"));
     }
 
-    /// Execute `k_dspark_reject` on the GPU over pre-populated target logits (`target_buf`, `[n_spans * (1 + k)][target_stride]`)
-    /// and draft proposals/logits, returning exact speculative rejection-sampling decisions per span.
-    #[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
-    pub fn reject_sample_gpu(
+    /// Execute `k_dspark_reject` on the GPU over pre-populated target logits (`target_buf`,
+    /// `[n_spans * (1 + k)][target_stride]`) and draft proposals/logits, supporting per-span
+    /// temperatures (`temp < 1e-5` greedy raw argmax, `temp >= 1e-5` exact rejection sampling).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reject_sample_gpu_spans(
         &self,
         target_buf: &Buf,
         base_target_off: u32,
@@ -2520,22 +2589,24 @@ impl Engine {
         k: usize,
         draft_toks_flat: &[u32],
         draft_logits_flat: &[f32],
-        seeds_and_pos: &[(u64, u32, Option<u32>)],
-        temp: f32,
+        spans: &[DSparkRejectSpanParams],
         target_softcap: f32,
         draft_softcap: f32,
     ) -> Result<Vec<SpeculativeVerifyOut>, String> {
-        let n_spans = seeds_and_pos.len();
+        let n_spans = spans.len();
         if n_spans == 0 {
             return Ok(Vec::new());
         }
-        if !temp.is_finite() || temp < 0.0 {
-            return Err(format!("invalid temperature {temp}"));
+        let any_stochastic = spans.iter().any(|s| s.temp >= 1e-5);
+        for (si, s) in spans.iter().enumerate() {
+            if !s.temp.is_finite() || s.temp < 0.0 {
+                return Err(format!("span {si}: invalid temperature {}", s.temp));
+            }
         }
         if draft_toks_flat.len() != n_spans * k {
             return Err(format!("draft_toks length {} != {} * {k}", draft_toks_flat.len(), n_spans));
         }
-        if temp > 0.0 && k > 0 && draft_logits_flat.len() < n_spans * k * draft_stride {
+        if any_stochastic && k > 0 && draft_logits_flat.len() < n_spans * k * draft_stride {
             return Err(format!(
                 "draft_logits length {} < {} * {k} * {draft_stride}",
                 draft_logits_flat.len(),
@@ -2544,9 +2615,12 @@ impl Engine {
         }
         let out_stride = k + 3;
         let mut descs = Vec::with_capacity(n_spans);
-        for (si, &(seed, base_pos, ban_tok)) in seeds_and_pos.iter().enumerate() {
+        for (si, s) in spans.iter().enumerate() {
             let span_target_off = base_target_off
-                .checked_add(u32::try_from(si * (1 + k) * target_stride).map_err(|_| "target_off overflow".to_string())?)
+                .checked_add(
+                    u32::try_from(si * (1 + k) * target_stride)
+                        .map_err(|_| "target_off overflow".to_string())?,
+                )
                 .ok_or_else(|| "target_off overflow".to_string())?;
             descs.push(DSparkSpanDesc {
                 target_off: span_target_off,
@@ -2554,11 +2628,11 @@ impl Engine {
                 draft_tok_off: (si * k) as u32,
                 out_off: (si * out_stride) as u32,
                 k: k as u32,
-                seed_lo: seed as u32,
-                seed_hi: (seed >> 32) as u32,
-                base_pos,
-                ban_tok: ban_tok.unwrap_or(u32::MAX),
-                pad0: 0,
+                seed_lo: s.seed as u32,
+                seed_hi: (s.seed >> 32) as u32,
+                base_pos: s.base_pos,
+                ban_tok: s.ban_tok.unwrap_or(u32::MAX),
+                temp: s.temp,
                 pad1: 0,
                 pad2: 0,
             });
@@ -2567,7 +2641,7 @@ impl Engine {
             n_vocab: self.n_vocab as u32,
             target_stride: target_stride as u32,
             draft_stride: draft_stride.max(1) as u32,
-            temp,
+            temp: spans[0].temp,
             target_softcap,
             draft_softcap,
             pad0: 0,
@@ -2631,6 +2705,71 @@ impl Engine {
         Ok(results)
     }
 
+    /// Execute `k_dspark_reject` on the GPU directly against the engine's current batch logits buffer (`b.lg`).
+    pub fn reject_sample_verify_batch_gpu(
+        &self,
+        draft_stride: usize,
+        k: usize,
+        draft_toks_flat: &[u32],
+        draft_logits_flat: &[f32],
+        spans: &[DSparkRejectSpanParams],
+        draft_softcap: f32,
+    ) -> Result<Vec<SpeculativeVerifyOut>, String> {
+        let b = self.ba.get();
+        let act_buf = self.act.borrow().clone();
+        self.reject_sample_gpu_spans(
+            &act_buf,
+            b.lg,
+            self.vocab_pad(),
+            draft_stride,
+            k,
+            draft_toks_flat,
+            draft_logits_flat,
+            spans,
+            self.softcap,
+            draft_softcap,
+        )
+    }
+
+    /// Execute `k_dspark_reject` on the GPU over pre-populated target logits (`target_buf`) with shared temperature.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn reject_sample_gpu(
+        &self,
+        target_buf: &Buf,
+        base_target_off: u32,
+        target_stride: usize,
+        draft_stride: usize,
+        k: usize,
+        draft_toks_flat: &[u32],
+        draft_logits_flat: &[f32],
+        seeds_and_pos: &[(u64, u32, Option<u32>)],
+        temp: f32,
+        target_softcap: f32,
+        draft_softcap: f32,
+    ) -> Result<Vec<SpeculativeVerifyOut>, String> {
+        let span_params: Vec<DSparkRejectSpanParams> = seeds_and_pos
+            .iter()
+            .map(|&(seed, base_pos, ban_tok)| DSparkRejectSpanParams {
+                seed,
+                base_pos,
+                ban_tok,
+                temp,
+            })
+            .collect();
+        self.reject_sample_gpu_spans(
+            target_buf,
+            base_target_off,
+            target_stride,
+            draft_stride,
+            k,
+            draft_toks_flat,
+            draft_logits_flat,
+            &span_params,
+            target_softcap,
+            draft_softcap,
+        )
+    }
+
     /// End-to-end fallible GPU speculative verification:
     /// 1. Validates batch-arena row capacity (`spans.len() * (1 + k) <= lg_rows`) and lane preconditions.
     /// 2. Runs `try_encode_verify` to compute target logits across all `1 + k` positions per span while recording `CS` & `KV`.
@@ -2652,16 +2791,18 @@ impl Engine {
             return Err("all spans in verify_speculative_gpu must share the same draft length k".into());
         }
         let draft_stride = reqs[0].draft_stride.max(self.n_vocab);
-        if temp > 0.0 && k > 0 && reqs.iter().any(|r| r.draft_stride != reqs[0].draft_stride || r.draft_logits.len() < k * reqs[0].draft_stride) {
+        if temp >= 1e-5
+            && k > 0
+            && reqs
+                .iter()
+                .any(|r| r.draft_stride != reqs[0].draft_stride || r.draft_logits.len() < k * reqs[0].draft_stride)
+        {
             return Err("when temp > 0 and k > 0, each span must supply k * draft_stride draft logits".into());
         }
         let _ = self.check_verify_capacity(reqs.len(), k)?;
         for (si, r) in reqs.iter().enumerate() {
             if r.draft_toks.iter().any(|&tok| tok as usize >= self.n_vocab) {
                 return Err(format!("span {si}: draft token out of vocabulary range (n_vocab={})", self.n_vocab));
-            }
-            if !r.draft_toks.is_empty() {
-                self.on(r.lane).set_tokens(r.p0 + 1, r.draft_toks);
             }
         }
         let spans: Vec<Span<'_>> = reqs
@@ -2670,37 +2811,51 @@ impl Engine {
             .collect();
         let cb = self.gpu.cmd();
         self.try_encode_verify(&cb, &spans, k)?;
+        for r in reqs {
+            if !r.draft_toks.is_empty() {
+                self.on(r.lane).set_tokens(r.p0 + 1, r.draft_toks);
+            }
+        }
         cb.commit();
         cb.waitUntilCompleted();
         if cb.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            for (si, r) in reqs.iter().enumerate() {
+                self.rollback_verify(r.lane, si, 0);
+            }
             return Err(format!("verify_speculative_gpu forward command buffer failed: {:?}", cb.status()));
         }
 
         let mut draft_toks_flat = Vec::with_capacity(reqs.len() * k);
-        let mut draft_logits_flat = Vec::with_capacity(if temp > 0.0 { reqs.len() * k * draft_stride } else { 0 });
-        let mut seeds_and_pos = Vec::with_capacity(reqs.len());
+        let mut draft_logits_flat = Vec::with_capacity(if temp >= 1e-5 { reqs.len() * k * draft_stride } else { 0 });
+        let mut span_params = Vec::with_capacity(reqs.len());
         for r in reqs {
             draft_toks_flat.extend_from_slice(r.draft_toks);
-            if temp > 0.0 && k > 0 {
+            if temp >= 1e-5 && k > 0 {
                 draft_logits_flat.extend_from_slice(&r.draft_logits[..k * r.draft_stride]);
             }
-            seeds_and_pos.push((r.seed, (r.p0 + 1) as u32, r.ban_tok));
+            span_params.push(DSparkRejectSpanParams {
+                seed: r.seed,
+                base_pos: (r.p0 + 1) as u32,
+                ban_tok: r.ban_tok,
+                temp,
+            });
         }
-        let b = self.ba.get();
-        let act_buf = self.act.borrow().clone();
-        let outs = self.reject_sample_gpu(
-            &act_buf,
-            b.lg,
-            self.vocab_pad(),
-            if temp > 0.0 && k > 0 { reqs[0].draft_stride } else { draft_stride },
+        let outs = match self.reject_sample_verify_batch_gpu(
+            if temp >= 1e-5 && k > 0 { reqs[0].draft_stride } else { draft_stride },
             k,
             &draft_toks_flat,
             &draft_logits_flat,
-            &seeds_and_pos,
-            temp,
-            self.softcap,
+            &span_params,
             draft_softcap,
-        )?;
+        ) {
+            Ok(outs) => outs,
+            Err(err) => {
+                for (si, r) in reqs.iter().enumerate() {
+                    self.rollback_verify(r.lane, si, 0);
+                }
+                return Err(err);
+            }
+        };
         for (si, (r, out)) in reqs.iter().zip(&outs).enumerate() {
             let n_keep = out.n_accepted + 1;
             self.rollback_verify(r.lane, si, n_keep);
