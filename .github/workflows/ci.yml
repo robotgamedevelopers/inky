@@ -33,6 +33,8 @@ jobs:
           out=$(cargo test --locked --bins serve_header_policy 2>&1) || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: crates.io package dry-run
+        run: cargo publish --locked --dry-run
   # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, and replay tools.
   go:
     runs-on: ubuntu-latest

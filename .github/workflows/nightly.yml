@@ -24,6 +24,8 @@ jobs:
         run: cargo build --locked --release
       - name: unit tests (release profile)
         run: cargo test --locked --release --bins
+      - name: crates.io package dry-run
+        run: cargo publish --locked --dry-run
   # The slow layout models (PrefixTree full, StartTails3) and PrefixTree trace mutants on macOS.
   tla-layout-nightly:
     runs-on: macos-latest
