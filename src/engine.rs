@@ -4208,13 +4208,19 @@ mod tests {
         let count_step = |n_lanes: usize, hgemm: bool, logits: bool, argmax: bool, skip: u32, wave2a: bool| -> (usize, usize) {
             let mut dispatches = 0usize;
             let mut barriers = 0usize;
-            let mut add_go = |cls: u32, count: usize| {
+            let add_go = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
                 if skip & (1 << cls) == 0 {
-                    dispatches += count;
-                    barriers += 1;
+                    *d += count;
+                    *b += 1;
                 }
             };
-            add_go(C_EMBED, 1);
+            let add_tohalf = |d: &mut usize, b: &mut usize, cls: u32, count: usize| {
+                if skip & (1 << cls) == 0 {
+                    *d += count;
+                }
+                *b += 1;
+            };
+            add_go(&mut dispatches, &mut barriers, C_EMBED, 1);
 
             let n_uncontrolled = LOOP_START + (LOOP_END - LOOP_START) + (N_PHYS - LOOP_END);
             let n_controlled = (N_PASS - 1) * (LOOP_END - LOOP_START);
@@ -4226,63 +4232,59 @@ mod tests {
                 let repeat = if controlled { n_controlled } else { n_uncontrolled };
                 for _ in 0..repeat {
                     if controlled {
-                        add_go(C_MIXA, 2);
+                        add_go(&mut dispatches, &mut barriers, C_MIXA, 2);
                         let fuse_down = wave2a && ctrl_down_direct_half(skip);
-                        add_go(C_CTRLD, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
                         if !fuse_down {
-                            if skip & (1 << C_CTRLA) == 0 { dispatches += 3; }
-                            barriers += 1;
+                            add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 3);
                         }
-                        add_go(C_CTRLA, 1);
-                        add_go(C_CTRLN, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
                     } else {
-                        add_go(C_MIXA, 1);
+                        add_go(&mut dispatches, &mut barriers, C_MIXA, 1);
                     }
-                    add_go(C_QKV, 1);
-                    add_go(C_ATTN, 1);
-                    add_go(C_COMB, 1);
+                    add_go(&mut dispatches, &mut barriers, C_QKV, 1);
+                    add_go(&mut dispatches, &mut barriers, C_ATTN, 1);
+                    add_go(&mut dispatches, &mut barriers, C_COMB, 1);
                     let direct_half = wave2a && decode_combine_direct_half(hgemm, skip);
                     if !direct_half {
-                        if skip & (1 << C_WO) == 0 { dispatches += 1; }
-                        barriers += 1;
+                        add_tohalf(&mut dispatches, &mut barriers, C_WO, 1);
                     }
-                    add_go(C_WO, 1);
-                    add_go(C_WOPOST, 1);
-                    add_go(C_MIXF, 1);
+                    add_go(&mut dispatches, &mut barriers, C_WO, 1);
+                    add_go(&mut dispatches, &mut barriers, C_WOPOST, 1);
+                    add_go(&mut dispatches, &mut barriers, C_MIXF, 1);
                     if controlled {
                         let fuse_down = wave2a && ctrl_down_direct_half(skip);
-                        add_go(C_CTRLD, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLD, 1);
                         if !fuse_down {
-                            if skip & (1 << C_CTRLA) == 0 { dispatches += 1; }
-                            barriers += 1;
+                            add_tohalf(&mut dispatches, &mut barriers, C_CTRLA, 1);
                         }
-                        add_go(C_CTRLA, 1);
-                        add_go(C_CTRLN, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLA, 1);
+                        add_go(&mut dispatches, &mut barriers, C_CTRLN, 1);
                     }
-                    add_go(C_ROUTER, 1);
+                    add_go(&mut dispatches, &mut barriers, C_ROUTER, 1);
                     if wave2a && use_fused_topk_route3(hgemm, n_lanes) {
-                        add_go(C_TOPK, 1);
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
                     } else {
-                        add_go(C_TOPK, 1);
-                        add_go(C_TOPK, 1);
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
+                        add_go(&mut dispatches, &mut barriers, C_TOPK, 1);
                     }
-                    if skip & (1 << C_GATHER) == 0 { dispatches += 1; }
-                    barriers += 1;
+                    add_tohalf(&mut dispatches, &mut barriers, C_GATHER, 1);
                     let cls_start = if wave2a { moe_class_start(n_lanes) } else { 0 };
                     let n_cls = MOE_CLS.len() - cls_start;
-                    add_go(C_GU, n_cls);
-                    add_go(C_DOWN, n_cls);
-                    add_go(C_COMB2, 1);
-                    add_go(C_FFNPOST, 1);
+                    add_go(&mut dispatches, &mut barriers, C_GU, n_cls);
+                    add_go(&mut dispatches, &mut barriers, C_DOWN, n_cls);
+                    add_go(&mut dispatches, &mut barriers, C_COMB2, 1);
+                    add_go(&mut dispatches, &mut barriers, C_FFNPOST, 1);
                 }
             }
             if logits {
-                add_go(C_OMIX, 1);
-                add_go(C_LMHEAD, 1);
+                add_go(&mut dispatches, &mut barriers, C_OMIX, 1);
+                add_go(&mut dispatches, &mut barriers, C_LMHEAD, 1);
                 if argmax {
                     for _ in 0..n_lanes {
-                        add_go(C_ARGMAX, 1);
-                        add_go(C_ARGMAX, 1);
+                        add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
+                        add_go(&mut dispatches, &mut barriers, C_ARGMAX, 1);
                     }
                 }
             }
