@@ -110,9 +110,9 @@ const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
     "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_attn_combine", "k_attn_combine_dec",
-    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
+    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_devcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -150,7 +150,7 @@ struct AttnBlkDecArgs {
     vconv_w: u32, qclip_w: u32, relclip_w: u32, relbias_w: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct PostConvDecArgs { desc_off: u32, y_off: u32, res_off: u32, out_off: u32, cs_slot_off: u32, convw_off: u32, has_res: u32, pad: u32 }
+struct PostConvDecArgs { desc_off: u32, y_off: u32, res_off: u32, out_off: u32, cs_slot_off: u32, convw_off: u32, has_res: u32, no_state_write: u32 }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct MixJob { n_s: u32, n_q: u32, s_off: [u32; 6], q_off: i32, out_off: [u32; 4], norm_off: [i32; 4], eps: f32, tstride: u32, ncopy: [[i32; 3]; 4], ntok: u32,
@@ -199,7 +199,7 @@ struct MoeArgs {
     dn_lo: u32, dn_hi: u32, dn_expert_bytes: u32, dn_row_bytes: u32,
     dn_type: u32, out_off: u32, res_off: i32, cs_off: u32,
     convw_off: u32, gu_type: u32, gu_gs_lo: u32, gu_gs_hi: u32,
-    dn_gs_lo: u32, dn_gs_hi: u32, pad0: u32, pad1: u32,
+    dn_gs_lo: u32, dn_gs_hi: u32, no_state_write: u32, pad1: u32,
 }
 
 // ---- prefill arg structs (mirror prefill.metal)
@@ -326,6 +326,8 @@ impl BArena {
 struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_index: u32, pad: [u32; 3] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct LoopCdArgs { logits_off: u32, n: u32, stride: u32, pad0: u32, softcap: f32, pad1: u32, pad2: u32, pad3: u32 }
 
 // ----------------------------------------------------------------------------- weights
 #[derive(Clone, Copy, Default, Debug)]
@@ -513,6 +515,12 @@ pub struct Engine {
     /// Shared GPU slab for all Layer 3 blocked lanes' `cs` and 64-bit GPU block tables (`full` + `win`),
     /// with free-list slot recycling on `Drop` of `Lane`.
     blocked_slab: Rc<RefCell<BlockedSlab>>,
+    /// Maximum adaptive LoopCD contrast weight (`0.0` = disabled, `0.0..=4.0`).
+    loopcd_omega: Cell<f32>,
+    /// True iff the most recent forward step ran `k_loopcd_blend` (so output logits are already post-softcap).
+    last_step_loopcd: Cell<bool>,
+    /// Lazy-allocated GPU buffer for weak-pass logits `z_1` (`n_lanes * vocab_pad * 4` bytes).
+    lg_weak: RefCell<Option<Buf>>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
     pub gpu: Gpu,
     pub g: Gguf,
@@ -900,7 +908,8 @@ impl Engine {
         let buffers = self.w.length()
             .saturating_add(self.pb.length())
             .saturating_add(self.ctr.length())
-            .saturating_add(self.act.borrow().length());
+            .saturating_add(self.act.borrow().length())
+            .saturating_add(self.lg_weak.borrow().as_ref().map_or(0, |b| b.length()));
         buffers.max(self.gpu.current_allocated_size()) as u64
     }
     /// Pure worst-case per-lane GPU memory formula at `max_ctx`: full KV + sliding-window KV +
@@ -1025,6 +1034,27 @@ impl Engine {
         let off = b.lg as usize + i * self.vocab_pad();
         unsafe { std::slice::from_raw_parts((self.act.borrow().contents().as_ptr() as *const f32).add(off), self.n_vocab) }
     }
+    /// Configure maximum adaptive LoopCD-Logits contrast weight (`0.0` disables LoopCD).
+    pub fn set_loopcd_omega(&self, omega: f32) {
+        assert!(omega.is_finite() && (0.0..=4.0).contains(&omega), "loopcd_omega must be finite in [0, 4]");
+        self.loopcd_omega.set(omega);
+    }
+    /// Current default adaptive LoopCD-Logits contrast weight (`0.0` = disabled).
+    #[allow(dead_code)]
+    pub fn loopcd_omega(&self) -> f32 { self.loopcd_omega.get() }
+    /// Effective softcap for downstream GPU `k_gumbel` or CPU `Sampler` over the last step's logits:
+    /// `0.0` when `k_loopcd_blend` already applied exact softcap in-place, otherwise `self.softcap`.
+    pub fn effective_sampler_softcap(&self) -> f32 {
+        if self.last_step_loopcd.get() { 0.0 } else { self.softcap }
+    }
+    fn ensure_lg_weak(&self, n_rows: usize) -> Buf {
+        let need_bytes = n_rows.max(1) * self.vocab_pad() * 4;
+        let mut slot = self.lg_weak.borrow_mut();
+        if slot.as_ref().is_none_or(|b| b.length() < need_bytes) {
+            *slot = Some(self.gpu.buffer(need_bytes));
+        }
+        slot.as_ref().unwrap().clone()
+    }
     fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
         assert!(out_index * 4 < lane.toks.length(), "encode_gumbel: out_index {out_index} out of bounds");
         let sa = SampArgs {
@@ -1035,7 +1065,7 @@ impl Engine {
             pos: pos as u32,
             ban_tok: ban_tok.unwrap_or(u32::MAX),
             temp,
-            softcap: self.softcap,
+            softcap: self.effective_sampler_softcap(),
         };
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
         let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
@@ -1078,6 +1108,7 @@ impl Engine {
         }
         let e = Enc::new(cb);
         self.bind_eng(&e);
+        let eff_softcap = self.effective_sampler_softcap();
         let gumbel_grid = (self.n_vocab.div_ceil(256), 1, 1);
         for item in items {
             let logits_off = b.lg + (item.span_idx * vp) as u32;
@@ -1089,7 +1120,7 @@ impl Engine {
                 pos: item.pos as u32,
                 ban_tok: item.ban_tok.unwrap_or(u32::MAX),
                 temp: item.temp,
-                softcap: self.softcap,
+                softcap: eff_softcap,
             };
             self.go_nb(&e, C_ARGMAX, "k_gumbel", &sa, gumbel_grid, 256);
         }
@@ -1329,6 +1360,9 @@ impl Engine {
             verify_keep: RefCell::new(None), verify_record: Cell::new(false),
             block_pool,
             blocked_slab,
+            loopcd_omega: Cell::new(0.0),
+            last_step_loopcd: Cell::new(false),
+            lg_weak: RefCell::new(None),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -2055,6 +2089,7 @@ impl Engine {
     /// This is the decode-path reference the `dbatch` harness checks (`INK_DB_OLD`), not the serving path:
     /// `inky serve` decodes through `encode_decode`.
     pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
+        self.last_step_loopcd.set(false);
         let n = lanes.len();
         let (start, tot) = (self.dstart.get(), self.ar.total);
         assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
@@ -2250,7 +2285,7 @@ impl Engine {
                 dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
                 dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
                 convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
-                dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
+                dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, no_state_write: 0, pad1: 0,
             };
             self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
             self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
@@ -2264,7 +2299,7 @@ impl Engine {
     /// preparation and cache writes, attention, the convolutions and their state) runs span by span with that lane's
     /// buffers bound. Optionally computes each span's logits (and argmax, written to the lane's tokens) for its last row:
     /// in the decode arena for a single span (`logits()`), in the batch arena for several (`span_logits`).
-    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None); }
+    pub fn encode_spans(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) { self.encode_spans_x(cb, spans, logits, argmax, false, None, None); }
     /// Verify step. Each span has length `1 + k` (the last committed token again, then `k` drafts). `k` is the
     /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
     /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
@@ -2284,7 +2319,7 @@ impl Engine {
             accepted_end: None,
         }).collect();
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
-        self.encode_spans_x(cb, spans, true, false, false, Some(k));
+        self.encode_spans_x(cb, spans, true, false, false, Some(k), None);
     }
     /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
     /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
@@ -2394,10 +2429,28 @@ impl Engine {
     /// blocks written by decode steps are never shared (docs/DESIGN.md).
     pub fn encode_decode(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool) {
         assert!(spans.iter().all(|s| s.t == 1));
-        self.encode_spans_x(cb, spans, logits, argmax, true, None);
+        self.encode_spans_x(cb, spans, logits, argmax, true, None, None);
     }
-    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>) {
+    /// Encode one decode step with explicit per-span `omega_max` values for adaptive `LoopCD-Logits`
+    /// (`0.0` disables LoopCD for that span). When every entry is `0.0`, behaves identically to `encode_decode`
+    /// with zero extra buffers or dispatches.
+    pub fn encode_decode_with_omegas(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, omegas: &[f32]) {
+        assert!(spans.iter().all(|s| s.t == 1));
+        assert_eq!(omegas.len(), spans.len(), "encode_decode_with_omegas: one omega per span");
+        self.encode_spans_x(cb, spans, logits, argmax, true, None, Some(omegas));
+    }
+    fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>, omegas: Option<&[f32]>) {
+        self.last_step_loopcd.set(false);
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
+        let lane_omegas: Vec<f32> = if dec && logits {
+            match omegas {
+                Some(ws) => ws.to_vec(),
+                None => vec![self.loopcd_omega.get(); spans.len()],
+            }
+        } else {
+            Vec::new()
+        };
+        let run_loopcd = dec && logits && lane_omegas.iter().any(|&w| w > 0.0);
         let t: usize = spans.iter().map(|s| s.t).sum();
         let blocked = spans[0].lane.use_blocks.get();
         assert!(spans.iter().all(|s| s.lane.use_blocks.get() == blocked), "cannot mix Layer 2 and Layer 3 lanes in one step");
@@ -2522,18 +2575,44 @@ impl Engine {
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
         if verify_k.is_some() { self.verify_record.set(true); }
-        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in 0..LOOP_START { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], false); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
+        let mut lg_weak_buf: Option<Buf> = None;
         for pass in 0..N_PASS {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
+            for ip in LOOP_START..LOOP_END { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0, false); }
             bank = (blocks[prelude_blocks.len() + 1], cur);
+            if pass == 0 && run_loopcd {
+                // Exact dry-state weak reference pass (z_1) immediately after pass 0, while CS[18..24] and
+                // KV[18..24] still hold the untouched pos - 1 state.
+                let mut cur_w = cur;
+                let mut blocks_w = blocks.clone();
+                let pinned_w = [prelude, bank.0, bank.1];
+                for ip in LOOP_END..N_PHYS {
+                    cur_w = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, 0, true);
+                }
+                let n = spans.len();
+                let st_w: Vec<u32> = blocks_w.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur_w))).collect();
+                let mut j = self.mix_job_off(&st_w, self.output_res_query as i32, 1, &[b.fin], &[self.output_norm as i32], E as u32);
+                j.hout[0] = b.xh[0] as i32; j.nof32 = 1;
+                self.mix_t(&e, C_OMIX, &[j], n);
+                let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
+                hs.ldo = self.vocab_pad() as u32;
+                self.gemm_h(&e, C_LMHEAD, &[hs], n);
+                let weak_buf = self.ensure_lg_weak(n);
+                let n_words = n * self.vocab_pad();
+                let dc = DevCopyArgs { src: b.lg, dst: 0, n: n_words as u32, pad: 0 };
+                e.buf(&weak_buf, 0, 3);
+                self.go(&e, C_LMHEAD, "k_devcopy", &dc, (n_words.div_ceil(1024), 1, 1), 1024);
+                e.buf(&self.act.borrow(), 0, 3);
+                lg_weak_buf = Some(weak_buf);
+            }
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], false); }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -2565,6 +2644,22 @@ impl Engine {
             let mut hs = Engine::hseg(&self.output, b.xh[0], b.lg);
             hs.ldo = self.vocab_pad() as u32;
             self.gemm_h(&e, C_LMHEAD, &[hs], n);
+            if let Some(weak_buf) = lg_weak_buf.as_ref() {
+                let la = LoopCdArgs {
+                    logits_off: b.lg,
+                    n: self.n_vocab as u32,
+                    stride: self.vocab_pad() as u32,
+                    pad0: 0,
+                    softcap: self.softcap,
+                    pad1: 0,
+                    pad2: 0,
+                    pad3: 0,
+                };
+                e.bytes_slice(&lane_omegas, 8);
+                e.buf(weak_buf, 0, 9);
+                self.go(&e, C_LMHEAD, "k_loopcd_blend", &la, (1, n, 1), 1024);
+                self.last_step_loopcd.set(true);
+            }
             if argmax {
                 for (si, sp) in spans.iter().enumerate() {
                     let nparts = 128u32;
@@ -2597,8 +2692,8 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, dec_meta: Option<DecBatchMeta>, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
-               msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
+    fn layer_b_ex(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, dec_meta: Option<DecBatchMeta>, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+                  msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize, dry_state: bool) -> usize {
         let l = &self.layers[ip];
         let b = self.ba.get();
         let vo = |i: usize| b.vec(i);
@@ -2684,7 +2779,7 @@ impl Engine {
                 desc_off: dm.desc_off,
                 pass_idx,
                 cs_slot,
-                swa: l.swa as u32,
+                swa: (l.swa as u32) | ((dry_state as u32) << 1),
                 q_off: b.q,
                 k_off: b.k,
                 v_off: b.v,
@@ -2741,7 +2836,7 @@ impl Engine {
                 let kps = Run::split_kps(nkeys);
                 let nsplit = nkeys.div_ceil(kps);
                 let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                    pad: self.sep_comb as u32, ..base };
+                                    pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
                 self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
                 let comb_out = if direct_half { b.agh + (r0 * (NH * HD / 2)) as u32 } else { aa.out_off };
@@ -2876,7 +2971,7 @@ impl Engine {
                 cs_slot_off: cs_slot + (2 * NKV * HD * 3) as u32,
                 convw_off: l.attn_post_conv,
                 has_res: (!block_start) as u32,
-                pad: 0,
+                no_state_write: dry_state as u32,
             };
             self.go(e, C_WOPOST, "k_postconv_state_dec", &pc, (E / 256, spans.len(), 1), 256);
         } else {
@@ -2888,13 +2983,15 @@ impl Engine {
                 self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
             }
             e.barrier();
-            for (si, sp) in spans.iter().enumerate() {
-                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-                self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
-                self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            if !dry_state {
+                for (si, sp) in spans.iter().enumerate() {
+                    sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                    let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                    self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
+                    self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+                }
+                e.barrier();
             }
-            e.barrier();
         }
         if block_start { blocks.push(cur); }
         // ---- FFN input
@@ -3013,7 +3110,7 @@ impl Engine {
                 cs_slot_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
                 convw_off: l.ffn_post_conv,
                 has_res: 1,
-                pad: 0,
+                no_state_write: dry_state as u32,
             };
             self.go(e, C_FFNPOST, "k_postconv_state_dec", &pc, (E / 256, spans.len(), 1), 256);
         } else {
@@ -3025,13 +3122,15 @@ impl Engine {
                 self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
             }
             e.barrier();
-            for (si, sp) in spans.iter().enumerate() {
-                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
-                let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-                self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
-                self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            if !dry_state {
+                for (si, sp) in spans.iter().enumerate() {
+                    sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                    let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                    self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
+                    self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+                }
+                e.barrier();
             }
-            e.barrier();
         }
         out
     }
@@ -3677,6 +3776,10 @@ impl<'a> Run<'a> {
         cx.e.end();
     }
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
+        self.last_step_loopcd.set(false);
+        let omega = self.loopcd_omega.get();
+        let run_loopcd = logits && omega > 0.0;
+        assert!(!run_loopcd || !self.tier_on(), "--loopcd cannot be combined with --kv-disk");
         let e = &cx.e;
         self.bind(e);
         let ar = self.ar_at();
@@ -3689,20 +3792,43 @@ impl<'a> Run<'a> {
         let mut va = VecAlloc { next: 1, n: N_VEC };
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
-        for ip in 0..LOOP_START { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
+        for ip in 0..LOOP_START { cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
+        let mut lg_weak_buf: Option<Buf> = None;
         for pass in 0..N_PASS {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
             for ip in LOOP_START..LOOP_END {
-                cur = self.layer(cx, pos, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned);
+                cur = self.layer_ex(cx, pos, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, false);
             }
             bank = (*blocks.get(prelude_blocks.len() + 1).unwrap_or(&0), cur);
+            if pass == 0 && run_loopcd {
+                // Exact dry-state weak reference pass (z_1) immediately after pass 0, while CS[18..24] and
+                // KV[18..24] still hold the untouched pos - 1 state.
+                let mut cur_w = cur;
+                let mut blocks_w = blocks.clone();
+                let pinned_w = [prelude, bank.0, bank.1];
+                for ip in LOOP_END..N_PHYS {
+                    cur_w = self.layer_ex(cx, pos, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, true);
+                }
+                let e = &cx.e;
+                let mut st_w = blocks_w.clone(); st_w.push(cur_w);
+                let j = self.mix_job(&st_w, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
+                self.mix(e, C_OMIX, &[j]);
+                self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
+                let weak_buf = self.ensure_lg_weak(1);
+                let n_words = self.vocab_pad();
+                let dc = DevCopyArgs { src: ar.logits, dst: 0, n: n_words as u32, pad: 0 };
+                e.buf(&weak_buf, 0, 3);
+                self.go(e, C_LMHEAD, "k_devcopy", &dc, (n_words.div_ceil(1024), 1, 1), 1024);
+                self.bind_kv(e, true);
+                lg_weak_buf = Some(weak_buf);
+            }
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[]); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_ex(cx, pos, ip, ip, cur, &mut blocks, None, &mut va, &[], false); }
 
         let e = &cx.e;
         if logits {
@@ -3710,6 +3836,23 @@ impl<'a> Run<'a> {
             let j = self.mix_job(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32]);
             self.mix(e, C_OMIX, &[j]);
             self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, ar.logits)]);
+            if let Some(weak_buf) = lg_weak_buf.as_ref() {
+                let la = LoopCdArgs {
+                    logits_off: ar.logits,
+                    n: self.n_vocab as u32,
+                    stride: self.vocab_pad() as u32,
+                    pad0: 0,
+                    softcap: self.softcap,
+                    pad1: 0,
+                    pad2: 0,
+                    pad3: 0,
+                };
+                let omegas = [omega];
+                e.bytes_slice(&omegas, 8);
+                e.buf(weak_buf, 0, 9);
+                self.go(e, C_LMHEAD, "k_loopcd_blend", &la, (1, 1, 1), 1024);
+                self.last_step_loopcd.set(true);
+            }
         }
         if logits && argmax {
             let nparts = 128u32;
@@ -3722,8 +3865,16 @@ impl<'a> Run<'a> {
     #[allow(clippy::too_many_arguments)]
     fn layer(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
              msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize]) -> usize {
-        if self.done.get() >= self.stop.get() { return cur; }
-        self.done.set(self.done.get() + 1);
+        self.layer_ex(cx, pos, slot, ip, cur, blocks, msg, va, pinned, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layer_ex(&self, cx: &mut Cx, pos: usize, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+                msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], dry_state: bool) -> usize {
+        if !dry_state {
+            if self.done.get() >= self.stop.get() { return cur; }
+            self.done.set(self.done.get() + 1);
+        }
         let e = &cx.e;
         let l = &self.layers[ip];
         let ar = self.ar_at();
@@ -3809,7 +3960,7 @@ impl<'a> Run<'a> {
                 e.buf(&pr.bag, 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
             }
-            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1, ..base };
+            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1 | ((dry_state as u32) << 1), ..base };
             self.bind_kv(e, false);
             self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
             nsplit = n1 + n2;
@@ -3820,7 +3971,7 @@ impl<'a> Run<'a> {
             let kps = Self::split_kps(nkeys);
             nsplit = nkeys.div_ceil(kps);
             let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
-                                pad: self.sep_comb as u32, ..base };
+                                pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
         }
         let e = &cx.e;
@@ -3833,7 +3984,7 @@ impl<'a> Run<'a> {
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         let mut so = Engine::seg(&l.wo, ar.attn_g, self.v(mid));
-        so.epi = 1; so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
+        so.epi = if dry_state { 2 } else { 1 }; so.res_off = if block_start { -1 } else { self.v(cur) as i32 };
         so.cs_off = cs_slot + (2 * NKV * HD * 3) as u32; so.convw_off = l.attn_post_conv;
         self.mv(e, C_WO, &[so]);
         if block_start { blocks.push(cur); }
@@ -3851,7 +4002,7 @@ impl<'a> Run<'a> {
             ar.fin
         };
         // ---- router with fused top-k (last threadgroup)
-        let sel = ar.sel_log + ((self.done.get() - 1) * 16) as u32;
+        let sel = if dry_state { ar.sel } else { ar.sel_log + ((self.done.get() - 1) * 16) as u32 };
         let rpost = MvArgs { post: (!self.sep_topk) as u32, ctr: 12, bias_off: l.exp_bias, sel_off: sel, wscale: self.wscale, ..Default::default() };
         self.mv_post(e, C_ROUTER, &[Engine::seg_pb(l.router, NEXP as u32, E as u32, x_off, ar.rlog)], rpost);
         let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
@@ -3866,12 +4017,14 @@ impl<'a> Run<'a> {
             dn_lo: l.dn.off as u32, dn_hi: (l.dn.off >> 32) as u32, dn_expert_bytes: l.dn.expert_bytes as u32, dn_row_bytes: l.dn.row_bytes,
             dn_type: l.dn.ty, out_off: self.v(out), res_off: self.v(mid) as i32, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
             convw_off: l.ffn_post_conv, gu_type: l.gu.ty, gu_gs_lo: l.gu.gs as u32, gu_gs_hi: (l.gu.gs >> 32) as u32,
-            dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, pad0: 0, pad1: 0,
+            dn_gs_lo: l.dn.gs as u32, dn_gs_hi: (l.dn.gs >> 32) as u32, no_state_write: dry_state as u32, pad1: 0,
         };
         // ---- experts
         self.go(e, C_GU, "k_moe_gu", &ma, (FF / 4, TOPK, 1), 128);
         self.go(e, C_DOWN, "k_moe_down", &ma, (E / 4, 1, 1), 64);
-        self.last_out.set(out); self.last_mid.set(mid);
+        if !dry_state {
+            self.last_out.set(out); self.last_mid.set(mid);
+        }
         out
     }
 
@@ -3917,6 +4070,59 @@ fn moe_class_start(n: usize) -> usize {
 #[inline]
 fn use_fused_topk_route3(hgemm: bool, n: usize) -> bool {
     hgemm && n <= 64
+}
+
+/// Pure Rust reference implementation of `k_loopcd_blend` (Liu et al., 2026, arXiv:2610.02185,
+/// Eqs. 3-4 & Appendix A.1-A.3) with exact logit softcapping:
+///   s3(v) = softcap(z3(v)), s1(v) = softcap(z1(v))
+///   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
+///   z3[v] <- s3(v) + omega_t * (s3(v) - s1(v))
+/// Returns the computed adaptive weight `omega_t`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32) -> f32 {
+    assert_eq!(z3.len(), z1.len(), "loopcd_blend_row: z3 and z1 must have equal length");
+    let cap = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
+    if z3.is_empty() {
+        return 0.0;
+    }
+    if omega_max <= 0.0 {
+        if softcap > 0.0 {
+            for x in z3.iter_mut() { *x = cap(*x); }
+        }
+        return 0.0;
+    }
+    let mut max1 = f32::NEG_INFINITY;
+    let mut max2 = f32::NEG_INFINITY;
+    for &raw in z3.iter() {
+        let s3 = cap(raw);
+        if s3 >= max1 {
+            max2 = max1;
+            max1 = s3;
+        } else if s3 > max2 {
+            max2 = s3;
+        }
+    }
+    let mut z = 0.0f32;
+    for &raw in z3.iter() {
+        z += (cap(raw) - max1).exp();
+    }
+    let omega_t = if z.is_finite() && z > 0.0 {
+        let p1 = 1.0 / z;
+        let p2 = if max2 > -1e30 { (max2 - max1).exp() / z } else { 0.0 };
+        omega_max * (1.0 - (p1 - p2)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    for (dst, &raw1) in z3.iter_mut().zip(z1.iter()) {
+        let s3 = cap(*dst);
+        if omega_t > 0.0 {
+            let s1 = cap(raw1);
+            *dst = s3 + omega_t * (s3 - s1);
+        } else {
+            *dst = s3;
+        }
+    }
+    omega_t
 }
 
 #[cfg(test)]
@@ -4018,6 +4224,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
         assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
         assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
+        assert_eq!(std::mem::size_of::<LoopCdArgs>(), 8 * 4);
         assert_eq!(std::mem::size_of::<DecodeSpanDesc>(), 16 * 4);
         assert_eq!(std::mem::align_of::<DecodeSpanDesc>(), 4);
         assert_eq!(std::mem::size_of::<EmbedDecArgs>(), 8 * 4);
@@ -4066,6 +4273,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, desc_off), 0);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, cs_slot_off), 16);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, has_res), 24);
+        assert_eq!(std::mem::offset_of!(PostConvDecArgs, no_state_write), 28);
+        assert_eq!(std::mem::offset_of!(MoeArgs, no_state_write), 30 * 4);
+        assert_eq!(std::mem::offset_of!(LoopCdArgs, logits_off), 0);
+        assert_eq!(std::mem::offset_of!(LoopCdArgs, n), 4);
+        assert_eq!(std::mem::offset_of!(LoopCdArgs, stride), 8);
+        assert_eq!(std::mem::offset_of!(LoopCdArgs, softcap), 16);
         assert_eq!(std::mem::offset_of!(TopkRoute3Args, logits_off), 0);
         assert_eq!(std::mem::offset_of!(TopkRoute3Args, bias_off), 4);
         assert_eq!(std::mem::offset_of!(TopkRoute3Args, sel_off), 8);
@@ -4135,11 +4348,13 @@ mod tests {
             "struct AttnBlkDecArgs",
             "struct PostConvDecArgs",
             "struct TopkRoute3Args",
+            "struct LoopCdArgs",
             "kernel void k_embed_dec(",
             "kernel void k_attn_blk_dec(",
             "kernel void k_attn_combine_dec(",
             "kernel void k_postconv_state_dec(",
             "kernel void k_moe_topk_route3(",
+            "kernel void k_loopcd_blend(",
         ] {
             assert!(full_src.contains(s), "missing expected Metal declaration `{s}`");
         }
@@ -4388,6 +4603,220 @@ mod tests {
             let ts_65 = route3_class_tiles(&picks_65);
             assert_eq!(ts_65[0], TOPK);
             assert_eq!(ts_65[1], 0);
+        }
+    }
+
+    #[test]
+    fn loopcd_blend_reference_identities_and_adaptive_schedule() {
+        let softcap = 20.0f32;
+        let cap = |x: f32| softcap * (x / softcap).tanh();
+
+        // 1. omega_max == 0.0 produces exact softcap(z3) with zero contrast.
+        let z3_raw = [18.0f32, 12.5, -3.0, -40.0, 0.0];
+        let z1_raw = [-5.0f32, 22.0, 10.0, 15.0, 3.0];
+        let mut out0 = z3_raw;
+        let w0 = loopcd_blend_row(&mut out0, &z1_raw, softcap, 0.0);
+        assert_eq!(w0, 0.0);
+        for (got, &raw) in out0.iter().zip(z3_raw.iter()) {
+            assert!((got - cap(raw)).abs() < 1e-6);
+        }
+
+        // 2. Dominant token (p_{3,(1)} -> 1, p_{3,(2)} -> 0): omega_t -> 0 (deterministic syntax/tool-calls preserved).
+        let mut z3_dom = [-50.0f32; 64];
+        z3_dom[7] = 30.0; // softcap(30) ~ 18.103, softcap(-50) ~ -19.732 -> gap > 37 nats
+        let mut z1_dom = [0.0f32; 64];
+        z1_dom[7] = -20.0;
+        let w_dom = loopcd_blend_row(&mut z3_dom, &z1_dom, softcap, 0.5);
+        assert!(w_dom < 1e-6, "confident distribution must suppress contrast, got omega_t={w_dom}");
+        assert!((z3_dom[7] - cap(30.0)).abs() < 1e-4);
+
+        // 3. Tied top-2 (p_{3,(1)} == p_{3,(2)} == 0.5): omega_t == omega_max, and the token refined
+        //    upward from z1 -> z3 strictly beats the stagnant token.
+        let mut z3_tie = [-100.0f32; 16];
+        z3_tie[2] = 10.0; // stagnant: z1 == 10.0 -> z3 == 10.0
+        z3_tie[5] = 10.0; // refined upward: z1 == 2.0 -> z3 == 10.0
+        let mut z1_tie = [-100.0f32; 16];
+        z1_tie[2] = 10.0;
+        z1_tie[5] = 2.0;
+        let omega_max = 0.4f32;
+        let w_tie = loopcd_blend_row(&mut z3_tie, &z1_tie, softcap, omega_max);
+        assert!((w_tie - omega_max).abs() < 1e-5, "tied top-2 must reach omega_max={omega_max}, got {w_tie}");
+        assert!(z3_tie[5] > z3_tie[2], "token refined upward from z1->z3 must strictly beat stagnant token");
+
+        // 4. Exact Appendix A.3 probability ratio identity across all pairs (u, v):
+        //    log p'(v) - log p'(u) == (1 + omega_t)(s3(v) - s3(u)) - omega_t(s1(v) - s1(u)).
+        let z3_orig = [4.2f32, 3.9, 3.1, 1.5, -2.0, 25.0, 24.8, -12.0];
+        let z1_orig = [1.0f32, 5.5, 2.0, -1.0, 0.5, 10.0, 24.5, -8.0];
+        let mut blended = z3_orig;
+        let wt = loopcd_blend_row(&mut blended, &z1_orig, softcap, 0.35);
+        assert!(wt > 0.0 && wt <= 0.35);
+        let lse = |v: &[f32]| -> f32 {
+            let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            m + v.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
+        };
+        let log_z = lse(&blended);
+        let log_p: Vec<f32> = blended.iter().map(|&x| x - log_z).collect();
+        for v in 0..z3_orig.len() {
+            for u in 0..z3_orig.len() {
+                let lhs = log_p[v] - log_p[u];
+                let rhs = (1.0 + wt) * (cap(z3_orig[v]) - cap(z3_orig[u]))
+                    - wt * (cap(z1_orig[v]) - cap(z1_orig[u]));
+                assert!((lhs - rhs).abs() < 1e-4, "pair ({v},{u}): lhs={lhs} rhs={rhs}");
+            }
+        }
+    }
+
+    #[test]
+    fn loopcd_parallel_top2_butterfly_matches_exact_sort() {
+        // Exact Rust mirror of the 1024-thread (32 simdgroups x 32 lanes) top2_merge butterfly in `k_loopcd_blend`.
+        let top2_merge = |m1: &mut f32, m2: &mut f32, b1: f32, b2: f32| {
+            if b1 >= *m1 {
+                *m2 = (*m1).max(b2);
+                *m1 = b1;
+            } else if b1 > *m2 {
+                *m2 = b1;
+            }
+        };
+        let gpu_top2 = |vals: &[f32]| -> (f32, f32) {
+            let mut sm1 = [f32::NEG_INFINITY; 32];
+            let mut sm2 = [f32::NEG_INFINITY; 32];
+            for sg in 0..32usize {
+                let mut m1 = [f32::NEG_INFINITY; 32];
+                let mut m2 = [f32::NEG_INFINITY; 32];
+                for lane in 0..32usize {
+                    let tid = sg * 32 + lane;
+                    let mut v = tid;
+                    while v < vals.len() {
+                        let s = vals[v];
+                        if s >= m1[lane] { m2[lane] = m1[lane]; m1[lane] = s; }
+                        else if s > m2[lane] { m2[lane] = s; }
+                        v += 1024;
+                    }
+                }
+                for off in [16usize, 8, 4, 2, 1] {
+                    let prev1 = m1;
+                    let prev2 = m2;
+                    for lane in 0..32 {
+                        top2_merge(&mut m1[lane], &mut m2[lane], prev1[lane ^ off], prev2[lane ^ off]);
+                    }
+                }
+                sm1[sg] = m1[0];
+                sm2[sg] = m2[0];
+            }
+            let mut bm1 = sm1;
+            let mut bm2 = sm2;
+            for off in [16usize, 8, 4, 2, 1] {
+                let prev1 = bm1;
+                let prev2 = bm2;
+                for lane in 0..32 {
+                    top2_merge(&mut bm1[lane], &mut bm2[lane], prev1[lane ^ off], prev2[lane ^ off]);
+                }
+            }
+            (bm1[0], bm2[0])
+        };
+
+        let cases: Vec<Vec<f32>> = vec![
+            vec![7.0],
+            vec![5.0, 5.0],
+            vec![1.0, 9.0, 9.0, 2.0],
+            // Tied maxima in different simdgroups and same thread stride
+            {
+                let mut v = vec![-10.0; 2500];
+                v[17] = 12.5;
+                v[17 + 1024] = 12.5;
+                v[500] = 11.0;
+                v
+            },
+            {
+                let mut v = vec![-10.0; 2500];
+                v[3] = 12.5;
+                v[1023] = 12.5;
+                v
+            },
+            (0..2053).map(|i| ((i * 7919) % 1000) as f32 * 0.01 - 5.0).collect(),
+        ];
+        for vals in &cases {
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let want1 = sorted[0];
+            let want2 = sorted.get(1).copied().unwrap_or(f32::NEG_INFINITY);
+            let (got1, got2) = gpu_top2(vals);
+            assert_eq!((got1, got2), (want1, want2), "top2 mismatch for len={}", vals.len());
+        }
+    }
+
+    #[test]
+    fn vecalloc_liveness_loopcd_zero_collisions() {
+        // Verify zero slot collisions across prelude + pass 0 + weak coda + pass 1..2 + real coda
+        // for BOTH batched decode (`B_NVEC = 10`) and single-stream decode (`N_VEC = 16`).
+        for n_vec in [B_NVEC, N_VEC] {
+            let mut va = VecAlloc { next: 1, n: n_vec };
+            let mut blocks: Vec<usize> = Vec::new();
+            let mut cur = 0usize;
+            let mut max_live = 0usize;
+
+            let mut step_layer = |va: &mut VecAlloc, ip: usize, cur: usize, blocks: &mut Vec<usize>, pinned: &[usize], guard: &[usize]| -> usize {
+                let block_start = ip % BLOCK == 0;
+                let mut live: Vec<usize> = blocks.clone();
+                live.push(cur);
+                live.extend_from_slice(pinned);
+                let mut uniq = live.clone();
+                uniq.sort_unstable();
+                uniq.dedup();
+                max_live = max_live.max(uniq.iter().filter(|&&x| x != 0).count());
+                let mid = va.alloc(&live);
+                assert!(!guard.contains(&mid), "mid={mid} collided with protected slot {guard:?}");
+                assert!(!live.contains(&mid));
+                if block_start { blocks.push(cur); }
+
+                let mut live2: Vec<usize> = blocks.clone();
+                live2.push(mid);
+                live2.extend_from_slice(pinned);
+                let mut uniq2 = live2.clone();
+                uniq2.sort_unstable();
+                uniq2.dedup();
+                max_live = max_live.max(uniq2.iter().filter(|&&x| x != 0).count());
+                let out = va.alloc(&live2);
+                assert!(!guard.contains(&out), "out={out} collided with protected slot {guard:?}");
+                assert!(!live2.contains(&out));
+                out
+            };
+
+            for ip in 0..LOOP_START {
+                cur = step_layer(&mut va, ip, cur, &mut blocks, &[], &[]);
+            }
+            let prelude = cur;
+            let prelude_blocks = blocks.clone();
+            assert_eq!(prelude_blocks, vec![0]);
+            let mut bank = (0usize, 0usize);
+
+            for pass in 0..N_PASS {
+                if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
+                let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
+                for ip in LOOP_START..LOOP_END {
+                    cur = step_layer(&mut va, ip, cur, &mut blocks, &pinned, &pinned);
+                }
+                bank = (blocks[prelude_blocks.len() + 1], cur);
+                if pass == 0 {
+                    // Weak coda immediately after pass 0 must preserve prelude, prelude_blocks, bank.0, and bank.1.
+                    let mut cur_w = cur;
+                    let mut blocks_w = blocks.clone();
+                    let pinned_w = [prelude, bank.0, bank.1];
+                    for ip in LOOP_END..N_PHYS {
+                        cur_w = step_layer(&mut va, ip, cur_w, &mut blocks_w, &pinned_w, &pinned_w);
+                    }
+                    assert_eq!(blocks_w.len(), 4, "weak coda must produce all 4 depth-residual block states for output_res_query");
+                    assert_ne!(cur_w, prelude);
+                    assert_ne!(cur_w, bank.0);
+                    assert_ne!(cur_w, bank.1);
+                }
+            }
+            for ip in LOOP_END..N_PHYS {
+                cur = step_layer(&mut va, ip, cur, &mut blocks, &[], &[]);
+            }
+            assert_eq!(blocks.len(), 4);
+            assert!(max_live < n_vec - 1, "peak non-zero live vectors ({max_live}) must fit within n_vec-1 ({})", n_vec - 1);
+            assert_ne!(cur, 0);
         }
     }
 }

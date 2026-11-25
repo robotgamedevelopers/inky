@@ -58,6 +58,7 @@ options:
   --kv-disk         keep only half of the (exact) K/V cache in memory while generating; the older half lives in a
                     temporary file and is read back for every token (slower generation)
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
+  --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --raw             do not apply the chat template; print special tokens";
 
 const DEFAULT_SERVE_LANES: usize = 64;
@@ -77,6 +78,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
                     hard cap on thinking tokens before forcing <|end_message|> (default 0 = unlimited)
+  --loopcd OMEGA    default adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
   --record-max-bytes N
                     max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
@@ -114,6 +116,16 @@ fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
     Ok(ctx.div_ceil(CONTEXT_ALIGNMENT) * CONTEXT_ALIGNMENT)
 }
 
+fn parse_loopcd_omega(flag: &str, value: &str) -> Result<f32, String> {
+    let omega: f32 = value
+        .parse()
+        .map_err(|_| format!("{flag} must be a finite number between 0 and 4"))?;
+    if !omega.is_finite() || !(0.0..=4.0).contains(&omega) {
+        return Err(format!("{flag} must be a finite number between 0 and 4"));
+    }
+    Ok(omega)
+}
+
 fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
@@ -121,7 +133,7 @@ fn default_model() -> String {
 fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
         model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
-        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, record_dir: None,
+        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
     };
@@ -151,6 +163,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             }
             "--queue" => o.queue = parse_usize(flag, value()?)?,
             "--thinking-budget" => o.thinking_budget = parse_usize(flag, value()?)?,
+            "--loopcd" => o.loopcd_omega = parse_loopcd_omega(flag, value()?)?,
             "--record-dir" => o.record_dir = Some(std::path::PathBuf::from(value()?)),
             "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
@@ -215,6 +228,13 @@ mod cli_tests {
             (&["--max-spill-bytes", "bad"], "--max-spill-bytes requires a nonnegative integer"),
             (&["--lanes", "bad"], "--lanes requires a nonnegative integer"),
             (&["--ctx", "262144"], "--ctx must be between 1 and 262080"),
+            (&["--loopcd"], "missing value for --loopcd"),
+            (&["--loopcd", "-0.1"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--loopcd", "nan"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--loopcd", "inf"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--loopcd", "-inf"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--loopcd", "5.0"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--loopcd", "abc"], "--loopcd must be a finite number between 0 and 4"),
             (&["--typo"], "unknown serve option --typo"),
         ] {
             let err = serve_args(args).err().unwrap();
@@ -255,45 +275,85 @@ mod cli_tests {
         }
         assert!(serve::is_private_ip("100.117.59.68".parse().unwrap()));
     }
+
+    #[test]
+    fn loopcd_cli_and_serve_flag_parsing() {
+        assert_eq!(serve_args(&[]).unwrap().loopcd_omega, 0.0);
+        assert_eq!(serve_args(&["--loopcd", "0"]).unwrap().loopcd_omega, 0.0);
+        assert_eq!(serve_args(&["--loopcd", "0.3"]).unwrap().loopcd_omega, 0.3);
+        assert_eq!(serve_args(&["--loopcd", "4.0"]).unwrap().loopcd_omega, 4.0);
+
+        let cli = |args: &[&str]| {
+            parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(cli(&["run", "-p", "hi"]).unwrap().1.loopcd_omega, 0.0);
+        assert_eq!(cli(&["run", "--loopcd", "0"]).unwrap().1.loopcd_omega, 0.0);
+        assert_eq!(cli(&["run", "--loopcd", "0.3"]).unwrap().1.loopcd_omega, 0.3);
+        assert_eq!(cli(&["chat", "--loopcd", "1.5"]).unwrap().1.loopcd_omega, 1.5);
+        assert_eq!(cli(&["bench", "--loopcd", "4.0"]).unwrap().1.loopcd_omega, 4.0);
+        for bad in ["-0.1", "nan", "NaN", "inf", "-inf", "4.01", "5.0", "bad"] {
+            let err = cli(&["run", "--loopcd", bad]).err().unwrap();
+            assert!(err.contains("--loopcd must be a finite number between 0 and 4"), "{bad}: {err}");
+        }
+        assert!(cli(&["run", "--loopcd"]).err().unwrap().contains("missing value for --loopcd"));
+        assert!(cli(&["run", "--loopcd", "0.3", "--kv-disk"]).err().unwrap().contains("--kv-disk"));
+    }
 }
 
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
+    loopcd_omega: f32, kv8: bool, kv_disk: bool,
+}
+
+fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
+    let mut args = raw_args.iter().map(String::as_str);
+    let cmd = args.next().unwrap_or("help").to_string();
+    let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
+                       raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
+                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false,
+                       loopcd_omega: 0.0, kv8: false, kv_disk: false };
+    while let Some(a) = args.next() {
+        let mut v = || args.next().ok_or_else(|| format!("missing value for {a}"));
+        match a {
+            "-m" | "--model" => o.model = v()?.into(),
+            "-p" | "--prompt" => o.prompt = v()?.into(),
+            "-f" | "--file" => {
+                let path = v()?;
+                o.prompt = std::fs::read_to_string(path).map_err(|e| format!("read prompt file {path}: {e}"))?;
+            }
+            "-n" => { o.n = parse_usize(a, v()?)?; o.n_set = true; }
+            "-c" | "--ctx" => o.ctx = parse_context(a, v()?)?,
+            "--raw" => o.raw = true,
+            "--kv8" => o.kv8 = true,
+            "--kv-disk" => o.kv_disk = true,
+            "--effort" => o.effort = v()?.into(),
+            "--system" => o.system = v()?.into(),
+            "--temp" => o.temp = v()?.parse().map_err(|_| format!("{a} requires a number"))?,
+            "--top-p" => o.top_p = v()?.parse().map_err(|_| format!("{a} requires a number"))?,
+            "--top-k" => o.top_k = parse_usize(a, v()?)?,
+            "--seed" => o.seed = parse_u64(a, v()?)?,
+            "--greedy" => o.temp = 0.0,
+            "--hide-thinking" => o.hide_thinking = true,
+            "--loopcd" => o.loopcd_omega = parse_loopcd_omega(a, v()?)?,
+            "--ref" => o.reference = v()?.into(),
+            "-q" => o.quiet = true,
+            "--stop" => o.stop = parse_usize(a, v()?)?,
+            "-h" | "--help" => { println!("{USAGE}"); std::process::exit(0) }
+            _ => return Err(format!("unknown option {a}\n\n{USAGE}")),
+        }
+    }
+    if o.loopcd_omega > 0.0 && o.kv_disk {
+        return Err("--loopcd cannot be combined with --kv-disk".into());
+    }
+    Ok((cmd, o))
 }
 
 fn parse() -> (String, Opts) {
-    let mut args = std::env::args().skip(1);
-    let cmd = args.next().unwrap_or_else(|| "help".into());
-    let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
-                       raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
-                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false };
-    while let Some(a) = args.next() {
-        let mut v = || args.next().unwrap_or_else(|| { eprintln!("missing value for {a}"); std::process::exit(2) });
-        match a.as_str() {
-            "-m" | "--model" => o.model = v(),
-            "-p" | "--prompt" => o.prompt = v(),
-            "-f" | "--file" => o.prompt = std::fs::read_to_string(v()).expect("read prompt file"),
-            "-n" => { o.n = parse_usize(&a, &v()).unwrap_or_else(|e| cli_error(e)); o.n_set = true; }
-            "-c" | "--ctx" => o.ctx = parse_context(&a, &v()).unwrap_or_else(|e| cli_error(e)),
-            "--raw" => o.raw = true,
-            "--kv8" => engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed),
-            "--kv-disk" => engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed),
-            "--effort" => o.effort = v(),
-            "--system" => o.system = v(),
-            "--temp" => o.temp = v().parse().unwrap(),
-            "--top-p" => o.top_p = v().parse().unwrap(),
-            "--top-k" => o.top_k = v().parse().unwrap(),
-            "--seed" => o.seed = v().parse().unwrap(),
-            "--greedy" => o.temp = 0.0,
-            "--hide-thinking" => o.hide_thinking = true,
-            "--ref" => o.reference = v(),
-            "-q" => o.quiet = true,
-            "--stop" => o.stop = v().parse().unwrap(),
-            "-h" | "--help" => { println!("{USAGE}"); std::process::exit(0) }
-            _ => { eprintln!("unknown option {a}\n\n{USAGE}"); std::process::exit(2) }
-        }
-    }
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let (cmd, mut o) = parse_cli_args(&raw).unwrap_or_else(|e| cli_error(e));
+    if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
+    if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
     if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64; }
     (cmd, o)
 }
@@ -323,6 +383,7 @@ fn token_rate(tokens: usize, elapsed: std::time::Duration) -> f64 {
 
 fn run(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
     let mut sess = Session::new(&eng, &tk);
     if std::env::var("INK_KV_PREALLOC").is_ok() { sess.run().reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
@@ -343,6 +404,7 @@ fn run(o: &Opts) {
 
 fn chat(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
     let mut sess = Session::new(&eng, &tk);
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
@@ -378,6 +440,7 @@ fn chat(o: &Opts) {
 
 fn bench(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
+    eng.set_loopcd_omega(o.loopcd_omega);
     if let Ok(v) = std::env::var("INK_SKIP") { eng.skip.set(v.parse().unwrap()); }
     let tk = Tokenizer::load(&eng.g);
     let n = if o.n_set { o.n } else { 128 };
@@ -531,7 +594,7 @@ fn check(o: &Opts) -> Result<(), String> {
         }
         for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.softcap)).collect();
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap())).collect();
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
             .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;

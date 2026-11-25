@@ -81,7 +81,13 @@ impl<'a> Session<'a> {
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
         if max == 0 { return 0; }
-        let mut tok = if sampler.greedy() { first } else { sampler.sample(eng.logits()) };
+        let mut tok = if sampler.greedy() {
+            first
+        } else {
+            sampler
+                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
+                .expect("model sampling failed")
+        };
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
         if sampler.greedy() {
@@ -124,7 +130,9 @@ impl<'a> Session<'a> {
                 eng.gen_reserve(self.n_past);
                 eng.step(self.n_past, true, false).waitUntilCompleted();
                 self.n_past += 1;
-                tok = sampler.sample(eng.logits());
+                tok = sampler
+                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
+                    .expect("model sampling failed");
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
             }

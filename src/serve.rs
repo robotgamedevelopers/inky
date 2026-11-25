@@ -39,6 +39,8 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       pub queue: usize,
                       /// default hard cap on thinking tokens before forcing `<|end_message|>` (`0` = unlimited)
                       pub thinking_budget: usize,
+                      /// default adaptive LoopCD-Logits contrast weight in `[0, 4]` (`0.0` = disabled)
+                      pub loopcd_omega: f32,
                       /// optional directory for opt-in JSONL card traffic recording (`--record-dir`)
                       pub record_dir: Option<std::path::PathBuf>,
                       /// max bytes per cards-YYYYMMDD.jsonl file before rotating to `.1`
@@ -583,6 +585,7 @@ struct Job {
     top_p: f32,
     seed: u64,
     thinking_budget: usize,
+    loopcd_omega: f32,
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
@@ -1267,7 +1270,7 @@ fn scheduler(
                             a.pending = Some(tok);
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                            match a.sampler.sample_next_with_ban(lg, a.think.ban_token(&sp)) {
+                            match a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
                                 Ok(tok) => {
                                     let tok = a.think.observe(tok, &sp);
                                     a.pending = Some(tok);
@@ -1333,9 +1336,10 @@ fn scheduler(
                     eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
                 }
                 let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
+                let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().loopcd_omega).collect();
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
-                eng.encode_decode(&cb, &spans, true, false);
+                eng.encode_decode_with_omegas(&cb, &spans, true, false, &omegas);
                 let gumbels: Vec<crate::engine::GumbelSpan<'_>> = live_dec
                     .iter()
                     .enumerate()
@@ -1387,7 +1391,7 @@ fn scheduler(
                         let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
                         a.pending = Some(tok);
                     } else {
-                        match a.sampler.sample_next_with_ban(eng.span_logits(k), a.think.ban_token(&sp)) {
+                        match a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
                             Err(e) => {
                                 l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
@@ -1880,7 +1884,7 @@ impl AdmissionGate {
     }
 }
 
-struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, thinking_budget: usize, seq: std::sync::atomic::AtomicU64,
+struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, thinking_budget: usize, loopcd_omega: f32, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
              /// Bounded lane admission and wait queue (admitted + queued <= max_admitted_lanes + max_queue).
              admission: AdmissionGate,
@@ -2113,6 +2117,13 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             None => return bad("thinking_budget must be a nonnegative integer".into()),
         },
     };
+    let loopcd_omega = match req.get("loopcd_omega") {
+        None | Some(Value::Null) => cx.loopcd_omega,
+        Some(v) => match v.as_f64() {
+            Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
+            _ => return bad("loopcd_omega must be a finite number between 0 and 4".into()),
+        },
+    };
     let include_usage = match req.get("stream_options") {
         None | Some(Value::Null) => false,
         Some(Value::Object(o)) => match o.get("include_usage") {
@@ -2166,7 +2177,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         h
     });
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
         record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
@@ -2324,6 +2335,16 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         }
         _ => cx.thinking_budget,
     };
+    let loopcd_omega = match req.get("loopcd_omega") {
+        None | Some(Value::Null) => cx.loopcd_omega,
+        Some(v) => match v.as_f64() {
+            Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
+            _ => {
+                record_err(first_tok, 400, "invalid_request_error", 0);
+                return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4");
+            }
+        },
+    };
     if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
     if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
@@ -2363,7 +2384,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         h
     };
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
@@ -2487,6 +2508,7 @@ pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
     let eng = Engine::load(&o.model, o.ctx);
+    eng.set_loopcd_omega(o.loopcd_omega);
     eng.ensure_batch(eng.chunk);
     let (chip, mem) = crate::tuning::this_machine();
     let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
@@ -2533,7 +2555,7 @@ pub fn serve(o: ServeOpts) {
     } else {
         None
     };
-    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
+    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
@@ -2575,6 +2597,9 @@ pub fn serve(o: ServeOpts) {
         let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap()));
         let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap()));
         eprintln!("[serve] Layer 3 paged KV pool: {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)");
+    }
+    if o.loopcd_omega > 0.0 {
+        eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, o.ctx, o.effort, effective_queue);
     std::thread::spawn(move || {
@@ -2689,7 +2714,7 @@ mod tests {
         let (jobs, rx) = channel();
         let cx = Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
+            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::with_timings(
                 max_lanes,
@@ -3224,7 +3249,7 @@ mod tests {
         let tk = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
@@ -3247,7 +3272,7 @@ mod tests {
         let sp = test_sp(&tk);
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
@@ -3286,7 +3311,7 @@ mod tests {
         let sp = test_sp(&tk);
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3314,7 +3339,7 @@ mod tests {
             let payload_tok = tk.encode("a", false)[0];
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-                max_tokens: 64, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                 admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3355,7 +3380,7 @@ mod tests {
         let tk0 = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
-                       max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
@@ -3377,7 +3402,7 @@ mod tests {
         let tk0 = Tokenizer::for_test();
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
-                       max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
@@ -3457,7 +3482,7 @@ mod tests {
             for stream in [false, true] {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
-                    max_tokens: 8, thinking_budget: 0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                    max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                     admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3550,6 +3575,44 @@ mod tests {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
             assert_eq!(job.thinking_budget, want_budget);
             assert_eq!(job.top_k, want_top_k);
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test] fn loopcd_omega_defaults_overrides_and_rejects_invalid_on_both_apis() {
+        let (mut cx, jrx) = admission_test_ctx(4);
+        cx.loopcd_omega = 0.25;
+        let cx = Arc::new(cx);
+
+        // Invalid values rejected with HTTP 400 on both OpenAI and Anthropic routes before admission.
+        for is_msg in [false, true] {
+            for bad in [json!(-0.1), json!(4.5), json!("0.3"), json!(true)] {
+                let req = json!({"max_tokens": 8, "loopcd_omega": bad, "messages": [{"role": "user", "content": "hi"}]});
+                let mut out = Vec::new();
+                if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+                let resp = String::from_utf8(out).unwrap();
+                assert!(resp.starts_with("HTTP/1.1 400"), "is_msg={is_msg} bad={bad}: {resp}");
+                assert!(resp.contains("loopcd_omega must be a finite number between 0 and 4"), "{resp}");
+                assert!(jrx.try_recv().is_err());
+            }
+        }
+
+        // Default and explicit per-request overrides propagate onto Job on both routes.
+        for (is_msg, req, want) in [
+            (false, json!({"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}), 0.25f32),
+            (true, json!({"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}), 0.25f32),
+            (false, json!({"max_tokens": 8, "loopcd_omega": 0.6, "messages": [{"role": "user", "content": "hi"}]}), 0.6f32),
+            (true, json!({"max_tokens": 8, "loopcd_omega": 0.0, "messages": [{"role": "user", "content": "hi"}]}), 0.0f32),
+        ] {
+            let cx2 = cx.clone();
+            let req2 = req.clone();
+            let worker = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                if is_msg { messages(&cx2, &req2, &mut out).unwrap(); } else { chat(&cx2, &req2, &mut out).unwrap(); }
+            });
+            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
+            assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
             job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
             worker.join().unwrap();
         }
@@ -3900,7 +3963,7 @@ mod tests {
         let (jobs, rx) = channel();
         let cx = Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0,
+            sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
             active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
@@ -4100,7 +4163,7 @@ mod tests {
         let (jobs, jrx) = channel();
         let cx = Arc::new(Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0,
+            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
             budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
@@ -4160,7 +4223,7 @@ mod tests {
         let (jobs, jrx) = channel();
         let cx = Arc::new(Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0,
+            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
             budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
@@ -4417,6 +4480,7 @@ mod tests {
                     top_p: 1.0,
                     seed: 1,
                     thinking_budget: 0,
+                    loopcd_omega: 0.0,
                     queued_at: Instant::now(),
                     out,
                     _permit: admission.try_acquire().unwrap(),

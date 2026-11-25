@@ -501,12 +501,12 @@ inline void topk_sg(device float * A, device const uchar * PB, uint logits_off, 
 
 inline void mv_epilogue(constant Seg & S, uint row, float y, device float * A, device float * CS, device const uchar * PB) {
     if (S.epi == 0) { A[S.out_off + row] = y; return; }
-    // post short-conv (static taps) over channel `row`
+    // post short-conv (static taps) over channel `row` (S.epi == 2: dry-state, read CS without updating)
     device float * h = CS + S.cs_off + row * 3;
     device const float * w = (device const float *) (PB + S.convw_off) + row * 4;
     const float h0 = h[0], h1 = h[1], h2 = h[2];
     const float conv = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * y;
-    h[0] = h1; h[1] = h2; h[2] = y;
+    if (S.epi == 1) { h[0] = h1; h[1] = h2; h[2] = y; }
     float o = (y + conv) * 0.4472135954999579f;  // 1/sqrt(5)
     if (S.res_off >= 0) o += A[S.res_off + row];
     A[S.out_off + row] = o;
@@ -712,6 +712,7 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
     const uint sp = tgp.x, g = tgp.y;
     const uint j0 = sp * a.kps, j1 = min(a.nkeys, j0 + a.kps);
     const bool owns = (j1 == a.nkeys) && a.noown == 0;
+    const bool dry = (a.pad & 2u) != 0u;
     device const float * qclip = (device const float *) (PB + a.qclip_w);
     // ---- phase 1: raw values + partial norms
     float q[3];
@@ -728,7 +729,7 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
             float acc = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * x;
             const int dyn = which == 0 ? a.kdyn_off : a.vdyn_off;
             if (dyn >= 0) { device const float * t = A + dyn + g * 4; acc += t[0] * x + t[1] * h2 + t[2] * h1 + t[3] * h0; }
-            hh[0] = h1; hh[1] = h2; hh[2] = x;
+            if (!dry) { hh[0] = h1; hh[1] = h2; hh[2] = x; }
             if (which == 0) kx = (x + acc) * scl; else vx = (x + acc) * scl;
         }
     }
@@ -764,12 +765,16 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
         const float sk = kv_scale(ck), sv = kv_scale(cv);
         const float qk = kv_quant(k, sk, ck, tid), qv = kv_quant(v, sv, cv, tid);
         kc[tid] = qk * sk; vc[tid] = qv * sv;
-        KV[a.k_base + KVROW(g, idx) + tid] = (kv_t) (int) qk;
-        KV[a.v_base + KVROW(g, idx) + tid] = (kv_t) (int) qv;
+        if (!dry) {
+            KV[a.k_base + KVROW(g, idx) + tid] = (kv_t) (int) qk;
+            KV[a.v_base + KVROW(g, idx) + tid] = (kv_t) (int) qv;
+        }
 #else
         kc[tid] = k; vc[tid] = v;
-        KV[a.k_base + KVROW(g, idx) + tid] = half(k);
-        KV[a.v_base + KVROW(g, idx) + tid] = half(v);
+        if (!dry) {
+            KV[a.k_base + KVROW(g, idx) + tid] = half(k);
+            KV[a.v_base + KVROW(g, idx) + tid] = half(v);
+        }
 #endif
     }
     float sink[3];
@@ -869,7 +874,7 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
     }
     // the last split of this kv group combines all splits (+ the zero-logit sink) and applies the sigmoid gate
     threadgroup uint flag;
-    if (a.pad == 0 && last_tg(CTR + a.ctr + g, a.nsplit, tid, &flag)) {
+    if ((a.pad & 1u) == 0u && last_tg(CTR + a.ctr + g, a.nsplit, tid, &flag)) {
         for (int h = 0; h < 3; h++) {
             const uint H = g * 3 + h;
             device const float * P = A + a.part_off + H * a.nsplit * (HD + 2);
@@ -942,7 +947,7 @@ struct MoeArgs {
     uint dn_lo, dn_hi, dn_expert_bytes, dn_row_bytes;
     uint dn_type, out_off; int res_off; uint cs_off;
     uint convw_off, gu_type, gu_gs_lo, gu_gs_hi;
-    uint dn_gs_lo, dn_gs_hi, pad0, pad1;
+    uint dn_gs_lo, dn_gs_hi, no_state_write, pad1;
 };
 
 #define GU_NSG 4
@@ -1074,7 +1079,7 @@ kernel void k_moe_down(device const uchar * W [[buffer(0)]], device const uchar 
             device const float * w = (device const float *) (PB + a.convw_off) + row * 4;
             const float h0 = h[0], h1 = h[1], h2 = h[2];
             const float conv = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * y;
-            h[0] = h1; h[1] = h2; h[2] = y;
+            if (a.no_state_write == 0u) { h[0] = h1; h[1] = h2; h[2] = y; }
             A[a.out_off + row] = A[a.res_off + row] + (y + conv) * 0.4472135954999579f;
         }
     }
@@ -1134,6 +1139,112 @@ kernel void k_gumbel(device float * A [[buffer(2)]], constant SampArgs & a [[buf
     A[a.logits_off + i] = x;
 }
 
+// Adaptive LoopCD-Logits (Liu et al., 2026, arXiv:2610.02185, Eqs. 3-4 & Appendix A.1-A.3)
+// with exact logit softcapping: computes s3 = softcap(Z3), s1 = softcap(Z1), exact global
+// top-2 probabilities (p_{3,(1)}, p_{3,(2)}) of softmax(s3), adaptive weight
+//   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
+// and overwrites Z3[v] <- s3(v) + omega_t * (s3(v) - s1(v)) in-place.
+// Downstream k_gumbel / CPU Sampler MUST pass softcap = 0.0 for blended rows.
+// Grid: (1, n_lanes, 1), 1024 threads (32 simdgroups).
+struct LoopCdArgs { uint logits_off, n, stride, pad0; float softcap; uint pad1, pad2, pad3; };
+inline void top2_merge(thread float & m1, thread float & m2, float b1, float b2) {
+    if (b1 >= m1) { m2 = max(m1, b2); m1 = b1; }
+    else if (b1 > m2) { m2 = b1; }
+}
+kernel void k_loopcd_blend(device float * A [[buffer(2)]],
+                           constant LoopCdArgs & a [[buffer(5)]],
+                           constant float * OMEGA [[buffer(8)]],
+                           device const float * LG_WEAK [[buffer(9)]],
+                           uint2 tgp [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]],
+                           ushort sg [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    if (a.n == 0u) return;
+    const uint si = tgp.y;
+    const ulong row_off = ulong(si) * ulong(a.stride);
+    device float * Z3 = A + ulong(a.logits_off) + row_off;
+    device const float * Z1 = LG_WEAK + row_off;
+    const float omega_max = OMEGA[si];
+    const float c = a.softcap;
+
+    threadgroup float sm1[32], sm2[32], ssum[32];
+    threadgroup float g_max1, g_max2, g_omega;
+
+    // Fast path when this lane disables LoopCD (omega_max <= 0): apply exact softcap only
+    // so every lane in a mixed decode batch produces post-softcap logits consistently.
+    if (omega_max <= 0.0f) {
+        if (c > 0.0f) {
+            for (uint v = tid; v < a.n; v += 1024u) {
+                Z3[v] = c * precise::tanh(Z3[v] / c);
+            }
+        }
+        return;
+    }
+
+    // Pass 1: exact global top-2 of softcapped strong logits s3 across all 1024 threads.
+    float m1 = -INFINITY, m2 = -INFINITY;
+    for (uint v = tid; v < a.n; v += 1024u) {
+        const float raw = Z3[v];
+        const float s3 = c > 0.0f ? c * precise::tanh(raw / c) : raw;
+        if (s3 >= m1) { m2 = m1; m1 = s3; }
+        else if (s3 > m2) { m2 = s3; }
+    }
+    for (ushort off = 16; off > 0; off >>= 1) {
+        const float o1 = simd_shuffle_xor(m1, off);
+        const float o2 = simd_shuffle_xor(m2, off);
+        top2_merge(m1, m2, o1, o2);
+    }
+    if (lane == 0) { sm1[sg] = m1; sm2[sg] = m2; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float bm1 = sm1[lane], bm2 = sm2[lane];
+        for (ushort off = 16; off > 0; off >>= 1) {
+            const float o1 = simd_shuffle_xor(bm1, off);
+            const float o2 = simd_shuffle_xor(bm2, off);
+            top2_merge(bm1, bm2, o1, o2);
+        }
+        if (lane == 0) { g_max1 = bm1; g_max2 = bm2; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: exact softmax partition function Z = sum_v exp(s3(v) - max1) and adaptive omega_t.
+    const float max1 = g_max1;
+    const float max2 = g_max2;
+    float sum_e = 0.0f;
+    for (uint v = tid; v < a.n; v += 1024u) {
+        const float raw = Z3[v];
+        const float s3 = c > 0.0f ? c * precise::tanh(raw / c) : raw;
+        sum_e += precise::exp(s3 - max1);
+    }
+    const float sg_sum = simd_sum(sum_e);
+    if (lane == 0) ssum[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const float z = simd_sum(ssum[lane]);
+        if (lane == 0) {
+            const bool z_ok = ((as_type<uint>(z) & 0x7f800000u) != 0x7f800000u) && (z > 0.0f);
+            const float p1 = z_ok ? (1.0f / z) : 1.0f;
+            const float p2 = (z_ok && max2 > -1e30f) ? (precise::exp(max2 - max1) / z) : 0.0f;
+            g_omega = z_ok ? (omega_max * clamp(1.0f - (p1 - p2), 0.0f, 1.0f)) : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 3: write guided post-softcap logits s3 + omega_t * (s3 - s1) back to Z3.
+    const float omega = g_omega;
+    for (uint v = tid; v < a.n; v += 1024u) {
+        const float raw3 = Z3[v];
+        const float s3 = c > 0.0f ? c * precise::tanh(raw3 / c) : raw3;
+        if (omega > 0.0f) {
+            const float raw1 = Z1[v];
+            const float s1 = c > 0.0f ? c * precise::tanh(raw1 / c) : raw1;
+            Z3[v] = s3 + omega * (s3 - s1);
+        } else {
+            Z3[v] = s3;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Layer 3 block-addressed KV cache helpers and decode split-K attention (`k_attn_blk`).
 // In-block layout matches `src/blocks.rs::key_row` and `specs/InBlock.tla`:
@@ -1174,6 +1285,7 @@ kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [
     const uint sp = tgp.x, g = tgp.y;
     const uint j0 = sp * a.kps, j1 = min(a.nkeys, j0 + a.kps);
     const bool owns = (j1 == a.nkeys) && a.noown == 0;
+    const bool dry = (a.pad & 2u) != 0u;
     const ulong koff = ulong(a.k_base) * KV_PASS_BYTES + ulong(g) * KV_HEAD_BYTES;
     const ulong voff = koff + KV_PLANE_BYTES;
     device const float * qclip = (device const float *) (PB + a.qclip_w);
@@ -1191,7 +1303,7 @@ kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [
             float acc = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * x;
             const int dyn = which == 0 ? a.kdyn_off : a.vdyn_off;
             if (dyn >= 0) { device const float * t = A + dyn + g * 4; acc += t[0] * x + t[1] * h2 + t[2] * h1 + t[3] * h0; }
-            hh[0] = h1; hh[1] = h2; hh[2] = x;
+            if (!dry) { hh[0] = h1; hh[1] = h2; hh[2] = x; }
             if (which == 0) kx = (x + acc) * scl; else vx = (x + acc) * scl;
         }
     }
@@ -1219,21 +1331,28 @@ kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [
     if (owns) {
         const float kf = clamp(QK_CLIP / (sqrt(tot[3]) + 1e-6f), 0.0f, 1.0f), vf = rsqrt(tot[4] / HD + 1e-6f);
         const float k = kx * kf, v = vx * vf;
-        const uint blk = a.pos >> 6, ib = a.pos & KV_BLK_MASK;
-        device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
-        device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
 #ifdef KV8
         const uint ck = kv_code(max(max(red[0][5], red[1][5]), max(red[2][5], red[3][5])) * kf);
         const uint cv = kv_code(max(max(red[0][6], red[1][6]), max(red[2][6], red[3][6])) * vf);
         const float sk = kv_scale(ck), sv = kv_scale(cv);
         const float qk = kv_quant(k, sk, ck, tid), qv = kv_quant(v, sv, cv, tid);
         kc[tid] = qk * sk; vc[tid] = qv * sv;
-        kp[tid] = (kv_t) (int) qk;
-        vp[tid] = (kv_t) (int) qv;
+        if (!dry) {
+            const uint blk = a.pos >> 6, ib = a.pos & KV_BLK_MASK;
+            device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
+            device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
+            kp[tid] = (kv_t) (int) qk;
+            vp[tid] = (kv_t) (int) qv;
+        }
 #else
         kc[tid] = k; vc[tid] = v;
-        kp[tid] = half(k);
-        vp[tid] = half(v);
+        if (!dry) {
+            const uint blk = a.pos >> 6, ib = a.pos & KV_BLK_MASK;
+            device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
+            device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
+            kp[tid] = half(k);
+            vp[tid] = half(v);
+        }
 #endif
     }
     float sink[3];
@@ -1329,7 +1448,7 @@ kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [
         P[2 + tid] = O;
     }
     threadgroup uint flag;
-    if (a.pad == 0 && last_tg(CTR + a.ctr + g, a.nsplit, tid, &flag)) {
+    if ((a.pad & 1u) == 0u && last_tg(CTR + a.ctr + g, a.nsplit, tid, &flag)) {
         for (int h = 0; h < 3; h++) {
             const uint H = g * 3 + h;
             device const float * P = A + a.part_off + H * a.nsplit * (HD + 2);
@@ -1347,6 +1466,8 @@ kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [
     }
 }
 
+// `swa` bit 0: sliding-window layer; bit 1: no_state_write (LoopCD dry weak pass: compute exact kc/vc in TG memory
+// without mutating CS or global KV).
 struct AttnBlkDecArgs {
     uint desc_off, pass_idx, cs_slot, swa;
     uint q_off, k_off, v_off, r_off;
@@ -1370,16 +1491,18 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
     threadgroup float ms_[4][3], ls_[4][3];
     threadgroup float4 os_[4][3][32];
     const uint sp = tgp.x, g = tgp.y, si = tgp.z;
+    const bool is_swa = (a.swa & 1u) != 0u;
+    const bool dry = (a.swa & 2u) != 0u;
     device const DecodeSpanDesc & d = ((device const DecodeSpanDesc *) (A + a.desc_off))[si];
-    const uint nsplit = a.swa ? d.swa_nsplit : d.full_nsplit;
+    const uint nsplit = is_swa ? d.swa_nsplit : d.full_nsplit;
     if (sp >= nsplit) return;
     const uint pos = d.pos;
-    const uint nkeys = a.swa ? d.swa_nkeys : d.full_nkeys;
-    const uint first_pos = a.swa ? d.swa_first_pos : 0u;
-    const uint kps = a.swa ? d.swa_kps : d.full_kps;
-    const float tau = a.swa ? 1.0f : d.full_tau;
+    const uint nkeys = is_swa ? d.swa_nkeys : d.full_nkeys;
+    const uint first_pos = is_swa ? d.swa_first_pos : 0u;
+    const uint kps = is_swa ? d.swa_kps : d.full_kps;
+    const float tau = is_swa ? 1.0f : d.full_tau;
     const uint cs_off = d.cs_base + a.cs_slot;
-    device const ulong * BT = BT_ALL + (a.swa ? d.bt_win_base : d.bt_full_base);
+    device const ulong * BT = BT_ALL + (is_swa ? d.bt_win_base : d.bt_full_base);
     const uint q_off = a.q_off + si * (NH * HD);
     const uint k_off = a.k_off + si * (NKV * HD);
     const uint v_off = a.v_off + si * (NKV * HD);
@@ -1407,7 +1530,7 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
             float acc = w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * x;
             const int dyn = which == 0 ? kdyn_off : vdyn_off;
             if (dyn >= 0) { device const float * t = A + dyn + g * 4; acc += t[0] * x + t[1] * h2 + t[2] * h1 + t[3] * h0; }
-            hh[0] = h1; hh[1] = h2; hh[2] = x;
+            if (!dry) { hh[0] = h1; hh[1] = h2; hh[2] = x; }
             if (which == 0) kx = (x + acc) * scl; else vx = (x + acc) * scl;
         }
     }
@@ -1435,21 +1558,28 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
     if (owns) {
         const float kf = clamp(QK_CLIP / (sqrt(tot[3]) + 1e-6f), 0.0f, 1.0f), vf = rsqrt(tot[4] / HD + 1e-6f);
         const float k = kx * kf, v = vx * vf;
-        const uint blk = pos >> 6, ib = pos & KV_BLK_MASK;
-        device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
-        device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
 #ifdef KV8
         const uint ck = kv_code(max(max(red[0][5], red[1][5]), max(red[2][5], red[3][5])) * kf);
         const uint cv = kv_code(max(max(red[0][6], red[1][6]), max(red[2][6], red[3][6])) * vf);
         const float sk = kv_scale(ck), sv = kv_scale(cv);
         const float qk = kv_quant(k, sk, ck, tid), qv = kv_quant(v, sv, cv, tid);
         kc[tid] = qk * sk; vc[tid] = qv * sv;
-        kp[tid] = (kv_t) (int) qk;
-        vp[tid] = (kv_t) (int) qv;
+        if (!dry) {
+            const uint blk = pos >> 6, ib = pos & KV_BLK_MASK;
+            device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
+            device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
+            kp[tid] = (kv_t) (int) qk;
+            vp[tid] = (kv_t) (int) qv;
+        }
 #else
         kc[tid] = k; vc[tid] = v;
-        kp[tid] = half(k);
-        vp[tid] = half(v);
+        if (!dry) {
+            const uint blk = pos >> 6, ib = pos & KV_BLK_MASK;
+            device kv_t * kp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, koff) + ib * HD;
+            device kv_t * vp = kv_blk_ptr(KV0, KV1, KV2, KV3, BT, blk, voff) + ib * HD;
+            kp[tid] = half(k);
+            vp[tid] = half(v);
+        }
 #endif
     }
     float sink[3];

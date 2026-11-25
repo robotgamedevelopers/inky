@@ -484,7 +484,8 @@ kernel void k_state_upd(device float * A [[buffer(2)]], device float * CS [[buff
 
 // ---- fused decode post-conv + conv-state update across all lanes in a decode batch.
 // grid (E/256, nspans, 1), 256 threads. Bit-identical to `k_postconv_b` (T=1) followed by `k_state_upd` (T=1).
-struct PostConvDecArgs { uint desc_off, y_off, res_off, out_off, cs_slot_off, convw_off, has_res, pad; };
+// When `no_state_write != 0`, computes `A[out_off + ...]` identically without modifying `CS` (LoopCD dry weak pass).
+struct PostConvDecArgs { uint desc_off, y_off, res_off, out_off, cs_slot_off, convw_off, has_res, no_state_write; };
 kernel void k_postconv_state_dec(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device float * CS [[buffer(4)]],
                                  constant PostConvDecArgs & a [[buffer(5)]],
                                  uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
@@ -496,7 +497,7 @@ kernel void k_postconv_state_dec(device const uchar * PB [[buffer(1)]], device f
     const float y = A[a.y_off + si * E + c];
     const float o = (y + w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * y) * 0.4472135954999579f;
     A[a.out_off + si * E + c] = (a.has_res ? A[a.res_off + si * E + c] : 0.0f) + o;
-    h[0] = h1; h[1] = h2; h[2] = y;
+    if (a.no_state_write == 0u) { h[0] = h1; h[1] = h2; h[2] = y; }
 }
 
 // ---- per-position conv state for a verify span. Same rule as k_state_upd, for every prefix length m = 1..T,

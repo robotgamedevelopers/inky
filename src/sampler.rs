@@ -50,6 +50,17 @@ impl Sampler {
     /// using a monotonic `atanh` raw-logit cutoff (chadlyb/erisinky) to skip `tanh`/`exp` on tokens
     /// more than 30 nats below the maximum.
     pub fn sample_next_with_ban(&mut self, logits: &[f32], ban: Option<u32>) -> Result<u32, &'static str> {
+        self.sample_next_with_ban_and_softcap(logits, ban, self.softcap)
+    }
+
+    /// Sample one model row with an optional banned token ID and an explicit per-step `softcap`
+    /// override (`0.0` when logits are already post-softcap, e.g. after `k_loopcd_blend`).
+    pub fn sample_next_with_ban_and_softcap(
+        &mut self,
+        logits: &[f32],
+        ban: Option<u32>,
+        softcap: f32,
+    ) -> Result<u32, &'static str> {
         if logits.is_empty() { return Err("model returned no logits"); }
         if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
         let mut best: Option<(f32, u32)> = None;
@@ -62,10 +73,10 @@ impl Sampler {
         if self.greedy() || self.temp < 1e-5 {
             return Ok(best_tok);
         }
-        if !self.softcap.is_finite() || !self.top_p.is_finite() {
+        if !softcap.is_finite() || !self.top_p.is_finite() {
             return Err("invalid sampling parameters");
         }
-        let c = self.softcap;
+        let c = softcap;
         let t = self.temp;
         let capped = |x: f32| if c > 0.0 { c * (x / c).tanh() } else { x };
         let max_cap = capped(best_val);
@@ -500,5 +511,19 @@ mod tests {
         }
         // Banning the only candidate fails cleanly.
         assert!(greedy.sample_next_with_ban(&[1.0], Some(0)).is_err());
+    }
+
+    #[test]
+    fn softcap_override_zero_matches_raw_softcapped_sampling() {
+        let raw = [12.0f32, 11.2, 10.5, 4.0, -8.0, -30.0];
+        let c = 20.0f32;
+        let pre_capped: Vec<f32> = raw.iter().map(|&x| c * (x / c).tanh()).collect();
+        let mut s_raw = Sampler::new(0.8, 4, 0.9, c, 0xCAFE_BABE);
+        let mut s_pre = Sampler::new(0.8, 4, 0.9, c, 0xCAFE_BABE);
+        for _ in 0..100 {
+            let t1 = s_raw.sample_next_with_ban(&raw, Some(3)).unwrap();
+            let t2 = s_pre.sample_next_with_ban_and_softcap(&pre_capped, Some(3), 0.0).unwrap();
+            assert_eq!(t1, t2, "zero softcap override on pre-softcapped logits must match raw softcapped draw");
+        }
     }
 }
