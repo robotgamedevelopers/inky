@@ -87,6 +87,13 @@ struct SpilledStart {
     last_used_tick: u64,
 }
 
+// Preserve the source files and shorter resident match while making room for a restore.
+struct RestoreSource {
+    spill_id: u64,
+    keys: HashSet<SpillKey>,
+    resident_start: Option<SealedId>,
+}
+
 fn to_spill_kind(kind: BlockKind) -> SpillBlockKind {
     match kind {
         BlockKind::Full => SpillBlockKind::Full,
@@ -556,7 +563,7 @@ impl ServeBlockCache {
                     None => false,
                 };
                 if !all_live {
-                    self.evict_start_inner(pools, sid, false);
+                    self.evict_start_inner(pools, sid, false, None);
                     in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
                 }
             } else {
@@ -584,7 +591,7 @@ impl ServeBlockCache {
             None => return None,
         };
         if !all_live {
-            self.evict_start_inner(pools, sid, false);
+            self.evict_start_inner(pools, sid, false, None);
             return None;
         }
         self.tick += 1;
@@ -659,7 +666,7 @@ impl ServeBlockCache {
         }
     }
 
-    fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart) {
+    fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart, restore: Option<&RestoreSource>) {
         if self.spill_store.is_none()
             || st.pos == 0
             || st.pos % BLOCK != 0
@@ -679,9 +686,10 @@ impl ServeBlockCache {
             let oldest = self
                 .spilled_starts
                 .iter()
+                .filter(|(id, _)| !restore.is_some_and(|source| source.spill_id == **id))
                 .min_by_key(|(_, sp)| (sp.last_used_tick, std::cmp::Reverse(sp.pos)))
                 .map(|(&id, _)| id);
-            let Some(oid) = oldest else { break };
+            let Some(oid) = oldest else { return };
             self.remove_spilled_start(oid, true);
         }
         if self.max_spilled_starts == 0 {
@@ -691,7 +699,7 @@ impl ServeBlockCache {
         let spill_id = self.next_spill_id;
         self.next_spill_id = self.next_spill_id.wrapping_add(1).max(1);
 
-        let mut protected: HashSet<SpillKey> = HashSet::new();
+        let mut protected = restore.map(|source| source.keys.clone()).unwrap_or_default();
         let mut newly_written_keys: Vec<SpillKey> = Vec::new();
         let mut spilled_entries: Vec<(BlockKind, BlockIndex, SpillKey)> =
             Vec::with_capacity(st.entries.len());
@@ -935,7 +943,7 @@ impl ServeBlockCache {
             return None;
         }
 
-        // Phase 1: read and SHA-256 verify cs + every needed KV block BEFORE mutating pools or evicting RAM.
+        // Recurrent state is needed by every restore and has a separate bounded spill record.
         let cs = match self.spill_store.as_mut()?.read_block(cs_key, Some(0)) {
             ReadOutcome::Hit(blk) => match blk.recurrent_state {
                 Some(cs) if !cs.is_empty() => cs,
@@ -950,71 +958,27 @@ impl ServeBlockCache {
             }
         };
 
-        let mut verified_kv: Vec<Vec<u8>> = Vec::with_capacity(disk_entries.len());
-        for &(kind, _, sk) in &disk_entries {
-            let expected_len = pools.of(kind).stride_bytes() as usize;
-            match self.spill_store.as_mut()?.read_block(sk, Some(expected_len)) {
-                ReadOutcome::Hit(blk) => verified_kv.push(blk.kv_bytes),
-                ReadOutcome::Miss(_) => {
-                    self.remove_spilled_start(spill_id, true);
-                    return None;
-                }
-            }
+        let source = RestoreSource {
+            spill_id,
+            keys: entries.iter().map(|&(_, _, key)| key).chain(std::iter::once(cs_key)).collect(),
+            resident_start: in_ram.start,
+        };
+        // Reused blocks and newly loaded blocks stay private to the restore until the
+        // complete checkpoint is verified. This list owns one temporary ref per entry.
+        let mut held = Vec::with_capacity(entries.len());
+        for (bi, fe) in reused_full {
+            pools.full.record_mut(fe.slot()).unwrap().add_ref().expect("pin reused full block");
+            held.push((BlockKind::Full, bi, fe));
+        }
+        if self.stage_restore_blocks(pools, &source, &disk_entries, &mut held).is_none() {
+            Self::release_restore_refs(pools, held);
+            return None;
         }
 
-        // Phase 2: pin reused in-RAM entries so take_zeroed_slot cannot evict them.
-        for &(_, fe) in &reused_full {
-            pools
-                .of_mut(BlockKind::Full)
-                .record_mut(fe.slot())
-                .unwrap()
-                .add_ref()
-                .expect("temp pin reused full block");
-        }
-
-        let mut taken: Vec<(BlockKind, BlockIndex, BlockEntry)> =
-            Vec::with_capacity(disk_entries.len());
-        for ((kind, bi, _), kv_bytes) in disk_entries.into_iter().zip(verified_kv.into_iter()) {
-            match self.take_zeroed_slot(pools, kind) {
-                Ok((slot, gen)) => {
-                    let pool = pools.of_mut(kind);
-                    let Ok(dst) = pool.slot_bytes_mut(slot) else {
-                        for (k, _, e) in taken {
-                            let _ = pools.of_mut(k).record_mut(e.slot()).and_then(|r| r.drop_ref());
-                        }
-                        for (_, fe) in reused_full {
-                            let _ = pools.of_mut(BlockKind::Full).record_mut(fe.slot()).and_then(|r| r.drop_ref());
-                        }
-                        return None;
-                    };
-                    dst.copy_from_slice(&kv_bytes);
-                    let rec = pool.record_mut(slot).unwrap();
-                    rec.set_length(BLOCK as u32).expect("set restored block length");
-                    rec.seal();
-                    rec.add_ref().expect("temp pin restored slot");
-                    let offset = pool.offset(slot).expect("restored slot offset");
-                    let entry = BlockEntry::new(slot, gen, offset, kind, pool.kvb());
-                    taken.push((kind, bi, entry));
-                }
-                Err(_) => {
-                    for (k, _, e) in taken {
-                        let _ = pools.of_mut(k).record_mut(e.slot()).and_then(|r| r.drop_ref());
-                    }
-                    for (_, fe) in reused_full {
-                        let _ = pools.of_mut(BlockKind::Full).record_mut(fe.slot()).and_then(|r| r.drop_ref());
-                    }
-                    return None;
-                }
-            }
-        }
-
-        // Phase 3: assemble EntryTree nodes and RetainedStart, transferring refs cleanly.
+        // Publish the verified checkpoint, transferring its provisional refs to the retained start.
         let mut full_by_bi: HashMap<u32, BlockEntry> = HashMap::with_capacity(pos / BLOCK);
         let mut win_by_bi: HashMap<u32, BlockEntry> = HashMap::with_capacity(WINDOW / BLOCK);
-        for &(bi, fe) in &reused_full {
-            full_by_bi.insert(bi.get(), fe);
-        }
-        for &(kind, bi, e) in &taken {
+        for &(kind, bi, e) in &held {
             match kind {
                 BlockKind::Full => {
                     full_by_bi.insert(bi.get(), e);
@@ -1093,40 +1057,72 @@ impl ServeBlockCache {
             );
         }
 
-        // Release temporary pins taken during Phase 2.
-        for (k, _, e) in taken {
-            pools
-                .of_mut(k)
-                .record_mut(e.slot())
-                .unwrap()
-                .drop_ref()
-                .expect("drop temp restored slot pin");
-        }
-        for (_, fe) in reused_full {
-            pools
-                .of_mut(BlockKind::Full)
-                .record_mut(fe.slot())
-                .unwrap()
-                .drop_ref()
-                .expect("drop temp reused full pin");
-        }
-
+        Self::release_restore_refs(pools, held);
         self.remove_spilled_start(spill_id, true);
         self.stats.starts_restored += 1;
         Some(tip)
     }
 
-    #[allow(dead_code)]
-    fn evict_start(&mut self, pools: &mut BlockPools, sid: SealedId) -> bool {
-        self.evict_start_inner(pools, sid, true)
+    fn stage_restore_blocks(
+        &mut self,
+        pools: &mut BlockPools,
+        source: &RestoreSource,
+        disk_entries: &[(BlockKind, BlockIndex, SpillKey)],
+        held: &mut Vec<(BlockKind, BlockIndex, BlockEntry)>,
+    ) -> Option<()> {
+        let mut verified_before_eviction = false;
+        for (i, &(kind, bi, key)) in disk_entries.iter().enumerate() {
+            if !verified_before_eviction && pools.of(kind).lowest_free().is_none() {
+                // A bad file must not discard a healthy resident checkpoint. Only the
+                // restore that needs eviction pays for this extra pass, one block at a time.
+                for &(remaining_kind, _, remaining_key) in &disk_entries[i..] {
+                    let len = pools.of(remaining_kind).stride_bytes() as usize;
+                    self.read_restore_kv(source.spill_id, remaining_key, len)?;
+                }
+                verified_before_eviction = true;
+            }
+            let len = pools.of(kind).stride_bytes() as usize;
+            let bytes = self.read_restore_kv(source.spill_id, key, len)?;
+            let (slot, generation) = self.take_zeroed_slot_inner(pools, kind, Some(source)).ok()?;
+            let pool = pools.of_mut(kind);
+            pool.slot_bytes_mut(slot).ok()?.copy_from_slice(&bytes);
+            let rec = pool.record_mut(slot).unwrap();
+            rec.set_length(BLOCK as u32).expect("set restored block length");
+            rec.seal();
+            rec.add_ref().expect("pin restored block");
+            let offset = pool.offset(slot).expect("restored slot offset");
+            held.push((kind, bi, BlockEntry::new(slot, generation, offset, kind, pool.kvb())));
+        }
+        Some(())
     }
 
-    fn evict_start_inner(&mut self, pools: &mut BlockPools, sid: SealedId, allow_spill: bool) -> bool {
+    fn read_restore_kv(&mut self, spill_id: u64, key: SpillKey, expected_len: usize) -> Option<Vec<u8>> {
+        match self.spill_store.as_mut()?.read_block(key, Some(expected_len)) {
+            ReadOutcome::Hit(block) => Some(block.kv_bytes),
+            ReadOutcome::Miss(_) => {
+                self.remove_spilled_start(spill_id, true);
+                None
+            }
+        }
+    }
+
+    fn release_restore_refs(pools: &mut BlockPools, held: Vec<(BlockKind, BlockIndex, BlockEntry)>) {
+        for (kind, _, entry) in held {
+            pools.of_mut(kind).record_mut(entry.slot()).unwrap().drop_ref().expect("drop restore ref");
+        }
+    }
+
+    #[allow(dead_code)]
+    fn evict_start(&mut self, pools: &mut BlockPools, sid: SealedId) -> bool {
+        self.evict_start_inner(pools, sid, true, None)
+    }
+
+    fn evict_start_inner(&mut self, pools: &mut BlockPools, sid: SealedId, allow_spill: bool, restore: Option<&RestoreSource>) -> bool {
         let Some(st) = self.starts.remove(&sid) else {
             return false;
         };
         if allow_spill && self.spill_store.is_some() {
-            self.spill_retained_start(pools, &st);
+            self.spill_retained_start(pools, &st, restore);
         }
         let _ = self.tree.release_start(sid);
         for (kind, _, e) in st.entries {
@@ -1143,9 +1139,10 @@ impl ServeBlockCache {
         true
     }
 
-    fn evict_one_lru_start_inner(&mut self, pools: &mut BlockPools, allow_spill: bool) -> bool {
+    fn evict_one_lru_start_inner(&mut self, pools: &mut BlockPools, allow_spill: bool, restore: Option<&RestoreSource>) -> bool {
         let mut victim: Option<(SealedId, u64, usize)> = None;
         for (&sid, st) in &self.starts {
+            if restore.is_some_and(|source| source.resident_start == Some(sid)) { continue; }
             let better = match victim {
                 None => true,
                 // Evict oldest LRU tick first; on a tie, evict deeper leaf before shallower shared root.
@@ -1161,7 +1158,7 @@ impl ServeBlockCache {
         let Some((sid, _, _)) = victim else {
             return false;
         };
-        self.evict_start_inner(pools, sid, allow_spill)
+        self.evict_start_inner(pools, sid, allow_spill, restore)
     }
 
     /// Take one zeroed slot of `kind`, evicting LRU retained start points until a free slot
@@ -1171,6 +1168,15 @@ impl ServeBlockCache {
         &mut self,
         pools: &mut BlockPools,
         kind: BlockKind,
+    ) -> Result<(Slot, u32), CacheError> {
+        self.take_zeroed_slot_inner(pools, kind, None)
+    }
+
+    fn take_zeroed_slot_inner(
+        &mut self,
+        pools: &mut BlockPools,
+        kind: BlockKind,
+        restore: Option<&RestoreSource>,
     ) -> Result<(Slot, u32), CacheError> {
         loop {
             if let Some(slot) = pools.of(kind).lowest_free() {
@@ -1183,7 +1189,7 @@ impl ServeBlockCache {
                 }
                 return Ok((slot, gen));
             }
-            if !self.evict_one_lru_start_inner(pools, true) {
+            if !self.evict_one_lru_start_inner(pools, true, restore) {
                 return Err(CacheError::PoolExhausted(kind));
             }
         }
@@ -1291,7 +1297,7 @@ impl ServeBlockCache {
                         .expect("insert sealed block into EntryTree");
                     let canon = self.tree.handle(id).expect("inserted handle");
                     let canon_f = canon.full();
-                    let canon_w = canon.window().expect("window handle on sealed block");
+                    let canon_w = canon.window();
                     let mut best_f = full_e;
                     let mut best_w = win_e;
                     if canon_f != full_e && entry_is_live_sealed(pools, BlockKind::Full, canon_f) {
@@ -1300,12 +1306,12 @@ impl ServeBlockCache {
                         best_f = canon_f;
                         self.stats.shared_dedups += 1;
                     }
-                    if canon_w != win_e && entry_is_live_sealed(pools, BlockKind::Window, canon_w) {
+                    if let Some(canon_w) = canon_w.filter(|&w| w != win_e && entry_is_live_sealed(pools, BlockKind::Window, w)) {
                         tbl.fill(&mut pools.window, bi, canon_w.slot(), canon_w.generation())
                             .expect("share canonical window block");
                         best_w = canon_w;
                     }
-                    if best_f != canon_f || best_w != canon_w {
+                    if best_f != canon_f || Some(best_w) != canon_w {
                         let _ = self.tree.set_handle(id, BlockHandles::new(best_f, Some(best_w)));
                     }
                     self.tree.pin(id).expect("pin newly sealed block");
@@ -1434,7 +1440,7 @@ impl ServeBlockCache {
 
     /// Evict every retained start point so all pool references drain cleanly on shutdown.
     pub fn shutdown(&mut self, pools: &mut BlockPools) {
-        while self.evict_one_lru_start_inner(pools, false) {}
+        while self.evict_one_lru_start_inner(pools, false, None) {}
     }
 }
 
@@ -2294,26 +2300,110 @@ mod tests {
         assert_zero_pool_leaks(&pools);
     }
 
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("block-cache-spill-tests")
+                .join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Populate a retained checkpoint at end, leaving its lane free.
+    fn retain_test_prompt(
+        cache: &mut ServeBlockCache,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        tokens: &[u32],
+        tag: u8,
+    ) -> SealedId {
+        let start = cache.match_and_bind(pools, tbl, state, tokens).map_or(0, |(p, _)| p);
+        let end = tokens.len() - 1;
+        cache.ensure_span_blocks(pools, tbl, start, end - start).unwrap();
+        cache.finish_prefill_span(pools, tbl, state, tokens, start, end - start, || fake_cs(tag));
+        let tip = *state.sealed.last().unwrap();
+        cache.release_lane(pools, tbl, state);
+        tip
+    }
+
+    #[test]
+    fn long_spill_restore_keeps_source_and_accepts_early_fork() {
+        let dir = ScratchDir::new("long-fork");
+        let store = SpillStore::open(&dir.0, 100 * 1024 * 1024).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut pools = BlockPools::with_capacities(18, 18, 1).unwrap();
+        let mut tbl = BlockTable::new(20).unwrap();
+        let mut state = LaneBlockState::default();
+        let end = WINDOW + BLOCK;
+        let long: Vec<u32> = (0..=end as u32).collect();
+        let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &long, 3);
+        assert!(cache.evict_start(&mut pools, tip));
+        // Two unrelated resident blocks leave only 16 free Full slots; the restore
+        // needs 17. Writing these victims to the tight SSD must preserve the source.
+        let unrelated: Vec<u32> = (0..=128).map(|i| 20_000 + i).collect();
+        retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &unrelated, 4);
+        assert_eq!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &long), Some((end, fake_cs(3))));
+        let root = state.sealed[0];
+        let root_full = cache.tree.handle(root).unwrap().full();
+        assert!(cache.tree.handle(root).unwrap().window().is_none());
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+
+        let mut fork = long[..BLOCK].to_vec();
+        fork.push(99_000);
+        assert!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &fork).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl, 0, BLOCK).unwrap();
+        let recomputed_window = tbl.get(BlockKind::Window, BlockIndex::new(0)).unwrap().unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut state, &fork, 0, BLOCK, || fake_cs(5));
+        assert_eq!(state.sealed[0], root);
+        assert_eq!(cache.tree.handle(root).unwrap(), BlockHandles::new(root_full, Some(recomputed_window)));
+        assert_eq!(tbl.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), Some(root_full));
+        cache.ensure_span_blocks(&mut pools, &mut tbl, BLOCK, 1).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut state, &fork, BLOCK, 1, || fake_cs(6));
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn spill_read_failure_releases_provisional_blocks_and_preserves_resident_match() {
+        let dir = ScratchDir::new("stream-rollback");
+        let store = SpillStore::open(&dir.0, 64 * 1024 * 1024).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut pools = BlockPools::with_capacities(16, 16, 1).unwrap();
+        let mut tbl = BlockTable::new(16).unwrap();
+        let mut state = LaneBlockState::default();
+        let long: Vec<u32> = (0..=6 * BLOCK as u32).collect();
+        let short = &long[..BLOCK + 1];
+        retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, short, 1);
+        let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut state, &long, 2);
+        assert!(cache.evict_start(&mut pools, tip));
+
+        let checkpoint = cache.spilled_starts.values().next().unwrap();
+        let (_, _, last_file) = *checkpoint.entries.last().unwrap();
+        std::fs::remove_file(cache.spill_store().unwrap().block_path(last_file)).unwrap();
+        let before = cache.stats().slots_taken;
+        assert_eq!(cache.match_and_bind(&mut pools, &mut tbl, &mut state, &long), Some((BLOCK, fake_cs(1))));
+        assert!(cache.stats().slots_taken > before, "earlier files used bounded provisional slots");
+        assert_eq!(cache.stats().starts_restored, 0);
+        assert_eq!(cache.retained_start_count(), 1);
+        assert_eq!(cache.spilled_start_count(), 0);
+        cache.release_lane(&mut pools, &mut tbl, &mut state);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
     #[test]
     fn spill_store_eviction_restore_and_corrupt_fallback() {
-        struct ScratchDir(std::path::PathBuf);
-        impl ScratchDir {
-            fn new(name: &str) -> Self {
-                let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .join("block-cache-spill-tests")
-                    .join(format!("{name}-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&p);
-                std::fs::create_dir_all(&p).unwrap();
-                Self(p)
-            }
-        }
-        impl Drop for ScratchDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
         let dir = ScratchDir::new("e2e");
         let store = SpillStore::open(&dir.0, 256 * 1024 * 1024).unwrap();
         // 24 Full slots, 16 Window slots at kvb=1 (1 MiB Full, 5 MiB Window).
