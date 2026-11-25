@@ -15,9 +15,9 @@ use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1571,11 +1571,15 @@ fn models_body() -> String {
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
+// Counting can accept prompts larger than the lane context. Cap the JSON before
+// allocating or translating it, since the token limit alone does not bound BPE scratch.
+const MAX_COUNT_BODY: usize = 1 << 20;
+const MAX_COUNT_TOKENS: usize = 256 << 10;
 // Cap buffered body capacity and the input represented by live decoded requests.
 const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
 /// rather than resetting a timeout on every read syscall.
@@ -1807,14 +1811,14 @@ fn route(method: &str, path: &str) -> Route {
 /// Decide header-only rejections before allocating or reading the request body.
 /// A chunked body has no length to check here: its cap is enforced chunk by
 /// chunk in `read_chunked`, after this gate and after the key check.
-fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, String)> {
+fn check_headers(h: &Head, path: &str, key: Option<&str>, body_limit: usize) -> Result<(), (u16, String)> {
     if let Some(k) = key {
         let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
         if path != "/health" && !authed {
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
         }
     }
-    if !h.chunked && h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
+    if !h.chunked && h.len > body_limit { return Err((413, format!("the body is over {body_limit} bytes"))); }
     Ok(())
 }
 
@@ -2093,15 +2097,62 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              admission: AdmissionGate,
              /// Automatic Metal working-set memory budget measured at startup.
              budget: MemoryBudget,
-             /// Translation and rendering capacity shared with count_tokens.
+             /// Generation translation and rendering capacity.
              preprocess: PermitPool,
+             /// Count-only capacity, independent of generation admission and rendering.
+             count_preprocess: PermitPool,
              /// Lanes currently occupied by an active job in the scheduler.
              active_lanes: Arc<AtomicUsize>,
-             /// connection threads alive; at most MAX_CONNS
-             conns: Arc<AtomicUsize>,
+             /// Live connections, capped globally and per peer.
+             conns: ConnectionSlots,
              /// opt-in non-blocking JSONL card traffic recorder
              recorder: Option<Arc<crate::record::Recorder>> }
 const MAX_CONNS: usize = 512;
+const MAX_PEER_CONNS: usize = 128;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct ConnectionSlots(Arc<Mutex<ConnectionCounts>>);
+
+#[derive(Default)]
+struct ConnectionCounts {
+    total: usize,
+    peers: HashMap<IpAddr, usize>,
+}
+
+struct ConnectionSlot {
+    counts: Arc<Mutex<ConnectionCounts>>,
+    peer: IpAddr,
+}
+
+impl ConnectionSlots {
+    fn acquire(&self, peer: IpAddr) -> Option<ConnectionSlot> {
+        let peer = peer.to_canonical();
+        let mut counts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.total >= MAX_CONNS {
+            return None;
+        }
+        let active = counts.peers.entry(peer).or_default();
+        if *active >= MAX_PEER_CONNS {
+            return None;
+        }
+        *active += 1;
+        counts.total += 1;
+        Some(ConnectionSlot { counts: self.0.clone(), peer })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let active = counts.peers.get_mut(&self.peer).expect("live connection has a peer entry");
+        *active -= 1;
+        if *active == 0 {
+            counts.peers.remove(&self.peer);
+        }
+        counts.total -= 1;
+    }
+}
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2722,13 +2773,10 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
 
 /// The would-be prompt's token count; no lane is taken, nothing is generated.
 fn count_tokens<W: Write + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::Result<()> {
-    let Some(preprocess) = cx.preprocess.acquire() else { return anthropic_overloaded(s, cx.admission.retry_after_secs(), PREPROCESS_BUSY) };
-    let rendered = render_messages(cx, req, usize::MAX);
-    drop(preprocess);
-    match rendered {
+    match render_messages(cx, req, MAX_COUNT_TOKENS) {
         Ok(t) => respond(s, 200, &json!({"input_tokens": t.len()}).to_string()),
         Err(RenderError::Invalid(e)) => anthropic_error(s, 400, "invalid_request_error", &e),
-        Err(RenderError::TooLong) => anthropic_error(s, 400, "invalid_request_error", "prompt is too long to count"),
+        Err(RenderError::TooLong) => anthropic_error(s, 400, "invalid_request_error", &format!("prompt is too long to count: more than {MAX_COUNT_TOKENS} tokens")),
     }
 }
 
@@ -2810,7 +2858,7 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2856,105 +2904,133 @@ pub fn serve(o: ServeOpts) {
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
-        for c in l.incoming() {
-            let Ok(mut s) = c else { continue };
+        loop {
+            let (mut s, peer) = match l.accept() {
+                Ok(connection) => connection,
+                Err(e) => {
+                    eprintln!("[serve] accept: {e}");
+                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    continue;
+                }
+            };
+            let accepted_at = Instant::now();
+            let Some(slot) = cx.conns.acquire(peer.ip()) else {
+                // A rejected socket must never stall the listener while writing its reply.
+                if s.set_nonblocking(true).is_ok() {
+                    let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+                }
+                continue;
+            };
             if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
             let cx = cx.clone();
-            if cx.conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNS {
-                cx.conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
-                continue;
-            }
             let body_budget = body_budget.clone();
-            std::thread::spawn(move || {
-                struct Conn(Arc<std::sync::atomic::AtomicUsize>);
-                impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
-                let _conn = Conn(cx.conns.clone());
-                let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
-                let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
-                let Ok(h) = read_head(&mut r) else { return };
-                let path = route_path(&h.path);
-                let method = h.method.clone();
-                // the key is checked before any body is read
-                if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref()) {
-                    drop(r);
-                    let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "invalid_request_error" }, &message) }
-                            else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                            else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
-                    return;
-                }
-                // Routes that do not use a body can answer without waiting for one.
-                let route = route(&method, &path);
-                if matches!(route, Route::Models | Route::Health | Route::NotFound) {
-                    drop(r);
-                    let result = match route {
-                        Route::Models => respond(&mut s, 200, &models_body()),
-                        Route::Health => respond(&mut s, 200, &health_body(&cx)),
-                        Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
-                        Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
-                        _ => unreachable!("body routes are handled below"),
-                    };
-                    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-                    return;
-                }
-                r.get_mut().set_deadline(Instant::now() + BODY_READ_TIMEOUT);
-                let body = if h.chunked {
-                    read_chunked(&mut r, MAX_BODY, &body_budget)
-                } else {
-                    read_fixed(&mut r, h.len, &body_budget)
-                };
-                // A completed body may have come entirely from BufReader's
-                // buffer. Check the deadline even if no socket read was needed.
-                let body = body.and_then(|body| match r.get_mut().remaining() {
-                    Ok(_) => Ok(body),
-                    Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
-                    Err(_) => Err(BodyError::Incomplete),
-                });
-                drop(r);
-                let _ = s.set_read_timeout(None);
-                let anthropic = matches!(route, Route::Messages | Route::CountTokens);
-                let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
-                    Ok(decoded) => decoded,
-                    Err(BodyError::Busy) => {
-                        let message = "inky is busy: the request body budget is full";
-                        let retry = cx.admission.retry_after_secs();
-                        let _ = if anthropic {
-                            anthropic_overloaded(&mut s, retry, message)
-                        } else {
-                            openai_overloaded(&mut s, retry, message)
-                        };
-                        return;
-                    }
-                    Err(BodyError::Incomplete) => return,
-                    Err(e) => {
-                        let (code, kind, message) = match e {
-                            BodyError::TooLarge => (413, "request_too_large", format!("the body is over {MAX_BODY} bytes")),
-                            BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
-                            BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
-                            BodyError::Busy | BodyError::Incomplete => unreachable!(),
-                        };
-                        let result = if anthropic {
-                            anthropic_error(&mut s, code, kind, &message)
-                        } else {
-                            respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
-                        };
-                        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-                        return;
-                    }
-                };
-                let card_id = h.card_id.as_deref();
-                let result = match route {
-                    Route::Chat => chat_with_card(&cx, &decoded.value, card_id, &mut s),
-                    Route::Messages => messages_with_card(&cx, &decoded.value, card_id, &mut s),
-                    Route::CountTokens => count_tokens(&cx, &decoded.value, &mut s),
-                    _ => unreachable!("bodyless routes were handled above"),
-                };
-                drop(decoded);
-                if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-            });
+            if let Err(e) = std::thread::Builder::new().spawn(move || {
+                let _slot = slot;
+                handle_connection(&cx, &body_budget, s, accepted_at, REQUEST_READ_TIMEOUT);
+            }) {
+                eprintln!("[serve] connection worker: {e}");
+            }
         }
     });
     scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
+}
+
+fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
+    let request_deadline = accepted_at + read_timeout;
+    let header_deadline = (accepted_at + HEADER_READ_TIMEOUT).min(request_deadline);
+    let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
+    let Ok(h) = read_head(&mut r) else { return };
+    if r.get_mut().remaining().is_err() { return; }
+    r.get_mut().set_deadline(request_deadline);
+    let path = route_path(&h.path);
+    let method = &h.method;
+    let route = route(method, &path);
+    let body_limit = if route == Route::CountTokens { MAX_COUNT_BODY } else { MAX_BODY };
+    // the key is checked before any body is read
+    if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref(), body_limit) {
+        drop(r);
+        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "request_too_large" }, &message) }
+                else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
+                else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
+        return;
+    }
+    // Routes that do not use a body can answer without waiting for one.
+    if matches!(route, Route::Models | Route::Health | Route::NotFound) {
+        drop(r);
+        let result = match route {
+            Route::Models => respond(&mut s, 200, &models_body()),
+            Route::Health => respond(&mut s, 200, &health_body(cx)),
+            Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
+            Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
+            _ => unreachable!("body routes are handled below"),
+        };
+        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+        return;
+    }
+    let body = if h.chunked {
+        read_chunked(&mut r, body_limit, body_budget)
+    } else {
+        read_fixed(&mut r, h.len, body_budget)
+    };
+    // A completed body may have come entirely from BufReader's
+    // buffer. Check the deadline even if no socket read was needed.
+    let body = body.and_then(|body| match r.get_mut().remaining() {
+        Ok(_) => Ok(body),
+        Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
+        Err(_) => Err(BodyError::Incomplete),
+    });
+    drop(r);
+    let _ = s.set_read_timeout(None);
+    let anthropic = matches!(route, Route::Messages | Route::CountTokens);
+    let _count_preprocess = if route == Route::CountTokens && body.is_ok() {
+        match cx.count_preprocess.acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let _ = anthropic_overloaded(&mut s, cx.admission.retry_after_secs(), "inky is busy: a token count is in progress");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
+        Ok(decoded) => decoded,
+        Err(BodyError::Busy) => {
+            let message = "inky is busy: the request body budget is full";
+            let retry = cx.admission.retry_after_secs();
+            let _ = if anthropic {
+                anthropic_overloaded(&mut s, retry, message)
+            } else {
+                openai_overloaded(&mut s, retry, message)
+            };
+            return;
+        }
+        Err(BodyError::Incomplete) => return,
+        Err(e) => {
+            let (code, kind, message) = match e {
+                BodyError::TooLarge => (413, "request_too_large", format!("the body is over {body_limit} bytes")),
+                BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
+                BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
+                BodyError::Busy | BodyError::Incomplete => unreachable!(),
+            };
+            let result = if anthropic {
+                anthropic_error(&mut s, code, kind, &message)
+            } else {
+                respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
+            };
+            if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+            return;
+        }
+    };
+    let card_id = h.card_id.as_deref();
+    let result = match route {
+        Route::Chat => chat_with_card(cx, &decoded.value, card_id, &mut s),
+        Route::Messages => messages_with_card(cx, &decoded.value, card_id, &mut s),
+        Route::CountTokens => count_tokens(cx, &decoded.value, &mut s),
+        _ => unreachable!("bodyless routes were handled above"),
+    };
+    drop(decoded);
+    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
 }
 
 #[cfg(test)]
@@ -3007,7 +3083,7 @@ mod tests {
                 DEFAULT_RETRY_AFTER_SECS,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         };
         (cx, rx)
     }
@@ -3075,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn overload_precedes_rendering_and_count_tokens_shares_the_preprocessing_limit() {
+    fn overload_precedes_rendering_and_count_tokens_uses_independent_preprocessing() {
         let (cx, jobs) = admission_test_ctx(1);
         let req = json!({"max_tokens": 1, "messages": [{"role": "unsupported", "content": "hi"}]});
         let generation = cx.admission.try_acquire().unwrap();
@@ -3098,12 +3174,136 @@ mod tests {
         let _preprocess = cx.preprocess.acquire().unwrap();
         let mut response = Vec::new();
         count_tokens(&cx, &over_context, &mut response).unwrap();
-        assert!(response.starts_with(b"HTTP/1.1 429"));
+        assert!(response.starts_with(b"HTTP/1.1 200"), "counting remains available during generation rendering");
         response.clear();
         messages(&cx, &req, &mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 429"));
         assert!(cx.admission.try_acquire().is_some(), "failed preprocessing admission returns the generation permit");
         assert!(jobs.try_recv().is_err());
+    }
+
+    fn open_http_test_connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn http_test_exchange(cx: &Ctx, request: &[u8]) -> String {
+        let (mut client, server) = open_http_test_connection();
+        let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
+        std::thread::scope(|scope| {
+            scope.spawn(move || handle_connection(cx, budget, server, Instant::now(), REQUEST_READ_TIMEOUT));
+            client.write_all(request).unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            response
+        })
+    }
+
+    fn json_request(path: &str, body: &str) -> String {
+        format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[test]
+    fn count_tokens_http_limits_both_body_framings_and_rendered_tokens() {
+        let (cx, jobs) = admission_test_ctx(1);
+        let path = "/v1/messages/count_tokens/?beta=true";
+        let declared = MAX_COUNT_BODY + 1;
+        let fixed = format!("POST {path} HTTP/1.1\r\nContent-Length: {declared}\r\n\r\n");
+        let chunked = format!("POST {path} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{declared:x}\r\n");
+        for request in [fixed, chunked] {
+            let response = http_test_exchange(&cx, request.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 413"));
+            assert!(response.contains("request_too_large"));
+        }
+
+        let body = json!({"messages": [{"role": "user", "content": "x".repeat(MAX_COUNT_TOKENS)}]}).to_string();
+        assert!(body.len() < MAX_COUNT_BODY);
+        let response = http_test_exchange(&cx, json_request(path, &body).as_bytes());
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("prompt is too long to count"));
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn count_tokens_uses_a_dedicated_http_preprocess_slot() {
+        let (cx, jobs) = admission_test_ctx(1);
+        let count = cx.count_preprocess.acquire().unwrap();
+        let body = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let count_req = json_request("/v1/messages/count_tokens", body);
+        let response = http_test_exchange(&cx, count_req.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 429"));
+        assert!(response.contains("Retry-After: 5"));
+        // An invalid prompt gets through generation admission and into rendering.
+        let invalid = r#"{"max_tokens":1,"messages":[{"role":"unsupported","content":"hello"}]}"#;
+        let messages = json_request("/v1/messages", invalid);
+        let response = http_test_exchange(&cx, messages.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(jobs.try_recv().is_err());
+
+        drop(count);
+        let generation = cx.preprocess.acquire().unwrap();
+        let response = http_test_exchange(&cx, count_req.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("input_tokens"));
+        drop(generation);
+    }
+
+    #[test]
+    fn partial_http_bodies_expire_within_the_request_read_deadline() {
+        let (cx, jobs) = admission_test_ctx(1);
+        for (framing, expected) in [
+            ("Content-Length: 8\r\n\r\n{", ""),
+            ("Transfer-Encoding: chunked\r\n\r\n8\r\n{", "HTTP/1.1 400"),
+        ] {
+            let (mut client, server) = open_http_test_connection();
+            write!(client, "POST /v1/messages/count_tokens HTTP/1.1\r\n{framing}").unwrap();
+            let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
+            std::thread::scope(|scope| {
+                let cx = &cx;
+                // Start with most of the request budget already spent so a fresh
+                // body budget would outlast the client's two-second read timeout.
+                let accepted_at = Instant::now() - Duration::from_millis(2800);
+                scope.spawn(move || handle_connection(cx, budget, server, accepted_at, Duration::from_secs(3)));
+                let mut response = String::new();
+                // Keep the write side open, so only the server deadline ends the request.
+                let result = client.read_to_string(&mut response);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                result.unwrap();
+                if expected.is_empty() {
+                    assert!(response.is_empty());
+                } else {
+                    assert!(response.starts_with(expected));
+                }
+            });
+        }
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn connection_slots_enforce_peer_and_global_limits_and_reuse_released_slots() {
+        let slots = ConnectionSlots::default();
+        let peer = "192.0.2.1".parse().unwrap();
+        let mapped = "::ffff:192.0.2.1".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_PEER_CONNS).map(|_| slots.acquire(peer).unwrap()).collect();
+        assert!(slots.acquire(mapped).is_none());
+        let other = "192.0.2.2".parse().unwrap();
+        assert!(slots.acquire(other).is_some());
+        held.pop();
+        held.push(slots.acquire(mapped).unwrap());
+
+        for n in 1..=(MAX_CONNS - held.len()) {
+            held.push(slots.acquire(IpAddr::from([198, 51, (n >> 8) as u8, n as u8])).unwrap());
+        }
+        assert!(slots.acquire(other).is_none());
+        held.pop();
+        held.push(slots.acquire(other).unwrap());
+        drop(held);
+        let counts = slots.0.lock().unwrap();
+        assert_eq!(counts.total, 0);
+        assert!(counts.peers.is_empty());
     }
 
     #[test]
@@ -3763,7 +3963,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3786,7 +3986,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -3825,7 +4025,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -3853,7 +4053,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -3894,7 +4094,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -3916,7 +4116,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3940,7 +4140,7 @@ mod tests {
             method: "POST".into(), path: "/v1/chat/completions".into(),
             len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
         };
-        let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
+        let status = |h: &Head| check_headers(h, &h.path, Some("test"), MAX_BODY).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
         head.auth = Some("test".into());
         assert_eq!(status(&head), Err(413));
@@ -3996,7 +4196,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -4302,7 +4502,7 @@ mod tests {
         let head = read_head(&mut r_ok).unwrap();
         assert_eq!(head.method, "GET");
         assert_eq!(head.path, "/health");
-        r_ok.get_mut().set_deadline(fast_clock.get() + BODY_READ_TIMEOUT);
+        r_ok.get_mut().set_deadline(start + REQUEST_READ_TIMEOUT);
         let mut tail = Vec::new();
         r_ok.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"body");
@@ -4503,14 +4703,14 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
         let mut head_reader = BufReader::new(&raw_req[..]);
         let head = read_head(&mut head_reader).unwrap();
         assert_eq!(head.card_id.as_deref(), Some("card-multi-7"));
-        assert!(check_headers(&head, "/v1/chat/completions", cx.key.as_deref()).is_ok());
+        assert!(check_headers(&head, "/v1/chat/completions", cx.key.as_deref(), MAX_BODY).is_ok());
 
         let worker = std::thread::spawn(move || {
             for turn in 0..2 {
@@ -4684,14 +4884,14 @@ mod tests {
             chunked: false,
         };
         // Unkeyed server permits loopback requests without headers
-        assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None).is_ok());
+        assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None, MAX_BODY).is_ok());
         // Keyed server keeps /health public and requires Bearer or x-api-key on /v1/*
-        assert!(check_headers(&req("/health", None, None), "/health", Some("k")).is_ok());
-        assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k")).unwrap_err().0, 401);
-        assert_eq!(check_headers(&req("/v1/models", Some("wrong"), None), "/v1/models", Some("k")).unwrap_err().0, 401);
-        assert_eq!(check_headers(&req("/v1/messages", None, Some("wrong")), "/v1/messages", Some("k")).unwrap_err().0, 401);
-        assert!(check_headers(&req("/v1/models", Some("k"), None), "/v1/models", Some("k")).is_ok());
-        assert!(check_headers(&req("/v1/messages", None, Some("k")), "/v1/messages", Some("k")).is_ok());
+        assert!(check_headers(&req("/health", None, None), "/health", Some("k"), MAX_BODY).is_ok());
+        assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert_eq!(check_headers(&req("/v1/models", Some("wrong"), None), "/v1/models", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert_eq!(check_headers(&req("/v1/messages", None, Some("wrong")), "/v1/messages", Some("k"), MAX_BODY).unwrap_err().0, 401);
+        assert!(check_headers(&req("/v1/models", Some("k"), None), "/v1/models", Some("k"), MAX_BODY).is_ok());
+        assert!(check_headers(&req("/v1/messages", None, Some("k")), "/v1/messages", Some("k"), MAX_BODY).is_ok());
     }
 
     #[test] fn openai_stream_options_include_usage_and_tool_loop() {
@@ -4703,7 +4903,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4763,7 +4963,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
         });
 
         let req = json!({
