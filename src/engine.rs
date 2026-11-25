@@ -659,6 +659,7 @@ pub struct Lane {
 }
 
 /// One lane's GPU Gumbel-max sampling request for [`Engine::encode_gumbel_spans`].
+#[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
 #[derive(Clone, Copy)]
 pub struct GumbelSpan<'a> {
     pub span_idx: usize,
@@ -1013,6 +1014,7 @@ impl Engine {
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
     /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
     /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item.
+    #[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
     pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
         if items.is_empty() { return; }
         let b = self.ba.get();

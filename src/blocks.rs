@@ -1780,8 +1780,8 @@ mod tests {
 
         // Coalesced range: mutate block 5 then block 2 -> [2..=5] (4 entries).
         let (sf5, off_f5) = pools.full.take_free().unwrap();
-        let (sf2, off_f2) = pools.full.take_free().unwrap();
         t.fill(&mut pools.full, BlockIndex::new(5), sf5, 1).unwrap();
+        let (sf2, off_f2) = pools.full.take_free().unwrap();
         t.fill(&mut pools.full, BlockIndex::new(2), sf2, 1).unwrap();
         assert_eq!(t.dirty_range(BlockKind::Full), Some((2, 5)));
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 4);
@@ -1799,12 +1799,12 @@ mod tests {
         let mut gpu_win = vec![0u64; 16];
 
         let (sf0, _) = pools.full.take_free().unwrap();
-        let (sf1, off_f1) = pools.full.take_free().unwrap();
-        let (sw0, _) = pools.window.take_free().unwrap();
-        let (sw1, off_w1) = pools.window.take_free().unwrap();
         t.fill(&mut pools.full, BlockIndex::new(0), sf0, 1).unwrap();
+        let (sf1, off_f1) = pools.full.take_free().unwrap();
         t.fill(&mut pools.full, BlockIndex::new(1), sf1, 1).unwrap();
+        let (sw0, _) = pools.window.take_free().unwrap();
         t.fill(&mut pools.window, BlockIndex::new(0), sw0, 1).unwrap();
+        let (sw1, off_w1) = pools.window.take_free().unwrap();
         t.fill(&mut pools.window, BlockIndex::new(1), sw1, 1).unwrap();
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Full, &pools.full, &mut gpu_full).unwrap(), 16);
         assert_eq!(t.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut gpu_win).unwrap(), 16);
