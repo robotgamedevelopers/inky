@@ -1494,6 +1494,153 @@ fn dbatch(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
+/// Layer 3 shared-KV grouped decode parity + speedup benchmark (`k_attn_grp_dec` G_MAX=8 vs `INK_NO_GRP_DEC=1`).
+/// Prefills a shared prefix of `INK_PREFIX` tokens (default 8192) once, forks `INK_LANES` (default 16,32) child lanes
+/// with staggered private suffixes, and verifies 100% bit-for-bit identical logits across all lanes and steps while
+/// measuring GPU ms/step speedup.
+fn sharedkv(o: &Opts) {
+    use poolgate::{Layer3Pool, StepPath};
+    let prefix_len: usize = std::env::var("INK_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    assert!(prefix_len >= 64 && prefix_len % 64 == 0, "INK_PREFIX must be a non-zero multiple of 64");
+    let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let max_suffix = 256usize;
+    let ctx = o.ctx.max((prefix_len + max_suffix + nd + 64).div_ceil(64) * 64);
+    let eng = Engine::load(&o.model, ctx);
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    let prefix: Vec<u32> = (0..prefix_len).map(|i| base[i % base.len()]).collect();
+    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let argmax = |v: &[f32]| -> u32 {
+        v.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i as u32).unwrap_or(0)
+    };
+
+    let run_mode = |n: usize, no_grp: bool| -> (Vec<Vec<u64>>, f64, f64) {
+        eng.set_no_grp_dec(no_grp);
+        let pool = Layer3Pool::with_persistent_starts(&eng, n + 1);
+        // Donor prefills `prefix_len` tokens (multiple of 64) so blocks `0..prefix_len/64` seal and register a PROMPT start point at `prefix_len`.
+        let donor_toks = prefix.clone();
+        let (donor, matched0) = pool.new_lane_matched(&donor_toks, ctx);
+        assert_eq!(matched0, 0);
+        let mut p = 0usize;
+        while p < donor_toks.len() {
+            let t = (donor_toks.len() - p).min(eng.chunk);
+            pool.prefill(&[(donor, p, t)]);
+            p += t;
+        }
+        // Fork `n` child lanes sharing `prefix_len` with staggered private suffixes.
+        let mut child_ids = Vec::with_capacity(n);
+        let mut child_pos = Vec::with_capacity(n);
+        for i in 0..n {
+            let sfx_len = 16 + (i * 19) % 192;
+            let mut toks = prefix.clone();
+            for k in 0..sfx_len {
+                toks.push(base[(97 * (i + 1) + k) % base.len()]);
+            }
+            let (lid, matched) = pool.new_lane_matched(&toks, ctx);
+            assert_eq!(matched, prefix_len, "child lane {i} must share full {prefix_len}-token prefix");
+            pool.prefill(&[(lid, matched, sfx_len)]);
+            let first_tok = argmax(&pool.logits(0));
+            pool.set_token(lid, toks.len(), first_tok);
+            child_ids.push(lid);
+            child_pos.push(toks.len());
+        }
+        pool.end_lane(donor);
+        pool.poison_free_slots();
+
+        let mut hashes: Vec<Vec<u64>> = vec![Vec::with_capacity(nd); n];
+        let mut gpu_times: Vec<f64> = Vec::with_capacity(nd);
+        let t0 = std::time::Instant::now();
+        for _step in 0..nd {
+            let sp: Vec<(usize, usize)> = child_ids.iter().copied().zip(child_pos.iter().copied()).collect();
+            let ms = pool.decode_timed(&sp);
+            gpu_times.push(ms);
+            for j in 0..n {
+                let lg = pool.logits(j);
+                hashes[j].push(fnv(&lg));
+                let next_tok = argmax(&lg);
+                child_pos[j] += 1;
+                pool.set_token(child_ids[j], child_pos[j], next_tok);
+            }
+        }
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
+        gpu_times.sort_by(|a, b| a.total_cmp(b));
+        let med_gpu_ms = gpu_times[gpu_times.len() / 2];
+        pool.shutdown();
+        (hashes, med_gpu_ms, wall_ms)
+    };
+
+    // Interleaved A/B timing on one warm live pool (eliminates thermal/paging drift between count=1 and G_MAX=8).
+    let bench_ab = |n: usize| -> (f64, f64, f64, f64) {
+        let pool = Layer3Pool::with_persistent_starts(&eng, n + 1);
+        let donor_toks = prefix.clone();
+        let (donor, _) = pool.new_lane_matched(&donor_toks, ctx);
+        let mut p = 0usize;
+        while p < donor_toks.len() {
+            let t = (donor_toks.len() - p).min(eng.chunk);
+            pool.prefill(&[(donor, p, t)]);
+            p += t;
+        }
+        let mut child_ids = Vec::with_capacity(n);
+        let mut child_pos = Vec::with_capacity(n);
+        for i in 0..n {
+            let sfx_len = 16 + (i * 19) % 192;
+            let mut toks = prefix.clone();
+            for k in 0..sfx_len { toks.push(base[(97 * (i + 1) + k) % base.len()]); }
+            let (lid, matched) = pool.new_lane_matched(&toks, ctx);
+            pool.prefill(&[(lid, matched, sfx_len)]);
+            pool.set_token(lid, toks.len(), base[(i + 7) % base.len()]);
+            child_ids.push(lid);
+            child_pos.push(toks.len());
+        }
+        pool.end_lane(donor);
+        let sp: Vec<(usize, usize)> = child_ids.iter().copied().zip(child_pos.iter().copied()).collect();
+        // Warmup 2 steps
+        eng.set_no_grp_dec(false); let _ = pool.bench_decode_ms(&sp);
+        eng.set_no_grp_dec(true);  let _ = pool.bench_decode_ms(&sp);
+        let (mut best_nogrp, mut best_grp, mut best_noattn) = (f64::MAX, f64::MAX, f64::MAX);
+        for _ in 0..5 {
+            eng.skip.set(0);
+            eng.set_no_grp_dec(true);
+            best_nogrp = best_nogrp.min(pool.bench_decode_ms(&sp));
+            eng.set_no_grp_dec(false);
+            best_grp = best_grp.min(pool.bench_decode_ms(&sp));
+            eng.skip.set(1 << 3); // skip C_ATTN
+            best_noattn = best_noattn.min(pool.bench_decode_ms(&sp));
+            eng.skip.set(0);
+        }
+        pool.shutdown();
+        let attn_nogrp = (best_nogrp - best_noattn).max(0.0);
+        let attn_grp = (best_grp - best_noattn).max(0.0);
+        (best_nogrp, best_grp, attn_nogrp, attn_grp)
+    };
+
+    let mut all_ok = true;
+    for &n in &counts {
+        let (h_nogrp, _, _) = run_mode(n, true);
+        let (h_grp, _, _) = run_mode(n, false);
+        let bad: Vec<usize> = (0..n).filter(|&j| h_grp[j] != h_nogrp[j]).collect();
+        let (gpu_nogrp, gpu_grp, attn_nogrp, attn_grp) = bench_ab(n);
+        let speedup = gpu_nogrp / gpu_grp;
+        let attn_speedup = if attn_grp > 0.01 { attn_nogrp / attn_grp } else { 0.0 };
+        println!(
+            "prefix={prefix_len} lanes={n:2} steps={nd}: count=1 {gpu_nogrp:6.2} ms GPU (attn {attn_nogrp:5.2} ms) -> G_MAX=8 {gpu_grp:6.2} ms GPU (attn {attn_grp:5.2} ms) | {speedup:.2}x step ({attn_speedup:.2}x attn) | {}",
+            if bad.is_empty() { "100% bit-identical".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) }
+        );
+        all_ok &= bad.is_empty();
+    }
+    eng.set_no_grp_dec(false);
+    if all_ok {
+        println!("sharedkv exact: every grouped lane and step is 100% bit-for-bit identical to INK_NO_GRP_DEC=1");
+    } else {
+        println!("SHAREDKV PARITY FAILED");
+        std::process::exit(1);
+    }
+}
+
 /// dev, the max-context eval: one lane prefills the --file text (real code) to the engine's limit, timing each stretch of
 /// prefill; at each checkpoint (INK_CKPTS) one stream decodes on the decode path, then as many lanes as fit a budget of
 /// INK_LANE_GIB GiB (copies of the prefilled cache, each decoding its own tokens) decode together. Timing only.
@@ -1780,6 +1927,7 @@ fn main() {
         "temp1" => temp1(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
+        "sharedkv" => sharedkv(&o),
         "maxctx" => maxctx(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),

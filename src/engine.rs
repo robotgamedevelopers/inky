@@ -83,10 +83,10 @@ struct Tier {
     pub read_bytes: Cell<u64>, pub read_time: Cell<std::time::Duration>, unaligned: Cell<bool>,
 }
 #[derive(Clone, Copy)]
-struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: usize, off: usize, sp0: usize, ns: usize, kps: usize }
+struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: usize, off: usize, sp0: usize, ns: usize, kps: usize, rel_split: bool }
 /// how one layer execution's keys are divided: file chunks cover the splits before `b`, the hot ring the `ns` splits from `sp0`
 #[derive(Clone, Copy)]
-struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize }
+struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize, rel_split: bool }
 
 /// the encoder a decode step is being written to; with the disk tier a step spans several command buffers
 pub struct Cx { e: Enc, cb: Option<CmdBuf> }
@@ -99,6 +99,10 @@ const KV_CAP0: usize = 64;
 pub const NTC: usize = 2;
 const MOE_CLS: [(&str, usize, usize); NTC] = [("k_moe_sg8", 128, 256), ("k_moe_sg4", 64, 128)];
 pub const MAX_SPLIT: usize = 256;
+/// Maximum decode lanes grouped onto one shared-KV tile read in `k_attn_grp_dec`.
+pub const DEC_GRP_MAX: usize = 8;
+/// Maximum fixed 64-token splits in a sliding-window (`EXT = 1024`) decode step (`1024 / 64 + 1 = 17`).
+pub const MAX_SWA_SPLIT: usize = EXT / crate::blocks::BLOCK + 1;
 
 /// kernel classes, for skip-mask profiling
 pub const CLS_NAMES: &[&str] = &["embed", "mix_attn", "qkv", "attn", "combine", "wo", "mix_ffn", "router", "moe_gu", "moe_down",
@@ -111,7 +115,7 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_attn_combine", "k_attn_combine_dec",
+    "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec", "k_attn_combine", "k_attn_combine_dec",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend",
     "k_topk", "k_norm",
     "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_devcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
@@ -144,12 +148,33 @@ struct DecodeSpanDesc {
 struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32, hout: u32, pad: [u32; 3] }
+#[allow(dead_code)]
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnBlkDecArgs {
     desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
     q_off: u32, k_off: u32, v_off: u32, r_off: u32,
     sink_off: u32, kdyn_off: i32, vdyn_off: i32, kconv_w: u32,
     vconv_w: u32, qclip_w: u32, relclip_w: u32, relbias_w: u32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DecAttnGroup {
+    pub abs_sp: u32,
+    pub count: u32,
+    pub span_idx: [u16; DEC_GRP_MAX],
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct KvPrepDecArgs {
+    desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
+    q_off: u32, k_off: u32, v_off: u32, r_off: u32,
+    qp_off: u32, rp_off: u32, kv_cur_off: u32, kdyn_off: i32,
+    vdyn_off: i32, kconv_w: u32, vconv_w: u32, qclip_w: u32,
+    relclip_w: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct AttnGrpDecArgs {
+    desc_off: u32, grp_off: u32, qp_off: u32, rp_off: u32,
+    kv_cur_off: u32, sink_off: u32, relbias_w: u32, pass_idx: u32,
+    kps: u32, swa: u32, pad0: u32, pad1: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct PostConvDecArgs { desc_off: u32, y_off: u32, res_off: u32, out_off: u32, cs_slot_off: u32, convw_off: u32, has_res: u32, no_state_write: u32 }
@@ -523,6 +548,8 @@ pub struct Engine {
     last_step_loopcd: Cell<bool>,
     /// Lazy-allocated GPU buffer for weak-pass logits `z_1` (`n_lanes * vocab_pad * 4` bytes).
     lg_weak: RefCell<Option<Buf>>,
+    /// Force `count = 1` groups in Layer 3 `k_attn_grp_dec` (`INK_NO_GRP_DEC=1` for A/B parity testing).
+    no_grp_dec: Cell<bool>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
     pub gpu: Gpu,
     pub g: Gguf,
@@ -691,8 +718,17 @@ pub struct GumbelSpan<'a> {
 #[derive(Clone, Copy)]
 struct DecBatchMeta {
     desc_off: u32,
-    max_swa_nsplit: usize,
-    max_full_nsplit: usize,
+    kv_cur_off: u32,
+    swa_solo_off: u32,
+    swa_shared_off: u32,
+    n_swa_solo: usize,
+    n_swa_shared: usize,
+    full_solo_off: u32,
+    full_shared_off: u32,
+    n_full_solo: usize,
+    n_full_shared: usize,
+    swa_kps: u32,
+    full_kps: u32,
 }
 
 /// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
@@ -1179,11 +1215,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, after everything else in the activation
-    /// buffer. Call after `ensure_batch` (a later batch arena may overlap it). Nothing may be in flight on the GPU.
+    /// Toggle grouped shared-KV decode (`true` forces `count = 1` groups, matching `INK_NO_GRP_DEC=1`).
+    pub fn set_no_grp_dec(&self, no_grp: bool) { self.no_grp_dec.set(no_grp); }
+    /// Whether grouped shared-KV decode is currently disabled (`count = 1` forced).
+    #[allow(dead_code)]
+    pub fn no_grp_dec(&self) -> bool { self.no_grp_dec.get() }
+
+    /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, followed by Layer 3
+    /// batched-decode scratch (`DecodeSpanDesc`, `kv_cur`, and `DecAttnGroup` lists), after everything else
+    /// in the activation buffer. Call after `ensure_batch` (a later batch arena may overlap it). Nothing may
+    /// be in flight on the GPU.
     pub fn ensure_dbatch(&self, n: usize) {
         let start = (self.ar.total).max(self.ba.get().end);
-        let need = (start as usize + n * self.ar.total as usize) * 4;
+        let need = (start as usize + n * self.ar.total as usize + decode_batch_extra_floats(n)) * 4;
         self.dstart.set(start);
         if self.act.borrow().length() < need {
             let nb = self.gpu.buffer(need);
@@ -1365,6 +1409,7 @@ impl Engine {
             loopcd_omega: Cell::new(0.0),
             last_step_loopcd: Cell::new(false),
             lg_weak: RefCell::new(None),
+            no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -2221,10 +2266,9 @@ impl Engine {
                 ctr: 0, gate_off: ar.gate, out_off: ar.attn_g, gstr: kcap * HD as u32, istr: HD as u32, ..Default::default()
             };
             run.bind_kv(e, l.swa);
-            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-            let kps = Run::split_kps(nkeys);
-            let nsplit = nkeys.div_ceil(kps);
-            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+            let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
+            let nkeys = pos + 1 - first_pos;
+            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                 pad: self.sep_comb as u32, ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
             if self.sep_comb {
@@ -2463,8 +2507,8 @@ impl Engine {
         }
         assert!(spans.len() == 1 || self.hgemm, "several spans need the fp16 path");
         assert!(!dec || (self.hgemm && spans.len() <= self.decode_span_limit()), "a decode step needs the fp16 path and room for f32 queries");
-        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize) * 4),
-                "a decode step keeps each lane's split partials in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
+        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize + decode_batch_extra_floats(spans.len())) * 4),
+                "a decode step keeps each lane's split partials and descriptors in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         if let Some(k) = verify_k {
             assert!(!dec && !argmax, "verify is not a decode step, and argmax would overwrite toks[p0 + t]");
@@ -2479,22 +2523,24 @@ impl Engine {
         self.bind_eng(&e);
         let b = self.ba.get();
         let dec_meta = if dec && blocked {
-            let desc_off = self.dstart.get();
-            let desc_floats = spans.len() * (std::mem::size_of::<DecodeSpanDesc>() / 4);
-            assert!(
-                desc_floats <= self.ar.part as usize,
-                "decode span descriptors ({desc_floats} floats) exceed pre-partial scratch ({})",
-                self.ar.part
-            );
+            let n = spans.len();
+            let align64 = |x: usize| x.div_ceil(64) * 64;
+            let grp_floats = std::mem::size_of::<DecAttnGroup>() / 4;
+            let desc_off = self.dstart.get() + n as u32 * self.ar.total;
+            let kv_cur_off = desc_off + align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4)) as u32;
+            let swa_grp_off = kv_cur_off + align64(n * 2 * NKV * HD) as u32;
+            let full_grp_off = swa_grp_off + align64(n * MAX_SWA_SPLIT * grp_floats) as u32;
+            let swa_kps = decode_split_kps(true, self.max_ctx);
+            let full_kps = decode_split_kps(false, self.max_ctx);
+            let mut swa_ranges = Vec::with_capacity(n);
+            let mut full_ranges = Vec::with_capacity(n);
             let slab = self.blocked_slab.borrow();
-            let mut max_swa_nsplit = 1usize;
-            let mut max_full_nsplit = 1usize;
             {
                 let act = self.act.borrow();
                 let dst = unsafe {
                     std::slice::from_raw_parts_mut(
                         (act.contents().as_ptr() as *mut f32).add(desc_off as usize) as *mut DecodeSpanDesc,
-                        spans.len(),
+                        n,
                     )
                 };
                 for (si, sp) in spans.iter().enumerate() {
@@ -2503,23 +2549,20 @@ impl Engine {
                     let pos = sp.p0;
                     assert!(pos * 4 < sp.lane.toks.length(), "decode pos {pos} out of bounds for lane.toks");
                     let tok_id = unsafe { *(sp.lane.toks.contents().as_ptr() as *const i32).add(pos) };
-                    let swa_nkeys = (pos + 1).min(EXT);
-                    let swa_first_pos = pos + 1 - swa_nkeys;
-                    let swa_kps = Run::split_kps(swa_nkeys);
-                    let swa_nsplit = swa_nkeys.div_ceil(swa_kps);
+                    let (swa_first_pos, _sk, _swa_sp_lo, swa_nsplit) = decode_split_grid(true, pos, self.max_ctx);
+                    let swa_nkeys = pos + 1 - swa_first_pos;
+                    let (_full_first_pos, _fk, _full_sp_lo, full_nsplit) = decode_split_grid(false, pos, self.max_ctx);
                     let full_nkeys = pos + 1;
-                    let full_kps = Run::split_kps(full_nkeys);
-                    let full_nsplit = full_nkeys.div_ceil(full_kps);
                     let full_tau = 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln();
-                    max_swa_nsplit = max_swa_nsplit.max(swa_nsplit);
-                    max_full_nsplit = max_full_nsplit.max(full_nsplit);
+                    swa_ranges.push((swa_first_pos, pos));
+                    full_ranges.push((0usize, pos));
                     dst[si] = DecodeSpanDesc {
                         tok_id,
                         pos: pos as u32,
                         cs_base: slab.cs_f32_base(slot.slot_idx),
                         bt_full_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, false)).expect("bt_full_base fits u32"),
                         bt_win_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, true)).expect("bt_win_base fits u32"),
-                        part_off: desc_off + si as u32 * self.ar.total + self.ar.part,
+                        part_off: self.dstart.get() + si as u32 * self.ar.total + self.ar.part,
                         swa_nkeys: swa_nkeys as u32,
                         swa_first_pos: swa_first_pos as u32,
                         swa_kps: swa_kps as u32,
@@ -2533,6 +2576,51 @@ impl Engine {
                     };
                 }
             }
+            // Build grouped shared-KV decode descriptors ONCE for all 40 SWA passes and all 8 full passes.
+            let no_grp = self.no_grp_dec.get();
+            let tables: Vec<std::cell::Ref<'_, crate::blocks::BlockTable>> =
+                spans.iter().map(|sp| sp.lane.block_table.borrow()).collect();
+            let swa_groups = build_decode_groups(&swa_ranges, swa_kps, no_grp, |si, blk| {
+                tables[si]
+                    .get(crate::blocks::BlockKind::Window, crate::blocks::BlockIndex::new(blk as u32))
+                    .ok()
+                    .flatten()
+                    .map(|e| (e.slot().get(), e.generation()))
+            });
+            let full_groups = build_decode_groups(&full_ranges, full_kps, no_grp, |si, blk| {
+                tables[si]
+                    .get(crate::blocks::BlockKind::Full, crate::blocks::BlockIndex::new(blk as u32))
+                    .ok()
+                    .flatten()
+                    .map(|e| (e.slot().get(), e.generation()))
+            });
+            debug_assert!(swa_groups.len() <= n * MAX_SWA_SPLIT);
+            debug_assert!(full_groups.len() <= n * MAX_SPLIT);
+            let partition_copy = |groups: &[DecAttnGroup], base_off: u32| -> (u32, usize, u32, usize) {
+                let mut n_solo = 0usize;
+                for g in groups { if g.count == 1 { n_solo += 1; } }
+                let n_shared = groups.len() - n_solo;
+                let shared_off = base_off + (n_solo * grp_floats) as u32;
+                let act = self.act.borrow();
+                unsafe {
+                    let dst_solo = (act.contents().as_ptr() as *mut f32).add(base_off as usize) as *mut DecAttnGroup;
+                    let dst_shared = (act.contents().as_ptr() as *mut f32).add(shared_off as usize) as *mut DecAttnGroup;
+                    let (mut is, mut ig) = (0usize, 0usize);
+                    for &g in groups {
+                        if g.count == 1 {
+                            *dst_solo.add(is) = g;
+                            is += 1;
+                        } else {
+                            *dst_shared.add(ig) = g;
+                            ig += 1;
+                        }
+                    }
+                }
+                (base_off, n_solo, shared_off, n_shared)
+            };
+            let (swa_solo_off, n_swa_solo, swa_shared_off, n_swa_shared) = partition_copy(&swa_groups, swa_grp_off);
+            let (full_solo_off, n_full_solo, full_shared_off, n_full_shared) = partition_copy(&full_groups, full_grp_off);
+            drop(tables);
             // Bind shared blocked `CS` (buffer 4) and `BT` (buffer 8) ONCE for the entire decode step.
             e.buf(slab.cs_buf.as_ref().expect("blocked slab missing cs_buf"), 0, 4);
             e.buf(slab.bt_buf.as_ref().expect("blocked slab missing bt_buf"), 0, 8);
@@ -2546,8 +2634,21 @@ impl Engine {
                 eps: self.eps,
                 pad: 0,
             };
-            self.go(&e, C_EMBED, "k_embed_dec", &ea, (spans.len(), 1, 1), 256);
-            Some(DecBatchMeta { desc_off, max_swa_nsplit, max_full_nsplit })
+            self.go(&e, C_EMBED, "k_embed_dec", &ea, (n, 1, 1), 256);
+            Some(DecBatchMeta {
+                desc_off,
+                kv_cur_off,
+                swa_solo_off,
+                swa_shared_off,
+                n_swa_solo,
+                n_swa_shared,
+                full_solo_off,
+                full_shared_off,
+                n_full_solo,
+                n_full_shared,
+                swa_kps: swa_kps as u32,
+                full_kps: full_kps as u32,
+            })
         } else {
             self.bind_lane(&e, spans[0].lane);
             // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step or Layer 3 block path does not use it)
@@ -2773,12 +2874,15 @@ impl Engine {
         let blocked = spans[0].lane.use_blocks.get();
         let pass_idx = self.slot_kind[slot].1 as u32;
         if let Some(dm) = dec_meta {
-            // Layer 3 blocked 3D-batched decode attention + 2D-batched combine: 1 dispatch each across all spans.
+            // Layer 3 blocked multi-query shared-KV grouped decode:
+            //   1. `k_kvprep_dec` once per (kv_head g, span si)
+            //   2. `k_attn_grp_dec` once per (DecAttnGroup, kv_head g), staging shared KV tiles once for up to 8 lanes
+            //   3. `k_attn_combine_dec` once per (head h, span si)
             // Shared `CS` (buffer 4) stays bound; rebind `BT` (buffer 8) after `mix_t`'s inline buffer(8) constants.
             assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
             self.bind_pool_slabs(e, l.swa);
             e.buf(self.blocked_slab.borrow().bt_buf.as_ref().expect("blocked slab missing bt_buf"), 0, 8);
-            let aa = AttnBlkDecArgs {
+            let ka = KvPrepDecArgs {
                 desc_off: dm.desc_off,
                 pass_idx,
                 cs_slot,
@@ -2787,17 +2891,60 @@ impl Engine {
                 k_off: b.k,
                 v_off: b.v,
                 r_off: b.rel,
-                sink_off: b.sink,
+                qp_off: b.qp,
+                rp_off: b.rp,
+                kv_cur_off: dm.kv_cur_off,
                 kdyn_off: if l.swa { -1 } else { b.kdyn as i32 },
                 vdyn_off: if l.swa { -1 } else { b.vdyn as i32 },
                 kconv_w: l.k_conv,
                 vconv_w: l.v_conv,
                 qclip_w: l.q_clip,
                 relclip_w: l.rel_clip,
-                relbias_w: l.rel_bias,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
             };
-            let max_nsplit = if l.swa { dm.max_swa_nsplit } else { dm.max_full_nsplit };
-            self.go(e, C_ATTN, "k_attn_blk_dec", &aa, (max_nsplit, NKV, spans.len()), 128);
+            self.go(e, C_KVPREP, "k_kvprep_dec", &ka, (NKV, spans.len(), 1), 128);
+            let (solo_off, n_solo, shared_off, n_shared, kps) = if l.swa {
+                (dm.swa_solo_off, dm.n_swa_solo, dm.swa_shared_off, dm.n_swa_shared, dm.swa_kps)
+            } else {
+                (dm.full_solo_off, dm.n_full_solo, dm.full_shared_off, dm.n_full_shared, dm.full_kps)
+            };
+            if n_solo > 0 {
+                let ga_solo = AttnGrpDecArgs {
+                    desc_off: dm.desc_off,
+                    grp_off: solo_off,
+                    qp_off: b.qp,
+                    rp_off: b.rp,
+                    kv_cur_off: dm.kv_cur_off,
+                    sink_off: b.sink,
+                    relbias_w: l.rel_bias,
+                    pass_idx,
+                    kps,
+                    swa: l.swa as u32,
+                    pad0: 0,
+                    pad1: 0,
+                };
+                self.go_nb(e, C_ATTN, "k_attn_dec_solo", &ga_solo, (n_solo, NKV, 1), 128);
+            }
+            if n_shared > 0 {
+                let ga_shared = AttnGrpDecArgs {
+                    desc_off: dm.desc_off,
+                    grp_off: shared_off,
+                    qp_off: b.qp,
+                    rp_off: b.rp,
+                    kv_cur_off: dm.kv_cur_off,
+                    sink_off: b.sink,
+                    relbias_w: l.rel_bias,
+                    pass_idx,
+                    kps,
+                    swa: l.swa as u32,
+                    pad0: 0,
+                    pad1: 0,
+                };
+                self.go_nb(e, C_ATTN, "k_attn_grp_dec", &ga_shared, (n_shared, NKV, 1), 512);
+            }
+            e.barrier();
             let direct_half = decode_combine_direct_half(self.hgemm, self.skip.get());
             let ca = CombineDecArgs {
                 desc_off: dm.desc_off,
@@ -2835,10 +2982,9 @@ impl Engine {
                     ctr: 0, gate_off: b.gate + (r0 * NH * HD) as u32, out_off: b.qp + (r0 * NH * HD) as u32, gstr: kcap * HD as u32, istr: HD as u32,
                     ..Default::default()
                 };
-                let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-                let kps = Run::split_kps(nkeys);
-                let nsplit = nkeys.div_ceil(kps);
-                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+                let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
+                let nkeys = pos + 1 - first_pos;
+                let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                     pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
                 self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
@@ -3254,7 +3400,8 @@ impl<'a> Run<'a> {
         if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
         let c = self.kv_exact_bytes(n);
         // staging: two halves, each at least one split of the longest attention (see `step`)
-        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
+        let max_kps = decode_split_kps(false, self.max_ctx).max(decode_split_kps(true, self.max_ctx));
+        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * max_kps * REC);
         let hot = (c / 2).saturating_sub(s);
         ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
     }
@@ -3263,9 +3410,6 @@ impl<'a> Run<'a> {
         ((if kind == 0 { i * EXT + p % EXT } else { n_swa * EXT + i * self.max_ctx + p }) * REC) as u64
     }
     fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
-    /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
-    /// the same keys in the same order)
-    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
     /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
     /// file is a ring of one window)
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
@@ -3352,7 +3496,8 @@ impl<'a> Run<'a> {
             let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n - h.min(n));
             let idx_old = |p: usize| if kind == 0 { p % old_cap } else { p };
             // the file runs one split ahead of the hot ring's start, so a split boundary always lies where both have the keys
-            let cold = (lo + Self::split_kps(n + 1 - first) + 64).min(n);
+            let kps = decode_split_kps(kind == 0, self.max_ctx);
+            let cold = (lo + kps + 64).min(n);
             self.tier_write(kind, first.max(t.filed[kind].get()), cold, idx_old);
             t.filed[kind].set(cold.max(t.filed[kind].get()));
             let nb = self.gpu.buffer(nsl * 2 * NKV * h * HD * 2);
@@ -3455,7 +3600,8 @@ impl<'a> Run<'a> {
             let need = (pos + 1).saturating_sub(cap);
             let lo = t.lo[kind].get().max(need);
             let done = pos.saturating_sub(32);
-            let want = (lo + Self::split_kps(if kind == 0 { (pos + 1).min(EXT) } else { pos + 1 })).min(done).max(need);
+            let kps = decode_split_kps(kind == 0, self.max_ctx);
+            let want = (lo + kps).min(done).max(need);
             if t.cold[kind].get() < want {
                 let upto = (want + 15).min(done).max(want);
                 self.tier_write(kind, t.cold[kind].get().max(t.filed[kind].get()), upto, |p| p % cap);
@@ -3465,9 +3611,9 @@ impl<'a> Run<'a> {
             t.lo[kind].set(lo);
         }
         // Plan this step's file reads: per layer execution the splits older than its hot ring, packed into staging halves.
-        // The layer's keys are divided into splits exactly as without the tier (same kps from the window start); the file
-        // supplies whole splits up to a boundary b that the hot ring also reaches, so every split sums the same keys in the
-        // same order as the in-memory path and the results are bit-identical.
+        // The layer's keys are divided into cache-fixed absolute splits exactly as without the tier; the file supplies whole
+        // splits up to an absolute split boundary `b` that the hot ring also reaches, so every split sums the same keys in
+        // the same order as the in-memory path and the results are bit-identical.
         let half_recs = t.stg.borrow().length() / 2 / REC;
         let (mut plan, mut execs) = (Vec::new(), Vec::new());
         let (mut round, mut room) = (0usize, half_recs);
@@ -3477,21 +3623,29 @@ impl<'a> Run<'a> {
         for (exec, &slot) in order.iter().enumerate() {
             let (swa, i) = self.slot_kind[slot];
             let kind = if swa { 0 } else { 1 };
-            let w0 = if swa { (pos + 1).saturating_sub(EXT) } else { 0 };
+            let (w0, kps, sp_lo, nsplit) = decode_split_grid(swa, pos, self.max_ctx);
             let lo = t.lo[kind].get().max(w0);
-            let nk = pos + 1 - w0;
-            let kps = Self::split_kps(nk);
-            let b = w0 + (lo - w0).div_ceil(kps) * kps;
+            let b = if lo <= w0 { w0 } else { lo.div_ceil(kps) * kps };
             if b <= pos && b <= t.cold[kind].get().max(w0) && kps <= half_recs {
+                let sp_end = if b > w0 { b / kps - sp_lo } else { 0 };
                 let (mut c, mut sp) = (w0, 0usize);
-                while c < b {
-                    if room < kps { round += 1; room = half_recs; }
-                    let ns = (room / kps).min((b - c) / kps);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + ns * kps, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
-                    c += ns * kps; sp += ns; room -= ns * kps;
+                while sp < sp_end {
+                    let next_boundary = (c / kps + 1) * kps;
+                    let first_len = next_boundary - c;
+                    if room < first_len { round += 1; room = half_recs; }
+                    let mut ns = 1usize;
+                    let mut c1 = next_boundary;
+                    while sp + ns < sp_end && (c1 - c) + kps <= room {
+                        c1 += kps;
+                        ns += 1;
+                    }
+                    plan.push(Chunk { exec, kind, i, c0: c, c1, round, off: (half_recs - room) * REC, sp0: sp, ns, kps, rel_split: false });
+                    room -= c1 - c;
+                    c = c1;
+                    sp += ns;
                 }
-                let nsplit = nk.div_ceil(kps);
-                execs.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp });
+                debug_assert_eq!(c, b);
+                execs.push(ExecPlan { b, kps, nsplit, sp0: sp, ns: nsplit - sp, rel_split: false });
             } else {
                 // (tiny hot rings in tests) no common boundary: divide the file part and the hot part separately - the same
                 // keys, summed in a different grouping
@@ -3502,12 +3656,12 @@ impl<'a> Run<'a> {
                     if room < (lo - c).min(64) { round += 1; room = half_recs; }
                     let n = room.min(lo - c);
                     let (kps, ns) = spl(n);
-                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps });
+                    plan.push(Chunk { exec, kind, i, c0: c, c1: c + n, round, off: (half_recs - room) * REC, sp0: sp, ns, kps, rel_split: true });
                     c += n; sp += ns; room -= n;
                 }
                 let (kps, ns) = spl(pos + 1 - lo);
                 assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
-                execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns });
+                execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns, rel_split: true });
             }
         }
         *t.execs.borrow_mut() = execs;
@@ -3948,12 +4102,14 @@ impl<'a> Run<'a> {
                 let e = &cx.e;
                 let off = ((t.half.get() * (t.stg.borrow().length() / 2) + c.off) / 2) as u32;       // in fp16 elements
                 let a = AttnArgs { nkeys: (c.c1 - c.c0) as u32, first_pos: c.c0 as u32, ring: 0, idx0: c.c0 as u32, k_base: off, v_base: off + (NKV * HD) as u32,
-                                   gstr: HD as u32, istr: (2 * NKV * HD) as u32, kps: c.kps as u32, nsplit: x.nsplit as u32, sp0: c.sp0 as u32, noown: 1, pad: 1, ..base };
+                                   gstr: HD as u32, istr: (2 * NKV * HD) as u32, kps: c.kps as u32, nsplit: x.nsplit as u32, sp0: c.sp0 as u32, noown: 1,
+                                   pad: 1 | if c.rel_split { 4 } else { 0 }, ..base };
                 e.buf(&t.stg.borrow(), 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (c.ns, NKV, 1), 128);
             }
             let e = &cx.e;
-            let a = AttnArgs { nkeys: (pos + 1 - x.b) as u32, first_pos: x.b as u32, ring: 1, kps: x.kps as u32, nsplit: x.nsplit as u32, sp0: x.sp0 as u32, pad: 1, ..base };
+            let a = AttnArgs { nkeys: (pos + 1 - x.b) as u32, first_pos: x.b as u32, ring: 1, kps: x.kps as u32, nsplit: x.nsplit as u32, sp0: x.sp0 as u32,
+                               pad: 1 | if x.rel_split { 4 } else { 0 }, ..base };
             self.bind_kv(e, l.swa);
             self.go(e, C_ATTN, "k_attn", &a, (x.ns, NKV, 1), 128);
             let total = x.nsplit;
@@ -3967,22 +4123,22 @@ impl<'a> Run<'a> {
             if nb > 0 {
                 let kb2 = (fi * 2 * NKV * pr.rows * HD) as u32;
                 let a = AttnArgs { nkeys: nb as u32, first_pos: 0, ring: 0, cap: pr.rows as u32, k_base: kb2, v_base: kb2 + (NKV * pr.rows * HD) as u32,
-                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1,
+                                   gstr: (pr.rows * HD) as u32, kps: k1 as u32, nsplit: (n1 + n2) as u32, sp0: 0, noown: 1, pad: 1 | 4,
                                    lastbias: if pr.use_sum { pr.lastbias } else { 0.0 }, ..base };
                 e.buf(&pr.bag, 0, 3);
                 self.go(e, C_ATTN, "k_attn", &a, (n1, NKV, 1), 128);
             }
-            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1 | ((dry_state as u32) << 1), ..base };
+            let a = AttnArgs { nkeys: (pos + 1 - pr.r0) as u32, first_pos: pr.r0 as u32, ring: 0, kps: k2 as u32, nsplit: (n1 + n2) as u32, sp0: n1 as u32, pad: 1 | 4 | ((dry_state as u32) << 1), ..base };
             self.bind_kv(e, false);
             self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
             nsplit = n1 + n2;
         } else {
             // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
             self.bind_kv(e, l.swa);
-            let nkeys = if l.swa { (pos + 1).min(EXT) } else { pos + 1 };
-            let kps = Self::split_kps(nkeys);
-            nsplit = nkeys.div_ceil(kps);
-            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
+            let (first_pos, kps, _sp_lo, nsplit_val) = decode_split_grid(l.swa, pos, self.max_ctx);
+            let nkeys = pos + 1 - first_pos;
+            nsplit = nsplit_val;
+            let aa = AttnArgs { nkeys: nkeys as u32, first_pos: first_pos as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                 pad: (self.sep_comb as u32) | ((dry_state as u32) << 1), ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
         }
@@ -4062,6 +4218,187 @@ fn validate_token_write(start: usize, toks: &[u32], capacity: usize, limit: usiz
 #[inline]
 fn decode_combine_direct_half(hgemm: bool, skip: u32) -> bool {
     hgemm && (skip & ((1 << C_COMB) | (1 << C_WO)) == 0)
+}
+
+/// Cache-fixed absolute split width for decode attention (independent of `pos` and batch membership):
+/// - Sliding-window (`EXT = 1024`): always 64 tokens (1 block), giving at most `17 <= MAX_SPLIT` splits.
+/// - Full attention: `512 * ceil(max_ctx / 131_072).max(1)` (`512` = 8 blocks for all contexts `<= 131,072`),
+///   fitting in `MAX_SPLIT = 256` without enlarging `Arena`.
+#[inline]
+pub fn decode_split_kps(swa: bool, max_ctx: usize) -> usize {
+    if swa {
+        crate::blocks::BLOCK
+    } else {
+        512 * max_ctx.div_ceil(131_072).max(1)
+    }
+}
+
+/// Cache-fixed absolute decode split range `(first_pos, kps, sp_lo, nsplit)` for a token at `pos`.
+/// Local split `s` in `0..nsplit` covers absolute split `abs_sp = sp_lo + s`, i.e., absolute positions
+/// `[abs_sp * kps, (abs_sp + 1) * kps)` clipped to `[first_pos, pos + 1)`.
+#[inline]
+pub fn decode_split_grid(swa: bool, pos: usize, max_ctx: usize) -> (usize, usize, usize, usize) {
+    let kps = decode_split_kps(swa, max_ctx);
+    let first_pos = if swa { (pos + 1).saturating_sub(EXT) } else { 0 };
+    let sp_lo = first_pos / kps;
+    let sp_hi = pos / kps;
+    let nsplit = sp_hi - sp_lo + 1;
+    debug_assert!(nsplit <= MAX_SPLIT);
+    (first_pos, kps, sp_lo, nsplit)
+}
+
+/// Extra `f32` scratch slots appended after `n * ar.total` in `ensure_dbatch(n)` for Layer 3
+/// batched decode (`DecodeSpanDesc`, `kv_cur`, SWA `DecAttnGroup`, Full `DecAttnGroup`).
+#[inline]
+pub fn decode_batch_extra_floats(n: usize) -> usize {
+    let align64 = |x: usize| x.div_ceil(64) * 64;
+    let desc = align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4));
+    let kv_cur = align64(n * 2 * NKV * HD);
+    let grp_floats = std::mem::size_of::<DecAttnGroup>() / 4;
+    let swa_grps = align64(n * MAX_SWA_SPLIT * grp_floats);
+    let full_grps = align64(n * MAX_SPLIT * grp_floats);
+    desc + kv_cur + swa_grps + full_grps
+}
+
+/// Build `DecAttnGroup` descriptors for one attention kind (`swa` or `full`) across a decode batch.
+///
+/// Invariants (matching `specs/GroupedLayout.tla`):
+/// - Every `(si, abs_sp)` with `abs_sp in (first_pos / kps)..=(pos / kps)` appears in EXACTLY ONE group.
+/// - Only strictly interior full splits (`first_pos <= abs_sp * kps && pos >= (abs_sp + 1) * kps`, so
+///   `p == pos` is never in the split and every key in `[abs_sp * kps, (abs_sp + 1) * kps)` is visible)
+///   with identical `Some((slot != 0, gen != 0))` across ALL `kps / 64` blocks in `abs_sp` may be grouped,
+///   capped at `DEC_GRP_MAX = 8` lanes per group.
+/// - Partial/boundary/divergent splits (and all splits when `no_grp` is true) emit `count = 1`.
+pub fn build_decode_groups<F>(
+    ranges: &[(usize, usize)],
+    kps: usize,
+    no_grp: bool,
+    mut block_entry: F,
+) -> Vec<DecAttnGroup>
+where
+    F: FnMut(usize, usize) -> Option<(u32, u32)>,
+{
+    debug_assert!(kps >= crate::blocks::BLOCK && kps % crate::blocks::BLOCK == 0);
+    let blks_per_split = kps / crate::blocks::BLOCK;
+    let n = ranges.len();
+    let mut out = Vec::with_capacity(n * if blks_per_split == 1 { MAX_SWA_SPLIT } else { 16 });
+
+    if no_grp || n <= 1 {
+        for (si, &(first_pos, pos)) in ranges.iter().enumerate() {
+            let sp_lo = first_pos / kps;
+            let sp_hi = pos / kps;
+            for abs_sp in sp_lo..=sp_hi {
+                let mut g = DecAttnGroup { abs_sp: abs_sp as u32, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                g.span_idx[0] = si as u16;
+                out.push(g);
+            }
+        }
+        return out;
+    }
+
+    let mut interior: Vec<(u32, u64, u16)> = Vec::new();
+    for (si, &(first_pos, pos)) in ranges.iter().enumerate() {
+        let sp_lo = first_pos / kps;
+        let sp_hi = pos / kps;
+        for abs_sp in sp_lo..=sp_hi {
+            let split_start = abs_sp * kps;
+            let split_end = split_start + kps;
+            let is_interior = first_pos <= split_start && pos >= split_end;
+            if !is_interior {
+                let mut g = DecAttnGroup { abs_sp: abs_sp as u32, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                g.span_idx[0] = si as u16;
+                out.push(g);
+            } else {
+                let blk0 = abs_sp * blks_per_split;
+                match block_entry(si, blk0) {
+                    Some((slot, gen)) if slot != 0 && gen != 0 => {
+                        let key = ((slot as u64) << 32) | (gen as u64);
+                        interior.push((abs_sp as u32, key, si as u16));
+                    }
+                    _ => {
+                        let mut g = DecAttnGroup { abs_sp: abs_sp as u32, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                        g.span_idx[0] = si as u16;
+                        out.push(g);
+                    }
+                }
+            }
+        }
+    }
+
+    if interior.is_empty() {
+        return out;
+    }
+
+    interior.sort_unstable();
+
+    let mut i = 0;
+    while i < interior.len() {
+        let abs_sp = interior[i].0;
+        let first_key = interior[i].1;
+        let mut j = i + 1;
+        while j < interior.len() && interior[j].0 == abs_sp && interior[j].1 == first_key {
+            j += 1;
+        }
+        let run = &interior[i..j];
+        if run.len() == 1 || blks_per_split == 1 {
+            for chunk in run.chunks(DEC_GRP_MAX) {
+                let mut g = DecAttnGroup { abs_sp, count: chunk.len() as u32, span_idx: [0; DEC_GRP_MAX] };
+                for (u, item) in chunk.iter().enumerate() {
+                    g.span_idx[u] = item.2;
+                }
+                out.push(g);
+            }
+        } else {
+            let blk0 = abs_sp as usize * blks_per_split;
+            let mut open: Vec<(usize, DecAttnGroup)> = Vec::new();
+            for &(_, _, si_u16) in run {
+                let si = si_u16 as usize;
+                let mut all_valid = true;
+                for b in 1..blks_per_split {
+                    if !matches!(block_entry(si, blk0 + b), Some((s, g)) if s != 0 && g != 0) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+                if !all_valid {
+                    let mut g = DecAttnGroup { abs_sp, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                    g.span_idx[0] = si_u16;
+                    out.push(g);
+                    continue;
+                }
+                let mut placed = false;
+                for (rep_si, grp) in open.iter_mut() {
+                    if (grp.count as usize) >= DEC_GRP_MAX {
+                        continue;
+                    }
+                    let mut same = true;
+                    for b in 1..blks_per_split {
+                        if block_entry(si, blk0 + b) != block_entry(*rep_si, blk0 + b) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if same {
+                        grp.span_idx[grp.count as usize] = si_u16;
+                        grp.count += 1;
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    let mut g = DecAttnGroup { abs_sp, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                    g.span_idx[0] = si_u16;
+                    open.push((si, g));
+                }
+            }
+            for (_, g) in open {
+                out.push(g);
+            }
+        }
+        i = j;
+    }
+
+    out
 }
 
 /// Write `half` directly from `ctrl_b`'s `down` `gemm_h` into `b.gh[c]`, skipping `k_tohalf` + barrier
@@ -4243,6 +4580,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<CombineArgs>(), 8 * 4);
         assert_eq!(std::mem::size_of::<CombineDecArgs>(), 8 * 4);
         assert_eq!(std::mem::size_of::<AttnBlkDecArgs>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<DecAttnGroup>(), 6 * 4);
+        assert_eq!(std::mem::align_of::<DecAttnGroup>(), 4);
+        assert_eq!(std::mem::size_of::<KvPrepDecArgs>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<AttnGrpDecArgs>(), 12 * 4);
         assert_eq!(std::mem::size_of::<PostConvDecArgs>(), 8 * 4);
         assert_eq!(std::mem::size_of::<TopkRoute3Args>(), 16 * 4);
 
@@ -4282,6 +4623,21 @@ mod tests {
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, kdyn_off), 36);
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, vdyn_off), 40);
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, relbias_w), 60);
+        assert_eq!(std::mem::offset_of!(DecAttnGroup, abs_sp), 0);
+        assert_eq!(std::mem::offset_of!(DecAttnGroup, count), 4);
+        assert_eq!(std::mem::offset_of!(DecAttnGroup, span_idx), 8);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, desc_off), 0);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, qp_off), 32);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, rp_off), 36);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, kv_cur_off), 40);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, kdyn_off), 44);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, vdyn_off), 48);
+        assert_eq!(std::mem::offset_of!(KvPrepDecArgs, relclip_w), 64);
+        assert_eq!(std::mem::offset_of!(AttnGrpDecArgs, desc_off), 0);
+        assert_eq!(std::mem::offset_of!(AttnGrpDecArgs, grp_off), 4);
+        assert_eq!(std::mem::offset_of!(AttnGrpDecArgs, kv_cur_off), 16);
+        assert_eq!(std::mem::offset_of!(AttnGrpDecArgs, kps), 32);
+        assert_eq!(std::mem::offset_of!(AttnGrpDecArgs, swa), 36);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, desc_off), 0);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, cs_slot_off), 16);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, has_res), 24);
@@ -4333,6 +4689,184 @@ mod tests {
         assert!(max_desc_floats <= ar.part as usize, "DecodeSpanDesc[{MAX_SPANS}] must fit before ar.part");
         // Batched Gumbel argmax1 partials use 512 floats per span inside `ar.part`.
         assert!(MAX_SPANS * 512 <= NH * MAX_SPLIT * (HD + 2));
+
+        // Verify Layer 3 batched-decode extra scratch bounds for all batch sizes 1..=MAX_SPANS.
+        let align64 = |x: usize| x.div_ceil(64) * 64;
+        let grp_floats = std::mem::size_of::<DecAttnGroup>() / 4;
+        for n in [1usize, 2, 8, 16, 32, 64, MAX_SPANS] {
+            let extra = decode_batch_extra_floats(n);
+            let desc = align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4));
+            let kv_cur = align64(n * 2 * NKV * HD);
+            let swa_g = align64(n * MAX_SWA_SPLIT * grp_floats);
+            let full_g = align64(n * MAX_SPLIT * grp_floats);
+            assert_eq!(extra, desc + kv_cur + swa_g + full_g);
+            assert_eq!(extra % 64, 0);
+            if n > 1 {
+                assert!(extra >= decode_batch_extra_floats(n - 1));
+            }
+            // Must never overlap any lane's `ar.part` when placed at `dstart + n * ar.total`.
+            let lane_end = (n - 1) * ar.total as usize + ar.part as usize + NH * MAX_SPLIT * (HD + 2);
+            assert!(lane_end <= n * ar.total as usize);
+        }
+    }
+
+    #[test]
+    fn fixed_decode_split_grid_boundaries_and_max_ctx_scaling() {
+        // SWA always anchors at 64-token block boundaries, <= 17 splits <= MAX_SPLIT.
+        assert_eq!(decode_split_kps(true, 4096), 64);
+        assert_eq!(decode_split_kps(true, 262_144), 64);
+        // Full anchors at 512 for max_ctx <= 131,072 and scales by ceil(max_ctx / 131_072) beyond.
+        assert_eq!(decode_split_kps(false, 4096), 512);
+        assert_eq!(decode_split_kps(false, 131_072), 512);
+        assert_eq!(decode_split_kps(false, 131_136), 1024);
+        assert_eq!(decode_split_kps(false, 262_144), 1024);
+
+        for &pos in &[0usize, 1, 62, 63, 64, 65, 510, 511, 512, 513, 1022, 1023, 1024, 1025, 1086, 1087, 1088, 16_383, 16_384, 131_071] {
+            for &swa in &[true, false] {
+                let (first_pos, kps, sp_lo, nsplit) = decode_split_grid(swa, pos, 131_072);
+                assert!(nsplit >= 1 && nsplit <= MAX_SPLIT);
+                if swa {
+                    assert!(nsplit <= MAX_SWA_SPLIT);
+                    assert_eq!(first_pos, (pos + 1).saturating_sub(EXT));
+                } else {
+                    assert_eq!(first_pos, 0);
+                    assert_eq!(sp_lo, 0);
+                }
+                // Clipped splits partition `[first_pos, pos + 1)` exactly with no empty split and no gap.
+                let mut covered = first_pos;
+                for s in 0..nsplit {
+                    let abs_sp = sp_lo + s;
+                    let lo = (abs_sp * kps).max(first_pos);
+                    let hi = ((abs_sp + 1) * kps).min(pos + 1);
+                    assert!(lo < hi, "empty split at pos={pos} swa={swa} s={s}");
+                    assert_eq!(lo, covered);
+                    covered = hi;
+                }
+                assert_eq!(covered, pos + 1);
+            }
+        }
+        // Specific boundary checks
+        assert_eq!(decode_split_grid(true, 63, 131_072), (0, 64, 0, 1));
+        assert_eq!(decode_split_grid(true, 64, 131_072), (0, 64, 0, 2));
+        assert_eq!(decode_split_grid(true, 1023, 131_072), (0, 64, 0, 16));
+        assert_eq!(decode_split_grid(true, 1024, 131_072), (1, 64, 0, 17));
+        assert_eq!(decode_split_grid(true, 1086, 131_072), (63, 64, 0, 17));
+        assert_eq!(decode_split_grid(true, 1087, 131_072), (64, 64, 1, 16));
+        assert_eq!(decode_split_grid(false, 511, 131_072), (0, 512, 0, 1));
+        assert_eq!(decode_split_grid(false, 512, 131_072), (0, 512, 0, 2));
+        assert_eq!(decode_split_grid(false, 131_071, 131_072), (0, 512, 0, 256));
+        assert_eq!(decode_split_grid(false, 262_143, 262_144), (0, 1024, 0, 256));
+    }
+
+    #[test]
+    fn grouped_decode_layout_invariants_and_boundaries() {
+        use std::collections::BTreeSet;
+        let check_invariants = |ranges: &[(usize, usize)], kps: usize, groups: &[DecAttnGroup], block_entry: &dyn Fn(usize, usize) -> Option<(u32, u32)>| {
+            let blks_per_split = kps / crate::blocks::BLOCK;
+            let mut seen = BTreeSet::new();
+            for g in groups {
+                assert!(g.count >= 1 && (g.count as usize) <= DEC_GRP_MAX);
+                let abs_sp = g.abs_sp as usize;
+                let split_start = abs_sp * kps;
+                let split_end = split_start + kps;
+                let rep = g.span_idx[0] as usize;
+                for u in 0..(g.count as usize) {
+                    let si = g.span_idx[u] as usize;
+                    assert!(si < ranges.len());
+                    assert!(seen.insert((si, abs_sp)), "duplicate (si={si}, abs_sp={abs_sp})");
+                    let (first_pos, pos) = ranges[si];
+                    assert!(abs_sp >= first_pos / kps && abs_sp <= pos / kps);
+                    if g.count > 1 {
+                        // Grouped lanes MUST be strictly interior (no partial start, no p == pos)
+                        assert!(first_pos <= split_start && pos >= split_end, "non-interior lane grouped at abs_sp={abs_sp}");
+                        // AND MUST have identical Some((slot != 0, gen != 0)) across ALL blocks in the split.
+                        for b in 0..blks_per_split {
+                            let blk = abs_sp * blks_per_split + b;
+                            let e_rep = block_entry(rep, blk).expect("rep entry must exist");
+                            let e_cur = block_entry(si, blk).expect("cur entry must exist");
+                            assert!(e_rep.0 != 0 && e_rep.1 != 0);
+                            assert_eq!(e_rep, e_cur, "divergent block {blk} grouped between lane {rep} and {si}");
+                        }
+                    }
+                }
+            }
+            // Exact partition: every `(si, abs_sp)` in every lane's visible range appears once.
+            let mut expected = BTreeSet::new();
+            for (si, &(first_pos, pos)) in ranges.iter().enumerate() {
+                for abs_sp in (first_pos / kps)..=(pos / kps) {
+                    expected.insert((si, abs_sp));
+                }
+            }
+            assert_eq!(seen, expected);
+        };
+
+        // 1. Boundary splits: 63/64/65, 511/512/513, 1023/1024/1025 (SWA + Full)
+        let boundary_positions = [63usize, 64, 65, 511, 512, 513, 1023, 1024, 1025];
+        let shared_all = |_si: usize, blk: usize| Some(((blk as u32) + 1, 7u32));
+        for &(swa, kps) in &[(true, 64usize), (false, 512usize)] {
+            let ranges: Vec<(usize, usize)> = boundary_positions
+                .iter()
+                .map(|&p| (if swa { (p + 1).saturating_sub(EXT) } else { 0 }, p))
+                .collect();
+            let grps = build_decode_groups(&ranges, kps, false, shared_all);
+            check_invariants(&ranges, kps, &grps, &shared_all);
+            let grps_off = build_decode_groups(&ranges, kps, true, shared_all);
+            check_invariants(&ranges, kps, &grps_off, &shared_all);
+            assert!(grps_off.iter().all(|g| g.count == 1));
+            // For SWA at pos=1024 (first_pos=1) and pos=1025 (first_pos=2), abs_sp=0 is partial -> never grouped with pos=64..1023!
+            if swa {
+                for g in &grps {
+                    if g.abs_sp == 0 && g.count > 1 {
+                        for u in 0..(g.count as usize) {
+                            let si = g.span_idx[u] as usize;
+                            assert!(ranges[si].0 == 0 && ranges[si].1 >= 64);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Divergent block inside a 512-token full split (same blk0..2, divergent blk3) and stale generation!
+        let ranges_div = vec![(0usize, 1200usize); 4];
+        let div_blocks = |si: usize, blk: usize| -> Option<(u32, u32)> {
+            match (si, blk) {
+                // Split 0 (blocks 0..8): lanes 0 and 1 identical; lane 2 diverges at block 3; lane 3 has different generation at block 5!
+                (0 | 1, b) if b < 8 => Some((10 + b as u32, 1)),
+                (2, b) if b < 3 => Some((10 + b as u32, 1)),
+                (2, b) if b < 8 => Some((100 + b as u32, 1)),
+                (3, 5) => Some((15, 2)), // SAME slot 15, DIFFERENT generation 2!
+                (3, b) if b < 8 => Some((10 + b as u32, 1)),
+                // Split 1 (blocks 8..16): all 4 private
+                (s, b) => Some((200 + (s as u32) * 32 + b as u32, 1)),
+            }
+        };
+        let grps_div = build_decode_groups(&ranges_div, 512, false, div_blocks);
+        check_invariants(&ranges_div, 512, &grps_div, &div_blocks);
+        let sp0_grps: Vec<&DecAttnGroup> = grps_div.iter().filter(|g| g.abs_sp == 0).collect();
+        assert_eq!(sp0_grps.len(), 3, "only lanes 0 & 1 may group on split 0; lane 2 (blk3 diff) & lane 3 (gen diff) must be separate");
+        assert!(sp0_grps.iter().any(|g| g.count == 2 && g.span_idx[0] == 0 && g.span_idx[1] == 1));
+
+        // 3. 20 lanes sharing an 8192-token (16 full splits) prefix with staggered decode positions -> G_MAX = 8 packing!
+        let ranges_20: Vec<(usize, usize)> = (0..20).map(|i| (0usize, 8192 + 64 + i * 17)).collect();
+        let shared_8k = |si: usize, blk: usize| -> Option<(u32, u32)> {
+            if blk < 128 {
+                Some((1 + blk as u32, 3)) // 8192 shared prefix tokens (128 blocks = 16 full splits)
+            } else {
+                Some((1000 + (si as u32) * 64 + blk as u32, 1)) // private suffix
+            }
+        };
+        let grps_20 = build_decode_groups(&ranges_20, 512, false, shared_8k);
+        check_invariants(&ranges_20, 512, &grps_20, &shared_8k);
+        // Each of the 16 shared splits (0..16) splits 20 lanes into 3 groups: 8 + 8 + 4!
+        for abs_sp in 0..16u32 {
+            let mut counts: Vec<u32> = grps_20.iter().filter(|g| g.abs_sp == abs_sp).map(|g| g.count).collect();
+            counts.sort();
+            assert_eq!(counts, vec![4, 8, 8]);
+        }
+        // Suffix split 16 (contains pos for all 20 lanes) must be 20 singletons.
+        assert_eq!(grps_20.iter().filter(|g| g.abs_sp == 16 && g.count == 1).count(), 20);
+        // Total groups: 16 * 3 + 20 = 68 vs 20 * 17 = 340 ungrouped (5.0x fewer TGs!).
+        assert_eq!(grps_20.len(), 68);
     }
 
     #[test]
@@ -4358,11 +4892,17 @@ mod tests {
             "struct CombineArgs",
             "struct CombineDecArgs",
             "struct AttnBlkDecArgs",
+            "struct DecAttnGroup",
+            "struct KvPrepDecArgs",
+            "struct AttnGrpDecArgs",
             "struct PostConvDecArgs",
             "struct TopkRoute3Args",
             "struct LoopCdArgs",
             "kernel void k_embed_dec(",
             "kernel void k_attn_blk_dec(",
+            "kernel void k_kvprep_dec(",
+            "kernel void k_attn_dec_solo(",
+            "kernel void k_attn_grp_dec(",
             "kernel void k_attn_combine_dec(",
             "kernel void k_postconv_state_dec(",
             "kernel void k_moe_topk_route3(",
