@@ -68,9 +68,17 @@ type tensorInfo struct {
 	Off  uint64 // from the start of the data section
 }
 
-func (t tensorInfo) rowLen() int { return int(t.Dims[0]) }
+func (t tensorInfo) rowLen() int {
+	if len(t.Dims) == 0 {
+		return 0
+	}
+	return int(t.Dims[0])
+}
 
 func (t tensorInfo) nRows() int {
+	if len(t.Dims) == 0 {
+		return 0
+	}
 	n := 1
 	for _, d := range t.Dims[1:] {
 		n *= int(d)
@@ -78,7 +86,27 @@ func (t tensorInfo) nRows() int {
 	return n
 }
 
+func sameDims(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (t tensorInfo) size() (uint64, error) {
+	if len(t.Dims) < 1 || len(t.Dims) > 4 {
+		return 0, fmt.Errorf("%s: invalid rank %d", t.Name, len(t.Dims))
+	}
+	for _, d := range t.Dims {
+		if d == 0 {
+			return 0, fmt.Errorf("%s: zero dimension in %v", t.Name, t.Dims)
+		}
+	}
 	bs, bw, err := typeBlock(t.Type)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", t.Name, err)
@@ -111,6 +139,7 @@ type gguf struct {
 	f        *os.File
 	nKV      uint64
 	kvRaw    []byte
+	keys     map[string]bool
 	tensors  []tensorInfo
 	byName   map[string]int
 	dataBase int64
@@ -121,7 +150,7 @@ func openGGUF(path string) (*gguf, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &gguf{f: f, byName: map[string]int{}}
+	g := &gguf{f: f, keys: map[string]bool{}, byName: map[string]int{}}
 	if err := g.parse(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -165,6 +194,13 @@ func (g *gguf) parse() error {
 		if err != nil {
 			return err
 		}
+		if key == "" {
+			return errors.New("empty metadata key")
+		}
+		if g.keys[key] {
+			return fmt.Errorf("duplicate metadata key %q", key)
+		}
+		g.keys[key] = true
 		var typ uint32
 		if err := binary.Read(cr, binary.LittleEndian, &typ); err != nil {
 			return err
@@ -197,6 +233,12 @@ func (g *gguf) parse() error {
 		if err != nil {
 			return err
 		}
+		if name == "" {
+			return errors.New("empty tensor name")
+		}
+		if _, dup := g.byName[name]; dup {
+			return fmt.Errorf("duplicate tensor %q", name)
+		}
 		var nd uint32
 		if err := binary.Read(cr, binary.LittleEndian, &nd); err != nil {
 			return err
@@ -212,6 +254,9 @@ func (g *gguf) parse() error {
 			return err
 		}
 		if err := binary.Read(cr, binary.LittleEndian, &t.Off); err != nil {
+			return err
+		}
+		if _, err := t.size(); err != nil {
 			return err
 		}
 		g.byName[name] = len(g.tensors)

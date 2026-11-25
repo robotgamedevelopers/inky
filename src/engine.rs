@@ -669,6 +669,70 @@ struct VerifyKeep {
 
 static LANE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Open an exclusive, private (`0600`), non-symlink-following, `flock(LOCK_EX | LOCK_NB)`-locked
+/// temporary file at `path` for `--kv-disk` tier storage without unlinking (caller unlinks or tests inspect).
+fn create_locked_kv_tier_file_at(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = opts.open(path)?;
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    // uncached I/O: the point of the file is that its contents are NOT in memory
+    unsafe {
+        libc::fcntl(fd, libc::F_NOCACHE, 1);
+    }
+    Ok(file)
+}
+
+fn open_exclusive_kv_tier_file(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let pid = std::process::id();
+    for attempt in 0..64u64 {
+        let seq = LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut z = nanos ^ ((pid as u64) << 32) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ attempt;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let path = dir.join(format!("inky-kv-{pid}-{seq}-{z:016x}.bin"));
+        match create_locked_kv_tier_file_at(&path) {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path); // it lives as long as the lane
+                return Ok(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "exhausted retries creating exclusive --kv-disk file",
+    ))
+}
+
+fn validate_snapshot_lengths(cs_len: usize, expected_cs_len: usize, swa_len: usize, dst_swa_len: usize) -> Result<(), String> {
+    if cs_len != expected_cs_len {
+        return Err(format!("snapshot conv-state byte length mismatch: snapshot has {cs_len}, lane expects {expected_cs_len}"));
+    }
+    if swa_len != dst_swa_len {
+        return Err(format!("snapshot window K/V byte length mismatch: snapshot has {swa_len}, lane buffer has {dst_swa_len}"));
+    }
+    Ok(())
+}
+
 impl Lane {
     /// A fresh, empty stream for `eng`: a small cache that grows with the context, zeroed convolution rows.
     pub fn new(eng: &Engine) -> Lane {
@@ -678,11 +742,8 @@ impl Lane {
         let gpu = &eng.gpu;
         let tier = if KV_DISK.load(std::sync::atomic::Ordering::Relaxed) {
             assert!(!eng.kv8, "--kv-disk keeps the exact fp16 cache; it cannot be combined with --kv8");
-            let path = std::env::temp_dir().join(format!("inky-kv-{}-{}.bin", std::process::id(), LANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("create the K/V file");
-            // uncached I/O: the point of the file is that its contents are NOT in memory
-            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1); }
-            let _ = std::fs::remove_file(&path);       // it lives as long as the lane
+            let dir = std::env::var_os("INK_TIER_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let file = open_exclusive_kv_tier_file(&dir).expect("create exclusive K/V file");
             Some(Tier { file, on: Cell::new(false), lo: Default::default(), cold: Default::default(), filed: Default::default(), next: Cell::new(0),
                         min_n: std::env::var("INK_TIER_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
                         stg: RefCell::new(gpu.buffer(16384)), half: Cell::new(0), pending: RefCell::new([None, None]),
@@ -3188,10 +3249,15 @@ impl<'a> Run<'a> {
         // dev: INK_TIER_HOT=positions forces small hot rings so short tests exercise the file
         if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
         let c = self.kv_exact_bytes(n);
-        // staging: two halves, each at least one split of the longest attention (see `step`)
+        // staging: two halves, each at least one split of the longest attention (see `step`),
+        // and each hot ring at least `kps + 64` so a split boundary always lies in the shared overlap (`b <= pos - 32`).
+        let kps_swa = decode_split_kps(true, self.max_ctx);
+        let kps_full = decode_split_kps(false, self.max_ctx);
         let s = Self::tier_staging(c, self.max_ctx);
         let hot = (c / 2).saturating_sub(s);
-        ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
+        let hs = (n.min(EXT) * hot / c / 64 * 64).max(kps_swa + 64);
+        let hf = (n * hot / c / 64 * 64).max(kps_full + 64);
+        (hs, hf, s)
     }
     fn tier_staging(c: usize, max_ctx: usize) -> usize {
         let max_kps = decode_split_kps(false, max_ctx).max(decode_split_kps(true, max_ctx));
@@ -3289,8 +3355,7 @@ impl<'a> Run<'a> {
         for (kind, h) in [(0usize, hs), (1usize, hf)] {
             let (buf, capc, nsl) = self.kind_bufs(kind);
             let old_cap = capc.get();
-            let h = h.min(n);
-            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n - h.min(n));
+            let (first, lo) = (if kind == 0 { n.saturating_sub(EXT) } else { 0 }, n.saturating_sub(h));
             let idx_old = |p: usize| if kind == 0 { p % old_cap } else { p };
             // the file runs one split ahead of the hot ring's start, so a split boundary always lies where both have the keys
             let kps = decode_split_kps(kind == 0, self.max_ctx);
@@ -3520,9 +3585,13 @@ impl<'a> Run<'a> {
         (self.get_cs(), g(&self.lane.kv_swa.borrow()))
     }
     pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
+        let swa_dst_len = self.lane.kv_swa.borrow().length();
+        let cs_dst_len = self.lane.with_cs_buf(|_, _, len| len);
+        validate_snapshot_lengths(s.0.len(), cs_dst_len, s.1.len(), swa_dst_len)
+            .unwrap_or_else(|e| panic!("{e}"));
         self.set_cs(&s.0);
         unsafe {
-            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8, s.1.len());
+            std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8, swa_dst_len);
         }
     }
     /// Score every far key (older than one window at context `n`) of the full-attention slots by the attention it received

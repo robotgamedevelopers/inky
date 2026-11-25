@@ -50,7 +50,7 @@ type Card struct {
 	Turns []RecordedEntry
 }
 
-// Clock abstracts time and sleep for deterministic socket/httptest unit tests.
+// Clock abstracts time and sleep for deterministic in-memory unit tests.
 type Clock interface {
 	Now() time.Time
 	Sleep(d time.Duration)
@@ -249,14 +249,23 @@ type healthTelemetry struct {
 }
 
 type memorySamples struct {
+	mu       sync.Mutex
 	observed uint64
 	budget   uint64
 }
 
 func (m *memorySamples) observe(h healthTelemetry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.observed = max(m.observed, h.ProcessFootprintBytes, h.PeakMemoryBytes, h.MemoryBytes, h.UsedBytes)
 	estimate := h.ModelBytes + uint64(max(0, h.ActiveLanes))*h.PerLaneWorstCaseBytes
 	m.budget = max(m.budget, estimate)
+}
+
+func (m *memorySamples) peaks() (uint64, uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.observed, m.budget
 }
 
 func pollHealthOnce(ctx context.Context, client *http.Client, baseURL, apiKey string, memory *memorySamples) {
@@ -354,23 +363,31 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	}
 
 	var memory memorySamples
+	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
+
+	start := clk.Now()
+	_, useRealTimers := clk.(realClock)
 	healthCtx, cancelHealth := context.WithCancel(ctx)
 	var healthWG sync.WaitGroup
-	healthWG.Add(1)
-	go func() {
-		defer healthWG.Done()
-		pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
-		ticker := time.NewTicker(healthInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-healthCtx.Done():
-				return
-			case <-ticker.C:
-				pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
+	var nextHealthPollNs atomic.Int64
+	nextHealthPollNs.Store(start.Add(healthInterval).UnixNano())
+	if useRealTimers {
+		healthWG.Add(1)
+		go func() {
+			defer healthWG.Done()
+			timer := time.NewTimer(healthInterval)
+			defer timer.Stop()
+			for {
+				select {
+				case <-healthCtx.Done():
+					return
+				case <-timer.C:
+					pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
+					timer.Reset(healthInterval)
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	totalCards := cfg.CardsPerRung
 	if cfg.Duration <= 0 && totalCards <= 0 {
@@ -389,7 +406,6 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	var ttftMu sync.Mutex
 	var ttftsMs []float64
 
-	start := clk.Now()
 	var deadline time.Time
 	if cfg.Duration > 0 {
 		deadline = start.Add(cfg.Duration)
@@ -417,6 +433,13 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 				for _, turn := range template.Turns {
 					toks, ttftMs, retries, err := executeTurn(ctx, client, clk, baseURL, cfg.APIKey, replayCardID, turn, maxRetries)
 					retry429Count.Add(int64(retries))
+					if !useRealTimers {
+						nowNs := clk.Now().UnixNano()
+						targetNs := nextHealthPollNs.Load()
+						if nowNs >= targetNs && nextHealthPollNs.CompareAndSwap(targetNs, nowNs+healthInterval.Nanoseconds()) {
+							pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
+						}
+					}
 					if err != nil {
 						errCount.Add(1)
 						cardOK = false
@@ -453,6 +476,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	totalTokS := totTok / wall
 	perLaneTokS := totalTokS / float64(lanes)
 
+	obsPeak, budPeak := memory.peaks()
 	return RungMetrics{
 		Lanes:                   lanes,
 		TotalTokS:               totalTokS,
@@ -460,8 +484,8 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 		TTFTP50Ms:               percentileMs(ttftsMs, 0.50),
 		TTFTP95Ms:               percentileMs(ttftsMs, 0.95),
 		TTFTSamples:             len(ttftsMs),
-		PeakMemoryBytes:         memory.observed,
-		PeakBudgetEstimateBytes: memory.budget,
+		PeakMemoryBytes:         obsPeak,
+		PeakBudgetEstimateBytes: budPeak,
 		CardsCompleted:          doneCards,
 		CardsPerHour:            float64(doneCards) / wall * 3600.0,
 		Errors:                  int(errCount.Load()),

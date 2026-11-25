@@ -19,15 +19,25 @@ var topics = []string{"a ring buffer", "a hash map with open addressing", "a bin
 	"an interval tree", "a radix sort"}
 var langs = []string{"C", "Go", "Rust", "Zig"}
 
-func main() {
-	url := flag.String("url", "http://127.0.0.1:8091/v1/chat/completions", "")
-	n := flag.Int("n", 1, "concurrent streams")
-	predict := flag.Int("predict", 256, "tokens per stream")
-	pad := flag.Int("pad", 0, "repeat a filler paragraph this many times in each prompt (context size)")
-	flag.Parse()
+func runLoad(args []string, client *http.Client, now func() time.Time, stdout, stderr io.Writer) int {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if now == nil {
+		now = time.Now
+	}
+	fs := flag.NewFlagSet("load", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	url := fs.String("url", "http://127.0.0.1:8091/v1/chat/completions", "")
+	n := fs.Int("n", 1, "concurrent streams")
+	predict := fs.Int("predict", 256, "tokens per stream")
+	pad := fs.Int("pad", 0, "repeat a filler paragraph this many times in each prompt (context size)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 	if *n < 1 || *predict < 1 || *pad < 0 {
-		fmt.Fprintln(os.Stderr, "n and predict must be positive; pad must be nonnegative")
-		os.Exit(2)
+		fmt.Fprintln(stderr, "n and predict must be positive; pad must be nonnegative")
+		return 2
 	}
 	type res struct {
 		toks int
@@ -36,7 +46,7 @@ func main() {
 	}
 	out := make([]res, *n)
 	var wg sync.WaitGroup
-	start := time.Now()
+	start := now()
 	for i := 0; i < *n; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -47,15 +57,15 @@ func main() {
 			}
 			body, _ := json.Marshal(map[string]any{"model": "inky", "max_tokens": *predict, "temperature": 0.7, "reasoning_effort": "none",
 				"messages": []map[string]string{{"role": "user", "content": p}}})
-			requestStart := time.Now()
-			r, err := http.Post(*url, "application/json", bytes.NewReader(body))
+			requestStart := now()
+			r, err := client.Post(*url, "application/json", bytes.NewReader(body))
 			if err != nil {
 				out[i].err = err
 				return
 			}
 			defer r.Body.Close()
 			b, err := io.ReadAll(r.Body)
-			elapsed := time.Since(requestStart).Seconds()
+			elapsed := now().Sub(requestStart).Seconds()
 			if err != nil {
 				out[i].err = err
 				return
@@ -84,14 +94,17 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
-	wall := time.Since(start).Seconds()
+	wall := now().Sub(start).Seconds()
+	if wall <= 0 {
+		wall = 1e-9
+	}
 	total, errs := 0, 0
 	var rates []float64
 	for _, r := range out {
 		if r.err != nil {
 			errs++
 			if errs == 1 {
-				fmt.Println("error:", r.err)
+				fmt.Fprintln(stdout, "error:", r.err)
 			}
 			continue
 		}
@@ -103,8 +116,13 @@ func main() {
 	if len(rates) > 0 {
 		med = rates[len(rates)/2]
 	}
-	fmt.Printf("n=%d tokens=%d wall=%.1fs total=%.0f tok/s per-request-median=%.1f tok/s errors=%d\n", *n, total, wall, float64(total)/wall, med, errs)
+	fmt.Fprintf(stdout, "n=%d tokens=%d wall=%.1fs total=%.0f tok/s per-request-median=%.1f tok/s errors=%d\n", *n, total, wall, float64(total)/wall, med, errs)
 	if errs != 0 {
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func main() {
+	os.Exit(runLoad(os.Args[1:], http.DefaultClient, time.Now, os.Stdout, os.Stderr))
 }

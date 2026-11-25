@@ -30,6 +30,12 @@ esac
 [ -x "$B" ] || { echo "FAIL: no inky binary at $B" >&2; exit 1; }
 fail=0
 tests/golden-status.sh || { echo "FAIL: golden producer status"; fail=1; }
+if [ ! -f "$REF/long.tokens" ] || ! cmp -s "$REF/long.tokens" ref/long.tokens; then
+    echo "FAIL: $REF/long.tokens is missing or differs from committed ref/long.tokens"
+    fail=1
+else
+    echo "reference tokens: $REF/long.tokens matches committed ref/long.tokens"
+fi
 agree() {  # name, ref, expected positions, env...
     local name=$1 ref=$2 expected=$3
     shift 3
@@ -57,6 +63,17 @@ agree "decode steps, short prompt vs llama.cpp" short 58 INK_DEC=1
 # negative control: INK_CHECK_SABOTAGE=1 perturbs one compared logit row and must exit 1 with CHECK AGREEMENT FAILED
 chk_out=$(INK_CHECK_SABOTAGE=1 "$B" check --ref "$REF/short" -c 4096 2>&1) && chk_rc=0 || chk_rc=$?
 if [ "$chk_rc" = 1 ] && print -r -- "$chk_out" | grep -q 'CHECK AGREEMENT FAILED'; then echo "check sabotage: detected, as required"; else echo "FAIL: check sabotage not detected (exit $chk_rc)"; fail=1; fi
+kvd_mem_out=$(env -u INK_DEC -u INK_TIER_HOT INK_PF=1500 "$B" check --ref "$REF/long" -c 4096 2>&1) || { print -r -- "$kvd_mem_out"; echo "FAIL: in-memory baseline for --kv-disk"; fail=1; }
+kvd_dsk_out=$(env -u INK_DEC -u INK_TIER_HOT INK_PF=1500 "$B" check --kv-disk --ref "$REF/long" -c 4096 2>&1) || { print -r -- "$kvd_dsk_out"; echo "FAIL: aligned --kv-disk check"; fail=1; }
+kvd_mem_hash=$(print -r -- "$kvd_mem_out" | sed -nE 's/^logit bits hash ([0-9a-f]+)$/\1/p')
+kvd_dsk_hash=$(print -r -- "$kvd_dsk_out" | sed -nE 's/^logit bits hash ([0-9a-f]+)$/\1/p')
+if [ -n "$kvd_mem_hash" ] && [ "$kvd_mem_hash" = "$kvd_dsk_hash" ] && print -r -- "$kvd_dsk_out" | grep -q '^disk tier:' && ! print -r -- "$kvd_dsk_out" | grep -q 'hot ring shorter than a split'; then
+    echo "aligned --kv-disk vs in-memory: logit bits hash $kvd_dsk_hash identical"
+else
+    print -r -- "$kvd_dsk_out"
+    echo "FAIL: aligned --kv-disk hash ($kvd_dsk_hash) != in-memory ($kvd_mem_hash)"
+    fail=1
+fi
 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
 # negative control: a copy one token short of the head it claims must exit 1 and report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
 xc_out=$(INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1) && xc_rc=0 || xc_rc=$?
@@ -68,6 +85,8 @@ $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | gre
 pg_out=$(INK_POOLGATE_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pg_rc=0 || pg_rc=$?
 if [ "$pg_rc" = 1 ] && print -r -- "$pg_out" | grep -q 'POOL GATE DIFFERS'; then echo "poolgate sabotage: detected, as required"; else echo "FAIL: poolgate sabotage not detected (exit $pg_rc)"; fail=1; fi
 if print -r -- "$pg_out" | grep -q '^INK_POOLGATE_SABOTAGE: no other lane differs'; then echo "poolgate sabotage: no other lane differs, as required"; else print -r -- "$pg_out" | grep 'LANE LEAK' || true; echo "FAIL: poolgate sabotage leaked across lanes"; fail=1; fi
+pgs_out=$(INK_POOLGATE_START_SABOTAGE=1 $B poolgate --ref ref/long.tokens -c 4096 2>&1) && pgs_rc=0 || pgs_rc=$?
+if [ "$pgs_rc" = 1 ] && print -r -- "$pgs_out" | grep -q 'PREFIX START-POINT GATE DIFFERS'; then echo "poolgate start-point sabotage: detected, as required"; else echo "FAIL: poolgate start-point sabotage not detected (exit $pgs_rc)"; fail=1; fi
 if [ "$mode" = pr ]; then
     echo "pr set done; binv, lanes, spans, dbatch (each with sabotage), cli checks and golden run in the nightly workflow (tests/ci.sh full)"
     exit $fail

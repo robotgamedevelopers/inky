@@ -212,6 +212,9 @@ fn parse_tables(bytes: &[u8]) -> io::Result<(HashMap<String, Value>, HashMap<Str
     let mut kv = HashMap::new();
     for _ in 0..nkv {
         let k = r.str()?;
+        if k.is_empty() {
+            return Err(invalid_model("empty GGUF metadata key"));
+        }
         let ty = r.u32()?;
         let v = r.value(ty)?;
         if kv.insert(k, v).is_some() {
@@ -228,6 +231,9 @@ fn parse_tables(bytes: &[u8]) -> io::Result<(HashMap<String, Value>, HashMap<Str
     let mut tensors = HashMap::new();
     for _ in 0..nt {
         let name = r.str()?;
+        if name.is_empty() {
+            return Err(invalid_model("empty GGUF tensor name"));
+        }
         let nd = r.u32()?;
         if !(1..=4).contains(&nd) {
             return Err(invalid_model(format_args!("tensor {name} has invalid rank {nd}")));
@@ -764,5 +770,38 @@ mod tests {
             }
         }
         assert!(rejected > 9_000, "expected majority of mutated GGUF inputs to be rejected cleanly, got {rejected}");
+    }
+
+    #[test]
+    fn rejects_duplicate_or_empty_metadata_keys_and_tensor_names() {
+        let mut dup_kv = b"GGUF".to_vec();
+        dup_kv.extend(3u32.to_le_bytes());
+        dup_kv.extend(0u64.to_le_bytes()); // tensors
+        dup_kv.extend(2u64.to_le_bytes()); // metadata entries
+        for _ in 0..2 {
+            dup_kv.extend(16u64.to_le_bytes());
+            dup_kv.extend(b"inkserve.experts");
+            dup_kv.extend(8u32.to_le_bytes());
+            dup_kv.extend(2u64.to_le_bytes());
+            dup_kv.extend(b"ok");
+        }
+        assert!(Gguf::open_bytes(&dup_kv).err().unwrap().to_string().contains("duplicate GGUF metadata key"));
+
+        let mut dup_tensor = b"GGUF".to_vec();
+        dup_tensor.extend(3u32.to_le_bytes());
+        dup_tensor.extend(2u64.to_le_bytes()); // tensors
+        dup_tensor.extend(0u64.to_le_bytes()); // metadata entries
+        for idx in 0..2u64 {
+            let name = b"blk.0.ffn_gate_up_exps.gscale";
+            dup_tensor.extend((name.len() as u64).to_le_bytes());
+            dup_tensor.extend(name);
+            dup_tensor.extend(1u32.to_le_bytes());
+            dup_tensor.extend(128u64.to_le_bytes());
+            dup_tensor.extend(T_F32.to_le_bytes());
+            dup_tensor.extend((idx * 512).to_le_bytes());
+        }
+        let off = dup_tensor.len().next_multiple_of(32);
+        dup_tensor.resize(off + 1024, 0);
+        assert!(Gguf::open_bytes(&dup_tensor).err().unwrap().to_string().contains("duplicate GGUF tensor name"));
     }
 }

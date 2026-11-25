@@ -44,25 +44,37 @@ func (s *safetensors) bf16s(name string, shape ...int) ([]float32, error) {
 }
 
 // quantizeQ8_0 packs rows of k values (k % 32 == 0) as Q8_0: per 32 values an f16 scale and 32 int8.
-func quantizeQ8_0(x []float32, k int) []byte {
+func quantizeQ8_0(x []float32, k int) ([]byte, error) {
+	if k <= 0 || k%32 != 0 || len(x) == 0 || len(x)%k != 0 {
+		return nil, fmt.Errorf("quantizeQ8_0: invalid input length %d for row width %d", len(x), k)
+	}
 	out := make([]byte, 0, len(x)/32*34)
 	for b := 0; b < len(x); b += 32 {
 		amax := float32(0)
 		for _, v := range x[b : b+32] {
+			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				return nil, fmt.Errorf("quantizeQ8_0: non-finite weight %v at block %d", v, b/32)
+			}
 			amax = max(amax, float32(math.Abs(float64(v))))
 		}
 		d := amax / 127
 		h := f32to16(d)
+		if h&0x7FFF >= 0x7C00 {
+			return nil, fmt.Errorf("quantizeQ8_0: fp16 scale overflow at block %d (amax=%v)", b/32, amax)
+		}
 		out = binary.LittleEndian.AppendUint16(out, h)
-		inv := float32(0)
-		if d > 0 {
-			inv = 1 / f16(h)
+		dh := f16(h)
+		inv := float64(0)
+		if dh > 0 {
+			inv = 1.0 / float64(dh)
 		}
 		for _, v := range x[b : b+32] {
-			out = append(out, byte(int8(math.RoundToEven(float64(v*inv)))))
+			q := int(math.RoundToEven(float64(v) * inv))
+			q = max(-127, min(127, q))
+			out = append(out, byte(int8(q)))
 		}
 	}
-	return out
+	return out, nil
 }
 
 func bf16bytes(x []float32) []byte {
@@ -91,6 +103,9 @@ type mtpTensor struct {
 }
 
 func convertMTP(mtpPath, official, outPath string) error {
+	if mtpPath == "" || official == "" || outPath == "" {
+		return fmt.Errorf("mtp needs -in, -official and -out")
+	}
 	st, err := openSafetensors(mtpPath)
 	if err != nil {
 		return err
@@ -125,7 +140,7 @@ func convertMTP(mtpPath, official, outPath string) error {
 			if err != nil {
 				return nil, err
 			}
-			return quantizeQ8_0(v, k), nil
+			return quantizeQ8_0(v, k)
 		})
 	}
 	const nh, nkv, hd, ff = 24, 8, 128, 9216
@@ -250,7 +265,7 @@ func convertMTP(mtpPath, official, outPath string) error {
 		if err := fold(); err != nil {
 			return nil, err
 		}
-		return quantizeQ8_0(fw, mtpRank), nil
+		return quantizeQ8_0(fw, mtpRank)
 	})
 	add("mtp.markov.fold_b", tF32, mtpVocab, 1, func() ([]byte, error) {
 		if err := fold(); err != nil {

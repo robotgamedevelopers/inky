@@ -275,4 +275,29 @@ mod tests {
             assert_eq!(waited, [0, 1, 2]);
         }
     }
+
+    #[test]
+    fn renderer_replaces_bad_utf8_with_replacement_char_and_keeps_following_text() {
+        // Standalone invalid byte followed by >8 bytes of valid ASCII in one chunk and subsequent chunks.
+        let mut r = Renderer::new(true, true);
+        let mut out = Vec::new();
+        r.emit(b"\xffhello, world!", &mut out);
+        r.emit(b" more text", &mut out);
+        r.end(&mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "\u{FFFD}hello, world! more text");
+
+        // Split valid 4-byte emoji across four 1-byte chunks, then an incomplete 3-byte prefix followed by valid ASCII,
+        // then a trailing incomplete 2-byte prefix flushed at end().
+        let mut r2 = Renderer::new(true, true);
+        let mut out2 = Vec::new();
+        for &b in "🦀".as_bytes() {
+            r2.emit(&[b], &mut out2);
+        }
+        r2.emit(&[0xE2, 0x82], &mut out2);
+        assert_eq!(String::from_utf8(out2.clone()).unwrap(), "🦀");
+        r2.emit(b"kept after truncated sequence", &mut out2);
+        r2.emit(&[0xC3], &mut out2);
+        r2.end(&mut out2);
+        assert_eq!(String::from_utf8(out2).unwrap(), "🦀\u{FFFD}kept after truncated sequence\u{FFFD}");
+    }
 }

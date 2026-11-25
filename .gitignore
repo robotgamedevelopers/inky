@@ -7,4 +7,6 @@
 /ref/*.log
 /tools/ref_logits
 .DS_Store
+__pycache__/
+*.py[cod]
 specs/**/states/

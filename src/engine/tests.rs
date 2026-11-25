@@ -1766,3 +1766,56 @@ fn blocked_slab_alloc_reuse_zero_fill_and_strided_growth() {
         assert!(bt[bt1..bt1 + 2 * 96].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY));
     }
 }
+
+#[test]
+fn kv_tier_file_opens_exclusively_rejects_symlinks_and_locks_fd() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::path::PathBuf::from("target").join(format!("test-kv-tier-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Pre-existing regular file must never be truncated or overwritten.
+    let existing = dir.join("existing.bin");
+    std::fs::write(&existing, b"keep-me").unwrap();
+    assert_eq!(create_locked_kv_tier_file_at(&existing).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
+    // 2. Planted symlink (even dangling) must never be followed.
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let symlink = dir.join("planted-link.bin");
+    std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+    assert!(create_locked_kv_tier_file_at(&symlink).is_err());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+    let dangling = dir.join("dangling-link.bin");
+    std::os::unix::fs::symlink(dir.join("nonexistent-target"), &dangling).unwrap();
+    assert!(create_locked_kv_tier_file_at(&dangling).is_err());
+    assert!(!dir.join("nonexistent-target").exists());
+
+    // 3. Fresh path opens with mode 0600 and holds LOCK_EX; open_exclusive_kv_tier_file unlinks immediately.
+    let fresh = dir.join("fresh.bin");
+    let f1 = create_locked_kv_tier_file_at(&fresh).unwrap();
+    let mode = f1.metadata().unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let f2 = std::fs::OpenOptions::new().read(true).write(true).open(&fresh).unwrap();
+    let lock_rc = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(lock_rc, 0, "second open description must observe LOCK_EX held by tier file");
+    drop(f2);
+    drop(f1);
+
+    let unlinked = open_exclusive_kv_tier_file(&dir).unwrap();
+    assert_eq!(unlinked.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    drop(unlinked);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshot_validation_checks_conv_and_window_buffer_fit() {
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 4096, 4096).is_ok());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES - 4, CS_STRIDE_BYTES, 4096, 4096).is_err());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 8192, 4096).is_err());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 2048, 4096).is_err());
+}

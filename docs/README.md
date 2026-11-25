@@ -305,14 +305,17 @@ floor at the measured ~290 GB/s is ~11 ms/token. The engine runs at ~15.9 ms; ll
   ~1K tokens, where every key is inside the window.
 - **`--kv-disk` halves the cache's memory without touching a number, and pays for it in generation speed.** Since the
   values cannot be made smaller, half of them are moved out of memory: while generating, each of the 48 cache slots keeps
-  only its newest keys in a ring, and every older key a layer still attends to lives in an unlinked temporary file (4 KiB
-  per position and slot, uncached I/O) and is read back for every token into a small staging buffer, two halves in turn so
-  the GPU works on one while the next reads land in the other. Memory = hot rings + staging <= half of the in-memory cache
-  at every context from 512 tokens up (process footprint while generating at 15K tokens: 952 -> 622 MB). The attention
-  keeps the split boundaries of the in-memory path (the file runs one split ahead of the ring so a boundary always lies
-  where both have the keys), so every partial sum covers the same keys in the same order: logits are bit-identical
-  (`inky check` prints a hash of all logit bits), and greedy, sampled and multi-turn outputs are byte-identical to the
-  in-memory engine. The cost is the SSD: half the cache is read per token at 7-9 GiB/s.
+  only its newest keys in a ring, and every older key a layer still attends to lives in an exclusively created, locked,
+  unlinked temporary file (4 KiB per position and slot, mode `0600`, uncached I/O) and is read back for every token into a
+  small staging buffer, two halves in turn so the GPU works on one while the next reads land in the other (`--kv-disk` keeps
+  the exact fp16 cache and is refused with `--kv8`). Memory = hot rings + staging <= half of the in-memory cache above the
+  one-split ring floor (process footprint while generating at 15K tokens: 952 -> 622 MB). Because each hot ring holds at
+  least one attention split plus pipelining headroom and the file runs one split ahead of the ring, a split boundary always
+  lies where both have the keys, so every partial sum covers the same keys in the same order: logits are bit-identical
+  (`inky check` prints a hash of all logit bits, gated against in-memory decode in `tests/golden.sh` and `tests/ci.sh`), and
+  greedy, sampled and multi-turn outputs are byte-identical to the in-memory engine. (`INK_TIER_HOT=n` is a test-only
+  override that forces sub-split rings where sums group differently and warns on stderr.) The cost is the SSD: half the cache
+  is read per token at 7-9 GiB/s.
 
   | context | in memory | `--kv-disk` memory | decode in memory | decode `--kv-disk` |
   |---|---|---|---|---|

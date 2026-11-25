@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,27 @@ import (
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func memResponse(status int, contentType, body string, headers map[string]string) *http.Response {
+	hdr := make(http.Header)
+	if contentType != "" {
+		hdr.Set("Content-Type", contentType)
+	}
+	for k, v := range headers {
+		hdr.Set(k, v)
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     hdr,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
 
 type fakeClock struct {
 	mu      sync.Mutex
@@ -211,7 +233,7 @@ func TestPickKnee(t *testing.T) {
 	})
 }
 
-func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
+func TestRunSweep_InMemoryMultiTurnAndHealthAnd429Retry(t *testing.T) {
 	cards, err := LoadReplaySet(filepath.Join("testdata", "sample_cards.jsonl"))
 	if err != nil {
 		t.Fatal(err)
@@ -220,13 +242,18 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 	var mu sync.Mutex
 	turnSeqByCard := make(map[string][]int)
 	var reqCount atomic.Int64
+	var healthPolls atomic.Int64
 	var sawAuth atomic.Bool
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/health" {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"ok":true,"active_lanes":4,"inflight":5,"model_bytes":1000000,"per_lane_worst_case_bytes":250000}`)
-			return
+			healthPolls.Add(1)
+			return memResponse(
+				http.StatusOK,
+				"application/json",
+				`{"ok":true,"active_lanes":4,"inflight":5,"model_bytes":1000000,"per_lane_worst_case_bytes":250000}`,
+				nil,
+			), nil
 		}
 		if r.Header.Get("Authorization") == "Bearer secret-replay-token" {
 			sawAuth.Store(true)
@@ -234,10 +261,12 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 		n := reqCount.Add(1)
 		// Inject deterministic 429 + Retry-After on the 2nd request.
 		if n == 2 {
-			w.Header().Set("Retry-After", "2")
-			w.WriteHeader(http.StatusTooManyRequests)
-			fmt.Fprint(w, `{"error":{"message":"busy"}}`)
-			return
+			return memResponse(
+				http.StatusTooManyRequests,
+				"application/json",
+				`{"error":{"message":"busy"}}`,
+				map[string]string{"Retry-After": "2"},
+			), nil
 		}
 
 		var body struct {
@@ -245,8 +274,7 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 			Messages []json.RawMessage `json:"messages"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
+			return memResponse(http.StatusBadRequest, "application/json", `{"error":{"message":"bad json"}}`, nil), nil
 		}
 		cardID := r.Header.Get("X-Inky-Card-Id")
 		mu.Lock()
@@ -254,27 +282,29 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 		mu.Unlock()
 
 		if body.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n")
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":16}}\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			return
+			sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":16}}\n\n" +
+				"data: [DONE]\n\n"
+			return memResponse(http.StatusOK, "text/event-stream", sse, nil), nil
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":12}}`)
-	}))
-	defer srv.Close()
+		return memResponse(
+			http.StatusOK,
+			"application/json",
+			`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":12}}`,
+			nil,
+		), nil
+	})
 
 	clk := newFakeClock(time.Date(2026, 11, 24, 18, 0, 0, 0, time.UTC))
 	cfg := SweepConfig{
-		BaseURL:        srv.URL,
+		BaseURL:        "http://inky.invalid:8090",
 		APIKey:         "secret-replay-token",
 		LaneCounts:     []int{2, 4},
 		CardsPerRung:   4,
 		MaxRetries:     4,
 		HealthInterval: 50 * time.Millisecond,
 		Knee:           DefaultKneeConfig(),
-		Client:         srv.Client(),
+		Client:         &http.Client{Transport: transport},
 		Clock:          clk,
 	}
 
@@ -287,6 +317,9 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 	}
 	if !sawAuth.Load() {
 		t.Fatal("expected Authorization bearer header to be sent")
+	}
+	if healthPolls.Load() < 4 {
+		t.Fatalf("expected initial, periodic, and final /health polls without real tickers, got %d", healthPolls.Load())
 	}
 	if rungs[0].Retries429 != 1 {
 		t.Fatalf("rung 0 retries_429=%d, want 1", rungs[0].Retries429)
@@ -337,33 +370,30 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 }
 
 func TestRunCLI_MarkdownAndTSVOutputs(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/health" {
-			fmt.Fprint(w, `{"ok":true,"active_lanes":2,"inflight":2,"peak_memory_bytes":4096}`)
-			return
+			return memResponse(http.StatusOK, "application/json", `{"ok":true,"active_lanes":2,"inflight":2,"peak_memory_bytes":4096}`, nil), nil
 		}
 		var body struct {
 			Stream bool `json:"stream"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":8}}\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			return
+			sse := "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":8}}\n\ndata: [DONE]\n\n"
+			return memResponse(http.StatusOK, "text/event-stream", sse, nil), nil
 		}
-		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"completion_tokens":8}}`)
-	}))
-	defer srv.Close()
+		return memResponse(http.StatusOK, "application/json", `{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"completion_tokens":8}}`, nil), nil
+	})
 
 	dir := localTempDir(t)
 	outMD := filepath.Join(dir, "summary.md")
 	outTSV := filepath.Join(dir, "summary.tsv")
 	var stdout, stderr bytes.Buffer
+	clk := newFakeClock(time.Date(2026, 11, 24, 18, 0, 0, 0, time.UTC))
 
-	code := runCLI(
+	code := runCLIWithDeps(
 		[]string{
-			"--url", srv.URL,
+			"--url", "http://inky.invalid:8090",
 			"--input", filepath.Join("testdata", "sample_cards.jsonl"),
 			"--lanes", "2,4",
 			"--cards", "4",
@@ -371,6 +401,8 @@ func TestRunCLI_MarkdownAndTSVOutputs(t *testing.T) {
 			"--out-tsv", outTSV,
 		},
 		func(string) string { return "" },
+		&http.Client{Transport: transport},
+		clk,
 		&stdout,
 		&stderr,
 	)
