@@ -118,7 +118,7 @@ impl From<&str> for RenderError {
 
 /// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
 /// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
-fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize) -> Result<Vec<u32>, RenderError> {
+fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize, continued_assistants: &[usize]) -> Result<Vec<u32>, RenderError> {
     let text = |t: &mut Vec<u32>, s: &str| {
         if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
     };
@@ -149,7 +149,7 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
     };
     let mut effort_done = false;
     let mut call_names = std::collections::HashMap::new();
-    for m in msgs {
+    for (message_index, m) in msgs.iter().enumerate() {
         let role = m["role"].as_str().ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
         if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
@@ -186,35 +186,36 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
             "assistant" => {
                 let asst_name = m["name"].as_str().filter(|n| !n.is_empty());
                 let reasoning = m["reasoning_content"].as_str().filter(|r| !r.is_empty());
-                if let Some(r) = reasoning {
-                    marks(&mut t, &[sp.msg_model])?;
-                    if let Some(name) = asst_name { text(&mut t, name)?; }
-                    marks(&mut t, &[sp.c_think])?;
-                    text(&mut t, r)?;
-                    marks(&mut t, &[sp.end])?;
-                }
+                let model_part = |tokens: &mut Vec<u32>, kind, body: &str| {
+                    marks(tokens, &[sp.msg_model])?;
+                    if let Some(name) = asst_name { text(tokens, name)?; }
+                    marks(tokens, &[kind])?;
+                    text(tokens, body)?;
+                    marks(tokens, &[sp.end])
+                };
+                if let Some(r) = reasoning { model_part(&mut t, sp.c_think, r)?; }
                 let calls: Vec<&Value> = m["tool_calls"].as_array().into_iter().flatten().collect();
                 match &m["content"] {
                     Value::Null => {}
                     Value::String(s) => {
                         if !s.is_empty() || (calls.is_empty() && reasoning.is_none()) {
-                            marks(&mut t, &[sp.msg_model])?;
-                            if let Some(name) = asst_name { text(&mut t, name)?; }
-                            marks(&mut t, &[sp.c_text])?;
-                            text(&mut t, s)?;
-                            marks(&mut t, &[sp.end])?;
+                            model_part(&mut t, sp.c_text, s)?;
                         }
                     }
-                    other => {
-                        let content = content_parts(other).join("");
-                        if !content.is_empty() || (calls.is_empty() && reasoning.is_none()) {
-                            marks(&mut t, &[sp.msg_model])?;
-                            if let Some(name) = asst_name { text(&mut t, name)?; }
-                            marks(&mut t, &[sp.c_text])?;
-                            text(&mut t, &content)?;
-                            marks(&mut t, &[sp.end])?;
+                    Value::Array(parts) => {
+                        for part in parts {
+                            let value = if let Some(s) = part.as_str() { s } else {
+                                if let Some(kind) = part.get("type") {
+                                    if !matches!(kind.as_str(), Some("text" | "input_text")) {
+                                        return Err(format!("unsupported assistant content part type {kind}").into());
+                                    }
+                                }
+                                part["text"].as_str().unwrap_or("")
+                            };
+                            model_part(&mut t, sp.c_text, value)?;
                         }
                     }
+                    _ => return Err("assistant content must be a string, array or null".into()),
                 }
                 for tc in calls {
                     let name = tc["function"]["name"].as_str().ok_or("tool call without a name")?;
@@ -229,7 +230,9 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                     text(&mut t, &format!("{{\"name\":{},\"args\":{}}}", Value::String(name.into()), args))?;
                     marks(&mut t, &[sp.end])?;
                 }
-                marks(&mut t, &[sp.end_sampling])?;
+                if continued_assistants.binary_search(&message_index).is_err() {
+                    marks(&mut t, &[sp.end_sampling])?;
+                }
             }
             r => return Err(format!("unknown role {r}").into()),
         }
@@ -240,36 +243,61 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
 
 #[cfg(test)]
 fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, RenderError> {
-    render_limited(tk, sp, req, default_effort, usize::MAX)
+    render_limited(tk, sp, req, default_effort, usize::MAX, &[])
 }
 
-/// A generated reply split into thinking, text and tool calls.
-struct Parsed { text: String, thinking: String, calls: Vec<(String, Value)> }
-fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
+enum ReplyPart { Text(String), Thinking(String), Tool(String, Value) }
+
+fn parse_tool_call(header: &[u8], body: &[u8]) -> (String, Value) {
+    let s = String::from_utf8_lossy(body);
+    let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+    let name = v["name"].as_str().map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(header).into_owned());
+    let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
+    (name, args)
+}
+
+/// Visit complete blocks in generation order. Final text is retained on length stops;
+/// a truncated tool body must never become a call.
+fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut(ReplyPart)) {
     #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
     let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
-    let mut p = Parsed { text: String::new(), thinking: String::new(), calls: vec![] };
     for &t in toks {
-        if t == sp.msg_model { mode = M::Header; header.clear(); cur.clear(); continue; }
-        if t == sp.c_think { mode = M::Think; cur.clear(); continue; }
-        if t == sp.c_text { mode = M::Text; cur.clear(); continue; }
-        if t == sp.c_tool { mode = M::Tool; cur.clear(); continue; }
-        if t == sp.end || t == sp.end_sampling || t == tk.eos {
-            let s = String::from_utf8_lossy(&cur).to_string();
+        let ends = t == sp.end || t == sp.end_sampling || t == tk.eos;
+        if t == sp.msg_model || t == sp.c_think || t == sp.c_text || t == sp.c_tool || ends {
+            if t == sp.c_text && mode == M::Text { continue; }
             match mode {
-                M::Think => p.thinking += &s, M::Text => p.text += &s,
-                M::Tool => { let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-                             let name = v["name"].as_str().map(|s| s.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&header).to_string());
-                             p.calls.push((name, if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) })); }
+                M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
+                M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
+                M::Tool if ends => {
+                    let (name, args) = parse_tool_call(&header, &cur);
+                    emit(ReplyPart::Tool(name, args));
+                }
                 _ => {}
             }
-            mode = M::None; cur.clear(); continue;
+            cur.clear();
+            mode = if t == sp.msg_model { header.clear(); M::Header }
+                else if t == sp.c_think { M::Think } else if t == sp.c_text { M::Text }
+                else if t == sp.c_tool { M::Tool } else { M::None };
+        } else {
+            match mode { M::Header => header.extend(tk.decode_bytes(t)), M::None => {}, _ => cur.extend(tk.decode_bytes(t)) }
         }
-        let b = tk.decode_bytes(t);
-        match mode { M::Header => header.extend(b), M::None => {}, _ => cur.extend(b) }
     }
-    let s = String::from_utf8_lossy(&cur).to_string();
-    match mode { M::Text => p.text += &s, M::Think => p.thinking += &s, _ => {} }
+    match mode {
+        M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
+        M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
+        _ => {}
+    }
+}
+
+/// Chat represents text, reasoning and tool calls in separate fields.
+struct Parsed { text: String, thinking: String, calls: Vec<(String, Value)> }
+fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
+    let mut p = Parsed { text: String::new(), thinking: String::new(), calls: Vec::new() };
+    visit_reply(tk, sp, toks, |part| match part {
+        ReplyPart::Text(s) => p.text.push_str(&s),
+        ReplyPart::Thinking(s) => p.thinking.push_str(&s),
+        ReplyPart::Tool(name, args) => p.calls.push((name, args)),
+    });
     p
 }
 
@@ -284,12 +312,14 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 /// system messages, a `system` role inside `messages[]` (Claude Code 2.1.330) becomes a system
 /// message in place so its order is kept, text blocks keep their order and their per-block
 /// rendering, a user message's tool results become tool messages in place, and an assistant
-/// message's text and tool uses become its content and tool calls (rendered text first, as the
-/// chat path renders them).
-fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
+/// message's tool uses and text retain their order. Chat renders text before tool calls, so a text
+/// block after a tool starts a new group in the same turn. The caller suppresses the intermediate
+/// end-of-sampling markers at the returned (ascending) group indices.
+fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), String> {
     let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
     if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
     let mut msgs: Vec<Value> = Vec::new();
+    let mut continued_assistants = Vec::new();
     match &req["system"] {
         Value::Null => {}
         Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
@@ -347,11 +377,17 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                 if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
             }
             ("assistant", Value::Array(blocks)) => {
-                let mut text = String::new();
+                let mut texts = Vec::new();
                 let mut calls: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b["type"].as_str() {
-                        Some("text") => text.push_str(b["text"].as_str().unwrap_or("")),
+                        Some("text") => {
+                            if !calls.is_empty() {
+                                continued_assistants.push(msgs.len());
+                                msgs.push(json!({"role": "assistant", "content": std::mem::take(&mut texts), "tool_calls": std::mem::take(&mut calls)}));
+                            }
+                            texts.push(b["text"].as_str().unwrap_or(""));
+                        }
                         Some("tool_use") => {
                             let id = b["id"].as_str().ok_or("tool_use without id")?;
                             let name = b["name"].as_str().ok_or("tool_use without a name")?;
@@ -362,7 +398,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                         t => return Err(format!("unsupported content block type {} in an assistant message", t.unwrap_or("none"))),
                     }
                 }
-                let mut msg = json!({"role": "assistant", "content": text});
+                let mut msg = json!({"role": "assistant", "content": texts});
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 msgs.push(msg);
             }
@@ -383,7 +419,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
             out["tools"] = json!(mapped);
         }
     }
-    Ok(out)
+    Ok((out, continued_assistants))
 }
 
 /// The thinking effort a Messages request asks for, as the `reasoning_effort`
@@ -448,14 +484,19 @@ fn startup_nonce() -> String {
 
 fn tool_use_id(nonce: &str, seq: u64, i: usize) -> String { format!("toolu_{nonce}_{seq}_{i}") }
 
-/// A parsed reply as Anthropic content blocks: the text, then each tool call.
-fn anthropic_content(p: &Parsed, nonce: &str, seq: u64) -> Vec<Value> {
-    let mut c = Vec::new();
-    if !p.text.is_empty() { c.push(json!({"type": "text", "text": p.text})); }
-    for (i, (name, args)) in p.calls.iter().enumerate() {
-        c.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, i), "name": name, "input": args}));
-    }
-    c
+/// Messages represents each visible text or tool block in generation order.
+fn anthropic_content(tk: &Tokenizer, sp: &Specials, toks: &[u32], nonce: &str, seq: u64) -> Vec<Value> {
+    let mut content = Vec::new();
+    let mut calls = 0;
+    visit_reply(tk, sp, toks, |part| match part {
+        ReplyPart::Text(text) => content.push(json!({"type": "text", "text": text})),
+        ReplyPart::Tool(name, args) => {
+            content.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, calls), "name": name, "input": args}));
+            calls += 1;
+        }
+        ReplyPart::Thinking(_) => {}
+    });
+    content
 }
 
 /// Usage in Anthropic's split: `input_tokens` is the part of the prompt no lane reused,
@@ -526,10 +567,7 @@ impl BlockStream {
         self.pend.clear();
     }
     fn emit_tool(&mut self, out: &mut Vec<String>) {
-        let s = String::from_utf8_lossy(&self.tool).to_string();
-        let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-        let name = v["name"].as_str().map(|x| x.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&self.header).to_string());
-        let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
+        let (name, args) = parse_tool_call(&self.header, &self.tool);
         let index = self.next; self.next += 1;
         let id = tool_use_id(&self.nonce, self.seq, self.calls); self.calls += 1;
         out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": index,
@@ -2198,7 +2236,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         }
     };
     let prompt_limit = cx.ctx.saturating_sub(3);
-    let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit);
+    let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit, &[]);
     drop(preprocess);
     let toks = match rendered {
         Ok(t) => t,
@@ -2350,8 +2388,8 @@ fn anthropic_error<W: Write + ?Sized>(s: &mut W, code: u16, kind: &str, msg: &st
 }
 
 fn render_messages(cx: &Ctx, req: &Value, limit: usize) -> Result<Vec<u32>, RenderError> {
-    let openai = anthropic_to_openai(req)?;
-    render_limited(&cx.tk, &cx.sp, &openai, &cx.effort, limit)
+    let (chat, continued_assistants) = translate_messages(req)?;
+    render_limited(&cx.tk, &cx.sp, &chat, &cx.effort, limit, &continued_assistants)
 }
 
 #[cfg(test)]
@@ -2514,12 +2552,13 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
                 if gen.len() % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
-                let p = parse(&cx.tk, &sp, &gen);
-                let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
+                let content = anthropic_content(&cx.tk, &sp, &gen, &cx.nonce, seq);
+                let calls: Vec<&str> = content.iter().filter_map(|block| block["name"].as_str()).collect();
+                let stop = anthropic_stop_reason(!calls.is_empty(), reason);
                 turn.completed(prompt, ng, &timing, stop);
-                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
+                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", calls.join(","), timing.summary);
                 return respond_with_timing(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
-                    "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
+                    "content": content, "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string(), &timing);
             }
             Ev::Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
@@ -2740,6 +2779,7 @@ pub fn serve(o: ServeOpts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn anthropic_to_openai(req: &Value) -> Result<Value, String> { translate_messages(req).map(|(chat, _)| chat) }
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
@@ -2883,7 +2923,7 @@ mod tests {
         let (cx, _) = admission_test_ctx(1);
         let req = json!({"messages": [{"role": "user", "content": "hello"}]});
         let expected = render(&cx.tk, &cx.sp, &req, &cx.effort).unwrap();
-        let render_to = |limit| render_limited(&cx.tk, &cx.sp, &req, &cx.effort, limit);
+        let render_to = |limit| render_limited(&cx.tk, &cx.sp, &req, &cx.effort, limit, &[]);
         assert_eq!(render_to(expected.len()).unwrap(), expected);
         assert!(matches!(render_to(expected.len() - 1), Err(RenderError::TooLong)), "the final message marker takes one position");
         assert!(matches!(render_to(2), Err(RenderError::TooLong)), "the effort text must fit as well");
@@ -3000,7 +3040,7 @@ mod tests {
         assert_eq!(o["messages"][0], json!({"role": "system", "content": [{"type": "text", "text": "Be terse."}, {"type": "text", "text": "Be kind."}]}));
         assert_eq!(o["messages"][1], json!({"role": "user", "content": [{"type": "text", "text": "Weather in SF?"}]}));
         assert_eq!(o["messages"][2]["role"], "assistant");
-        assert_eq!(o["messages"][2]["content"], "Checking.");
+        assert_eq!(o["messages"][2]["content"], json!(["Checking."]));
         assert_eq!(o["messages"][2]["tool_calls"][0]["id"], "toolu_1");
         assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["arguments"], json!({"city": "SF"}));
@@ -3061,7 +3101,7 @@ mod tests {
         assert!(anthropic_to_openai(&json!({"tools": [{"description": "x"}], "messages": [{"role": "user", "content": "x"}]})).is_err(), "a tool without a name");
         // a thinking block in a sent history is the one block dropped: it has no rendering in either API here
         let o = anthropic_to_openai(&json!({"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "Done"}]}]})).unwrap();
-        assert_eq!(o["messages"][0]["content"], "Done");
+        assert_eq!(o["messages"][0]["content"], json!(["Done"]));
     }
 
     #[test] fn anthropic_and_chat_requests_render_the_same_tokens() {
@@ -3230,6 +3270,93 @@ mod tests {
         assert_eq!(names, ["first", "second"]);
     }
 
+    #[test]
+    fn multipart_assistant_content_matches_the_gguf_template() {
+        let tk = Tokenizer::for_byte_test();
+        let sp = test_sp(&tk);
+        let req = json!({"messages": [
+            {"role":"assistant","name":"writer","content":["one",{"type":"text","text":""},{"type":"input_text","text":"two"}]},
+            {"role":"assistant","content":[]}
+        ]});
+        // tokenizer.chat_template in Inkling-2-Mini-Q4_K_M.gguf emits a named header
+        // and end_message for every text part, then one end_sampling for each turn.
+        let golden = concat!("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+            "<|message_model|>writer<|content_text|>one<|end_message|>",
+            "<|message_model|>writer<|content_text|><|end_message|>",
+            "<|message_model|>writer<|content_text|>two<|end_message|>",
+            "<|content_model_end_sampling|><|content_model_end_sampling|>");
+        assert_eq!(render(&tk, &sp, &req, "high").unwrap(), tk.encode(golden, true));
+        for kind in ["image", "input_audio", "unknown"] {
+            let req = json!({"messages":[{"role":"assistant","content":[{"type":kind}]}]});
+            assert!(matches!(render(&tk, &sp, &req, "high"), Err(RenderError::Invalid(_))));
+        }
+    }
+
+    #[test]
+    fn messages_round_trips_interleaved_assistant_blocks_in_both_response_modes() {
+        let (mut cx, jobs) = admission_test_ctx(1);
+        cx.ctx = 2048;
+        let tk = Tokenizer::for_byte_test();
+        cx.sp = test_sp(&tk);
+        cx.tk = Arc::new(tk);
+        let name = "lookup";
+        let expected_content = json!([
+            {"type":"text","text":"before"},
+            {"type":"tool_use","id":"toolu_test_1_0","name":name,"input":{}},
+            {"type":"text","text":""},
+            {"type":"text","text":"after"}
+        ]);
+        let wire = concat!("<|message_model|><|content_text|>before<|end_message|>",
+            "<|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{}}<|end_message|>",
+            "<|message_model|><|content_text|><|end_message|>",
+            "<|message_model|><|content_text|>after<|end_message|><|content_model_end_sampling|>");
+        let req = json!({"max_tokens":256,"messages":[
+            {"role":"assistant","content":expected_content},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_test_1_0","content":"ok"}]}
+        ]});
+        let prompt = cx.tk.encode(&format!("<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|>{wire}<|message_tool|>lookup<|content_text|>ok<|end_message|>"), true);
+        for stream in [false, true] {
+            let mut req = req.clone();
+            req["stream"] = json!(stream);
+            let mut output = Vec::new();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| messages(&cx, &req, &mut output));
+                let job = jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+                let tokens = cx.tk.encode(wire, true);
+                for &id in &tokens { job.out.send(Ev::Tok(id)).unwrap(); }
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
+                worker.join().unwrap().unwrap();
+                assert_eq!(job.toks, prompt, "submitted assistant turn changed during rendering");
+            });
+            let body = std::str::from_utf8(&output).unwrap().split_once("\r\n\r\n").unwrap().1;
+            if !stream {
+                let reply: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(reply["content"], expected_content);
+                assert_eq!(reply["stop_reason"], "tool_use");
+            } else {
+                let mut blocks: Vec<Value> = Vec::new();
+                for data in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
+                    let e: Value = serde_json::from_str(data).unwrap();
+                    match e["type"].as_str() {
+                        Some("content_block_start") => blocks.push(e["content_block"].clone()),
+                        Some("content_block_delta") if e["delta"]["type"] == "text_delta" => {
+                            let b = &mut blocks[e["index"].as_u64().unwrap() as usize];
+                            b["text"] = json!(format!("{}{}", b["text"].as_str().unwrap(), e["delta"]["text"].as_str().unwrap()));
+                        }
+                        Some("content_block_delta") if e["delta"]["type"] == "input_json_delta" => {
+                            blocks[e["index"].as_u64().unwrap() as usize]["input"] = serde_json::from_str(e["delta"]["partial_json"].as_str().unwrap()).unwrap();
+                        }
+                        Some("message_delta") => assert_eq!(e["delta"]["stop_reason"], "tool_use"),
+                        _ => {}
+                    }
+                }
+                let mut expected = expected_content.clone();
+                expected[1]["id"] = json!("toolu_test_2_0");
+                assert_eq!(Value::Array(blocks), expected);
+            }
+        }
+    }
+
     #[test] fn a_generated_reply_parses_to_anthropic_blocks() {
         let tk = Tokenizer::for_test();
         let sp = test_sp(&tk);
@@ -3238,7 +3365,7 @@ mod tests {
         assert_eq!(p.thinking, "hmm");
         assert_eq!(p.calls.len(), 1);
         assert_eq!(p.calls[0], ("get_weather".to_string(), json!({"city": "SF"})));
-        let content = anthropic_content(&p, "abc123", 7);
+        let content = anthropic_content(&tk, &sp, &reply_stream(&tk, &sp), "abc123", 7);
         assert_eq!(content[0], json!({"type": "text", "text": "Hello"}));
         assert_eq!(content[1], json!({"type": "tool_use", "id": "toolu_abc123_7_0", "name": "get_weather", "input": {"city": "SF"}}));
         assert_eq!(anthropic_stop_reason(true, "stop"), "tool_use");
