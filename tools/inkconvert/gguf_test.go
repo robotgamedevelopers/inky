@@ -153,3 +153,42 @@ func TestMTPFailurePreservesDestination(t *testing.T) {
 		t.Fatalf("temporary outputs after error: %v, %v", leftovers, err)
 	}
 }
+
+func TestConvertedModelCanBeUsedAsBase(t *testing.T) {
+	dir := t.TempDir()
+	base, official := filepath.Join(dir, "base"), filepath.Join(dir, "official")
+	first, second := filepath.Join(dir, "first"), filepath.Join(dir, "second")
+	writeGGUFFixture(t, base)
+	emptySafetensorsFixture(t, official)
+	for _, paths := range [][2]string{{base, first}, {first, second}} {
+		if err := convert(official, paths[0], "", "", "", "base", paths[1], "interleaved"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Identical conversion settings preserve both tensor contents and a single provenance record.
+	if !bytes.Equal(fileContents(t, first), fileContents(t, second)) {
+		t.Fatal("converting the same model twice changed its GGUF")
+	}
+}
+
+func TestConvertPublishesThroughDanglingOutputLink(t *testing.T) {
+	dir := t.TempDir()
+	base, official := filepath.Join(dir, "base"), filepath.Join(dir, "official")
+	link, target := filepath.Join(dir, "out"), filepath.Join(dir, "new-model")
+	writeGGUFFixture(t, base)
+	emptySafetensorsFixture(t, official)
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := convert(official, base, "", "", "", "base", link, "interleaved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Readlink(link); err != nil {
+		t.Fatalf("output link was replaced: %v", err)
+	}
+	g, err := openGGUF(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Close()
+}

@@ -19,6 +19,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
 )
 
 const (
@@ -343,6 +344,10 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 	var plans []plan
 	var infos []tensorInfo
 	for _, t := range base.tensors {
+		if weight, ok := strings.CutSuffix(t.Name, ".gscale"); ok && srcs[weight+".weight"] != nil {
+			// The generated native projection supplies its own scale when needed.
+			continue
+		}
 		if s, ok := srcs[t.Name]; ok {
 			nt := tensorInfo{Name: t.Name, Dims: t.Dims, Type: s.ggmlType()}
 			if nt.rowLen() != s.k || nt.nRows() != nExperts*s.rows {
@@ -385,7 +390,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 	if q8 != nil {
 		note += "; Q8_0 tensors matching " + q8re
 	}
-	kv := appendKVString(append([]byte(nil), base.kvRaw...), "inkserve.experts", note)
+	kv := appendKVString(append([]byte(nil), base.kvRaw...), conversionKey, note)
 	w, err := createGGUF(outPath, base.nKV+1, kv, infos, inputs...)
 	if err != nil {
 		return err
