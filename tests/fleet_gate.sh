@@ -34,6 +34,11 @@ while (( $# )); do
     esac
 done
 
+if (( offline == 0 )) && [[ -z "$url" ]]; then
+    echo "[fleet_gate] live verification requires --url or INKY_URL (use --offline for unit checks)" >&2
+    exit 2
+fi
+
 echo "[fleet_gate] running Go -race tests for tests/fleetcheck..."
 (cd tests && go test -race -count=1 ./fleetcheck)
 
@@ -42,10 +47,7 @@ if [[ -f scripts/inky-fleet-serve.sh ]]; then
     echo "[fleet_gate] scripts/inky-fleet-serve.sh syntax OK"
 fi
 
-if (( offline == 1 )) || [[ -z "$url" ]]; then
-    if (( offline == 0 )); then
-        echo "[fleet_gate] INKY_URL not set; unit checks passed (pass INKY_URL=http://100.117.59.68:18096 for live card verification)"
-    fi
+if (( offline == 1 )); then
     exit 0
 fi
 
