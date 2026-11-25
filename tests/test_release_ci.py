@@ -87,7 +87,7 @@ class ReleaseCiTests(unittest.TestCase):
         ci_jobs = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]
         expanded = set()
         for key, job in ci_jobs.items():
-            if key in {"m5-approval", "m5-attestation"}:
+            if key in {"m5-approval", "m5-dispatch"}:
                 self.assertIn("github.event_name == 'issue_comment'", job["if"])
                 continue
             base = job.get("name", key)
@@ -100,7 +100,8 @@ class ReleaseCiTests(unittest.TestCase):
         linux = ci_jobs["go"]["steps"]
         self.assertTrue(any("go test -race ./servecheck" in step.get("run", "")
                             and step.get("working-directory") == "tests" for step in linux))
-        serve = [step.get("run", "") for step in ci_jobs["m5-serve"]["steps"]
+        control = workflow(ROOT / "ci/inky-m5-control.yml")["jobs"]
+        serve = [step.get("run", "") for step in control["m5-serve"]["steps"]
                  if not step.get("continue-on-error") and not step.get("if")]
         self.assertLess(
             serve.index("tests/serve.sh ./target/ci/inky"),

@@ -1,0 +1,208 @@
+# Install as .github/workflows/inky-m5.yml in the private control repository.
+name: Inky M5
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        required: true
+        type: string
+      head:
+        required: true
+        type: string
+      candidate:
+        required: true
+        type: string
+      request:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  input:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.input.outputs.mode }}
+      head: ${{ steps.input.outputs.head }}
+      candidate: ${{ steps.input.outputs.candidate }}
+      request: ${{ steps.input.outputs.request }}
+    steps:
+      - name: validate authenticated dispatch
+        id: input
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          DISPATCH_ACTOR: ${{ vars.INKY_M5_DISPATCH_ACTOR }}
+          MODE: ${{ inputs.mode }}
+          HEAD: ${{ inputs.head }}
+          CANDIDATE: ${{ inputs.candidate }}
+          REQUEST: ${{ inputs.request }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DISPATCH_ACTOR" && "$ACTOR" = "$DISPATCH_ACTOR" ]]
+          [[ "$MODE" = pr || "$MODE" = main || "$MODE" = nightly ]]
+          [[ "$HEAD" =~ ^[0-9a-f]{40}$ && "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MODE" = pr || "$HEAD" = "$CANDIDATE" ]]
+          [[ "$REQUEST" =~ ^[0-9]+\.[0-9]+$ ]]
+          printf 'mode=%s\nhead=%s\ncandidate=%s\nrequest=%s\n' \
+            "$MODE" "$HEAD" "$CANDIDATE" "$REQUEST" >> "$GITHUB_OUTPUT"
+  m5-gpu:
+    needs: input
+    if: needs.input.outputs.mode != 'nightly'
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    timeout-minutes: 60
+    steps:
+      - name: fetch exact public candidate without credentials
+        env:
+          CANDIDATE: ${{ needs.input.outputs.candidate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin https://github.com/robotgamedevelopers/inky.git
+          git fetch --no-tags --depth=1 origin "$CANDIDATE"
+          git -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+      - name: build
+        run: cargo build --locked --profile ci
+      - name: GPU router regression
+        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
+      - name: GPU gates (pull request set)
+        env:
+          INKY_BIN: ./target/ci/inky
+        run: tests/ci.sh pr
+
+  m5-serve:
+    needs: input
+    if: needs.input.outputs.mode != 'nightly'
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    timeout-minutes: 40
+    steps:
+      - name: fetch exact public candidate without credentials
+        env:
+          CANDIDATE: ${{ needs.input.outputs.candidate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin https://github.com/robotgamedevelopers/inky.git
+          git fetch --no-tags --depth=1 origin "$CANDIDATE"
+          git -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+      - name: build
+        run: cargo build --locked --profile ci
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      # servecheck allocates ephemeral loopback ports, bounds requests/server
+      # lifetime, and cancels/waits for each child server before removing logs.
+      # serve_header_policy runs in the unit job (cargo test --bins), so this job runs the probes alone.
+      - name: serve API probes
+        timeout-minutes: 15
+        env:
+          SERVECHECK_SABOTAGE: ''
+          INKY_SERVE_PROBES_ONLY: '1'
+        run: tests/serve.sh ./target/ci/inky
+      - name: serve API negative controls
+        timeout-minutes: 15
+        env:
+          INKY_SERVE_PROBES_ONLY: '1'
+        run: tests/serve-negative.sh tests/serve.sh ./target/ci/inky
+
+
+  m5-full:
+    needs: input
+    if: needs.input.outputs.mode == 'nightly'
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    steps:
+      - name: fetch exact public candidate without credentials
+        env:
+          CANDIDATE: ${{ needs.input.outputs.candidate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin https://github.com/robotgamedevelopers/inky.git
+          git fetch --no-tags --depth=1 origin "$CANDIDATE"
+          git -c advice.detachedHead=false checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+      - name: build
+        run: cargo build --locked --release
+      - name: GPU router regression
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
+      - name: GPU gates (full set)
+        if: ${{ !cancelled() }}
+        run: tests/ci.sh full
+      # The long poisoned-slot gate (17 lanes, 64 decode steps; about 126-140 s), from #55.
+      - name: long GPU gates
+        if: ${{ !cancelled() }}
+        run: tests/nightly.sh
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: ${{ !cancelled() }}
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: serve API probes
+        if: ${{ !cancelled() }}
+        env:
+          SERVECHECK_SABOTAGE: ''
+        run: tests/serve.sh
+      - name: serve API negative controls
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: tests/serve-negative.sh tests/serve.sh
+
+  attest:
+    if: always() && needs.input.result == 'success' && github.ref == 'refs/heads/main'
+    needs: [input, m5-gpu, m5-serve, m5-full]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: inky-m5-report
+    steps:
+      - name: mint Inky-only reporting token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.INKY_M5_REPORT_APP_ID }}
+          private-key: ${{ secrets.INKY_M5_REPORT_APP_PRIVATE_KEY }}
+          owner: robotgamedevelopers
+          repositories: inky
+          permission-checks: write
+      - name: publish authenticated results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          MODE: ${{ needs.input.outputs.mode }}
+          HEAD: ${{ needs.input.outputs.head }}
+          CANDIDATE: ${{ needs.input.outputs.candidate }}
+          REQUEST: ${{ needs.input.outputs.request }}
+          GPU: ${{ needs.m5-gpu.result }}
+          SERVE: ${{ needs.m5-serve.result }}
+          FULL: ${{ needs.m5-full.result }}
+        run: |
+          set -euo pipefail
+          publish() {
+            local name=$1 result=$2 conclusion=failure
+            if [[ "$result" = success ]]; then conclusion=success; fi
+            gh api repos/robotgamedevelopers/inky/check-runs \
+              -f name="$name" -f head_sha="$HEAD" -f external_id="$REQUEST" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=Inky M5 result" \
+              -f "output[summary]=Tested commit $CANDIDATE for request $REQUEST." --silent
+          }
+          case "$MODE" in
+            pr)
+              if [[ "$GPU" = success && "$SERVE" = success ]]; then
+                publish m5-reviewed success
+              else
+                publish m5-reviewed failure
+              fi
+              ;;
+            main)
+              publish m5-main-gpu "$GPU"
+              publish m5-main-serve "$SERVE"
+              ;;
+            nightly) publish m5-nightly "$FULL" ;;
+          esac

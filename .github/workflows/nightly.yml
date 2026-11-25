@@ -74,45 +74,39 @@ jobs:
         run: |
           test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
           test "$REF" = refs/heads/main || { echo "m5-full runs only on main, not $REF" >&2; exit 1; }
-  # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
-  # its sabotage, dbatch, CLI checks, the golden hashes, the long poolgate (tests/nightly.sh) and the serve API
-  # negative control.
-  # Every gate step runs even when an earlier one fails (if: !cancelled()), so one red gate never hides another.
+  # Run the full release-profile M5 set in the trusted control repository.
   m5-full:
     needs: guard
     if: >-
       github.repository == 'robotgamedevelopers/inky' && github.ref == 'refs/heads/main' &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on:
-      group: inky-reviewed-m5
-      labels: [self-hosted, macOS, ARM64, m5]
+    runs-on: ubuntu-latest
+    environment: inky-m5-dispatch
+    permissions:
+      contents: read
+      checks: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: build
-        run: cargo build --locked --release
-      - name: GPU router regression
-        if: ${{ !cancelled() }}
-        run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
-      - name: GPU gates (full set)
-        if: ${{ !cancelled() }}
-        run: tests/ci.sh full
-      # The long poisoned-slot gate (17 lanes, 64 decode steps; about 126-140 s), from #55.
-      - name: long GPU gates
-        if: ${{ !cancelled() }}
-        run: tests/nightly.sh
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        if: ${{ !cancelled() }}
+      - name: mint control-repository dispatch token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          go-version: '1.26.10'
-          cache: false
-      - name: serve API probes
-        if: ${{ !cancelled() }}
+          app-id: ${{ vars.INKY_M5_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.INKY_M5_DISPATCH_APP_PRIVATE_KEY }}
+          owner: robotgamedevelopers
+          repositories: ${{ vars.INKY_M5_CONTROL_REPOSITORY }}
+          permission-actions: write
+      - name: dispatch the nightly candidate
+        id: dispatch
         env:
-          SERVECHECK_SABOTAGE: ''
-        run: tests/serve.sh
-      - name: serve API negative controls
-        if: ${{ !cancelled() }}
-        timeout-minutes: 15
-        run: tests/serve-negative.sh tests/serve.sh
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          M5_CONTROL_REPOSITORY: ${{ vars.INKY_M5_CONTROL_REPOSITORY }}
+        run: python3 scripts/m5_control.py dispatch nightly "$GITHUB_SHA" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: verify the authenticated nightly result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          M5_REPORT_APP_ID: ${{ vars.INKY_M5_REPORT_APP_ID }}
+          REQUEST: ${{ steps.dispatch.outputs.request }}
+        run: python3 scripts/m5_control.py wait m5-nightly "$GITHUB_SHA" "$REQUEST"

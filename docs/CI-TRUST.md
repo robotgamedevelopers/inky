@@ -1,75 +1,75 @@
 # Inky CI trust and main protection
 
-GitHub-hosted `unit`, `go`, and the four `tla` checks run on ordinary pull
-requests and main pushes. A repository administrator reviews the exact
-revision of an up-to-date PR to main and comments `/test-m5 <full PR head SHA>`.
-This comment is the approval and works when the PR was opened under the
-administrator's own GitHub identity. Post it from the administrator account
-after reviewing and use a fresh comment for a retry.
+Hosted Inky CI runs on pull requests and main pushes. To qualify a ready,
+up-to-date PR for M5, an administrator reviews the revision and comments
+`/test-m5 <full PR head SHA>`. This approval works when the PR uses the same
+GitHub identity. The main workflow checks administrator access, the exact
+PR head, and the current test merge. It requires the reviewed head and test
+merge to have identical Git trees. Update and review a new head after an
+out-of-date or changed PR. Post a fresh comment for a retry.
 
-The main workflow checks the administrator's current permission and confirms
-the requested SHA is still the PR head. It builds GitHub's immutable merge
-candidate only if it includes current main and has the same Git tree as the
-approved head. The hosted check runs and the M5 receipt are both attached to
-the PR head. If advancing main renders the branch out of date, update the
-branch and review its new head before posting another approval.
-
-The two M5 jobs also run on main pushes. Scheduled or manually dispatched
-nightlies use the M5 runner group from main only. Manual dispatch on main is
-`gh workflow run nightly.yml --ref main`. Release publication waits for the
-actual main-push CI and its individual jobs.
+M5 workers register only with a private control repository. They never
+join public Inky's runner inventory. Public main CI dispatches M5 tests to
+that repository and waits for authenticated results independently for GPU
+and serving. The PR run publishes a single `m5-reviewed` receipt on the
+approved head. The public main nightly dispatches the full release-profile
+suite. Release verification retains the two original native main CI job
+names and checks that both authenticated gates ran.
 
 ## Administrator cutover
 
-1. Create an organization runner group named `inky-reviewed-m5`. Allow access
-   from public repositories and select only `robotgamedevelopers/inky`.
-   Enable selected-workflow access and allow exactly these qualified refs.
-   [Runner group configuration](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
+1. Approve a private repository in `robotgamedevelopers` dedicated to Inky
+   CI, or nominate an existing equivalent with access restricted to
+   trusted CI administrators. Restrict changes and branches in that
+   repository to those administrators and protect its default branch
+   `main`. Install [the workflow template](../ci/inky-m5-control.yml)
+   at `.github/workflows/inky-m5.yml`. The private repository is the
+   runner access boundary. Review future changes to its workflow before
+   promoting the updated template. [GitHub self-hosted runner access](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
+2. Create two scoped Apps with webhooks disabled. Install the dispatch
+   App only in the private control repository, with **Actions: write**.
+   Install the result App only in public Inky, with **Checks: write**.
+   Both inherit Metadata: read. Use separate private keys. In public
+   Inky, create the `inky-m5-dispatch` environment with the single
+   selected branch `main` and no tag access. Set environment variables
+   `INKY_M5_DISPATCH_APP_ID` and `INKY_M5_CONTROL_REPOSITORY` (just the
+   repository name). Store `INKY_M5_DISPATCH_APP_PRIVATE_KEY` as an
+   environment secret. Set public Inky's repository variable
+   `INKY_M5_REPORT_APP_ID` to the reporting App ID. [Dispatch permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
+3. In the private control repository, set the repository variable
+   `INKY_M5_DISPATCH_ACTOR` to the dispatch App's bot login. Create the
+   `inky-m5-report` environment with the single selected branch `main`
+   and no tag access. Set environment variable `INKY_M5_REPORT_APP_ID`
+   and environment secret `INKY_M5_REPORT_APP_PRIVATE_KEY`. The report
+   job uses a GitHub-hosted runner. Neither private key is installed on
+   Macs or passed into the test jobs. [Environment configuration](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+4. Provision a standard, dedicated macOS service account on an approved
+   M5 host with no passwordless sudo, access to the owner home, or
+   existing project credentials. Register clean ephemeral ARM64 macOS
+   workers to the **private control repository** with the `m5` label.
+   Give each listener an independent workspace. Install Rust and the
+   Metal runtime and provide read-only model and reference fixtures.
+   The current test defaults are `~/inky-ci/ref` and
+   `~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf`.
+   Verify both commands from under the dedicated account. Create a new
+   clean listener registration after each ephemeral job.
+   [Ephemeral runners](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling)
+5. After existing public M5 jobs drain, unregister all public Inky
+   self-hosted runners, including offline registrations. Leave unrelated
+   projects' listeners alone. Verify public Inky has no access to an
+   organization M5 group. Use the temporary hosted checks in
+   [Main ruleset](MAIN-RULESET.md) to merge the public workflow change.
+   Confirm the two public main-push M5 jobs independently received the
+   reporting App's gate results for the exact commit, run and attempt.
+6. With a benign, up-to-date PR, verify an ordinary PR cannot enqueue
+   private M5. Verify an administrator review command with a stale SHA
+   is rejected. Confirm the valid command runs both short tests and
+   publishes the dedicated App's `m5-reviewed` on the reviewed head.
+   Rehearse a nightly dispatch from main and confirm it waits for its
+   own full-suite receipt. Enable the final ruleset context only after
+   this passes.
 
-   - `robotgamedevelopers/inky/.github/workflows/ci.yml@refs/heads/main`
-   - `robotgamedevelopers/inky/.github/workflows/nightly.yml@refs/heads/main`
-
-2. Create a private organization-owned GitHub App with repository Checks:
-   read and write, and the implicit Metadata: read permission. Install it
-   only on Inky. Create the `inky-m5-attestation` Actions environment with
-   a selected **branch** rule for `main` and no tag rules. Put its App ID in
-   the environment variable `INKY_M5_APP_ID` and its private key in the
-   environment secret `INKY_M5_APP_PRIVATE_KEY`. The dedicated App identity
-   lets the rule distinguish the M5 receipt from checks other Actions jobs
-   can publish. [Environment configuration](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
-
-3. Provision a dedicated standard macOS service account on each M5 host and
-   register fresh organization runners in the selected group with the `m5`
-   label. Give each listener its own runner and work directories under the
-   dedicated account. Install the Rust and Metal runtime prerequisites and
-   provide fixtures through read-only paths. Verify the listener UID is
-   outside the admin group, has no passwordless sudo, and runs with its own
-   home and keychain. Restrict access to the owner home, credentials, other
-   runner workspaces, and writable shared directories. Test the GPU gates
-   from that account before routing production CI to it.
-
-4. Coordinate the cutover after any outstanding old-workflow jobs drain.
-   Disable and unregister all Inky repository-scoped runners, including
-   offline registrations. Leave unrelated projects' listeners alone.
-   Confirm other organization groups available to Inky contain no
-   general-purpose self-hosted runners. Protect main with the temporary
-   contexts described in [Main ruleset](MAIN-RULESET.md), then merge this
-   workflow through that rule. Confirm the resulting main-push `m5-gpu` and
-   `m5-serve` jobs use the new group and complete successfully.
-
-5. From a benign, up-to-date PR, run hosted CI and have a repository
-   administrator review and comment its exact head SHA. Verify both M5 jobs checked out GitHub's
-   same test merge commit, passed on the dedicated account, and that
-   `m5-reviewed` on the PR head was published by the dedicated App. Confirm
-   ordinary PR events and non-main dispatches do not get M5 runners, and
-   approval for an earlier head produces no candidate. Then add
-   `m5-reviewed` to the required checks and verify merging is blocked
-   before the authentic check and allowed after it. GitHub requires a
-   recent successful check before treating it as an eligible required
-   context. [Required check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)
-
-A failed cutover leaves the unsafe registrations disabled. Restore CI by
-repairing the restricted group or attestations and rerunning the same
-verification before enabling the final check.
-
-See [Main ruleset](MAIN-RULESET.md) for the required checks and verification.
+A failed cutover leaves public runner registrations disabled. Restore CI
+by repairing the private receiver or reporting configuration and rerunning
+the verification. To retry an unsuccessful main-push dispatch, rerun the
+whole public workflow so it sends a new request.

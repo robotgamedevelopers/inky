@@ -131,9 +131,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/reviewed_m5.py
 
-  # The organization group only admits the main-branch versions of ci.yml and
-  # nightly.yml. The event and approval checks decide which code those workflows run.
-  m5-gpu:
+  # Only protected main can access the dispatch key. Public jobs never use a
+  # self-hosted runner, and the private receiver publishes the exact-SHA result.
+  m5-dispatch:
     needs: m5-approval
     if: >-
       !cancelled() && github.repository == 'robotgamedevelopers/inky' &&
@@ -142,98 +142,68 @@ jobs:
         (github.event_name == 'issue_comment' && github.run_attempt == '1' &&
          needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != '')
       )
-    runs-on:
-      group: inky-reviewed-m5
-      labels: [self-hosted, macOS, ARM64, m5]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.m5-approval.outputs.candidate || github.sha }}
-          persist-credentials: false
-      - name: build
-        run: cargo build --locked --profile ci
-      - name: GPU router regression
-        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
-      - name: GPU gates (pull request set)
-        env:
-          INKY_BIN: ./target/ci/inky
-        run: tests/ci.sh pr
-  m5-serve:
-    needs: m5-approval
-    if: >-
-      !cancelled() && github.repository == 'robotgamedevelopers/inky' &&
-      github.ref == 'refs/heads/main' && (
-        github.event_name == 'push' ||
-        (github.event_name == 'issue_comment' && github.run_attempt == '1' &&
-         needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != '')
-      )
-    runs-on:
-      group: inky-reviewed-m5
-      labels: [self-hosted, macOS, ARM64, m5]
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.m5-approval.outputs.candidate || github.sha }}
-          persist-credentials: false
-      - name: build
-        run: cargo build --locked --profile ci
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: '1.26.10'
-          cache: false
-      # servecheck allocates ephemeral loopback ports, bounds requests/server
-      # lifetime, and cancels/waits for each child server before removing logs.
-      # serve_header_policy runs in the unit job (cargo test --bins), so this job runs the probes alone.
-      - name: serve API probes
-        timeout-minutes: 15
-        env:
-          SERVECHECK_SABOTAGE: ''
-          INKY_SERVE_PROBES_ONLY: '1'
-        run: tests/serve.sh ./target/ci/inky
-      - name: serve API negative controls
-        timeout-minutes: 15
-        env:
-          INKY_SERVE_PROBES_ONLY: '1'
-        run: tests/serve-negative.sh tests/serve.sh ./target/ci/inky
-
-  m5-attestation:
-    if: >-
-      always() && github.repository == 'robotgamedevelopers/inky' &&
-      github.ref == 'refs/heads/main' && github.event_name == 'issue_comment' &&
-      needs.m5-approval.result == 'success' && needs.m5-approval.outputs.candidate != ''
-    needs: [m5-approval, m5-gpu, m5-serve]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    environment: inky-m5-attestation
-    permissions: {}
+    environment: inky-m5-dispatch
+    outputs:
+      request: ${{ steps.dispatch.outputs.request }}
     steps:
-      - name: get the check publisher token
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: mint control-repository dispatch token
         id: app
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ vars.INKY_M5_APP_ID }}
-          private-key: ${{ secrets.INKY_M5_APP_PRIVATE_KEY }}
-          permission-checks: write
-      - name: report the reviewed M5 result on the pull request head
+          app-id: ${{ vars.INKY_M5_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.INKY_M5_DISPATCH_APP_PRIVATE_KEY }}
+          owner: robotgamedevelopers
+          repositories: ${{ vars.INKY_M5_CONTROL_REPOSITORY }}
+          permission-actions: write
+      - name: dispatch the reviewed immutable candidate
+        id: dispatch
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          HEAD_SHA: ${{ needs.m5-approval.outputs.head }}
-          CANDIDATE: ${{ needs.m5-approval.outputs.candidate }}
-          M5_GPU: ${{ needs.m5-gpu.result }}
-          M5_SERVE: ${{ needs.m5-serve.result }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          conclusion=failure
-          if [[ "$M5_GPU" = success && "$M5_SERVE" = success ]]; then
-            conclusion=success
-          fi
-          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
-            -f name=m5-reviewed -f head_sha="$HEAD_SHA" -f status=completed \
-            -f "output[title]=M5 GPU and serving gates" \
-            -f "output[summary]=Tested merge candidate $CANDIDATE, with the same tree as the reviewed head." \
-            -f conclusion="$conclusion" \
-            -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --silent
+          M5_CONTROL_REPOSITORY: ${{ vars.INKY_M5_CONTROL_REPOSITORY }}
+          MODE: ${{ github.event_name == 'push' && 'main' || 'pr' }}
+          HEAD_SHA: ${{ needs.m5-approval.outputs.head || github.sha }}
+          CANDIDATE: ${{ needs.m5-approval.outputs.candidate || github.sha }}
+        run: python3 scripts/m5_control.py dispatch "$MODE" "$HEAD_SHA" "$CANDIDATE" >> "$GITHUB_OUTPUT"
+
+  m5-gpu:
+    needs: m5-dispatch
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: verify the authenticated M5 gpu result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          M5_REPORT_APP_ID: ${{ vars.INKY_M5_REPORT_APP_ID }}
+          REQUEST: ${{ needs.m5-dispatch.outputs.request }}
+        run: python3 scripts/m5_control.py wait m5-main-gpu "$GITHUB_SHA" "$REQUEST"
+
+  m5-serve:
+    needs: m5-dispatch
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: verify the authenticated M5 serve result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          M5_REPORT_APP_ID: ${{ vars.INKY_M5_REPORT_APP_ID }}
+          REQUEST: ${{ needs.m5-dispatch.outputs.request }}
+        run: python3 scripts/m5_control.py wait m5-main-serve "$GITHUB_SHA" "$REQUEST"
