@@ -23,7 +23,7 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender,
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-mod block_cache;
+pub(crate) mod block_cache;
 mod messages;
 mod prompt;
 mod reply;
@@ -107,6 +107,7 @@ struct Job {
     seed: u64,
     thinking_budget: usize,
     loopcd_omega: f32,
+    tool_catalog: Option<Arc<crate::json_grammar::ToolCatalog>>,
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
@@ -142,9 +143,15 @@ impl Job {
             seed,
             thinking_budget,
             loopcd_omega,
+            tool_catalog: None,
             out,
             _permit: permit,
         }
+    }
+
+    fn with_tool_catalog(mut self, tool_catalog: Option<Arc<crate::json_grammar::ToolCatalog>>) -> Self {
+        self.tool_catalog = tool_catalog;
+        self
     }
 }
 
@@ -348,10 +355,59 @@ struct Active {
     #[allow(dead_code)]
     draft_sampler: Sampler,
     think: ThinkBudget,
+    tool_grammar: Option<crate::json_grammar::ToolCallGrammar>,
     pending: Option<u32>,
 }
 
 impl Active {
+    #[inline]
+    fn uses_gpu_gumbel(&self) -> bool {
+        self.sampler.uses_gpu_gumbel()
+            && !self.tool_grammar.as_ref().is_some_and(|g| g.is_in_json())
+    }
+
+    fn sample_cpu_token(
+        &mut self,
+        logits: &[f32],
+        softcap: f32,
+        sp: &Specials,
+        vocab: &crate::json_grammar::VocabBytes,
+    ) -> Result<u32, &'static str> {
+        let ban = self.think.ban_token(sp);
+        if let Some(grammar) = &self.tool_grammar {
+            if grammar.is_in_json() {
+                return self.sampler.sample_next_filtered(logits, ban, softcap, |id| {
+                    grammar.allows_token(id, vocab, sp.end)
+                });
+            }
+        }
+        self.sampler.sample_next_with_ban_and_softcap(logits, ban, softcap)
+    }
+
+    fn commit_sampled_token(
+        &mut self,
+        raw_tok: u32,
+        sp: &Specials,
+        vocab: &crate::json_grammar::VocabBytes,
+        eos: u32,
+    ) {
+        let tok = self.think.observe(raw_tok, sp);
+        if let Some(grammar) = &mut self.tool_grammar {
+            grammar.observe_token(
+                tok,
+                vocab,
+                sp.msg_model,
+                sp.c_think,
+                sp.c_text,
+                sp.c_tool,
+                sp.end,
+                sp.end_sampling,
+                eos,
+            );
+        }
+        self.pending = Some(tok);
+    }
+
     fn step_input(&self, runnable: bool) -> crate::scheduler::ServeLaneInput {
         let mut prefill_target = effective_pf_target(self.n_past, self.pf_end);
         let mut decode = self.pending.is_some() && self.n_past < self.pf_end + self.gen;
@@ -755,6 +811,7 @@ fn scheduler(
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<QueuedJob> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
+    let vocab_bytes = crate::json_grammar::VocabBytes::from_tokenizer(tk);
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
     let (context, window_slots) = {
         let pools = eng.block_pool().borrow();
@@ -966,6 +1023,10 @@ fn scheduler(
                 // once per request, not per round and not per emitted token
                 let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
                 let think = ThinkBudget::new(j.thinking_budget);
+                let tool_grammar = j
+                    .tool_catalog
+                    .as_ref()
+                    .map(|cat| crate::json_grammar::ToolCallGrammar::new(cat.clone()));
                 lanes[i].job = Some(Active {
                     pf_end: j_len,
                     n_past: start,
@@ -976,6 +1037,7 @@ fn scheduler(
                     sampler,
                     draft_sampler,
                     think,
+                    tool_grammar,
                     pending: None,
                     job: j,
                 });
@@ -1180,7 +1242,7 @@ fn scheduler(
                             let l = &lanes[i];
                             let a = l.job.as_ref().unwrap();
                             let next_pos = p0 + t;
-                            (next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel())
+                            (next_pos == a.pf_end && !a.job.out.cancelled() && a.uses_gpu_gumbel())
                                 .then(|| crate::engine::GumbelSpan {
                                     span_idx: k,
                                     lane: &l.lane,
@@ -1197,7 +1259,7 @@ fn scheduler(
                     let l = &lanes[i];
                     let a = l.job.as_ref().unwrap();
                     let next_pos = p0 + t;
-                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.uses_gpu_gumbel() {
                         eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
                     }
                 }
@@ -1245,14 +1307,14 @@ fn scheduler(
                         continue;
                     }
                     if a.n_past == a.pf_end {
-                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                        let sampled = if a.uses_gpu_gumbel() {
                             eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                            a.sampler.sample_next_with_ban_and_softcap(&lg, a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                            a.sample_cpu_token(&lg, eng.effective_sampler_softcap(k), &sp, &vocab_bytes)
                         };
                         match sampled {
-                            Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
+                            Ok(tok) => a.commit_sampled_token(tok, &sp, &vocab_bytes, tk.eos),
                             Err(e) => {
                                 l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
                                 planner.on_finish(i);
@@ -1327,7 +1389,7 @@ fn scheduler(
                     .filter_map(|(k, &i)| {
                         let l = &lanes[i];
                         let a = l.job.as_ref().unwrap();
-                        (!a.job.out.cancelled() && a.sampler.uses_gpu_gumbel()).then(|| {
+                        (!a.job.out.cancelled() && a.uses_gpu_gumbel()).then(|| {
                             let next_pos = a.n_past + 1;
                             crate::engine::GumbelSpan {
                                 span_idx: k,
@@ -1374,13 +1436,13 @@ fn scheduler(
                     if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
                         let _ = planner.request_cancel(i);
                     } else {
-                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                        let sampled = if a.uses_gpu_gumbel() {
                             eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
-                            a.sampler.sample_next_with_ban_and_softcap(&eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                            a.sample_cpu_token(&eng.span_logits(k), eng.effective_sampler_softcap(k), &sp, &vocab_bytes)
                         };
                         match sampled {
-                            Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
+                            Ok(tok) => a.commit_sampled_token(tok, &sp, &vocab_bytes, tk.eos),
                             Err(e) => {
                                 l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
                                 planner.on_finish(i);
@@ -2498,6 +2560,11 @@ impl Drop for ConnectionSlot {
     }
 }
 const PREPROCESS_LIMIT: usize = 4;
+
+#[inline]
+fn generation_preprocess_limit(effective_lanes: usize) -> usize {
+    effective_lanes.max(PREPROCESS_LIMIT)
+}
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -2828,7 +2895,8 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         h
     });
     let (tx, rx) = job_events();
-    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit)
+        .with_tool_catalog(crate::json_grammar::ToolCatalog::from_request(req));
     if enqueue(cx, job).is_err() {
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
@@ -3055,7 +3123,8 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         h
     };
     let (tx, rx) = job_events();
-    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit)
+        .with_tool_catalog(crate::json_grammar::ToolCatalog::from_request(req));
     if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     record_delivery(cx, req, card_id, "/v1/messages", req_start, prompt_len, |turn| {
         messages_stream_or_reply(cx, req, seq, prompt_len, rx, s, turn)
@@ -3523,7 +3592,7 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission,
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder, spill_telemetry: spill_telemetry.clone() });
+        preprocess: PermitPool::new(generation_preprocess_limit(effective_lanes)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder, spill_telemetry: spill_telemetry.clone() });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -3985,6 +4054,105 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("input_tokens"));
         drop(generation);
+    }
+
+    #[test]
+    fn count_tokens_flood_never_starves_concurrent_chat_or_messages_preprocessing() {
+        let (cx, jobs) = admission_test_ctx_with(8, 8, Duration::from_secs(2), generation_preprocess_limit(8));
+        let cx = Arc::new(cx);
+        let worker_tk = cx.tk.clone();
+        let worker_sp = cx.sp;
+        // Fake scheduler responder that drains all 8 generation jobs cleanly.
+        let sched = std::thread::spawn(move || {
+            let reply = [worker_sp.msg_model, worker_sp.c_text, worker_tk.encode("ok", false)[0], worker_sp.end, worker_sp.end_sampling];
+            for _ in 0..8 {
+                let job = jobs.recv_timeout(Duration::from_secs(5)).expect("generation job arrived");
+                for &tok in &reply {
+                    job.out.send(Ev::Tok(tok)).unwrap();
+                }
+                job.out.send(Ev::Done {
+                    prompt: job.toks.len(),
+                    cached: 0,
+                    gen: reply.len(),
+                    reason: "stop",
+                    timing: Default::default(),
+                }).unwrap();
+            }
+        });
+
+        // Hold `count_preprocess` busy while firing 16 concurrent `/v1/messages/count_tokens` requests
+        // alongside 4 `/v1/chat/completions` and 4 `/v1/messages` generation requests!
+        let held_count = cx.count_preprocess.acquire().unwrap();
+        let start_barrier = Arc::new(std::sync::Barrier::new(1 + 16 + 8));
+        let count_429s = Arc::new(AtomicUsize::new(0));
+        let gen_200s = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let cx = cx.clone();
+                let bar = start_barrier.clone();
+                let count_429s = count_429s.clone();
+                scope.spawn(move || {
+                    let req = json_request("/v1/messages/count_tokens", r#"{"messages":[{"role":"user","content":"count me"}]}"#);
+                    bar.wait();
+                    let resp = http_test_exchange(&cx, req.as_bytes());
+                    if resp.starts_with("HTTP/1.1 429") {
+                        count_429s.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            for idx in 0..8 {
+                let cx = cx.clone();
+                let bar = start_barrier.clone();
+                let gen_200s = gen_200s.clone();
+                scope.spawn(move || {
+                    let req = if idx % 2 == 0 {
+                        json_request("/v1/chat/completions", r#"{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#)
+                    } else {
+                        json_request("/v1/messages", r#"{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#)
+                    };
+                    bar.wait();
+                    let resp = http_test_exchange(&cx, req.as_bytes());
+                    assert!(resp.starts_with("HTTP/1.1 200"), "generation request {idx} starved by count_tokens flood: {resp}");
+                    gen_200s.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            start_barrier.wait();
+        });
+
+        drop(held_count);
+        sched.join().unwrap();
+        assert_eq!(count_429s.load(Ordering::Relaxed), 16, "all 16 flooded count_tokens requests should hit 429 while count slot is held");
+        assert_eq!(gen_200s.load(Ordering::Relaxed), 8, "all 8 concurrent generation requests must succeed with 200 OK");
+    }
+
+    #[test]
+    fn generation_preprocess_pool_scales_above_four_lanes() {
+        assert_eq!(generation_preprocess_limit(1), 4);
+        assert_eq!(generation_preprocess_limit(4), 4);
+        assert_eq!(generation_preprocess_limit(8), 8);
+        assert_eq!(generation_preprocess_limit(64), 64);
+
+        let (cx, jobs) = admission_test_ctx_with(12, 4, Duration::from_secs(1), generation_preprocess_limit(8));
+        let permits: Vec<Permit> = (0..8)
+            .map(|i| cx.preprocess.acquire().unwrap_or_else(|| panic!("expected permit {i} for 8-lane pool")))
+            .collect();
+        assert_eq!(permits.len(), 8);
+        assert!(cx.preprocess.acquire().is_none(), "9th concurrent generation preprocess must hit limit=8");
+
+        // Extra generation request hits 429 PREPROCESS_BUSY and returns its lane admission permit cleanly.
+        let gen_req = json_request("/v1/chat/completions", r#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#);
+        let gen_resp = http_test_exchange(&cx, gen_req.as_bytes());
+        assert!(gen_resp.starts_with("HTTP/1.1 429"), "got: {gen_resp}");
+        assert!(gen_resp.contains(PREPROCESS_BUSY), "got: {gen_resp}");
+        assert_eq!(cx.admission.inflight(), 0, "rejected render must release its lane permit");
+
+        // Independent count_tokens still succeeds while all 8 generation preprocess permits are held.
+        let count_req = json_request("/v1/messages/count_tokens", r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        let count_resp = http_test_exchange(&cx, count_req.as_bytes());
+        assert!(count_resp.starts_with("HTTP/1.1 200"), "got: {count_resp}");
+        drop(permits);
+        assert!(jobs.try_recv().is_err());
     }
 
     #[test]
@@ -5094,6 +5262,7 @@ mod tests {
                     sampler,
                     draft_sampler,
                     think: ThinkBudget::new(0),
+                    tool_grammar: None,
                     pending: None,
                 };
                 assert_eq!(a.step_input(true).needs_decode(), want > 0.0);
@@ -6350,6 +6519,7 @@ mod tests {
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
             think: ThinkBudget::new(0),
+            tool_grammar: None,
             pending: Some(42),
         };
 
@@ -6492,6 +6662,7 @@ mod tests {
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
             think: ThinkBudget::new(0),
+            tool_grammar: None,
             pending: Some(7),
         };
 
@@ -7243,5 +7414,417 @@ mod tests {
         cache2.release_lane(&mut pools2, &mut tbl_d, &mut st_d);
         cache2.release_lane(&mut pools2, &mut tbl_pin, &mut st_pin);
         cache2.shutdown(&mut pools2);
+    }
+
+    #[test]
+    fn tool_grammar_switches_active_lane_between_gpu_gumbel_and_masked_cpu_sampling() {
+        let tk = Tokenizer::for_byte_test();
+        let sp = test_sp(&tk);
+        let vocab = crate::json_grammar::VocabBytes::from_tokenizer(&tk);
+        let (cx, _) = admission_test_ctx(1);
+        let permit = cx.admission.try_acquire().unwrap();
+        let (out, _events) = job_events();
+        let req = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"host": {"type": "string"}},
+                        "required": ["host"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        });
+        let catalog = crate::json_grammar::ToolCatalog::from_request(&req).unwrap();
+        let job = Job::new(1, Instant::now(), vec![sp.msg_user, sp.end], 64, 1.0, 0, 1.0, 7, 0, 0.0, out, permit)
+            .with_tool_catalog(Some(catalog.clone()));
+        let mut active = Active {
+            pf_end: 2,
+            n_past: 2,
+            cached: 0,
+            gen: 0,
+            restoring_target: None,
+            timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
+            sampler: Sampler::new(1.0, 0, 1.0, 0.0, 7),
+            draft_sampler: Sampler::draft(1.0, 0, 1.0, 0.0, 7),
+            think: ThinkBudget::new(0),
+            tool_grammar: Some(crate::json_grammar::ToolCallGrammar::new(catalog)),
+            pending: None,
+            job,
+        };
+
+        // Normal model header / thinking / text keeps GPU Gumbel active (`top_p == 1.0, top_k == 0`).
+        assert!(active.uses_gpu_gumbel());
+        active.commit_sampled_token(sp.msg_model, &sp, &vocab, tk.eos);
+        for tok in tk.encode("ping", false) {
+            active.commit_sampled_token(tok, &sp, &vocab, tk.eos);
+        }
+        assert!(active.uses_gpu_gumbel(), "header before <|content_invoke_tool_json|> keeps GPU Gumbel");
+
+        // Entering `<|content_invoke_tool_json|>` switches the lane to masked CPU sampling.
+        active.commit_sampled_token(sp.c_tool, &sp, &vocab, tk.eos);
+        assert!(!active.uses_gpu_gumbel(), "active JSON tool span must bypass unmasked GPU Gumbel");
+
+        // Even when premature `<|end_message|>` and `}` have huge logits, CPU masked sampling picks `{`.
+        let mut logits = vec![-5.0f32; tk.vocab_len()];
+        logits[sp.end as usize] = 50.0;
+        let close_brace = tk.encode("}", false)[0];
+        let open_brace = tk.encode("{", false)[0];
+        logits[close_brace as usize] = 40.0;
+        logits[open_brace as usize] = 5.0;
+        let first = active.sample_cpu_token(&logits, 0.0, &sp, &vocab).unwrap();
+        assert_eq!(first, open_brace);
+        active.commit_sampled_token(first, &sp, &vocab, tk.eos);
+
+        // Advance valid tool payload `"args":{"host":"a"}}` and verify `<|end_message|>` unlocks and restores GPU Gumbel.
+        for tok in tk.encode(r#""args":{"host":"a"}}"#, false) {
+            active.commit_sampled_token(tok, &sp, &vocab, tk.eos);
+        }
+        let end_picked = active.sample_cpu_token(&logits, 0.0, &sp, &vocab).unwrap();
+        assert_eq!(end_picked, sp.end);
+        active.commit_sampled_token(end_picked, &sp, &vocab, tk.eos);
+        assert!(active.uses_gpu_gumbel(), "GPU Gumbel must resume immediately after <|end_message|>");
+    }
+
+    #[test]
+    fn multipart_assistant_with_empty_parts_and_following_user_turn_preserves_exact_history_tokens() {
+        let tk = Tokenizer::for_byte_test();
+        let sp = test_sp(&tk);
+        let req = json!({
+            "messages": [
+                {"role": "system", "content": "Follow repository conventions."},
+                {"role": "user", "content": "Inspect the project."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Let me read Cargo.toml first.",
+                    "content": [
+                        {"type": "text", "text": "Checking manifest."},
+                        {"type": "text", "text": ""},
+                        {"type": "input_text", "text": "Now invoking read_file."}
+                    ],
+                    "tool_calls": [{
+                        "id": "call_hist_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"Cargo.toml\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_hist_1", "name": "read_file", "content": "[package]\nname = \"inky\""},
+                {"role": "assistant", "content": ["", {"type": "text", "text": "Package is inky."}]},
+                {"role": "user", "content": "What should we test next?"}
+            ]
+        });
+        let golden = concat!(
+            "<|message_system|><|content_text|>Follow repository conventions.<|end_message|>",
+            "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|>",
+            "<|message_user|><|content_text|>Inspect the project.<|end_message|>",
+            "<|message_model|><|content_thinking|>Let me read Cargo.toml first.<|end_message|>",
+            "<|message_model|><|content_text|>Checking manifest.<|end_message|>",
+            "<|message_model|><|content_text|><|end_message|>",
+            "<|message_model|><|content_text|>Now invoking read_file.<|end_message|>",
+            "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}}<|end_message|>",
+            "<|content_model_end_sampling|>",
+            "<|message_tool|>read_file<|content_text|>[package]\nname = \"inky\"<|end_message|>",
+            "<|message_model|><|content_text|><|end_message|>",
+            "<|message_model|><|content_text|>Package is inky.<|end_message|>",
+            "<|content_model_end_sampling|>",
+            "<|message_user|><|content_text|>What should we test next?<|end_message|>"
+        );
+        assert_eq!(render(&tk, &sp, &req, "low").unwrap(), tk.encode(golden, true));
+    }
+
+    #[test]
+    #[ignore = "requires local Inkling-2-Mini GGUF model to read embedded tokenizer.chat_template"]
+    fn gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token() {
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
+            "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf".to_string()
+        });
+        assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
+        let g = crate::gguf::Gguf::open(&model).expect("open GGUF");
+        let Some(crate::gguf::Value::S(chat_template)) = g.kv.get("tokenizer.chat_template") else {
+            panic!("missing tokenizer.chat_template in GGUF");
+        };
+        for required_marker in [
+            "<|message_system|>",
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|message_tool|>",
+            "<|content_text|>",
+            "<|content_thinking|>",
+            "<|content_invoke_tool_json|>",
+            "<|end_message|>",
+            "<|content_model_end_sampling|>",
+            "tool_declare",
+            "Thinking effort level:",
+        ] {
+            assert!(
+                chat_template.contains(required_marker),
+                "GGUF tokenizer.chat_template missing expected marker {required_marker:?}"
+            );
+        }
+
+        let tk = Tokenizer::load(&g);
+        let sp = test_sp(&tk);
+
+        let cases = vec![
+            (
+                "multipart_assistant_and_followup_user",
+                "high",
+                json!({
+                    "messages": [
+                        {"role": "system", "content": "Be exact."},
+                        {"role": "user", "content": "Give two notes."},
+                        {"role": "assistant", "content": [
+                            {"type": "text", "text": "First note."},
+                            {"type": "text", "text": ""},
+                            {"type": "text", "text": "Second note."}
+                        ]},
+                        {"role": "user", "content": "Add a third note."}
+                    ]
+                }),
+                concat!(
+                    "<|message_system|><|content_text|>Be exact.<|end_message|>",
+                    "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+                    "<|message_user|><|content_text|>Give two notes.<|end_message|>",
+                    "<|message_model|><|content_text|>First note.<|end_message|>",
+                    "<|message_model|><|content_text|><|end_message|>",
+                    "<|message_model|><|content_text|>Second note.<|end_message|>",
+                    "<|content_model_end_sampling|>",
+                    "<|message_user|><|content_text|>Add a third note.<|end_message|>"
+                ),
+            ),
+            (
+                "multi_turn_tool_history_verbatim",
+                "medium",
+                json!({
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Look up weather.",
+                            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+                        }
+                    }],
+                    "messages": [
+                        {"role": "user", "content": "Weather in Boston?"},
+                        {
+                            "role": "assistant",
+                            "reasoning_content": "Need weather tool.",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"city\":\"Boston\"}"}
+                            }]
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "name": "get_weather", "content": "{\"temp_f\":58}"},
+                        {"role": "assistant", "content": "It is 58F in Boston."},
+                        {"role": "user", "content": "And tomorrow?"}
+                    ]
+                }),
+                concat!(
+                    "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Look up weather.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|>",
+                    "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|>",
+                    "<|message_user|><|content_text|>Weather in Boston?<|end_message|>",
+                    "<|message_model|><|content_thinking|>Need weather tool.<|end_message|>",
+                    "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Boston\"}}<|end_message|>",
+                    "<|content_model_end_sampling|>",
+                    "<|message_tool|>get_weather<|content_text|>{\"temp_f\":58}<|end_message|>",
+                    "<|message_model|><|content_text|>It is 58F in Boston.<|end_message|>",
+                    "<|content_model_end_sampling|>",
+                    "<|message_user|><|content_text|>And tomorrow?<|end_message|>"
+                ),
+            ),
+        ];
+
+        for (label, effort, req, expected_rendered_text) in cases {
+            let got_tokens = render(&tk, &sp, &req, effort).unwrap();
+            let want_tokens = tk.encode(expected_rendered_text, true);
+            assert_eq!(got_tokens, want_tokens, "token-ID mismatch for {label}");
+        }
+    }
+
+    #[test]
+    fn bimodal_2k_and_64k_tight_pool_with_mid_step_disconnects_drains_cleanly() {
+        use crate::blocks::{BlockKind, BlockPools, BlockTable, BLOCK};
+        use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        const SHORT: usize = 2 * 1024;  // 32 Full blocks + 16 Window blocks
+        const LONG: usize = 64 * 1024;  // 1,024 Full blocks + 16 Window blocks
+        // Tight pool: 1,040 Full slots fits LONG (1,024) alone OR several SHORT (32) requests,
+        // NEVER LONG + SHORT simultaneously (`1,024 + 32 = 1,056 > 1,040`), while 48 Window slots
+        // require active sliding-window pruning across LONG's 64K prefill!
+        let mut pools = BlockPools::with_capacities(1_040, 48, 1).unwrap();
+        let mut cache = ServeBlockCache::new();
+        let mut planner = ServeStepPlanner::new(3, SERVE_STEP_MAX_BYPASS);
+        let metrics = Mutex::new(Counters::new(Instant::now()));
+        let (_jtx, jrx) = channel::<Job>();
+        let mut queue: VecDeque<QueuedJob> = VecDeque::new();
+        let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
+
+        let prompt_long_victim: Vec<u32> = (0..LONG as u32).map(|i| 100_000 + i).collect();
+        let prompt_short_a: Vec<u32> = (0..SHORT as u32).map(|i| 200_000 + i).collect();
+        let prompt_long_survivor: Vec<u32> = (0..LONG as u32).map(|i| 300_000 + i).collect();
+        let prompt_short_waiter: Vec<u32> = (0..SHORT as u32).map(|i| 400_000 + i).collect();
+
+        let mk_active = |seq: u64, toks: Vec<u32>, max: usize| -> (Active, JobEvents) {
+            let pf_end = toks.len();
+            let (out, ev) = job_events();
+            let job = Job::new(seq, Instant::now(), toks, max, 0.0, 1, 1.0, seq, 0, 0.0, out, admission.try_acquire().unwrap());
+            let act = Active {
+                pf_end,
+                n_past: 0,
+                cached: 0,
+                gen: 0,
+                restoring_target: None,
+                timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
+                sampler: Sampler::new(0.0, 1, 1.0, 0.0, seq),
+                draft_sampler: Sampler::draft(0.0, 1, 1.0, 0.0, seq),
+                think: ThinkBudget::new(0),
+                tool_grammar: None,
+                pending: None,
+                job,
+            };
+            (act, ev)
+        };
+
+        let mut tbls = [
+            BlockTable::new(1088).unwrap(),
+            BlockTable::new(1088).unwrap(),
+            BlockTable::new(1088).unwrap(),
+        ];
+        let mut blocks = [
+            LaneBlockState::default(),
+            LaneBlockState::default(),
+            LaneBlockState::default(),
+        ];
+
+        // Phase A: Admit 64K victim on Lane 0 and waiting 2K client on Lane 1 (`pool_deferred` once 64K fills pool).
+        // Disconnect BOTH mid-step (Lane 0 `InStep -> Cancelling`, Lane 1 `Ready -> waiting_cancelled`)!
+        let (act0, ev0) = mk_active(1, prompt_long_victim, 4);
+        let (act1, ev1) = mk_active(2, prompt_short_waiter, 4);
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[0], &mut blocks[0], &act0.job.toks).is_none());
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[1], &mut blocks[1], &act1.job.toks).is_none());
+        planner.on_admit(0);
+        planner.on_admit(1);
+        let mut jobs: [Option<Active>; 3] = [Some(act0), Some(act1), None];
+
+        // Step 64K Lane 0 past 4,096 tokens (exercising sliding-window block pruning), then drop BOTH clients mid-step!
+        while jobs[0].as_ref().unwrap().n_past < 4_096 {
+            let np0 = jobs[0].as_ref().unwrap().n_past;
+            let pf0 = effective_pf_target(np0, LONG).min(window_span_end(np0, 48));
+            let inputs = [
+                ServeLaneInput { runnable: true, n_past: np0, pf_end: pf0, has_pending_decode: false },
+                ServeLaneInput { runnable: false, n_past: 0, pf_end: SHORT, has_pending_decode: false },
+                ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
+            ];
+            let Some(ServeStepPlan::Prefill(sps)) = planner.plan_and_begin_step(&inputs, 1024, BLOCK) else {
+                panic!("expected prefill step for 64K lane 0");
+            };
+            assert_eq!(sps.len(), 1);
+            let (i, p0, t) = sps[0];
+            cache.ensure_span_blocks(&mut pools, &mut tbls[i], p0, t).unwrap();
+            if p0 >= 3_072 {
+                // Mid-step client disconnects: Lane 0 is `InStep`, Lane 1 is `Ready`!
+                drop(ev0);
+                drop(ev1);
+                let waiting_cancelled = overlap_host_work_step(
+                    &jrx,
+                    &mut queue,
+                    jobs.iter().enumerate().map(|(idx, j)| (idx, j.as_ref())),
+                    &mut planner,
+                    &mut cache,
+                    &metrics,
+                );
+                assert_eq!(planner.state(0), LaneState::Cancelling, "InStep lane must hold pins in Cancelling until complete_step");
+                assert_eq!(waiting_cancelled, vec![1]);
+                cache.finish_prefill_span(&mut pools, &mut tbls[0], &mut blocks[0], &jobs[0].as_ref().unwrap().job.toks, p0, t, || vec![3u8; 16]);
+                let cancelled_after_step = planner.complete_step();
+                assert_eq!(cancelled_after_step, vec![0]);
+                cache.release_lane(&mut pools, &mut tbls[0], &mut blocks[0]);
+                jobs[0] = None;
+                assert!(planner.request_cancel(1));
+                cache.release_lane(&mut pools, &mut tbls[1], &mut blocks[1]);
+                jobs[1] = None;
+                break;
+            }
+            cache.finish_prefill_span(&mut pools, &mut tbls[i], &mut blocks[i], &jobs[i].as_ref().unwrap().job.toks, p0, t, || vec![3u8; 16]);
+            jobs[i].as_mut().unwrap().n_past = p0 + t;
+            assert!(planner.complete_step().is_empty());
+        }
+
+        // Phase B: Verify zero leaked slots (`free_plus_evictable == capacity`), then drive surviving
+        // 2K (`Lane 0`) + 64K (`Lane 2`) bimodal workload to full completion under the 1,040-slot cap!
+        assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Full), 1_040);
+        assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Window), 48);
+
+        let (short_surv, _ev_short) = mk_active(3, prompt_short_a, 2);
+        let (long_surv, _ev_long) = mk_active(4, prompt_long_survivor, 2);
+        // Tight admission check: 2K admits first; 64K cannot co-admit until 2K finishes and releases!
+        assert!(cache.can_admit(&pools, &[], 0, &short_surv.job.toks, 2, 1024));
+        let active_short = [InflightLaneReserve {
+            lane: 0,
+            toks: &short_surv.job.toks,
+            block_hashes: Some(&short_surv.job.block_hashes),
+            n_past: 0,
+            pf_end: SHORT,
+            cached: 0,
+            written: 0,
+            gen: 0,
+            max_gen: 2,
+            runnable: true,
+        }];
+        assert!(!cache.can_admit(&pools, &active_short, 2, &long_surv.job.toks, 2, 1024));
+
+        // Complete 2K request (`SHORT = 2,048` + 2 decode steps), release, then admit and complete full 64K request (`LONG = 65,536` + 2 decode steps)!
+        for (lane_idx, mut act) in [(0usize, short_surv), (2usize, long_surv)] {
+            assert!(cache.can_admit(&pools, &[], lane_idx, &act.job.toks, 2, 1024));
+            assert!(cache.match_and_bind(&mut pools, &mut tbls[lane_idx], &mut blocks[lane_idx], &act.job.toks).is_none());
+            planner.on_admit(lane_idx);
+            while act.gen < 2 {
+                let target = if act.n_past < act.pf_end {
+                    effective_pf_target(act.n_past, act.pf_end).min(window_span_end(act.n_past, 48))
+                } else {
+                    act.pf_end
+                };
+                let mut inputs = [ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false }; 3];
+                inputs[lane_idx] = ServeLaneInput {
+                    runnable: true,
+                    n_past: act.n_past,
+                    pf_end: target,
+                    has_pending_decode: act.n_past >= act.pf_end,
+                };
+                match planner.plan_and_begin_step(&inputs, 2048, BLOCK).unwrap() {
+                    ServeStepPlan::Prefill(sps) => {
+                        for (i, p0, t) in sps {
+                            cache.ensure_span_blocks(&mut pools, &mut tbls[i], p0, t).unwrap();
+                            cache.finish_prefill_span(&mut pools, &mut tbls[i], &mut blocks[i], &act.job.toks, p0, t, || vec![5u8; 16]);
+                            act.n_past = p0 + t;
+                            if act.n_past == act.pf_end {
+                                act.gen = 1;
+                            }
+                        }
+                    }
+                    ServeStepPlan::Decode(decs) => {
+                        for i in decs {
+                            cache.ensure_span_blocks(&mut pools, &mut tbls[i], act.n_past, 1).unwrap();
+                            cache.finish_decode_span(&mut pools, &mut tbls[i], &mut blocks[i], act.n_past);
+                            act.n_past += 1;
+                            act.gen += 1;
+                        }
+                    }
+                }
+                assert!(planner.complete_step().is_empty());
+            }
+            planner.on_finish(lane_idx);
+            cache.release_lane(&mut pools, &mut tbls[lane_idx], &mut blocks[lane_idx]);
+        }
+
+        assert!(cache.stats().window_pruned >= 1_000, "64K prefill must prune expired sliding-window blocks");
+        assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Full), 1_040);
+        assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Window), 48);
+        cache.shutdown(&mut pools);
     }
 }

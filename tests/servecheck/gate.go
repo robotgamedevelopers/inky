@@ -335,6 +335,90 @@ func (g *gate) concurrentToolCalls() error {
 	return nil
 }
 
+func (g *gate) toolGrammarConstrainedSampling() error {
+	ctx, cancel := context.WithTimeout(g.ctx, 90*time.Second)
+	defer cancel()
+	for _, seed := range []int{4242, 4243, 4244, 4245} {
+		stream := seed%2 == 1
+		payload := map[string]any{
+			"messages": []map[string]string{
+				{
+					"role":    "system",
+					"content": "You are a weather tool caller. Always call forecast_weather immediately with the city and integer number of days requested by the user.",
+				},
+				{
+					"role":    "user",
+					"content": "Fetch the 5-day forecast for Tokyo, Japan using forecast_weather now.",
+				},
+			},
+			"tools": []map[string]any{
+				{
+					"type": "function",
+					"function": map[string]any{
+						"name":        "forecast_weather",
+						"description": "Fetch multi-day weather forecast for a city.",
+						"parameters": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"city":  map[string]any{"type": "string"},
+								"days":  map[string]any{"type": "integer"},
+								"units": map[string]any{"type": "string"},
+							},
+							"required":             []string{"city", "days"},
+							"additionalProperties": false,
+						},
+					},
+				},
+			},
+			"max_tokens":       256,
+			"thinking_budget":  8,
+			"seed":             seed,
+			"temperature":      1.0,
+			"top_p":            0.95,
+			"top_k":            64,
+			"reasoning_effort": "none",
+			"stream":           stream,
+		}
+		rawBody, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		sample, err := g.sampleToolReply(ctx, string(rawBody), stream)
+		if err != nil {
+			return fmt.Errorf("seed %d (stream=%v): %w", seed, stream, err)
+		}
+		if sample.Finish != "tool_calls" || len(sample.ToolCalls) == 0 {
+			return fmt.Errorf("seed %d: expected tool_calls finish, got finish=%q calls=%d content=%q",
+				seed, sample.Finish, len(sample.ToolCalls), sample.Content)
+		}
+		for callIdx, tc := range sample.ToolCalls {
+			if tc.Function.Name != "forecast_weather" {
+				return fmt.Errorf("seed %d call %d: got name %q, want forecast_weather", seed, callIdx, tc.Function.Name)
+			}
+			args, err := parseToolArgsObject(tc.Function.Arguments)
+			if err != nil {
+				return fmt.Errorf("seed %d call %d: %w", seed, callIdx, err)
+			}
+			city, ok := args["city"].(string)
+			if !ok || city == "" {
+				return fmt.Errorf("seed %d call %d: expected non-empty string city in %v", seed, callIdx, args)
+			}
+			daysRaw, hasDays := args["days"]
+			daysFloat, ok := daysRaw.(float64)
+			if !hasDays || !ok || daysFloat != float64(int64(daysFloat)) {
+				return fmt.Errorf("seed %d call %d: expected integer days in %v", seed, callIdx, args)
+			}
+			for k := range args {
+				if k != "city" && k != "days" && k != "units" {
+					return fmt.Errorf("seed %d call %d: unexpected additional property %q in %v", seed, callIdx, k, args)
+				}
+			}
+		}
+	}
+	_, err := g.waitHealthDrained(5 * time.Second)
+	return err
+}
+
 func verifyDisconnectMidThinking(logBytes []byte, maxTokens int, drained healthSnapshot, ref, followUp replySample) error {
 	if err := checkFreed(logBytes, false, maxTokens); err != nil {
 		return err

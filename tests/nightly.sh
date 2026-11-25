@@ -49,4 +49,11 @@ else
     fail=1
 fi
 print -r -- "$spill_result"
+# Verify live `inky serve --spill-dir` SIGKILL mid-spill-write recovery and SSD HTTP parity.
+if spill_kill_out=$(cargo test --locked --release --test spill_http_m5 m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs -- --ignored --exact --nocapture 2>&1); then
+    grep -Fq 'test result: ok. 1 passed;' <<< "$spill_kill_out" || fail=1
+else
+    fail=1
+fi
+print -r -- "$spill_kill_out"
 exit $fail

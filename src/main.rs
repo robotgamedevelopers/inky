@@ -5,6 +5,7 @@ mod cache_trace;
 mod blockbook;
 mod engine;
 mod gguf;
+mod json_grammar;
 #[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
 mod prefix;
 mod metal;
@@ -1515,6 +1516,7 @@ fn temp1(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(4);
+    eng.init_serve_block_pools(2u64 << 30, 4);
     let base: Vec<u32> = std::fs::read_to_string(&o.reference)
         .expect("--ref FILE.tokens")
         .lines()
@@ -1781,6 +1783,279 @@ fn temp1(o: &Opts) {
                 );
             }
             ok &= seed_ok;
+
+            // 3. Layer 3/4 `ServeBlockCache` + `Lane::new_blocked` + `BlockPools` + `ServeStepPlanner`:
+            // proves `temperature=1.0` fixed-seed outputs match uncached solo bit-for-bit WITH the
+            // production paged `ServeBlockCache` (not only `copy_lane_prefix`).
+            let mut sbc = serve::block_cache::ServeBlockCache::new();
+            {
+                let warm_lane = Lane::new_blocked(&eng, o.ctx);
+                let mut warm_blocks = serve::block_cache::LaneBlockState::default();
+                eng.on(&warm_lane).reset();
+                {
+                    let mut pools = eng.block_pool().borrow_mut();
+                    let mut tbl = warm_lane.block_table().borrow_mut();
+                    let _ = sbc.match_and_bind(&mut pools, &mut tbl, &mut warm_blocks, &prompts[0][..head + 1]);
+                }
+                eng.on(&warm_lane).set_tokens(0, &prompts[0][..head + 1]);
+                let mut p = 0usize;
+                for &c in &[128usize, 256] {
+                    {
+                        let mut pools = eng.block_pool().borrow_mut();
+                        let mut tbl = warm_lane.block_table().borrow_mut();
+                        sbc.ensure_span_blocks(&mut pools, &mut tbl, p, c).expect("warm ensure_span_blocks");
+                    }
+                    eng.poison_scratch();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_spans_logits(&cb, &[Span { lane: &warm_lane, p0: p, t: c }], &[false], false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    {
+                        let mut pools = eng.block_pool().borrow_mut();
+                        let mut tbl = warm_lane.block_table().borrow_mut();
+                        sbc.finish_prefill_span(
+                            &mut pools,
+                            &mut tbl,
+                            &mut warm_blocks,
+                            &prompts[0][..head + 1],
+                            p,
+                            c,
+                            || eng.on(&warm_lane).get_cs(),
+                        );
+                    }
+                    p += c;
+                }
+                let mut pools = eng.block_pool().borrow_mut();
+                let mut tbl = warm_lane.block_table().borrow_mut();
+                sbc.release_lane(&mut pools, &mut tbl, &mut warm_blocks);
+            }
+
+            struct BlockedReq {
+                lane: Lane,
+                blocks: serve::block_cache::LaneBlockState,
+                prompt: Vec<u32>,
+                n_past: usize,
+                pf_end: usize,
+                seed: u64,
+                sampler: Sampler,
+                toks: Vec<u32>,
+            }
+            let mut breqs: Vec<BlockedReq> = prompts
+                .iter()
+                .enumerate()
+                .map(|(idx, prompt)| {
+                    let req_seed = seed.wrapping_add((idx as u64) * 0x9E37_79B9);
+                    let l = Lane::new_blocked(&eng, o.ctx);
+                    let mut blocks = serve::block_cache::LaneBlockState::default();
+                    eng.on(&l).reset();
+                    let matched = {
+                        let mut pools = eng.block_pool().borrow_mut();
+                        let mut tbl = l.block_table().borrow_mut();
+                        sbc.match_and_bind(&mut pools, &mut tbl, &mut blocks, prompt)
+                    };
+                    let start = match matched {
+                        Some((m, cs)) => {
+                            assert_eq!(idx < 2, true, "cold prompt {idx} unexpectedly matched cache");
+                            assert_eq!(m, head, "ServeBlockCache must match exact {head}-token head");
+                            if !(sabotage && idx == 1) {
+                                eng.on(&l).set_cs(&cs);
+                            }
+                            m
+                        }
+                        None => {
+                            assert_eq!(idx, 2, "prefix-sharing prompt {idx} missed ServeBlockCache");
+                            0
+                        }
+                    };
+                    eng.on(&l).set_tokens(0, prompt);
+                    BlockedReq {
+                        lane: l,
+                        blocks,
+                        prompt: prompt.clone(),
+                        n_past: start,
+                        pf_end: prompt.len(),
+                        seed: req_seed,
+                        sampler: Sampler::new(1.0, 0, top_p, eng.softcap, req_seed),
+                        toks: Vec::with_capacity(ndec),
+                    }
+                })
+                .collect();
+
+            let mut bplanner = ServeStepPlanner::new(breqs.len(), 2);
+            for i in 0..breqs.len() {
+                bplanner.on_admit(i);
+            }
+            while breqs.iter().any(|r| r.toks.len() < ndec) {
+                let inputs: Vec<ServeLaneInput> = breqs
+                    .iter()
+                    .map(|r| ServeLaneInput {
+                        runnable: r.toks.len() < ndec,
+                        n_past: r.n_past,
+                        pf_end: r.pf_end,
+                        has_pending_decode: !r.toks.is_empty() && r.n_past < r.pf_end + r.toks.len(),
+                    })
+                    .collect();
+                let plan = bplanner
+                    .plan_and_begin_step(&inputs, 256, 64)
+                    .expect("temp1 ServeBlockCache planner must make progress");
+                match plan {
+                    ServeStepPlan::Prefill(sp_list) => {
+                        {
+                            let mut pools = eng.block_pool().borrow_mut();
+                            for &(i, p0, t) in &sp_list {
+                                let mut tbl = breqs[i].lane.block_table().borrow_mut();
+                                sbc.ensure_span_blocks(&mut pools, &mut tbl, p0, t).expect("blocked pf ensure_span_blocks");
+                            }
+                        }
+                        let spans: Vec<Span> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| Span { lane: &breqs[i].lane, p0, t })
+                            .collect();
+                        let want_logits: Vec<bool> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| p0 + t == breqs[i].pf_end)
+                            .collect();
+                        let many = spans.len() > 1;
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_spans_logits(&cb, &spans, &want_logits, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        {
+                            let mut pools = eng.block_pool().borrow_mut();
+                            for &(i, p0, t) in &sp_list {
+                                let r = &mut breqs[i];
+                                let mut tbl = r.lane.block_table().borrow_mut();
+                                sbc.finish_prefill_span(
+                                    &mut pools,
+                                    &mut tbl,
+                                    &mut r.blocks,
+                                    &r.prompt,
+                                    p0,
+                                    t,
+                                    || eng.on(&r.lane).get_cs(),
+                                );
+                            }
+                        }
+                        let mut gpu_pf = Vec::new();
+                        for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
+                            breqs[i].n_past = p0 + t;
+                            if breqs[i].n_past == breqs[i].pf_end {
+                                if breqs[i].sampler.uses_gpu_gumbel() {
+                                    gpu_pf.push((k, i));
+                                } else {
+                                    let lg = if many { eng.span_logits(k) } else { eng.logits() };
+                                    let tok = breqs[i].sampler.sample_next(&lg).expect("blocked pf sample");
+                                    breqs[i].toks.push(tok);
+                                }
+                            }
+                        }
+                        if !gpu_pf.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_pf {
+                                let p = breqs[i].n_past;
+                                if many {
+                                    eng.encode_gumbel_span(&gcb, k, &breqs[i].lane, p, breqs[i].seed, p, 1.0, None);
+                                } else {
+                                    eng.encode_gumbel_solo(&gcb, &breqs[i].lane, p, breqs[i].seed, p, 1.0, None);
+                                }
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                            for &(_, i) in &gpu_pf {
+                                let p = breqs[i].n_past;
+                                let tok = eng.on(&breqs[i].lane).sampled_token_at(p).expect("valid GPU sample");
+                                breqs[i].toks.push(tok);
+                            }
+                        }
+                    }
+                    ServeStepPlan::Decode(dec_lanes) => {
+                        {
+                            let mut pools = eng.block_pool().borrow_mut();
+                            for &i in &dec_lanes {
+                                let pos = breqs[i].n_past;
+                                let mut tbl = breqs[i].lane.block_table().borrow_mut();
+                                sbc.ensure_span_blocks(&mut pools, &mut tbl, pos, 1).expect("blocked dec ensure_span_blocks");
+                            }
+                        }
+                        for &i in &dec_lanes {
+                            let tok = *breqs[i].toks.last().unwrap();
+                            eng.on(&breqs[i].lane).set_tokens(breqs[i].n_past, &[tok]);
+                        }
+                        let spans: Vec<Span> = dec_lanes
+                            .iter()
+                            .map(|&i| Span { lane: &breqs[i].lane, p0: breqs[i].n_past, t: 1 })
+                            .collect();
+                        eng.poison_scratch();
+                        let cb = eng.gpu.cmd();
+                        eng.encode_decode(&cb, &spans, true, false);
+                        cb.commit();
+                        cb.waitUntilCompleted();
+                        {
+                            let mut pools = eng.block_pool().borrow_mut();
+                            for &i in &dec_lanes {
+                                let r = &mut breqs[i];
+                                let pos = r.n_past;
+                                let mut tbl = r.lane.block_table().borrow_mut();
+                                sbc.finish_decode_span(&mut pools, &mut tbl, &mut r.blocks, pos);
+                            }
+                        }
+                        let gpu_dec: Vec<(usize, usize)> = dec_lanes
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &i)| breqs[i].sampler.uses_gpu_gumbel())
+                            .map(|(k, &i)| (k, i))
+                            .collect();
+                        if !gpu_dec.is_empty() {
+                            let gcb = eng.gpu.cmd();
+                            for &(k, i) in &gpu_dec {
+                                let next_pos = breqs[i].n_past + 1;
+                                eng.encode_gumbel_span(&gcb, k, &breqs[i].lane, next_pos, breqs[i].seed, next_pos, 1.0, None);
+                            }
+                            gcb.commit();
+                            gcb.waitUntilCompleted();
+                        }
+                        for (k, &i) in dec_lanes.iter().enumerate() {
+                            breqs[i].n_past += 1;
+                            let tok = if breqs[i].sampler.uses_gpu_gumbel() {
+                                eng.on(&breqs[i].lane).sampled_token_at(breqs[i].n_past).expect("valid GPU sample")
+                            } else {
+                                breqs[i].sampler.sample_next(&eng.span_logits(k)).expect("blocked dec sample")
+                            };
+                            breqs[i].toks.push(tok);
+                        }
+                    }
+                }
+                let _ = bplanner.complete_step();
+            }
+
+            let mut sbc_ok = true;
+            for (i, (solo, breq)) in solo_seqs.iter().zip(&breqs).enumerate() {
+                if solo != &breq.toks {
+                    let first_diff = solo.iter().zip(&breq.toks).position(|(a, b)| a != b);
+                    println!(
+                        "{mode_name} ServeBlockCache seed=0x{seed:016x} req {i}: DIFFERS at token {:?} (solo={:?} vs sbc={:?})",
+                        first_diff,
+                        first_diff.map(|k| solo[k]),
+                        first_diff.map(|k| breq.toks[k])
+                    );
+                    sbc_ok = false;
+                }
+            }
+            {
+                let mut pools = eng.block_pool().borrow_mut();
+                for r in &mut breqs {
+                    let mut tbl = r.lane.block_table().borrow_mut();
+                    sbc.release_lane(&mut pools, &mut tbl, &mut r.blocks);
+                }
+                sbc.shutdown(&mut pools);
+            }
+            if sbc_ok {
+                println!(
+                    "{mode_name} ServeBlockCache seed=0x{seed:016x}: 3 blocked lanes x {ndec} tokens (2 ServeBlockCache-hit + 1 cold) IDENTICAL to uncached solo"
+                );
+            }
+            ok &= sbc_ok;
         }
     }
     if sabotage {
@@ -3020,16 +3295,20 @@ fn vcost(o: &Opts) {
     }
 }
 
-fn enter_inky_mode() -> Option<memd::Lease> {
+fn enter_inky_mode_with(persistent: bool) -> Option<memd::Lease> {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-    let lease = memd::enter(&sock);
-    match &lease {
-        Some(lease) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, lease.initial_limit),
+    let lease = if persistent { memd::enter_persistent(&sock) } else { memd::enter(&sock) };
+    match lease.as_ref().and_then(|l| l.initial_limit) {
+        Some(limit) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, limit),
         None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
     }
     lease
+}
+
+fn enter_inky_mode() -> Option<memd::Lease> {
+    enter_inky_mode_with(false)
 }
 
 /// Current physical footprint charged to this process by the macOS kernel, in bytes.
@@ -3064,14 +3343,20 @@ fn main() {
             }
             let (chip, memory) = tuning::this_machine();
             let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
-            let _lease = enter_inky_mode();
+            let _lease = enter_inky_mode_with(true);
             serve::serve(options);
             return;
         }
         Some("mode") => {
             // Hold inky mode for the requested interval, then leave by exiting.
-            let _lease = enter_inky_mode();
-            let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let args = &raw[2..];
+            let persistent = args.iter().any(|a| a == "--persistent");
+            let secs: u64 = args
+                .iter()
+                .find(|a| a.as_str() != "--persistent")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let _lease = enter_inky_mode_with(persistent);
             std::thread::sleep(std::time::Duration::from_secs(secs));
             return;
         }

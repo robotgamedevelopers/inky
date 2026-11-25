@@ -592,9 +592,10 @@ fn connect_lease(path: &str) -> Option<(UnixStream, u64)> {
     Some((s, v))
 }
 
-/// Keeps the reservation alive until its owner drops it, including across helper restarts.
+/// Keeps the reservation alive until its owner drops it, including across helper restarts
+/// or late helper installation (`enter_persistent`).
 pub struct Lease {
-    pub initial_limit: u64,
+    pub initial_limit: Option<u64>,
     stop: UnixStream,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -606,9 +607,10 @@ impl Drop for Lease {
     }
 }
 
-fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
-    let mut connection = Some(initial);
-    let mut retry_ms = 100;
+fn maintain_lease(path: String, initial: Option<UnixStream>, stop: UnixStream) {
+    let mut had_ever_connected = initial.is_some();
+    let mut connection = initial;
+    let mut retry_ms = if connection.is_some() { 100 } else { 250 };
     loop {
         // An acknowledged helper sends no further data. EOF, an error, or an unexpected
         // message ends that lease. Poll the stop socket too so idle leases need no timer.
@@ -627,9 +629,22 @@ fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
         if connection.take().is_some() {
             eprintln!("[inky] lost memory-helper connection; retrying");
             retry_ms = 100;
+            // Attempt immediate reconnect in case `tune-memory` already bound the replacement socket;
+            // otherwise enter bounded exponential backoff (100..2000 ms).
+            if let Some((stream, limit)) = connect_lease(&path) {
+                eprintln!("[inky] memory-helper connection restored; GPU wired limit {limit} MB");
+                connection = Some(stream);
+                had_ever_connected = true;
+            }
         } else if let Some((stream, limit)) = connect_lease(&path) {
-            eprintln!("[inky] memory-helper connection restored; GPU wired limit {limit} MB");
+            if had_ever_connected {
+                eprintln!("[inky] memory-helper connection restored; GPU wired limit {limit} MB");
+            } else {
+                eprintln!("[inky] memory-helper connection established; GPU wired limit {limit} MB");
+                had_ever_connected = true;
+            }
             connection = Some(stream);
+            retry_ms = 100;
         } else {
             retry_ms = (retry_ms * 2).min(2_000);
         }
@@ -638,6 +653,20 @@ fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
 
 pub fn enter(path: &str) -> Option<Lease> {
     let (stream, initial_limit) = connect_lease(path)?;
+    let (stop, monitor) = UnixStream::pair().ok()?;
+    let path = path.to_owned();
+    let worker = std::thread::Builder::new().name("inky-memd-lease".into())
+        .spawn(move || maintain_lease(path, Some(stream), monitor)).ok()?;
+    Some(Lease { initial_limit: Some(initial_limit), stop, worker: Some(worker) })
+}
+
+/// Persistent lease monitor for long-running `inky serve`: connects immediately if the helper
+/// is already running, and otherwise polls cleanly in the background so starting or reinstalling
+/// `memd` (`sudo inky tune-memory`) while `serve` is live establishes/restores the reservation.
+pub fn enter_persistent(path: &str) -> Option<Lease> {
+    let initial = connect_lease(path);
+    let initial_limit = initial.as_ref().map(|&(_, limit)| limit);
+    let stream = initial.map(|(s, _)| s);
     let (stop, monitor) = UnixStream::pair().ok()?;
     let path = path.to_owned();
     let worker = std::thread::Builder::new().name("inky-memd-lease".into())
@@ -916,7 +945,7 @@ mod tests {
         });
         let lease = enter(path.to_str().unwrap()).unwrap();
         let mut peer = helper.join().unwrap();
-        assert_eq!(lease.initial_limit, 12345);
+        assert_eq!(lease.initial_limit, Some(12345));
         peer.set_nonblocking(true).unwrap();
         let mut byte = [0; 1];
         assert_eq!(peer.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
