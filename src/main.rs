@@ -62,7 +62,6 @@ options:
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --raw             do not apply the chat template; print special tokens";
 
-const DEFAULT_SERVE_LANES: usize = 64;
 
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
@@ -74,7 +73,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
                     alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
-  --lanes N         active inference lanes (default 64)
+  --lanes N         active inference lanes (defaults to this machine's tuning)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
@@ -82,7 +81,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --loopcd OMEGA    default adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
   --record-max-bytes N
-                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
+                    max bytes per segment before rotating to .1 (default 104857600); larger rows are dropped
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
@@ -138,9 +137,9 @@ fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
 
-fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
+fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: default_lanes, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
@@ -193,13 +192,21 @@ mod cli_tests {
     use super::*;
 
     fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
-        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), |name| match name {
+        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), 64, |name| match name {
             "PRESENT" => Ok("configured-key".into()),
             "EMPTY" => Ok(String::new()),
             "BLANK" => Ok(" \t".into()),
             "NONUNICODE" => Err(std::env::VarError::NotUnicode("secret data".into())),
             _ => Err(std::env::VarError::NotPresent),
         })
+    }
+
+    #[test]
+    fn serving_uses_machine_lane_default_unless_overridden() {
+        let lanes = tuning::select("Apple M5 Pro", 64 << 30).default_lanes;
+        assert_eq!(parse_serve(&[], lanes, |_| unreachable!()).unwrap().lanes, 32);
+        let args = ["--lanes".to_string(), "8".to_string()];
+        assert_eq!(parse_serve(&args, lanes, |_| unreachable!()).unwrap().lanes, 8);
     }
 
     #[test]
@@ -1737,6 +1744,17 @@ fn enter_inky_mode() -> Option<memd::Lease> {
     lease
 }
 
+/// Current physical footprint charged to this process by the macOS kernel, in bytes.
+fn process_footprint_bytes() -> Option<u64> {
+    unsafe {
+        let mut usage: libc::rusage_info_v4 = std::mem::zeroed();
+        let result = libc::proc_pid_rusage(
+            libc::getpid(), libc::RUSAGE_INFO_V4, &mut usage as *mut _ as *mut libc::rusage_info_t,
+        );
+        (result == 0).then_some(usage.ri_phys_footprint)
+    }
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
@@ -1756,7 +1774,8 @@ fn main() {
                 println!("{SERVE_USAGE}");
                 return;
             }
-            let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
+            let (chip, memory) = tuning::this_machine();
+            let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
             let _lease = enter_inky_mode();
             serve::serve(options);
             return;
@@ -1855,7 +1874,7 @@ fn main() {
             // the GPU's first touch of a page cost?
             let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_w(device uint * B [[buffer(0)]], constant uint2 & a [[buffer(1)]], uint gid [[thread_position_in_grid]]) { B[a.x + gid * a.y] += gid + 1; }\n";
             let gpu = metal::Gpu::new(src, &["k_w"]);
-            let foot = || unsafe { let mut ri: libc::rusage_info_v4 = std::mem::zeroed(); libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t); ri.ri_phys_footprint as f64 / 1048576.0 };
+            let foot = || process_footprint_bytes().expect("read process physical footprint") as f64 / 1048576.0;
             let len = 1usize << 30;
             let f0 = foot();
             let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) } as *mut u8;

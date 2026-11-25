@@ -36,7 +36,7 @@ func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer)
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	url := fs.String("url", "http://127.0.0.1:8080", "base URL of inky serve")
-	input := fs.String("input", "", "path to recorded .jsonl file or directory of .jsonl files")
+	input := fs.String("input", "", "path to recorded .jsonl file or directory with .jsonl and .jsonl.1 segments")
 	lanesRaw := fs.String("lanes", "8,16,32,48,64,96,128", "comma-separated lane counts to sweep")
 	cardsPerRung := fs.Int("cards", 0, "cards to run per rung (0 = max(loaded cards, lanes))")
 	duration := fs.Duration("duration", 0, "optional fixed duration per rung (e.g. 30s; 0 uses --cards)")
@@ -50,6 +50,10 @@ func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer)
 	outMD := fs.String("out-md", "", "optional path to write Markdown summary")
 
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *duration < 0 {
+		fmt.Fprintln(stderr, "--duration must be nonnegative")
 		return 2
 	}
 	if strings.TrimSpace(*input) == "" {
@@ -93,7 +97,9 @@ func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer)
 	rungs, knee, err := RunSweep(context.Background(), cfg, cards)
 	if err != nil {
 		fmt.Fprintf(stderr, "sweep failed: %v\n", err)
-		return 1
+		if len(rungs) == 0 {
+			return 1
+		}
 	}
 
 	md := FormatMarkdown(rungs, knee)
@@ -111,6 +117,9 @@ func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer)
 			fmt.Fprintf(stderr, "write --out-tsv: %v\n", err)
 			return 1
 		}
+	}
+	if err != nil {
+		return 1
 	}
 	return 0
 }
