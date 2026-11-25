@@ -5,7 +5,6 @@ mod cache_trace;
 mod blockbook;
 mod engine;
 mod gguf;
-#[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
 mod prefix;
 mod metal;
 mod sampler;
@@ -85,6 +84,9 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
+  --isolate-cache   give every request a distinct cache namespace (disables cross-request prefix reuse)
+  --hide-cached-tokens
+                    report 0 cached prompt tokens in API usage fields while keeping server cache reuse
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
@@ -137,6 +139,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
+        isolate_cache: false, hide_cached_tokens: false,
         kv8: false,
     };
     let mut bind = "127.0.0.1:8090";
@@ -170,6 +173,8 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
+            "--isolate-cache" => o.isolate_cache = true,
+            "--hide-cached-tokens" => o.hide_cached_tokens = true,
             "--kv8" => o.kv8 = true,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
@@ -288,6 +293,10 @@ mod cli_tests {
         assert_eq!(serve_args(&["--loopcd", "0"]).unwrap().loopcd_omega, 0.0);
         assert_eq!(serve_args(&["--loopcd", "0.3"]).unwrap().loopcd_omega, 0.3);
         assert_eq!(serve_args(&["--loopcd", "4.0"]).unwrap().loopcd_omega, 4.0);
+        assert!(!serve_args(&[]).unwrap().isolate_cache);
+        assert!(!serve_args(&[]).unwrap().hide_cached_tokens);
+        assert!(serve_args(&["--isolate-cache"]).unwrap().isolate_cache);
+        assert!(serve_args(&["--hide-cached-tokens"]).unwrap().hide_cached_tokens);
 
         let cli = |args: &[&str]| {
             parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
@@ -1008,13 +1017,14 @@ fn poolgate(o: &Opts) {
     }
 }
 
-/// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
-/// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
-/// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
-/// same logits at every shared boundary and decode step, and the same cache and convolution rows at the end,
-/// with the scratch poisoned before every step. Two tails share the one head. The copy must not move the
-/// source. INK_XCOPY_SABOTAGE=1 is the reversed witness: it copies one head token too few while the tail
-/// still starts at the head's end, and the gate must then fail (tests/ci.sh requires that failure).
+/// dev, the standalone Layer 2 cross-lane prefix gate (`Engine::copy_lane_prefix`): a source lane prefilled
+/// with a shared head is copied into a lane that prefills a different tail — `copy_lane_prefix` of the head,
+/// then the head's convolution state (`inky serve` uses zero-copy Layer 3 `ServeBlockCache` instead) — and
+/// the result must be bit-identical to a cold prefill of head + tail: the same logits at every shared boundary
+/// and decode step, and the same cache and convolution rows at the end, with the scratch poisoned before every
+/// step. Two tails share the one head. The copy must not move the source. `INK_XCOPY_SABOTAGE=1` is the reversed
+/// witness: it copies one head token too few while the tail still starts at the head's end, and the gate must
+/// then fail (`tests/ci.sh` requires that failure).
 fn xcopy(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);

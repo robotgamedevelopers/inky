@@ -38,6 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(all(unix, standalone_blocks))]
+use crate::libc;
 
 /// Positions in one sealed block (`docs/DESIGN.md`, Blocks).
 pub const BLOCK_POSITIONS: usize = 64;

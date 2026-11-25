@@ -126,6 +126,21 @@ A block is written by exactly one lane, then sealed, then never written again. S
 
 **Tiers.** A block is in memory, on disk, or both. Blocks no lane references (the tree's cold blocks) are written to the SSD lazily, only under memory pressure, least recently used first, and dropped from memory; they are dropped from disk under disk pressure. A request whose blocks were dropped prefills again: slower, never wrong.
 
+**Cache trust boundary and namespace isolation.** Prefix reuse in `ServeBlockCache` (in-memory `EntryTree`, singleflight turn-1 leader coalescing, and SSD `SpillStore` start-point restore) is scoped by a 64-bit cache namespace tag derived with SHA-256 over the server's random startup nonce, the authenticated credential (`Authorization: Bearer` or `x-api-key`), and the optional `X-Inky-Namespace` request header:
+
+- **Single-owner fleet serving (default):** Workers presenting the same fleet key (and no `X-Inky-Namespace`, or the same namespace tag) map to one namespace and share 100% of system/tool and turn checkpoints across lanes.
+- **Multi-principal or multi-tenant proxies:** Callers presenting different credentials or distinct `X-Inky-Namespace` values map to disjoint namespaces: they share zero `EntryTree` nodes, never coalesce on singleflight prefill, never restore another principal's SSD checkpoints, and observe `cached_tokens = 0` (`cache_read_input_tokens = 0`) on another principal's prompts.
+- **Per-request isolation and count suppression:** `--isolate-cache` assigns every request a fresh per-request namespace so no two requests share cached prefixes even under one credential; `--hide-cached-tokens` zeroes `usage.prompt_tokens_details.cached_tokens` and `cache_read_input_tokens` in HTTP responses while preserving internal server-side prefix reuse and operator stderr/JSONL telemetry.
+
+## LoopCD (Loop-Contrastive Decoding)
+
+Inkling 2 Mini executes its middle 12 layers three times per token (passes 1, 2, and 3) before the coda and `lm_head`. Adaptive `LoopCD-Logits` (`--loopcd <omega_max>`, Liu et al. 2026, arXiv:2610.02185) contrasts the full 3-pass recurrent logits $z_3$ against an early-exit 1-pass weak logits vector $z_1$ without training or fine-tuning:
+
+- **Dry weak pass (zero state mutation):** Immediately after recurrent pass 1 (`pass == 0`), when any active sampling row has $\omega_{\max} > 0$, the engine runs the coda layers and `lm_head` into a dedicated `lg_weak` scratch slice with `no_state_write` (`swa` bit 1) set on all attention and causal-convolution kernels. K/V cache slots and recurrent convolution state `cs` are left byte-for-byte untouched so passes 2 and 3 proceed identically to a non-LoopCD step.
+- **Strong pass and softcap-exact blend (`k_loopcd_blend`):** After pass 3 writes raw logits $z_3$, `k_loopcd_blend` softcaps both distributions first, $s_k = c \tanh(z_k / c)$ ($c = 30$), computes the strong pass's top-2 softmax margin $m_t = p_{3,(1)} - p_{3,(2)}$ via a 1024-thread butterfly reduction, scales the adaptive contrast weight $\omega_t = \omega_{\max}(1 - m_t)$ so confident tokens stay untouched while uncertain tokens suppress premature pass-1 priors, and writes $(1 + \omega_t) s_3 - \omega_t s_1$ in place.
+- **Per-lane isolation and softcapping handoff:** In `inky serve`, each request carries its own `loopcd_omega` (`0..=4`, defaulting to `--loopcd`). Lanes with `loopcd_omega == 0` skip the contrastive subtraction, and `Engine::effective_sampler_softcap()` returns `0.0` whenever `k_loopcd_blend` already applied `tanh` softcapping on the GPU so neither `k_gumbel` nor the CPU `Sampler` ever double-softcaps a row.
+- **First-token and decode coverage & GPU gate:** LoopCD applies to the first generated token emitted from terminal prefill as well as every subsequent decode step, and is verified on hardware against `Engine::loopcd_blend_row` (including dry-pass KV/`cs` preservation, mixed-$\omega$ batches, and planted-bug negative controls).
+
 ## Scheduler
 
 Lane states: `Queued -> Admitted -> Restoring -> Ready <-> InStep -> Finished`, with `Cancelling` from `InStep` and `Cancelled` from every other state.

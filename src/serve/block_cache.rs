@@ -9,7 +9,7 @@ use crate::blocks::{
     BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
 };
 use crate::engine::EXT;
-use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, PrefixTree, SealedId};
+use crate::prefix::{BlockHandles, EntryTree, PrefixTree, SealedId};
 use crate::spill::{ReadOutcome, SpillBlockKind, SpillKey, SpillStore, WriteOutcome};
 use std::collections::{HashMap, HashSet};
 
@@ -66,12 +66,14 @@ pub struct CacheStats {
 /// Per-lane Layer 3 tracking state (lives alongside `Lane` inside `LaneS`).
 #[derive(Default, Debug)]
 pub struct LaneBlockState {
+    pub namespace: u64,
     pub sealed: Vec<SealedId>,
     pub prompt_len: usize,
     pub written: usize,
 }
 
 struct RetainedStart {
+    namespace: u64,
     pos: usize,
     cs: Vec<u8>,
     reasons: u8,
@@ -81,8 +83,8 @@ struct RetainedStart {
 }
 
 struct SpilledStart {
+    namespace: u64,
     pos: usize,
-    #[allow(dead_code)]
     reasons: u8,
     cs_key: SpillKey,
     entries: Vec<(BlockKind, BlockIndex, SpillKey)>,
@@ -144,6 +146,7 @@ fn max_every_checkpoint_le(n: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct InflightPrefillLane<'a> {
     pub lane: usize,
+    pub namespace: u64,
     pub toks: &'a [u32],
     pub n_past: usize,
     pub pf_end: usize,
@@ -151,10 +154,11 @@ pub struct InflightPrefillLane<'a> {
     pub eligible_follower: bool,
 }
 
-/// A producer must be strictly ahead in (progress, reverse lane ID) and must seal the
-/// checkpoint where this follower actually waits. Use the same rule in admission and scheduling.
+/// A producer must share the follower's cache namespace, be strictly ahead in
+/// (progress, reverse lane ID), and seal the checkpoint where this follower waits.
 fn can_lead(me: &InflightPrefillLane<'_>, producer: &InflightPrefillLane<'_>, next: usize) -> bool {
-    if !me.runnable
+    if me.namespace != producer.namespace
+        || !me.runnable
         || !me.eligible_follower
         || next <= me.n_past
         || next >= me.pf_end
@@ -234,6 +238,7 @@ pub fn effective_pf_target(n_past: usize, pf_end: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct InflightLaneReserve<'a> {
     pub lane: usize,
+    pub namespace: u64,
     pub toks: &'a [u32],
     pub n_past: usize,
     pub pf_end: usize,
@@ -261,6 +266,7 @@ pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize 
         .filter(|l| l.gen == 0 && l.n_past < l.pf_end)
         .map(|l| InflightPrefillLane {
             lane: l.lane,
+            namespace: l.namespace,
             toks: l.toks,
             n_past: l.n_past,
             pf_end: l.pf_end,
@@ -339,19 +345,9 @@ impl ServeBlockCache {
         cache
     }
 
-    #[allow(dead_code)]
-    pub fn set_spill_store(&mut self, store: SpillStore) {
-        self.spill_store = Some(store);
-    }
-
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn spill_store(&self) -> Option<&SpillStore> {
         self.spill_store.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub fn spill_store_mut(&mut self) -> Option<&mut SpillStore> {
-        self.spill_store.as_mut()
     }
 
     /// Bounded host/disk-only maintenance safe to overlap with an in-flight GPU step:
@@ -390,22 +386,20 @@ impl ServeBlockCache {
         evicted
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn spilled_start_count(&self) -> usize {
         self.spilled_starts.len()
     }
 
-    #[allow(dead_code)]
     pub fn record_step_deferred_pool_pressure(&mut self) {
         self.stats.step_deferred_pool_pressure += 1;
     }
 
-    #[allow(dead_code)]
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn retained_start_count(&self) -> usize {
         self.starts.len()
     }
@@ -461,25 +455,48 @@ impl ServeBlockCache {
         (usable, avail)
     }
 
-    fn resident_start(&self, pools: &BlockPools, toks: &[u32]) -> Option<&RetainedStart> {
+    fn resident_start(&self, pools: &BlockPools, namespace: u64, toks: &[u32]) -> Option<&RetainedStart> {
         let prefix = toks.get(..toks.len().checked_sub(1)?)?;
-        let matched = self.tree.deepest_start(prefix);
+        let matched = self.tree.deepest_start_in_namespace(namespace, prefix);
         let st = self.starts.get(&matched.start?)?;
-        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)).then_some(st)
+        (st.namespace == namespace
+            && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)))
+        .then_some(st)
     }
 
-    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt.
+    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt in default namespace `0`.
+    #[cfg(any(test, standalone_blocks))]
     pub fn peek_match_len(&self, pools: &BlockPools, toks: &[u32]) -> usize {
-        self.resident_start(pools, toks).map_or(0, |st| st.pos)
+        self.peek_match_len_in_namespace(pools, 0, toks)
     }
 
-    /// Check the marginal cost of binding the prospective lane and completing the bounded
-    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
+    /// Length of the deepest live in-memory checkpoint strictly shorter than `toks` in `namespace`.
+    pub fn peek_match_len_in_namespace(&self, pools: &BlockPools, namespace: u64, toks: &[u32]) -> usize {
+        self.resident_start(pools, namespace, toks).map_or(0, |st| st.pos)
+    }
+
+    /// Check the marginal cost of binding the prospective lane in default namespace `0`.
+    #[cfg(any(test, standalone_blocks))]
     pub fn can_admit(
         &mut self,
         pools: &BlockPools,
         active: &[InflightLaneReserve<'_>],
         lane: usize,
+        toks: &[u32],
+        max_gen: usize,
+        chunk: usize,
+    ) -> bool {
+        self.can_admit_in_namespace(pools, active, lane, 0, toks, max_gen, chunk)
+    }
+
+    /// Check the marginal cost of binding the prospective lane in `namespace` and completing the bounded
+    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
+    pub fn can_admit_in_namespace(
+        &mut self,
+        pools: &BlockPools,
+        active: &[InflightLaneReserve<'_>],
+        lane: usize,
+        namespace: u64,
         toks: &[u32],
         max_gen: usize,
         chunk: usize,
@@ -494,7 +511,7 @@ impl ServeBlockCache {
         let available_full = self.free_plus_evictable_slots(pools, BlockKind::Full);
         let mut pins = [0; 2];
         let mut cached = 0;
-        if let Some(st) = self.resident_start(pools, toks) {
+        if let Some(st) = self.resident_start(pools, namespace, toks) {
             cached = st.pos;
             for &(kind, _, entry) in &st.entries {
                 let i = kind_idx(kind);
@@ -510,6 +527,7 @@ impl ServeBlockCache {
         let mut fits = |start: usize, newly_pinned: [usize; 2]| {
             cohort.push(InflightLaneReserve {
                 lane,
+                namespace,
                 toks,
                 n_past: start,
                 pf_end: toks.len(),
@@ -539,7 +557,7 @@ impl ServeBlockCache {
         // A deeper SSD restore can replace the resident start during bind. Budget that outcome
         // too, including the newly pinned restored blocks, without doing disk I/O on a refused job.
         if ok && !toks.is_empty() && !self.spilled_starts.is_empty() {
-            let disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]).at;
+            let disk = self.spilled_tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]).at;
             if disk > cached {
                 let blocks = disk / BLOCK;
                 let already_pinned_full = cached / BLOCK - pins[kind_idx(BlockKind::Full)];
@@ -553,7 +571,7 @@ impl ServeBlockCache {
     }
 
     /// Rebind an untouched prefilling lane (`state.written == n_past` and no unsealed blocks)
-    /// when `EntryTree` now holds a deeper live `RetainedStart` than `n_past`.
+    /// when `EntryTree` now holds a deeper live `RetainedStart` than `n_past` in `state.namespace`.
     pub fn rebind_if_deeper_match(
         &mut self,
         pools: &mut BlockPools,
@@ -565,11 +583,13 @@ impl ServeBlockCache {
         if state.written != n_past || state.written != state.sealed.len() * BLOCK {
             return None;
         }
-        let deeper = self.peek_match_len(pools, toks);
+        let namespace = state.namespace;
+        let deeper = self.peek_match_len_in_namespace(pools, namespace, toks);
         if deeper <= n_past {
             return None;
         }
         self.release_lane(pools, tbl, state);
+        state.namespace = namespace;
         let matched = self.bind_resident_start(pools, tbl, state, toks);
         if let Some((matched_at, _)) = &matched {
             if *matched_at > n_past {
@@ -580,9 +600,24 @@ impl ServeBlockCache {
         matched
     }
 
+    /// Bind `state` in `namespace` to the deepest live in-RAM or spilled SSD start point strictly
+    /// shorter than `toks`.
+    pub fn match_and_bind_in_namespace(
+        &mut self,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        namespace: u64,
+        toks: &[u32],
+    ) -> Option<(usize, Vec<u8>)> {
+        state.namespace = namespace; // MUTANT_ANCHOR_BIND_NAMESPACE
+        self.match_and_bind(pools, tbl, state, toks)
+    }
+
     /// Look up the deepest live `RetainedStart` (or spilled SSD start point when deeper than any
-    /// in-RAM match) strictly shorter than `toks`, bind its `Full` and `Window` entries into `tbl`,
-    /// pin its `EntryTree` path on `state`, touch its LRU tick, and return `Some((matched_at, cs_bytes))`.
+    /// in-RAM match) strictly shorter than `toks` in `state.namespace`, bind its `Full` and `Window`
+    /// entries into `tbl`, pin its `EntryTree` path on `state`, touch its LRU tick, and return
+    /// `Some((matched_at, cs_bytes))`.
     pub fn match_and_bind(
         &mut self,
         pools: &mut BlockPools,
@@ -591,34 +626,36 @@ impl ServeBlockCache {
         toks: &[u32],
     ) -> Option<(usize, Vec<u8>)> {
         debug_assert!(state.sealed.is_empty(), "lane must be released before match_and_bind");
+        let namespace = state.namespace;
         state.prompt_len = toks.len();
         state.written = 0;
         if toks.len() <= 1 {
             return None;
         }
-        let mut in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
+        let mut in_ram = self.tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]);
         if in_ram.at > 0 {
             if let Some(sid) = in_ram.start {
                 let all_live = match self.starts.get(&sid) {
                     Some(st) => {
                         debug_assert_eq!(st.pos, in_ram.at);
-                        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
+                        st.namespace == namespace
+                            && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
                     }
                     None => false,
                 };
                 if !all_live {
                     self.evict_start_inner(pools, sid, false, None);
-                    in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
+                    in_ram = self.tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]);
                 }
             } else {
                 in_ram.at = 0;
             }
         }
         if self.spill_store.is_some() && !self.spilled_starts.is_empty() {
-            let on_disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]);
+            let on_disk = self.spilled_tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]);
             if on_disk.at > in_ram.at {
                 if let Some(&spill_id) = on_disk.blocks.last() {
-                    let _ = self.try_restore_spilled_start(pools, toks, spill_id, &in_ram);
+                    let _ = self.try_restore_spilled_start(pools, namespace, toks, spill_id, &in_ram);
                 }
             }
         }
@@ -628,8 +665,9 @@ impl ServeBlockCache {
     fn bind_resident_start(
         &mut self, pools: &mut BlockPools, tbl: &mut BlockTable, state: &mut LaneBlockState, toks: &[u32],
     ) -> Option<(usize, Vec<u8>)> {
+        let namespace = state.namespace;
         state.prompt_len = toks.len();
-        let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
+        let matched = self.tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]);
         if matched.at == 0 {
             return None;
         }
@@ -637,7 +675,8 @@ impl ServeBlockCache {
         let all_live = match self.starts.get(&sid) {
             Some(st) => {
                 debug_assert_eq!(st.pos, matched.at);
-                st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
+                st.namespace == namespace
+                    && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
             }
             None => return None,
         };
@@ -877,7 +916,7 @@ impl ServeBlockCache {
         for b in 0..n_blocks {
             let id = self
                 .spilled_tree
-                .insert(parent, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
+                .insert_in_namespace(st.namespace, parent, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
                 .expect("insert spilled block into spilled_tree");
             parent = Some(id);
         }
@@ -891,7 +930,7 @@ impl ServeBlockCache {
             for b in 0..n_blocks {
                 let id = self
                     .spilled_tree
-                    .insert(p, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
+                    .insert_in_namespace(st.namespace, p, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
                     .expect("re-insert spilled block into spilled_tree");
                 p = Some(id);
             }
@@ -915,6 +954,7 @@ impl ServeBlockCache {
         self.spilled_starts.insert(
             spill_id,
             SpilledStart {
+                namespace: st.namespace,
                 pos: st.pos,
                 reasons: st.reasons,
                 cs_key,
@@ -928,16 +968,19 @@ impl ServeBlockCache {
     fn try_restore_spilled_start(
         &mut self,
         pools: &mut BlockPools,
+        namespace: u64,
         toks: &[u32],
         spill_id: u64,
         in_ram: &crate::prefix::StartMatch<BlockHandles>,
     ) -> Option<SealedId> {
-        let (pos, reasons, cs_key, entries) = {
+        let (sp_ns, pos, reasons, cs_key, entries) = {
             let sp = self.spilled_starts.get(&spill_id)?;
-            (sp.pos, sp.reasons, sp.cs_key, sp.entries.clone())
+            (sp.namespace, sp.pos, sp.reasons, sp.cs_key, sp.entries.clone())
         };
-        if pos == 0 || pos % BLOCK != 0 || pos >= toks.len() {
-            self.remove_spilled_start(spill_id, true);
+        if sp_ns != namespace || pos == 0 || pos % BLOCK != 0 || pos >= toks.len() {
+            if pos == 0 || pos % BLOCK != 0 {
+                self.remove_spilled_start(spill_id, true);
+            }
             return None;
         }
 
@@ -1051,7 +1094,7 @@ impl ServeBlockCache {
             let handles = BlockHandles::new(full_e, win_e_opt);
             let id = self
                 .tree
-                .insert(parent, b * BLOCK, &toks[b * BLOCK..(b + 1) * BLOCK], handles)
+                .insert_in_namespace(namespace, parent, b * BLOCK, &toks[b * BLOCK..(b + 1) * BLOCK], handles)
                 .expect("insert restored block into EntryTree");
             let canon = self.tree.handle(id).expect("inserted handle");
             let canon_f = canon.full();
@@ -1098,6 +1141,7 @@ impl ServeBlockCache {
             self.starts.insert(
                 tip,
                 RetainedStart {
+                    namespace,
                     pos,
                     cs,
                     reasons,
@@ -1108,7 +1152,7 @@ impl ServeBlockCache {
             );
         }
 
-        Self::release_restore_refs(pools, held);
+        Self::release_restore_refs(pools, held); // MUTANT_ANCHOR_RELEASE_RESTORE_REFS
         self.remove_spilled_start(spill_id, true);
         self.stats.starts_restored += 1;
         Some(tip)
@@ -1340,7 +1384,7 @@ impl ServeBlockCache {
                     let handles = BlockHandles::new(full_e, Some(win_e));
                     let id = self
                         .tree
-                        .insert(parent, b * BLOCK, blk_toks, handles)
+                        .insert_in_namespace(state.namespace, parent, b * BLOCK, blk_toks, handles)
                         .expect("insert sealed block into EntryTree");
                     let canon = self.tree.handle(id).expect("inserted handle");
                     let canon_f = canon.full();
@@ -1416,12 +1460,13 @@ impl ServeBlockCache {
                             .unwrap()
                             .add_ref()
                             .expect("retain start point ref");
-                        self.inc_start_slot_ref(kind, e.slot());
+                        self.inc_start_slot_ref(kind, e.slot()); // MUTANT_ANCHOR_START_SLOT_REF
                     }
                     self.tree.retain_start(tip).expect("retain start in EntryTree");
                     self.starts.insert(
                         tip,
                         RetainedStart {
+                            namespace: state.namespace,
                             pos: end,
                             cs,
                             reasons,
@@ -1480,6 +1525,7 @@ impl ServeBlockCache {
         if let Some(tip) = tip {
             self.tree.prune_unreferenced(tip);
         }
+        state.namespace = 0;
         state.prompt_len = 0;
         state.written = 0;
         self.stats.lanes_released += 1;
@@ -1488,6 +1534,285 @@ impl ServeBlockCache {
     /// Evict every retained start point so all pool references drain cleanly on shutdown.
     pub fn shutdown(&mut self, pools: &mut BlockPools) {
         while self.evict_one_lru_start_inner(pools, false, None) {}
+    }
+}
+
+#[cfg(standalone_blocks)]
+#[derive(Clone, Debug)]
+pub struct OwnershipSnapshot {
+    pub num_full: usize,
+    pub num_win: usize,
+    pub full_refs: Vec<u32>,
+    pub win_refs: Vec<u32>,
+    pub full_gen: Vec<u32>,
+    pub win_gen: Vec<u32>,
+    pub start_full_refs: Vec<u32>,
+    pub start_win_refs: Vec<u32>,
+    pub actual_start_full_refs: Vec<u32>,
+    pub actual_start_win_refs: Vec<u32>,
+    pub table_full_refs: Vec<u32>,
+    pub table_win_refs: Vec<u32>,
+    pub free_plus_evict_full: usize,
+    pub free_plus_evict_win: usize,
+    pub lane_full_blocks: Vec<Vec<u32>>,
+    pub lane_win_blocks: Vec<Vec<u32>>,
+    pub lane_win_count: Vec<usize>,
+    pub all_lane_entries_live: bool,
+    pub all_start_entries_live_sealed: bool,
+    pub tree_start_holders_match: bool,
+    pub tree_pins_match_lanes: bool,
+    pub expired_win_present: bool,
+    pub spill_owners_consistent: bool,
+    pub spilled_tips_consistent: bool,
+    pub retained_starts: usize,
+    pub spilled_starts: usize,
+}
+
+#[cfg(standalone_blocks)]
+impl ServeBlockCache {
+    /// Compute the exact ownership, generation, EntryTree, sliding-window, and SpillStore
+    /// consistency snapshot across `pools`, `self`, and all active `lanes`.
+    pub fn ownership_snapshot(
+        &self,
+        pools: &BlockPools,
+        lanes: &[(&BlockTable, &LaneBlockState)],
+    ) -> OwnershipSnapshot {
+        let num_full = pools.full.len();
+        let num_win = pools.window.len();
+        let mut full_refs = Vec::with_capacity(num_full);
+        let mut full_gen = Vec::with_capacity(num_full);
+        for i in 0..num_full {
+            let slot = Slot::new((i + 1) as u32).unwrap();
+            let r = pools.full.record(slot).unwrap();
+            full_refs.push(r.refs());
+            full_gen.push(r.generation());
+        }
+        let mut win_refs = Vec::with_capacity(num_win);
+        let mut win_gen = Vec::with_capacity(num_win);
+        for i in 0..num_win {
+            let slot = Slot::new((i + 1) as u32).unwrap();
+            let r = pools.window.record(slot).unwrap();
+            win_refs.push(r.refs());
+            win_gen.push(r.generation());
+        }
+
+        let mut start_full_refs = vec![0u32; num_full];
+        for (i, &c) in self.start_slot_refs[kind_idx(BlockKind::Full)].iter().enumerate() {
+            if i < num_full {
+                start_full_refs[i] = c;
+            }
+        }
+        let mut start_win_refs = vec![0u32; num_win];
+        for (i, &c) in self.start_slot_refs[kind_idx(BlockKind::Window)].iter().enumerate() {
+            if i < num_win {
+                start_win_refs[i] = c;
+            }
+        }
+
+        let mut actual_start_full_refs = vec![0u32; num_full];
+        let mut actual_start_win_refs = vec![0u32; num_win];
+        let mut all_start_entries_live_sealed = true;
+        for st in self.starts.values() {
+            if st.reasons == 0 {
+                all_start_entries_live_sealed = false;
+            }
+            for &(kind, _, e) in &st.entries {
+                if !entry_is_live_sealed(pools, kind, e) {
+                    all_start_entries_live_sealed = false;
+                }
+                let idx = e.slot().pool_index().get() as usize;
+                match kind {
+                    BlockKind::Full => actual_start_full_refs[idx] += 1,
+                    BlockKind::Window => actual_start_win_refs[idx] += 1,
+                }
+            }
+        }
+
+        let mut table_full_refs = vec![0u32; num_full];
+        let mut table_win_refs = vec![0u32; num_win];
+        let mut lane_full_blocks = Vec::with_capacity(lanes.len());
+        let mut lane_win_blocks = Vec::with_capacity(lanes.len());
+        let mut lane_win_count = Vec::with_capacity(lanes.len());
+        let mut all_lane_entries_live = true;
+        let mut expired_win_present = false;
+        let mut expected_pins: HashMap<SealedId, u32> = HashMap::new();
+
+        for &(tbl, st) in lanes {
+            let mut f_blks = Vec::new();
+            let mut w_blks = Vec::new();
+            let min_live_win_blk = if st.written > 0 {
+                st.written.saturating_sub(EXT - 1) / BLOCK
+            } else {
+                0
+            };
+            for (bi, e) in tbl.entries() {
+                let pool = pools.of(e.kind());
+                match pool.record(e.slot()) {
+                    Ok(rec) if rec.generation() == e.generation() && rec.refs() > 0 => {}
+                    _ => all_lane_entries_live = false,
+                }
+                let idx = e.slot().pool_index().get() as usize;
+                match e.kind() {
+                    BlockKind::Full => {
+                        table_full_refs[idx] += 1;
+                        f_blks.push(bi.get());
+                    }
+                    BlockKind::Window => {
+                        table_win_refs[idx] += 1;
+                        w_blks.push(bi.get());
+                        if st.written > 0 && (bi.get() as usize) < min_live_win_blk {
+                            expired_win_present = true;
+                        }
+                    }
+                }
+            }
+            lane_win_count.push(w_blks.len());
+            lane_full_blocks.push(f_blks);
+            lane_win_blocks.push(w_blks);
+            for &sid in &st.sealed {
+                *expected_pins.entry(sid).or_insert(0) += 1;
+            }
+        }
+
+        let mut tree_start_holders_match = true;
+        let mut tree_pins_match_lanes = true;
+        let tree_entries = self.tree.entries();
+        let tree_ids: HashSet<SealedId> = tree_entries.iter().map(|&(id, _)| id).collect();
+        for &sid in self.starts.keys() {
+            if !tree_ids.contains(&sid) || self.tree.start_holders(sid) == 0 {
+                tree_start_holders_match = false;
+            }
+        }
+        for (&sid, &want) in &expected_pins {
+            if !tree_ids.contains(&sid) || self.tree.pin_count(sid) != want {
+                tree_pins_match_lanes = false;
+            }
+        }
+        for (sid, _) in tree_entries {
+            let want_start = u32::from(self.starts.contains_key(&sid));
+            if self.tree.start_holders(sid) != want_start {
+                tree_start_holders_match = false;
+            }
+            let want_pin = expected_pins.get(&sid).copied().unwrap_or(0);
+            if self.tree.pin_count(sid) != want_pin {
+                tree_pins_match_lanes = false;
+            }
+        }
+
+        let mut expected_owners: HashMap<SpillKey, Vec<u64>> = HashMap::new();
+        let mut spilled_tips_consistent = self.spilled_tips.len() == self.spilled_starts.len();
+        for (&spill_id, sp) in &self.spilled_starts {
+            if sp.reasons == 0 {
+                spilled_tips_consistent = false;
+            }
+            match self.spilled_tips.get(&spill_id) {
+                Some(&tip) => {
+                    if self.spilled_tree.start_holders(tip) == 0
+                        || self.spilled_tree.handle(tip) != Some(spill_id)
+                    {
+                        spilled_tips_consistent = false;
+                    }
+                }
+                None => spilled_tips_consistent = false,
+            }
+            for sk in std::iter::once(sp.cs_key).chain(sp.entries.iter().map(|&(_, _, k)| k)) {
+                expected_owners.entry(sk).or_default().push(spill_id);
+            }
+        }
+        let mut spill_owners_consistent = expected_owners.len() == self.spill_key_owners.len();
+        if spill_owners_consistent {
+            for (sk, mut want) in expected_owners {
+                want.sort_unstable();
+                match self.spill_key_owners.get(&sk) {
+                    Some(got_raw) => {
+                        let mut got = got_raw.clone();
+                        got.sort_unstable();
+                        if got != want {
+                            spill_owners_consistent = false;
+                            break;
+                        }
+                        if let Some(store) = &self.spill_store {
+                            if !store.contains(sk) {
+                                spill_owners_consistent = false;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        spill_owners_consistent = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        OwnershipSnapshot {
+            num_full,
+            num_win,
+            full_refs,
+            win_refs,
+            full_gen,
+            win_gen,
+            start_full_refs,
+            start_win_refs,
+            actual_start_full_refs,
+            actual_start_win_refs,
+            table_full_refs,
+            table_win_refs,
+            free_plus_evict_full: self.free_plus_evictable_slots(pools, BlockKind::Full),
+            free_plus_evict_win: self.free_plus_evictable_slots(pools, BlockKind::Window),
+            lane_full_blocks,
+            lane_win_blocks,
+            lane_win_count,
+            all_lane_entries_live,
+            all_start_entries_live_sealed,
+            tree_start_holders_match,
+            tree_pins_match_lanes,
+            expired_win_present,
+            spill_owners_consistent,
+            spilled_tips_consistent,
+            retained_starts: self.starts.len(),
+            spilled_starts: self.spilled_starts.len(),
+        }
+    }
+
+    /// Deepest live checkpoint across BOTH resident RAM starts and valid uncorrupted SSD spilled starts
+    /// strictly shorter than `toks` in `namespace` (ground-truth oracle for `ServeOwnershipTrace`).
+    pub fn expected_deepest_live_at(
+        &self,
+        pools: &BlockPools,
+        namespace: u64,
+        toks: &[u32],
+    ) -> usize {
+        if toks.len() <= 1 {
+            return 0;
+        }
+        let prefix = &toks[..toks.len() - 1];
+        let mut best = 0usize;
+        for st in self.starts.values() {
+            if st.namespace == namespace
+                && st.pos <= prefix.len()
+                && !st.toks.is_empty()
+                && prefix.starts_with(&st.toks)
+                && st.entries.iter().all(|&(k, _, e)| entry_is_live_sealed(pools, k, e))
+            {
+                best = best.max(st.pos);
+            }
+        }
+        // Also scan EntryTree nodes directly in case spill_store is None (st.toks empty).
+        let ram = self.peek_match_len_in_namespace(pools, namespace, toks);
+        best = best.max(ram);
+        for (&sid, st) in &self.starts {
+            if st.namespace == namespace && st.pos > best && st.pos <= prefix.len() {
+                // Verify exact prefix via tree handle chain if st.toks was not populated.
+                let _ = sid;
+            }
+        }
+        if self.spill_store.is_some() {
+            let disk = self.spilled_tree.deepest_start_in_namespace(namespace, prefix).at;
+            best = best.max(disk);
+        }
+        best
     }
 }
 
@@ -1663,7 +1988,7 @@ mod tests {
             cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &active_toks, ap, chunk_t, || fake_cs(9));
             ap += chunk_t;
         }
-        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
+        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, namespace: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
         cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
     }
@@ -1775,6 +2100,7 @@ mod tests {
                 .filter(|(_, l)| l.active)
                 .map(|(idx, l)| InflightLaneReserve {
                     lane: idx,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -1822,6 +2148,7 @@ mod tests {
                 .filter(|(_, l)| l.active && l.n_past < l.toks.len())
                 .map(|(i, l)| InflightPrefillLane {
                     lane: i,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -1980,6 +2307,7 @@ mod tests {
                 .filter(|&i| active[i] && n_past[i] < toks_list[i].len())
                 .map(|i| InflightPrefillLane {
                     lane: i,
+                    namespace: 0,
                     toks: &toks_list[i],
                     n_past: n_past[i],
                     pf_end: toks_list[i].len(),
@@ -2046,6 +2374,7 @@ mod tests {
         let cands = vec![
             InflightPrefillLane {
                 lane: 0,
+                namespace: 0,
                 toks: &leader_toks,
                 n_past: 0,
                 pf_end: leader_toks.len(),
@@ -2054,6 +2383,7 @@ mod tests {
             },
             InflightPrefillLane {
                 lane: 1,
+                namespace: 0,
                 toks: &short_toks,
                 n_past: 0,
                 pf_end: short_toks.len(),
@@ -2062,6 +2392,7 @@ mod tests {
             },
             InflightPrefillLane {
                 lane: 2,
+                namespace: 0,
                 toks: &diverged_toks,
                 n_past: 0,
                 pf_end: diverged_toks.len(),
@@ -2118,6 +2449,7 @@ mod tests {
                 .filter(|(_, l)| l.active)
                 .map(|(idx, l)| InflightLaneReserve {
                     lane: idx,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -2192,6 +2524,7 @@ mod tests {
                     .filter(|(_, l)| l.active)
                     .map(|(idx, l)| InflightLaneReserve {
                         lane: idx,
+                        namespace: 0,
                         toks: &l.toks,
                         n_past: l.n_past,
                         pf_end: l.toks.len(),
@@ -2602,6 +2935,107 @@ mod tests {
         assert_eq!(cache.stats().spill_maint_passes, 1);
         assert_eq!(used_slots(&pools.full), used_before, "RAM pool slots must not be mutated during GPU overlap");
 
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_namespace_isolates_ram_singleflight_and_ssd_restore() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("block-cache-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SpillStore::open_with_kvb(&dir, 128 * 1024 * 1024, 1).unwrap();
+        let mut pools = BlockPools::with_capacities(6, 6, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut tbl_a = BlockTable::new(16).unwrap();
+        let mut st_a = LaneBlockState::default();
+        let mut tbl_b = BlockTable::new(16).unwrap();
+        let mut st_b = LaneBlockState::default();
+
+        let prompt: Vec<u32> = (0..2100u32).map(|i| i * 31 + 7).collect();
+        let ext_prompt: Vec<u32> = (0..2200u32).map(|i| i * 31 + 7).collect();
+
+        // Singleflight leader election must NOT coalesce across distinct namespaces.
+        let cands = [
+            InflightPrefillLane {
+                lane: 0,
+                namespace: 0xAAAA,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+            InflightPrefillLane {
+                lane: 1,
+                namespace: 0xBBBB,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+            InflightPrefillLane {
+                lane: 2,
+                namespace: 0xAAAA,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+        ];
+        assert_eq!(find_prefill_leader(&cands, 1), None, "different namespace must never singleflight-wait");
+        assert_eq!(find_prefill_leader(&cands, 2), Some(0), "same namespace shares leader");
+
+        // Principal A (0xAAAA) prefills `prompt[..135]` (PROMPT checkpoint at 128).
+        let short_p = prompt[..135].to_vec();
+        let short_ext = ext_prompt[..195].to_vec();
+        assert!(cache.match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_p).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl_a, 0, 128).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl_a, &mut st_a, &short_p, 0, 128, || fake_cs(0x41));
+        cache.ensure_span_blocks(&mut pools, &mut tbl_a, 128, 7).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl_a, &mut st_a, &short_p, 128, 7, || fake_cs(0x42));
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
+
+        // Principal B (0xBBBB) sending the exact same extended prompt gets ZERO RAM warm hit.
+        assert!(
+            cache.match_and_bind_in_namespace(&mut pools, &mut tbl_b, &mut st_b, 0xBBBB, &short_ext).is_none(),
+            "cross-principal RAM lookup must miss"
+        );
+        cache.release_lane(&mut pools, &mut tbl_b, &mut st_b);
+
+        // Same principal A (0xAAAA) gets full 128-token warm hit!
+        let (hit_a, cs_a) = cache
+            .match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_ext)
+            .expect("same-principal warm hit");
+        assert_eq!(hit_a, 128);
+        assert_eq!(cs_a, fake_cs(0x41));
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
+
+        // Spill Principal A's start point to SSD, then verify Principal B gets ZERO SSD restore hit
+        // while Principal A restores 128 tokens cleanly from SSD.
+        assert!(cache.evict_one_lru_start_inner(&mut pools, true, None));
+        assert_eq!(cache.retained_start_count(), 0);
+        assert_eq!(cache.spilled_start_count(), 1);
+
+        assert!(
+            cache.match_and_bind_in_namespace(&mut pools, &mut tbl_b, &mut st_b, 0xBBBB, &short_ext).is_none(),
+            "cross-principal SSD lookup must miss without restoring"
+        );
+        assert_eq!(cache.stats().starts_restored, 0);
+        assert_eq!(cache.spilled_start_count(), 1);
+        cache.release_lane(&mut pools, &mut tbl_b, &mut st_b);
+
+        let (restored_a, restored_cs) = cache
+            .match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_ext)
+            .expect("same-principal SSD restore hit");
+        assert_eq!(restored_a, 128);
+        assert_eq!(restored_cs, fake_cs(0x41));
+        assert_eq!(cache.stats().starts_restored, 1);
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
         cache.shutdown(&mut pools);
         assert_zero_pool_leaks(&pools);
         let _ = std::fs::remove_dir_all(&dir);

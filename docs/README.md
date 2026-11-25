@@ -82,12 +82,17 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
+| `--loopcd OMEGA` | `0` (disabled) | Default adaptive `LoopCD-Logits` contrast weight $\omega_{\max} \in [0, 4]$; overridable per request via JSON `loopcd_omega` |
+| `--isolate-cache` | off | Give every request a distinct cache namespace (disables cross-request prefix reuse and cache-timing/count inference) |
+| `--hide-cached-tokens` | off | Report `0` cached prompt tokens in HTTP usage fields while keeping internal server prefix reuse |
 | `--kv8` | off | 8-bit K/V cache: doubles paged `BlockPool` capacity and halves KV read bandwidth (NOT exact; default is fp16) |
 | `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
 An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.
 
-An extending request can reuse a lane's previous prompt while its sliding-window history is still in the cache. Decode writes that overwrite that history discard the saved prompt. At prefill completion, another lane can copy the cache and the prompt-end convolution state and prefill only the suffix. `inky xcopy` checks that this copy is bit-identical to cold prefill. Partial overlaps start cold because the convolution state is saved only at the prompt's end.
+`inky serve` shares sealed 64-token K/V blocks zero-copy across lanes through Layer 3 `ServeBlockCache` (`EntryTree` + `BlockPools`), saving recurrent convolution checkpoints at periodic 2,048/4,096-token boundaries and at each prompt's last 64-token boundary, coalescing simultaneous cold turn-1 prefills via singleflight follower rebinding, and optionally spilling cold checkpoints to SSD (`--spill-dir`). Decode writes stay in private unsealed blocks and never overwrite retained prompt checkpoints. (`inky xcopy` separately verifies the standalone Layer 2 `Engine::copy_lane_prefix` primitive against cold prefill.)
+
+Cache lookups and singleflight coalescing are scoped by `(credential, X-Inky-Namespace)`: workers sharing a fleet key reuse prefixes across cards, while requests presenting a different credential or distinct `X-Inky-Namespace` header ( up to 128 printable ASCII bytes) observe zero cross-principal hits or SSD restores. Pass `--isolate-cache` to isolate every request even under one shared key, or `--hide-cached-tokens` to report `0` in `cached_tokens` / `cache_read_input_tokens`. Both `/v1/chat/completions` and `/v1/messages` also accept an optional finite `loopcd_omega` in `[0, 4]` to override `--loopcd` per request (`0` disables LoopCD for that request).
 
 `GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini` and `inky/inkling-2-mini`. `POST /v1/messages` supports streaming, thinking effort mapping, and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, `stream_options.include_usage: true`, model `inkling-2-mini` or `inky/inkling-2-mini`, and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 

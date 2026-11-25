@@ -49,6 +49,7 @@ impl ResponseMetrics {
         })
     }
 
+    #[cfg(test)]
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let obj = v.as_object().ok_or("response must be a JSON object")?;
         let prompt_tokens = obj
@@ -120,6 +121,7 @@ impl RecordEntry {
         })
     }
 
+    #[cfg(test)]
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let obj = v.as_object().ok_or("record entry must be a JSON object")?;
         let schema_version = obj
@@ -201,19 +203,6 @@ pub fn sanitize_card_id(raw: Option<&str>) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Extracts only `X-Inky-Card-Id` from HTTP headers while strictly ignoring auth/cookie headers.
-#[allow(dead_code)]
-pub fn card_id_from_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("x-inky-card-id") {
-            if let Some(id) = sanitize_card_id(Some(value)) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 fn is_sensitive_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -238,7 +227,7 @@ pub fn sanitize_request_body(req: &Value) -> Value {
 }
 
 /// Parses newline-delimited JSON records, ignoring blank lines.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn parse_jsonl(input: &str) -> Result<Vec<RecordEntry>, String> {
     let mut out = Vec::new();
     for (idx, line) in input.lines().enumerate() {
@@ -257,7 +246,7 @@ pub fn parse_jsonl(input: &str) -> Result<Vec<RecordEntry>, String> {
 
 /// Groups recorded turns by `card_id`, ordering each card's turns by `(turn_index, recorded_at_ms)`
 /// and ordering cards by their earliest `(recorded_at_ms, card_id)`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn group_by_card(entries: &[RecordEntry]) -> Vec<Vec<RecordEntry>> {
     let mut grouped: HashMap<&str, Vec<RecordEntry>> = HashMap::new();
     for e in entries {
@@ -329,14 +318,9 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(dir: PathBuf) -> Self {
         Self::with_options(dir, DEFAULT_QUEUE_CAPACITY, DEFAULT_MAX_FILE_BYTES)
-    }
-
-    #[allow(dead_code)]
-    pub fn with_capacity(dir: PathBuf, capacity: usize) -> Self {
-        Self::with_options(dir, capacity, DEFAULT_MAX_FILE_BYTES)
     }
 
     pub fn with_options(dir: PathBuf, capacity: usize, max_file_bytes: u64) -> Self {
@@ -674,24 +658,12 @@ mod tests {
 
     #[test]
     fn auth_headers_and_keys_are_never_recorded() {
-        let headers = [
-            ("Authorization", "Bearer super-secret-token-xyz"),
-            ("Cookie", "session=top-secret-cookie"),
-            ("X-Api-Key", "sk-secret-api-key-999"),
-            ("X-Inky-Card-Id", "card-safe-1"),
-        ];
-        assert_eq!(card_id_from_headers(headers), Some("card-safe-1".to_string()));
-        assert_eq!(
-            card_id_from_headers([("Authorization", "Bearer secret"), ("Cookie", "a=b")]),
-            None
-        );
-
         let dir = temp_dir("auth");
         let _ = fs::remove_dir_all(&dir);
         let ts = 1_795_543_200_000u64;
         {
             let rec = Recorder::new(dir.clone());
-            let (cid, turn) = rec.allocate_turn(card_id_from_headers(headers).as_deref());
+            let (cid, turn) = rec.allocate_turn(sanitize_card_id(Some("card-safe-1")).as_deref());
             rec.record(RecordEntry {
                 schema_version: SCHEMA_VERSION,
                 recorded_at_ms: ts,

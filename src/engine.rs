@@ -148,7 +148,7 @@ struct DecodeSpanDesc {
 struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32, hout: u32, pad: [u32; 3] }
-#[allow(dead_code)]
+#[cfg(test)]
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnBlkDecArgs {
     desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
@@ -703,7 +703,6 @@ pub struct Lane {
 }
 
 /// One lane's GPU Gumbel-max sampling request for [`Engine::encode_gumbel_spans`].
-#[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
 #[derive(Clone, Copy)]
 pub struct GumbelSpan<'a> {
     pub span_idx: usize,
@@ -842,29 +841,9 @@ impl Lane {
         f(buf, base_u64 * 8, slot.bt_blocks)
     }
 
-    #[allow(dead_code)]
-    pub fn is_blocked(&self) -> bool { self.use_blocks.get() }
-
-    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
+    /// The lane's block table. Callers borrow through the `RefCell` and populate entries via
+    /// [`crate::blocks::BlockTable::fill`].
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
-
-    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
-    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
-    /// is `NoSlots`. Does not allocate a GPU buffer.
-    #[allow(dead_code)]
-    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
-        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
-    }
-
-    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
-    /// The slot base comes from the lane table. The width is the pool's `kvb`.
-    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
-    #[allow(dead_code)]
-    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
-        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
-    }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
@@ -876,7 +855,6 @@ impl Engine {
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
     /// Both block pools. One GPU slab per kind, sized at load to `kvb` and the initial cache block.
     /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
     pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
 
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
@@ -960,13 +938,6 @@ impl Engine {
         let toks = max_ctx.saturating_add(8).saturating_mul(4);
         let dbatch_arena = arena_floats.saturating_mul(4);
         swa_kv.saturating_add(full_kv).saturating_add(cs).saturating_add(toks).saturating_add(dbatch_arena) as u64
-    }
-    /// Worst-case GPU memory required by a single lane at `self.max_ctx`.
-    #[allow(dead_code)]
-    pub fn per_lane_worst_case_bytes(&self) -> u64 {
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        let n_full = N_SLOT - n_swa;
-        Self::lane_worst_case_bytes_for(n_swa, n_full, self.max_ctx, self.kvb, self.ar.total as usize)
     }
     /// Realistic paged per-lane working reserve for Layer 3 `serve`: KV blocks are paged from
     /// shared `BlockPools` rather than pre-allocated to `max_ctx`, so admission sizes lanes using
@@ -1128,7 +1099,6 @@ impl Engine {
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
     /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
     /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item.
-    #[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
     pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
         if items.is_empty() { return; }
         let b = self.ba.get();
@@ -3305,7 +3275,7 @@ impl<'a> Run<'a> {
     }
     /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
     /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
-    /// table. A block-cache key address is `Lane::attn_key_offset`, a `u64` from the table.
+    /// table. A block-cache key address is `BlockTable::read_key(pool, pos)?.row(pass, kv, head)`.
     fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
         let (swa, i) = self.slot_kind[slot];
         let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };

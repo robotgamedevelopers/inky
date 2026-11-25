@@ -14,7 +14,7 @@
 //!    `Lane::block_table`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, pool, slot)` over that kind's GPU buffer, at the pool's width. `Layer2` implements it with lane k's window
+//!    `BlockPool::slot_raw_region` over that kind's GPU slab, at the pool's width. `Layer2` implements it with lane k's window
 //!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
@@ -72,7 +72,6 @@ pub trait Candidate: StepPath + PoisonPool {}
 impl<T: StepPath + PoisonPool> Candidate for T {}
 
 /// Every (kind, slot) a block table holds an entry for. Walks each kind's rows until the table says out of range.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no table
 pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     let mut v = Vec::new();
     for kind in KINDS {
@@ -83,17 +82,6 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
         }
     }
     v
-}
-
-/// The bytes of `slot` in `pool`'s buffer at `base` of `len` bytes, at the pool's element width.
-/// None when the slot does not fit in the buffer.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
-pub fn slot_region(base: *mut u8, len: usize, pool: &crate::blocks::BlockPool, slot: Slot) -> Option<(*mut u8, usize)> {
-    let stride = pool.kind().stride_bytes(pool.kvb()).ok()?;
-    let off = pool.offset(slot).ok()?;
-    let end = off.checked_add(stride)?;
-    if end > len as u64 { return None; }
-    Some((unsafe { base.add(off as usize) }, stride as usize))
 }
 
 /// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
@@ -313,10 +301,6 @@ impl<'a> Layer2<'a> {
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
     }
-    #[allow(dead_code)]
-    pub fn candidate_label(&self) -> &'static str {
-        "Layer2 self-check (BlockPools candidate not yet wired)"
-    }
     fn run<R>(&self, f: impl FnOnce(&[Option<Lane>]) -> R) -> R { f(&self.lanes.borrow()) }
 }
 
@@ -441,7 +425,6 @@ impl<'a> Layer3Pool<'a> {
         p
     }
 
-    #[allow(dead_code)]
     pub fn candidate_label(&self) -> &'static str {
         "Layer3 BlockPool + BlockTable + PrefixTree"
     }
@@ -1191,23 +1174,6 @@ mod tests {
     fn table_slots_reads_every_entry_of_both_kinds() {
         assert_eq!(table_slots(&BlockTable::new(4).unwrap()), vec![]);
         assert_eq!(table_slots(&BlockTable::empty()), vec![]);
-    }
-
-    #[test]
-    fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
-        use crate::blocks::BlockPool;
-        let base = 0x1000 as *mut u8;
-        let len = 2 * crate::blocks::FULL_STRIDE as usize;
-        let full = BlockPool::new(BlockKind::Full, 4);
-        let narrow = BlockPool::with_kvb(BlockKind::Full, 4, 1).unwrap();
-        let window = BlockPool::new(BlockKind::Window, 4);
-        assert_eq!(slot_region(base, len, &full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
-        assert_eq!(slot_region(base, len, &full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
-        assert_eq!(slot_region(base, len, &full, sl(3)), None);
-        assert_eq!(slot_region(base, len, &window, sl(1)), None);
-        let half = crate::blocks::FULL_STRIDE as usize / 2;
-        assert_eq!(slot_region(base, 4 * half, &narrow, sl(2)).map(|r| r.1), Some(half));
-        assert!(half < crate::blocks::FULL_STRIDE as usize);
     }
 
     #[test]

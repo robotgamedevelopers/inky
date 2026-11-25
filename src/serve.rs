@@ -1,15 +1,13 @@
-//! `inky serve`: OpenAI chat completions and Anthropic Messages endpoints over many lanes. One scheduler thread owns the engine and
-//! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens) or a
-//! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
-//! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
-//! prompt's end while its sliding-window history survives. A request whose tokens extend that prompt continues from
-//! there and prefills only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
-//! may also start a different lane: when the lane holding the longest matching prompt is busy, its prefill-written
-//! prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the suffix is
-//! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
-//! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
+//! `inky serve`: OpenAI chat completions and Anthropic Messages endpoints over many lanes. One scheduler thread owns the engine,
+//! the lanes, and the Layer 3 `ServeBlockCache` (`EntryTree` + `BlockPools` + optional SSD `SpillStore`), running one GPU step at
+//! a time: a prefill step (lanes with prompt left, capped at periodic 2,048/4,096-token and prompt-end 64-token checkpoint boundaries)
+//! or a decode step (one token for every ready generating lane). Connection threads validate headers and credentials, render the chat
+//! template, and stream back tokens or SSE events. Sealed 64-token prefill blocks and checkpoint convolution states (`RetainedStart`)
+//! are shared zero-copy across lanes within the caller's cache namespace, simultaneous cold turn-1 prefills coalesce via singleflight
+//! follower rebinding, and decode writes stay in private unsealed blocks so generation never corrupts retained prompt checkpoints
+//! (docs/DESIGN.md, decisions 3–5 and Blocks).
 
-use crate::engine::{Engine, Lane, Span, EXT};
+use crate::engine::{Engine, Lane, Span};
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -48,6 +46,10 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       pub spill_dir: Option<std::path::PathBuf>,
                       /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
                       pub max_spill_bytes: u64,
+                      /// isolate every request in its own fresh cache namespace (`--isolate-cache`)
+                      pub isolate_cache: bool,
+                      /// report `0` cached prompt tokens in HTTP usage fields (`--hide-cached-tokens`)
+                      pub hide_cached_tokens: bool,
                       /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
                       pub kv8: bool }
 
@@ -587,6 +589,7 @@ struct Job {
     seed: u64,
     thinking_budget: usize,
     loopcd_omega: f32,
+    cache_namespace: u64,
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
@@ -757,24 +760,24 @@ impl Active {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn reusable_prefix(prompt: &[u32], has_state: bool, request: &[u32]) -> usize {
     let n = shared_prefix(prompt, request);
     if has_state && n == prompt.len() && n < request.len() { n } else { 0 }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct LaneCand { prefix: usize, free: bool, copyable: bool, tick: u64 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Admission { dst: usize, src: usize, prefix: usize }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
     let own = cands.iter().enumerate().filter(|(_, c)| c.free)
         .max_by_key(|(_, c)| (c.prefix, std::cmp::Reverse(c.tick)));
@@ -789,9 +792,6 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
         _ => Some(Admission { dst, src: dst, prefix: own_prefix }),
     }
 }
-
-#[allow(dead_code)]
-fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
 
 /// Wait for an already-committed `MTLCommandBuffer` and inspect its completion status.
 fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
@@ -1058,6 +1058,7 @@ fn scheduler(
                         let run = !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[idx];
                         Some(InflightLaneReserve {
                             lane: idx,
+                            namespace: a.job.cache_namespace,
                             toks: &a.job.toks,
                             n_past: a.n_past,
                             pf_end: a.pf_end,
@@ -1069,7 +1070,7 @@ fn scheduler(
                         })
                     })
                     .collect();
-                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
+                if !cache.can_admit_in_namespace(&pools, &active_reserves, i, j.cache_namespace, &j.toks, j.max, eng.chunk) {
                     break;
                 }
             }
@@ -1082,7 +1083,7 @@ fn scheduler(
                 let mut pools = eng.block_pool().borrow_mut();
                 let matched = {
                     let mut tbl = l.lane.block_table().borrow_mut();
-                    cache.match_and_bind(&mut pools, &mut tbl, &mut l.blocks, &j.toks)
+                    cache.match_and_bind_in_namespace(&mut pools, &mut tbl, &mut l.blocks, j.cache_namespace, &j.toks)
                 };
                 match matched {
                     Some((matched_at, cs)) => {
@@ -1146,6 +1147,7 @@ fn scheduler(
                 let a = l.job.as_ref()?;
                 (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
                     lane: i,
+                    namespace: a.job.cache_namespace,
                     toks: &a.job.toks,
                     n_past: a.n_past,
                     pf_end: a.pf_end,
@@ -1519,7 +1521,17 @@ fn models_body() -> String {
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
+struct Head {
+    method: String,
+    path: String,
+    len: usize,
+    auth: Option<String>,
+    api_key: Option<String>,
+    card_id: Option<String>,
+    cache_namespace: Option<String>,
+    chunked: bool,
+}
+const MAX_CACHE_NAMESPACE_LEN: usize = 128;
 const MAX_BODY: usize = 32 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1570,7 +1582,16 @@ fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<Stri
 fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, card_id: None, chunked: false };
+    let mut h = Head {
+        method: it.next().unwrap_or("").to_string(),
+        path: it.next().unwrap_or("").to_string(),
+        len: 0,
+        auth: None,
+        api_key: None,
+        card_id: None,
+        cache_namespace: None,
+        chunked: false,
+    };
     for _ in 0..128 {
         let l = read_bounded_line(r, 16384)?;
         if l == "\r\n" || l == "\n" { return Ok(h); }
@@ -1583,6 +1604,7 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
             }
             if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
             if k.eq_ignore_ascii_case("x-inky-card-id") { h.card_id = crate::record::sanitize_card_id(Some(v)); }
+            if k.eq_ignore_ascii_case("x-inky-namespace") { h.cache_namespace = Some(v.to_string()); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
@@ -1653,8 +1675,51 @@ fn check_headers(h: &Head, path: &str, key: Option<&str>) -> Result<(), (u16, St
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
         }
     }
+    if let Some(ns) = h.cache_namespace.as_deref() {
+        if ns.is_empty()
+            || ns.len() > MAX_CACHE_NAMESPACE_LEN
+            || ns.bytes().any(|b| !(0x21..=0x7e).contains(&b))
+        {
+            return Err((400, format!("X-Inky-Namespace must be 1..={MAX_CACHE_NAMESPACE_LEN} printable ASCII characters without spaces")));
+        }
+    }
     if !h.chunked && h.len > MAX_BODY { return Err((413, format!("the body is over {} bytes", MAX_BODY))); }
     Ok(())
+}
+
+/// Derive a 64-bit cache namespace tag from the server startup nonce, isolation policy,
+/// caller credential, and optional `X-Inky-Namespace` header using SHA-256.
+fn derive_cache_namespace(
+    nonce: &str,
+    isolate_cache: bool,
+    seq: u64,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+) -> u64 {
+    let mut hasher = crate::spill::Sha256::new();
+    hasher.update(b"inky-cache-ns-v1\0");
+    hasher.update(nonce.as_bytes());
+    if isolate_cache {
+        hasher.update(b"\0isolate\0");
+        hasher.update(&seq.to_le_bytes());
+    } else {
+        hasher.update(b"\0principal\0");
+        let cred = credential.unwrap_or("");
+        hasher.update(&(cred.len() as u64).to_le_bytes());
+        hasher.update(cred.as_bytes());
+        hasher.update(b"\0tenant\0");
+        let ns = tenant_ns.unwrap_or("");
+        hasher.update(&(ns.len() as u64).to_le_bytes());
+        hasher.update(ns.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachePolicy {
+    isolate_cache: bool,
+    hide_cached_tokens: bool,
 }
 
 /// compare without stopping at the first differing byte
@@ -1939,7 +2004,9 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              /// connection threads alive; at most MAX_CONNS
              conns: Arc<AtomicUsize>,
              /// opt-in non-blocking JSONL card traffic recorder
-             recorder: Option<Arc<crate::record::Recorder>> }
+             recorder: Option<Arc<crate::record::Recorder>>,
+             /// cache isolation and client-visible cached-token reporting policy
+             cache_policy: CachePolicy }
 const MAX_CONNS: usize = 512;
 const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2133,7 +2200,19 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     chat_with_card(cx, req, None, s)
 }
 
+#[cfg(test)]
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
+    chat_with_principal(cx, req, card_id, None, None, s)
+}
+
+fn chat_with_principal<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    card_id: Option<&str>,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+) -> std::io::Result<()> {
     let req_start = Instant::now();
     let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let mut first_tok: Option<Instant> = None;
@@ -2227,8 +2306,15 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     });
+    let cache_namespace = derive_cache_namespace(
+        &cx.nonce,
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, cache_namespace, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
         record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
@@ -2302,7 +2388,8 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, prompt, ng, Some(&timing), finish, 200);
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
-                let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
+                let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
+                let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": reported_cached}});
                 eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
                 if stream {
                     let text = take_stream_text(&mut pend, true);
@@ -2358,7 +2445,19 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
     messages_with_card(cx, req, None, s)
 }
 
+#[cfg(test)]
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
+    messages_with_principal(cx, req, card_id, None, None, s)
+}
+
+fn messages_with_principal<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    card_id: Option<&str>,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+) -> std::io::Result<()> {
     let req_start = Instant::now();
     let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
     let mut first_tok: Option<Instant> = None;
@@ -2435,8 +2534,15 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     };
+    let cache_namespace = derive_cache_namespace(
+        &cx.nonce,
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, cache_namespace, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
@@ -2474,11 +2580,12 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
+                    let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
                     record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {}", timing.summary, calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
-                        "usage": streaming_delta_usage(prompt, cached, ng)})))?;
+                        "usage": streaming_delta_usage(prompt, reported_cached, ng)})))?;
                     write!(s, "{}", sse_text("message_stop", &json!({"type": "message_stop"})))?;
                     return s.flush();
                 }
@@ -2513,11 +2620,12 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
+                let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
                 record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
                 eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
                 return respond_with_timing(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
                     "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
-                    "usage": anthropic_usage(prompt, cached, ng)}).to_string(), &timing);
+                    "usage": anthropic_usage(prompt, reported_cached, ng)}).to_string(), &timing);
             }
             Ev::Err(e) => { record_err(first_tok, 400, "invalid_request_error", gen.len()); return anthropic_error(s, 400, "invalid_request_error", &e); }
             Ev::Failed(message) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", &message); }
@@ -2615,7 +2723,8 @@ pub fn serve(o: ServeOpts) {
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), active_lanes: active_lanes.clone(), conns: Default::default(), recorder,
+        cache_policy: CachePolicy { isolate_cache: o.isolate_cache, hide_cached_tokens: o.hide_cached_tokens } });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2717,13 +2826,15 @@ pub fn serve(o: ServeOpts) {
                 drop(r);
                 let _ = s.set_read_timeout(None);
                 let card_id = h.card_id.as_deref();
+                let credential = h.auth.as_deref().or(h.api_key.as_deref());
+                let tenant_ns = h.cache_namespace.as_deref();
                 let r = match route {
                     Route::Chat => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
+                        Ok(v) => chat_with_principal(&cx, &v, card_id, credential, tenant_ns, &mut s),
                         Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
                     },
                     Route::Messages => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
+                        Ok(v) => messages_with_principal(&cx, &v, card_id, credential, tenant_ns, &mut s),
                         Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
                     },
                     Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
@@ -2782,7 +2893,7 @@ mod tests {
                 DEFAULT_RETRY_AFTER_SECS,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default(),
         };
         (cx, rx)
     }
@@ -3308,7 +3419,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3331,7 +3442,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -3370,7 +3481,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -3398,7 +3509,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -3439,7 +3550,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -3461,7 +3572,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3483,7 +3594,7 @@ mod tests {
     #[test] fn serve_header_policy() {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
-            len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
+            len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, cache_namespace: None, chunked: false,
         };
         let status = |h: &Head| check_headers(h, &h.path, Some("test")).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
@@ -3496,7 +3607,7 @@ mod tests {
         head.chunked = true;
         head.len = 0;
         assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
-        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false };
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, cache_namespace: None, chunked: false };
         assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
         by_key.api_key = Some("wrong".into());
         assert_eq!(status(&by_key), Err(401));
@@ -3526,13 +3637,6 @@ mod tests {
         let mut at_end = ext.clone(); at_end[100] = 9999;
         assert_eq!(reusable_prefix(&p, true, &at_end), 100, "diverging at the first suffix token still reuses the whole prompt");
     }
-    #[test] fn decoding_invalidates_only_when_a_write_wraps_into_prefill_history() {
-        assert!(!decode_overwrites_prompt(100, 100));
-        assert!(!decode_overwrites_prompt(EXT - 1, 100));
-        assert!(decode_overwrites_prompt(EXT, 100));
-        assert!(decode_overwrites_prompt(EXT, EXT));
-        assert!(decode_overwrites_prompt(EXT + 40, EXT + 40));
-    }
 
     #[test] fn inference_failures_reach_both_apis_without_a_success_terminator() {
         let tk = Arc::new(Tokenizer::for_test());
@@ -3541,7 +3645,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default() };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -4031,7 +4135,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()), cache_policy: CachePolicy::default(),
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -4209,6 +4313,7 @@ mod tests {
             auth: auth.map(str::to_owned),
             api_key: api_key.map(str::to_owned),
             card_id: None,
+            cache_namespace: None,
             chunked: false,
         };
         // Unkeyed server permits loopback requests without headers
@@ -4231,7 +4336,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default(),
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4291,7 +4396,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None, cache_policy: CachePolicy::default(),
         });
 
         let req = json!({
@@ -4546,6 +4651,7 @@ mod tests {
                     seed: 1,
                     thinking_budget: 0,
                     loopcd_omega: 0.0,
+                    cache_namespace: 0,
                     queued_at: Instant::now(),
                     out,
                     _permit: admission.try_acquire().unwrap(),
@@ -4648,9 +4754,9 @@ mod tests {
         toks0.extend(30000..30300);
 
         let cands = [
-            InflightPrefillLane { lane: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 1, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 2, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 0, namespace: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 1, namespace: 0, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 2, namespace: 0, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
         ];
         assert_eq!(find_prefill_leader(&cands, 0), None);
         assert_eq!(find_prefill_leader(&cands, 1), Some(0));
@@ -4761,6 +4867,7 @@ mod tests {
                 seed: 1,
                 thinking_budget: 0,
                 loopcd_omega: 0.0,
+                cache_namespace: 0,
                 queued_at: Instant::now(),
                 out,
                 _permit: admission.try_acquire().unwrap(),
@@ -4816,12 +4923,12 @@ mod tests {
         metrics.lock().unwrap().queued = 2;
         jtx.send(Job {
             seq: 10, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_live_out,
+            thinking_budget: 0, loopcd_omega: 0.0, cache_namespace: 0, queued_at: Instant::now(), out: arr_live_out,
             _permit: admission.try_acquire().unwrap(),
         }).unwrap();
         jtx.send(Job {
             seq: 11, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_dead_out,
+            thinking_budget: 0, loopcd_omega: 0.0, cache_namespace: 0, queued_at: Instant::now(), out: arr_dead_out,
             _permit: admission.try_acquire().unwrap(),
         }).unwrap();
 
@@ -4903,6 +5010,7 @@ mod tests {
                 seed: 1,
                 thinking_budget: 0,
                 loopcd_omega: 0.0,
+                cache_namespace: 0,
                 queued_at: Instant::now(),
                 out,
                 _permit: admission.try_acquire().unwrap(),
@@ -4951,5 +5059,102 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn cache_isolation_and_hide_cached_tokens_across_both_apis() {
+        // 1. Header parsing and validation for X-Inky-Namespace
+        let ok_raw = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer fleet-key\r\nX-Inky-Namespace: tenant-alpha\r\nContent-Length: 2\r\n\r\n{}";
+        let ok_head = read_head(&mut BufReader::new(&ok_raw[..])).unwrap();
+        assert_eq!(ok_head.cache_namespace.as_deref(), Some("tenant-alpha"));
+        assert!(check_headers(&ok_head, "/v1/messages", Some("fleet-key")).is_ok());
+
+        for bad_ns in ["", "has space", &"a".repeat(MAX_CACHE_NAMESPACE_LEN + 1)] {
+            let mut bad_head = Head {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                len: 2,
+                auth: Some("fleet-key".into()),
+                api_key: None,
+                card_id: None,
+                cache_namespace: Some(bad_ns.into()),
+                chunked: false,
+            };
+            assert_eq!(check_headers(&bad_head, "/v1/messages", Some("fleet-key")).unwrap_err().0, 400);
+            bad_head.cache_namespace = None;
+            assert!(check_headers(&bad_head, "/v1/messages", Some("fleet-key")).is_ok());
+        }
+
+        // 2. Principal namespace derivation: same fleet bearer shares namespace; distinct key or X-Inky-Namespace isolates;
+        //    --isolate-cache gives every request its own namespace even with identical credentials.
+        let ns_card1 = derive_cache_namespace("srv-nonce", false, 1, Some("fleet-key"), None);
+        let ns_card2 = derive_cache_namespace("srv-nonce", false, 2, Some("fleet-key"), None);
+        assert_eq!(ns_card1, ns_card2, "workers sharing the fleet key must share prefix cache");
+
+        let ns_other_key = derive_cache_namespace("srv-nonce", false, 3, Some("other-key"), None);
+        let ns_tenant_a = derive_cache_namespace("srv-nonce", false, 4, Some("fleet-key"), Some("tenant-a"));
+        let ns_tenant_b = derive_cache_namespace("srv-nonce", false, 5, Some("fleet-key"), Some("tenant-b"));
+        assert_ne!(ns_card1, ns_other_key);
+        assert_ne!(ns_card1, ns_tenant_a);
+        assert_ne!(ns_tenant_a, ns_tenant_b);
+
+        let iso1 = derive_cache_namespace("srv-nonce", true, 1, Some("fleet-key"), None);
+        let iso2 = derive_cache_namespace("srv-nonce", true, 2, Some("fleet-key"), None);
+        assert_ne!(iso1, iso2, "--isolate-cache must isolate every request");
+
+        // 3. End-to-end handler test: jobs carry derived `cache_namespace` AND `--hide-cached-tokens`
+        //    zeroes client-reported cached counts across Chat Completions and Anthropic Messages (stream + non-stream).
+        for hide in [false, true] {
+            for is_msg in [false, true] {
+                for stream in [false, true] {
+                    let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(50), 4);
+                    cx.cache_policy = CachePolicy { isolate_cache: false, hide_cached_tokens: hide };
+                    let cx = Arc::new(cx);
+                    let cx2 = cx.clone();
+                    let worker = std::thread::spawn(move || {
+                        let mut out = Vec::new();
+                        let req = if is_msg {
+                            json!({"max_tokens": 8, "stream": stream, "messages": [{"role": "user", "content": "hello world"}]})
+                        } else {
+                            json!({"max_tokens": 8, "stream": stream, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "hello world"}]})
+                        };
+                        if is_msg {
+                            messages_with_principal(&cx2, &req, None, Some("cred-1"), Some("ns-1"), &mut out).unwrap();
+                        } else {
+                            chat_with_principal(&cx2, &req, None, Some("cred-1"), Some("ns-1"), &mut out).unwrap();
+                        }
+                        out
+                    });
+                    let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must enqueue");
+                    assert_eq!(
+                        job.cache_namespace,
+                        derive_cache_namespace(&cx.nonce, false, job.seq, Some("cred-1"), Some("ns-1"))
+                    );
+                    let prompt_len = job.toks.len();
+                    job.out
+                        .send(Ev::Done {
+                            prompt: prompt_len,
+                            cached: 4,
+                            gen: 1,
+                            reason: "stop",
+                            timing: Default::default(),
+                        })
+                        .unwrap();
+                    let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+                    let want_cached = if hide { 0 } else { 4 };
+                    if is_msg {
+                        assert!(
+                            resp.contains(&format!("\"cache_read_input_tokens\":{want_cached}")),
+                            "hide={hide} stream={stream} messages resp: {resp}"
+                        );
+                    } else {
+                        assert!(
+                            resp.contains(&format!("\"cached_tokens\":{want_cached}")),
+                            "hide={hide} stream={stream} chat resp: {resp}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

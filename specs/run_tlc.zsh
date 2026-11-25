@@ -119,6 +119,7 @@ check PrefixTreeFast PrefixTree
 check PrefixTreeEvictFast PrefixTree
 check PrefixTreeShallow PrefixTree DeepestStart
 check PrefixTreeStale PrefixTree ResultLive
+check PrefixTreeKindMixup PrefixTree ResultLive
 check PrefixTreeFirstToken PrefixTree MatchExact
 check PrefixTreeAnyParent PrefixTree ResultIsStart
 check PrefixTreePartial PrefixTree StartOnBoundary
@@ -243,4 +244,8 @@ if [[ -n $nightly_only && $(uname -s) = Darwin ]]; then
         'self.records.drop_ref(e.slot(), e.kind(), e.generation())' \
         'Ok::<(), BlockError>(())' \
         'Invariant PoolBooks is violated'
+    mutant kind-mixup \
+        'self.records.generation(e.slot(), e.kind()) != Some(e.generation())' \
+        'self.records.generation(e.slot(), BlockKind::Full) != Some(e.generation())' \
+        'Deadlock reached'
 fi
