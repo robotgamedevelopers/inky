@@ -12,7 +12,7 @@ mod tokenizer;
 mod unicode_tables;
 
 use engine::{Engine, Lane};
-use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus};
 use sampler::Sampler;
 use session::{Renderer, Session};
 use std::io::{BufRead, Write};
@@ -196,6 +196,43 @@ fn kv_note(eng: engine::Run, n: usize) -> String {
     else { format!("K/V cache {:.0} MiB", mib(eng.mem().0)) }
 }
 
+// Waiting alone does not mean the GPU executed the command successfully.
+fn require_gpu_completion(status: MTLCommandBufferStatus, detail: Option<&str>) {
+    assert_eq!(status, MTLCommandBufferStatus::Completed,
+        "Metal command buffer failed (status {status:?}): {}", detail.unwrap_or("no driver error provided"));
+}
+
+fn wait_checked(cb: &metal::CmdBuf) {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if status != MTLCommandBufferStatus::Completed {
+        let error = cb.error().map(|e| e.localizedDescription().to_string());
+        require_gpu_completion(status, error.as_deref());
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completed_is_accepted() {
+        require_gpu_completion(MTLCommandBufferStatus::Completed, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Metal command buffer failed")]
+    fn driver_error_is_rejected() {
+        require_gpu_completion(MTLCommandBufferStatus::Error, Some("test driver error"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Metal command buffer failed")]
+    fn nonterminal_status_is_rejected() {
+        require_gpu_completion(MTLCommandBufferStatus::Scheduled, None);
+    }
+}
+
 fn check(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
@@ -228,17 +265,17 @@ fn check(o: &Opts) {
                 let cbp = eng.gpu.cmd();
                 eng.encode_prefill(&cbp, p0, t, p0 + t == pf, false);
                 cbp.commit();
-                cbp.waitUntilCompleted();
+                wait_checked(&cbp);
                 p0 += t;
             }
         } else if kv_disk {
             eng.gen_reserve(pos);
-            eng.step(pos, true, false).waitUntilCompleted();
+            wait_checked(&eng.step(pos, true, false));
         } else if dec_steps {
             eng.encode_decode(&cb, &[engine::Span { lane: eng.lane, p0: pos, t: 1 }], true, false);
         } else { eng.encode_step(&cb, pos, true, false); }
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_checked(&cb);
         // dev: INK_KVQ=kbits,vbits rounds the cache as it is written, to measure what a coarser cache would cost
         if let Ok(v) = std::env::var("INK_KVQ") {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
@@ -478,7 +515,7 @@ fn crosspath(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.on(lane).encode_prefill(&cb, p0, t, logits, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_checked(&cb);
     };
     // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
     let mut cursor = 0;
@@ -500,7 +537,7 @@ fn crosspath(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_decode(&cb, &[Span { lane: &decode, p0: target, t: 1 }], true, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_checked(&cb);
         let actual = eng.span_logits(0);
         let first_bad = expected.iter().zip(actual).position(|(&a, &b)| {
             !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
