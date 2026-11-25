@@ -29,8 +29,8 @@ jobs:
         run: scripts/check-tla.sh
       - name: build
         run: cargo build --release
-      - name: unit tests (debug assertions)
-        run: cargo test --bins
+      - name: unit and integration tests (debug assertions)
+        run: cargo test --locked --bins --tests
       - name: unit tests (release)
         run: cargo test --release --bins
   go:
@@ -42,6 +42,8 @@ jobs:
         with:
           go-version: '1.26.10'
           cache: false
+      - name: release gate tests
+        run: python3 tests/test_release_ci.py
       - name: soak client tests
         run: go test -race tests/soak_client.go tests/soak_client_test.go
       - name: load client tests
@@ -61,6 +63,9 @@ jobs:
       - name: fleetcheck tests
         working-directory: tests
         run: go vet ./fleetcheck/... && go test -race ./fleetcheck/...
+      - name: servecheck tests
+        working-directory: tests
+        run: go vet ./servecheck && go test -race ./servecheck
       - name: replay sweep tests
         working-directory: tools/replay
         run: go vet ./... && go test -race ./...
@@ -69,7 +74,7 @@ jobs:
     # Pull requests from forks never run here (the repository also requires approval for outside contributors).
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, m5]
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: build
@@ -85,22 +90,10 @@ jobs:
       # servecheck allocates ephemeral loopback ports, bounds requests/server
       # lifetime, and cancels/waits for each child server before removing logs.
       - name: serve API probes
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
           SERVECHECK_SABOTAGE: ''
         run: tests/serve.sh
-      - name: serve API negative control
-        timeout-minutes: 10
-        env:
-          SERVECHECK_SABOTAGE: health-status
-        run: |
-          log=$(mktemp)
-          trap 'rm -f "$log"' EXIT
-          if tests/serve.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
-          cat "$log"
-          # Require the deliberate mismatch and completed suite; a crash is not proof.
-          test "$rc" -eq 1
-          grep -Fxq 'FAIL bearer authentication and public health: sabotage health-status: got HTTP 200, want 418' "$log"
-          grep -Fxq 'one or more serve checks failed' "$log"
-          test "$(grep -c '^FAIL ' "$log")" -eq 1
-          echo 'serve health-status sabotage: detected, as required'
+      - name: serve API negative controls
+        timeout-minutes: 15
+        run: tests/serve-negative.sh tests/serve.sh

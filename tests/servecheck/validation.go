@@ -30,7 +30,7 @@ type healthSnapshot struct {
 
 func (g *gate) fetchHealth(path string) (int, healthSnapshot, error) {
 	var snap healthSnapshot
-	req, err := http.NewRequest(http.MethodGet, g.url+path, nil)
+	req, err := http.NewRequestWithContext(g.ctx, http.MethodGet, g.url+path, nil)
 	if err != nil {
 		return 0, snap, err
 	}
@@ -57,6 +57,9 @@ func (g *gate) waitHealthDrained(timeout time.Duration) (healthSnapshot, error) 
 				snap.QueuedRequests != nil && *snap.QueuedRequests == 0 {
 				return snap, nil
 			}
+		}
+		if g.ctx.Err() != nil {
+			return last, g.ctx.Err()
 		}
 		if time.Now().After(deadline) {
 			if err != nil {
@@ -139,7 +142,7 @@ func (g *gate) observeHeaders(path string, headers map[string]string, body []byt
 	if body != nil {
 		method = http.MethodPost
 	}
-	req, err := http.NewRequest(method, g.url+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(g.ctx, method, g.url+path, bytes.NewReader(body))
 	if err != nil {
 		return result, err
 	}
@@ -190,7 +193,7 @@ func (g *gate) checkHealth(path string, sabotage bool) error {
 }
 
 func (g *gate) validation(expectedLanes int) {
-	g.run("bearer authentication and public health", func() error {
+	g.run("bearer authentication and public health", func(g *gate) error {
 		for _, auth := range []string{"", "Bearer " + g.key + "-wrong"} {
 			r, err := g.observe("/v1/models", auth, nil)
 			if err != nil {
@@ -231,9 +234,9 @@ func (g *gate) validation(expectedLanes int) {
 		if err := verifyModelsList(goodKey.Models); err != nil {
 			return err
 		}
-		return g.checkHealth("/health", g.sabotage == "health-status")
+		return g.checkHealth("/health", g.sabotageEnabled("health-status"))
 	})
-	g.run("health reports Metal memory budget and admission limits", func() error {
+	g.run("health reports Metal memory budget and admission limits", func(g *gate) error {
 		code, snap, err := g.fetchHealth("/health")
 		if err != nil {
 			return err
@@ -248,7 +251,7 @@ func (g *gate) validation(expectedLanes int) {
 		if verifyHealthBudget(badSnap, expectedLanes) == nil {
 			return fmt.Errorf("health budget assertion accepted zero working set")
 		}
-		if g.sabotage == "memory-budget" {
+		if g.sabotageEnabled("memory-budget") {
 			snap.RecommendedWorkingSetBytes = &zero
 			if err := verifyHealthBudget(snap, expectedLanes); err != nil {
 				return fmt.Errorf("sabotage memory-budget: %w", err)
@@ -257,7 +260,7 @@ func (g *gate) validation(expectedLanes int) {
 		}
 		return verifyHealthBudget(snap, expectedLanes)
 	})
-	g.run("sampling bounds and subsequent health", func() error {
+	g.run("sampling bounds and subsequent health", func(g *gate) error {
 		for _, tc := range []struct{ name, field string }{{"max_tokens", `"max_tokens":18446744073709551615`}, {"temperature", `"temperature":5,"max_tokens":1`}, {"top_p", `"top_p":0,"max_tokens":1`}} {
 			body := []byte(`{"messages":[{"role":"user","content":"Hello."}],` + tc.field + "}")
 			r, err := g.observe("/v1/chat/completions", "Bearer "+g.key, body)
@@ -276,7 +279,7 @@ func (g *gate) validation(expectedLanes int) {
 		}
 		return g.checkHealth("/health", false)
 	})
-	g.run("bearer header casing and trailing-slash health", func() error {
+	g.run("bearer header casing and trailing-slash health", func(g *gate) error {
 		r, err := g.observe("/v1/models", "BEARER "+g.key, nil)
 		if err != nil {
 			return err
