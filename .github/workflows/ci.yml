@@ -115,7 +115,20 @@ jobs:
       - name: build
         run: cargo build --locked --profile ci
       - name: GPU router regression
-        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
+        run: |
+          out=$(cargo test --locked --bins --profile ci engine::tests::router_handles_nonfinite_scores -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU window attention split-invariance regression
+        run: |
+          out=$(cargo test --locked --bins --profile ci engine::tests::k_attn_b_and_blk_are_split_invariant_across_sliding_window -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'k_attn_b split-invariance: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU pool slot zero-fill on reuse
+        run: |
+          out=$(cargo test --locked --bins --profile ci blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (pull request set)
         env:
           INKY_BIN: ./target/ci/inky

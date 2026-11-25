@@ -5,7 +5,8 @@
 set -e
 set -o pipefail
 B=${1:-./target/release/inky}
-D=$(mktemp -d); trap 'rm -rf $D' EXIT
+mkdir -p ./target
+D=$(mktemp -d ./target/inky-golden.XXXXXX); trap 'rm -rf "$D"' EXIT
 nv=200058
 # a reference of one zero logit row: check then hashes every step and compares only the last position (ignored here)
 for f in haiku long; do cp ref/$f.tokens $D/$f.tokens; head -c $((nv * 4)) /dev/zero > $D/$f.logits; done

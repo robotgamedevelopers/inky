@@ -26,7 +26,7 @@ impl backend::SchedulerEngine for FakeEngine {
     fn prefill(&self, _: &[LaneS<()>], _: &[(usize, usize, usize)]) -> Duration { Duration::ZERO }
     fn decode(&self, _: &[LaneS<()>], _: &[usize]) -> Duration { Duration::ZERO }
     fn save_state(&self, _: &()) -> Vec<u8> { vec![] }
-    fn result_logits(&self, _: Option<usize>) -> &[f32] { &[0.0, 1.0] }
+    fn result_logits(&self, _: Option<usize>) -> Vec<f32> { vec![0.0, 1.0] }
 }
 
 struct Workload<'a> {

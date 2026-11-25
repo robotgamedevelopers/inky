@@ -618,11 +618,11 @@ fn check(o: &Opts) -> Result<(), String> {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
-        let raw: &[f32] = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
+        let raw = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
         if let Some(token) = raw.iter().position(|x| !x.is_finite()) {
             return Err(format!("non-finite engine logit at position {pos}, token {token}"));
         }
-        for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
         let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
@@ -724,7 +724,7 @@ fn rows(o: &Opts) {
     let mut ok = true;
     for r in 0..1 + k {
         let got = eng.span_logits(r);
-        let same = got == expect[r].as_slice();
+        let same = &*got == expect[r].as_slice();
         ok &= same;
         println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
     }
@@ -792,7 +792,7 @@ fn rollback(o: &Opts) {
         eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
         cb.commit();
         cb.waitUntilCompleted();
-        let logits_same = eng.span_logits(n_keep - 1) == ref_logits.as_slice();
+        let logits_same = &*eng.span_logits(n_keep - 1) == ref_logits.as_slice();
         eng.rollback_verify(&lane, 0, n_keep);
         let pref_ok = eng.lane_hash(&lane) == hash_pref;
         run.set_tokens(reject_at, &[true_tok(reject_at)]);
@@ -820,9 +820,30 @@ fn binv(o: &Opts) -> Result<(), String> {
     let tk = Tokenizer::load(&eng.g);
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
     // each entry is one way to split the prompt: boundaries joined by '+' ("37+190": three prefills); an entry may repeat,
-    // which tests that the same split gives the same bits run after run
-    let splits: Vec<Vec<usize>> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',')
-        .map(|v| v.split('+').map(|x| x.parse().unwrap()).filter(|&x| x > 0).collect()).collect();
+    // which tests that the same split gives the same bits run after run. At least two schedules are required (refusing e.g. `INK_SPLITS=0` alone).
+    let raw_splits = std::env::var("INK_SPLITS").unwrap_or_else(|_| "0,1,5,16,23,100,1001".into());
+    let splits: Vec<Vec<usize>> = raw_splits
+        .split(',')
+        .map(|v| {
+            if v.trim().is_empty() {
+                eprintln!("[inky] INK_SPLITS contains an empty schedule in {raw_splits:?}");
+                std::process::exit(2);
+            }
+            v.split('+')
+                .map(|x| {
+                    x.trim().parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("[inky] invalid split point {x:?} in INK_SPLITS={raw_splits:?}");
+                        std::process::exit(2);
+                    })
+                })
+                .filter(|&x| x > 0)
+                .collect()
+        })
+        .collect();
+    if splits.len() < 2 {
+        eprintln!("[inky] INK_SPLITS must specify at least two split schedules to compare (got {raw_splits:?})");
+        std::process::exit(2);
+    }
     let mut first = None;
     let mut base: Vec<f32> = Vec::new();
     let mut ok = true;
@@ -832,20 +853,21 @@ fn binv(o: &Opts) -> Result<(), String> {
         for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b])?; p = b; } }
         let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
         let k = if k.is_empty() { "0".to_string() } else { k };
+        let lg = eng.logits();
         let mut h = 0xcbf29ce484222325u64;
-        for x in eng.logits() { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*lg { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         let same = *first.get_or_insert(h) == h;
-        if base.is_empty() { base = eng.logits().to_vec(); }
-        let maxdiff = eng.logits().iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        if base.is_empty() { base = lg.to_vec(); }
+        let maxdiff = lg.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
         ok &= same;
         // KL(first || this) over the soft-capped logits, as sampling sees them
         let cap = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| softcap(x, eng.softcap)).collect() };
-        let (pa, pb) = (cap(&base), cap(eng.logits()));
+        let (pa, pb) = (cap(&base), cap(&lg));
         let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
         let (l1, l2) = (lse(&pa), lse(&pb));
         let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
-        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
+        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(&lg));
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
@@ -873,7 +895,7 @@ fn lanes(o: &Opts) {
         let cb = run.gpu.cmd();
         if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
         cb.commit(); cb.waitUntilCompleted();
-        for x in run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
     };
     // per-step hashes, to name the first step where two runs part
     let trace = |run: &engine::Run, toks: &[u32], other: Option<&engine::Run>| -> Vec<u64> {
@@ -945,7 +967,7 @@ fn spans(o: &Opts) {
         let mut hs = Vec::new();
         for &(p0, t) in &work {
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); cb.waitUntilCompleted();
-            hs.push(fnv(eng.logits()));
+            hs.push(fnv(&eng.logits()));
         }
         alone.push((hs, eng.lane_hash(&l)));
     }
@@ -962,15 +984,18 @@ fn spans(o: &Opts) {
             for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
             if sp.is_empty() { continue; }
             if sabotage && !sabotaged && sp.len() >= 2 {
-                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
-                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
-                sp[0].lane = &lanes[who[1]];
+                // negative control: swap the first two spans' lanes so every span still names a distinct lane,
+                // while binding both spans to the wrong lane's state; their logits and caches must then differ
+                println!("INK_SPANS_SABOTAGE: spans of lanes {} and {} swapped", who[0], who[1]);
+                let lane0 = sp[0].lane;
+                sp[0].lane = sp[1].lane;
+                sp[1].lane = lane0;
                 sabotaged = true;
             }
             if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
             nsteps += 1;
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
-            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
+            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(&*(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) }))); }
         }
         let mut bad = Vec::new();
         for i in 0..n {
@@ -1057,7 +1082,7 @@ fn xcopy(o: &Opts) {
         let cb = eng.gpu.cmd();
         if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
         cb.commit(); cb.waitUntilCompleted();
-        fnv(if dec { eng.span_logits(0) } else { eng.logits() })
+        fnv(&*(if dec { eng.span_logits(0) } else { eng.logits() }))
     };
     let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
         let mut hs = Vec::new(); let mut p = from;
@@ -1159,7 +1184,7 @@ fn temp1(o: &Opts) {
                     gcb.waitUntilCompleted();
                     r.sampled_token_at(pos).expect("valid GPU sample")
                 } else {
-                    sampler.sample_next(eng.logits()).expect("solo prefill sample")
+                    sampler.sample_next(&eng.logits()).expect("solo prefill sample")
                 };
                 let mut toks = vec![first_tok];
                 while toks.len() < ndec {
@@ -1178,7 +1203,7 @@ fn temp1(o: &Opts) {
                         gcb.waitUntilCompleted();
                         r.sampled_token_at(next_pos).expect("valid GPU sample")
                     } else {
-                        sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
+                        sampler.sample_next(&eng.span_logits(0)).expect("solo decode sample")
                     };
                     pos = next_pos;
                     toks.push(tok);
@@ -1266,10 +1291,14 @@ fn temp1(o: &Opts) {
                             .iter()
                             .map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t })
                             .collect();
+                        let want_logits: Vec<bool> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| p0 + t == reqs[i].pf_end)
+                            .collect();
                         let many = spans.len() > 1;
                         eng.poison_scratch();
                         let cb = eng.gpu.cmd();
-                        eng.encode_spans(&cb, &spans, true, false);
+                        eng.encode_spans_logits(&cb, &spans, &want_logits, false);
                         cb.commit();
                         cb.waitUntilCompleted();
                         let mut gpu_pf = Vec::new();
@@ -1280,7 +1309,7 @@ fn temp1(o: &Opts) {
                                     gpu_pf.push((k, i));
                                 } else {
                                     let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                                    let tok = reqs[i].sampler.sample_next(lg).expect("batched pf sample");
+                                    let tok = reqs[i].sampler.sample_next(&lg).expect("batched pf sample");
                                     reqs[i].toks.push(tok);
                                 }
                             }
@@ -1338,7 +1367,7 @@ fn temp1(o: &Opts) {
                             let tok = if reqs[i].sampler.uses_gpu_gumbel() {
                                 eng.on(&reqs[i].lane).sampled_token_at(reqs[i].n_past).expect("valid GPU sample")
                             } else {
-                                reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
+                                reqs[i].sampler.sample_next(&eng.span_logits(k)).expect("batched dec sample")
                             };
                             reqs[i].toks.push(tok);
                         }
@@ -1489,7 +1518,7 @@ fn dbatch(o: &Opts) {
         for q in 0..nd {
             let cb = eng.gpu.cmd();
             if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
-            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(if old { eng.logits() } else { eng.span_logits(0) }));
+            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(&*(if old { eng.logits() } else { eng.span_logits(0) })));
         }
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
@@ -1507,7 +1536,7 @@ fn dbatch(o: &Opts) {
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
+            for j in 0..n { hs[j].push(fnv(&*(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) }))); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
@@ -2092,7 +2121,7 @@ fn main() {
             let mut p0 = 0;
             while p0 < n { let t = (n - p0).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, p0, t, p0 + t == n, false); cb.commit(); cb.waitUntilCompleted(); p0 += t; }
             let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
-            let first = am(eng.logits()) as u32;
+            let first = am(&eng.logits()) as u32;
             let snap = eng.snapshot();
             let run = |toks: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<f32>>, f64) {
                 eng.restore(&snap);
