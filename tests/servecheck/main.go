@@ -23,6 +23,10 @@ type gate struct {
 	failed        bool
 }
 
+func (g *gate) sabotageEnabled(probe string) bool {
+	return g.sabotage == "all" || g.sabotage == probe
+}
+
 func (g *gate) run(name string, fn func() error) {
 	if err := fn(); err != nil {
 		fmt.Printf("FAIL %s: %v\n", name, err)
@@ -139,7 +143,7 @@ func execute() error {
 	http.DefaultClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	sabotage := os.Getenv("SERVECHECK_SABOTAGE")
 	switch sabotage {
-	case "", "health-status", "memory-budget", "concurrent-tool-calls", "disconnect-mid-thinking":
+	case "", "all", "health-status", "memory-budget", "concurrent-tool-calls", "disconnect-mid-thinking":
 	default:
 		return fmt.Errorf("unknown SERVECHECK_SABOTAGE probe %q", sabotage)
 	}

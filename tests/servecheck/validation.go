@@ -231,7 +231,7 @@ func (g *gate) validation(expectedLanes int) {
 		if err := verifyModelsList(goodKey.Models); err != nil {
 			return err
 		}
-		return g.checkHealth("/health", g.sabotage == "health-status")
+		return g.checkHealth("/health", g.sabotageEnabled("health-status"))
 	})
 	g.run("health reports Metal memory budget and admission limits", func() error {
 		code, snap, err := g.fetchHealth("/health")
@@ -248,7 +248,7 @@ func (g *gate) validation(expectedLanes int) {
 		if verifyHealthBudget(badSnap, expectedLanes) == nil {
 			return fmt.Errorf("health budget assertion accepted zero working set")
 		}
-		if g.sabotage == "memory-budget" {
+		if g.sabotageEnabled("memory-budget") {
 			snap.RecommendedWorkingSetBytes = &zero
 			if err := verifyHealthBudget(snap, expectedLanes); err != nil {
 				return fmt.Errorf("sabotage memory-budget: %w", err)

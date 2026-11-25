@@ -297,7 +297,7 @@ func (g *gate) concurrentToolCalls() error {
 			}
 			got[o.idx] = o.sample
 		}
-		if g.sabotage == "concurrent-tool-calls" && tc.stream {
+		if g.sabotageEnabled("concurrent-tool-calls") && tc.stream {
 			// Negative control: inject duplicate call ID + argument bleed to prove validator catches it.
 			got[1].ToolCalls[0].ID = got[0].ToolCalls[0].ID
 			got[1].ToolCalls[0].Function.Arguments += "bleed"
@@ -454,7 +454,7 @@ func (g *gate) disconnectMidThinking() error {
 	if err != nil {
 		return err
 	}
-	if g.sabotage == "disconnect-mid-thinking" {
+	if g.sabotageEnabled("disconnect-mid-thinking") {
 		// Negative control: simulate an uncancelled lane that ran to max_tokens.
 		fakeLog := []byte(fmt.Sprintf("[serve] client gone after %d generated tokens; lane freed\n", thinkMaxTokens))
 		if err := verifyDisconnectMidThinking(fakeLog, thinkMaxTokens, drained, ref, followUp); err != nil {
