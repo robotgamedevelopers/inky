@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 mod block_cache;
 mod timing;
 use block_cache::{
-    effective_pf_target, find_prefill_leader, inflight_shared_checkpoint, InflightPrefillLane,
-    LaneBlockState, ServeBlockCache,
+    effective_pf_target, find_prefill_leader, inflight_shared_checkpoint,
+    reserved_inflight_full_slots, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
+    ServeBlockCache,
 };
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
@@ -883,7 +884,38 @@ fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCa
 
 const SERVE_STEP_MAX_BYPASS: u32 = 16;
 
-fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>, active_lanes: Arc<AtomicUsize>, metrics: &Mutex<Counters>) {
+/// Partition `ensure_span_blocks` failures into `(to_defer, to_fail)`.
+/// When any lane in the current step succeeded (`live_any`) or another runnable lane outside the
+/// step can still make progress and free blocks (`other_runnable_exists`), all exhausted lanes
+/// defer with zero HTTP 500s. Only when zero progress is otherwise possible do we fail one victim
+/// (or the sole unrecoverable lane) to release its blocks and prevent livelock.
+fn partition_pool_exhausted(
+    exhausted: Vec<(usize, String)>,
+    live_any: bool,
+    other_runnable_exists: bool,
+) -> (Vec<usize>, Vec<(usize, String)>) {
+    if exhausted.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if live_any || other_runnable_exists {
+        return (exhausted.into_iter().map(|(i, _)| i).collect(), Vec::new());
+    }
+    let mut to_fail = exhausted;
+    let victim = to_fail.pop().expect("non-empty exhausted");
+    let to_defer = to_fail.into_iter().map(|(i, _)| i).collect();
+    (to_defer, vec![victim])
+}
+
+fn scheduler(
+    eng: &Engine,
+    tk: &Tokenizer,
+    sp: Specials,
+    nlanes: usize,
+    rx: Receiver<Job>,
+    active_lanes: Arc<AtomicUsize>,
+    metrics: &Mutex<Counters>,
+    spill_store: Option<crate::spill::SpillStore>,
+) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
         .enumerate()
         .map(|(i, _)| LaneS {
@@ -893,13 +925,25 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             job: None,
         })
         .collect();
-    let mut cache = ServeBlockCache::new();
+    let mut cache = match spill_store {
+        Some(store) => ServeBlockCache::with_spill(store),
+        None => ServeBlockCache::new(),
+    };
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
+    let mut pool_deferred = vec![false; nlanes];
+    let mut prev_lanes_released = cache.stats().lanes_released;
+    let mut prev_window_pruned = cache.stats().window_pruned;
     let mut checkpoints_sealed = false;
     loop {
+        let cur_stats = cache.stats();
+        if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
+            pool_deferred.fill(false);
+            prev_lanes_released = cur_stats.lanes_released;
+            prev_window_pruned = cur_stats.window_pruned;
+        }
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
         // take new requests: block only when there is nothing to do
@@ -963,24 +1007,48 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             let active_now = lanes.iter().filter(|l| l.job.is_some()).count();
             {
                 let pools = eng.block_pool().borrow();
-                let leaders: Vec<InflightPrefillLane<'_>> = lanes
+                let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, l)| {
                         let a = l.job.as_ref()?;
-                        let run = !a.job.out.cancelled() && !a.job.out.backpressured();
-                        (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
+                        let run = !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[idx];
+                        Some(InflightLaneReserve {
                             lane: idx,
                             toks: &a.job.toks,
                             n_past: a.n_past,
                             pf_end: a.pf_end,
+                            cached: a.cached,
+                            written: l.blocks.written,
+                            gen: a.gen,
+                            max_gen: a.job.max,
                             runnable: run,
-                            eligible_follower: false,
                         })
                     })
                     .collect();
+                let leaders: Vec<InflightPrefillLane<'_>> = active_reserves
+                    .iter()
+                    .filter(|r| r.gen == 0 && r.n_past < r.pf_end)
+                    .map(|r| InflightPrefillLane {
+                        lane: r.lane,
+                        toks: r.toks,
+                        n_past: r.n_past,
+                        pf_end: r.pf_end,
+                        runnable: r.runnable,
+                        eligible_follower: false,
+                    })
+                    .collect();
                 let shared_ckpt = inflight_shared_checkpoint(&j.toks, &leaders);
-                if !cache.can_admit_with_shared(&pools, active_now, &j.toks, j.max, eng.chunk, shared_ckpt) {
+                let reserved_inflight_full = reserved_inflight_full_slots(&active_reserves);
+                if !cache.can_admit_with_shared(
+                    &pools,
+                    active_now,
+                    &j.toks,
+                    j.max,
+                    eng.chunk,
+                    shared_ckpt,
+                    reserved_inflight_full,
+                ) {
                     break;
                 }
             }
@@ -1021,6 +1089,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 pending: None,
                 job: j,
             });
+            pool_deferred[i] = false;
             planner.on_admit(i);
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
@@ -1045,7 +1114,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         }
         // Starvation-bounded Layer 4 step selection: ceiling >= W, longest-waiting first,
         // active 1-token decoding lanes, then 64-aligned prefill spans capped at checkpoint boundaries.
-        let runnable = |a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured();
+        let runnable = |i: usize, a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[i];
         let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
             .iter()
             .enumerate()
@@ -1056,7 +1125,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     toks: &a.job.toks,
                     n_past: a.n_past,
                     pf_end: a.pf_end,
-                    runnable: runnable(a),
+                    runnable: runnable(i, a),
                     eligible_follower: a.n_past == a.cached && l.blocks.written == a.n_past,
                 })
             })
@@ -1069,7 +1138,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         }
         let step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
             Some(a) => crate::scheduler::ServeLaneInput {
-                runnable: runnable(a) && !deferred_by_singleflight[i],
+                runnable: runnable(i, a) && !deferred_by_singleflight[i],
                 n_past: a.n_past,
                 pf_end: effective_pf_target(a.n_past, a.pf_end),
                 has_pending_decode: a.pending.is_some() && a.n_past < a.pf_end + a.gen,
@@ -1091,12 +1160,28 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         }
                     }
                 }
-                for (i, msg) in exhausted {
-                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
-                    planner.on_finish(i);
+                if !exhausted.is_empty() {
+                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                        !sp_list.iter().any(|&(k, _, _)| k == j)
+                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                    });
+                    let (to_defer, to_fail) =
+                        partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_runnable_exists);
+                    for i in to_defer {
+                        cache.record_step_deferred_pool_pressure();
+                        pool_deferred[i] = true;
+                    }
+                    for (i, msg) in to_fail {
+                        lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                        planner.on_finish(i);
+                    }
                 }
                 if live_sp.is_empty() {
-                    let _ = planner.complete_step();
+                    for cancelled_i in planner.complete_step() {
+                        if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
+                            a.log_cancellation(cancelled_i);
+                        }
+                    }
                     continue;
                 }
                 let spans: Vec<Span> = live_sp.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
@@ -1218,12 +1303,28 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         }
                     }
                 }
-                for (i, msg) in exhausted {
-                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
-                    planner.on_finish(i);
+                if !exhausted.is_empty() {
+                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                        !need_dec.contains(&j)
+                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                    });
+                    let (to_defer, to_fail) =
+                        partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_runnable_exists);
+                    for i in to_defer {
+                        cache.record_step_deferred_pool_pressure();
+                        pool_deferred[i] = true;
+                    }
+                    for (i, msg) in to_fail {
+                        lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                        planner.on_finish(i);
+                    }
                 }
                 if live_dec.is_empty() {
-                    let _ = planner.complete_step();
+                    for cancelled_i in planner.complete_step() {
+                        if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
+                            a.log_cancellation(cancelled_i);
+                        }
+                    }
                     continue;
                 }
                 // feed each lane's pending token at its position
@@ -2412,7 +2513,7 @@ pub fn serve(o: ServeOpts) {
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
-    if let Some(spill_dir) = &o.spill_dir {
+    let spill_store = if let Some(spill_dir) = &o.spill_dir {
         match crate::spill::SpillStore::open(spill_dir, o.max_spill_bytes) {
             Ok(store) => {
                 let swept = store.stats().orphans_swept;
@@ -2422,13 +2523,16 @@ pub fn serve(o: ServeOpts) {
                     o.max_spill_bytes as f64 / (1u64 << 30) as f64,
                     swept,
                 );
+                Some(store)
             }
             Err(e) => {
                 eprintln!("cannot prepare --spill-dir {}: {e}", spill_dir.display());
                 std::process::exit(2);
             }
         }
-    }
+    } else {
+        None
+    };
     let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
@@ -2550,7 +2654,7 @@ pub fn serve(o: ServeOpts) {
             });
         }
     });
-    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics);
+    scheduler(&eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store);
 }
 
 #[cfg(test)]
@@ -4359,7 +4463,7 @@ mod tests {
             (turn2, turn3, t1_out, t2_out, t3_out)
         });
 
-        scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics);
+        scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
 
         // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!
@@ -4443,5 +4547,37 @@ mod tests {
         drop(events);
         assert!(out.cancelled());
         assert!(out.send(Ev::Alive).is_err());
+    }
+
+    #[test] fn pool_exhaustion_partition_defers_when_progress_exists_and_breaks_livelock() {
+        let ex = vec![
+            (1, "KV block pool exhausted (Full)".to_string()),
+            (2, "KV block pool exhausted (Full)".to_string()),
+        ];
+        // Partial step succeeded -> defer all exhausted lanes, fail 0.
+        let (defer, fail) = partition_pool_exhausted(ex.clone(), true, false);
+        assert_eq!(defer, vec![1, 2]);
+        assert!(fail.is_empty());
+
+        // Nothing in current step ran, but another runnable lane exists -> defer all, fail 0.
+        let (defer, fail) = partition_pool_exhausted(ex.clone(), false, true);
+        assert_eq!(defer, vec![1, 2]);
+        assert!(fail.is_empty());
+
+        // Zero progress possible across 2 exhausted lanes -> fail 1 victim to free blocks, defer the other.
+        let (defer, fail) = partition_pool_exhausted(ex, false, false);
+        assert_eq!(defer, vec![1]);
+        assert_eq!(fail.len(), 1);
+        assert_eq!(fail[0].0, 2);
+
+        // Single unrecoverable lane -> fail it.
+        let (defer, fail) = partition_pool_exhausted(
+            vec![(0, "KV block pool exhausted (Full)".to_string())],
+            false,
+            false,
+        );
+        assert!(defer.is_empty());
+        assert_eq!(fail.len(), 1);
+        assert_eq!(fail[0].0, 0);
     }
 }
