@@ -19,28 +19,41 @@ fn differs_from_plain(guided: &[f32], plain: &[f32], cap: f32) -> bool {
     guided.iter().zip(plain).any(|(&a, &b)| (a - cap * (b / cap).tanh()).abs() > 0.1)
 }
 
-#[test]
-#[ignore = "needs the Inkling Q4_K_M model and an M5 Metal device"]
-fn loopcd_model_first_token_and_mixed_lanes() {
+const OMEGA: f32 = 4.0;
+
+fn load_fixture() -> (Engine, Tokenizer, Vec<u32>) {
     let model = std::env::var("INKY_MODEL").unwrap_or_else(|_| default_model());
     let eng = Engine::load(&model, 128);
     let tk = Tokenizer::load(&eng.g);
     let toks = tk.encode("At the edge of the forest, the traveler found", false);
-    let pos = toks.len() - 1;
-    assert!(pos > 0 && toks.len() <= crate::blocks::BLOCK);
+    assert!(toks.len() > 1 && toks.len() <= crate::blocks::BLOCK);
     eng.ensure_batch(64);
-    const OMEGA: f32 = 4.0;
+    (eng, tk, toks)
+}
+
+#[test]
+#[ignore = "needs the Inkling Q4_K_M model and an M5 Metal device"]
+fn loopcd_cli_first_token() {
+    let (eng, tk, toks) = load_fixture();
+    let pos = toks.len() - 1;
 
     // Reference: evaluate the final prompt token in a standalone ordinary decode after
     // the prior tokens have warmed the lane. The weak pass must leave the strong KV/CS intact.
+    let prefix = Lane::new(&eng);
+    let run = eng.on(&prefix);
+    run.reserve(toks.len() + 1, true);
+    run.set_tokens(0, &toks);
+    let cb = eng.gpu.cmd();
+    run.encode_prefill(&cb, 0, pos, false, false);
+    complete(cb);
     let cli_reference = |omega| {
         eng.set_loopcd_omega(omega);
         let lane = Lane::new(&eng);
         let run = eng.on(&lane);
         run.reserve(toks.len() + 1, true);
+        eng.copy_lane(&prefix, &lane);
         run.set_tokens(0, &toks);
         let cb = eng.gpu.cmd();
-        run.encode_prefill(&cb, 0, pos, false, false);
         run.encode_step(&cb, pos, true, true);
         complete(cb);
         (eng.logits().to_vec(), run.token_at(toks.len()), eng.lane_hash(&lane))
@@ -75,9 +88,15 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     assert_eq!(draw(&mut session, first), [guided_draw]);
     eprintln!("first-token reference: seed={seed} plain={plain_draw} guided={guided_draw}");
 
+}
+
+#[test]
+#[ignore = "needs the Inkling Q4_K_M model and an M5 Metal device"]
+fn loopcd_paged_mixed_lane_state() {
+    let (eng, _, toks) = load_fixture();
+    let pos = toks.len() - 1;
     // Seed three independent paged cache lanes. Decode two together at different weights
     // and the same plain lane alone. Compare both kinds of physical pages and recurrent state.
-    eng.ensure_batch(64);
     eng.ensure_dbatch(2);
     let paged = || {
         let lane = Lane::new_blocked(&eng, 128);
@@ -108,18 +127,18 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     final_row(&[&solo], &[0.0]);
     let solo_row = eng.span_logits(0).to_vec();
     final_row(&[&disabled, &enabled], &[0.0, OMEGA]);
-    assert!(same_row(eng.span_logits(0), &solo_row), "neighbor changed disabled logits");
-    assert!(differs_from_plain(eng.span_logits(1), &solo_row, eng.softcap));
-    assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
-    assert_eq!(eng.effective_sampler_softcap(1), 0.0);
+    assert!(same_row(eng.span_logits(0), &solo_row), "LoopCD paged weak pass changed strong logits or state: disabled row");
     let pools = eng.block_pool().borrow();
     for lane in [&disabled, &enabled] {
-        assert!(eng.on(lane).get_cs() == eng.on(&solo).get_cs(), "recurrent state changed");
+        assert!(eng.on(lane).get_cs() == eng.on(&solo).get_cs(), "LoopCD paged weak pass changed strong logits or state: recurrent state");
         for kind in [BlockKind::Full, BlockKind::Window] {
             let slot_at = |l: &Lane| l.block_table().borrow().get(kind, BlockIndex::new(0)).unwrap().unwrap().slot();
             let pool = pools.of(kind);
             assert!(pool.slot_bytes(slot_at(lane)).unwrap() == pool.slot_bytes(slot_at(&solo)).unwrap(),
-                    "{kind:?} cache changed");
+                    "LoopCD paged weak pass changed strong logits or state: {kind:?} cache");
         }
     }
+    assert!(differs_from_plain(eng.span_logits(1), &solo_row, eng.softcap));
+    assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
+    assert_eq!(eng.effective_sampler_softcap(1), 0.0);
 }
