@@ -37,8 +37,10 @@ const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
 const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
 pub const KPS_CHUNK: usize = 32;
-/// keys in front of the prefill K/V scratch that the 64-key attention chunks may read (always masked)
-const KGUARD: usize = 64;
+/// Key rows loaded together by k_attn_h (AK in prefill.metal).
+const ATT_AK: usize = 64;
+/// Enough guard rows for an attention tile to overlap either edge of the scratch.
+const KGUARD: usize = ATT_AK;
 /// most spans one step can carry (each has a logits row in the batch arena)
 pub const MAX_SPANS: usize = 128;
 const MAX_PREFILL_CHUNK: usize = 4096;
@@ -272,8 +274,10 @@ struct KvPrepArgs {
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnBArgs { t: u32, p0: u32, ring: u32, cap: u32, k_base: u32, v_base: u32, window: u32, qp_off: u32,
                    rp_off: u32, sink_off: u32, gate_off: u32, out_off: u32, relbias_w: u32, ghalf: u32, kpos0: i32, pad: u32 }
-#[repr(C)] #[derive(Clone, Copy, Default)]
-struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_off: u32, sv_off: u32, scap: u32, kpos0: i32, to_ring: u32, pad: [u32; 2] }
+#[repr(u32)] #[derive(Clone, Copy)]
+enum KvCopyMode { ToScratch = 0, ToRing = 1, ClearScratch = 2 }
+#[repr(C)] #[derive(Clone, Copy)]
+struct KvCopyArgs { n: u32, pos0: u32, ring_k: u32, ring_v: u32, cap: u32, sk_off: u32, sv_off: u32, scap: u32, kpos0: i32, mode: KvCopyMode, pad: [u32; 2] }
 
 /// batch (prefill) arena: per-token activation arrays [T][dim], f32 offsets into the same arena buffer
 #[derive(Clone, Copy, Default, Debug)]
@@ -2915,13 +2919,13 @@ impl Engine {
         }
         let (kb, vb, kcap) = run.kv_slot(slot);
         let (pk, pv, cap, kpos0) = if l.swa { (b.sk * (4 / self.kvb) as u32, b.sv * (4 / self.kvb) as u32, scap, p0 as i32 - (EXT + KGUARD) as i32) } else { (kb, vb, kcap, 0) };
-        let kcopy = |n: usize, pos0: usize, to_ring: u32| {
-            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, to_ring, pad: [0; 2] };
+        let kcopy = |n: usize, pos0: usize, mode: KvCopyMode| {
+            let a = KvCopyArgs { n: n as u32, pos0: pos0 as u32, ring_k: kb, ring_v: vb, cap: kcap, sk_off: b.sk, sv_off: b.sv, scap, kpos0, mode, pad: [0; 2] };
             e.buf(&sp.lane.kv_swa.borrow(), 0, 3);
             self.go(e, C_KVPREP, "k_kvcopy", &a, (n, NKV, 1), 32);
             e.buf(&self.act.borrow(), 0, 3);
         };
-        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), 0); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
+        if l.swa { if p0 > 0 { kcopy(p0.min(EXT), p0 - p0.min(EXT), KvCopyMode::ToScratch); } e.buf(&self.act.borrow(), 0, 3); } else { e.buf(&sp.lane.kv_full.borrow(), 0, 3); }
         let ka = KvPrepArgs {
             t: tt, p0: p0 as u32, ring: 0, cap, k_base: pk, v_base: pv, cs_off: cs_slot, q_off: rs(b.q, qd),
             k_off: rs(b.k, NKV * HD), v_off: rs(b.v, NKV * HD), r_off: rs(b.rel, NH * NREL),
@@ -2940,7 +2944,17 @@ impl Engine {
             self.go(e, C_KVPREP, "k_devcopy", &a, ((t * NH).div_ceil(1024), 1, 1), 1024);
             e.buf(&sp.lane.kv_full.borrow(), 0, 3);
         }
-        if l.swa { kcopy(t.min(EXT), p0 + t - t.min(EXT), 1); }
+        if l.swa {
+            let end = p0 + t;
+            kcopy(t.min(EXT), end - t.min(EXT), KvCopyMode::ToRing);
+            // Multiple spans reuse scratch. A longer span can leave values in the masked
+            // part of this span's last attention tile even after the step's initial clear.
+            // k_attn_h multiplies every value in that tile, including zero-weighted ones.
+            if spans.len() > 1 {
+                let tail = end.next_multiple_of(ATT_AK) - end;
+                if tail > 0 { kcopy(tail, end, KvCopyMode::ClearScratch); }
+            }
+        }
         let su = StateArgs { x_off: rs(b.k, NKV * HD), ldx: (NKV * HD) as u32, cs_off: cs_slot, nch: (NKV * HD) as u32, t: tt, pad: [0; 3] };
         self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
         self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
@@ -3214,7 +3228,7 @@ impl<'a> Run<'a> {
         // one trivial dispatch per buffer (a window-history copy of key 0 into the scratch guard area) makes the driver wire them
         let b = self.ba.get();
         let a = KvCopyArgs { n: 1, pos0: 0, ring_k: 0, ring_v: 0, cap: 64, sk_off: b.sk, sv_off: b.sv, scap: (EXT + b.cap + 2 * KGUARD) as u32,
-                             kpos0: 0, to_ring: 0, pad: [0; 2] };
+                             kpos0: 0, mode: KvCopyMode::ToScratch, pad: [0; 2] };
         e.pso(&self.gpu.pso("k_kvcopy")); e.bytes(&a, 5);
         self.bind_kv(&e, true); e.dispatch((1, 1, 1), 32);
         e.barrier();
@@ -4171,6 +4185,57 @@ mod tests {
             let disk: Vec<_> = (0..b).step_by(kps).chain((b..pos + 1).step_by(kps))
                 .map(|start| (start, (start + kps).min(pos + 1))).collect();
             assert_eq!(disk, groups, "pos={pos}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+    fn private_prefill_clears_the_last_window_tile_between_lanes() {
+        use crate::poolgate::{Layer2, Layer3Pool, StepPath};
+
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+        let eng = Engine::load(&model, 128);
+        // The short span appends three keys after 62 saved positions. Its final key
+        // starts a new 64-key tile, leaving 63 masked rows in that tile.
+        let prefix = 62;
+        let short_tokens: Vec<_> = (113..178).collect();
+        let append = short_tokens.len() - prefix;
+        let long_tokens: Vec<_> = (17..84).collect();
+
+        let want = {
+            let paged = Layer3Pool::new(&eng, 1);
+            let alone = paged.new_lane(&short_tokens, 128);
+            paged.prefill(&[(alone, 0, prefix)]);
+            paged.prefill(&[(alone, prefix, append)]);
+            paged.logits(0)
+        };
+        assert!(want.iter().all(|x| x.is_finite()));
+
+        let private = Layer2::new(&eng, 2);
+        let long = private.new_lane(&long_tokens, 128);
+        let short = private.new_lane(&short_tokens, 128);
+        private.prefill(&[(short, 0, prefix)]);
+        private.prefill(&[(long, 0, long_tokens.len()), (short, prefix, append)]);
+        let got = private.logits(1);
+        assert_eq!(got.len(), want.len());
+        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "private multi-lane logits must match the independent paged lane");
+
+        // Inspect both K and V after the final private sliding-window layer.
+        let batch = eng.ba.get();
+        let stride = EXT + batch.cap + 2 * KGUARD;
+        let row_bytes = HD * eng.kvb;
+        let act = eng.act.borrow();
+        let bytes = unsafe { std::slice::from_raw_parts(act.contents().as_ptr().cast::<u8>(), act.length()) };
+        for base in [batch.sk, batch.sv] {
+            for group in 0..NKV {
+                let first = base as usize * 4 + (group * stride + EXT + KGUARD) * row_bytes;
+                let live_end = first + append * row_bytes;
+                let tile_end = live_end + 63 * row_bytes;
+                assert!(bytes[first..live_end].iter().any(|&b| b != 0));
+                assert!(bytes[live_end..tile_end].iter().all(|&b| b == 0),
+                        "masked scratch rows still hold the previous private lane's values");
+            }
         }
     }
 

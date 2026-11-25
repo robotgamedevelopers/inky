@@ -240,3 +240,19 @@ Reversed witnesses (`Bug`): `unguarded` (the first stepping lane is not
 protected; the same switch as `INK_POOLGATE_SABOTAGE`), `nosave` and
 `ownedonly`. The unit tests in `src/poolgate.rs` check `poison_plan` against
 the same three properties on every two-lane, three-slot table assignment.
+
+## Private sliding-window prefill scratch
+
+`ScratchTail` models the private prefill path's shared K/V scratch across spans
+and sliding-window layers. Each span copies its history below scratch row zero
+and writes its current keys starting at zero. Attention loads whole tiles.
+Rows past the span's end in its final tile must remain zero because a masked
+nonfinite value can still affect the sum. For multi-span steps the encoder
+clears those rows before attention. The single-span path relies on the initial
+scratch clear and the same span length in each layer.
+
+`InBounds` checks that all tile reads fit in the allocated scratch.
+`NoForeignRead` checks that each row read belongs to the current span or is
+zero. `ScratchTailNoZero` requires a counterexample when a multi-span step
+omits the clear. `ScratchTailOneSpan` checks the single-span case with that
+clear disabled.

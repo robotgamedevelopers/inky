@@ -42,6 +42,16 @@ agree "decode steps, short prompt vs llama.cpp" short 58 INK_DEC=1
 $B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
 $B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
 INK_LANES=1,2,17,65 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
+# A shorter private lane must clear the masked tail of its last K/V tile.
+private_test=engine::tests::private_prefill_clears_the_last_window_tile_between_lanes
+if private_out=$(cargo test --locked --release --bin inky "$private_test" -- --ignored --exact 2>&1) &&
+   [[ "$private_out" == *"test $private_test ... ok"* ]]; then
+    echo "private prefill scratch: masked rows cleared"
+else
+    print -r -- "$private_out"
+    echo "FAIL: private prefill scratch"
+    fail=1
+fi
 # negative control: the sabotaged spans run (one span bound to the wrong lane's state) must report SPANS NOT INVARIANT
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other failure does not count
 if INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1 | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else echo "FAIL: spans sabotage not detected"; fail=1; fi
