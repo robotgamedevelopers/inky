@@ -85,6 +85,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
+  --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -136,6 +137,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
+        kv8: false,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -168,6 +170,7 @@ fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::e
             "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
+            "--kv8" => o.kv8 = true,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -252,9 +255,12 @@ mod cli_tests {
         assert_eq!(serve_args(&["--record-max-bytes", "4096"]).unwrap().record_max_bytes, 4096);
         assert_eq!(serve_args(&[]).unwrap().spill_dir, None);
         assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
-        let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576"]).unwrap();
+        assert!(!serve_args(&[]).unwrap().kv8);
+        assert!(serve_args(&["--kv8"]).unwrap().kv8);
+        let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576", "--kv8"]).unwrap();
         assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
         assert_eq!(spilled.max_spill_bytes, 1_048_576);
+        assert!(spilled.kv8);
         assert_eq!(serve_args(&[]).unwrap().effort, "medium");
         assert_eq!(serve_args(&["--effort", "high"]).unwrap().effort, "high");
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);

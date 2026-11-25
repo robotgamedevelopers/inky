@@ -59,6 +59,8 @@ pub struct CacheStats {
     pub starts_spilled: u64,
     pub starts_restored: u64,
     pub lanes_released: u64,
+    pub spill_maint_passes: u64,
+    pub spill_maint_evictions: u64,
 }
 
 /// Per-lane Layer 3 tracking state (lives alongside `Lane` inside `LaneS`).
@@ -366,6 +368,42 @@ impl ServeBlockCache {
     #[allow(dead_code)]
     pub fn spill_store_mut(&mut self) -> Option<&mut SpillStore> {
         self.spill_store.as_mut()
+    }
+
+    /// Bounded host/disk-only maintenance safe to overlap with an in-flight GPU step:
+    /// enforces `max_spilled_starts` and `SpillStore` disk budget without touching
+    /// `BlockPools`, `BlockTable`, or active RAM pins.
+    pub fn maintain_spill_during_gpu(&mut self) -> usize {
+        if self.spill_store.is_none() {
+            return 0;
+        }
+        let mut evicted = 0usize;
+        while self.spilled_starts.len() > self.max_spilled_starts {
+            let oldest = self
+                .spilled_starts
+                .iter()
+                .min_by_key(|(_, sp)| (sp.last_used_tick, std::cmp::Reverse(sp.pos)))
+                .map(|(&id, _)| id);
+            let Some(oid) = oldest else { break };
+            self.remove_spilled_start(oid, true);
+            evicted += 1;
+        }
+        let gc_evicted = if let Some(store) = self.spill_store.as_mut() {
+            if store.used_bytes() > store.max_bytes() {
+                store.evict_lru_to_fit(0, &HashSet::new())
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        if !gc_evicted.is_empty() {
+            evicted += gc_evicted.len();
+            self.handle_disk_gc_evicted(&gc_evicted);
+        }
+        self.stats.spill_maint_passes += 1;
+        self.stats.spill_maint_evictions += evicted as u64;
+        evicted
     }
 
     #[allow(dead_code)]
@@ -2318,7 +2356,7 @@ mod tests {
         }
 
         let dir = ScratchDir::new("e2e");
-        let store = SpillStore::open(&dir.0, 256 * 1024 * 1024).unwrap();
+        let store = SpillStore::open_with_kvb(&dir.0, 256 * 1024 * 1024, 1).unwrap();
         // 24 Full slots, 16 Window slots at kvb=1 (1 MiB Full, 5 MiB Window).
         // Each 576-token prompt saves a PROMPT checkpoint at 512 (8 Full + 8 Window).
         // Three distinct prompts demand 24 Window slots (> 16), forcing LRU eviction + SSD spill of prompt 0!
@@ -2426,5 +2464,50 @@ mod tests {
 
         cache.shutdown(&mut pools);
         assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("block-cache-maint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SpillStore::open_with_kvb(&dir, 256 * 1024 * 1024, 1).unwrap();
+        let mut pools = BlockPools::with_capacities(16, 16, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut tbl = BlockTable::new(16).unwrap();
+        let mut st = LaneBlockState::default();
+
+        for base in [1000u32, 2000u32, 3000u32] {
+            let p: Vec<u32> = (0..576u32).map(|i| base + i).collect();
+            assert!(cache.match_and_bind(&mut pools, &mut tbl, &mut st, &p).is_none());
+            let mut pos = 0;
+            while pos < p.len() {
+                let next = effective_pf_target(pos, p.len());
+                cache.ensure_span_blocks(&mut pools, &mut tbl, pos, next - pos).unwrap();
+                cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &p, pos, next - pos, || fake_cs((base / 1000) as u8));
+                pos = next;
+            }
+            cache.release_lane(&mut pools, &mut tbl, &mut st);
+        }
+        assert!(cache.spilled_start_count() >= 1);
+        let used_slots = |p: &crate::blocks::BlockPool| {
+            (1..=p.len())
+                .filter(|&i| p.record(Slot::new(i as u32).unwrap()).unwrap().refs() > 0)
+                .count()
+        };
+        let used_before = used_slots(&pools.full);
+
+        cache.max_spilled_starts = 0;
+        let trimmed = cache.maintain_spill_during_gpu();
+        assert!(trimmed >= 1);
+        assert_eq!(cache.spilled_start_count(), 0);
+        assert_eq!(cache.spill_store().unwrap().entry_count(), 0);
+        assert_eq!(cache.stats().spill_maint_passes, 1);
+        assert_eq!(used_slots(&pools.full), used_before, "RAM pool slots must not be mutated during GPU overlap");
+
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

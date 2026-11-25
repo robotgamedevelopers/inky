@@ -82,6 +82,7 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
+| `--kv8` | off | 8-bit K/V cache: doubles paged `BlockPool` capacity and halves KV read bandwidth (NOT exact; default is fp16) |
 | `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
 An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.

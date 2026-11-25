@@ -48,7 +48,9 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// optional directory for Layer 4 lazy LRU SSD block spill (`--spill-dir`)
                       pub spill_dir: Option<std::path::PathBuf>,
                       /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
-                      pub max_spill_bytes: u64 }
+                      pub max_spill_bytes: u64,
+                      /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
+                      pub kv8: bool }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -806,14 +808,21 @@ fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
 }
 
 /// Safe non-GPU host work overlapped while a committed `MTLCommandBuffer` executes on GPU:
-/// drains newly arrived queued jobs, drops cancelled queued jobs, and sends keepalive
-/// `Ev::Alive` pings to waiting (`Ready`, non-`InStep`) prefilling lanes without touching
-/// `eng`, `pools`, `Lane` Metal buffers, or logits.
-fn overlap_host_work_during_gpu(
+/// 1. Drains newly arrived queued jobs from `rx`, drops cancelled queued jobs, and updates `metrics.queued`.
+/// 2. Checks client disconnects across all active lanes without releasing GPU pins mid-step:
+///    - `InStep` lanes whose client disconnected transition `InStep -> Cancelling` (`CancelInStep`),
+///      keeping all `BlockTable` / `BlockPool` pins held until `wait_committed_step` and
+///      `planner.complete_step()` finish.
+///    - `Ready` waiting lanes whose client disconnected (or whose prefill keepalive `Ev::Alive`
+///      fails) are collected in `waiting_cancelled` and released only after `wait_committed_step`.
+/// 3. Runs bounded `SpillStore` disk/index maintenance (`cache.maintain_spill_during_gpu()`)
+///    without touching `eng`, `pools`, `BlockTable`, `Lane` Metal buffers, or logits.
+fn overlap_host_work_step<'a>(
     rx: &Receiver<Job>,
     queue: &mut VecDeque<Job>,
-    lanes: &[LaneS],
-    planner: &crate::scheduler::ServeStepPlanner,
+    lane_jobs: impl IntoIterator<Item = (usize, Option<&'a Active>)>,
+    planner: &mut crate::scheduler::ServeStepPlanner,
+    cache: &mut ServeBlockCache,
     metrics: &Mutex<Counters>,
 ) -> Vec<usize> {
     loop {
@@ -829,18 +838,47 @@ fn overlap_host_work_during_gpu(
         m.queued = m.queued.saturating_sub(dropped);
     }
     let mut waiting_cancelled = Vec::new();
-    for (i, l) in lanes.iter().enumerate() {
-        if planner.state(i) != crate::scheduler::LaneState::Ready {
-            continue;
-        }
-        let Some(a) = l.job.as_ref() else { continue };
-        if a.job.out.cancelled()
-            || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
-        {
-            waiting_cancelled.push(i);
+    for (i, job) in lane_jobs {
+        let Some(a) = job else { continue };
+        match planner.state(i) {
+            crate::scheduler::LaneState::InStep => {
+                if a.job.out.cancelled() {
+                    // CancelInStep: transition InStep -> Cancelling now while keeping pins held
+                    // until wait_committed_step + planner.complete_step() complete.
+                    let released_now = planner.request_cancel(i);
+                    debug_assert!(!released_now, "InStep cancel must defer release until complete_step");
+                }
+            }
+            crate::scheduler::LaneState::Ready => {
+                if a.job.out.cancelled()
+                    || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
+                {
+                    waiting_cancelled.push(i);
+                }
+            }
+            _ => {}
         }
     }
+    let _ = cache.maintain_spill_during_gpu();
     waiting_cancelled
+}
+
+fn overlap_host_work_during_gpu(
+    rx: &Receiver<Job>,
+    queue: &mut VecDeque<Job>,
+    lanes: &[LaneS],
+    planner: &mut crate::scheduler::ServeStepPlanner,
+    cache: &mut ServeBlockCache,
+    metrics: &Mutex<Counters>,
+) -> Vec<usize> {
+    overlap_host_work_step(
+        rx,
+        queue,
+        lanes.iter().enumerate().map(|(i, l)| (i, l.job.as_ref())),
+        planner,
+        cache,
+        metrics,
+    )
 }
 
 fn release_cancelled_waiting(
@@ -1222,7 +1260,7 @@ fn scheduler(
                     }
                 }
                 cb.commit();
-                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &planner, metrics);
+                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
                 if let Err(e) = wait_committed_step(&cb, "prefill") {
                     fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
@@ -1259,7 +1297,7 @@ fn scheduler(
                     let a = l.job.as_mut().unwrap();
                     a.timing.prefill.add(t, elapsed);
                     a.n_past = p0 + t;
-                    if a.job.out.cancelled() {
+                    if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
                         // Cancel-in-step barrier: defer release until all step GPU work completes.
                         let _ = planner.request_cancel(i);
                         continue;
@@ -1362,7 +1400,7 @@ fn scheduler(
                     .collect();
                 eng.encode_gumbel_spans(&cb, &gumbels);
                 cb.commit();
-                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &planner, metrics);
+                let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
                 if let Err(e) = wait_committed_step(&cb, "decode") {
                     fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
@@ -1385,7 +1423,7 @@ fn scheduler(
                     let a = l.job.as_mut().unwrap();
                     a.timing.generation.add(1, elapsed);
                     a.n_past += 1;
-                    if a.job.out.cancelled() {
+                    if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
                         let _ = planner.request_cancel(i);
                     } else if a.sampler.uses_gpu_gumbel() {
                         let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
@@ -1884,7 +1922,7 @@ impl AdmissionGate {
     }
 }
 
-struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, thinking_budget: usize, loopcd_omega: f32, seq: std::sync::atomic::AtomicU64,
+struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jobs: Sender<Job>, effort: String, max_tokens: usize, thinking_budget: usize, loopcd_omega: f32, kv8: bool, seq: std::sync::atomic::AtomicU64,
              nonce: String, key: Option<String>, ctx: usize,
              /// Bounded lane admission and wait queue (admitted + queued <= max_admitted_lanes + max_queue).
              admission: AdmissionGate,
@@ -1934,6 +1972,7 @@ impl PermitPool {
 }
 
 fn health_body(cx: &Ctx) -> String {
+    let kv_bytes_per_elem: u32 = if cx.kv8 { 1 } else { 2 };
     let mut obj = serde_json::Map::from_iter([
         ("ok".into(), json!(true)),
         ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
@@ -1943,6 +1982,8 @@ fn health_body(cx: &Ctx) -> String {
         ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
         ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
         ("queued_requests".into(), json!(cx.admission.queued())),
+        ("kv8".into(), json!(cx.kv8)),
+        ("kv_bytes_per_elem".into(), json!(kv_bytes_per_elem)),
     ]);
     if let Some(rec) = &cx.recorder {
         obj.insert("record_written".into(), json!(rec.written_count()));
@@ -2513,6 +2554,7 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
+    crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     eng.ensure_batch(eng.chunk);
@@ -2542,12 +2584,14 @@ pub fn serve(o: ServeOpts) {
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
     let spill_store = if let Some(spill_dir) = &o.spill_dir {
-        match crate::spill::SpillStore::open(spill_dir, o.max_spill_bytes) {
+        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
+        match crate::spill::SpillStore::open_with_kvb(spill_dir, o.max_spill_bytes, kvb) {
             Ok(store) => {
                 let swept = store.stats().orphans_swept;
                 eprintln!(
-                    "[serve] spill dir {} ready (budget {:.2} GiB, swept {} orphan tmp file(s))",
+                    "[serve] spill dir {} ready (kvb={}, budget {:.2} GiB, swept {} orphan tmp file(s))",
                     store.dir().display(),
+                    store.kvb(),
                     o.max_spill_bytes as f64 / (1u64 << 30) as f64,
                     swept,
                 );
@@ -2561,7 +2605,7 @@ pub fn serve(o: ServeOpts) {
     } else {
         None
     };
-    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, seq: Default::default(),
+    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: o.ctx,
         admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
         budget,
@@ -2602,7 +2646,8 @@ pub fn serve(o: ServeOpts) {
         let kvb = if eng.kv8 { 1u32 } else { 2u32 };
         let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap()));
         let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap()));
-        eprintln!("[serve] Layer 3 paged KV pool: {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)");
+        eprintln!("[serve] Layer 3 paged KV pool (kvb={kvb}{}): {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)",
+                  if eng.kv8 { ", --kv8" } else { "" });
     }
     if o.loopcd_omega > 0.0 {
         eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
@@ -2720,7 +2765,7 @@ mod tests {
         let (jobs, rx) = channel();
         let cx = Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0,
+            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::with_timings(
                 max_lanes,
@@ -3255,7 +3300,7 @@ mod tests {
         let tk = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
@@ -3278,7 +3323,7 @@ mod tests {
         let sp = test_sp(&tk);
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
@@ -3317,7 +3362,7 @@ mod tests {
         let sp = test_sp(&tk);
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3345,7 +3390,7 @@ mod tests {
             let payload_tok = tk.encode("a", false)[0];
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-                max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                 admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3386,7 +3431,7 @@ mod tests {
         let tk0 = Tokenizer::for_test();
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
-                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
@@ -3408,7 +3453,7 @@ mod tests {
         let tk0 = Tokenizer::for_test();
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
-                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                       max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                        admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), active_lanes: Default::default(), conns: Default::default(), recorder: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
@@ -3488,7 +3533,7 @@ mod tests {
             for stream in [false, true] {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
-                    max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+                    max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
                     admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
@@ -3790,7 +3835,7 @@ mod tests {
     }
 
     #[test] fn health_body_reports_ok_active_lanes_and_inflight() {
-        let (cx, _jrx) = admission_test_ctx_with(4, 2, Duration::from_secs(1), 4);
+        let (mut cx, _jrx) = admission_test_ctx_with(4, 2, Duration::from_secs(1), 4);
         let b = cx.budget;
         let idle: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(idle, json!({
@@ -3802,7 +3847,14 @@ mod tests {
             "per_lane_worst_case_bytes": b.per_lane_worst_case_bytes,
             "max_admitted_lanes": b.max_admitted_lanes,
             "queued_requests": 0,
+            "kv8": false,
+            "kv_bytes_per_elem": 2,
         }));
+        cx.kv8 = true;
+        let kv8_snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
+        assert_eq!(kv8_snap["kv8"], true);
+        assert_eq!(kv8_snap["kv_bytes_per_elem"], 1);
+        cx.kv8 = false;
         let p = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
         let busy: Value = serde_json::from_str(&health_body(&cx)).unwrap();
@@ -3969,7 +4021,7 @@ mod tests {
         let (jobs, rx) = channel();
         let cx = Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0,
+            sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
             active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
@@ -4169,7 +4221,7 @@ mod tests {
         let (jobs, jrx) = channel();
         let cx = Arc::new(Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0,
+            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
             budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
@@ -4229,7 +4281,7 @@ mod tests {
         let (jobs, jrx) = channel();
         let cx = Arc::new(Ctx {
             metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0,
+            tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
             budget: test_budget(4), preprocess: PermitPool::new(4), active_lanes: Default::default(), conns: Default::default(), recorder: None,
@@ -4649,5 +4701,248 @@ mod tests {
         assert!(defer.is_empty());
         assert_eq!(fail.len(), 1);
         assert_eq!(fail[0].0, 0);
+    }
+
+    #[test]
+    fn overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill() {
+        use crate::blocks::{BlockIndex, BlockKind, BlockPools, BlockTable, BLOCK};
+        use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        let spill_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-overlap-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        let store = crate::spill::SpillStore::open_with_kvb(&spill_dir, 64 * 1024 * 1024, 1).unwrap();
+
+        let mut pools = BlockPools::with_capacities(10, 10, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut tbl0 = BlockTable::new(16).unwrap();
+        let mut tbl1 = BlockTable::new(16).unwrap();
+        let mut st0 = LaneBlockState::default();
+        let mut st1 = LaneBlockState::default();
+
+        // Seed and spill an old prompt so SpillStore holds a spilled start, then exercise
+        // opportunistic SpillStore maintenance during GPU execution.
+        for base in [0u32, 10_000u32, 20_000u32] {
+            let p: Vec<u32> = (0..320u32).map(|i| base + i).collect();
+            let mut tb = BlockTable::new(16).unwrap();
+            let mut stb = LaneBlockState::default();
+            assert!(cache.match_and_bind(&mut pools, &mut tb, &mut stb, &p).is_none());
+            let mut pos = 0;
+            while pos < p.len() {
+                let next = effective_pf_target(pos, p.len());
+                cache.ensure_span_blocks(&mut pools, &mut tb, pos, next - pos).unwrap();
+                cache.finish_prefill_span(&mut pools, &mut tb, &mut stb, &p, pos, next - pos, || vec![2u8; 64]);
+                pos = next;
+            }
+            cache.release_lane(&mut pools, &mut tb, &mut stb);
+        }
+        assert!(cache.spilled_start_count() >= 1);
+
+        // Now start two active lanes: lane 0 (decoding InStep) and lane 1 (backpressured Ready).
+        let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
+        let (out0, ev0) = job_events();
+        let (out1, ev1) = job_events();
+        let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
+            job: Job {
+                seq,
+                toks: (0..pf_end as u32).collect(),
+                max: 32,
+                temp: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 1,
+                thinking_budget: 0,
+                loopcd_omega: 0.0,
+                queued_at: Instant::now(),
+                out,
+                _permit: admission.try_acquire().unwrap(),
+            },
+            n_past,
+            pf_end,
+            cached: 0,
+            gen,
+            timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
+            sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
+            draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
+            think: ThinkBudget::new(0),
+            pending: Some(42),
+        };
+
+        let mut p0_toks: Vec<u32> = (1..=64u32).collect();
+        p0_toks.push(42);
+        assert!(cache.match_and_bind(&mut pools, &mut tbl0, &mut st0, &p0_toks[..64]).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl0, 0, 64).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl0, &mut st0, &p0_toks[..64], 0, 64, || vec![3u8; 64]);
+        // Lane 0 enters decode step at position 64 (allocates block 1).
+        cache.ensure_span_blocks(&mut pools, &mut tbl0, 64, 1).unwrap();
+        let slot0_b0 = tbl0.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap().slot();
+        let slot0_b1 = tbl0.get(BlockKind::Full, BlockIndex::new(1)).unwrap().unwrap().slot();
+
+        // Lane 1 has block 0 pinned as Ready (backpressured, not in current step).
+        let p1_toks: Vec<u32> = (50_000..50_128u32).collect();
+        assert!(cache.match_and_bind(&mut pools, &mut tbl1, &mut st1, &p1_toks).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl1, 0, 64).unwrap();
+        let slot1_b0 = tbl1.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap().slot();
+
+        let mut planner = ServeStepPlanner::new(2, SERVE_STEP_MAX_BYPASS);
+        planner.on_admit(0);
+        planner.on_admit(1);
+        let plan = planner.plan_and_begin_step(
+            &[
+                ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+                ServeLaneInput { runnable: false, n_past: 0, pf_end: 128, has_pending_decode: false },
+            ],
+            4096,
+            BLOCK,
+        );
+        assert_eq!(plan, Some(ServeStepPlan::Decode(vec![0])));
+        assert_eq!(planner.state(0), LaneState::InStep);
+        assert_eq!(planner.state(1), LaneState::Ready);
+
+        // Simulate cb.commit() in flight: new HTTP arrivals + mid-step disconnects on BOTH lanes.
+        let (jtx, jrx) = channel::<Job>();
+        let metrics = Mutex::new(Counters::new(Instant::now()));
+        let (arr_live_out, _arr_live_ev) = job_events();
+        let (arr_dead_out, arr_dead_ev) = job_events();
+        drop(arr_dead_ev);
+        metrics.lock().unwrap().queued = 2;
+        jtx.send(Job {
+            seq: 10, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
+            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_live_out,
+            _permit: admission.try_acquire().unwrap(),
+        }).unwrap();
+        jtx.send(Job {
+            seq: 11, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
+            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_dead_out,
+            _permit: admission.try_acquire().unwrap(),
+        }).unwrap();
+
+        // Client disconnects while GPU step is executing!
+        drop(ev0);
+        drop(ev1);
+        let a0 = make_active(1, 64, 64, 1, out0);
+        let a1 = make_active(2, 0, 128, 0, out1);
+        let mut queue = VecDeque::new();
+        let waiting_cancelled = overlap_host_work_step(
+            &jrx,
+            &mut queue,
+            [(0, Some(&a0)), (1, Some(&a1))],
+            &mut planner,
+            &mut cache,
+            &metrics,
+        );
+
+        // 1. Live arrived job drained into queue; cancelled arrived job dropped & metrics.queued updated.
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().seq, 10);
+        assert_eq!(metrics.lock().unwrap().queued, 1);
+
+        // 2. CancelInStep: lane 0 transitioned InStep -> Cancelling (NOT Cancelled!),
+        //    and waiting_cancelled only lists Ready lane 1.
+        assert_eq!(planner.state(0), LaneState::Cancelling);
+        assert_eq!(waiting_cancelled, vec![1]);
+
+        // 3. CRITICAL INVARIANT: all GPU block pins for BOTH lanes remain held until after wait_committed_step!
+        assert!(pools.full.record(slot0_b0).unwrap().refs() > 0);
+        assert!(pools.full.record(slot0_b1).unwrap().refs() > 0);
+        assert!(pools.full.record(slot1_b0).unwrap().refs() > 0);
+        assert_eq!(cache.stats().spill_maint_passes, 1);
+
+        // 4. Simulate wait_committed_step finishing: complete GPU decode span + complete_step + release!
+        cache.finish_decode_span(&mut pools, &mut tbl0, &mut st0, 64);
+        let completed_cancelled = planner.complete_step();
+        assert_eq!(completed_cancelled, vec![0]);
+        assert_eq!(planner.state(0), LaneState::Cancelled);
+
+        cache.release_lane(&mut pools, &mut tbl0, &mut st0);
+        for &wi in &waiting_cancelled {
+            assert!(planner.request_cancel(wi));
+        }
+        cache.release_lane(&mut pools, &mut tbl1, &mut st1);
+        assert_eq!(planner.state(1), LaneState::Cancelled);
+
+        // Zero leaked pins on the unsealed in-flight decode block (slot0_b1) and lane 1's unsealed block (slot1_b0)!
+        assert_eq!(pools.full.record(slot0_b1).unwrap().refs(), 0);
+        assert_eq!(pools.full.record(slot1_b0).unwrap().refs(), 0);
+
+        cache.shutdown(&mut pools);
+        let free_count = |p: &crate::blocks::BlockPool| {
+            (1..=p.len())
+                .filter(|&idx| p.record(crate::blocks::Slot::new(idx as u32).unwrap()).unwrap().refs() == 0)
+                .count()
+        };
+        assert_eq!(free_count(&pools.full), 10);
+        assert_eq!(free_count(&pools.window), 10);
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    #[test]
+    fn overlap_host_work_keeps_live_lanes_and_pings_waiting_prefillers() {
+        use crate::blocks::BLOCK;
+        use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        let admission = AdmissionGate::new(2, 2, Duration::from_secs(5));
+        let (out0, ev0) = job_events();
+        let (out1, ev1) = job_events();
+        let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
+            job: Job {
+                seq,
+                toks: (0..pf_end as u32).collect(),
+                max: 16,
+                temp: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: 1,
+                thinking_budget: 0,
+                loopcd_omega: 0.0,
+                queued_at: Instant::now(),
+                out,
+                _permit: admission.try_acquire().unwrap(),
+            },
+            n_past,
+            pf_end,
+            cached: 0,
+            gen,
+            timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
+            sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
+            draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
+            think: ThinkBudget::new(0),
+            pending: Some(7),
+        };
+
+        let mut planner = ServeStepPlanner::new(2, SERVE_STEP_MAX_BYPASS);
+        planner.on_admit(0);
+        planner.on_admit(1);
+        let plan = planner.plan_and_begin_step(
+            &[
+                ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+                ServeLaneInput { runnable: true, n_past: 0, pf_end: 128, has_pending_decode: false },
+            ],
+            4096,
+            BLOCK,
+        );
+        assert_eq!(plan, Some(ServeStepPlan::Decode(vec![0])));
+
+        let a0 = make_active(1, 64, 64, 1, out0);
+        let a1 = make_active(2, 0, 128, 0, out1);
+        let (_jtx, jrx) = channel::<Job>();
+        let mut queue = VecDeque::new();
+        let mut cache = ServeBlockCache::new();
+        let metrics = Mutex::new(Counters::new(Instant::now()));
+
+        let waiting_cancelled = overlap_host_work_step(
+            &jrx,
+            &mut queue,
+            [(0, Some(&a0)), (1, Some(&a1))],
+            &mut planner,
+            &mut cache,
+            &metrics,
+        );
+        assert!(waiting_cancelled.is_empty());
+        assert_eq!(planner.state(0), LaneState::InStep);
+        assert_eq!(planner.state(1), LaneState::Ready);
+        assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
+        assert!(ev0.recv_timeout(Duration::ZERO).is_err());
     }
 }
