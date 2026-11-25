@@ -10,7 +10,7 @@ mod tokenizer;
 mod unicode_tables;
 
 use engine::{Engine, Lane};
-use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus};
 use sampler::Sampler;
 use session::{Renderer, Session};
 use std::io::{BufRead, Write};
@@ -447,13 +447,53 @@ fn binv(o: &Opts) {
 /// the decode path's ring write (`ring = l.swa && t == 1` in engine.rs) and compare decode with itself, so
 /// every span has at least two rows, and a span ending just past a split boundary crosses it.
 const CROSSPATH_SPAN: usize = 17;
+const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
+
+fn crosspath_start(end: usize) -> usize { end.saturating_sub(CROSSPATH_SPAN) }
+
+fn crosspath_completed(status: MTLCommandBufferStatus) -> bool { status == MTLCommandBufferStatus::Completed }
+
+fn wait_crosspath(cb: &metal::CmdBuf) {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if !crosspath_completed(status) {
+        let error = cb.error().map(|e| e.localizedDescription().to_string());
+        panic!("crosspath Metal command failed (status {status:?}): {}", error.as_deref().unwrap_or("no driver error provided"));
+    }
+}
+
+#[cfg(test)]
+mod crosspath_tests {
+    use super::*;
+
+    #[test]
+    fn only_successful_gpu_completion_is_accepted() {
+        assert!(crosspath_completed(MTLCommandBufferStatus::Completed));
+        assert!(!crosspath_completed(MTLCommandBufferStatus::Error));
+        assert!(!crosspath_completed(MTLCommandBufferStatus::Scheduled));
+    }
+
+    #[test]
+    fn every_default_boundary_uses_an_independent_17_row_span() {
+        let ends: Vec<usize> = CROSSPATH_ENDS.split(',').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ends.len(), 12);
+        let mut cursor = 0;
+        for end in ends {
+            let start = crosspath_start(end);
+            assert!(start >= cursor);
+            assert_eq!(end - start, 17);
+            cursor = start;
+        }
+    }
+}
+
 fn crosspath(o: &Opts) {
     use engine::Span;
 
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens")
         .lines().map(|line| line.trim().parse().unwrap()).collect();
     let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS").unwrap_or_else(|_| {
-        "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049".into()
+        CROSSPATH_ENDS.into()
     }).split(',').map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts")).collect();
     let len = *ends.last().unwrap();
     assert!(ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
@@ -476,13 +516,13 @@ fn crosspath(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.on(lane).encode_prefill(&cb, p0, t, logits, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_crosspath(&cb);
     };
     // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
     let mut cursor = 0;
     let mut ok = true;
     for end in ends {
-        let start = end.saturating_sub(CROSSPATH_SPAN);
+        let start = crosspath_start(end);
         let target = end - 1;
         assert!(start >= cursor && target - start >= 1, "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows");
         while cursor < start {
@@ -498,7 +538,7 @@ fn crosspath(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_decode(&cb, &[Span { lane: &decode, p0: target, t: 1 }], true, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_crosspath(&cb);
         let actual = eng.span_logits(0);
         let first_bad = expected.iter().zip(actual).position(|(&a, &b)| {
             !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
