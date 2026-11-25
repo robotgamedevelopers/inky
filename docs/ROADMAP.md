@@ -282,7 +282,22 @@ The self-hosted runner, branch protection, per-pull-request CI time and the nigh
 |---|:---:|
 | The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user | ❌ |
 | main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main | ❌ |
-| Remove the dead code the compiler finds once the allow(dead_code) attributes are stripped | ❌ |
+| Settle the dead-code candidates that are not certain: held for open pull requests, stale attributes and test-only groups | ❌ |
+| Remove decode_overwrites_prompt and its unit test | ❌ |
+| Remove record::card_id_from_headers and the test lines that call it | ❌ |
+| Remove Recorder::with_capacity | ❌ |
+| Remove Lane::is_blocked | ❌ |
+| Remove Lane::fill_block and Lane::attn_key_offset | ❌ |
+| Remove the method Engine::per_lane_worst_case_bytes | ❌ |
+| Remove SealedId::index | ❌ |
+| Remove BlockPool::zero_slot | ❌ |
+| Remove the accessor KeyAddr::kvb | ❌ |
+| Remove BlockKind::position_bytes and BlockPool::append with their test | ❌ |
+| Remove poolgate::slot_region and its test | ❌ |
+| Remove Layer2::candidate_label | ❌ |
+| Remove spill::BLOCK_POSITIONS, spill::WINDOW_STRIDE and SpillBlockKind::default_stride | ❌ |
+| Remove the getter SpillStore::max_bytes | ❌ |
+| Remove ServeBlockCache::set_spill_store and spill_store_mut | ❌ |
 | Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ❌ |
 | The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget | ❌ |
 | The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget | ❌ |
