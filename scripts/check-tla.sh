@@ -46,7 +46,8 @@ ReleaseEarly RaisedWhileConnected
 NoPersist RestoredWhenIdle
 LostSeed SavedIsOwner
 StaleSaved RestoredWhenIdle
-NoRollback RefusedRollbackSafe'
+NoRollback RefusedRollbackSafe
+LowerHigher RaisedWhileConnected'
 
 layout_sel() {
     case $1 in
@@ -163,7 +164,7 @@ check_memmode() {
 }
 
 if want memmode; then
-    # The seven runs are independent and small: all at once, then the results in order.
+    # The eight runs are independent and small: all at once, then the results in order.
     pids=
     while read -r name expected; do
         check_memmode "$name" "$expected" &
@@ -207,7 +208,7 @@ if want layout-nightly && [ -f "$root/specs/BlockLayout.tla" ]; then
 fi
 
 # The CacheScheduler runner takes more than two minutes (its DecodePriority run
-# alone took 159 s on hetzner1, and the whole cpu TLA step 4 min 58 s on the
+# alone took 159 s on a 4-core Linux box, and the whole cpu TLA step 4 min 58 s on the
 # hosted runner, 2026-11-24). Pull request CI therefore leaves it to the nightly
 # workflow, which sets TLA_NIGHTLY=1. The runner must still exist. Asked for by
 # name (the scheduler part) without TLA_NIGHTLY=1, this script refuses above.

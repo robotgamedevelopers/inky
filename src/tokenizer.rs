@@ -404,6 +404,134 @@ mod tests {
         assert!(t.encode_plain_limited(&text, &mut out, expected.len() + 1));
         assert_eq!(out[1..], expected);
     }
+
+    fn split_pieces(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let flags: Vec<u8> = chars.iter().map(|&c| uflags(c as u32)).collect();
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = Tokenizer::piece_end(&chars, &flags, i);
+            assert!(end > i && end <= chars.len(), "invalid piece_end({i}) = {end}");
+            pieces.push(chars[i..end].iter().collect());
+            i = end;
+        }
+        pieces
+    }
+
+    #[test]
+    fn uflags_tables_classify_ascii_and_unicode_categories() {
+        for ch in ['A', 'Z', 'Ω', 'Ж'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_ucls(f) && !is_lcls(f) && !is_n(f) && !is_ws(f), "upper {ch:?}");
+        }
+        for ch in ['a', 'z', 'é', 'ω', 'ж'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_lcls(f) && !is_ucls(f) && !is_n(f) && !is_ws(f), "lower {ch:?}");
+        }
+        // Titlecase letter (ǅ): U_LT -> letter + ucls, not lcls.
+        let lt = uflags('\u{01C5}' as u32);
+        assert!(is_l(lt) && is_ucls(lt) && !is_lcls(lt));
+        // Modifier letter (ʰ) and Lo CJK ideograph (中): letter + both ucls and lcls.
+        for ch in ['\u{02B0}', '中', 'あ'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_ucls(f) && is_lcls(f) && !is_n(f) && !is_ws(f), "lm/lo {ch:?}");
+        }
+        // Combining acute accent (U+0301): mark -> both ucls and lcls, not standalone is_l.
+        let mark = uflags('\u{0301}' as u32);
+        assert!(!is_l(mark) && is_ucls(mark) && is_lcls(mark) && !is_n(mark) && !is_ws(mark));
+        // Numbers across Nd / No scripts.
+        for ch in ['0', '9', '²', '٣'] {
+            let f = uflags(ch as u32);
+            assert!(is_n(f) && !is_l(f) && !is_ws(f), "number {ch:?}");
+        }
+        // Whitespace across ASCII and Unicode Zs.
+        for ch in [' ', '\t', '\r', '\n', '\u{00A0}', '\u{2003}', '\u{3000}'] {
+            let f = uflags(ch as u32);
+            assert!(is_ws(f) && !is_l(f) && !is_n(f), "ws {ch:?}");
+        }
+        // Punctuation, emoji, and supplementary-plane boundary.
+        for ch in ['!', '/', '+', '🦀', '\u{10FFFF}'] {
+            let f = uflags(ch as u32);
+            assert!(!is_l(f) && !is_n(f) && !is_ws(f), "other {ch:?}");
+        }
+    }
+
+    #[test]
+    fn piece_end_matches_o200k_contractions_digits_punctuation_and_whitespace() {
+        assert_eq!(
+            split_pieces("don't won't I'm we're they've you'll he'd IT'S WE'RE rock'n'roll"),
+            vec![
+                "don't", " won't", " I'm", " we're", " they've", " you'll", " he'd",
+                " IT'S", " WE'RE", " rock", "'n", "'roll",
+            ]
+        );
+        // CamelCase / acronym transitions (body1 merges acronym+title `HTTPServer`, while lowercase ` parse` stops before uppercase `JSON`).
+        assert_eq!(
+            split_pieces("HTTPServer HTML5 parseJSON"),
+            vec!["HTTPServer", " HTML", "5", " parse", "JSON"]
+        );
+        // 1-3 digit chunking across ASCII and Unicode digits.
+        assert_eq!(split_pieces("1234567890"), vec!["123", "456", "789", "0"]);
+        assert_eq!(split_pieces("١٢٣٤"), vec!["١٢٣", "٤"]);
+        // Optional leading space on punctuation + trailing slashes/CRLF consumption.
+        assert_eq!(
+            split_pieces("a += 1;//\r\nb"),
+            vec!["a", " +=", " ", "1", ";//\r\n", "b"]
+        );
+        // Whitespace lookahead: `\s+(?!\S)` leaves the final space attached to the next word,
+        // while trailing whitespace at end-of-string stays one piece and `\s*[\r\n]+` splits after last newline.
+        assert_eq!(split_pieces("x    y   "), vec!["x", "   ", " y", "   "]);
+        assert_eq!(split_pieces("  \r\n  z"), vec!["  \r\n", " ", " z"]);
+        // Multi-script words + combining marks + emoji.
+        assert_eq!(
+            split_pieces("cafe\u{0301} Москва 日本語1234 🦀!"),
+            vec!["cafe\u{0301}", " Москва", " 日本語", "123", "4", " 🦀!"]
+        );
+    }
+
+    #[test]
+    fn production_byte_bpe_round_trips_multibyte_utf8_merges_and_specials() {
+        let mut t = Tokenizer::for_byte_test();
+        let map_bytes = |tk: &Tokenizer, s: &[u8]| -> String {
+            s.iter().map(|&b| tk.id_to_tok[tk.byte_to_id[b as usize] as usize].as_str()).collect()
+        };
+        let add_byte_merge = |tk: &mut Tokenizer, left: &[u8], right: &[u8], rank: u32| {
+            let l = map_bytes(tk, left);
+            let r = map_bytes(tk, right);
+            let lid = tk.tok_to_id[&l];
+            let rid = tk.tok_to_id[&r];
+            let merged = format!("{l}{r}");
+            let mid = tk.id_to_tok.len() as u32;
+            tk.max_bpe_token_bytes = tk.max_bpe_token_bytes.max(merged.chars().count());
+            tk.id_to_tok.push(merged.clone());
+            tk.tok_type.push(0);
+            tk.tok_to_id.insert(merged, mid);
+            tk.merges.insert((lid, rid), (rank, mid));
+        };
+        add_byte_merge(&mut t, b" ", b"t", 0);
+        add_byte_merge(&mut t, b" t", b"h", 1);
+        add_byte_merge(&mut t, b" th", b"e", 2);
+        add_byte_merge(&mut t, b"\xc3", b"\xa9", 3); // UTF-8 'é'
+        add_byte_merge(&mut t, b"c", b"a", 4);
+        add_byte_merge(&mut t, b"ca", b"f", 5);
+        add_byte_merge(&mut t, b"caf", "é".as_bytes(), 6);
+
+        let the_id = t.tok_to_id[&map_bytes(&t, b" the")];
+        let cafe_id = t.tok_to_id[&map_bytes(&t, "café".as_bytes())];
+        assert_eq!(t.encode("café the", false), vec![cafe_id, the_id]);
+
+        let rich = format!(
+            "<|message_user|><|content_text|>café the Москва 日本語 🦀 12345 {}\r\n<|end_message|>",
+            "café".repeat(20) // > 32 bytes in a single piece to exercise bpe_ranked heap path
+        );
+        let ids = t.encode(&rich, true);
+        let mut decoded = Vec::new();
+        for &id in &ids {
+            decoded.extend_from_slice(&t.decode_bytes(id));
+        }
+        assert_eq!(decoded, rich.as_bytes());
+    }
 }
 
 #[cfg(test)]

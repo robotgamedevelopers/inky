@@ -9,15 +9,14 @@
 //! out. Every step's logits and every greedy token must be bit-identical to the reference.
 //!
 //! What plugs in where (src/blocks.rs types):
-//!  - `StepPath`: create a lane, step prefill spans, step decode spans, read logits, end a lane. `Layer2` is today's
-//!    per-lane caches; the block cache implements it as the candidate, over `Engine::block_pool` and
-//!    `Lane::block_table`.
+//!  - `StepPath`: create a lane, step prefill spans, step decode spans, read logits, end a lane. `Layer2` is the
+//!    per-lane contiguous reference path; `Layer3Pool` is the paged candidate over `Engine::block_pool`,
+//!    `Lane::block_table`, and `EntryTree`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, pool, slot)` over that kind's GPU buffer, at the pool's width. `Layer2` implements it with lane k's window
-//!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
-//!    caches poisoned.
-//!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
+//!    `slot_region` over that kind's GPU slab buffer, at the pool's width. `Layer2` also implements it with lane k's
+//!    window cache as window slot k + 1 and its full cache as full slot k + 1 for unit self-checks.
+//!  - main.rs `poolgate` builds the `Layer2` reference and the `Layer3Pool` candidate and compares every step and token.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
 use crate::blockbook::{EVERY, HEAD, PROMPT};
@@ -72,7 +71,6 @@ pub trait Candidate: StepPath + PoisonPool {}
 impl<T: StepPath + PoisonPool> Candidate for T {}
 
 /// Every (kind, slot) a block table holds an entry for. Walks each kind's rows until the table says out of range.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no table
 pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     let mut v = Vec::new();
     for kind in KINDS {
@@ -87,7 +85,7 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
 
 /// The bytes of `slot` in `pool`'s buffer at `base` of `len` bytes, at the pool's element width.
 /// None when the slot does not fit in the buffer.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
+#[allow(dead_code)] // Layer3Pool resolves multi-slab slots via BlockPool::slab_slot_offset; unit tests cover single-buffer regions
 pub fn slot_region(base: *mut u8, len: usize, pool: &crate::blocks::BlockPool, slot: Slot) -> Option<(*mut u8, usize)> {
     let stride = pool.kind().stride_bytes(pool.kvb()).ok()?;
     let off = pool.offset(slot).ok()?;
@@ -312,10 +310,6 @@ impl<'a> Layer2<'a> {
         eng.ensure_batch(eng.chunk);
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
-    }
-    #[allow(dead_code)]
-    pub fn candidate_label(&self) -> &'static str {
-        "Layer2 self-check (BlockPools candidate not yet wired)"
     }
     fn run<R>(&self, f: impl FnOnce(&[Option<Lane>]) -> R) -> R { f(&self.lanes.borrow()) }
 }

@@ -703,7 +703,6 @@ pub struct Lane {
 }
 
 /// One lane's GPU Gumbel-max sampling request for [`Engine::encode_gumbel_spans`].
-#[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
 #[derive(Clone, Copy)]
 pub struct GumbelSpan<'a> {
     pub span_idx: usize,
@@ -845,9 +844,8 @@ impl Lane {
     #[allow(dead_code)]
     pub fn is_blocked(&self) -> bool { self.use_blocks.get() }
 
-    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
+    /// The lane's 64-bit paged block table (`Lane::new_blocked`), synced incrementally to GPU memory
+    /// by [`Engine::sync_lane_block_table`] and read by `ServeBlockCache` and `Layer3Pool`.
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
 
     /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
@@ -874,9 +872,8 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
-    /// Both block pools. One GPU slab per kind, sized at load to `kvb` and the initial cache block.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    /// Shared Layer 3 `Window` and `Full` GPU block pools (`init_serve_block_pools` sizes multi-slab pools for
+    /// `inky serve` and `Layer3Pool`). Interior mutability: callers borrow through the `RefCell`.
     pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
 
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
@@ -1127,8 +1124,7 @@ impl Engine {
     /// Batched GPU Gumbel-max sampling for multiple batch spans inside a SINGLE `MTLComputeCommandEncoder`:
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
     /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
-    /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item.
-    #[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
+    /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item; called by `inky serve` batched sampling.
     pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
         if items.is_empty() { return; }
         let b = self.ba.get();

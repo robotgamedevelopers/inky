@@ -10,12 +10,17 @@ B=./target/release/inky
 fail=0
 INK_POOLGATE_LANES=17 INK_POOLGATE_CHUNKS=31,1,23,7,17,1,29,64,127,61,1,256 INK_POOLGATE_DECODE=64 \
     $B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -2 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate long"; fail=1; }
-# Verify a real SSD restore and early prefix fork against both sets of cold model logits.
-spill_test=serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits
-if spill_result=$(cargo test --locked --release --bin inky "$spill_test" -- --ignored --exact --nocapture 2>&1); then
-    grep -Fq 'test result: ok. 1 passed;' <<< "$spill_result" || fail=1
-else
-    fail=1
-fi
-print -r -- "$spill_result"
+# Verify a real SSD restore and early prefix fork against both sets of cold model logits,
+# and verify 3-turn 10K-token ServeBlockCache reuse against cold solo execution.
+for gpu_test in \
+    serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits \
+    serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo
+do
+    if test_result=$(cargo test --locked --release --bin inky "$gpu_test" -- --ignored --exact --nocapture 2>&1); then
+        grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$test_result" || { echo "FAIL: $gpu_test did not match 1 passed; 0 failed" >&2; fail=1; }
+    else
+        fail=1
+    fi
+    print -r -- "$test_result"
+done
 exit $fail

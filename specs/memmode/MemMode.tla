@@ -1,7 +1,9 @@
 --------------------------- MODULE MemMode ---------------------------
 \* Inky mode's helper (src/memd.rs): a root daemon that raises the GPU wired-memory limit while any inky process is
-\* connected and restores the limit it found when the last connection closes. A client's connection closes on a clean
-\* exit, a crash, kill -9 or sleep alike: one Close action for all of them. The helper itself may crash at any moment:
+\* connected and restores the limit it found when the last connection closes (unless the owner's limit was already at
+\* or above Target, in which case the helper leaves it untouched). A client's connection closes on a clean exit, a
+\* crash, or kill -9 alike: one Close action for all of them. Local Unix sockets stay open across macOS sleep, so the
+\* limit stays held while any client remains connected across sleep. The helper itself may crash at any moment:
 \* every connection dies with it, and launchd starts it again. The limit it found is on disk while it is raised, and a
 \* starting helper restores a limit it finds there.
 \*
@@ -20,7 +22,7 @@
 EXTENDS Integers, FiniteSets
 NONE == -1     \* nothing saved
 CONSTANTS Clients, Values, Target, Bug
-ASSUME Target \in Values /\ Bug \in {"none", "restore_default", "release_early", "no_persist", "lost_seed", "stale_saved", "no_rollback"}
+ASSUME Target \in Values /\ Bug \in {"none", "restore_default", "release_early", "no_persist", "lost_seed", "stale_saved", "no_rollback", "lower_higher"}
 VARIABLES limit,      \* the OS setting iogpu.wired_limit_mb
           saved,      \* the limit the running helper found when it raised it (in memory), or NONE
           disk,       \* the same, in the saved file, or NONE
@@ -62,11 +64,17 @@ Connect(c) == /\ alive /\ c \notin conns
                                     /\ UNCHANGED <<saved, limit, disk, owed>>
                  ELSE \/ \* failure reading the current value or persisting it refuses before any raise
                          /\ saved = NONE /\ rollback' = NoRollback /\ UNCHANGED <<conns, saved, limit, disk, owed>>
+                      \/ \* owner's current limit is already at or above Target: admit without lowering or saving
+                         /\ saved = NONE /\ limit >= Target /\ Bug # "lower_higher"
+                         /\ conns' = {c} /\ rollback' = NoRollback
+                         /\ UNCHANGED <<saved, limit, disk, owed>>
                       \/ \* admitted: persist the found limit before raising
+                         /\ (saved # NONE \/ limit < Target \/ Bug = "lower_higher")
                          /\ conns' = {c} /\ limit' = Target /\ owed' = TRUE /\ rollback' = NoRollback
                          /\ saved' = IF saved = NONE THEN limit ELSE saved
                          /\ disk' = IF saved = NONE THEN (IF Bug = "no_persist" THEN NONE ELSE limit) ELSE disk
-                      \/ RefusedConnect
+                      \/ /\ (saved # NONE \/ limit < Target \/ Bug = "lower_higher")
+                         /\ RefusedConnect
               /\ UNCHANGED <<alive, owner>>
 Close(c) == /\ rollback' = NoRollback /\ alive /\ c \in conns /\ conns' = conns \ {c}
             /\ IF conns' # {} /\ Bug # "release_early"
@@ -93,13 +101,15 @@ Restart == /\ rollback' = NoRollback /\ ~alive /\ alive' = TRUE
 Next == (\E c \in Clients : Connect(c) \/ Close(c)) \/ (\E v \in Values : OwnerSets(v)) \/ Crash \/ Restart
 Spec == Init /\ [][Next]_vars /\ WF_vars(Restart) /\ WF_vars(\E c \in Clients : Close(c))
 
-\* in inky mode exactly while someone is connected to a running helper
-RaisedWhileConnected == alive /\ conns # {} => limit = Target
+\* in inky mode while someone is connected: raised to Target, or left at the owner's higher limit
+RaisedWhileConnected == alive /\ conns # {} => limit = IF owner >= Target THEN owner ELSE Target
 \* a running helper with no clients and nothing saved anywhere has given the owner's limit back (a save kept
 \* across the idle time means a restore is still pending, not that the limit was forgotten)
 RestoredWhenIdle == alive /\ conns = {} /\ saved = NONE /\ disk = NONE => limit = owner
-\* the limit found is on disk exactly while it is raised
-SavedIsOwner == alive /\ conns # {} => saved = owner /\ disk = owner
+\* the limit found is on disk while inky mode raised it; an already-sufficient owner limit needs no raise or save
+SavedIsOwner == alive /\ conns # {} =>
+    IF owner < Target THEN saved = owner /\ disk = owner
+    ELSE saved = NONE /\ disk = NONE
 \* a save held by a running helper is always a restore still owed; a save left behind by a confirmed
 \* restore or a forgotten failed raise (Bug "stale_saved") breaks this
 SavedIsOwed == alive /\ saved # NONE => owed

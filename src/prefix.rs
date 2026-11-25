@@ -17,14 +17,17 @@
 //! to it. Position 0 is always a start point and needs nothing.
 //!
 //! A `BlockEntry` names a pool slot at a generation, and a slot is reused:
-//! the entry alone goes stale. `LiveTree` is the matcher over Johnny's
-//! slot records — cached blocks sit at zero pool refs until a lane
-//! pins them, it refuses an entry whose generation its slot has moved
-//! past, evicts every stale block on a seek before matching, and drops
-//! pinned refs generation-checked so a reused slot's new owner is
-//! never corrupted. The plain `PrefixTree` below it knows nothing of pools.
+//! the entry alone goes stale. Three tree layers live in this module:
+//! - `PrefixTree`: the pure token-digest and exact-token tree with reference-counted
+//!   start points, independent of GPU pools.
+//! - `EntryTree`: pairs each tree block with its `(Window, Full)` `BlockEntry` handles;
+//!   `ServeBlockCache` (`src/serve/block_cache.rs`) and `Layer3Pool` (`src/poolgate.rs`)
+//!   use `EntryTree` to match, retain, evict, and spill cross-request checkpoints.
+//! - `LiveTree`: wraps `PrefixTree` directly over a single `BlockPool`'s slot records —
+//!   cached blocks sit at zero pool refs until a lane pins them, stale generations are
+//!   evicted on seek before matching, and pinned refs drop generation-checked.
 //!
-//! Modelled by `specs/PrefixTree.tla`; this code is bound to that model
+//! Modelled by `specs/PrefixTree.tla`; `LiveTree` is bound to that model
 //! by the trace check in `specs/run_tlc.zsh` (`PrefixTreeTrace`): a
 //! seeded walk over `LiveTree` emits its states, and TLC checks each
 //! emitted state is a behaviour of the spec.

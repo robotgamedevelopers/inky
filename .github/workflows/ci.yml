@@ -32,6 +32,26 @@ jobs:
           out=$(cargo test --locked --bins serve_header_policy 2>&1) || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: memd socket integration tests
+        run: |
+          out=$(cargo test --locked --bins memd::tests:: -- --ignored 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 2 passed; 0 failed;' || { echo 'memd socket integration: expected 2 passed; 0 failed' >&2; exit 1; }
+      - name: spill SIGKILL crash-recovery integration test
+        run: |
+          out=$(cargo test --locked --bins spill::tests::kill9_mid_write_loses_cache_never_correctness -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'spill kill9 gate: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: trace dump entrypoints emit non-empty JSONL
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          out=$(INKY_BLOCK_TRACE_OUT="$tmp/block.ndjson" cargo test --locked --bins cache_scheduler::tests::dump_block_layout -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/block.ndjson"
+          out=$(INKY_CACHE_TRACE_OUT="$tmp/cache.ndjson" cargo test --locked --bins cache_scheduler::tests::dump_cache_scheduler -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/cache.ndjson"
+          out=$(INKY_SCHED_TRACE_OUT="$tmp/sched.jsonl" cargo test --locked --bins serve::scheduler_trace::dump -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/sched.jsonl"
       - name: crates.io package dry-run
         run: cargo publish --locked --dry-run
   # go: Linux-hosted regression tests for the soak, load, inkconvert, fleetcheck, servecheck, and replay tools.
@@ -113,7 +133,15 @@ jobs:
       - name: build
         run: cargo build --locked --profile ci
       - name: GPU router regression
-        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
+        run: |
+          out=$(cargo test --locked --profile ci --bins engine::tests::router_handles_nonfinite_scores -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU pool slot zero-fill
+        run: |
+          out=$(cargo test --locked --profile ci --bins blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (pull request set)
         env:
           INKY_BIN: ./target/ci/inky

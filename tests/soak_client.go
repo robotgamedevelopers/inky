@@ -1,6 +1,5 @@
-// Soak and fault-storm client for `inky serve`. Shell launches this through
-// nova-secrets exec (or INKY_SERVE_KEY in env). This process never prints that
-// value and never puts it on argv.
+// Soak and fault-storm client for `inky serve`. Reads the bearer key from
+// INKY_SERVE_KEY in the environment; never prints that value or puts it on argv.
 package main
 
 import (

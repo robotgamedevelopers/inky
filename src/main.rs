@@ -5,7 +5,7 @@ mod cache_trace;
 mod blockbook;
 mod engine;
 mod gguf;
-#[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
+#[allow(dead_code)] // EntryTree powers ServeBlockCache and Layer3Pool; LiveTree powers #[cfg(test)] PrefixTreeTrace
 mod prefix;
 mod metal;
 mod sampler;
@@ -960,12 +960,12 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
-/// dev, layer 3's output gate (src/poolgate.rs): lanes run together with every pool slot outside the step poisoned must
-/// give exactly the logits and greedy tokens of layer 2's path, each lane alone. Today the candidate is layer 2 itself,
-/// over each lane's own buffers; the block cache replaces it in `cand` below. INK_POOLGATE_LANES (default 3),
-/// INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position block boundary) and
-/// INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a long one.
-/// INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are poisoned, and the gate must then fail.
+/// dev, layer 3's output gate (src/poolgate.rs): lanes run together through `Layer3Pool` (`BlockPools` + `BlockTable`
+/// + `EntryTree`) with every pool slot outside the step poisoned must give bit-identical logits and greedy tokens to
+/// `Layer2`'s solo reference path. INK_POOLGATE_LANES (default 3), INK_POOLGATE_CHUNKS (prefill chunk sizes, default
+/// 31,1,23,17: across a 64-position block boundary) and INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs
+/// the default, tests/nightly.sh a long one. INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are
+/// poisoned, and the gate must then fail in that lane alone without leaking across lanes.
 fn poolgate(o: &Opts) {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
@@ -1869,9 +1869,10 @@ fn enter_inky_mode() {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-    match memd::enter(&sock) {
-        Some(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
-        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
+    match memd::enter_outcome(&sock) {
+        memd::EnterOutcome::Entered(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
+        memd::EnterOutcome::NotInstalled => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
+        memd::EnterOutcome::Refused(reason) => eprintln!("[inky] inky mode refused ({reason}): continuing with current GPU wired limit (tuning {}, default_lanes {})", t.name, t.default_lanes),
     }
 }
 

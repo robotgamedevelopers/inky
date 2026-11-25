@@ -4,22 +4,22 @@ Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapp
 
 ## 1. Candidate Machine Measurements
 
-| Host | Chip | Unified RAM | `iogpu.wired_limit_mb` | Metal Working Set | Weights Read (`inky bw`, 1 / 2 / 4 / 8 GB) |
+| Profile | Chip | Unified RAM | `iogpu.wired_limit_mb` | Metal Working Set | Weights Read (`inky bw`, 1 / 2 / 4 / 8 GB) |
 |---|---|---:|---:|---:|---|
-| `macbook` | Apple M5 Max | 128 GB | `118000` | `115.23 GiB` | `574.0` / `570.2` / `522.9` / `565.8 GB/s` |
-| `mini-m5` | Apple M5 Pro | 64 GB | `0` (macOS default) | `51.84 GiB` | `289.3` / `290.4` / `287.6` / `273.0 GB/s` |
+| M5 Max (128 GB) | Apple M5 Max | 128 GB | `118000` | `115.23 GiB` | `574.0` / `570.2` / `522.9` / `565.8 GB/s` |
+| M5 Pro (64 GB) | Apple M5 Pro | 64 GB | `0` (macOS default) | `51.84 GiB` | `289.3` / `290.4` / `287.6` / `273.0 GB/s` |
 
 Single-stream prefill & decode (`./target/release/inky bench ... -n 128`, greedy):
 
-| Host | Prompt | Prompt Tokens | Prefill Time | Prefill Rate | Decode (`128 tok`) | Single-Stream Decode |
+| Profile | Prompt | Prompt Tokens | Prefill Time | Prefill Rate | Decode (`128 tok`) | Single-Stream Decode |
 |---|---|---:|---:|---:|---:|---:|
-| `macbook` (M5 Max) | default (`23 tok`) | 23 | `61.5 ms` | `373.9 tok/s` | `1395.9 ms` | `91.70 tok/s` |
-| `macbook` (M5 Max) | [`src/tuning.rs`](../src/tuning.rs) | 1,466 | `378.3 ms` | `3874.8 tok/s` | `1312.1 ms` | `97.55 tok/s` |
-| `macbook` (M5 Max) | [`tools/replay/knee.go`](../tools/replay/knee.go) | 2,502 | `596.3 ms` | `4196.2 tok/s` | `1333.0 ms` | `96.02 tok/s` |
-| `macbook` (M5 Max) | [`src/record.rs`](../src/record.rs) | 9,174 | `3684.6 ms` | `2489.8 tok/s` | `1597.0 ms` | `80.15 tok/s` |
-| `mini-m5` (M5 Pro) | default (`23 tok`) | 23 | `101.0 ms` | `227.8 tok/s` | `1929.1 ms` | `66.35 tok/s` |
-| `mini-m5` (M5 Pro) | [`tools/replay/knee.go`](../tools/replay/knee.go) | 2,502 | `1178.6 ms` | `2122.8 tok/s` | `2077.1 ms` | `61.62 tok/s` |
-| `mini-m5` (M5 Pro) | [`src/record.rs`](../src/record.rs) | 9,174 | `4475.5 ms` | `2049.8 tok/s` | `2195.3 ms` | `58.31 tok/s` |
+| M5 Max (128 GB) | default (`23 tok`) | 23 | `61.5 ms` | `373.9 tok/s` | `1395.9 ms` | `91.70 tok/s` |
+| M5 Max (128 GB) | [`src/tuning.rs`](../src/tuning.rs) | 1,466 | `378.3 ms` | `3874.8 tok/s` | `1312.1 ms` | `97.55 tok/s` |
+| M5 Max (128 GB) | [`tools/replay/knee.go`](../tools/replay/knee.go) | 2,502 | `596.3 ms` | `4196.2 tok/s` | `1333.0 ms` | `96.02 tok/s` |
+| M5 Max (128 GB) | [`src/record.rs`](../src/record.rs) | 9,174 | `3684.6 ms` | `2489.8 tok/s` | `1597.0 ms` | `80.15 tok/s` |
+| M5 Pro (64 GB) | default (`23 tok`) | 23 | `101.0 ms` | `227.8 tok/s` | `1929.1 ms` | `66.35 tok/s` |
+| M5 Pro (64 GB) | [`tools/replay/knee.go`](../tools/replay/knee.go) | 2,502 | `1178.6 ms` | `2122.8 tok/s` | `2077.1 ms` | `61.62 tok/s` |
+| M5 Pro (64 GB) | [`src/record.rs`](../src/record.rs) | 9,174 | `4475.5 ms` | `2049.8 tok/s` | `2195.3 ms` | `58.31 tok/s` |
 
 The M5 Max (`574.0 GB/s` peak weight read) runs ~1.98× the memory bandwidth of M5 Pro (`290.4 GB/s`), giving ~1.46× single-stream decode (`96.02` vs `61.62 tok/s` at 2.5K) and ~1.98× prefill (`4196.2` vs `2122.8 tok/s` at 2.5K).
 
@@ -27,7 +27,7 @@ The M5 Max (`574.0 GB/s` peak weight read) runs ~1.98× the memory bandwidth of 
 
 [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) was captured from live `inky serve --record-dir` (`cards-20261124.jsonl`) across **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
 
-## 3. Lane-Count Sweep (`8..128` Lanes on `macbook`, M5 Max 128 GB)
+## 3. Lane-Count Sweep (`8..128` Lanes on M5 Max 128 GB)
 
 Server configuration:
 
@@ -66,7 +66,7 @@ Measured results (after sizing `serve()`'s preprocessing permit pool to `effecti
 - **Unconstrained scaling (`PickKnee` with `--min-gain 0.05`)**: Total throughput continues scaling cleanly at short-to-medium prompt sizes through `128` lanes (`401.96 tok/s`, `5,283.9 cards/hr`, `+21.8%/doubling` from `96` to `128`), because per-lane KV cache traffic at `< 2K` tokens is small relative to weight bandwidth.
 - **Selected Operational Knee (`PickKnee` with `--max-ttft-p95-ms 20000 --min-per-lane-tok-s 4.0`): `64` lanes**:
   1. **Marginal gain inflection**: `48 -> 64` jumps `+38.5%` (`232.94 -> 322.66 tok/s`, `+92.8%/doubling`), whereas `64 -> 96` drops to `+14.2%` (`+24.3%/doubling`) and `96 -> 128` drops to `+9.0%` (`+21.8%/doubling`).
-  2. **Worker probe & latency SLO**: At `64` lanes, `ttft_p95_ms = 16,331.1 ms` stays under the `20,000 ms` (`20 s`) `nova-sprint` worker startup probe ceiling (`docs/README.md`) and `per_lane_tok_s = 5.04` stays above `4.0 tok/s`; `96` (`20,689.1 ms`, `3.84 tok/s`) and `128` (`25,447.6 ms`, `3.14 tok/s`) cross both thresholds.
+  2. **Worker probe & latency SLO**: At `64` lanes, `ttft_p95_ms = 16,331.1 ms` stays under the `20,000 ms` (`20 s`) worker startup probe ceiling (`docs/README.md`) and `per_lane_tok_s = 5.04` stays above `4.0 tok/s`; `96` (`20,689.1 ms`, `3.84 tok/s`) and `128` (`25,447.6 ms`, `3.14 tok/s`) cross both thresholds.
   3. **Working-set headroom**: At `64` lanes (`60.52 GiB` peak worst-case at `-c 16384`), `54.7 GiB` of working set remains free for macOS/spill/longer turns, whereas `128` lanes consumes `103.02 GiB` (`89%` of the `115.23 GiB` working set). When running at higher per-lane context (`-c 65536`), `MemoryBudget` automatically caps admission to `43` lanes on M5 Max 128 GB.
 
 The chosen default lane count **`64`** is set in:

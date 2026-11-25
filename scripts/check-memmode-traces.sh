@@ -4,7 +4,7 @@
 # run in parallel. `check-memmode-traces.sh --list` prints the run names (production and each mutant) and runs nothing;
 # scripts/check-tla-tiers.sh reads it.
 set -euo pipefail
-mutants=(early-release no-rollback no-readback lost-seed skip-keep)
+mutants=(early-release no-rollback no-readback lost-seed lower-higher skip-keep)
 case ${1:-} in
     '') ;;
     --list) printf '%s\n' production "${mutants[@]}"; exit 0 ;;

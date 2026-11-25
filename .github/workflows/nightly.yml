@@ -40,7 +40,7 @@ jobs:
           TLA_NIGHTLY: '1'
         run: scripts/check-tla.sh layout-nightly
   # The exhaustive CacheScheduler safety and liveness models and their reversed witnesses
-  # (about 195 s with two TLC workers on hetzner2; CacheSchedulerTwoPrefixes alone is 61 s).
+  # (about 195 s with two TLC workers on a 4-core Linux runner; CacheSchedulerTwoPrefixes alone is 61 s).
   # run_cache_scheduler.sh gives TLC -Xmx8g. ubuntu-latest for a public repository has 4 CPUs and 16 GB of RAM;
   # macos-latest (arm64) has 7 GB, too little for an 8 GB heap, so this job runs on Linux and checks the memory first.
   tla-scheduler:
@@ -85,7 +85,16 @@ jobs:
         run: cargo build --locked --release
       - name: GPU router regression
         if: ${{ !cancelled() }}
-        run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
+        run: |
+          out=$(cargo test --locked --release --bins engine::tests::router_handles_nonfinite_scores -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU pool slot zero-fill
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --release --bins blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (full set)
         if: ${{ !cancelled() }}
         run: tests/ci.sh full

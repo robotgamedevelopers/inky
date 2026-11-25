@@ -248,8 +248,8 @@ pub fn write_inblock_trace(path: &str) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-/// Bytes of one slot at element width `kvb`. `kvb` is 1 (`--kv8`) or 2 (fp16).
-/// fp16 is [`BlockKind::stride`]. [`byte_offset`] stays on that fp16 stride.
+/// Bytes of one slot at element width `kvb` (`1` for `--kv8`, `2` for fp16).
+/// fp16 (`kvb == 2`) equals [`BlockKind::stride`]; [`byte_offset`] scales by `stride_bytes(kvb)`.
 pub fn stride_at(kind: BlockKind, kvb: u32) -> Result<u64, BlockError> {
     match kvb {
         1 | 2 => Ok(kind.stride() / 2 * u64::from(kvb)),
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     #[cfg(not(standalone_blocks))]
-    #[ignore = "needs a Metal device; run on mini-m5"]
+    #[ignore = "requires a Metal GPU device; run in CI m5-gpu and nightly m5-full"]
     fn gpu_pool_zero_fills_a_taken_slot() {
         use objc2_metal::{MTLBuffer, MTLDevice};
         let dev = objc2_metal::MTLCreateSystemDefaultDevice().expect("metal device");

@@ -2942,6 +2942,7 @@ mod tests {
     ///   ground-truth recomputation with bit-identical outputs.
     #[cfg(unix)]
     #[test]
+    #[ignore = "spawns SIGKILL writer subprocesses; run explicitly in CI unit job"]
     fn kill9_mid_write_loses_cache_never_correctness() {
         use std::os::unix::process::ExitStatusExt;
 

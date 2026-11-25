@@ -1,13 +1,12 @@
-//! `inky serve`: OpenAI chat completions and Anthropic Messages endpoints over many lanes. One scheduler thread owns the engine and
-//! the lanes and runs one GPU step at a time: a prefill step (lanes with prompt left, up to one chunk of tokens) or a
-//! decode step (one token for every lane that is generating). Connection threads parse requests, render the chat
-//! template, and stream back what the scheduler sends them. A lane keeps its last prompt and its convolution state at the
-//! prompt's end while its sliding-window history survives. A request whose tokens extend that prompt continues from
-//! there and prefills only what is new. Only prefill-written cache is ever reused (docs/DESIGN.md, decisions 4 and 5). The same kept prompt
-//! may also start a different lane: when the lane holding the longest matching prompt is busy, its prefill-written
-//! prefix is copied into a free lane (`copy_lane_prefix`, then the kept convolution state) and only the suffix is
-//! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
-//! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
+//! `inky serve`: OpenAI Chat Completions (`/v1/chat/completions`) and Anthropic Messages (`/v1/messages`,
+//! `/v1/messages/count_tokens`) over batched Layer 3 paged lanes (`Lane::new_blocked`). One scheduler thread owns the
+//! engine, the `ServeBlockCache` (`src/serve/block_cache.rs`), and the `ServeStepPlanner` (`src/scheduler.rs`, driving
+//! lanes through `Idle`, `Queued`, `Admitted`, `Restoring`, `Ready`, `InStep`, `Cancelling`, `Cancelled`, `Finished`,
+//! and `Refused`), and runs one GPU step at a time: a prefill step (chunked spans) or a batched decode step (one token
+//! per generating lane). Connection threads parse requests, render the chat template, and stream SSE or JSON responses back. Cross-card and
+//! multi-turn KV prefix reuse is served from `ServeBlockCache`: sealed 64-position `Window` and `Full` pool blocks live
+//! in `EntryTree` with retained start-point checkpoints (plus convolution state) at prompt ends, periodic 16-block
+//! boundaries, and lane heads, backed by cold-stampede singleflight leader election and optional `--spill-dir` SSD spill.
 
 use crate::engine::{Engine, Lane, Span, EXT};
 use crate::metal::CmdBuf;
@@ -1883,6 +1882,7 @@ impl AdmissionGate {
         let ticket = st.next_ticket;
         st.next_ticket = st.next_ticket.wrapping_add(1);
         st.waiters.push_back(ticket);
+        cvar.notify_all();
         let mut guard = WaiterGuard { inner: &self.inner, ticket, armed: true };
         let deadline = Instant::now() + self.queue_timeout;
         loop {
@@ -1913,6 +1913,15 @@ impl AdmissionGate {
     fn queued(&self) -> usize {
         let (lock, _) = &*self.inner;
         lock.lock().unwrap_or_else(|e| e.into_inner()).waiters.len()
+    }
+
+    #[cfg(test)]
+    fn wait_until_queued(&self, target: usize) {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while st.waiters.len() < target {
+            st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     fn inflight(&self) -> usize {
@@ -3929,12 +3938,9 @@ mod tests {
             out
         });
 
-        // Wait until request 2 is visibly sitting in the wait queue via /health telemetry.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while cx.admission.queued() != 1 {
-            assert!(Instant::now() < deadline, "queued request did not enter wait queue");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Wait deterministically on the admission condvar until request 2 enters the wait queue.
+        cx.admission.wait_until_queued(1);
+        assert_eq!(cx.admission.queued(), 1);
         let snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(snap["active_lanes"], 1);
         assert_eq!(snap["queued_requests"], 1);
@@ -4455,9 +4461,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Inkling-2-Mini GGUF model on Metal GPU"]
     fn serve_layer3_three_turn_10k_cached_matches_cold_solo() {
-        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
-            "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf".to_string()
-        });
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
         assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
 
         let ctx = 16384usize;
