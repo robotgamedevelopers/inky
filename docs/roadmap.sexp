@@ -48,38 +48,38 @@
      ("audit-cache-decode-reserve" "done" "t-audit-cache-decode-reserve")
      ("audit-cache-pool-deferred" "done" "t-audit-cache-pool-deferred")
    ))
-  (:id "t-audit-cache-spill-identity" :type :task :title "P1 — Keep SSD checkpoint identities unique across restarts and concurrent opens" :state :doing
-   :evidence ("src/spill.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-spill-identity" :type :task :title "P1 — Keep SSD checkpoint identities unique across restarts and concurrent opens" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/spill.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "After reopening the store, the first allocated Full ID already belonged to the previous process. Preserve readable legacy blocks, assign fresh IDs, and grant one writer ownership before recovery or eviction.")
-  (:id "t-audit-cache-admission-warm" :type :task :title "P1 — Charge newly pinned Full and Window blocks before admitting a warm match" :state :doing
-   :evidence ("src/serve/block_cache.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
-   :note "In a 24-slot Full pool, binding a 768-token checkpoint reduced reclaimable capacity from 16 slots to four. Each of two lanes still needed six. Charge the first active reference once and share blocks already pinned by active lanes.")
-  (:id "t-audit-cache-physical-limits" :type :task :title "Apply physical KV row limits before accepting the request and size prefill spans to the Window pool" :state :doing
-   :evidence ("src/serve.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
+  (:id "t-audit-cache-admission-warm" :type :task :title "P1 — Charge newly pinned Full and Window blocks before admitting a warm match" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d6778fe8df304001a41bf3922dc122360dafc51f" "src/serve/block_cache.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
+   :note "In a 24-slot Full pool, binding a 768-token checkpoint reduced reclaimable capacity from 16 slots to four. Each of two lanes still needed six. Admission now charges the first active reference once and shares blocks already pinned by active lanes. Concurrent requests reserve up to 4,096 future decode tokens per lane at a time. Longer replies extend that reservation as they advance.")
+  (:id "t-audit-cache-physical-limits" :type :task :title "Apply physical KV row limits before accepting the request and size prefill spans to the Window pool" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d6778fe8df304001a41bf3922dc122360dafc51f" "src/serve.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
    :note "An idle scheduler could accept a prompt exactly at the Full pool limit and fail at the second generated token, after a streaming HTTP success header. The row cost is prompt length plus generated tokens minus one. Check the budget before starting either API response and bound each prefill span by the writable Window slots.")
-  (:id "t-audit-cache-admission-singleflight" :type :task :title "Reserve every distinct suffix with the lane that will prefill it" :state :doing
-   :evidence ("src/serve/block_cache.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
+  (:id "t-audit-cache-admission-singleflight" :type :task :title "Reserve every distinct suffix with the lane that will prefill it" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d6778fe8df304001a41bf3922dc122360dafc51f" "src/serve/block_cache.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/79")
    :note "Two followers credited each other for an 8,192-token checkpoint their elected leader would never reach. The calculation reserved 35 Full slots for three prompts even though a single long prompt needed 129. Cover leader cancellation and promotion.")
-  (:id "t-audit-cache-spill-window" :type :task :title "P1 — Restore a long checkpoint and safely prefill a different continuation" :state :doing
-   :evidence ("src/serve/block_cache.rs" "src/prefix.rs" "Cargo.toml" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-spill-window" :type :task :title "P1 — Restore a long checkpoint and safely prefill a different continuation" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/serve/block_cache.rs" "src/prefix.rs" "Cargo.toml" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "A 1,088-token restore produced 17 Full blocks and 16 Window handles. Prefill assumed every canonical ancestor retained its Window handle and could abort the release server. Install the new window block when revisiting such an ancestor.")
-  (:id "t-audit-cache-spill-ownership" :type :task :title "Limit recovery cleanup to temporary files generated by Inky" :state :doing
-   :evidence ("src/spill.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-spill-ownership" :type :task :title "Limit recovery cleanup to temporary files generated by Inky" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/spill.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "The startup sweep removed an unrelated backup whose name contained .tmp. Recognize the complete generated name, preserve other files, and cover interruption during a real block write.")
-  (:id "t-audit-cache-spill-accounting" :type :task :title "Retain disk charges until deletion succeeds or absence is confirmed" :state :doing
-   :evidence ("src/spill.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-spill-accounting" :type :task :title "Retain disk charges until deletion succeeds or absence is confirmed" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/spill.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "The old LRU path subtracted a file’s size even when removal failed. Preserve the entry and byte count, try other eligible victims, and decline the write if the remaining files exhaust the disk budget.")
-  (:id "t-audit-cache-spill-staging" :type :task :title "Reserve restore destinations and bound temporary KV memory" :state :doing
-   :evidence ("src/serve/block_cache.rs" "src/blocks.rs" "tunings/m5-pro-64gb.tuning" "tunings/m5-max-128gb.tuning" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-spill-staging" :type :task :title "Reserve restore destinations and bound temporary KV memory" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/serve/block_cache.rs" "src/blocks.rs" "tunings/m5-pro-64gb.tuning" "tunings/m5-max-128gb.tuning" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "A cold 131,072-token fp16 checkpoint could stage 4,256 MiB beyond its allocated pools. Both shipped M5 profiles reserve 4 GiB of headroom. Verify one block at a time and release all provisional slots if any read fails.")
   (:id "t-audit-cache-spill-progress" :type :task :title "Measure cold SSD restore latency and keep unrelated decoding responsive" :state :todo
    :evidence ("src/serve/block_cache.rs" "src/serve.rs" "src/spill.rs")
    :note "Disk reads and checksum verification ran on the sole scheduler thread. Measure resident memory and unrelated-lane progress during a long cold restore under pressure. Size the I/O staging and move blocking work off the serving loop if needed.")
-  (:id "t-audit-cache-prefix-storage" :type :task :title "Bound prefix metadata by peak occupancy and preserve stale-handle rejection" :state :doing
-   :evidence ("src/prefix.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-prefix-storage" :type :task :title "Bound prefix metadata by peak occupancy and preserve stale-handle rejection" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/prefix.rs" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "After 16,384 insertions and evictions, the production tree had zero live nodes and retained 2,228,428 heap bytes. Reclaim slots and keep historical handles distinct from newly allocated nodes.")
-  (:id "t-audit-cache-window-pruning" :type :task :title "Visit each expired window block once per lane" :state :doing
-   :evidence ("src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
+  (:id "t-audit-cache-window-pruning" :type :task :title "Visit each expired window block once per lane" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/d676502c50c083a1f46f9ba12040670fc78cddba" "src/serve/block_cache.rs" "https://github.com/robotgamedevelopers/inky/pull/78")
    :note "The decode pruner restarted at block zero on every token. Its loop visits 2,031 old entries at position 131,008, or 64,992 for 32 lanes. Advance a per-lane cursor and reset it on release or rebind.")
   (:id "t-audit-cache-scheduler-trace" :type :task :title "Replay live scheduler burst and preemption decisions against their own specification" :state :doing
    :evidence ("src/serve.rs" "src/serve/scheduler_trace.rs" "src/scheduler.rs" "scripts/check-scheduler-traces.sh" "specs/CacheScheduler.tla" "https://github.com/robotgamedevelopers/inky/pull/87")
@@ -99,9 +99,9 @@
   (:id "t-audit-cache-spill-hardware" :type :task :title "Compare SSD-restored and cold generation on an M5 across eviction, restart and branching" :state :todo
    :evidence ("src/serve/block_cache.rs" "src/serve.rs" "src/spill.rs" "tests/golden.sh")
    :note "PR #78 also exercises the real M5 Pro block cache with model weights. A 1,088-token restore performed 34 committed writes and 53 verified reads, and all 200,058 logits matched cold execution for the continuation and early branch. Process-restart and HTTP-level spill qualification remain open. The GPU disk golden exercised CLI --kv-disk. Drive serve --spill-dir with model weights, confirm a restore occurred where expected, and compare generated output with an independent cold path after both an intact restore and a cache miss.")
-  (:id "t-audit-cache-decode-reserve" :type :task :title "Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure" :state :todo
+  (:id "t-audit-cache-decode-reserve" :type :task :title "Reserve each request's real reply budget, or state the 4096 decode cap and the remaining livelock failure" :state :done
    :evidence ("src/serve/block_cache.rs" "src/serve.rs" "src/main.rs" "docs/DESIGN.md" "docs/releases/v0.2.2.md")
-   :note "Johnny Grok, 2026-11-25, read this on main at d6778fe. InflightLaneReserve::reserved_end adds at most MAX_ADMIT_DECODE_RESERVE (4096) decode tokens (block_cache.rs:26 and :250). Serve default -n is 16384 (main.rs:88). An empty active set is admitted without a pool check (block_cache.rs:451). DESIGN.md still says a request is admitted only when every admitted lane's worst case fits. partition_pool_exhausted still fails one victim when nothing else can progress (serve.rs:894). Chat and Messages streams write HTTP 200 before generation (serve.rs:2197 and :2402), so that victim is a 200 stream with an error body. The v0.2.2 note says pool-exhaustion 500s were eliminated. The one-victim path is the livelock break and stays; the sentence and the 4096 cap need to match the code.")
+   :note "Johnny Grok, 2026-11-25, read this on main at d6778fe. InflightLaneReserve::reserved_end adds at most MAX_ADMIT_DECODE_RESERVE (4096) decode tokens (block_cache.rs:26 and :250). Serve default -n is 16384 (main.rs:88). An empty active set is admitted without a pool check (block_cache.rs:451). DESIGN.md still says a request is admitted only when every admitted lane's worst case fits. partition_pool_exhausted still fails one victim when nothing else can progress (serve.rs:894). Chat and Messages streams write HTTP 200 before generation (serve.rs:2197 and :2402), so that victim is a 200 stream with an error body. The v0.2.2 note says pool-exhaustion 500s were eliminated. The design and v0.2.2 release notes now document the bounded reserve and the one-request failure that releases capacity when all runnable lanes stall.")
   (:id "t-audit-cache-pool-deferred" :type :task :title "Wake a pool-deferred lane when the holder can make progress, including before the first window prune" :state :todo
    :evidence ("src/serve.rs" "src/serve/block_cache.rs" "src/engine.rs" "src/scheduler.rs")
    :note "Johnny Grok, 2026-11-25, on main at d6778fe. pool_deferred clears only when lanes_released or window_pruned changes (serve.rs:948). A deferred lane is not runnable (serve.rs:1100), so the W=16 ceiling does not tick it. newly_expired_window_blocks is empty until a position reaches EXT (1024, engine.rs:16; block_cache.rs:99). A deferred prefill shorter than that waits until the holder finishes or prunes a window block. This is a stall of an admitted lane, not a permanent spin.")
@@ -254,6 +254,8 @@
      ("audit-http-body-memory" "Bound simultaneous authenticated body reads and decoding ([#90](https://github.com/robotgamedevelopers/inky/pull/90))")
      ("audit-http-body-deadline" "Enforce a wall-clock deadline throughout body ingestion ([#90](https://github.com/robotgamedevelopers/inky/pull/90))")
      ("audit-ci-serve-controls" "Run servecheck units and verify live negative controls ([#75](https://github.com/robotgamedevelopers/inky/pull/75))")
+     ("audit-ci-queue-proof" "Prove queue occupancy, rejection and recovery with finite overlapping streams ([#75](https://github.com/robotgamedevelopers/inky/pull/75))")
+     ("audit-ci-serve-deadline" "Give each M5 serving probe a deadline within the CI suite budget ([#75](https://github.com/robotgamedevelopers/inky/pull/75))")
      ("audit-ci-integration-tests" "Include Rust integration tests in hosted debug CI ([#75](https://github.com/robotgamedevelopers/inky/pull/75))")
      ("audit-replay-line-size" "Read the full range of recorder-supported JSONL rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91))")
      ("audit-record-generation-delivery" "Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90))")
@@ -293,26 +295,28 @@
      ("audit-http-body-memory" "done" "t-audit-http-body-memory")
      ("audit-http-body-deadline" "done" "t-audit-http-body-deadline")
      ("audit-ci-serve-controls" "done" "t-audit-ci-serve-controls")
+     ("audit-ci-queue-proof" "done" "t-audit-ci-queue-proof")
+     ("audit-ci-serve-deadline" "done" "t-audit-ci-serve-deadline")
      ("audit-ci-integration-tests" "done" "t-audit-ci-integration-tests")
      ("audit-replay-line-size" "done" "t-audit-replay-line-size")
      ("audit-record-generation-delivery" "done" "t-audit-record-generation-delivery")
      ("audit-api-count-pool" "done" "t-audit-api-count-pool")
      ("audit-ci-pipefail" "done" "t-audit-ci-pipefail")
    ))
-  (:id "t-audit-fleet-worker" :type :task :title "P1 — Isolate model-edited Go during fleet checks" :state :doing
-   :evidence ("tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "docs/FLEET-SPRINT.md" "https://github.com/robotgamedevelopers/inky/pull/82")
+  (:id "t-audit-fleet-worker" :type :task :title "P1 — Isolate model-edited Go during fleet checks" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/1863db8ffba497c4e5ec34b4c5e588f2b8862c52" "tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "docs/FLEET-SPRINT.md" "https://github.com/robotgamedevelopers/inky/pull/82")
    :note "Run both model-triggered and final compilation/tests in a restricted worker with a clean environment, a deadline, and bounded output. Verify credential isolation and fail closed when the worker is unavailable.")
-  (:id "t-audit-release-exact-ci" :type :task :title "P1 — Require successful CI on the tagged commit before publication" :state :doing
-   :evidence (".github/workflows/release.yml" "https://github.com/robotgamedevelopers/inky/pull/75" "https://github.com/robotgamedevelopers/inky/actions/runs/45524141827" "https://github.com/robotgamedevelopers/inky/actions/runs/45524151899" "https://github.com/robotgamedevelopers/inky/actions/runs/45538544639" "https://github.com/robotgamedevelopers/inky/actions/runs/45540575332")
-   :note "v0.2.1 went live before its M5 cache checks failed. Open PR #75 waits for the exact main-push CPU, Go and M5 jobs and blocks publication on missing, failed or skipped jobs. The historical v0.2.2 M5 run passed before publication.")
-  (:id "t-audit-fleet-workdir" :type :task :title "Preserve caller files when creating a card workspace" :state :doing
-   :evidence ("tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
+  (:id "t-audit-release-exact-ci" :type :task :title "P1 — Require successful CI on the tagged commit before publication" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" ".github/workflows/release.yml" "https://github.com/robotgamedevelopers/inky/pull/75" "https://github.com/robotgamedevelopers/inky/actions/runs/45524141827" "https://github.com/robotgamedevelopers/inky/actions/runs/45524151899" "https://github.com/robotgamedevelopers/inky/actions/runs/45538544639" "https://github.com/robotgamedevelopers/inky/actions/runs/45540575332")
+   :note "v0.2.1 went live before its M5 cache checks failed. PR #75 waits for the exact main-push CPU, Go and M5 jobs and blocks publication on missing, failed or skipped jobs. A read-only check accepted v0.2.2 and rejected v0.2.1. The merged tree passed all 17 positive M5 Pro HTTP probes and its wrapper detected exactly the four intended negative controls.")
+  (:id "t-audit-fleet-workdir" :type :task :title "Preserve caller files when creating a card workspace" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/1863db8ffba497c4e5ec34b4c5e588f2b8862c52" "tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
    :note "Create each fixture in its own child directory and verify that existing files at the requested workdir survive setup.")
-  (:id "t-audit-fleet-acceptance" :type :task :title "Require successful tools and independent fleet acceptance tests" :state :doing
-   :evidence ("tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
+  (:id "t-audit-fleet-acceptance" :type :task :title "Require successful tools and independent fleet acceptance tests" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/1863db8ffba497c4e5ec34b4c5e588f2b8862c52" "tests/fleetcheck/main.go" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
    :note "Keep the acceptance harness immutable, require the initial fixture to fail for its intended reason and run the original checks on the submitted function. Require a successful model-initiated test after the last edit.")
-  (:id "t-audit-fleet-live-endpoint" :type :task :title "Require an endpoint for a live fleet verdict" :state :doing
-   :evidence ("tests/fleet_gate.sh" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
+  (:id "t-audit-fleet-live-endpoint" :type :task :title "Require an endpoint for a live fleet verdict" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/1863db8ffba497c4e5ec34b4c5e588f2b8862c52" "tests/fleet_gate.sh" "tests/fleetcheck/main_test.go" "https://github.com/robotgamedevelopers/inky/pull/82")
    :note "Make offline mode explicit. A live gate with no endpoint previously exited successfully after unit tests. Check the command exit and diagnostic.")
   (:id "t-audit-fleet-live-card" :type :task :title "Repeat the live fleet card with the corrected verifier" :state :todo
    :evidence ("tests/fleet_gate.sh" "docs/FLEET-SPRINT.md")
@@ -389,12 +393,18 @@
   (:id "t-audit-http-body-deadline" :type :task :title "Enforce a wall-clock deadline throughout body ingestion" :state :doing
    :evidence ("src/serve.rs" "docs/README.md" "https://github.com/robotgamedevelopers/inky/pull/90")
    :note "Keep the header deadline and give the subsequent request body an absolute deadline across reads. Verify fragmented bodies cannot extend that deadline and budget charges release on timeout.")
-  (:id "t-audit-ci-serve-controls" :type :task :title "Run servecheck units and verify live negative controls" :state :doing
-   :evidence (".github/workflows/ci.yml" "tests/serve.sh" "tests/servecheck/servecheck_test.go" "https://github.com/robotgamedevelopers/inky/pull/75")
-   :note "The main Go job omits five servecheck tests, and M5 omits the memory-budget, concurrent-tool and mid-thinking disconnect controls. Open PR #75 adds the race suite and checks exact expected failure diagnostics for these plus the existing health control.")
-  (:id "t-audit-ci-integration-tests" :type :task :title "Include Rust integration tests in hosted debug CI" :state :doing
-   :evidence (".github/workflows/ci.yml" "https://github.com/robotgamedevelopers/inky/pull/75")
-   :note "Open PR #75 adds integration targets to the debug suite so new subprocess or helper-lifecycle tests under tests/ are scheduled alongside binary tests.")
+  (:id "t-audit-ci-serve-controls" :type :task :title "Run servecheck units and verify live negative controls" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" ".github/workflows/ci.yml" "tests/serve.sh" "tests/servecheck/servecheck_test.go" "https://github.com/robotgamedevelopers/inky/pull/75")
+   :note "The main Go job omits five servecheck tests, and M5 omits the memory-budget, concurrent-tool and mid-thinking disconnect controls. PR #75 adds the race suite and checks exact expected failure diagnostics for these plus the existing health control.")
+  (:id "t-audit-ci-queue-proof" :type :task :title "Prove queue occupancy, rejection and recovery with finite overlapping streams" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" "tests/servecheck/jobs.go" "https://github.com/robotgamedevelopers/inky/pull/75")
+   :note "On M5 Pro the old probe observed two active lanes, one waiter and both overflow rejections, then timed out trying to drain two 256-token streams in 60 seconds. The M5 Pro retest observed two active lanes, one waiter and both 429 responses. The three accepted streams completed with 64, 64 and 12 tokens and capacity recovered.")
+  (:id "t-audit-ci-serve-deadline" :type :task :title "Give each M5 serving probe a deadline within the CI suite budget" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" "tests/servecheck/main.go" "https://github.com/robotgamedevelopers/inky/actions/runs/45549645627" "https://github.com/robotgamedevelopers/inky/pull/75")
+   :note "On the pre-repair main revision the loopback server reached its three-minute process deadline during a valid Messages tool loop. Later probes then saw EOF and connection failures. Keep the combined suite bounded and give each check its own deadline and cleanup.")
+  (:id "t-audit-ci-integration-tests" :type :task :title "Include Rust integration tests in hosted debug CI" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" ".github/workflows/ci.yml" "https://github.com/robotgamedevelopers/inky/pull/75")
+   :note "PR #75 adds integration targets to the debug suite so new subprocess or helper-lifecycle tests under tests/ are scheduled alongside binary tests.")
   (:id "t-audit-replay-line-size" :type :task :title "Read the full range of recorder-supported JSONL rows" :state :doing
    :evidence ("tools/replay/replay.go" "src/serve.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "The loader aborts a replay set at a 16 MiB line, while the server accepts 32 MiB bodies and the recorder defaults to 100 MiB per segment. Read a valid recorded line above 16 MiB and its following turn without silent loss.")
@@ -536,6 +546,7 @@
      ("audit-verify-hardware" "Verify M5 Max and Pro reference agreement and chip goldens")
      ("audit-verify-http" "Check the published binary and the three-turn RAM cache on M5 Pro")
      ("audit-verify-models" "Replay shipped model traces and their negative controls")
+     ("audit-ci-unix-socket-path" "Run helper socket tests independently of checkout path length ([#84](https://github.com/robotgamedevelopers/inky/pull/84))")
      ("audit-verify-umask-fixtures" "Isolate the helper socket test from concurrent recorder tests ([#91](https://github.com/robotgamedevelopers/inky/pull/91))")
    )
    :columns (("done" "done"))
@@ -545,6 +556,7 @@
      ("audit-verify-hardware" "done" "t-audit-verify-hardware")
      ("audit-verify-http" "done" "t-audit-verify-http")
      ("audit-verify-models" "done" "t-audit-verify-models")
+     ("audit-ci-unix-socket-path" "done" "t-audit-ci-unix-socket-path")
      ("audit-verify-umask-fixtures" "done" "t-audit-verify-umask-fixtures")
    ))
   (:id "t-audit-verify-package" :type :task :title "Verify the published v0.2.2 source and release assets" :state :done
@@ -562,6 +574,9 @@
   (:id "t-audit-verify-models" :type :task :title "Replay shipped model traces and their negative controls" :state :done
    :evidence ("scripts/check-tla.sh" "specs" "https://github.com/robotgamedevelopers/inky/commit/be82ef36c93672c715312676d40c25e9dfeb6fff")
    :note "The v0.2.2 TLA runner accepted its positive traces and rejected the five MemMode, six blockbook, seven cache and four scheduler mutations. Its synthetic scheduler traces have separate coverage from the live planner.")
+  (:id "t-audit-ci-unix-socket-path" :type :task :title "Run helper socket tests independently of checkout path length" :state :doing
+   :evidence ("src/memd.rs" "https://github.com/robotgamedevelopers/inky/pull/84")
+   :note "Two macOS helper tests exceeded the Unix socket pathname limit when run from a long checkout. Create a short, private scratch directory for each test and preserve isolation across concurrent runs.")
   (:id "t-audit-verify-umask-fixtures" :type :task :title "Isolate the helper socket test from concurrent recorder tests" :state :doing
    :evidence ("src/memd.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "The helper socket test temporarily changes the process-wide file mask. In a parallel run a recorder fixture directory was created without search permission and rotation failed. Run the helper fixture in its own process and use a deterministic recorder write failure.")
@@ -764,7 +779,7 @@
   (:id "t-l4-bound" :type :task :title "No Ready, Restoring or Queued lane is passed over more than W ticks" :state :doing :evidence ("src/scheduler.rs: wait_ticks <= max_bypass across Queued/Restoring/Ready"))
   (:id "t-l4-admit" :type :task :title "Admission by worst-case memory against the measured budget, a bounded queue, then 429 with Retry-After" :state :doing :evidence ("src/serve.rs: MemoryBudget, AdmissionGate (429 + Retry-After)" "src/scheduler.rs: arrive/admit"))
   (:id "t-l4-budget" :type :task :title "The memory budget read from Metal's recommended working set at start, never passed by hand" :state :done :evidence ("src/metal.rs: recommended_max_working_set_size" "src/engine.rs: model_and_scratch_bytes, per_lane_worst_case_bytes" "src/serve.rs: MemoryBudget::compute"))
-  (:id "t-l4-mode" :type :task :title "Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not" :state :done :evidence ("specs/memmode/MemMode.tla" "scripts/check-memmode-traces.sh") :note "src/memd.rs and inky tune-memory; MemMode.tla with its trace check in CI (pull requests 13, 16, 23, 26, 29)")
+  (:id "t-l4-mode" :type :task :title "Inky mode: a one-time root helper raises the GPU wired limit while inky runs and restores it when inky's connection closes, crash or not" :state :doing :evidence ("specs/memmode/MemMode.tla" "scripts/check-memmode-traces.sh") :note "src/memd.rs and inky tune-memory; MemMode.tla with its trace check in CI (pull requests 13, 16, 23, 26, 29)")
   (:id "t-l4-cancel" :type :task :title "Cancel in a step waits for the step's GPU work and disk I/O" :state :done :evidence ("src/scheduler.rs: InStep/Restoring -> Cancelling -> Cancelled barrier" "src/serve.rs: ServeStepPlanner"))
   (:id "t-l4-spill" :type :task :title "Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first" :state :done :evidence ("src/spill.rs: SpillStore, lazy LRU spill (--spill-dir, --max-spill-bytes)"))
   (:id "t-l4-restore" :type :task :title "Restoring reserves the whole working set atomically before reading" :state :doing :evidence ("src/spill.rs: atomic working-set restore reservation" "src/scheduler.rs: begin_restore"))
