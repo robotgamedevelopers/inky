@@ -186,7 +186,7 @@ fn is_known_cli_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "help" | "-h" | "--help"
-            | "check" | "rows" | "rollback" | "binv" | "lanes" | "spans" | "xcopy" | "poolgate"
+            | "check" | "rows" | "rollback" | "binv" | "crosspath" | "lanes" | "spans" | "xcopy" | "poolgate"
             | "loopcdgate" | "blockedinv" | "temp1"
             | "lanebench" | "dbatch" | "sharedkv" | "maxctx" | "debug" | "prof" | "routes" | "vcost" | "prof_pf"
             | "kmoe" | "kgemm" | "kmoepf" | "ksg" | "qclip" | "lazytest" | "kvprune" | "kvscreen" | "kvdump"
@@ -282,6 +282,19 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn loopcd_weak_logits_require_both_finite_references() {
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.25, 2.0], &[1.0, 2.0]), Some(0.25));
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 2.25]), Some(0.25));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[f32::NAN], &[1.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[1.0], &[f32::NAN]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[], &[], &[]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[f32::NAN], &[1.0], &[1.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[f32::INFINITY], &[f32::INFINITY], &[f32::INFINITY]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.0], &[1.0, 2.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[1.0000001], &[0.9999999]), None);
+    }
 
     fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
         parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), 64, |name| match name {
@@ -505,6 +518,7 @@ mod cli_tests {
         }
         assert_eq!(cli(&[]).unwrap().0, "help");
         assert_eq!(cli(&["--help"]).unwrap().0, "help");
+        assert_eq!(cli(&["crosspath", "--ref", "ref/long.tokens"]).unwrap().0, "crosspath");
 
         // Context headroom check refuses prompts >= ctx cleanly
         assert!(check_prompt_fits_ctx(0, 64).is_err());
@@ -1125,6 +1139,127 @@ fn binv(o: &Opts) -> Result<(), String> {
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
     Ok(())
+}
+
+/// Compare the same target row through two chunkings of the prefill arithmetic. Every checked end gets its own
+/// span of CROSSPATH_SPAN rows ending at that end (fewer only when the end is shorter), started from one
+/// base lane that never takes part in a comparison: one lane prefills the full multi-row span, while the
+/// other prefills its first rows and last row separately. Every span has at least two rows, and one ending
+/// just past a split boundary crosses it. Decode has a different arithmetic and is not expected to match.
+const CROSSPATH_SPAN: usize = 17;
+const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
+
+fn crosspath_start(end: usize) -> usize { end.saturating_sub(CROSSPATH_SPAN) }
+
+fn crosspath_completed(status: objc2_metal::MTLCommandBufferStatus) -> bool { status == objc2_metal::MTLCommandBufferStatus::Completed }
+
+fn wait_crosspath(cb: &metal::CmdBuf) {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if !crosspath_completed(status) {
+        let error = cb.error().map(|e| e.localizedDescription().to_string());
+        panic!("crosspath Metal command failed (status {status:?}): {}", error.as_deref().unwrap_or("no driver error provided"));
+    }
+}
+
+#[cfg(test)]
+mod crosspath_tests {
+    use super::*;
+
+    #[test]
+    fn only_successful_gpu_completion_is_accepted() {
+        assert!(crosspath_completed(objc2_metal::MTLCommandBufferStatus::Completed));
+        assert!(!crosspath_completed(objc2_metal::MTLCommandBufferStatus::Error));
+        assert!(!crosspath_completed(objc2_metal::MTLCommandBufferStatus::Scheduled));
+    }
+
+    #[test]
+    fn every_default_boundary_uses_an_independent_17_row_span() {
+        let ends: Vec<usize> = CROSSPATH_ENDS.split(',').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ends.len(), 12);
+        let mut cursor = 0;
+        for end in ends {
+            let start = crosspath_start(end);
+            assert!(start >= cursor);
+            assert_eq!(end - start, 17);
+            cursor = start;
+        }
+    }
+}
+
+fn crosspath(o: &Opts) {
+    let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens")
+        .lines().map(|line| line.trim().parse().unwrap()).collect();
+    let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS").unwrap_or_else(|_| {
+        CROSSPATH_ENDS.into()
+    }).split(',').map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts")).collect();
+    let len = *ends.last().unwrap();
+    assert!(ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
+            "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)");
+    assert!(len <= toks.len() && len <= o.ctx, "crosspath fixture or context is too short");
+
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    assert!(CROSSPATH_SPAN <= eng.chunk, "a crosspath span must fit one prefill chunk");
+    let base = Lane::new(&eng);
+    let prefill = Lane::new(&eng);
+    let split = Lane::new(&eng);
+    for lane in [&base, &prefill, &split] {
+        let run = eng.on(lane);
+        run.reserve(len, false);
+        run.set_tokens(0, &toks[..len]);
+    }
+
+    let run_prefill = |lane: &Lane, p0, t, logits| {
+        let cb = eng.gpu.cmd();
+        eng.on(lane).encode_prefill(&cb, p0, t, logits, false);
+        cb.commit();
+        wait_crosspath(&cb);
+    };
+    // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
+    let mut cursor = 0;
+    let mut ok = true;
+    for end in ends {
+        let start = crosspath_start(end);
+        let target = end - 1;
+        assert!(start >= cursor && target - start >= 1, "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows");
+        while cursor < start {
+            let count = (start - cursor).min(eng.chunk);
+            run_prefill(&base, cursor, count, false);
+            cursor += count;
+        }
+        eng.copy_lane(&base, &prefill);
+        eng.copy_lane(&base, &split);
+        eng.on(&split).set_tokens(0, &toks[..len]);
+        run_prefill(&split, start, target - start, false);
+        run_prefill(&prefill, start, end - start, true);
+        let expected = eng.logits().to_vec();
+        if std::env::var_os("INK_CROSSPATH_SABOTAGE").is_some() {
+            eng.on(&split).set_tokens(target, &[(toks[target] + 1) % eng.n_vocab as u32]);
+        }
+        run_prefill(&split, target, 1, true);
+        let actual = eng.logits();
+        let first_bad = expected.iter().zip(actual.iter()).position(|(&a, &b)| {
+            !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
+        });
+        let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&split);
+        if let Some(i) = first_bad {
+            println!("after {end} tokens: logit {i} differs (prefill {:08x}, split {:08x}), prefill span [{start}, {end})",
+                     expected[i].to_bits(), actual[i].to_bits());
+        }
+        if !state_equal {
+            println!("after {end} tokens: cache or convolution state differs, prefill span [{start}, {end})");
+        }
+        if first_bad.is_none() && state_equal {
+            println!("after {end} tokens: exact, prefill span [{start}, {end}) of {} rows", end - start);
+        }
+        ok &= first_bad.is_none() && state_equal;
+    }
+    if !ok {
+        println!("CROSSPATH MISMATCH");
+        std::process::exit(1);
+    }
+    println!("crosspath exact: prefill chunkings agree");
 }
 
 /// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
@@ -2056,6 +2191,20 @@ fn cpu_loopcd_reference(z3_raw: &[f32], z1_raw: &[f32], softcap: f32, omega_max:
     (out, omega_t as f32)
 }
 
+fn weak_loopcd_mismatch(candidate: &[f32], dry: &[f32], stateful: &[f32]) -> Option<f32> {
+    if candidate.len() != dry.len() || candidate.len() != stateful.len() || candidate.is_empty() {
+        return Some(f32::INFINITY);
+    }
+    let mut max_delta = 0.0f32;
+    for ((&actual, &dry_ref), &stateful_ref) in candidate.iter().zip(dry).zip(stateful) {
+        if !(actual.is_finite() && dry_ref.is_finite() && stateful_ref.is_finite()) {
+            return Some(f32::INFINITY);
+        }
+        max_delta = max_delta.max((actual - dry_ref).abs()).max((actual - stateful_ref).abs());
+    }
+    (max_delta > 1e-6).then_some(max_delta)
+}
+
 /// GPU gate for Adaptive `LoopCD-Logits` (`t-au-loopcd-gpu-gate` / `U19`):
 /// 1. Runs `encode_decode_with_omegas` on a 4-lane Layer 3 blocked batch with mixed omegas `[0.0, 0.35, 0.0, 0.5]`
 ///    (lanes 0 & 1 sharing a sealed 64-token prefix block for `k_attn_grp_dec`, lanes 2 & 3 private for `k_attn_dec_solo`).
@@ -2290,15 +2439,8 @@ fn loopcdgate(o: &Opts) {
             bad.push(format!("lane {i}: post-step KV blocks differ from standalone omega=0 decode"));
         }
         // Verify captured `lg_weak` matches both isolated dry probe and standalone 1-pass reference.
-        if cand_weak_logits[i] != dry_weak_probe_logits[i] || cand_weak_logits[i] != z1_ref[i] {
-            let wd = cand_weak_logits[i]
-                .iter()
-                .zip(&z1_ref[i])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            if wd > 1e-6 {
-                bad.push(format!("lane {i}: dry weak logits differ from standalone 1-pass reference (max_diff={wd:.6e})"));
-            }
+        if let Some(wd) = weak_loopcd_mismatch(&cand_weak_logits[i], &dry_weak_probe_logits[i], &z1_ref[i]) {
+            bad.push(format!("lane {i}: captured weak logits fail the dry-probe or standalone comparison (max_diff={wd:.6e})"));
         }
 
         if omegas[i] == 0.0 {
@@ -2989,6 +3131,7 @@ fn main() {
         "rows" => rows(&o),
         "rollback" => rollback(&o),
         "binv" => report_cli_result(&cmd, binv(&o)),
+        "crosspath" => crosspath(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),

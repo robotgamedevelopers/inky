@@ -105,8 +105,8 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/engine/tests.rs",
             "loopcd_mixed_batch_preserves_disabled_rows",
-            ".github/workflows/nightly.yml",
-            "loopcd_ -- --ignored",
+            "tests/loopcd-gate.sh",
+            "engine::tests::loopcd_mixed_batch_preserves_disabled_rows",
         ),
         (
             "src/engine/tests.rs",
@@ -122,9 +122,15 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/loopcd_tests.rs",
-            "loopcd_model_first_token_and_mixed_lanes",
-            ".github/workflows/nightly.yml",
-            "loopcd_ -- --ignored",
+            "loopcd_cli_first_token",
+            "tests/loopcd-gate.sh",
+            "loopcd_tests::loopcd_cli_first_token",
+        ),
+        (
+            "src/loopcd_tests.rs",
+            "loopcd_paged_mixed_lane_state",
+            "tests/loopcd-gate.sh",
+            "loopcd_tests::loopcd_paged_mixed_lane_state",
         ),
         (
             "src/memd.rs",

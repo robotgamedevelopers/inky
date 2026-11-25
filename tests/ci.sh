@@ -58,6 +58,21 @@ agree() {  # name, ref, expected positions, env...
         END { exit (seen != 1 || bad) }
     ' || { echo "FAIL: $name (expected $expected agreeing positions)"; fail=1; }
 }
+# Keep command status and the exact verdict together. A crash after printing a verdict fails.
+verdict() {
+    local name=$1 expected_status=$2 expected_line=$3
+    shift 3
+    local out rc=0
+    out=$("$@" 2>&1) || rc=$?
+    if [[ "$rc" == "$expected_status" ]] && grep -Eq "$expected_line" <<< "$out"; then
+        print -r -- "$name: $(grep -E "$expected_line" <<< "$out")"
+    else
+        print -r -- "$out"
+        echo "FAIL: $name (exit $rc, expected $expected_status)"
+        fail=1
+    fi
+}
+
 agree "decode, short prompt vs llama.cpp" short 58
 agree "prefill+decode (1 prefill end + 23 decode rows), long prompt vs llama.cpp" long 24 INK_PF=2380
 agree "decode steps, short prompt vs llama.cpp" short 58 INK_DEC=1
@@ -75,11 +90,10 @@ else
     echo "FAIL: aligned --kv-disk hash ($kvd_dsk_hash) != in-memory ($kvd_mem_hash)"
     fail=1
 fi
-$B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^xcopy lossless' || { echo "FAIL: xcopy"; fail=1; }
+verdict xcopy 0 '^xcopy lossless' "$B" xcopy --ref ref/long.tokens -c 4096
 # negative control: a copy one token short of the head it claims must exit 1 AND report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other status does not count
-xc_out=$(INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1) && xc_rc=0 || xc_rc=$?
-if [ "$xc_rc" = 1 ] && print -r -- "$xc_out" | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else print -r -- "$xc_out"; echo "FAIL: xcopy sabotage not detected (exit $xc_rc)"; fail=1; fi
-$B poolgate --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^pool gate identical' || { echo "FAIL: poolgate"; fail=1; }
+verdict "xcopy sabotage" 1 '^XCOPY NOT LOSSLESS$' env INK_XCOPY_SABOTAGE=1 "$B" xcopy --ref ref/long.tokens -c 4096
+verdict poolgate 0 '^pool gate identical' "$B" poolgate --ref ref/long.tokens -c 4096
 # negative control: a step whose own slots are poisoned must exit 1 AND print POOL GATE DIFFERS (src/main.rs); a crash
 # (any other status, a panic) does not count, nor does the text without status 1. And only the poisoned lane may differ:
 # another lane that differs read the poison through state the lanes share.
@@ -98,13 +112,11 @@ if [ "$mode" = pr ]; then
     echo "pr set done; binv, lanes, spans, dbatch, blockedinv (each with sabotage), cli checks and golden run in the nightly workflow (tests/ci.sh full)"
     exit $fail
 fi
-$B binv --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^batch invariant' || { echo "FAIL: binv"; fail=1; }
-binv_out=$(INK_BINV_SABOTAGE=1 INK_SPLITS=0,64 $B binv --ref ref/long.tokens -c 4096 2>&1) && binv_rc=0 || binv_rc=$?
-if [ "$binv_rc" = 1 ] && print -r -- "$binv_out" | grep -q '^NOT batch invariant$'; then echo "binv sabotage: detected, as required"; else echo "FAIL: binv sabotage not detected (exit $binv_rc)"; fail=1; fi
-$B lanes --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^lanes independent' || { echo "FAIL: lanes"; fail=1; }
-lanes_out=$(INK_LANES_SABOTAGE=1 INK_PF=2380 $B lanes --ref ref/long.tokens -c 4096 2>&1) && lanes_rc=0 || lanes_rc=$?
-if [ "$lanes_rc" = 1 ] && print -r -- "$lanes_out" | grep -q '^LANES NOT INDEPENDENT$'; then echo "lanes sabotage: detected, as required"; else echo "FAIL: lanes sabotage not detected (exit $lanes_rc)"; fail=1; fi
-INK_LANES=1,2,17,64,65,129 $B spans --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^spans invariant' || { echo "FAIL: spans"; fail=1; }
+verdict binv 0 '^batch invariant' "$B" binv --ref ref/long.tokens -c 4096
+verdict "binv sabotage" 1 '^NOT batch invariant$' env INK_BINV_SABOTAGE=1 INK_SPLITS=0,64 "$B" binv --ref ref/long.tokens -c 4096
+verdict lanes 0 '^lanes independent' "$B" lanes --ref ref/long.tokens -c 4096
+verdict "lanes sabotage" 1 '^LANES NOT INDEPENDENT$' env INK_LANES_SABOTAGE=1 INK_PF=2380 "$B" lanes --ref ref/long.tokens -c 4096
+verdict spans 0 '^spans invariant' env INK_LANES=1,2,17,64,65,129 "$B" spans --ref ref/long.tokens -c 4096
 # A shorter private lane must clear the masked tail of its last K/V tile.
 private_test=engine::tests::private_prefill_clears_the_last_window_tile_between_lanes
 if private_out=$(cargo test --locked --release --bin inky "$private_test" -- --ignored --exact 2>&1) &&
@@ -117,14 +129,15 @@ else
 fi
 # negative control: the sabotaged spans run (one span bound to the wrong lane's state) must exit 1 AND report SPANS NOT INVARIANT
 # (the exact line `inky spans` prints when its lanes differ, src/main.rs); a crash or any other status does not count
-sp_out=$(INK_SPANS_SABOTAGE=1 INK_LANES=2 $B spans --ref ref/long.tokens -c 4096 2>&1) && sp_rc=0 || sp_rc=$?
-if [ "$sp_rc" = 1 ] && print -r -- "$sp_out" | grep -q 'SPANS NOT INVARIANT'; then echo "spans sabotage: detected, as required"; else print -r -- "$sp_out"; echo "FAIL: spans sabotage not detected (exit $sp_rc)"; fail=1; fi
-INK_LANES=1,8,33,64 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
-db_out=$(INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 $B dbatch --ref ref/long.tokens -c 4096 2>&1) && db_rc=0 || db_rc=$?
-if [ "$db_rc" = 1 ] && print -r -- "$db_out" | grep -q '^DBATCH NOT EXACT$'; then echo "dbatch sabotage: detected, as required"; else echo "FAIL: dbatch sabotage not detected (exit $db_rc)"; fail=1; fi
-$B blockedinv --ref ref/long.tokens -c 4160 2>&1 | tail -1 | tee /dev/stderr | grep -q '^blockedinv exact' || { echo "FAIL: blockedinv"; fail=1; }
-bi_out=$(INK_BLOCKEDINV_SABOTAGE=1 $B blockedinv --ref ref/long.tokens -c 1024 2>&1) && bi_rc=0 || bi_rc=$?
-if [ "$bi_rc" = 1 ] && print -r -- "$bi_out" | grep -q 'BLOCKED NOT INVARIANT'; then echo "blockedinv sabotage: detected, as required"; else print -r -- "$bi_out"; echo "FAIL: blockedinv sabotage not detected (exit $bi_rc)"; fail=1; fi
+verdict "spans sabotage" 1 '^SPANS NOT INVARIANT$' env INK_SPANS_SABOTAGE=1 INK_LANES=2 "$B" spans --ref ref/long.tokens -c 4096
+verdict crosspath 0 '^crosspath exact:' "$B" crosspath --ref ref/long.tokens -c 4096
+verdict "crosspath sabotage" 1 '^CROSSPATH MISMATCH$' env INK_CROSSPATH_SABOTAGE=1 "$B" crosspath --ref ref/long.tokens -c 4096
+verdict dbatch 0 '^dbatch exact' env INK_LANES=1,8,33,64,65 INK_DECODE=8 "$B" dbatch --ref ref/long.tokens -c 4096
+verdict "dbatch sabotage" 1 '^DBATCH NOT EXACT$' env INK_DBATCH_SABOTAGE=1 INK_LANES=2 INK_PF=128 INK_DECODE=2 "$B" dbatch --ref ref/long.tokens -c 4096
+verdict blockedinv 0 '^blockedinv exact' "$B" blockedinv --ref ref/long.tokens -c 4160
+verdict "blockedinv sabotage" 1 '^BLOCKED NOT INVARIANT' env INK_BLOCKEDINV_SABOTAGE=1 "$B" blockedinv --ref ref/long.tokens -c 1024
+verdict temp1 0 '^temp1 equivalent:' env -u INK_TEMP1_SABOTAGE "$B" temp1 --ref ref/long.tokens -c 4096
+verdict "temp1 sabotage" 1 '^TEMP1 NOT EQUIVALENT$' env INK_TEMP1_SABOTAGE=1 "$B" temp1 --ref ref/long.tokens -c 4096
 zero_out=$(mktemp)
 if zero_stats=$($B run -c 128 --raw -n 0 -p 'Once upon a time' 2>&1 > "$zero_out") &&
    [[ ! -s "$zero_out" && "$zero_stats" == *'generated 0 tok @ 0.00 tok/s'* ]]; then
