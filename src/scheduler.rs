@@ -1944,11 +1944,13 @@ impl ServeStepPlanner {
     pub fn start_restore(&mut self, lane: usize) {
         assert_eq!(self.states[lane], LaneState::Admitted);
         self.states[lane] = LaneState::Restoring;
+        self.wait_ticks[lane] = 0;
     }
 
     pub fn finish_restore(&mut self, lane: usize) {
         assert_eq!(self.states[lane], LaneState::Restoring);
         self.states[lane] = LaneState::Ready;
+        self.wait_ticks[lane] = 0;
     }
 
     /// Register a prebuilt lane in the standalone planner tests and pool gate.

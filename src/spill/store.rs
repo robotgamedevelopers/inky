@@ -239,7 +239,9 @@ impl SpillStore {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
-            if SpillKey::parse_tmp_filename(&name).is_some() {
+            if SpillKey::parse_tmp_filename(&name).is_some()
+                || name.starts_with(SPILL_INDEX_TMP_PREFIX)
+            {
                 if meta.is_file() && unlink_if_present(&path)? {
                     self.stats.orphans_swept += 1;
                 }
@@ -265,6 +267,7 @@ impl SpillStore {
         // Order surviving blocks oldest-mtime first so LRU clock preserves relative age.
         discovered.sort_by_key(|&(key, _, mtime)| (mtime, key));
         for (key, len, _) in discovered {
+            self.last_allocated_id = self.last_allocated_id.max(key.id);
             let seq = self.next_lru();
             self.entries.insert(key, DiskEntry { bytes: len, lru_seq: seq });
             self.used_bytes = self.used_bytes.saturating_add(len);
@@ -439,7 +442,92 @@ impl SpillStore {
     /// returns `ReadOutcome::Miss(reason)` (and unlinks the corrupt `.blk`),
     /// NEVER exposing unverified or corrupt bytes.
     pub fn read_block(&mut self, key: SpillKey, expected_kv_len: Option<usize>) -> ReadOutcome {
-        let path = self.block_path(key);
+        let raw = read_block_from_dir(&self.dir, self.kvb, key, expected_kv_len);
+        self.apply_raw_read(key, raw)
+    }
+
+    /// Apply bookkeeping (LRU touch, hit/miss/corrupt counters, and unlinking corrupt `.blk`
+    /// files) for a [`RawDiskRead`] completed by a background restore worker.
+    pub fn apply_raw_read(&mut self, key: SpillKey, raw: RawDiskRead) -> ReadOutcome {
+        if let Some(file_len) = raw.observed_file_len {
+            let entry = self.entries.entry(key).or_insert(DiskEntry { bytes: 0, lru_seq: 0 });
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes).saturating_add(file_len);
+            entry.bytes = file_len;
+        }
+        match &raw.outcome {
+            ReadOutcome::Hit(_) => {
+                let seq = self.next_lru();
+                let entry = self.entries.entry(key).or_insert(DiskEntry { bytes: 0, lru_seq: 0 });
+                entry.lru_seq = seq;
+                self.stats.reads_hit += 1;
+            }
+            ReadOutcome::Miss(reason) => {
+                if raw.is_corrupt {
+                    self.drop_corrupt(key);
+                } else {
+                    if *reason == MissReason::NotFound {
+                        self.forget_block(key);
+                    }
+                    self.stats.reads_miss += 1;
+                }
+            }
+        }
+        raw.outcome
+    }
+
+    /// Remove any indexed `.blk` files not present in `keep`, returning the number removed.
+    pub fn retain_keys(&mut self, keep: &HashSet<SpillKey>) -> usize {
+        let stale: Vec<SpillKey> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|k| !keep.contains(k))
+            .collect();
+        let mut removed = 0usize;
+        for k in stale {
+            if self.remove_block(k) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Crash-safe atomic write of `spill-index.bin` (`0600`, `O_NOFOLLOW`, `fsync`, `rename`, dir `fsync`).
+    pub fn write_index_bytes(&self, bytes: &[u8]) -> Result<(), SpillError> {
+        let final_path = self.dir.join(SPILL_INDEX_FILENAME);
+        let pid = std::process::id();
+        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.dir.join(format!("{SPILL_INDEX_TMP_PREFIX}{pid:08x}.{nonce:016x}"));
+        let res = (|| -> io::Result<()> {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = opts.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp_path, &final_path)?;
+            fsync_dir(&self.dir)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SpillError::Io(e));
+        }
+        Ok(())
+    }
+
+    /// Read `spill-index.bin` if present and regular (`<= max_len` bytes).
+    /// Unlinks and returns `None` if corrupt, non-regular, or oversized.
+    pub fn read_index_bytes(&mut self, max_len: usize) -> Option<Vec<u8>> {
+        let path = self.dir.join(SPILL_INDEX_FILENAME);
         let mut opts = OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -448,143 +536,42 @@ impl SpillStore {
         }
         let file = match opts.open(&path) {
             Ok(f) => f,
-            Err(e) => {
-                #[cfg(unix)]
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    self.drop_corrupt(key);
-                    return ReadOutcome::Miss(MissReason::NotRegularFile);
-                }
-                self.stats.reads_miss += 1;
-                let reason = if e.kind() == io::ErrorKind::NotFound {
-                    self.forget_block(key);
-                    MissReason::NotFound
-                } else {
-                    MissReason::IoReadError
-                };
-                return ReadOutcome::Miss(reason);
-            }
-        };
-
-        enable_nocache(&file);
-
-        let meta = match file.metadata() {
-            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
             Err(_) => {
-                self.drop_corrupt(key);
-                return ReadOutcome::Miss(MissReason::IoReadError);
+                if matches!(unlink_if_present(&path), Ok(true)) {
+                    self.stats.corrupt_files_removed += 1;
+                }
+                return None;
             }
         };
-        if !meta.is_file() {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::NotRegularFile);
-        }
-        let file_len = meta.len();
-        // Charge the observed length even when verification fails and cleanup cannot unlink it.
-        let entry = self.entries.entry(key).or_insert(DiskEntry { bytes: 0, lru_seq: 0 });
-        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes).saturating_add(file_len);
-        entry.bytes = file_len;
-        if file_len < SPILL_HEADER_LEN as u64 {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::TruncatedHeader);
-        }
-
-        let mut header = [0u8; SPILL_HEADER_LEN];
-        if pread_exact(&file, &mut header, 0).is_err() {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::TruncatedHeader);
-        }
-
-        if header[0..8] != SPILL_MAGIC {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::BadMagic);
-        }
-        let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        if version != SPILL_FORMAT_VERSION {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::UnsupportedVersion);
-        }
-        let raw_kind = u32::from(u16::from_le_bytes(header[12..14].try_into().unwrap()));
-        let Some(kind) = SpillBlockKind::from_u32(raw_kind) else {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::BadBlockKind);
-        };
-        let file_kvb = u32::from(u16::from_le_bytes(header[14..16].try_into().unwrap()));
-        if file_kvb != self.kvb {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::KvbMismatch);
-        }
-        let block_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
-        if kind != key.kind || block_id != key.id {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::MetadataMismatch);
-        }
-        let generation = u64::from_le_bytes(header[24..32].try_into().unwrap());
-        let kv_len_u64 = u64::from_le_bytes(header[32..40].try_into().unwrap());
-        let state_len_u64 = u64::from_le_bytes(header[40..48].try_into().unwrap());
-        let stored_digest: [u8; 32] = header[48..80].try_into().unwrap();
-
-        let (Ok(kv_len), Ok(state_len)) = (usize::try_from(kv_len_u64), usize::try_from(state_len_u64)) else {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::PayloadTooLarge);
-        };
-        if kv_len > MAX_KV_PAYLOAD_BYTES || state_len > MAX_RECURRENT_STATE_BYTES {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::PayloadTooLarge);
-        }
-        if let Some(exp) = expected_kv_len {
-            if kv_len != exp {
-                self.drop_corrupt(key);
-                return ReadOutcome::Miss(MissReason::LengthMismatch);
+        let meta = match file.metadata() {
+            Ok(m) if m.is_file() && m.len() <= max_len as u64 => m,
+            _ => {
+                drop(file);
+                if matches!(unlink_if_present(&path), Ok(true)) {
+                    self.stats.corrupt_files_removed += 1;
+                }
+                return None;
             }
-        }
-        let expected_file_len = (SPILL_HEADER_LEN as u64)
-            .checked_add(kv_len_u64)
-            .and_then(|v| v.checked_add(state_len_u64));
-        if expected_file_len != Some(file_len) {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::SizeMismatch);
-        }
-
-        let mut kv_bytes = vec![0u8; kv_len];
-        if kv_len > 0 && pread_exact(&file, &mut kv_bytes, SPILL_HEADER_LEN as u64).is_err() {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::IoReadError);
-        }
-
-        let recurrent_state = if state_len > 0 {
-            let mut st = vec![0u8; state_len];
-            let st_off = (SPILL_HEADER_LEN as u64).saturating_add(kv_len_u64);
-            if pread_exact(&file, &mut st, st_off).is_err() {
-                self.drop_corrupt(key);
-                return ReadOutcome::Miss(MissReason::IoReadError);
-            }
-            Some(st)
-        } else {
-            None
         };
-
-        let mut hasher = Sha256::new();
-        hasher.update(&header[0..HEADER_PREFIX_LEN]);
-        hasher.update(&kv_bytes);
-        if let Some(st) = &recurrent_state {
-            hasher.update(st);
+        let len = meta.len() as usize;
+        let mut buf = vec![0u8; len];
+        if pread_exact(&file, &mut buf, 0).is_err() {
+            drop(file);
+            if matches!(unlink_if_present(&path), Ok(true)) {
+                self.stats.corrupt_files_removed += 1;
+            }
+            return None;
         }
-        let computed = hasher.finalize();
-        if !ct_eq_32(&computed, &stored_digest) {
-            self.drop_corrupt(key);
-            return ReadOutcome::Miss(MissReason::ChecksumMismatch);
+        Some(buf)
+    }
+
+    /// Unlink `spill-index.bin` (recording a corrupt removal if `count_corrupt` is true).
+    pub fn remove_index(&mut self, count_corrupt: bool) {
+        let path = self.dir.join(SPILL_INDEX_FILENAME);
+        if matches!(unlink_if_present(&path), Ok(true)) && count_corrupt {
+            self.stats.corrupt_files_removed += 1;
         }
-
-        let seq = self.next_lru();
-        self.entries.get_mut(&key).expect("indexed before verification").lru_seq = seq;
-        self.stats.reads_hit += 1;
-
-        ReadOutcome::Hit(RestoredBlock {
-            key,
-            generation,
-            kv_bytes,
-            recurrent_state,
-        })
     }
 
     fn drop_corrupt(&mut self, key: SpillKey) {
@@ -592,6 +579,170 @@ impl SpillStore {
             self.stats.corrupt_files_removed += 1;
         }
         self.stats.reads_miss += 1;
+    }
+}
+
+/// Result of reading and SHA-256-verifying a single `.blk` file without holding `&mut SpillStore`.
+#[derive(Debug)]
+pub struct RawDiskRead {
+    pub outcome: ReadOutcome,
+    pub observed_file_len: Option<u64>,
+    pub is_corrupt: bool,
+}
+
+/// Standalone `pread` + SHA-256 verification of a `.blk` file inside `dir`.
+/// Safe to execute on a background restore worker thread without blocking the scheduler.
+pub fn read_block_from_dir(
+    dir: &Path,
+    kvb: u32,
+    key: SpillKey,
+    expected_kv_len: Option<usize>,
+) -> RawDiskRead {
+    #[cfg(test)]
+    super::run_test_spill_read_hook(dir, key);
+
+    let path = dir.join(key.blk_filename());
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match opts.open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            #[cfg(unix)]
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return RawDiskRead {
+                    outcome: ReadOutcome::Miss(MissReason::NotRegularFile),
+                    observed_file_len: None,
+                    is_corrupt: true,
+                };
+            }
+            let reason = if e.kind() == io::ErrorKind::NotFound {
+                MissReason::NotFound
+            } else {
+                MissReason::IoReadError
+            };
+            return RawDiskRead {
+                outcome: ReadOutcome::Miss(reason),
+                observed_file_len: None,
+                is_corrupt: false,
+            };
+        }
+    };
+
+    enable_nocache(&file);
+
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => {
+            return RawDiskRead {
+                outcome: ReadOutcome::Miss(MissReason::IoReadError),
+                observed_file_len: None,
+                is_corrupt: true,
+            };
+        }
+    };
+    if !meta.is_file() {
+        return RawDiskRead {
+            outcome: ReadOutcome::Miss(MissReason::NotRegularFile),
+            observed_file_len: None,
+            is_corrupt: true,
+        };
+    }
+    let file_len = meta.len();
+    let miss_corrupt = |reason: MissReason| RawDiskRead {
+        outcome: ReadOutcome::Miss(reason),
+        observed_file_len: Some(file_len),
+        is_corrupt: true,
+    };
+    if file_len < SPILL_HEADER_LEN as u64 {
+        return miss_corrupt(MissReason::TruncatedHeader);
+    }
+
+    let mut header = [0u8; SPILL_HEADER_LEN];
+    if pread_exact(&file, &mut header, 0).is_err() {
+        return miss_corrupt(MissReason::TruncatedHeader);
+    }
+    if header[0..8] != SPILL_MAGIC {
+        return miss_corrupt(MissReason::BadMagic);
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if version != SPILL_FORMAT_VERSION {
+        return miss_corrupt(MissReason::UnsupportedVersion);
+    }
+    let raw_kind = u32::from(u16::from_le_bytes(header[12..14].try_into().unwrap()));
+    let Some(kind) = SpillBlockKind::from_u32(raw_kind) else {
+        return miss_corrupt(MissReason::BadBlockKind);
+    };
+    let file_kvb = u32::from(u16::from_le_bytes(header[14..16].try_into().unwrap()));
+    if file_kvb != kvb {
+        return miss_corrupt(MissReason::KvbMismatch);
+    }
+    let block_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    if kind != key.kind || block_id != key.id {
+        return miss_corrupt(MissReason::MetadataMismatch);
+    }
+    let generation = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let kv_len_u64 = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    let state_len_u64 = u64::from_le_bytes(header[40..48].try_into().unwrap());
+    let stored_digest: [u8; 32] = header[48..80].try_into().unwrap();
+
+    let (Ok(kv_len), Ok(state_len)) = (usize::try_from(kv_len_u64), usize::try_from(state_len_u64)) else {
+        return miss_corrupt(MissReason::PayloadTooLarge);
+    };
+    if kv_len > MAX_KV_PAYLOAD_BYTES || state_len > MAX_RECURRENT_STATE_BYTES {
+        return miss_corrupt(MissReason::PayloadTooLarge);
+    }
+    if let Some(exp) = expected_kv_len {
+        if kv_len != exp {
+            return miss_corrupt(MissReason::LengthMismatch);
+        }
+    }
+    let expected_file_len = (SPILL_HEADER_LEN as u64)
+        .checked_add(kv_len_u64)
+        .and_then(|v| v.checked_add(state_len_u64));
+    if expected_file_len != Some(file_len) {
+        return miss_corrupt(MissReason::SizeMismatch);
+    }
+
+    let mut kv_bytes = vec![0u8; kv_len];
+    if kv_len > 0 && pread_exact(&file, &mut kv_bytes, SPILL_HEADER_LEN as u64).is_err() {
+        return miss_corrupt(MissReason::IoReadError);
+    }
+
+    let recurrent_state = if state_len > 0 {
+        let mut st = vec![0u8; state_len];
+        let st_off = (SPILL_HEADER_LEN as u64).saturating_add(kv_len_u64);
+        if pread_exact(&file, &mut st, st_off).is_err() {
+            return miss_corrupt(MissReason::IoReadError);
+        }
+        Some(st)
+    } else {
+        None
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&header[0..HEADER_PREFIX_LEN]);
+    hasher.update(&kv_bytes);
+    if let Some(st) = &recurrent_state {
+        hasher.update(st);
+    }
+    let computed = hasher.finalize();
+    if !ct_eq_32(&computed, &stored_digest) {
+        return miss_corrupt(MissReason::ChecksumMismatch);
+    }
+
+    RawDiskRead {
+        outcome: ReadOutcome::Hit(RestoredBlock {
+            key,
+            generation,
+            kv_bytes,
+            recurrent_state,
+        }),
+        observed_file_len: Some(file_len),
+        is_corrupt: false,
     }
 }
 

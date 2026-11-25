@@ -35,7 +35,8 @@ mod scheduler_trace;
 mod step;
 mod timing;
 use block_cache::{
-    effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
+    compute_block_hashes, effective_pf_target, find_prefill_leaders, AdmitBindOutcome,
+    InflightLaneReserve, InflightPrefillLane, LaneBlockState, PreparedInflightCohort,
     ServeBlockCache,
 };
 use messages::translate_messages;
@@ -48,6 +49,7 @@ use reply::{
     anthropic_content, anthropic_stop_reason, anthropic_usage, parse, sse_text,
     streaming_delta_usage, take_stream_text, BlockStream,
 };
+use std::sync::atomic::AtomicU64;
 use step::SERVE_STEP_MAX_BYPASS;
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
@@ -96,7 +98,8 @@ pub(crate) fn startup_nonce() -> String {
 struct Job {
     seq: u64,
     queued_at: Instant,
-    toks: Vec<u32>,
+    toks: Arc<[u32]>,
+    block_hashes: Arc<[u64]>,
     max: usize,
     temp: f32,
     top_k: usize,
@@ -107,6 +110,78 @@ struct Job {
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
+}
+
+impl Job {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seq: u64,
+        queued_at: Instant,
+        toks: Vec<u32>,
+        max: usize,
+        temp: f32,
+        top_k: usize,
+        top_p: f32,
+        seed: u64,
+        thinking_budget: usize,
+        loopcd_omega: f32,
+        out: JobOutput,
+        permit: LanePermit,
+    ) -> Self {
+        let block_hashes: Arc<[u64]> = compute_block_hashes(&toks).into();
+        let toks: Arc<[u32]> = toks.into();
+        Self {
+            seq,
+            queued_at,
+            toks,
+            block_hashes,
+            max,
+            temp,
+            top_k,
+            top_p,
+            seed,
+            thinking_budget,
+            loopcd_omega,
+            out,
+            _permit: permit,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpillTelemetry {
+    starts_spilled: AtomicU64,
+    starts_restored: AtomicU64,
+    spilled_starts_indexed: AtomicU64,
+    corrupt_fallbacks: AtomicU64,
+    corrupt_files_removed: AtomicU64,
+    last_restore_us: AtomicU64,
+    writes_committed: AtomicU64,
+    reads_hit: AtomicU64,
+    bytes_used: AtomicU64,
+}
+
+impl SpillTelemetry {
+    fn sync_from(&self, cache: &ServeBlockCache) {
+        let cs = cache.stats();
+        self.starts_spilled.store(cs.starts_spilled, Ordering::Relaxed);
+        self.starts_restored.store(cs.starts_restored, Ordering::Relaxed);
+        self.spilled_starts_indexed
+            .store(cache.spilled_start_count() as u64, Ordering::Relaxed);
+        self.corrupt_fallbacks
+            .store(cs.corrupt_fallbacks, Ordering::Relaxed);
+        self.last_restore_us
+            .store(cs.last_restore_us, Ordering::Relaxed);
+        if let Some(store) = cache.spill_store() {
+            let ss = store.stats();
+            self.corrupt_files_removed
+                .store(ss.corrupt_files_removed, Ordering::Relaxed);
+            self.writes_committed
+                .store(ss.writes_committed, Ordering::Relaxed);
+            self.reads_hit.store(ss.reads_hit, Ordering::Relaxed);
+            self.bytes_used.store(store.used_bytes(), Ordering::Relaxed);
+        }
+    }
 }
 
 /// Hard thinking-token budget state machine (chadlyb/erisinky): after `budget` tokens inside
@@ -265,6 +340,7 @@ impl LaneS {
 
 struct Active {
     job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
+    restoring_target: Option<usize>,
     timing: RequestTiming,
     sampler: Sampler,
     /// Draft stream, seeded once per request (`seed ^ DRAFT_SEED_MIX`). A verify round advances it.
@@ -388,7 +464,7 @@ fn overlap_host_work_step<'a>(
                     debug_assert!(!released_now, "InStep cancel must defer release until complete_step");
                 }
             }
-            crate::scheduler::LaneState::Ready => {
+            crate::scheduler::LaneState::Ready | crate::scheduler::LaneState::Restoring => {
                 if a.job.out.cancelled()
                     || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
                 {
@@ -430,7 +506,12 @@ fn release_cancelled_waiting(
     tick_seq: &mut u64,
 ) {
     for &i in waiting_cancelled {
+        let was_restoring = planner.state(i) == crate::scheduler::LaneState::Restoring;
         if planner.request_cancel(i) {
+            if was_restoring {
+                let mut pools = eng.block_pool().borrow_mut();
+                cache.cancel_restore(&mut pools, i);
+            }
             if let Some(a) = lanes[i].release_job(eng, cache, metrics, tick_seq) {
                 a.log_cancellation(i);
             }
@@ -454,12 +535,174 @@ fn fail_step(
 
 fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCache) {
     let mut pools = eng.block_pool().borrow_mut();
+    cache.cancel_all_restores(&mut pools);
     for l in lanes.iter_mut() {
         l.job = None;
         let mut tbl = l.lane.block_table().borrow_mut();
         cache.release_lane(&mut pools, &mut tbl, &mut l.blocks);
     }
     cache.shutdown(&mut pools);
+}
+
+fn complete_ready_restores(
+    eng: &Engine,
+    cache: &mut ServeBlockCache,
+    lanes: &mut [LaneS],
+    planner: &mut crate::scheduler::ServeStepPlanner,
+    checkpoints_sealed: &mut bool,
+    #[cfg(test)] admissions: &mut Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
+) {
+    let mut tbl_ptrs: Vec<Option<(*mut crate::blocks::BlockTable, *mut LaneBlockState)>> =
+        Vec::with_capacity(lanes.len());
+    let mut guards: Vec<Option<std::cell::RefMut<'_, crate::blocks::BlockTable>>> =
+        Vec::with_capacity(lanes.len());
+    for l in lanes.iter_mut() {
+        if l.job.as_ref().is_some_and(|a| a.restoring_target.is_some()) {
+            let mut g = l.lane.block_table().borrow_mut();
+            let tp: *mut crate::blocks::BlockTable = &mut *g;
+            let sp: *mut LaneBlockState = &mut l.blocks;
+            guards.push(Some(g));
+            tbl_ptrs.push(Some((tp, sp)));
+        } else {
+            guards.push(None);
+            tbl_ptrs.push(None);
+        }
+    }
+    let completed = {
+        let mut pools = eng.block_pool().borrow_mut();
+        cache.poll_restores(&mut pools, |idx| {
+            tbl_ptrs.get(idx).copied().flatten().map(|(tp, sp)| (&(), tp, sp))
+        })
+    };
+    drop(guards);
+    for c in completed {
+        let l = &mut lanes[c.lane];
+        let Some(a) = l.job.as_mut() else { continue };
+        a.restoring_target = None;
+        a.timing.prep += c.elapsed;
+        if c.corrupt_fallback {
+            eprintln!(
+                "[serve] lane {}: SSD spill restore fell back cleanly after missing/corrupt block (#{})",
+                c.lane, a.job.seq
+            );
+        }
+        match c.matched {
+            Some((matched_at, cs)) => {
+                eng.on(&l.lane).set_cs(&cs);
+                a.n_past = matched_at;
+                a.cached = matched_at;
+                *checkpoints_sealed = true;
+            }
+            None => {
+                eng.on(&l.lane).reset();
+                a.n_past = 0;
+                a.cached = 0;
+            }
+        }
+        if planner.state(c.lane) == crate::scheduler::LaneState::Restoring {
+            planner.finish_restore(c.lane);
+            #[cfg(test)]
+            if let Some(admissions) = admissions.as_mut() {
+                admissions.push([
+                    crate::scheduler::LaneState::Queued,
+                    crate::scheduler::LaneState::Admitted,
+                    crate::scheduler::LaneState::Restoring,
+                    planner.state(c.lane),
+                ]);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PoolWakeSnapshot {
+    lanes_released: u64,
+    window_pruned: u64,
+    shared_dedups: u64,
+    start_points_saved: u64,
+    starts_restored: u64,
+    avail_full: usize,
+    avail_window: usize,
+}
+
+impl PoolWakeSnapshot {
+    fn capture(cache: &ServeBlockCache, pools: &crate::blocks::BlockPools) -> Self {
+        let s = cache.stats();
+        Self {
+            lanes_released: s.lanes_released,
+            window_pruned: s.window_pruned,
+            shared_dedups: s.shared_dedups,
+            start_points_saved: s.start_points_saved,
+            starts_restored: s.starts_restored,
+            avail_full: cache.free_plus_evictable_slots(pools, crate::blocks::BlockKind::Full),
+            avail_window: cache.free_plus_evictable_slots(pools, crate::blocks::BlockKind::Window),
+        }
+    }
+}
+
+fn planned_next_span_len(
+    n_past: usize,
+    pf_target: usize,
+    has_pending_decode: bool,
+    window_slots: usize,
+    chunk: usize,
+) -> Option<usize> {
+    if n_past < pf_target {
+        let target = pf_target.min(window_span_end(n_past, window_slots));
+        if target <= n_past {
+            return None;
+        }
+        let budget = chunk.max(1);
+        let raw_t = (target - n_past).min(budget);
+        let t = if n_past + raw_t < target && raw_t > crate::blocks::BLOCK {
+            let aligned = raw_t - ((n_past + raw_t) % crate::blocks::BLOCK);
+            if aligned > 0 { aligned } else { raw_t }
+        } else {
+            raw_t
+        };
+        Some(t.max(1))
+    } else if has_pending_decode {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Wake any `pool_deferred` lane whose next planned span can now be satisfied from free +
+/// evictable pool capacity (including `< EXT = 1024` progress via singleflight checkpoint
+/// sealing + follower rebind, `shared_dedups` freeing duplicate blocks, restore fallback,
+/// or holder release/pruning) without busy-spinning when capacity still cannot fit the span.
+fn refresh_pool_deferred<'a>(
+    cache: &ServeBlockCache,
+    pools: &crate::blocks::BlockPools,
+    prev: &mut PoolWakeSnapshot,
+    pool_deferred: &mut [bool],
+    window_slots: usize,
+    chunk: usize,
+    lane_iter: impl IntoIterator<Item = (usize, &'a crate::blocks::BlockTable, usize, usize, bool)>,
+) {
+    let cur = PoolWakeSnapshot::capture(cache, pools);
+    let global_release_or_prune =
+        cur.lanes_released != prev.lanes_released || cur.window_pruned != prev.window_pruned;
+    *prev = cur;
+
+    if !pool_deferred.iter().any(|&d| d) {
+        return;
+    }
+    for (i, tbl, n_past, pf_target, has_pending_decode) in lane_iter {
+        if !pool_deferred[i] {
+            continue;
+        }
+        if let Some(span_len) =
+            planned_next_span_len(n_past, pf_target, has_pending_decode, window_slots, chunk)
+        {
+            if cache.can_satisfy_span(pools, tbl, n_past, span_len) {
+                pool_deferred[i] = false;
+            }
+        } else if global_release_or_prune {
+            pool_deferred[i] = false;
+        }
+    }
 }
 
 /// Partition `ensure_span_blocks` failures into `(to_defer, to_fail)`.
@@ -484,6 +727,7 @@ fn partition_pool_exhausted(
     (to_defer, vec![victim])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scheduler(
     eng: &Engine,
     tk: &Tokenizer,
@@ -492,7 +736,8 @@ fn scheduler(
     rx: Receiver<Job>,
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
-    spill_store: Option<crate::spill::SpillStore>,
+    mut cache: ServeBlockCache,
+    spill_telemetry: Option<&SpillTelemetry>,
     #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
@@ -504,10 +749,9 @@ fn scheduler(
             job: None,
         })
         .collect();
-    let mut cache = match spill_store {
-        Some(store) => ServeBlockCache::with_spill(store),
-        None => ServeBlockCache::new(),
-    };
+    if let Some(st) = spill_telemetry {
+        st.sync_from(&cache);
+    }
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<QueuedJob> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
@@ -517,20 +761,29 @@ fn scheduler(
         (pooled_context(eng.max_ctx, pools.full.len(), pools.window.len()), pools.window.len())
     };
     let mut pool_deferred = vec![false; nlanes];
-    let mut prev_lanes_released = cache.stats().lanes_released;
-    let mut prev_window_pruned = cache.stats().window_pruned;
+    let mut wake_snap = {
+        let pools = eng.block_pool().borrow();
+        PoolWakeSnapshot::capture(&cache, &pools)
+    };
     let mut prev_starts_spilled = 0;
     let mut checkpoints_sealed = false;
     loop {
+        complete_ready_restores(
+            eng,
+            &mut cache,
+            &mut lanes,
+            &mut planner,
+            &mut checkpoints_sealed,
+            #[cfg(test)]
+            &mut admissions,
+        );
+        if let Some(st) = spill_telemetry {
+            st.sync_from(&cache);
+        }
         let cur_stats = cache.stats();
         if cur_stats.starts_spilled != prev_starts_spilled {
             metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled = cur_stats.starts_spilled;
             prev_starts_spilled = cur_stats.starts_spilled;
-        }
-        if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
-            pool_deferred.fill(false);
-            prev_lanes_released = cur_stats.lanes_released;
-            prev_window_pruned = cur_stats.window_pruned;
         }
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
@@ -561,122 +814,231 @@ fn scheduler(
             m.queued = m.queued.saturating_sub(dropped);
         }
         for (i, lane) in lanes.iter_mut().enumerate() {
-            if lane.job.as_ref().is_some_and(|a| a.job.out.cancelled()) && planner.request_cancel(i) {
-                if let Some(a) = lane.release_job(eng, &mut cache, metrics, &mut tick_seq) {
-                    a.log_cancellation(i);
+            if lane.job.as_ref().is_some_and(|a| a.job.out.cancelled()) {
+                let was_restoring = planner.state(i) == crate::scheduler::LaneState::Restoring;
+                if planner.request_cancel(i) {
+                    if was_restoring {
+                        let mut pools = eng.block_pool().borrow_mut();
+                        cache.cancel_restore(&mut pools, i);
+                    }
+                    if let Some(a) = lane.release_job(eng, &mut cache, metrics, &mut tick_seq) {
+                        a.log_cancellation(i);
+                    }
                 }
             }
         }
         // Admit queued jobs onto free Layer 3 lanes with zero-copy prefix matching via EntryTree
-        // + BlockPools, guarded by pool-pressure headroom (always allowing >= 1 active lane).
-        while let Some(queued) = queue.front() {
-            let j = &queued.job;
-            let Some(i) = lanes
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.job.is_none())
-                .min_by_key(|(_, l)| l.tick)
-                .map(|(i, _)| i)
-            else {
-                break;
-            };
-            if j.out.cancelled() {
-                let _ = queue.pop_front();
-                let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                m.queued = m.queued.saturating_sub(1);
-                continue;
+        // + BlockPools, guarded by linear shared-prefix pool-pressure headroom (`U331`).
+        // Pre-clone Arcs into an immutable backing slice so `PreparedInflightCohort` is built
+        // ONCE per scheduler pass and updated incrementally with zero all-pairs rescans.
+        if !queue.is_empty() {
+            let mut backing: Vec<(Arc<[u32]>, Arc<[u64]>)> =
+                Vec::with_capacity(lanes.len() + queue.len());
+            let mut init_meta: Vec<(usize, usize, usize, usize, usize, usize, usize, usize, bool)> =
+                Vec::with_capacity(lanes.len());
+            for (idx, l) in lanes.iter().enumerate() {
+                let Some(a) = l.job.as_ref() else { continue };
+                let b_idx = backing.len();
+                backing.push((a.job.toks.clone(), a.job.block_hashes.clone()));
+                let (eff_past, eff_cached, eff_written, eff_run) = match a.restoring_target {
+                    Some(target) => (target, target, target, false),
+                    None => (
+                        a.n_past,
+                        a.cached,
+                        l.blocks.written,
+                        !a.job.out.cancelled()
+                            && !a.job.out.backpressured()
+                            && !pool_deferred[idx]
+                            && planner.state(idx) == crate::scheduler::LaneState::Ready,
+                    ),
+                };
+                init_meta.push((
+                    b_idx,
+                    idx,
+                    eff_past,
+                    a.pf_end,
+                    eff_cached,
+                    eff_written,
+                    a.gen,
+                    a.job.max,
+                    eff_run,
+                ));
             }
-            if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap().job;
-                let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                m.queued = m.queued.saturating_sub(1);
-                let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
-                continue;
+            let queue_backing_base = backing.len();
+            for q in &queue {
+                backing.push((q.job.toks.clone(), q.job.block_hashes.clone()));
             }
+            let mut cohort = PreparedInflightCohort::empty();
+            for (b_idx, lane_idx, n_past, pf_end, cached, written, gen, max_gen, runnable) in
+                init_meta
             {
-                let pools = eng.block_pool().borrow();
-                let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
+                cohort.push_admitted(InflightLaneReserve {
+                    lane: lane_idx,
+                    toks: &backing[b_idx].0,
+                    block_hashes: Some(&backing[b_idx].1),
+                    n_past,
+                    pf_end,
+                    cached,
+                    written,
+                    gen,
+                    max_gen,
+                    runnable,
+                });
+            }
+            let mut q_cursor = 0usize;
+            while let Some(queued) = queue.front() {
+                let j = &queued.job;
+                let Some(i) = lanes
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, l)| {
-                        let a = l.job.as_ref()?;
-                        let run = !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[idx];
-                        Some(InflightLaneReserve {
-                            lane: idx,
-                            toks: &a.job.toks,
-                            n_past: a.n_past,
-                            pf_end: a.pf_end,
-                            cached: a.cached,
-                            written: l.blocks.written,
-                            gen: a.gen,
-                            max_gen: a.job.max,
-                            runnable: run,
-                        })
-                    })
-                    .collect();
-                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
+                    .filter(|(_, l)| l.job.is_none())
+                    .min_by_key(|(_, l)| l.tick)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                if j.out.cancelled() {
+                    let _ = queue.pop_front();
+                    q_cursor += 1;
+                    let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    m.queued = m.queued.saturating_sub(1);
+                    continue;
+                }
+                if context_over(j.toks.len(), j.max, context) {
+                    let j = queue.pop_front().unwrap().job;
+                    q_cursor += 1;
+                    let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    m.queued = m.queued.saturating_sub(1);
+                    let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
+                    continue;
+                }
+                let q_b_idx = queue_backing_base + q_cursor;
+                let can_fit = {
+                    let pools = eng.block_pool().borrow();
+                    cache.can_admit_with_cohort(
+                        &pools,
+                        &cohort,
+                        i,
+                        &backing[q_b_idx].0,
+                        Some(&backing[q_b_idx].1),
+                        j.max,
+                        eng.chunk,
+                    )
+                };
+                if !can_fit {
                     break;
                 }
-            }
-            let QueuedJob { job: j, state } = queue.pop_front().unwrap();
-            planner.admit_queued(i, state);
-            #[cfg(test)]
-            let admitted = planner.state(i);
-            // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
-            let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
-            let prep_began = Instant::now();
-            planner.start_restore(i);
-            #[cfg(test)]
-            let restoring = planner.state(i);
-            let start = {
-                let l = &mut lanes[i];
-                let mut pools = eng.block_pool().borrow_mut();
-                let matched = {
-                    let mut tbl = l.lane.block_table().borrow_mut();
-                    cache.match_and_bind(&mut pools, &mut tbl, &mut l.blocks, &j.toks)
+                let QueuedJob { job: j, state } = queue.pop_front().unwrap();
+                q_cursor += 1;
+                let j_max = j.max;
+                let j_len = j.toks.len();
+                planner.admit_queued(i, state);
+                #[cfg(test)]
+                let admitted = planner.state(i);
+                // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
+                let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
+                let prep_began = Instant::now();
+                planner.start_restore(i);
+                #[cfg(test)]
+                let restoring = planner.state(i);
+                let (start, restoring_target) = {
+                    let l = &mut lanes[i];
+                    let mut pools = eng.block_pool().borrow_mut();
+                    let outcome = {
+                        let mut tbl = l.lane.block_table().borrow_mut();
+                        cache.begin_admit_bind(&mut pools, i, &mut tbl, &mut l.blocks, &j.toks)
+                    };
+                    match outcome {
+                        AdmitBindOutcome::Immediate(Some((matched_at, cs))) => {
+                            eng.on(&l.lane).set_cs(&cs);
+                            (matched_at, None)
+                        }
+                        AdmitBindOutcome::Immediate(None) => {
+                            eng.on(&l.lane).reset();
+                            (0, None)
+                        }
+                        AdmitBindOutcome::Restoring { target_pos } => (0, Some(target_pos)),
+                    }
                 };
-                match matched {
-                    Some((matched_at, cs)) => {
-                        eng.on(&l.lane).set_cs(&cs);
-                        matched_at
+                eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
+                timing.prep = prep_began.elapsed();
+                let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
+                // once per request, not per round and not per emitted token
+                let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
+                let think = ThinkBudget::new(j.thinking_budget);
+                lanes[i].job = Some(Active {
+                    pf_end: j_len,
+                    n_past: start,
+                    cached: start,
+                    gen: 0,
+                    restoring_target,
+                    timing,
+                    sampler,
+                    draft_sampler,
+                    think,
+                    pending: None,
+                    job: j,
+                });
+                pool_deferred[i] = false;
+                if let Some(target_pos) = restoring_target {
+                    cohort.invalidate_headroom();
+                    cohort.push_admitted(InflightLaneReserve {
+                        lane: i,
+                        toks: &backing[q_b_idx].0,
+                        block_hashes: Some(&backing[q_b_idx].1),
+                        n_past: target_pos,
+                        pf_end: j_len,
+                        cached: target_pos,
+                        written: target_pos,
+                        gen: 0,
+                        max_gen: j_max,
+                        runnable: false,
+                    });
+                } else {
+                    if start > 0 {
+                        cohort.invalidate_headroom();
                     }
-                    None => {
-                        eng.on(&l.lane).reset();
-                        0
+                    planner.finish_restore(i);
+                    #[cfg(test)]
+                    if let Some(admissions) = admissions.as_mut() {
+                        admissions.push([state, admitted, restoring, planner.state(i)]);
                     }
+                    cohort.push_admitted(InflightLaneReserve {
+                        lane: i,
+                        toks: &backing[q_b_idx].0,
+                        block_hashes: Some(&backing[q_b_idx].1),
+                        n_past: start,
+                        pf_end: j_len,
+                        cached: start,
+                        written: start,
+                        gen: 0,
+                        max_gen: j_max,
+                        runnable: true,
+                    });
                 }
-            };
-            eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
-            timing.prep = prep_began.elapsed();
-            let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
-            // once per request, not per round and not per emitted token
-            let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
-            let think = ThinkBudget::new(j.thinking_budget);
-            lanes[i].job = Some(Active {
-                pf_end: j.toks.len(),
-                n_past: start,
-                cached: start,
-                gen: 0,
-                timing,
-                sampler,
-                draft_sampler,
-                think,
-                pending: None,
-                job: j,
-            });
-            pool_deferred[i] = false;
-            planner.finish_restore(i);
-            #[cfg(test)]
-            if let Some(admissions) = admissions.as_mut() {
-                admissions.push([state, admitted, restoring, planner.state(i)]);
             }
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
-        // Rebind eligible untouched followers whenever the prior prefill step sealed new checkpoints.
+        complete_ready_restores(
+            eng,
+            &mut cache,
+            &mut lanes,
+            &mut planner,
+            &mut checkpoints_sealed,
+            #[cfg(test)]
+            &mut admissions,
+        );
+        if let Some(st) = spill_telemetry {
+            st.sync_from(&cache);
+        }
+        // Rebind eligible untouched followers whenever the prior step or restore sealed new checkpoints.
         if checkpoints_sealed {
             checkpoints_sealed = false;
             let mut pools = eng.block_pool().borrow_mut();
-            for l in lanes.iter_mut() {
+            for (idx, l) in lanes.iter_mut().enumerate() {
+                if planner.state(idx) != crate::scheduler::LaneState::Ready {
+                    continue;
+                }
                 let Some(a) = l.job.as_mut() else { continue };
                 if a.gen == 0 && a.n_past == a.cached && l.blocks.written == a.n_past && !a.job.out.cancelled() {
                     let rebound = {
@@ -691,32 +1053,71 @@ fn scheduler(
                 }
             }
         }
+        // Wake pool-deferred lanes whenever pool availability or rebind progress allows their next
+        // planned span to fit (including `< EXT = 1024` before any window block expires).
+        {
+            let pools = eng.block_pool().borrow();
+            let tbl_refs: Vec<Option<(std::cell::Ref<'_, crate::blocks::BlockTable>, usize, usize, bool)>> = lanes
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if !pool_deferred[i] {
+                        return None;
+                    }
+                    let a = l.job.as_ref()?;
+                    let inp = a.step_input(true);
+                    Some((l.lane.block_table().borrow(), inp.n_past, inp.pf_end, inp.has_pending_decode))
+                })
+                .collect();
+            refresh_pool_deferred(
+                &cache,
+                &pools,
+                &mut wake_snap,
+                &mut pool_deferred,
+                window_slots,
+                eng.chunk,
+                tbl_refs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, opt)| opt.as_ref().map(|(t, np, pf, hd)| (i, &**t, *np, *pf, *hd))),
+            );
+        }
         // Starvation-bounded Layer 4 step selection: ceiling >= W, longest-waiting first,
         // active 1-token decoding lanes, then 64-aligned prefill spans capped at checkpoint boundaries.
-        let runnable = |i: usize, a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[i];
+        let runnable = |i: usize, a: &Active, p: &crate::scheduler::ServeStepPlanner| {
+            p.state(i) == crate::scheduler::LaneState::Ready
+                && !a.job.out.cancelled()
+                && !a.job.out.backpressured()
+                && !pool_deferred[i]
+        };
         let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
+                if planner.state(i) != crate::scheduler::LaneState::Ready {
+                    return None;
+                }
                 let a = l.job.as_ref()?;
                 (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
                     lane: i,
                     toks: &a.job.toks,
+                    block_hashes: Some(&a.job.block_hashes),
                     n_past: a.n_past,
                     pf_end: a.pf_end,
-                    runnable: runnable(i, a),
+                    runnable: runnable(i, a, &planner),
                     eligible_follower: a.n_past == a.cached && l.blocks.written == a.n_past,
                 })
             })
             .collect();
+        let leaders = find_prefill_leaders(&prefill_cands);
         let mut deferred_by_singleflight = vec![false; lanes.len()];
         for (idx, cand) in prefill_cands.iter().enumerate() {
-            if find_prefill_leader(&prefill_cands, idx).is_some() {
+            if leaders[idx].is_some() {
                 deferred_by_singleflight[cand.lane] = true;
             }
         }
         let mut step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
-            Some(a) => a.step_input(runnable(i, a) && !deferred_by_singleflight[i]),
+            Some(a) => a.step_input(runnable(i, a, &planner) && !deferred_by_singleflight[i]),
             None => crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
         }).collect();
         for input in &mut step_inputs {
@@ -740,7 +1141,8 @@ fn scheduler(
                 if !exhausted.is_empty() {
                     let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !sp_list.iter().any(|&(k, _, _)| k == j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && (planner.state(j) == crate::scheduler::LaneState::Restoring
+                                || l.job.as_ref().is_some_and(|a| runnable(j, a, &planner) && !deferred_by_singleflight[j]))
                     });
                     let (to_defer, to_fail) =
                         partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_runnable_exists);
@@ -880,7 +1282,8 @@ fn scheduler(
                 if !exhausted.is_empty() {
                     let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !need_dec.contains(&j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && (planner.state(j) == crate::scheduler::LaneState::Restoring
+                                || l.job.as_ref().is_some_and(|a| runnable(j, a, &planner) && !deferred_by_singleflight[j]))
                     });
                     let (to_defer, to_fail) =
                         partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_runnable_exists);
@@ -989,9 +1392,11 @@ fn scheduler(
                 release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             None => {
-                // No GPU work can proceed while every live lane's output buffer is full.
-                // Recheck consumption and cancellation shortly, waking sooner for another request.
-                if lanes.iter().any(|l| l.job.is_some()) {
+                // No GPU work can proceed right now (e.g. cold SSD restore in flight or every
+                // Ready lane's output buffer is full). Wake immediately on restore completion.
+                if cache.has_inflight_restores() {
+                    cache.wait_restore_activity(Duration::from_micros(250));
+                } else if lanes.iter().any(|l| l.job.is_some()) {
                     match rx.recv_timeout(Duration::from_millis(2)) {
                         Ok(job) => queue.push_back(QueuedJob::new(job)),
                         Err(RecvTimeoutError::Timeout) => {}
@@ -2007,7 +2412,9 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              /// Live connections, capped globally (clamped below soft RLIMIT_NOFILE) and per peer.
              conns: ConnectionSlots,
              /// opt-in non-blocking JSONL card traffic recorder
-             recorder: Option<Arc<crate::record::Recorder>> }
+             recorder: Option<Arc<crate::record::Recorder>>,
+             /// opt-in Layer 4 SSD spill telemetry (`--spill-dir`)
+             spill_telemetry: Option<Arc<SpillTelemetry>> }
 const MAX_CONNS: usize = 512;
 const MAX_PEER_CONNS: usize = 128;
 
@@ -2138,6 +2545,18 @@ fn health_body(cx: &Ctx) -> String {
         obj.insert("record_dropped".into(), json!(rec.dropped_count()));
         obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
         obj.insert("record_rotations".into(), json!(rec.rotation_count()));
+    }
+    if let Some(sp) = &cx.spill_telemetry {
+        obj.insert("spill_starts_spilled".into(), json!(sp.starts_spilled.load(Ordering::Relaxed)));
+        obj.insert("spill_starts_restored".into(), json!(sp.starts_restored.load(Ordering::Relaxed)));
+        obj.insert("spill_spilled_starts_indexed".into(), json!(sp.spilled_starts_indexed.load(Ordering::Relaxed)));
+        obj.insert("spill_corrupt_fallbacks".into(), json!(sp.corrupt_fallbacks.load(Ordering::Relaxed)));
+        obj.insert("spill_corrupt_files_removed".into(), json!(sp.corrupt_files_removed.load(Ordering::Relaxed)));
+        let restore_ms = sp.last_restore_us.load(Ordering::Relaxed) as f64 / 1000.0;
+        obj.insert("spill_last_restore_ms".into(), json!(restore_ms));
+        obj.insert("spill_writes_committed".into(), json!(sp.writes_committed.load(Ordering::Relaxed)));
+        obj.insert("spill_reads_hit".into(), json!(sp.reads_hit.load(Ordering::Relaxed)));
+        obj.insert("spill_bytes_used".into(), json!(sp.bytes_used.load(Ordering::Relaxed)));
     }
     Value::Object(obj).to_string()
 }
@@ -2400,7 +2819,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         h
     });
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
     if enqueue(cx, job).is_err() {
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
@@ -2627,7 +3046,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         h
     };
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
     if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     record_delivery(cx, req, card_id, "/v1/messages", req_start, prompt_len, |turn| {
         messages_stream_or_reply(cx, req, seq, prompt_len, rx, s, turn)
@@ -3081,11 +3500,20 @@ pub fn serve(o: ServeOpts) {
     };
     let admission = AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT)
         .with_faults(faults);
+    let cache = match spill_store {
+        Some(store) => ServeBlockCache::with_spill(store),
+        None => ServeBlockCache::new(),
+    };
+    let spill_telemetry = cache.spill_store().map(|_| {
+        let st = Arc::new(SpillTelemetry::default());
+        st.sync_from(&cache);
+        st
+    });
     let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
         admission,
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder, spill_telemetry: spill_telemetry.clone() });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -3164,7 +3592,15 @@ pub fn serve(o: ServeOpts) {
         }
     });
     scheduler(
-        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
+        &eng,
+        &tk,
+        sp,
+        effective_lanes,
+        jrx,
+        active_lanes,
+        &metrics,
+        cache,
+        spill_telemetry.as_deref(),
         #[cfg(test)]
         None,
     );
@@ -3338,7 +3774,7 @@ mod tests {
                 clock,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
         };
         (cx, rx)
     }
@@ -4231,7 +4667,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -4254,7 +4690,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -4293,7 +4729,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let scheduler = std::thread::spawn(move || {
             let job = jrx.recv().expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
@@ -4321,7 +4757,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv().expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -4334,7 +4770,7 @@ mod tests {
                 }
                 sent
             });
-            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
+            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell<usize>::new(0) };
             if use_chat {
                 chat(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
             } else {
@@ -4362,7 +4798,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -4385,7 +4821,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -4506,7 +4942,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv().expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -4643,6 +5079,7 @@ mod tests {
                     pf_end,
                     cached: 0,
                     gen: 0,
+                    restoring_target: None,
                     timing,
                     sampler,
                     draft_sampler,
@@ -5022,7 +5459,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()), spill_telemetry: None,
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -5227,7 +5664,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -5288,7 +5725,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
         });
 
         let req = json!({
@@ -5620,20 +6057,20 @@ mod tests {
             let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
             let send_turn = |seq: u64, prompt: Vec<u32>| -> (Vec<u32>, usize, usize) {
                 let (out, events) = job_events();
-                let job = Job {
+                let job = Job::new(
                     seq,
-                    toks: prompt,
-                    max: n_gen,
-                    temp: 0.0,
-                    top_k: 0,
-                    top_p: 1.0,
-                    seed: 1,
-                    thinking_budget: 0,
-                    loopcd_omega: 0.0,
-                    queued_at: Instant::now(),
+                    Instant::now(),
+                    prompt,
+                    n_gen,
+                    0.0,
+                    0,
+                    1.0,
+                    1,
+                    0,
+                    0.0,
                     out,
-                    _permit: admission.try_acquire().unwrap(),
-                };
+                    admission.try_acquire().unwrap(),
+                );
                 jtx.send(job).unwrap();
                 let mut toks = Vec::new();
                 loop {
@@ -5679,7 +6116,18 @@ mod tests {
         use crate::scheduler::LaneState::{Admitted, Queued, Ready, Restoring};
         let mut admissions = Vec::new();
         scheduler_trace::capture_if_requested(|| {
-            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None, Some(&mut admissions))
+            scheduler(
+                &eng,
+                &tk,
+                sp,
+                4,
+                jrx,
+                active_lanes,
+                &metrics,
+                ServeBlockCache::new(),
+                None,
+                Some(&mut admissions),
+            )
         });
         assert_eq!(admissions, [[Queued, Admitted, Restoring, Ready]; 3]);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
@@ -5765,13 +6213,14 @@ mod tests {
         toks0.extend(30000..30300);
 
         let cands = [
-            InflightPrefillLane { lane: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 1, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 2, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 0, toks: &toks0, block_hashes: None, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 1, toks: &toks1, block_hashes: None, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 2, toks: &toks2, block_hashes: None, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
         ];
-        assert_eq!(find_prefill_leader(&cands, 0), None);
-        assert_eq!(find_prefill_leader(&cands, 1), Some(0));
-        assert_eq!(find_prefill_leader(&cands, 2), Some(0));
+        assert_eq!(block_cache::find_prefill_leader(&cands, 0), None);
+        assert_eq!(block_cache::find_prefill_leader(&cands, 1), Some(0));
+        assert_eq!(block_cache::find_prefill_leader(&cands, 2), Some(0));
+        assert_eq!(find_prefill_leaders(&cands), vec![None, Some(0), Some(0)]);
 
         let inputs = [
             crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: effective_pf_target(0, toks0.len()), has_pending_decode: false },
@@ -5868,24 +6317,25 @@ mod tests {
         let (out0, ev0) = job_events();
         let (out1, ev1) = job_events();
         let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
-            job: Job {
+            job: Job::new(
                 seq,
-                toks: (0..pf_end as u32).collect(),
-                max: 32,
-                temp: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                seed: 1,
-                thinking_budget: 0,
-                loopcd_omega: 0.0,
-                queued_at: Instant::now(),
+                Instant::now(),
+                (0..pf_end as u32).collect(),
+                32,
+                0.0,
+                0,
+                1.0,
+                1,
+                0,
+                0.0,
                 out,
-                _permit: admission.try_acquire().unwrap(),
-            },
+                admission.try_acquire().unwrap(),
+            ),
             n_past,
             pf_end,
             cached: 0,
             gen,
+            restoring_target: None,
             timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
@@ -5931,16 +6381,14 @@ mod tests {
         let (arr_dead_out, arr_dead_ev) = job_events();
         drop(arr_dead_ev);
         metrics.lock().unwrap().queued = 2;
-        jtx.send(Job {
-            seq: 10, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_live_out,
-            _permit: admission.try_acquire().unwrap(),
-        }).unwrap();
-        jtx.send(Job {
-            seq: 11, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_dead_out,
-            _permit: admission.try_acquire().unwrap(),
-        }).unwrap();
+        jtx.send(Job::new(
+            10, Instant::now(), vec![1, 2], 4, 0.0, 0, 1.0, 1, 0, 0.0, arr_live_out,
+            admission.try_acquire().unwrap(),
+        )).unwrap();
+        jtx.send(Job::new(
+            11, Instant::now(), vec![1, 2], 4, 0.0, 0, 1.0, 1, 0, 0.0, arr_dead_out,
+            admission.try_acquire().unwrap(),
+        )).unwrap();
 
         // Client disconnects while GPU step is executing!
         drop(ev0);
@@ -6011,24 +6459,25 @@ mod tests {
         let (out0, ev0) = job_events();
         let (out1, ev1) = job_events();
         let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
-            job: Job {
+            job: Job::new(
                 seq,
-                toks: (0..pf_end as u32).collect(),
-                max: 16,
-                temp: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                seed: 1,
-                thinking_budget: 0,
-                loopcd_omega: 0.0,
-                queued_at: Instant::now(),
+                Instant::now(),
+                (0..pf_end as u32).collect(),
+                16,
+                0.0,
+                0,
+                1.0,
+                1,
+                0,
+                0.0,
                 out,
-                _permit: admission.try_acquire().unwrap(),
-            },
+                admission.try_acquire().unwrap(),
+            ),
             n_past,
             pf_end,
             cached: 0,
             gen,
+            restoring_target: None,
             timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
@@ -6583,5 +7032,206 @@ mod tests {
         assert_eq!(entries[0].turn_index, 0);
         assert_eq!(entries[1].turn_index, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pool_deferred_lane_wakes_before_first_window_prune_on_sub_ext_progress() {
+        use crate::blocks::{BlockPools, BlockTable, BLOCK};
+        use crate::scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        // 1. Sub-EXT (< 1024) shared PROMPT checkpoint seal + follower rebind while holder stays active:
+        // Pool has 12 Full + 12 Window slots (< 16 blocks = 1024 EXT, so `window_pruned` is ALWAYS 0!).
+        // - Lane 0 has a 600-token prompt (`PROMPT` checkpoint at 576 = 9 blocks) + 120 decode tokens (< 1024).
+        // - Lane 1 shares the first 576 tokens and extends to 644 tokens (`PROMPT` checkpoint at 640 = 10 blocks).
+        // Because 576 != 640 and both are < EARLY_EVERY_TOKENS (2048), singleflight does NOT defer Lane 1
+        // at pos 0; both enter Prefill step 1 together (`9 + 10 = 19 > 12` slots).
+        // Lane 0 takes 9 slots (3 free left); Lane 1 hits PoolExhausted and becomes `pool_deferred[1] = true`.
+        // When Lane 0 finishes `[0..576)` (`pos = 576 < 1024`, `lanes_released == 0`, `window_pruned == 0`),
+        // Lane 1 rebinds to 576 (`rebind_if_deeper_match`) and now needs ONLY 1 block (`<= 3` free)!
+        // `refresh_pool_deferred` MUST wake Lane 1 immediately instead of stalling across 120 holder decodes!
+        let mut pools = BlockPools::with_capacities(12, 12, 1).unwrap();
+        let mut cache = ServeBlockCache::new();
+        let mut planner = ServeStepPlanner::new(2, 2);
+        planner.on_admit(0);
+        planner.on_admit(1);
+
+        let shared_576: Vec<u32> = (0..576u32).map(|i| 5_000 + i).collect();
+        let mut toks0 = shared_576.clone();
+        toks0.extend(10_000..10_024); // 600 tokens total (< 1024)
+        let mut toks1 = shared_576;
+        toks1.extend(20_000..20_068); // 644 tokens total (< 1024)
+
+        let mut tbls = [BlockTable::new(32).unwrap(), BlockTable::new(32).unwrap()];
+        let mut blocks = [LaneBlockState::default(), LaneBlockState::default()];
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[0], &mut blocks[0], &toks0).is_none());
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[1], &mut blocks[1], &toks1).is_none());
+
+        let mut n_past = [0usize, 0usize];
+        let mut cached = [0usize, 0usize];
+        let pf_end = [toks0.len(), toks1.len()];
+        let mut gen = [0usize, 0usize];
+        let max_gen = [64usize, 1usize];
+        let mut pool_deferred = [false, false];
+        let mut wake_snap = PoolWakeSnapshot::capture(&cache, &pools);
+
+        // Step 1: Both lanes planned in Prefill; Lane 0 allocates 9 blocks, Lane 1 defers!
+        let inputs1: Vec<ServeLaneInput> = (0..2)
+            .map(|i| ServeLaneInput {
+                runnable: !pool_deferred[i],
+                n_past: n_past[i],
+                pf_end: effective_pf_target(n_past[i], pf_end[i]),
+                has_pending_decode: false,
+            })
+            .collect();
+        let Some(ServeStepPlan::Prefill(sp1)) = planner.plan_and_begin_step(&inputs1, 2048, BLOCK) else {
+            panic!("expected step 1 prefill");
+        };
+        assert_eq!(sp1, vec![(0, 0, 576), (1, 0, 640)]);
+        cache.ensure_span_blocks(&mut pools, &mut tbls[0], 0, 576).unwrap();
+        assert!(cache.ensure_span_blocks(&mut pools, &mut tbls[1], 0, 640).is_err());
+        pool_deferred[1] = true;
+        cache.finish_prefill_span(&mut pools, &mut tbls[0], &mut blocks[0], &toks0, 0, 576, || vec![9u8; 16]);
+        n_past[0] = 576;
+        let checkpoints_sealed = true;
+        assert!(planner.complete_step().is_empty());
+        assert_eq!(cache.stats().window_pruned, 0, "sub-EXT step never prunes window blocks");
+        assert_eq!(cache.stats().lanes_released, 0, "holder lane 0 is still active");
+
+        // Next iteration: follower rebinds to 576, then `refresh_pool_deferred` wakes Lane 1 immediately!
+        if checkpoints_sealed {
+            if let Some((m, _)) = cache.rebind_if_deeper_match(&mut pools, &mut tbls[1], &mut blocks[1], &toks1, n_past[1]) {
+                n_past[1] = m;
+                cached[1] = m;
+            }
+        }
+        assert_eq!(n_past[1], 576);
+        assert_eq!(cached[1], 576);
+        refresh_pool_deferred(
+            &cache,
+            &pools,
+            &mut wake_snap,
+            &mut pool_deferred,
+            12,
+            2048,
+            [(0, &tbls[0], n_past[0], pf_end[0], false), (1, &tbls[1], n_past[1], pf_end[1], false)],
+        );
+        assert!(!pool_deferred[1], "Lane 1 must wake immediately at pos 576 (< EXT=1024) before any window prune or holder release!");
+
+        // Verify Lane 1 finishes its remaining prefill `[576..644)` while Lane 0 is STILL active (< 1024)!
+        let mut lane1_finished_while_holder_active = false;
+        for _ in 0..12 {
+            let inputs: Vec<ServeLaneInput> = (0..2)
+                .map(|i| ServeLaneInput {
+                    runnable: (i == 0 || gen[1] == 0) && !pool_deferred[i],
+                    n_past: n_past[i],
+                    pf_end: if n_past[i] < pf_end[i] {
+                        effective_pf_target(n_past[i], pf_end[i])
+                    } else {
+                        pf_end[i]
+                    },
+                    has_pending_decode: n_past[i] >= pf_end[i] && gen[i] < max_gen[i],
+                })
+                .collect();
+            let plan = planner.plan_and_begin_step(&inputs, 2048, BLOCK).unwrap();
+            match plan {
+                ServeStepPlan::Prefill(sps) => {
+                    for (i, p0, t) in sps {
+                        cache.ensure_span_blocks(&mut pools, &mut tbls[i], p0, t).unwrap();
+                        let t_ref = if i == 0 { &toks0 } else { &toks1 };
+                        cache.finish_prefill_span(&mut pools, &mut tbls[i], &mut blocks[i], t_ref, p0, t, || vec![1u8; 16]);
+                        n_past[i] = p0 + t;
+                        if i == 1 && n_past[1] == pf_end[1] {
+                            gen[1] = 1;
+                            lane1_finished_while_holder_active = gen[0] < max_gen[0];
+                        }
+                    }
+                }
+                ServeStepPlan::Decode(decs) => {
+                    for i in decs {
+                        cache.ensure_span_blocks(&mut pools, &mut tbls[i], n_past[i], 1).unwrap();
+                        cache.finish_decode_span(&mut pools, &mut tbls[i], &mut blocks[i], n_past[i]);
+                        n_past[i] += 1;
+                        gen[i] += 1;
+                    }
+                }
+            }
+            assert!(planner.complete_step().is_empty());
+            if gen[1] >= 1 {
+                break;
+            }
+        }
+        assert!(lane1_finished_while_holder_active, "Lane 1 must complete while holder Lane 0 is still decoding < 1024");
+        assert_eq!(cache.stats().window_pruned, 0);
+        // Only the 1 internal release inside `rebind_if_deeper_match` occurred; neither active job released!
+        assert_eq!(cache.stats().lanes_released, 1);
+
+        cache.release_lane(&mut pools, &mut tbls[0], &mut blocks[0]);
+        cache.release_lane(&mut pools, &mut tbls[1], &mut blocks[1]);
+        cache.shutdown(&mut pools);
+
+        // 2. Sub-EXT (< 1024) `shared_dedups` wakeup with ZERO `lanes_released` delta and ZERO `window_pruned`:
+        // - Pin a 512-token prompt (`prior`, 8 blocks) on active Lane 2 in a 16-slot pool (8 slots left).
+        // - Holder Lane 0 shares the first 384 tokens (6 blocks) with `prior` then diverges to 460 tokens
+        //   (`match_and_bind` returns `None` because `prior`'s start is at 512 > 460).
+        // - Deferred Lane 1 has a disjoint 320-token prompt (5 blocks).
+        // - Step 1: Lane 0 allocates 6 blocks (`[0..384)` -> 2 slots left); Lane 1 needs 5 blocks -> defers!
+        //   When Lane 0 finishes `[0..384)`, all 6 blocks deduplicate against `prior` (`shared_dedups == 6`),
+        //   dropping Lane 0's 6 private slots back to `refs == 0` (8 free slots!) while BOTH
+        //   `lanes_released` delta == 0 AND `window_pruned == 0` (`pos = 384 < 1024`)!
+        let mut pools2 = BlockPools::with_capacities(16, 16, 1).unwrap();
+        let mut cache2 = ServeBlockCache::new();
+        let prior: Vec<u32> = (0..520u32).map(|i| 30_000 + i).collect();
+        let mut tbl_pin = BlockTable::new(32).unwrap();
+        let mut st_pin = LaneBlockState::default();
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_pin, &mut st_pin, &prior).is_none());
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_pin, 0, 512).unwrap();
+        cache2.finish_prefill_span(&mut pools2, &mut tbl_pin, &mut st_pin, &prior, 0, 512, || vec![7u8; 16]);
+        cache2.release_lane(&mut pools2, &mut tbl_pin, &mut st_pin);
+        let mut prior_cont = prior[..512].to_vec();
+        prior_cont.push(99_999);
+        assert_eq!(cache2.match_and_bind(&mut pools2, &mut tbl_pin, &mut st_pin, &prior_cont).unwrap().0, 512);
+
+        let mut holder = prior[..384].to_vec();
+        holder.extend(40_000..40_076); // 460 tokens -> prompt_ckpt = 448, shares first 6 blocks with `prior`!
+        let disjoint: Vec<u32> = (0..320u32).map(|i| 50_000 + i).collect(); // 5 blocks
+
+        let mut tbl_h = BlockTable::new(32).unwrap();
+        let mut st_h = LaneBlockState::default();
+        let mut tbl_d = BlockTable::new(32).unwrap();
+        let mut st_d = LaneBlockState::default();
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_h, &mut st_h, &holder).is_none());
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_d, &mut st_d, &disjoint).is_none());
+
+        let released_before = cache2.stats().lanes_released;
+        let mut snap2 = PoolWakeSnapshot::capture(&cache2, &pools2);
+        let mut deferred2 = [false, false];
+
+        // Holder allocates 6 blocks [0..384) -> 2 free slots left; disjoint needs 5 blocks -> defers!
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_h, 0, 384).unwrap();
+        assert!(cache2.ensure_span_blocks(&mut pools2, &mut tbl_d, 0, 320).is_err());
+        deferred2[1] = true;
+
+        // Holder finishes [0..384): 6 blocks dedup against `prior`, freeing 6 slots at pos=384 (< 1024)!
+        cache2.finish_prefill_span(&mut pools2, &mut tbl_h, &mut st_h, &holder, 0, 384, || vec![8u8; 16]);
+        assert_eq!(cache2.stats().lanes_released, released_before, "zero lanes released");
+        assert_eq!(cache2.stats().window_pruned, 0, "zero window blocks pruned");
+        assert!(cache2.stats().shared_dedups >= 6);
+
+        refresh_pool_deferred(
+            &cache2,
+            &pools2,
+            &mut snap2,
+            &mut deferred2,
+            16,
+            2048,
+            [(0, &tbl_h, 384, holder.len(), false), (1, &tbl_d, 0, disjoint.len(), false)],
+        );
+        assert!(!deferred2[1], "Deferred lane must wake immediately when shared_dedups frees slots < 1024!");
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_d, 0, 320).unwrap();
+
+        cache2.release_lane(&mut pools2, &mut tbl_h, &mut st_h);
+        cache2.release_lane(&mut pools2, &mut tbl_d, &mut st_d);
+        cache2.release_lane(&mut pools2, &mut tbl_pin, &mut st_pin);
+        cache2.shutdown(&mut pools2);
     }
 }
