@@ -29,8 +29,8 @@ jobs:
         run: scripts/check-tla.sh
       - name: build
         run: cargo build --release
-      - name: unit tests (debug assertions)
-        run: cargo test --bins
+      - name: unit and integration tests (debug assertions)
+        run: cargo test --locked --bins --tests
       - name: unit tests (release)
         run: cargo test --release --bins
   go:
