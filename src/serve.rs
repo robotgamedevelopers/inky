@@ -1336,7 +1336,7 @@ fn scheduler(
                     eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
                 }
                 let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-                let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().loopcd_omega).collect();
+                let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().job.loopcd_omega).collect();
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode_with_omegas(&cb, &spans, true, false, &omegas);
