@@ -112,7 +112,7 @@ pub const KERNELS: &[&str] = &[
     "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_attn_combine", "k_attn_combine_dec",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
@@ -141,7 +141,7 @@ struct DecodeSpanDesc {
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32 }
+struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32, hout: u32, pad: [u32; 3] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnBlkDecArgs {
     desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
@@ -186,7 +186,7 @@ struct DevCopyArgs { src: u32, dst: u32, n: u32, pad: u32 }
 /// the last one a summary of the evicted keys with score bias `lastbias`); keys from position `r0` on are untouched
 pub struct Prune { bag: Buf, rows: usize, r0: usize, lastbias: f32, use_sum: bool }
 #[repr(C)] #[derive(Clone, Copy, Default)]
-struct CombineArgs { part_off: u32, nsplit: u32, gate_off: u32, out_off: u32 }
+struct CombineArgs { part_off: u32, nsplit: u32, gate_off: u32, out_off: u32, hout: u32, pad: [u32; 3] }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct EpiArgs { out_off: u32, res_off: i32, cs_off: u32, convw_off: u32, n: u32, pad: [u32; 3] }
 
@@ -239,6 +239,13 @@ struct TopkBArgs { logits_off: u32, bias_off: u32, sel_off: u32, t: u32, wscale:
 struct RouteArgs { sel_off: u32, t: u32, perm_off: u32, inv_off: u32, tiles_off: u32, ntiles_off: u32, tile: u32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct Route3Args { sel_off: u32, t: u32, perm_off: u32, inv_off: u32, aw_off: u32, ind_off: u32, gu_y: u32, dn_y: u32, tiles_off: [u32; NTC], pad: [u32; 2] }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct TopkRoute3Args {
+    logits_off: u32, bias_off: u32, sel_off: u32, t: u32,
+    wscale: f32, perm_off: u32, inv_off: u32, aw_off: u32,
+    ind_off: u32, gu_y: u32, dn_y: u32, tiles_off: [u32; NTC],
+    pad: [u32; 3],
+}
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct MoeCombArgs { yd_off: u32, inv_off: u32, sel_off: u32, out_off: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
@@ -1965,10 +1972,23 @@ impl Engine {
         let pb = |off: u32, rows: u32, k: u32, in_off: u32, in2: u32, out: u32| GSeg {
             w_lo: off, w_hi: 0, row_bytes: k * 2, wtype: T_BF16, nrows: rows, k, in_off, out_off: out, ldo: rows, wsrc: 1, in2, ..Default::default() };
         if self.hgemm {
-            let down: Vec<HSeg> = jobs.iter().map(|&(c, _, _, _, _)| Self::hseg_pb(lw.down[c], 64, (2 * E) as u32, b.cath[c], b.ctrlg[c])).collect();
+            let fuse_down_half = ctrl_down_direct_half(self.skip.get());
+            let down: Vec<HSeg> = jobs.iter().map(|&(c, _, _, _, _)| {
+                let mut sg = Self::hseg_pb(
+                    lw.down[c],
+                    64,
+                    (2 * E) as u32,
+                    b.cath[c],
+                    if fuse_down_half { b.gh[c] } else { b.ctrlg[c] },
+                );
+                sg.hout = fuse_down_half as u32;
+                sg
+            }).collect();
             self.gemm_h(e, C_CTRLD, &down, t);
-            for &(c, _, _, _, _) in jobs { self.tohalf(e, C_CTRLA, b.ctrlg[c], 64, b.gh[c], 64, 64, t, None); }
-            e.barrier();
+            if !fuse_down_half {
+                for &(c, _, _, _, _) in jobs { self.tohalf(e, C_CTRLA, b.ctrlg[c], 64, b.gh[c], 64, 64, t, None); }
+                e.barrier();
+            }
             // gain/forget GEMM with the apply fused into its epilogue: raw (un-normalized) outputs land in gain_o
             let mut ga = CtrlGfArgs { t: t as u32, njobs: jobs.len() as u32, ..Default::default() };
             for (i, &(c, u, m, _, _)) in jobs.iter().enumerate() {
@@ -2171,7 +2191,7 @@ impl Engine {
                                 pad: self.sep_comb as u32, ..base };
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
             if self.sep_comb {
-                let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
+                let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g, hout: 0, pad: [0; 3] };
                 self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
             }
         }
@@ -2680,14 +2700,25 @@ impl Engine {
             };
             let max_nsplit = if l.swa { dm.max_swa_nsplit } else { dm.max_full_nsplit };
             self.go(e, C_ATTN, "k_attn_blk_dec", &aa, (max_nsplit, NKV, spans.len()), 128);
-            let ca = CombineDecArgs { desc_off: dm.desc_off, gate_off: b.gate, out_off: b.qp, swa: l.swa as u32 };
+            let direct_half = decode_combine_direct_half(self.hgemm, self.skip.get());
+            let ca = CombineDecArgs {
+                desc_off: dm.desc_off,
+                gate_off: b.gate,
+                out_off: if direct_half { b.agh } else { b.qp },
+                swa: l.swa as u32,
+                hout: direct_half as u32,
+                pad: [0; 3],
+            };
             self.go(e, C_COMB, "k_attn_combine_dec", &ca, (NH, spans.len(), 1), 128);
             e.buf(&self.act.borrow(), 0, 3);
-            // f32 attention outputs -> the half rows the output projection reads
-            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
-            e.barrier();
+            if !direct_half {
+                // f32 attention outputs -> the half rows the output projection reads
+                self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+                e.barrier();
+            }
         } else if dec {
             // Layer 2 decode step: each lane's token through the decode path's fused attention.
+            let direct_half = decode_combine_direct_half(self.hgemm, self.skip.get());
             let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
             for (si, sp) in spans.iter().enumerate() {
                 let run = self.on(sp.lane);
@@ -2713,15 +2744,18 @@ impl Engine {
                                     pad: self.sep_comb as u32, ..base };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
                 self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
-                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
+                let comb_out = if direct_half { b.agh + (r0 * (NH * HD / 2)) as u32 } else { aa.out_off };
+                combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: comb_out, hout: direct_half as u32, pad: [0; 3] });
             }
             e.barrier();
             for ca in &combs { self.go_nb(e, C_COMB, "k_attn_combine", ca, (NH, 1, 1), 128); }
             e.barrier();
             e.buf(&self.act.borrow(), 0, 3);
-            // f32 attention outputs -> the half rows the output projection reads
-            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
-            e.barrier();
+            if !direct_half {
+                // f32 attention outputs -> the half rows the output projection reads
+                self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+                e.barrier();
+            }
         }
         if !dec && blocked { self.bind_pool_slabs(e, l.swa); }
         for (si, sp) in spans.iter().enumerate() {
@@ -2883,16 +2917,35 @@ impl Engine {
                         ldo: NEXP as u32, wsrc: 1, ..Default::default() };
         if rth { self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n); }
         else { self.gemm(e, C_ROUTER, &[rs], n); }
-        let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
-        self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
         let tile = 32usize;
-        if self.hgemm {
-            let ra = Route3Args { sel_off: b.sel, t: nn_, perm_off: b.perm, inv_off: b.inv, aw_off: b.aw, ind_off: b.ind, gu_y: (FF / 32) as u32,
-                                  dn_y: (E / 64) as u32, tiles_off: b.tl, pad: [0; 2] };
-            self.go(e, C_TOPK, "k_moe_route3", &ra, (1, 1, 1), 1024);
+        if use_fused_topk_route3(self.hgemm, n) {
+            let tra = TopkRoute3Args {
+                logits_off: b.rlog,
+                bias_off: l.exp_bias,
+                sel_off: b.sel,
+                t: nn_,
+                wscale: self.wscale,
+                perm_off: b.perm,
+                inv_off: b.inv,
+                aw_off: b.aw,
+                ind_off: b.ind,
+                gu_y: (FF / 32) as u32,
+                dn_y: (E / 64) as u32,
+                tiles_off: b.tl,
+                pad: [0; 3],
+            };
+            self.go(e, C_TOPK, "k_moe_topk_route3", &tra, (1, 1, 1), 1024);
         } else {
-            let ra = RouteArgs { sel_off: b.sel, t: tt, perm_off: b.perm, inv_off: b.inv, tiles_off: b.tiles, ntiles_off: b.ntiles, tile: tile as u32, pad: 0 };
-            self.go(e, C_ROUTER, "k_moe_route", &ra, (1, 1, 1), 1024);
+            let ta = TopkBArgs { logits_off: b.rlog, bias_off: l.exp_bias, sel_off: b.sel, t: nn_, wscale: self.wscale, pad: [0; 3] };
+            self.go(e, C_TOPK, "k_topk_b", &ta, (n, 1, 1), 32);
+            if self.hgemm {
+                let ra = Route3Args { sel_off: b.sel, t: nn_, perm_off: b.perm, inv_off: b.inv, aw_off: b.aw, ind_off: b.ind, gu_y: (FF / 32) as u32,
+                                      dn_y: (E / 64) as u32, tiles_off: b.tl, pad: [0; 2] };
+                self.go(e, C_TOPK, "k_moe_route3", &ra, (1, 1, 1), 1024);
+            } else {
+                let ra = RouteArgs { sel_off: b.sel, t: tt, perm_off: b.perm, inv_off: b.inv, tiles_off: b.tiles, ntiles_off: b.ntiles, tile: tile as u32, pad: 0 };
+                self.go(e, C_ROUTER, "k_moe_route", &ra, (1, 1, 1), 1024);
+            }
         }
         let max_tiles = (t * TOPK).div_ceil(tile) + NEXP;
         let gu = MoeGemmArgs {
@@ -2904,12 +2957,13 @@ impl Engine {
         let mg = if self.tensor { "k_moe_gemm_t" } else { "k_moe_gemm" };
         if self.hgemm {
             // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
-            // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
             self.tohalf_x(e, C_GATHER, sh(b.fh, E / 2), E, b.xgh, E, E, n * TOPK, Some(b.perm), true);
             e.barrier();
-            // tiles in four widths, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently
+            // tiles in two width classes, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently.
+            // Each token picks TOPK distinct experts, so when n <= 64 every expert receives <= 64 tokens and class 0 (65..128) is empty.
+            let cls_start = moe_class_start(n);
             if self.skip.get() & (1 << C_GU) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
                     let g = MoeGemmHArgs {
                         w_lo: l.gu.off as u32, w_hi: (l.gu.off >> 32) as u32, expert_bytes: l.gu.expert_bytes as u32, row_bytes: l.gu.row_bytes,
                         wtype: l.gu.ty, nrows: (2 * FF) as u32, k: es, xh_off: b.xgh, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
@@ -2922,7 +2976,7 @@ impl Engine {
                 e.barrier();
             }
             if self.skip.get() & (1 << C_DOWN) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate() {
+                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
                     let d = MoeGemmHArgs {
                         w_lo: l.dn.off as u32, w_hi: (l.dn.off >> 32) as u32, expert_bytes: l.dn.expert_bytes as u32, row_bytes: l.dn.row_bytes,
                         wtype: l.dn.ty, nrows: es, k: FF as u32, xh_off: b.acth, tiles_off: b.tl[c], ntiles_off: b.ind + (c * 4) as u32,
@@ -3771,7 +3825,7 @@ impl<'a> Run<'a> {
         }
         let e = &cx.e;
         if self.sep_comb || self.tier_on() || self.lane.prune.borrow().is_some() {
-            let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g };
+            let ca = CombineArgs { part_off: ar.part, nsplit: nsplit as u32, gate_off: ar.gate, out_off: ar.attn_g, hout: 0, pad: [0; 3] };
             self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
         }
         // ---- output projection + post-conv (+ residual unless this layer starts a new block)
@@ -3836,6 +3890,33 @@ fn validate_token_write(start: usize, toks: &[u32], capacity: usize, limit: usiz
         return Err(format!("token {id} at position {} is outside the embedding vocabulary (0..{limit})", start + i));
     }
     Ok(())
+}
+
+/// Write `half` directly from `k_attn_combine` / `k_attn_combine_dec` into `b.agh` on the fp16 decode path,
+/// skipping the standalone `k_tohalf` + barrier unless skip-mask profiling isolates `C_COMB` or `C_WO`.
+#[inline]
+fn decode_combine_direct_half(hgemm: bool, skip: u32) -> bool {
+    hgemm && (skip & ((1 << C_COMB) | (1 << C_WO)) == 0)
+}
+
+/// Write `half` directly from `ctrl_b`'s `down` `gemm_h` into `b.gh[c]`, skipping `k_tohalf` + barrier
+/// unless skip-mask profiling isolates `C_CTRLD` or `C_CTRLA`.
+#[inline]
+fn ctrl_down_direct_half(skip: u32) -> bool {
+    skip & ((1 << C_CTRLD) | (1 << C_CTRLA)) == 0
+}
+
+/// Starting index in `MOE_CLS`: each token selects `TOPK` distinct experts, so when `n <= 64` every expert
+/// receives at most 64 tokens and class 0 (`65..128` tokens, `k_moe_sg8`) is guaranteed to have 0 tiles.
+#[inline]
+fn moe_class_start(n: usize) -> usize {
+    if n <= 64 { 1 } else { 0 }
+}
+
+/// Use fused 1-TG `k_moe_topk_route3` on the fp16 path whenever `n <= 64`.
+#[inline]
+fn use_fused_topk_route3(hgemm: bool, n: usize) -> bool {
+    hgemm && n <= 64
 }
 
 #[cfg(test)]
@@ -3940,9 +4021,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<DecodeSpanDesc>(), 16 * 4);
         assert_eq!(std::mem::align_of::<DecodeSpanDesc>(), 4);
         assert_eq!(std::mem::size_of::<EmbedDecArgs>(), 8 * 4);
-        assert_eq!(std::mem::size_of::<CombineDecArgs>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<CombineArgs>(), 8 * 4);
+        assert_eq!(std::mem::size_of::<CombineDecArgs>(), 8 * 4);
         assert_eq!(std::mem::size_of::<AttnBlkDecArgs>(), 16 * 4);
         assert_eq!(std::mem::size_of::<PostConvDecArgs>(), 8 * 4);
+        assert_eq!(std::mem::size_of::<TopkRoute3Args>(), 16 * 4);
 
         // Verify exact field offsets of `DecodeSpanDesc` match `kernels.metal`.
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, tok_id), 0);
@@ -3962,7 +4045,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad0), 56);
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad1), 60);
 
-        // Verify `AttnBlkDecArgs` and `PostConvDecArgs` field offsets match Metal structs.
+        // Verify `CombineArgs`, `CombineDecArgs`, `AttnBlkDecArgs`, `PostConvDecArgs`, and `TopkRoute3Args` offsets match Metal structs.
+        assert_eq!(std::mem::offset_of!(CombineArgs, part_off), 0);
+        assert_eq!(std::mem::offset_of!(CombineArgs, nsplit), 4);
+        assert_eq!(std::mem::offset_of!(CombineArgs, gate_off), 8);
+        assert_eq!(std::mem::offset_of!(CombineArgs, out_off), 12);
+        assert_eq!(std::mem::offset_of!(CombineArgs, hout), 16);
+        assert_eq!(std::mem::offset_of!(CombineArgs, pad), 20);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, desc_off), 0);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, gate_off), 4);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, out_off), 8);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, swa), 12);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, hout), 16);
+        assert_eq!(std::mem::offset_of!(CombineDecArgs, pad), 20);
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, desc_off), 0);
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, swa), 12);
         assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, kdyn_off), 36);
@@ -3971,6 +4066,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, desc_off), 0);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, cs_slot_off), 16);
         assert_eq!(std::mem::offset_of!(PostConvDecArgs, has_res), 24);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, logits_off), 0);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, bias_off), 4);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, sel_off), 8);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, t), 12);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, wscale), 16);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, perm_off), 20);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, inv_off), 24);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, aw_off), 28);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, ind_off), 32);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, gu_y), 36);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, dn_y), 40);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, tiles_off), 44);
+        assert_eq!(std::mem::offset_of!(TopkRoute3Args, pad), 52);
     }
 
     #[test]
@@ -4022,19 +4130,22 @@ mod tests {
         for s in [
             "struct DecodeSpanDesc",
             "struct EmbedDecArgs",
+            "struct CombineArgs",
             "struct CombineDecArgs",
             "struct AttnBlkDecArgs",
             "struct PostConvDecArgs",
+            "struct TopkRoute3Args",
             "kernel void k_embed_dec(",
             "kernel void k_attn_blk_dec(",
             "kernel void k_attn_combine_dec(",
             "kernel void k_postconv_state_dec(",
+            "kernel void k_moe_topk_route3(",
         ] {
             assert!(full_src.contains(s), "missing expected Metal declaration `{s}`");
         }
 
         // Compile via `xcrun -sdk macosx metal`: full shader when `-std=metal4.0` is supported,
-        // otherwise compile `kernels.metal` + `k_postconv_state_dec` under `-std=metal3.1` if available.
+        // otherwise compile `kernels.metal` + `k_moe_topk_route3` + `k_postconv_state_dec` under `-std=metal3.1` if available.
         let compile_metal = |std_flag: &str, src: &str, tag: &str| -> Result<(), String> {
             let pid = std::process::id();
             let tmp_in = std::env::temp_dir().join(format!("inky_check_{pid}_{tag}.metal"));
@@ -4065,6 +4176,13 @@ mod tests {
             let stripped_kernels = kernels_src
                 .replace("#include <metal_tensor>\n", "")
                 .replace("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n", "");
+            let topk_route_start = prefill_src
+                .find("struct TopkRoute3Args")
+                .expect("TopkRoute3Args in prefill.metal");
+            let topk_route_end = prefill_src[topk_route_start..]
+                .find("\n// ---- expert sum per token")
+                .map(|rel| topk_route_start + rel)
+                .unwrap_or(prefill_src.len());
             let postconv_start = prefill_src
                 .find("struct PostConvDecArgs")
                 .expect("PostConvDecArgs in prefill.metal");
@@ -4072,12 +4190,204 @@ mod tests {
                 .find("\n// ---- per-position conv state")
                 .map(|rel| postconv_start + rel)
                 .unwrap_or(prefill_src.len());
-            let dec_src = format!("{stripped_kernels}\n{}\n", &prefill_src[postconv_start..postconv_end]);
+            let dec_src = format!(
+                "{stripped_kernels}\n#define NTC 2\n{}\n{}\n",
+                &prefill_src[topk_route_start..topk_route_end],
+                &prefill_src[postconv_start..postconv_end],
+            );
             compile_metal("-std=metal3.1", &dec_src, "dec_fp16")
                 .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (fp16) compile failed:\n{e}"));
             let dec_kv8_src = format!("#define KV8 1\n{dec_src}");
             compile_metal("-std=metal3.1", &dec_kv8_src, "dec_kv8")
                 .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (KV8) compile failed:\n{e}"));
+        }
+    }
+
+    #[test]
+    fn wave2a_decode_dispatch_and_barrier_reduction_32_lanes() {
+        let count_step = |n_lanes: usize, hgemm: bool, logits: bool, argmax: bool, skip: u32, wave2a: bool| -> (usize, usize) {
+            let mut dispatches = 0usize;
+            let mut barriers = 0usize;
+            let mut add_go = |cls: u32, count: usize| {
+                if skip & (1 << cls) == 0 {
+                    dispatches += count;
+                    barriers += 1;
+                }
+            };
+            add_go(C_EMBED, 1);
+
+            let n_uncontrolled = LOOP_START + (LOOP_END - LOOP_START) + (N_PHYS - LOOP_END);
+            let n_controlled = (N_PASS - 1) * (LOOP_END - LOOP_START);
+            assert_eq!(n_uncontrolled + n_controlled, N_SLOT);
+            assert_eq!(n_uncontrolled, 24);
+            assert_eq!(n_controlled, 24);
+
+            for controlled in [false, true] {
+                let repeat = if controlled { n_controlled } else { n_uncontrolled };
+                for _ in 0..repeat {
+                    if controlled {
+                        add_go(C_MIXA, 2);
+                        let fuse_down = wave2a && ctrl_down_direct_half(skip);
+                        add_go(C_CTRLD, 1);
+                        if !fuse_down {
+                            if skip & (1 << C_CTRLA) == 0 { dispatches += 3; }
+                            barriers += 1;
+                        }
+                        add_go(C_CTRLA, 1);
+                        add_go(C_CTRLN, 1);
+                    } else {
+                        add_go(C_MIXA, 1);
+                    }
+                    add_go(C_QKV, 1);
+                    add_go(C_ATTN, 1);
+                    add_go(C_COMB, 1);
+                    let direct_half = wave2a && decode_combine_direct_half(hgemm, skip);
+                    if !direct_half {
+                        if skip & (1 << C_WO) == 0 { dispatches += 1; }
+                        barriers += 1;
+                    }
+                    add_go(C_WO, 1);
+                    add_go(C_WOPOST, 1);
+                    add_go(C_MIXF, 1);
+                    if controlled {
+                        let fuse_down = wave2a && ctrl_down_direct_half(skip);
+                        add_go(C_CTRLD, 1);
+                        if !fuse_down {
+                            if skip & (1 << C_CTRLA) == 0 { dispatches += 1; }
+                            barriers += 1;
+                        }
+                        add_go(C_CTRLA, 1);
+                        add_go(C_CTRLN, 1);
+                    }
+                    add_go(C_ROUTER, 1);
+                    if wave2a && use_fused_topk_route3(hgemm, n_lanes) {
+                        add_go(C_TOPK, 1);
+                    } else {
+                        add_go(C_TOPK, 1);
+                        add_go(C_TOPK, 1);
+                    }
+                    if skip & (1 << C_GATHER) == 0 { dispatches += 1; }
+                    barriers += 1;
+                    let cls_start = if wave2a { moe_class_start(n_lanes) } else { 0 };
+                    let n_cls = MOE_CLS.len() - cls_start;
+                    add_go(C_GU, n_cls);
+                    add_go(C_DOWN, n_cls);
+                    add_go(C_COMB2, 1);
+                    add_go(C_FFNPOST, 1);
+                }
+            }
+            if logits {
+                add_go(C_OMIX, 1);
+                add_go(C_LMHEAD, 1);
+                if argmax {
+                    for _ in 0..n_lanes {
+                        add_go(C_ARGMAX, 1);
+                        add_go(C_ARGMAX, 1);
+                    }
+                }
+            }
+            (dispatches, barriers)
+        };
+
+        // 32-lane blocked decode (hgemm=true, logits=true, argmax=false, skip=0):
+        //   Opt 1 (combine direct half):        -48 dispatches, -48 barriers
+        //   Opt 2 (ctrl_b down hout=1):         -96 dispatches, -48 barriers (24 controlled layers x [3+1] jobs)
+        //   Opt 3 (skip empty MoE class 0):     -96 indirect dispatches, 0 barriers (48 layers x [GU+DOWN])
+        //   Opt 4 (fused k_moe_topk_route3):    -48 dispatches, -48 barriers
+        //   Total reduction:                   -288 dispatches, -144 barriers
+        let (base_d, base_b) = count_step(32, true, true, false, 0, false);
+        let (opt_d, opt_b) = count_step(32, true, true, false, 0, true);
+        assert_eq!((base_d, base_b), (1131, 963));
+        assert_eq!((opt_d, opt_b), (843, 819));
+        assert_eq!(base_d - opt_d, 288);
+        assert_eq!(base_b - opt_b, 144);
+
+        // Same reduction holds across 1..=64 lanes; above 64 lanes, only Opt 1 + Opt 2 apply (-144 d, -96 b).
+        assert_eq!(count_step(1, true, true, false, 0, true), (843, 819));
+        assert_eq!(count_step(64, true, true, false, 0, true), (843, 819));
+        let (d65, b65) = count_step(65, true, true, false, 0, true);
+        assert_eq!((base_d - d65, base_b - b65), (144, 96));
+
+        // Skip-mask semantics: isolating C_WO/C_COMB disables Opt 1 fusion; isolating C_CTRLD/C_CTRLA disables Opt 2 fusion.
+        assert!(decode_combine_direct_half(true, 0));
+        assert!(!decode_combine_direct_half(false, 0));
+        assert!(!decode_combine_direct_half(true, 1 << C_COMB));
+        assert!(!decode_combine_direct_half(true, 1 << C_WO));
+        assert!(ctrl_down_direct_half(0));
+        assert!(!ctrl_down_direct_half(1 << C_CTRLD));
+        assert!(!ctrl_down_direct_half(1 << C_CTRLA));
+    }
+
+    #[test]
+    fn moe_class0_empty_invariant_for_n_le_64() {
+        // Exact Rust mirror of `topk_sg` (`kernels.metal`) + `k_moe_route3` (`prefill.metal`) tile class counts.
+        let topk_pick = |logits: &[f32; NEXP], bias: &[f32; NEXP]| -> [usize; TOPK] {
+            let mut sel = [0.0f32; NEXP];
+            for e in 0..NEXP {
+                let p = 1.0f32 / (1.0f32 + (-logits[e]).exp());
+                let score = p + bias[e];
+                let finite = (score.to_bits() & 0x7f80_0000u32) != 0x7f80_0000u32;
+                sel[e] = if finite { score } else { f32::from_bits(0xff7f_ffffu32) };
+            }
+            let mut out = [0usize; TOPK];
+            for k in 0..TOPK {
+                let mut mv = f32::NEG_INFINITY;
+                let mut win = NEXP;
+                for (e, &s) in sel.iter().enumerate() {
+                    if s > mv || (s == mv && e < win) {
+                        mv = s;
+                        win = e;
+                    }
+                }
+                let pick = if win < NEXP { win } else { k };
+                sel[pick] = f32::NEG_INFINITY;
+                out[k] = pick;
+            }
+            out
+        };
+        let route3_class_tiles = |picks: &[[usize; TOPK]]| -> [usize; NTC] {
+            let mut cnt = [0usize; NEXP];
+            for row in picks {
+                let mut seen = [false; NEXP];
+                for &e in row {
+                    assert!(e < NEXP);
+                    assert!(!seen[e], "a single token must pick TOPK distinct experts");
+                    seen[e] = true;
+                    cnt[e] += 1;
+                }
+            }
+            let mut ts = [0usize; NTC];
+            for &c in &cnt {
+                let r = c % 128;
+                ts[0] += c / 128 + usize::from(r > 64);
+                ts[1] += usize::from(r > 0 && r <= 64);
+            }
+            ts
+        };
+
+        // Adversarial worst cases: identical finite logits, all-NaN logits, and strongly skewed bias.
+        let cases: [([f32; NEXP], [f32; NEXP]); 3] = [
+            ([0.0; NEXP], [0.0; NEXP]),
+            ([f32::NAN; NEXP], [0.0; NEXP]),
+            ([1.5; NEXP], std::array::from_fn(|e| if e >= NEXP - TOPK { 10.0 } else { -10.0 })),
+        ];
+        for (logits, bias) in &cases {
+            let single = topk_pick(logits, bias);
+            for n in 1..=64 {
+                assert_eq!(moe_class_start(n), 1);
+                assert!(use_fused_topk_route3(true, n));
+                let picks = vec![single; n];
+                let ts = route3_class_tiles(&picks);
+                assert_eq!(ts[0], 0, "class 0 (65..128) must be empty for n={n}");
+                assert!(ts[1] > 0, "class 1 (1..64) must cover all tiles for n={n}");
+            }
+            // Tightness check: at n = 65 with all tokens picking the same experts, class 0 becomes non-empty.
+            assert_eq!(moe_class_start(65), 0);
+            assert!(!use_fused_topk_route3(true, 65));
+            let picks_65 = vec![single; 65];
+            let ts_65 = route3_class_tiles(&picks_65);
+            assert_eq!(ts_65[0], TOPK);
+            assert_eq!(ts_65[1], 0);
         }
     }
 }

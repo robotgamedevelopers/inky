@@ -359,6 +359,74 @@ kernel void k_moe_route3(device float * A [[buffer(2)]], constant Route3Args & a
     }
 }
 
+// ---- fused top-k + routing for n <= 64 (fp16 path): 1 TG x 1024 threads (32 simdgroups).
+// Simdgroups execute the exact `topk_sg` arithmetic of `k_topk_b` across rows [0, T), writing `sel`,
+// then synchronize via a device+threadgroup barrier before executing the exact body of `k_moe_route3`.
+struct TopkRoute3Args {
+    uint logits_off, bias_off, sel_off, T;
+    float wscale; uint perm_off, inv_off, aw_off;
+    uint ind_off, gu_y, dn_y; uint tiles_off[NTC];
+    uint pad0, pad1, pad2;
+};
+kernel void k_moe_topk_route3(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                              constant TopkRoute3Args & a [[buffer(5)]],
+                              ushort tid [[thread_index_in_threadgroup]],
+                              ushort sg [[simdgroup_index_in_threadgroup]],
+                              ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup atomic_uint cnt[NEXP];
+    threadgroup uint off[NEXP], toff[NTC][NEXP];
+    threadgroup atomic_uint fill[NEXP];
+    if (tid < NEXP) {
+        atomic_store_explicit(&cnt[tid], 0, memory_order_relaxed);
+        atomic_store_explicit(&fill[tid], 0, memory_order_relaxed);
+    }
+    for (uint row = sg; row < a.T; row += 32) {
+        topk_sg(A, PB, a.logits_off + row * NEXP, a.bias_off, a.sel_off + row * 2 * TOPK, a.wscale, lane);
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    const uint n = a.T * TOPK;
+    for (uint i = tid; i < n; i += 1024) {
+        const uint e = (uint) A[a.sel_off + (i / TOPK) * 16 + (i % TOPK)];
+        atomic_fetch_add_explicit(&cnt[e], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint s = 0, ts[NTC] = {0, 0};
+        for (int e = 0; e < NEXP; e++) {
+            const uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed), r = c % 128;
+            off[e] = s; s += c;
+            toff[0][e] = ts[0]; toff[1][e] = ts[1];
+            ts[0] += c / 128 + (r > 64 ? 1 : 0);
+            ts[1] += (r > 0 && r <= 64) ? 1 : 0;
+        }
+        device uint * ind = (device uint *) (A + a.ind_off);
+        for (int c = 0; c < NTC; c++) {
+            ind[c * 4 + 0] = ts[c]; ind[c * 4 + 1] = a.gu_y; ind[c * 4 + 2] = 1; ind[c * 4 + 3] = ts[c];
+            ind[4 * NTC + c * 4 + 0] = ts[c]; ind[4 * NTC + c * 4 + 1] = a.dn_y; ind[4 * NTC + c * 4 + 2] = 1; ind[4 * NTC + c * 4 + 3] = ts[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device uint * perm = (device uint *) (A + a.perm_off);
+    device uint * inv = (device uint *) (A + a.inv_off);
+    for (uint i = tid; i < n; i += 1024) {
+        const uint t = i / TOPK, k = i % TOPK;
+        const uint e = (uint) A[a.sel_off + t * 16 + k];
+        const uint slot = off[e] + atomic_fetch_add_explicit(&fill[e], 1, memory_order_relaxed);
+        perm[slot] = t;
+        inv[i] = slot;
+        A[a.aw_off + slot] = A[a.sel_off + t * 16 + TOPK + k];
+    }
+    if (tid < NEXP) {
+        const uint c = atomic_load_explicit(&cnt[tid], memory_order_relaxed), n128 = c / 128, r = c % 128;
+        device uint * t8 = (device uint *) (A + a.tiles_off[0]) + toff[0][tid] * 4;
+        for (uint j = 0; j < n128; j++) { t8[j * 4] = tid; t8[j * 4 + 1] = off[tid] + j * 128; t8[j * 4 + 2] = 128; t8[j * 4 + 3] = 0; }
+        if (r > 0) {
+            device uint * tt = r > 64 ? t8 + n128 * 4 : (device uint *) (A + a.tiles_off[1]) + toff[1][tid] * 4;
+            tt[0] = tid; tt[1] = off[tid] + n128 * 128; tt[2] = r; tt[3] = 0;
+        }
+    }
+}
+
 // ---- expert sum per token for the fp16 path (routing weights are already folded into the activations):
 // y[t][c] = sum_k ydh[inv[t*8+k]][c], ydh half. grid (T, ceil(E/1024)), 256 threads x 4 columns
 kernel void k_moe_comb_h(device float * A [[buffer(2)]], constant MoeCombArgs & a [[buffer(5)]],

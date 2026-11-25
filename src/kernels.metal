@@ -888,7 +888,8 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
 }
 
 // combine split partials (+ zero-logit sink) and apply the sigmoid output gate. grid: NH TGs x 128 threads
-struct CombineArgs { uint part_off, nsplit, gate_off, out_off; };
+// hout != 0: write half directly to ((device half *) (A + a.out_off))[i] instead of f32.
+struct CombineArgs { uint part_off, nsplit, gate_off, out_off; uint hout, pad0, pad1, pad2; };
 kernel void k_attn_combine(device float * A [[buffer(2)]], constant CombineArgs & a [[buffer(5)]],
                            uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     device const float * P = A + a.part_off + h * a.nsplit * (HD + 2);
@@ -901,11 +902,14 @@ kernel void k_attn_combine(device float * A [[buffer(2)]], constant CombineArgs 
         o += w * P[s * (HD + 2) + 2 + tid];
     }
     const uint i = h * HD + tid;
-    A[a.out_off + i] = o / L * sigm(A[a.gate_off + i]);
+    const float val = o / L * sigm(A[a.gate_off + i]);
+    if (a.hout) ((device half *) (A + a.out_off))[i] = half(val);
+    else A[a.out_off + i] = val;
 }
 
 // 2D-batched split combine across all lanes in a decode batch. grid: (NH, nspans, 1) x 128 threads
-struct CombineDecArgs { uint desc_off, gate_off, out_off, swa; };
+// hout != 0: write half directly to ((device half *) (A + a.out_off))[i] instead of f32.
+struct CombineDecArgs { uint desc_off, gate_off, out_off, swa; uint hout, pad0, pad1, pad2; };
 kernel void k_attn_combine_dec(device float * A [[buffer(2)]], constant CombineDecArgs & a [[buffer(5)]],
                                uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     const uint h = tgp.x, si = tgp.y;
@@ -921,7 +925,9 @@ kernel void k_attn_combine_dec(device float * A [[buffer(2)]], constant CombineD
         o += w * P[s * (HD + 2) + 2 + tid];
     }
     const uint i = si * (NH * HD) + h * HD + tid;
-    A[a.out_off + i] = o / L * sigm(A[a.gate_off + i]);
+    const float val = o / L * sigm(A[a.gate_off + i]);
+    if (a.hout) ((device half *) (A + a.out_off))[i] = half(val);
+    else A[a.out_off + i] = val;
 }
 
 // ---------------------------------------------------------------------------------------------
