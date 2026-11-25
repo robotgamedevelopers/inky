@@ -200,8 +200,8 @@ Defects in the server, the root helper, the CLI and the tools that are still ope
 
 | feature | done |
 |---|:---:|
-| Every connection has a deadline for the whole request and each peer a connection cap, so slow or idle clients cannot hold every slot | ❌ |
-| count_tokens bounds its input in tokens and memory, and never starves generation of preprocess permits | ❌ |
+| Each peer has a connection cap, and the entire request upload has a deadline ([#100](https://github.com/robotgamedevelopers/inky/pull/100)) | ✅ |
+| count_tokens limits request bytes and rendered tokens and uses its own preprocessing permit ([#100](https://github.com/robotgamedevelopers/inky/pull/100)) | ✅ |
 | Admission checks shared prefixes in time linear in the prefilling lanes, with no all-pairs rescans while the GPU waits | ❌ |
 | inky serve refuses a bind address that is neither loopback nor private, so the binding rule the server and fleet rows state holds | ❌ |
 | The recorder queue is bounded in bytes and holds no copy of refused requests | ❌ |
@@ -212,7 +212,7 @@ Defects in the server, the root helper, the CLI and the tools that are still ope
 | A streaming client that reads too slowly is cut off by a total write deadline and frees its lane | ❌ |
 | The accept loop backs off and logs on errors, and the connection cap sits below the descriptor limit | ❌ |
 | An allocation that eviction cannot satisfy fails without emptying the cache, and a rolled-back span leaves the cache as it was | ❌ |
-| complete | 0% |
+| complete | 16% |
 
 [Source data](roadmap.sexp)
 
