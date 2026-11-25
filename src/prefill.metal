@@ -633,7 +633,6 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
     threadgroup float ss[AQT * 3][33];
     threadgroup float rs[AQT * 3][NREL];
     threadgroup float sk[AQT * 3];
-    threadgroup float alpha[AQT * 3];
     const uint g = tgp.y, t0 = tgp.x * AQT;
     const uint nq = min((uint) AQT, a.T - t0);
     for (uint i = tid; i < AQT * 3 * HD; i += 128) {
@@ -648,7 +647,9 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint plast = a.p0 + t0 + nq - 1;
     const uint pfirst = a.p0 + t0;
-    const uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
+    // Align `kstart` down to a cache-fixed 32-key tile boundary so online-softmax reduction tiles
+    // `[32*b, 32*b + 32)` are independent of how prefill chunks were split (`a.p0`).
+    const uint kstart = ((a.window > 0 && pfirst + 1 > a.window) ? (pfirst + 1 - a.window) : 0u) & ~31u;
     float o[AQT * 3];
     for (int r = 0; r < AQT * 3; r++) o[r] = 0;
     // running stats in registers of every thread (identical copies)
@@ -687,10 +688,14 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
             ss[row][j] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // online softmax: every thread updates its copy of the row stats; thread-local exp of row/key pairs
+        // online softmax: bound each query row `r` to its own causal prefix `jend = min(32, qp - kc + 1)`
+        // and skip tiles completely outside `[qp + 1 - window, qp]` so every split executes identical FP steps.
         for (int r = 0; r < AQT * 3; r++) {
+            const uint tt = uint(r) / 3u, qp = a.p0 + t0 + tt;
+            const uint jend = (tt < nq && kc <= qp) ? min(32u, qp - kc + 1u) : 0u;
+            if (jend == 0u || (a.window > 0 && qp >= kc + jend - 1u + a.window)) continue;
             float mx = m[r];
-            for (uint j = 0; j < nk; j++) mx = max(mx, ss[r][j]);
+            for (uint j = 0; j < jend; j++) mx = max(mx, ss[r][j]);
             const float f = exp(m[r] - mx);
             l[r] *= f; o[r] *= f; m[r] = mx;
         }
@@ -698,8 +703,11 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
         for (uint i = tid; i < AQT * 3 * 32; i += 128) { const uint row = i / 32, j = i % 32; ss[row][j] = j < nk ? exp(ss[row][j] - m[row]) : 0.0f; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int r = 0; r < AQT * 3; r++) {
+            const uint tt = uint(r) / 3u, qp = a.p0 + t0 + tt;
+            const uint jend = (tt < nq && kc <= qp) ? min(32u, qp - kc + 1u) : 0u;
+            if (jend == 0u || (a.window > 0 && qp >= kc + jend - 1u + a.window)) continue;
             float acc = 0, ls = 0;
-            for (uint j = 0; j < nk; j++) { const float p = ss[r][j]; ls += p; acc += p * float(vs[j][tid]); }
+            for (uint j = 0; j < jend; j++) { const float p = ss[r][j]; ls += p; acc += p * float(vs[j][tid]); }
             l[r] += ls; o[r] += acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1533,7 +1541,7 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
     device const float * relb = (device const float *) (PB + a.relbias_w);
     const uint plast = a.p0 + t0 + nq - 1;
     const uint pfirst = a.p0 + t0;
-    const uint kstart = (a.window > 0 && pfirst + 1 > a.window) ? pfirst + 1 - a.window : 0;
+    const uint kstart = ((a.window > 0 && pfirst + 1 > a.window) ? (pfirst + 1 - a.window) : 0u) & ~31u;
     float o[AQT * 3];
     for (int r = 0; r < AQT * 3; r++) o[r] = 0;
     float m[AQT * 3], l[AQT * 3];
@@ -1571,8 +1579,11 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int r = 0; r < AQT * 3; r++) {
+            const uint tt = uint(r) / 3u, qp = a.p0 + t0 + tt;
+            const uint jend = (tt < nq && kc <= qp) ? min(32u, qp - kc + 1u) : 0u;
+            if (jend == 0u || (a.window > 0 && qp >= kc + jend - 1u + a.window)) continue;
             float mx = m[r];
-            for (uint j = 0; j < nk; j++) mx = max(mx, ss[r][j]);
+            for (uint j = 0; j < jend; j++) mx = max(mx, ss[r][j]);
             const float f = exp(m[r] - mx);
             l[r] *= f; o[r] *= f; m[r] = mx;
         }
@@ -1580,8 +1591,11 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
         for (uint i = tid; i < AQT * 3 * 32; i += 128) { const uint row = i / 32, j = i % 32; ss[row][j] = j < nk ? exp(ss[row][j] - m[row]) : 0.0f; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int r = 0; r < AQT * 3; r++) {
+            const uint tt = uint(r) / 3u, qp = a.p0 + t0 + tt;
+            const uint jend = (tt < nq && kc <= qp) ? min(32u, qp - kc + 1u) : 0u;
+            if (jend == 0u || (a.window > 0 && qp >= kc + jend - 1u + a.window)) continue;
             float acc = 0, ls = 0;
-            for (uint j = 0; j < nk; j++) { const float p = ss[r][j]; ls += p; acc += p * float(vs[j][tid]); }
+            for (uint j = 0; j < jend; j++) { const float p = ss[r][j]; ls += p; acc += p * float(vs[j][tid]); }
             l[r] += ls; o[r] += acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

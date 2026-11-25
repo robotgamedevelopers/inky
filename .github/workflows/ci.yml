@@ -21,8 +21,11 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: soak qualification shell tests
         run: tests/soak_qualification_test.sh
       - name: unit and integration tests (debug assertions)
@@ -95,10 +98,14 @@ jobs:
           distribution: temurin
           java-version: '21'
       # The pinned tla2tools.jar, kept across runs; check-tla.sh still checks its SHA-256 every time.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/inky-tla
           key: tla2tools-fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        if: matrix.part == 'traces'
+        with:
+          toolchain: 1.98.1
       - name: TLA ${{ matrix.part }}
         run: TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh ${{ matrix.part }}
   # The self-hosted M5 Macs: the engine needs Metal 4 and the M5 neural accelerators, which hosted runners lack.
@@ -111,11 +118,32 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: verify pinned Rust toolchain
+        run: |
+          v=$(rustc --version)
+          echo "$v"
+          case "$v" in
+            "rustc 1.98.1 "*) ;;
+            *) echo "expected rustc 1.98.1, got: $v" >&2; exit 1 ;;
+          esac
       - name: build
         run: cargo build --locked --profile ci
       - name: GPU router regression
-        run: cargo test --locked --profile ci router_handles_nonfinite_scores -- --ignored
+        run: |
+          out=$(cargo test --locked --bins --profile ci engine::tests::router_handles_nonfinite_scores -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU window attention split-invariance regression
+        run: |
+          out=$(cargo test --locked --bins --profile ci engine::tests::k_attn_b_and_blk_are_split_invariant_across_sliding_window -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'k_attn_b split-invariance: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU pool slot zero-fill on reuse
+        run: |
+          out=$(cargo test --locked --bins --profile ci blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (pull request set)
         env:
           INKY_BIN: ./target/ci/inky
@@ -125,7 +153,15 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: verify pinned Rust toolchain
+        run: |
+          v=$(rustc --version)
+          echo "$v"
+          case "$v" in
+            "rustc 1.98.1 "*) ;;
+            *) echo "expected rustc 1.98.1, got: $v" >&2; exit 1 ;;
+          esac
       - name: build
         run: cargo build --locked --profile ci
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

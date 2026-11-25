@@ -109,6 +109,9 @@ Restart == /\ rollback' = NoRollback /\ ~alive /\ alive' = TRUE
            /\ UNCHANGED <<conns, owner>>
 Next == (\E c \in Clients : Connect(c) \/ Close(c)) \/ (\E v \in Values : OwnerSets(v) \/ Reboot(v)) \/ Crash \/ Restart
 Spec == Init /\ [][Next]_vars /\ WF_vars(Restart) /\ WF_vars(\E c \in Clients : Close(c))
+\* Reversed liveness witness (`UnfairRestart.cfg`): omitting weak fairness of
+\* `Restart` lets a crashed helper stay down forever with the limit raised.
+SpecUnfair == Init /\ [][Next]_vars /\ WF_vars(\E c \in Clients : Close(c))
 
 \* in inky mode exactly while someone is connected to a running helper
 RaisedWhileConnected == alive /\ conns # {} => limit = Target
@@ -129,7 +132,7 @@ RefusedRollbackSafe ==
     /\ (rollback.restored => limit = rollback.found)
     /\ (rollback.needed /\ limit # rollback.found =>
           rollback.attempted /\ saved = rollback.found /\ owed)
-\* whatever happens, once the helper runs with no clients and stops rebooting, the owner's limit is back,
+\* whatever happens, once no clients remain connected, the owner's limit is back (via close, restart, or reboot),
 \* or a restore of it is still pending in memory and has not been silently dropped
-EventuallyRestored == <>[](conns = {} /\ alive) ~> (limit = owner \/ saved # NONE)
+EventuallyRestored == <>[](conns = {}) ~> (limit = owner \/ saved # NONE)
 =============================================================================

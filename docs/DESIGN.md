@@ -1,6 +1,6 @@
 # Lanes: design
 
-Status (2026-11-24): Layers 1–2 (multi-lane Metal engine) and `inky serve` (OpenAI Chat Completions + Anthropic Messages HTTP server, ahead of the block cache) are built and running in CI; Layer 3 (pooled 64-token block tree and start-point restore) is in progress. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
+Status (2026-11-25): Layers 1–7 are built and running in CI — the multi-lane Metal engine (Layers 1–2), paged 64-token K/V block pools, prefix tree and start-point restore (Layer 3), starvation-bounded scheduler, admission guard and SSD spill tier (Layer 4), stateless OpenAI Chat Completions + Anthropic Messages HTTP server (Layer 5), recorded card traffic replay sweep (Layer 6), and private-network fleet wiring (Layer 7); Layer 8 multi-day live soak continues under production load. The work is tracked layer by layer in [ROADMAP.md](ROADMAP.md).
 
 One process on one Apple silicon machine serves Inkling 2 Mini to many low-priority coding-agent tasks (cards) at once. It starts from inkling, Eris's engine ([github.com/Eriskii/erisinky](https://github.com/Eriskii/erisinky), GPL-3.0-or-later). This repository is the fork: `main` builds and serves the multi-lane engine (`inky serve`), while the historical branch `tracer-serve` held the initial one-lane endpoint the tracer card ran on. The aim is the most cards landed per hour, not the fastest single card.
 
@@ -62,7 +62,7 @@ So the 58 ms is not a fixed overhead. It is the experts a batch touches, read by
 
 ### What CI checks
 
-CI checks agreement with llama.cpp on a short prompt's decode path and a long prompt's prefill path. It does not check the long prompt's decode path position by position: near the end of that prompt some positions are ill-conditioned in the model itself, and llama.cpp disagrees with its own batched run on 16 of the last 64 (inky decoding token by token agrees with llama.cpp's batched run on 47, and with its token-by-token run on 50).
+CI checks agreement with llama.cpp across three `inky check` runs: a 58-position short-prompt decode run (`encode_step`), a 58-position short-prompt batched decode-step run (`INK_DEC=1`, `encode_decode`), and a 24-position long-prompt run (`INK_PF=2380` on the 2,403-token reference, comparing position `2379` at the end of the 2,380-token prefill plus the 23 post-prefill decode-path positions `2380..=2402`). It does not run cold token-by-token decode from position 0 across the whole 2,403-token prompt: near the end of that prompt some positions are ill-conditioned in the model itself, and llama.cpp disagrees with its own batched run on 16 of the last 64 (inky decoding token by token from position 0 agrees with llama.cpp's batched run on 47, and with its token-by-token run on 50).
 
 ## The cold read, and what it changed
 
@@ -116,7 +116,7 @@ A block holds the cache for 64 consecutive positions. Two kinds, because the mod
 
 A block is written by exactly one lane, then sealed, then never written again. Sharing is a reference count; because blocks are append-only there is no copy-on-write. The cache for position p depends only on tokens 0..p, so two requests with the same first N tokens share the same blocks exactly.
 
-**Start points.** The recurrent state (convolution rows, 3.66 MiB) exists only at the end of a step. A position k is a start point when the tree keeps all three of: the state at k, the full blocks before k, and the window blocks covering the 1024 positions before k. A start point references those window blocks, so they are not released while it is kept. Start points are kept at the end of every request's prompt, at every 16th block boundary a prefill crosses, and at a running lane's head. Prefill chunks end on block boundaries, so a chunk's end can be a start point. A request starts at the deepest start point its tokens match and prefills from there: at most 1023 positions more than the deepest block it matches.
+**Start points.** The recurrent state (convolution rows, 3.66 MiB) exists only at the end of a step. A position k is a start point when the tree keeps all three of: the state at k, the full blocks before k, and the window blocks covering the 1024 positions before k. A start point references those window blocks, so they are not released while it is kept. In `inky serve` (`ServeBlockCache`), start points are kept at block-aligned prompt ends and at periodic `EVERY` boundaries — every 2,048 tokens (32 blocks, `EARLY_EVERY_TOKENS`) up to 16,384 tokens, widening to every 4,096 tokens (64 blocks, `LATE_EVERY_TOKENS`) above 16,384 tokens — and never at a decoding lane's head, since decode writes use decode arithmetic and are never reused as prompt history (Decisions 2, 4, and 5; the standalone `BlockBook` model harness additionally tests 16-block strides and running heads). Prefill chunks align to 64-token block boundaries (except a prompt's final unaligned tail), so periodic boundaries land at chunk ends. A request starts at the deepest retained start point its prompt tokens match and prefills the suffix from there.
 
 **Unsealed tails.** A lane's last, partly written block is private, zero-filled past its length on allocation, never matched, and dropped when the lane ends. Pool slots are zero-filled on reuse, so a masked read never meets a non-finite value.
 
@@ -132,7 +132,7 @@ Lane states: `Queued -> Admitted -> Restoring -> Ready <-> InStep -> Finished`, 
 
 - **Admission.** The server sizes its pools from the GPU working-set limit after subtracting weights, scratch and a margin. It checks the physical prompt and reply limits before opening a response. When admitting concurrent lanes, it accounts for their pinned blocks, unwritten prompts, rolling windows and up to 4,096 future decode tokens per lane. A longer reply extends that reservation as it advances. Requests wait when capacity is busy. A full queue returns HTTP 429 with `Retry-After`. If every runnable lane needs another block and none can make progress, the scheduler fails one request to release its blocks. An open stream receives an error event.
 - **Restoring** reserves the lane's whole working set in memory, atomically, before it reads any block back from disk.
-- **Each tick builds one step:** the longest-waiting Ready lane first, then other Ready decoding lanes, then prefill spans to fill the step's token budget, so a large tool result is taken over several steps and never stalls the decoders. No Ready, Restoring or Queued lane is passed over more than W ticks in a row.
+- **Each tick builds one homogeneous step (`ServeStepPlanner`):** decode steps (`ServeStepPlan::Decode`, 1 token per ready decoding lane via `encode_decode`) and prefill steps (`ServeStepPlan::Prefill`, 64-token-aligned spans sliced up to the step's `chunk` token budget via `encode_spans`) run in separate command buffers and are never mixed in one step. Ready decoding lanes burst first so multi-chunk prefills do not stall active streams, up to the starvation bound `W = 16` (`SERVE_STARVATION_W`): once any runnable prefill lane has been bypassed `W` ticks (`wait_ticks >= W`, with no runnable decoder above it), a prefill step preempts, reserving span budget for ceiling prefillers first so no runnable lane exceeds `W` bypassed ticks. Admission from the wait queue is likewise bounded against indefinite bypass.
 - **Cancel during a step waits for the step.** Command buffers do not retain their buffers, so a lane cancelled while `InStep` goes to `Cancelling` and releases its references only when the GPU and any disk I/O of that step have finished. A client that disconnects cancels its lane.
 
 ## Models (TLA+, before code; TLC on a bench)
@@ -177,13 +177,13 @@ Each is secured before the next starts.
 | | layer | gate |
 |---|---|---|
 | 1 | Lane state out of the engine (done) | logits identical to the unmodified engine; two interleaved lanes with poisoned scratch give each lane its own logits |
-| 2 | Batched step over spans, on today's per-lane cache buffers | bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits; agreement with llama.cpp; then measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table |
-| 3 | Block cache: pool, table, tree, start points, unsealed tails | CacheScheduler and BlockLayout hold in TLC with their reversed witnesses; traces checked in CI; outputs identical to layer 2 with poisoned pool slots |
-| 4 | Scheduler, admission, disk tier | traces checked; a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step; kill -9 in mid-write loses cache and never correctness; temperature 1 with fixed seeds gives the same outputs with and without the cache |
-| 5 | Server: the OpenAI endpoint, template, tool calls, 429, health | the tracer card and a replay set land; concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation |
-| 6 | Sweep: replay recorded card traffic at 8 to 128 lanes | the knee becomes the route's concurrency |
-| 7 | Fleet wiring: a provider entry, concurrency, a priority ceiling | a real low-priority card lands from the fleet |
-| 8 | Soak under real load | days, not hours |
+| 2 | Batched step over spans, on per-lane cache buffers (done) | bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits; agreement with llama.cpp; then measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table |
+| 3 | Block cache: pool, table, tree, start points, unsealed tails (done) | CacheScheduler and BlockLayout hold in TLC with their reversed witnesses; traces checked in CI; outputs identical to layer 2 with poisoned pool slots |
+| 4 | Scheduler, admission, disk tier (done) | traces checked; a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step; kill -9 in mid-write loses cache and never correctness; temperature 1 with fixed seeds gives the same outputs with and without the cache |
+| 5 | Server: OpenAI + Anthropic endpoints, template, tool calls, 429, health (done) | the tracer card and a replay set land; concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation |
+| 6 | Sweep: replay recorded card traffic at 8 to 128 lanes (done) | the knee becomes the route's concurrency |
+| 7 | Fleet wiring: a provider entry, concurrency, a priority ceiling (done) | a real low-priority card lands from the fleet |
+| 8 | Soak under real load (in progress) | days, not hours |
 
 ## Follow-ons, not in the first build
 

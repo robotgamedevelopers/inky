@@ -153,8 +153,8 @@ run_one() {
         if grep -q "^Error:" "$log"; then ok=false; fi
         grep -Fxq "Model checking completed. No error has been found." "$log" || ok=false
         if [[ $module = InBlockTrace ]]; then
-            # Both element widths enumerate 2 passes x 2 planes x 3 heads x 4 positions.
-            grep -Eq '^[0-9,]+ states generated, 48 distinct states found, 0 states left on queue\.' "$log" || ok=false
+            # SmallTrace (48) + MetalFull (240) + MetalWin (1,200) = 1,488 distinct states.
+            grep -Eq '^[0-9,]+ states generated, 1,?488 distinct states found, 0 states left on queue\.' "$log" || ok=false
         fi
     fi
     if [[ $ok != true ]]; then
@@ -171,7 +171,7 @@ run_one() {
     else
         counts=$(awk "/^[0-9,]+ states generated, [0-9,]+ distinct states found/ { print \$1 \" | \" \$4 }" "$log")
     fi
-    printf "%s | %s | %.3f | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}" > "$output/$name.result"
+    printf "%s | %s | %s | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}" > "$output/$name.result"
 }
 if [[ $mode = one ]]; then run_one "${@:2}"; exit 0; fi
 
@@ -223,11 +223,41 @@ check BlockLayoutHigh BlockLayout
 check BlockLayoutKv8 BlockLayout
 check StaleEntry BlockLayout GenerationMatches
 check WindowOffByOne BlockLayout WindowCovered
+check FullDropped BlockLayout FullCovered
 check SpanTooSmall BlockLayout SpanPinned
 check StartReleased BlockLayout StartRetained
+check TailNotZeroed BlockLayout TailPrivateZero
+check WrongTableIndex BlockLayout TableIndex
 check Truncate32 BlockLayout Address64
+check SlotOverlap BlockLayout Address64
+check SlabWord SlabWord
+check SlabWordKv8 SlabWord
+check SlabWordUnmasked SlabWord ShaderPtrResolves
+check SlabWordWrongBind SlabWord ShaderPtrResolves
+check SlabWordOverflow SlabWord NoOffsetClobbersSlab
+check SlabWordFifthSlab SlabWord SlabCountBounded
+check BlockedSlab3 BlockedSlab
+check BlockedSlab4 BlockedSlab
+check BlockedSlabFlatGrow BlockedSlab SyncedMatchesCpu
+check BlockedSlabNoReuseZero BlockedSlab CleanSlotZeroed
+check BlockedSlabMissedDirty BlockedSlab SyncedMatchesCpu
+check VecAlloc10 VecAlloc
+check VecAlloc7 VecAlloc
+check VecAlloc6 VecAlloc NoPoolExhaustion
+check VecAllocUnpinnedWeak VecAlloc NeverOverwritesLive
+check VerifyRollback VerifyRollback
+check VerifyOffByOneCs VerifyRollback ConvMatchesSequential
+check VerifyKeepRejectedKv VerifyRollback RejectedTailRestored
+check VerifySealRejected VerifyRollback NoRejectedSeal
+check KvDiskTier KvDiskTier
+check KvDiskNoOverlap KvDiskTier SplitBoundaryAligned
+check KvDiskStagingRace KvDiskTier StagingHalfSafe
+check SwaRing SwaRing
+check SwaRingShortWriteback SwaRing RingHoldsExactWindow
 check SpanPins512 SpanPins
 check SpanPins17 SpanPins Covered
+check SpanPinsOverBound SpanPins BoundHolds
+check SpanPinsMax24 SpanPins MaximumIs25
 check GroupedLayout3 GroupedLayout
 check GroupedLayout4 GroupedLayout
 check LocalMatch GroupedLayout VisitedKeys
@@ -240,10 +270,12 @@ check AdvanceUnfair GroupedLayout TraversalCompletes temporal
 # so only StagedOnce can see it. Restage above proves the same mutant is live.
 check RestageOutputs GroupedLayout
 check StartTails2 StartTails
+check LaneStaleGen StartTails LaneCovered
 check UnheldWindow StartTails StartRetained
 check PrunedUnderStart StartTails StartRetained
 check TailOverread StartTails ReadsWritten
 check ReuseNotZeroed StartTails TailPrivateZero
+check DanglingHead StartTails HeadsConsistent
 # Three slots per kind takes about a minute on one worker: the nightly workflow runs it via layout-nightly.
 check_nightly StartTails3 StartTails
 check PoisonGate3 PoisonGate
@@ -251,6 +283,7 @@ check PoisonGate4 PoisonGate
 check PoisonUnguarded PoisonGate NoFalsePoison
 check PoisonNoSave PoisonGate LiveIntact
 check PoisonOwnedOnly PoisonGate Coverage
+check PoisonNoZero PoisonGate NoFalsePoison
 check ScratchTail3 ScratchTail
 check ScratchTail4 ScratchTail
 check ScratchTailOneSpan ScratchTail

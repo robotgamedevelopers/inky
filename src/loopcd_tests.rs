@@ -55,7 +55,7 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     // Find a deterministic draw where changing only the weight changes the first emitted token.
     let sampler = |seed| Sampler::new(1.0, 64, 0.95, eng.softcap, seed);
     let (seed, plain_draw, guided_draw) = (1..=128).find_map(|seed| {
-        let plain_draw = sampler(seed).sample_next(eng.logits()).unwrap();
+        let plain_draw = sampler(seed).sample_next(&eng.logits()).unwrap();
         let guided_draw = sampler(seed).sample_next_with_ban_and_softcap(&guided, None, 0.0).unwrap();
         (plain_draw != guided_draw && plain_draw != tk.eos && guided_draw != tk.eos)
             .then_some((seed, plain_draw, guided_draw))
@@ -70,7 +70,7 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     let mut session = Session::new(&eng, &tk);
     let first = session.prefill(&toks).unwrap();
     assert_eq!(first, guided_token);
-    assert!(same_row(eng.logits(), &guided), "CLI did not guide its first sample");
+    assert!(same_row(&eng.logits(), &guided), "CLI did not guide its first sample");
     assert_eq!(eng.lane_hash(&session.lane), guided_state);
     assert_eq!(draw(&mut session, first), [guided_draw]);
     eprintln!("first-token reference: seed={seed} plain={plain_draw} guided={guided_draw}");
@@ -108,8 +108,8 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     final_row(&[&solo], &[0.0]);
     let solo_row = eng.span_logits(0).to_vec();
     final_row(&[&disabled, &enabled], &[0.0, OMEGA]);
-    assert!(same_row(eng.span_logits(0), &solo_row), "neighbor changed disabled logits");
-    assert!(differs_from_plain(eng.span_logits(1), &solo_row, eng.softcap));
+    assert!(same_row(&eng.span_logits(0), &solo_row), "neighbor changed disabled logits");
+    assert!(differs_from_plain(&eng.span_logits(1), &solo_row, eng.softcap));
     assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
     assert_eq!(eng.effective_sampler_softcap(1), 0.0);
     let pools = eng.block_pool().borrow();

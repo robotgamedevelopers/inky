@@ -177,30 +177,26 @@ fn cache_scheduler_admit_bypass_step_bypass_and_cold_spill_restore_hold() {
     assert!(saw_cancel, "walks must exercise mid-step cancellation");
     assert!(saw_refuse, "walks must exercise HTTP 429 refusal");
 
-    // Explicit cold SSD spill + atomic restore scenario:
+    // Explicit cold SSD spill + atomic restore scenario (prefill-only sealing, Decision 4):
     let mut ev_sink = MemorySink::new();
     let mut st_sink = MemorySink::new();
     let mut sched = CacheScheduler::new(cfg, &mut ev_sink, &mut st_sink).unwrap();
-    sched.arrive("a", "p1", 2, &mut ev_sink, &mut st_sink).unwrap();
+    sched.arrive("a", "p1", 4, &mut ev_sink, &mut st_sink).unwrap();
     sched.admit("a", &mut ev_sink, &mut st_sink).unwrap();
     sched.begin_restore("a", &mut ev_sink, &mut st_sink).unwrap();
     sched.finish_restore("a", &mut ev_sink, &mut st_sink).unwrap();
-    sched.build_step(&[("a".into(), 1)], &mut ev_sink, &mut st_sink).unwrap();
+    sched.build_step(&[("a".into(), 2)], &mut ev_sink, &mut st_sink).unwrap();
     sched.gpu_execute(&mut ev_sink, &mut st_sink).unwrap();
     sched.finish_step(&mut ev_sink, &mut st_sink).unwrap();
-    sched.build_step(&[("a".into(), 1)], &mut ev_sink, &mut st_sink).unwrap();
-    sched.gpu_execute(&mut ev_sink, &mut st_sink).unwrap();
-    sched.finish_step(&mut ev_sink, &mut st_sink).unwrap();
-    sched.finish_ready("a", &mut ev_sink, &mut st_sink).unwrap();
+    sched.cancel("a", &mut ev_sink, &mut st_sink).unwrap();
 
-    sched.arrive("a", "p2", 2, &mut ev_sink, &mut st_sink).unwrap();
+    sched.arrive("a", "p2", 4, &mut ev_sink, &mut st_sink).unwrap();
     sched.admit("a", &mut ev_sink, &mut st_sink).unwrap();
     sched.begin_restore("a", &mut ev_sink, &mut st_sink).unwrap();
     sched.finish_restore("a", &mut ev_sink, &mut st_sink).unwrap();
-    sched.arrive("b", "p2", 2, &mut ev_sink, &mut st_sink).unwrap();
-    sched.admit("b", &mut ev_sink, &mut st_sink).unwrap();
-    sched.begin_restore("b", &mut ev_sink, &mut st_sink).unwrap();
-    sched.finish_restore("b", &mut ev_sink, &mut st_sink).unwrap();
+    sched.build_step(&[("a".into(), 2)], &mut ev_sink, &mut st_sink).unwrap();
+    sched.gpu_execute(&mut ev_sink, &mut st_sink).unwrap();
+    sched.finish_step(&mut ev_sink, &mut st_sink).unwrap();
     assert!(sched.mem_pressure());
 
     let spilled1 = sched.start_cold_writeback(&mut ev_sink, &mut st_sink).unwrap();
@@ -208,18 +204,86 @@ fn cache_scheduler_admit_bypass_step_bypass_and_cold_spill_restore_hold() {
     let spilled2 = sched.start_cold_writeback(&mut ev_sink, &mut st_sink).unwrap();
     sched.complete_step_io(&mut ev_sink, &mut st_sink).unwrap();
     assert_eq!(sched.disk_used(), 2);
-    assert_eq!(sched.mem_used(), 0);
+    assert_eq!(sched.mem_used(), 2);
 
     sched.cancel("a", &mut ev_sink, &mut st_sink).unwrap();
-    sched.cancel("b", &mut ev_sink, &mut st_sink).unwrap();
-    sched.arrive("c", "p1", 2, &mut ev_sink, &mut st_sink).unwrap();
+    sched.arrive("c", "p1", 4, &mut ev_sink, &mut st_sink).unwrap();
     sched.admit("c", &mut ev_sink, &mut st_sink).unwrap();
     let (matched_pos, reserved) = sched.begin_restore("c", &mut ev_sink, &mut st_sink).unwrap();
-    assert_eq!((matched_pos, reserved), (2, 2));
+    assert_eq!((matched_pos, reserved), (2, 4));
     sched.restore_block("c", &spilled1, &mut ev_sink, &mut st_sink).unwrap();
     sched.restore_block("c", &spilled2, &mut ev_sink, &mut st_sink).unwrap();
     sched.finish_restore("c", &mut ev_sink, &mut st_sink).unwrap();
-    sched.finish_ready("c", &mut ev_sink, &mut st_sink).unwrap();
+    sched.cancel("c", &mut ev_sink, &mut st_sink).unwrap();
+}
+
+#[test]
+fn walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill() {
+    struct FailAtSink {
+        remaining: usize,
+    }
+    impl TraceSink for FailAtSink {
+        fn emit_line(&mut self, _json_line: &str) -> Result<(), crate::cache_trace::TraceError> {
+            if self.remaining == 0 {
+                return Err(crate::cache_trace::TraceError::Io("injected sink failure".into()));
+            }
+            self.remaining -= 1;
+            Ok(())
+        }
+    }
+
+    let cfg = CacheSchedulerConfig {
+        lanes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        prefixes: vec!["p1".into(), "p2".into()],
+        request_lengths: vec![2, 4],
+        block_size: 2,
+        window_size: 2,
+        max_pos: 4,
+        max_span: 2,
+        step_token_budget: 2,
+        mem_budget: 4,
+        disk_budget: 3,
+        max_queue: 2,
+        max_bypass: 2,
+    };
+
+    let mut st_full = MemorySink::new();
+    walk_cache_scheduler(cfg.clone(), 1, &mut NullSink, &mut st_full).unwrap();
+    let total_lines = st_full.lines().len();
+    assert!(total_lines > 12);
+
+    // Inject a sink failure at every single step of seed 1 (covering writeback, reclaim, and
+    // restore_block) and seed 3 (covering drop_unreferenced) — NONE may be swallowed!
+    for seed in [1u64, 3u64] {
+        let mut probe = MemorySink::new();
+        walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut probe).unwrap();
+        for fail_idx in 0..probe.lines().len() {
+            let mut failing = FailAtSink { remaining: fail_idx };
+            let err = walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut failing)
+                .expect_err("walk_cache_scheduler must propagate sink error immediately");
+            assert!(matches!(err, SchedulerError::Trace(_)), "unexpected error {err:?}");
+        }
+    }
+
+    let mut saw_spill = false;
+    let mut saw_restore = false;
+    let mut saw_drop = false;
+    let mut saw_slide = false;
+    for seed in [1u64, 2u64, 3u64] {
+        let mut st = MemorySink::new();
+        walk_cache_scheduler(cfg.clone(), seed, &mut NullSink, &mut st).unwrap();
+        let parsed = parse_cache_scheduler_jsonl(&st.to_jsonl()).unwrap();
+        for step in &parsed.steps {
+            match step.action.as_str() {
+                "StartColdWriteback" => saw_spill = true,
+                "RestoreBlock" => saw_restore = true,
+                "DropUnreferenced" => saw_drop = true,
+                "SlideWindow" => saw_slide = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_spill && saw_restore && saw_drop && saw_slide);
 }
 
 #[test]

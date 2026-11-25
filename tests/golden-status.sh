@@ -9,7 +9,10 @@ n=$(cat "$INK_GOLDEN_COUNT")
 n=$((n + 1))
 print -r -- "$n" > "$INK_GOLDEN_COUNT"
 case "$1" in
-  check) print 'hash abcdef' ;;
+  check)
+    case "$*" in *--kv-disk*) print 'disk tier: fake' ;; esac
+    print 'hash abcdef'
+    ;;
   binv) print 'same' ;;
   chat) cat > /dev/null; print 'text' ;;
   lanes) print 'lanes independent' ;;
@@ -19,7 +22,7 @@ esac
 FAKE
 chmod +x "$D/fake"
 export INK_GOLDEN_COUNT="$D/count"
-for failure in {0..10}; do
+for failure in {0..11}; do
     print 0 > "$INK_GOLDEN_COUNT"
     export INK_GOLDEN_FAIL=$failure
     if tests/golden.sh "$D/fake" > "$D/out" 2>&1; then
@@ -30,4 +33,4 @@ for failure in {0..10}; do
         [[ $(cat "$D/count") -eq $failure ]] || { print -u2 "golden did not stop at failed producer $failure"; exit 1; }
     fi
 done
-print 'golden producer status: all ten failure cases rejected'
+print 'golden producer status: all eleven failure cases rejected'

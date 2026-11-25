@@ -1164,10 +1164,14 @@ fn scheduler(
                     continue;
                 }
                 let spans: Vec<Span> = live_sp.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
+                let want_logits: Vec<bool> = live_sp
+                    .iter()
+                    .map(|&(i, p0, t)| p0 + t == lanes[i].job.as_ref().unwrap().pf_end)
+                    .collect();
                 let many = spans.len() > 1;
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
-                eng.encode_spans(&cb, &spans, true, false);
+                eng.encode_spans_logits(&cb, &spans, &want_logits, false);
                 if many {
                     let gumbels: Vec<crate::engine::GumbelSpan<'_>> = live_sp
                         .iter()
@@ -1245,7 +1249,7 @@ fn scheduler(
                             eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                            a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                            a.sampler.sample_next_with_ban_and_softcap(&lg, a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
                         };
                         match sampled {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
@@ -1373,7 +1377,7 @@ fn scheduler(
                         let sampled = if a.sampler.uses_gpu_gumbel() {
                             eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
-                            a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                            a.sampler.sample_next_with_ban_and_softcap(&eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
                         };
                         match sampled {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
@@ -3445,6 +3449,7 @@ pub fn serve(o: ServeOpts) {
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
+    eng.reserve_loopcd_weak(o.lanes);
     eng.ensure_batch(eng.chunk);
     let (chip, mem) = crate::tuning::this_machine();
     let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
@@ -6035,7 +6040,7 @@ mod tests {
             let mut sampler = Sampler::new(0.0, 0, 1.0, eng.softcap, 1);
             let stop = [tk.eos, sp.end_sampling];
             let mut out = Vec::new();
-            let mut tok = sampler.sample_next_with_ban(eng.logits(), None).unwrap();
+            let mut tok = sampler.sample_next_with_ban(&eng.logits(), None).unwrap();
             out.push(tok);
             let mut n_past = toks.len();
             while out.len() < n_gen && !stop.contains(&tok) {
@@ -6045,7 +6050,7 @@ mod tests {
                 cb.commit();
                 cb.waitUntilCompleted();
                 n_past += 1;
-                tok = sampler.sample_next_with_ban(eng.span_logits(0), None).unwrap();
+                tok = sampler.sample_next_with_ban(&eng.span_logits(0), None).unwrap();
                 out.push(tok);
             }
             out

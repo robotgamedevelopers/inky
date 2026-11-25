@@ -19,7 +19,7 @@ if [[ "${INKY_SERVE_PROBES_ONLY:-}" == 1 ]]; then
     print -r -- "serve_header_policy: runs in the unit job (cargo test --bins), not here"
 else
     out=$(cargo test --locked --offline serve_header_policy) || { print -ru2 -- "$out"; exit 1; }
-    [[ "$out" == *'1 passed; 0 failed;'* ]] || { print -ru2 -- "$out"; exit 1; }
+    grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$out" || { print -ru2 -- "$out"; exit 1; }
 fi
 cd tests
 exec go run ./servecheck "$bin_abs" "$model_abs"
