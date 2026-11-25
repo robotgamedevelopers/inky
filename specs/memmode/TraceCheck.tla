@@ -3,9 +3,9 @@ EXTENDS MemMode, TraceData, TraceProtocol, Sequences
 VARIABLES trace, pos
 TraceState == Traces[trace][pos]
 Matches == /\ limit = TraceState.limit /\ saved = TraceState.saved
-           /\ disk = TraceState.disk /\ conns = TraceState.conns
-           /\ alive = TraceState.alive /\ owed = TraceState.owed
-           /\ owner = TraceState.owner
+           /\ disk = TraceState.disk /\ diskStale = TraceState.diskStale
+           /\ conns = TraceState.conns /\ alive = TraceState.alive
+           /\ owed = TraceState.owed /\ owner = TraceState.owner
 \* Lift the concrete call log into the model's rollback observation, rather
 \* than inferring an attempt from Mode.saved or choosing a model branch.
 ObservedRollback(p,s) ==
@@ -27,6 +27,7 @@ ReplayNext == /\ UNCHANGED trace
               /\ limit' = Traces[trace][pos'].limit
               /\ saved' = Traces[trace][pos'].saved
               /\ disk' = Traces[trace][pos'].disk
+              /\ diskStale' = Traces[trace][pos'].diskStale
               /\ conns' = Traces[trace][pos'].conns
               /\ alive' = Traces[trace][pos'].alive
               /\ owed' = Traces[trace][pos'].owed

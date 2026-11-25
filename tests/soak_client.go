@@ -43,6 +43,18 @@ var promptKinds = []struct {
 
 var maxTokensChoices = []int{16, 64, 256}
 
+type soakClock interface {
+	Now() time.Time
+	Sleep(d time.Duration)
+}
+
+type realSoakClock struct{}
+
+func (realSoakClock) Now() time.Time        { return time.Now() }
+func (realSoakClock) Sleep(d time.Duration) { time.Sleep(d) }
+
+type dialFunc func(network, addr string, timeout time.Duration) (net.Conn, error)
+
 func prompt(kind, n int) string {
 	unit := "The soak client asks for a brief note about the ocean. "
 	var b strings.Builder
@@ -420,12 +432,15 @@ func measureDirBytes(dir string) (int64, int, error) {
 	}
 	var total int64
 	var count int
-	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
 				return nil
 			}
 			return walkErr
+		}
+		if path == dir && !d.IsDir() {
+			return fmt.Errorf("%s is not a directory", dir)
 		}
 		if d.IsDir() {
 			return nil
@@ -499,71 +514,124 @@ type clientConfig struct {
 	stormRequests         int
 	expectRecordWriteErrs bool
 	referenceFile         string
+	clock                 soakClock
+	dial                  dialFunc
+	stdout                io.Writer
+	stderr                io.Writer
+}
+
+func (c clientConfig) clk() soakClock {
+	if c.clock != nil {
+		return c.clock
+	}
+	return realSoakClock{}
+}
+
+func (c clientConfig) dialConn(network, addr string, timeout time.Duration) (net.Conn, error) {
+	if c.dial != nil {
+		return c.dial(network, addr, timeout)
+	}
+	return net.DialTimeout(network, addr, timeout)
+}
+
+func (c clientConfig) outWriter() io.Writer {
+	if c.stdout != nil {
+		return c.stdout
+	}
+	return os.Stdout
+}
+
+func (c clientConfig) errWriter() io.Writer {
+	if c.stderr != nil {
+		return c.stderr
+	}
+	return os.Stderr
+}
+
+func formatTokens(tokens []int) string {
+	if len(tokens) == 0 {
+		tokens = maxTokensChoices
+	}
+	values := make([]string, len(tokens))
+	for i, v := range tokens {
+		values[i] = strconv.Itoa(v)
+	}
+	return strings.Join(values, ",")
 }
 
 func main() {
-	urlFlag := flag.String("url", "http://127.0.0.1:18090/v1/chat/completions", "chat completions URL")
-	durationFlag := flag.String("duration", "3600", "run duration (seconds or Go duration like 60s, 72h)")
-	epochFlag := flag.String("epoch", "0", "longitudinal sampling epoch duration (0 = auto)")
-	minEpochs := flag.Int("min-epochs", 0, "optional minimum number of epochs to complete")
-	warmupEpochs := flag.Int("warmup-epochs", 1, "warmup epochs before steady-state drift analysis")
-	maxTokensFlag := flag.String("max-tokens", "", "optional comma-separated max_tokens choices (default 16,64,256)")
-	clients := flag.Int("clients", 24, "concurrent clients")
-	lanes := flag.Int("lanes", 16, "server lane count, recorded in the summary")
-	queue := flag.Int("queue", 64, "server queue depth, recorded in the summary")
-	seed := flag.Uint64("seed", 1, "RNG seed")
-	disconnect := flag.Int("disconnect-pct", 30, "percent of requests closed mid-response")
-	serverPID := flag.Int("server-pid", 0, "optional server PID for RSS drift sampling")
-	recordDir := flag.String("record-dir", "", "optional server --record-dir to verify bounded disk usage")
-	recordMaxTotalBytes := flag.Int64("record-max-total-bytes", 0, "optional max total bytes allowed in record-dir")
-	spillDir := flag.String("spill-dir", "", "optional spill directory to verify bounded disk usage")
-	spillMaxTotalBytes := flag.Int64("spill-max-total-bytes", 0, "optional max total bytes allowed in spill-dir")
-	maxRSSDriftPct := flag.Float64("max-rss-drift-pct", 15.0, "allowed steady-state RSS drift percentage")
-	maxRSSDriftBytes := flag.Int64("max-rss-drift-bytes", 64*1024*1024, "minimum allowed steady-state RSS drift bytes")
-	mode := flag.String("mode", "soak", "mode: soak | disconnect-storm | fault-check | reference-check")
-	stormRequests := flag.Int("storm-requests", 72, "total overlapping requests in disconnect-storm mode")
-	expectRecordWriteErrs := flag.Bool("expect-record-write-errors", false, "require /health record_write_errors > 0 in fault-check mode")
-	referenceFile := flag.String("reference-file", "", "path to save/compare seeded solo reference in reference-check mode")
-	selfCheck := flag.Bool("self-check", false, "check prompt lengths and exit")
-	flag.Parse()
+	os.Exit(runCLI(os.Args[1:], os.Getenv, nil, clientConfig{}))
+}
+
+func runCLI(args []string, getenv func(string) string, httpClient *http.Client, base clientConfig) int {
+	out := base.outWriter()
+	errOut := base.errWriter()
+	fs := flag.NewFlagSet("soak", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	urlFlag := fs.String("url", "http://127.0.0.1:18090/v1/chat/completions", "chat completions URL")
+	durationFlag := fs.String("duration", "3600", "run duration (seconds or Go duration like 60s, 72h)")
+	epochFlag := fs.String("epoch", "0", "longitudinal sampling epoch duration (0 = auto)")
+	minEpochs := fs.Int("min-epochs", 0, "optional minimum number of epochs to complete")
+	warmupEpochs := fs.Int("warmup-epochs", 1, "warmup epochs before steady-state drift analysis")
+	maxTokensFlag := fs.String("max-tokens", "", "optional comma-separated max_tokens choices (default 16,64,256)")
+	clients := fs.Int("clients", 24, "concurrent clients")
+	lanes := fs.Int("lanes", 16, "server lane count, recorded in the summary")
+	queue := fs.Int("queue", 64, "server queue depth, recorded in the summary")
+	seed := fs.Uint64("seed", 1, "RNG seed")
+	disconnect := fs.Int("disconnect-pct", 30, "percent of requests closed mid-response")
+	serverPID := fs.Int("server-pid", 0, "optional server PID for RSS drift sampling")
+	recordDir := fs.String("record-dir", "", "optional server --record-dir to verify bounded disk usage")
+	recordMaxTotalBytes := fs.Int64("record-max-total-bytes", 0, "optional max total bytes allowed in record-dir")
+	spillDir := fs.String("spill-dir", "", "optional spill directory to verify bounded disk usage")
+	spillMaxTotalBytes := fs.Int64("spill-max-total-bytes", 0, "optional max total bytes allowed in spill-dir")
+	maxRSSDriftPct := fs.Float64("max-rss-drift-pct", 15.0, "allowed steady-state RSS drift percentage")
+	maxRSSDriftBytes := fs.Int64("max-rss-drift-bytes", 64*1024*1024, "minimum allowed steady-state RSS drift bytes")
+	mode := fs.String("mode", "soak", "mode: soak | disconnect-storm | fault-check | reference-check")
+	stormRequests := fs.Int("storm-requests", 72, "total overlapping requests in disconnect-storm mode")
+	expectRecordWriteErrs := fs.Bool("expect-record-write-errors", false, "require /health record_write_errors > 0 in fault-check mode")
+	referenceFile := fs.String("reference-file", "", "path to save/compare seeded solo reference in reference-check mode")
+	selfCheck := fs.Bool("self-check", false, "check prompt lengths and exit")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	if *selfCheck {
 		for i, k := range promptKinds {
 			p := prompt(i, k.n)
 			if len(p) != k.n {
-				fmt.Fprintf(os.Stderr, "prompt %s length %d want %d\n", k.name, len(p), k.n)
-				os.Exit(1)
+				fmt.Fprintf(errOut, "prompt %s length %d want %d\n", k.name, len(p), k.n)
+				return 1
 			}
 			q := withID(p, 42)
 			if len(q) != k.n {
-				fmt.Fprintf(os.Stderr, "prompt %s id length %d want %d\n", k.name, len(q), k.n)
-				os.Exit(1)
+				fmt.Fprintf(errOut, "prompt %s id length %d want %d\n", k.name, len(q), k.n)
+				return 1
 			}
 		}
-		fmt.Printf("prompt_short_bytes=%d\n", lenShort)
-		fmt.Printf("prompt_medium_bytes=%d\n", lenMedium)
-		fmt.Printf("prompt_long_bytes=%d\n", lenLong)
-		fmt.Printf("max_tokens=%d,%d,%d\n", maxTokensChoices[0], maxTokensChoices[1], maxTokensChoices[2])
-		fmt.Println("self_check=ok")
-		return
+		fmt.Fprintf(out, "prompt_short_bytes=%d\n", lenShort)
+		fmt.Fprintf(out, "prompt_medium_bytes=%d\n", lenMedium)
+		fmt.Fprintf(out, "prompt_long_bytes=%d\n", lenLong)
+		fmt.Fprintf(out, "max_tokens=%d,%d,%d\n", maxTokensChoices[0], maxTokensChoices[1], maxTokensChoices[2])
+		fmt.Fprintln(out, "self_check=ok")
+		return 0
 	}
 
 	dur, err := parseFlexibleDuration(*durationFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "bad -duration: %v\n", err)
-		os.Exit(2)
+		fmt.Fprintf(errOut, "bad -duration: %v\n", err)
+		return 2
 	}
 	var epDur time.Duration
 	if strings.TrimSpace(*epochFlag) != "" && strings.TrimSpace(*epochFlag) != "0" && strings.TrimSpace(*epochFlag) != "0s" {
 		epDur, err = parseFlexibleDuration(*epochFlag)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "bad -epoch: %v\n", err)
-			os.Exit(2)
+			fmt.Fprintf(errOut, "bad -epoch: %v\n", err)
+			return 2
 		}
 	}
 	if *clients < 1 || *lanes < 1 || *queue < 0 || *disconnect < 0 || *disconnect > 100 || *stormRequests < 1 || *minEpochs < 0 {
-		fmt.Fprintln(os.Stderr, "clients, lanes, queue, storm-requests, min-epochs, or disconnect-pct is out of range")
-		os.Exit(2)
+		fmt.Fprintln(errOut, "clients, lanes, queue, storm-requests, min-epochs, or disconnect-pct is out of range")
+		return 2
 	}
 	parsedMaxTokens := maxTokensChoices
 	if strings.TrimSpace(*maxTokensFlag) != "" {
@@ -571,16 +639,16 @@ func main() {
 		for _, part := range strings.Split(*maxTokensFlag, ",") {
 			v, convErr := strconv.Atoi(strings.TrimSpace(part))
 			if convErr != nil || v < 1 {
-				fmt.Fprintf(os.Stderr, "bad -max-tokens: %s\n", *maxTokensFlag)
-				os.Exit(2)
+				fmt.Fprintf(errOut, "bad -max-tokens: %s\n", *maxTokensFlag)
+				return 2
 			}
 			parsedMaxTokens = append(parsedMaxTokens, v)
 		}
 	}
-	key := os.Getenv("INKY_SERVE_KEY")
+	key := getenv("INKY_SERVE_KEY")
 	if key == "" {
-		fmt.Fprintln(os.Stderr, "INKY_SERVE_KEY is not set")
-		os.Exit(2)
+		fmt.Fprintln(errOut, "INKY_SERVE_KEY is not set")
+		return 2
 	}
 
 	cfg := clientConfig{
@@ -607,27 +675,40 @@ func main() {
 		stormRequests:         *stormRequests,
 		expectRecordWriteErrs: *expectRecordWriteErrs,
 		referenceFile:         *referenceFile,
+		clock:                 base.clock,
+		dial:                  base.dial,
+		stdout:                out,
+		stderr:                errOut,
 	}
 
-	httpClient := newSoakHTTPClient()
+	if httpClient == nil {
+		httpClient = newSoakHTTPClient()
+	}
+	rssFn := sampleProcessRSS
+	if cfg.clock != nil && cfg.serverPID == 0 {
+		rssFn = func(int) (int64, error) { return 0, nil }
+	}
 	switch cfg.mode {
 	case "soak":
-		os.Exit(runSoak(httpClient, cfg, sampleProcessRSS))
+		return runSoak(httpClient, cfg, rssFn)
 	case "disconnect-storm":
-		os.Exit(runDisconnectStorm(httpClient, cfg))
+		return runDisconnectStorm(httpClient, cfg)
 	case "fault-check":
-		os.Exit(runFaultCheck(httpClient, cfg))
+		return runFaultCheck(httpClient, cfg)
 	case "reference-check":
-		os.Exit(runReferenceCheck(httpClient, cfg))
+		return runReferenceCheck(httpClient, cfg)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown -mode: %s\n", cfg.mode)
-		os.Exit(2)
+		fmt.Fprintf(errOut, "unknown -mode: %s\n", cfg.mode)
+		return 2
 	}
 }
 
 func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (int64, error)) int {
+	clk := cfg.clk()
+	out := cfg.outWriter()
+	errOut := cfg.errWriter()
 	var tot totals
-	startTime := time.Now()
+	startTime := clk.Now()
 	totalDeadline := startTime.Add(cfg.duration)
 	epochDur := chooseEpochDuration(cfg.duration, cfg.epoch)
 	hURL := healthURL(cfg.chatURL)
@@ -635,49 +716,51 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	var samples []epochSample
 	epochIdx := 0
 
-	for epochIdx == 0 || time.Now().Before(totalDeadline) || epochIdx < cfg.minEpochs {
-		epochDeadline := time.Now().Add(epochDur)
+	for epochIdx == 0 || clk.Now().Before(totalDeadline) || epochIdx < cfg.minEpochs {
+		epochDeadline := clk.Now().Add(epochDur)
 		if epochIdx >= cfg.minEpochs && epochDeadline.After(totalDeadline) {
 			epochDeadline = totalDeadline
 		}
 
 		ctxEpoch, cancelEpoch := context.WithCancel(context.Background())
 		var wg sync.WaitGroup
-		go func(idx int) {
-			tick := time.NewTicker(30 * time.Second)
-			defer tick.Stop()
-			for {
-				select {
-				case <-ctxEpoch.Done():
-					return
-				case <-tick.C:
-					fmt.Fprintf(os.Stderr, "soak tick epoch=%d requests=%d inflight=%d 5xx=%d disconnected=%d\n",
-						idx, tot.requests.Load(), tot.inflight.Load(), tot.http5xx.Load(), tot.disconnected.Load())
+		if cfg.clock == nil {
+			go func(idx int) {
+				tick := time.NewTicker(30 * time.Second)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctxEpoch.Done():
+						return
+					case <-tick.C:
+						fmt.Fprintf(errOut, "soak tick epoch=%d requests=%d inflight=%d 5xx=%d disconnected=%d\n",
+							idx, tot.requests.Load(), tot.inflight.Load(), tot.http5xx.Load(), tot.disconnected.Load())
+					}
 				}
-			}
-		}(epochIdx)
+			}(epochIdx)
+		}
 
 		for w := 0; w < cfg.clients; w++ {
 			wg.Add(1)
 			go func(w int, ep int) {
 				defer wg.Done()
 				rng := rand.New(rand.NewPCG(cfg.seed^uint64(ep*7919), uint64(w)+1))
-				for time.Now().Before(epochDeadline) && ctxEpoch.Err() == nil {
-					oneRequest(&tot, httpClient, cfg.key, cfg.chatURL, cfg.disconnectPct, cfg.seed, "", cfg.maxTokensChoices, rng)
+				for clk.Now().Before(epochDeadline) && ctxEpoch.Err() == nil {
+					oneRequest(&tot, httpClient, cfg.key, cfg.chatURL, cfg.disconnectPct, cfg.seed, "", cfg.maxTokensChoices, clk, rng)
 				}
 			}(w, epochIdx)
 		}
 		wg.Wait()
 		cancelEpoch()
 
-		snap, healthOK := waitHealthDrain(httpClient, hURL, 10*time.Second)
+		snap, healthOK := waitHealthDrainWithClock(httpClient, hURL, 10*time.Second, clk)
 		rssBytes, _ := rssSampler(cfg.serverPID)
 		recBytes, recFiles, _ := measureDirBytes(cfg.recordDir)
 		spillBytes, _, _ := measureDirBytes(cfg.spillDir)
 
 		s := epochSample{
 			Epoch:          epochIdx,
-			ElapsedS:       time.Since(startTime).Seconds(),
+			ElapsedS:       clk.Now().Sub(startTime).Seconds(),
 			HealthOK:       healthOK,
 			Health:         snap,
 			ServerRSSBytes: rssBytes,
@@ -688,7 +771,7 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 			Completed:      tot.completed.Load(),
 		}
 		samples = append(samples, s)
-		fmt.Fprintf(os.Stderr, "soak epoch=%d elapsed=%.1fs active_lanes=%d inflight=%d queued=%d rss_bytes=%d record_bytes=%d record_files=%d\n",
+		fmt.Fprintf(errOut, "soak epoch=%d elapsed=%.1fs active_lanes=%d inflight=%d queued=%d rss_bytes=%d record_bytes=%d record_files=%d\n",
 			s.Epoch, s.ElapsedS, ptrIntVal(s.Health.ActiveLanes), ptrIntVal(s.Health.Inflight), ptrIntVal(s.Health.QueuedRequests),
 			s.ServerRSSBytes, s.RecordDirBytes, s.RecordDirFiles)
 		epochIdx++
@@ -699,7 +782,7 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	if inflightEnd == 0 {
 		probeOK = runRecoveryProbes(httpClient, cfg.key, cfg.chatURL, cfg.lanes, cfg.seed)
 	}
-	finalSnap, serverHealthOK := waitHealthDrain(httpClient, hURL, 5*time.Second)
+	finalSnap, serverHealthOK := waitHealthDrainWithClock(httpClient, hURL, 5*time.Second, clk)
 	serverActiveLanes := ptrIntVal(finalSnap.ActiveLanes)
 	serverInflight := ptrIntVal(finalSnap.Inflight)
 	serverQueued := 0
@@ -715,50 +798,50 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 		SpillMaxTotalBytes:  cfg.spillMaxTotalBytes,
 	})
 
-	fmt.Printf("seed=%d\n", cfg.seed)
-	fmt.Printf("duration_s=%d\n", int(cfg.duration.Seconds()))
-	fmt.Printf("clients=%d\n", cfg.clients)
-	fmt.Printf("lanes=%d\n", cfg.lanes)
-	fmt.Printf("queue=%d\n", cfg.queue)
-	fmt.Printf("disconnect_pct=%d\n", cfg.disconnectPct)
-	fmt.Printf("prompt_short_bytes=%d\n", lenShort)
-	fmt.Printf("prompt_medium_bytes=%d\n", lenMedium)
-	fmt.Printf("prompt_long_bytes=%d\n", lenLong)
-	fmt.Printf("max_tokens=%d,%d,%d\n", maxTokensChoices[0], maxTokensChoices[1], maxTokensChoices[2])
-	fmt.Printf("requests=%d\n", tot.requests.Load())
-	fmt.Printf("http_200=%d\n", tot.http200.Load())
-	fmt.Printf("http_4xx=%d\n", tot.http4xx.Load())
-	fmt.Printf("http_401=%d\n", tot.http401.Load())
-	fmt.Printf("http_429=%d\n", tot.http429.Load())
-	fmt.Printf("http_5xx=%d\n", tot.http5xx.Load())
-	fmt.Printf("disconnected=%d\n", tot.disconnected.Load())
-	fmt.Printf("transport_errors=%d\n", tot.transport.Load())
-	fmt.Printf("timeouts=%d\n", tot.timeouts.Load())
-	fmt.Printf("inflight_end=%d\n", inflightEnd)
-	fmt.Printf("inflight_max=%d\n", tot.inflightMax.Load())
-	fmt.Printf("server_active_lanes_end=%d\n", serverActiveLanes)
-	fmt.Printf("server_inflight_end=%d\n", serverInflight)
-	fmt.Printf("server_queued_end=%d\n", serverQueued)
-	fmt.Printf("server_health_ok=%d\n", boolInt(serverHealthOK))
-	fmt.Printf("workload_completed=%d\n", tot.completed.Load())
-	fmt.Printf("unexpected_status=%d\n", tot.unexpected.Load())
-	fmt.Printf("stream_errors=%d\n", tot.streamErrors.Load())
-	fmt.Printf("recovery_completed=%d\n", probeOK)
-	fmt.Printf("recovery_requested=%d\n", cfg.lanes)
-	fmt.Printf("epochs_total=%d\n", drift.EpochsTotal)
-	fmt.Printf("epochs_steady=%d\n", drift.EpochsSteady)
-	fmt.Printf("rss_warmup_bytes=%d\n", drift.RSSWarmupBytes)
-	fmt.Printf("rss_steady_first_bytes=%d\n", drift.RSSSteadyFirstBytes)
-	fmt.Printf("rss_steady_last_bytes=%d\n", drift.RSSSteadyLastBytes)
-	fmt.Printf("rss_steady_max_bytes=%d\n", drift.RSSSteadyMaxBytes)
-	fmt.Printf("rss_drift_bytes=%d\n", drift.RSSDriftBytes)
-	fmt.Printf("record_dir_bytes_max=%d\n", drift.RecordDirBytesMax)
-	fmt.Printf("spill_dir_bytes_max=%d\n", drift.SpillDirBytesMax)
-	fmt.Printf("drift_ok=%d\n", boolInt(drift.OK))
+	fmt.Fprintf(out, "seed=%d\n", cfg.seed)
+	fmt.Fprintf(out, "duration_s=%d\n", int(cfg.duration.Seconds()))
+	fmt.Fprintf(out, "clients=%d\n", cfg.clients)
+	fmt.Fprintf(out, "lanes=%d\n", cfg.lanes)
+	fmt.Fprintf(out, "queue=%d\n", cfg.queue)
+	fmt.Fprintf(out, "disconnect_pct=%d\n", cfg.disconnectPct)
+	fmt.Fprintf(out, "prompt_short_bytes=%d\n", lenShort)
+	fmt.Fprintf(out, "prompt_medium_bytes=%d\n", lenMedium)
+	fmt.Fprintf(out, "prompt_long_bytes=%d\n", lenLong)
+	fmt.Fprintf(out, "max_tokens=%s\n", formatTokens(cfg.maxTokensChoices))
+	fmt.Fprintf(out, "requests=%d\n", tot.requests.Load())
+	fmt.Fprintf(out, "http_200=%d\n", tot.http200.Load())
+	fmt.Fprintf(out, "http_4xx=%d\n", tot.http4xx.Load())
+	fmt.Fprintf(out, "http_401=%d\n", tot.http401.Load())
+	fmt.Fprintf(out, "http_429=%d\n", tot.http429.Load())
+	fmt.Fprintf(out, "http_5xx=%d\n", tot.http5xx.Load())
+	fmt.Fprintf(out, "disconnected=%d\n", tot.disconnected.Load())
+	fmt.Fprintf(out, "transport_errors=%d\n", tot.transport.Load())
+	fmt.Fprintf(out, "timeouts=%d\n", tot.timeouts.Load())
+	fmt.Fprintf(out, "inflight_end=%d\n", inflightEnd)
+	fmt.Fprintf(out, "inflight_max=%d\n", tot.inflightMax.Load())
+	fmt.Fprintf(out, "server_active_lanes_end=%d\n", serverActiveLanes)
+	fmt.Fprintf(out, "server_inflight_end=%d\n", serverInflight)
+	fmt.Fprintf(out, "server_queued_end=%d\n", serverQueued)
+	fmt.Fprintf(out, "server_health_ok=%d\n", boolInt(serverHealthOK))
+	fmt.Fprintf(out, "workload_completed=%d\n", tot.completed.Load())
+	fmt.Fprintf(out, "unexpected_status=%d\n", tot.unexpected.Load())
+	fmt.Fprintf(out, "stream_errors=%d\n", tot.streamErrors.Load())
+	fmt.Fprintf(out, "recovery_completed=%d\n", probeOK)
+	fmt.Fprintf(out, "recovery_requested=%d\n", cfg.lanes)
+	fmt.Fprintf(out, "epochs_total=%d\n", drift.EpochsTotal)
+	fmt.Fprintf(out, "epochs_steady=%d\n", drift.EpochsSteady)
+	fmt.Fprintf(out, "rss_warmup_bytes=%d\n", drift.RSSWarmupBytes)
+	fmt.Fprintf(out, "rss_steady_first_bytes=%d\n", drift.RSSSteadyFirstBytes)
+	fmt.Fprintf(out, "rss_steady_last_bytes=%d\n", drift.RSSSteadyLastBytes)
+	fmt.Fprintf(out, "rss_steady_max_bytes=%d\n", drift.RSSSteadyMaxBytes)
+	fmt.Fprintf(out, "rss_drift_bytes=%d\n", drift.RSSDriftBytes)
+	fmt.Fprintf(out, "record_dir_bytes_max=%d\n", drift.RecordDirBytesMax)
+	fmt.Fprintf(out, "spill_dir_bytes_max=%d\n", drift.SpillDirBytesMax)
+	fmt.Fprintf(out, "drift_ok=%d\n", boolInt(drift.OK))
 	if !drift.OK {
-		fmt.Printf("drift_reason=%s\n", drift.Reason)
+		fmt.Fprintf(out, "drift_reason=%s\n", drift.Reason)
 	}
-	fmt.Println("inflight_source=server_health_and_client_outstanding")
+	fmt.Fprintln(out, "inflight_source=server_health_and_client_outstanding")
 
 	if inflightEnd != 0 || !serverHealthOK || serverActiveLanes != 0 || serverInflight != 0 || serverQueued != 0 ||
 		tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 ||
@@ -852,13 +935,16 @@ func runSeededSoloReference(httpClient *http.Client, key, chatURL string, seed u
 }
 
 func runReferenceCheck(httpClient *http.Client, cfg clientConfig) int {
+	clk := cfg.clk()
+	out := cfg.outWriter()
+	errOut := cfg.errWriter()
 	refSeed := cfg.seed ^ 0x9001
 	var baseline *seededReply
 	if cfg.referenceFile != "" {
 		if data, err := os.ReadFile(cfg.referenceFile); err == nil {
 			var r seededReply
 			if err := json.Unmarshal(data, &r); err != nil {
-				fmt.Fprintf(os.Stderr, "invalid reference file %s: %v\n", cfg.referenceFile, err)
+				fmt.Fprintf(errOut, "invalid reference file %s: %v\n", cfg.referenceFile, err)
 				return 1
 			}
 			baseline = &r
@@ -867,23 +953,23 @@ func runReferenceCheck(httpClient *http.Client, cfg clientConfig) int {
 
 	got, err := runSeededSoloReference(httpClient, cfg.key, cfg.chatURL, refSeed)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "seeded solo reference failed: %v\n", err)
+		fmt.Fprintf(errOut, "seeded solo reference failed: %v\n", err)
 		return 1
 	}
 	if baseline == nil {
 		if cfg.referenceFile != "" {
 			data, _ := json.Marshal(got)
 			if err := os.WriteFile(cfg.referenceFile, data, 0o600); err != nil {
-				fmt.Fprintf(os.Stderr, "write reference file: %v\n", err)
+				fmt.Fprintf(errOut, "write reference file: %v\n", err)
 				return 1
 			}
 		}
-		fmt.Printf("reference_saved=1 finish_reason=%s completion_tokens=%d\n", got.FinishReason, got.CompletionTokens)
+		fmt.Fprintf(out, "reference_saved=1 finish_reason=%s completion_tokens=%d\n", got.FinishReason, got.CompletionTokens)
 		return 0
 	}
 
 	if got != *baseline {
-		fmt.Fprintf(os.Stderr, "seeded reference mismatch: got=%+v want=%+v\n", got, *baseline)
+		fmt.Fprintf(errOut, "seeded reference mismatch: got=%+v want=%+v\n", got, *baseline)
 		return 1
 	}
 	// Also verify multi-lane concurrent execution matches exact seeded output.
@@ -900,12 +986,12 @@ func runReferenceCheck(httpClient *http.Client, cfg clientConfig) int {
 		}()
 	}
 	wg.Wait()
-	snap, healthOK := waitHealthDrain(httpClient, healthURL(cfg.chatURL), 5*time.Second)
+	snap, healthOK := waitHealthDrainWithClock(httpClient, healthURL(cfg.chatURL), 5*time.Second, clk)
 	if mismatch.Load() != 0 || !healthOK || !snap.isDrained() {
-		fmt.Fprintf(os.Stderr, "post-check mismatch=%d health_ok=%v drained=%v\n", mismatch.Load(), healthOK, snap.isDrained())
+		fmt.Fprintf(errOut, "post-check mismatch=%d health_ok=%v drained=%v\n", mismatch.Load(), healthOK, snap.isDrained())
 		return 1
 	}
-	fmt.Printf("reference_match=1 lanes_verified=%d finish_reason=%s completion_tokens=%d\n",
+	fmt.Fprintf(out, "reference_match=1 lanes_verified=%d finish_reason=%s completion_tokens=%d\n",
 		cfg.lanes, got.FinishReason, got.CompletionTokens)
 	return 0
 }
@@ -939,10 +1025,13 @@ func (s disconnectStage) String() string {
 }
 
 func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
+	clk := cfg.clk()
+	out := cfg.outWriter()
+	errOut := cfg.errWriter()
 	refSeed := cfg.seed ^ 0x9001
 	baseline, err := runSeededSoloReference(httpClient, cfg.key, cfg.chatURL, refSeed)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pre-storm solo reference failed: %v\n", err)
+		fmt.Fprintf(errOut, "pre-storm solo reference failed: %v\n", err)
 		return 1
 	}
 
@@ -970,14 +1059,14 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 					stage = stageComplete
 				}
 				stageCounts[stage].Add(1)
-				runStormOne(&tot, httpClient, cfg.key, cfg.chatURL, stage, cfg.seed^uint64(idx), rng)
+				runStormOne(&tot, httpClient, cfg, stage, cfg.seed^uint64(idx), rng)
 			}
 		}(w)
 	}
 	wg.Wait()
 
 	hURL := healthURL(cfg.chatURL)
-	snap, healthOK := waitHealthDrain(httpClient, hURL, 20*time.Second)
+	snap, healthOK := waitHealthDrainWithClock(httpClient, hURL, 20*time.Second, clk)
 	drained := healthOK && snap.isDrained()
 
 	postRef, err := runSeededSoloReference(httpClient, cfg.key, cfg.chatURL, refSeed)
@@ -988,26 +1077,26 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 		probeOK = runRecoveryProbes(httpClient, cfg.key, cfg.chatURL, cfg.lanes, cfg.seed)
 	}
 
-	fmt.Printf("storm_requests=%d\n", tot.requests.Load())
-	fmt.Printf("storm_stage_0ms=%d\n", stageCounts[stageZeroMs].Load())
-	fmt.Printf("storm_stage_header_done=%d\n", stageCounts[stageHeaderDone].Load())
-	fmt.Printf("storm_stage_ttft=%d\n", stageCounts[stageTTFT].Load())
-	fmt.Printf("storm_stage_mid_thinking=%d\n", stageCounts[stageMidThinking].Load())
-	fmt.Printf("storm_stage_mid_decode=%d\n", stageCounts[stageMidDecode].Load())
-	fmt.Printf("storm_stage_complete=%d\n", stageCounts[stageComplete].Load())
-	fmt.Printf("storm_http_200=%d\n", tot.http200.Load())
-	fmt.Printf("storm_http_429=%d\n", tot.http429.Load())
-	fmt.Printf("storm_http_5xx=%d\n", tot.http5xx.Load())
-	fmt.Printf("storm_disconnected=%d\n", tot.disconnected.Load())
-	fmt.Printf("storm_completed=%d\n", tot.completed.Load())
-	fmt.Printf("storm_stream_errors=%d\n", tot.streamErrors.Load())
-	fmt.Printf("drain_ok=%d\n", boolInt(drained))
-	fmt.Printf("server_active_lanes_end=%d\n", ptrIntVal(snap.ActiveLanes))
-	fmt.Printf("server_inflight_end=%d\n", ptrIntVal(snap.Inflight))
-	fmt.Printf("server_queued_end=%d\n", ptrIntVal(snap.QueuedRequests))
-	fmt.Printf("ref_match=%d\n", boolInt(refMatch))
-	fmt.Printf("recovery_completed=%d\n", probeOK)
-	fmt.Printf("recovery_requested=%d\n", cfg.lanes)
+	fmt.Fprintf(out, "storm_requests=%d\n", tot.requests.Load())
+	fmt.Fprintf(out, "storm_stage_0ms=%d\n", stageCounts[stageZeroMs].Load())
+	fmt.Fprintf(out, "storm_stage_header_done=%d\n", stageCounts[stageHeaderDone].Load())
+	fmt.Fprintf(out, "storm_stage_ttft=%d\n", stageCounts[stageTTFT].Load())
+	fmt.Fprintf(out, "storm_stage_mid_thinking=%d\n", stageCounts[stageMidThinking].Load())
+	fmt.Fprintf(out, "storm_stage_mid_decode=%d\n", stageCounts[stageMidDecode].Load())
+	fmt.Fprintf(out, "storm_stage_complete=%d\n", stageCounts[stageComplete].Load())
+	fmt.Fprintf(out, "storm_http_200=%d\n", tot.http200.Load())
+	fmt.Fprintf(out, "storm_http_429=%d\n", tot.http429.Load())
+	fmt.Fprintf(out, "storm_http_5xx=%d\n", tot.http5xx.Load())
+	fmt.Fprintf(out, "storm_disconnected=%d\n", tot.disconnected.Load())
+	fmt.Fprintf(out, "storm_completed=%d\n", tot.completed.Load())
+	fmt.Fprintf(out, "storm_stream_errors=%d\n", tot.streamErrors.Load())
+	fmt.Fprintf(out, "drain_ok=%d\n", boolInt(drained))
+	fmt.Fprintf(out, "server_active_lanes_end=%d\n", ptrIntVal(snap.ActiveLanes))
+	fmt.Fprintf(out, "server_inflight_end=%d\n", ptrIntVal(snap.Inflight))
+	fmt.Fprintf(out, "server_queued_end=%d\n", ptrIntVal(snap.QueuedRequests))
+	fmt.Fprintf(out, "ref_match=%d\n", boolInt(refMatch))
+	fmt.Fprintf(out, "recovery_completed=%d\n", probeOK)
+	fmt.Fprintf(out, "recovery_requested=%d\n", cfg.lanes)
 
 	if tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 ||
 		tot.streamErrors.Load() != 0 || tot.timeouts.Load() != 0 ||
@@ -1017,7 +1106,10 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	return 0
 }
 
-func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stage disconnectStage, reqSeed uint64, rng *rand.Rand) {
+func runStormOne(tot *totals, httpClient *http.Client, cfg clientConfig, stage disconnectStage, reqSeed uint64, rng *rand.Rand) {
+	clk := cfg.clk()
+	key := cfg.key
+	chatURL := cfg.chatURL
 	tot.enter()
 	defer tot.inflight.Add(-1)
 	id := uint64(tot.requests.Add(1))
@@ -1029,7 +1121,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 	}
 
 	if stage == stageZeroMs {
-		c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+		c, err := cfg.dialConn("tcp", u.Host, 5*time.Second)
 		if err != nil {
 			tot.transport.Add(1)
 			return
@@ -1044,7 +1136,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 
 	payload := buildStormPayload(stage, id, reqSeed, rng)
 	if stage == stageHeaderDone {
-		c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+		c, err := cfg.dialConn("tcp", u.Host, 5*time.Second)
 		if err != nil {
 			tot.transport.Add(1)
 			return
@@ -1057,7 +1149,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 			u.RequestURI(), u.Host, key, len(payload))
 		_, _ = c.Write([]byte(hdr))
 		_, _ = c.Write(payload[:partialLen])
-		time.Sleep(time.Duration(1+rng.IntN(5)) * time.Millisecond)
+		clk.Sleep(time.Duration(1+rng.IntN(5)) * time.Millisecond)
 		_ = c.Close()
 		tot.disconnected.Add(1)
 		return
@@ -1116,11 +1208,11 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 				break
 			}
 		}
-		time.Sleep(time.Duration(1+rng.IntN(25)) * time.Millisecond)
+		clk.Sleep(time.Duration(1+rng.IntN(25)) * time.Millisecond)
 	case stageMidDecode:
 		buf := make([]byte, 512)
 		_, _ = resp.Body.Read(buf)
-		time.Sleep(time.Duration(15+rng.IntN(160)) * time.Millisecond)
+		clk.Sleep(time.Duration(15+rng.IntN(160)) * time.Millisecond)
 	}
 	if c := box.conn(); c != nil {
 		_ = c.Close()
@@ -1181,22 +1273,25 @@ func buildStormPayload(stage disconnectStage, id, reqSeed uint64, rng *rand.Rand
 }
 
 func runFaultCheck(httpClient *http.Client, cfg clientConfig) int {
+	clk := cfg.clk()
+	out := cfg.outWriter()
+	errOut := cfg.errWriter()
 	var tot totals
-	deadline := time.Now().Add(cfg.duration)
+	deadline := clk.Now().Add(cfg.duration)
 	var wg sync.WaitGroup
 	for w := 0; w < cfg.clients; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewPCG(cfg.seed^0xfa11, uint64(w)+1))
-			for time.Now().Before(deadline) {
-				oneWithCard(&tot, httpClient, cfg.key, cfg.chatURL, cfg.seed, fmt.Sprintf("fault-card-%d", w), rng)
+			for clk.Now().Before(deadline) {
+				oneWithCard(&tot, httpClient, cfg.key, cfg.chatURL, cfg.seed, fmt.Sprintf("fault-card-%d", w), clk, rng)
 			}
 		}(w)
 	}
 	wg.Wait()
 
-	snap, healthOK := waitHealthDrain(httpClient, healthURL(cfg.chatURL), 10*time.Second)
+	snap, healthOK := waitHealthDrainWithClock(httpClient, healthURL(cfg.chatURL), 10*time.Second, clk)
 	drained := healthOK && snap.isDrained()
 	var writeErrs int64
 	if snap.RecordWriteErrors != nil {
@@ -1207,17 +1302,17 @@ func runFaultCheck(httpClient *http.Client, cfg clientConfig) int {
 		recWritten = *snap.RecordWritten
 	}
 
-	fmt.Printf("requests=%d\n", tot.requests.Load())
-	fmt.Printf("http_200=%d\n", tot.http200.Load())
-	fmt.Printf("http_429=%d\n", tot.http429.Load())
-	fmt.Printf("http_5xx=%d\n", tot.http5xx.Load())
-	fmt.Printf("workload_completed=%d\n", tot.completed.Load())
-	fmt.Printf("stream_errors=%d\n", tot.streamErrors.Load())
-	fmt.Printf("transport_errors=%d\n", tot.transport.Load())
-	fmt.Printf("timeouts=%d\n", tot.timeouts.Load())
-	fmt.Printf("drain_ok=%d\n", boolInt(drained))
-	fmt.Printf("record_written=%d\n", recWritten)
-	fmt.Printf("record_write_errors=%d\n", writeErrs)
+	fmt.Fprintf(out, "requests=%d\n", tot.requests.Load())
+	fmt.Fprintf(out, "http_200=%d\n", tot.http200.Load())
+	fmt.Fprintf(out, "http_429=%d\n", tot.http429.Load())
+	fmt.Fprintf(out, "http_5xx=%d\n", tot.http5xx.Load())
+	fmt.Fprintf(out, "workload_completed=%d\n", tot.completed.Load())
+	fmt.Fprintf(out, "stream_errors=%d\n", tot.streamErrors.Load())
+	fmt.Fprintf(out, "transport_errors=%d\n", tot.transport.Load())
+	fmt.Fprintf(out, "timeouts=%d\n", tot.timeouts.Load())
+	fmt.Fprintf(out, "drain_ok=%d\n", boolInt(drained))
+	fmt.Fprintf(out, "record_written=%d\n", recWritten)
+	fmt.Fprintf(out, "record_write_errors=%d\n", writeErrs)
 
 	if tot.inflight.Load() != 0 || !drained || tot.http5xx.Load() != 0 || tot.http401.Load() != 0 ||
 		tot.unexpected.Load() != 0 || tot.streamErrors.Load() != 0 || tot.completed.Load() == 0 ||
@@ -1225,7 +1320,7 @@ func runFaultCheck(httpClient *http.Client, cfg clientConfig) int {
 		return 1
 	}
 	if cfg.expectRecordWriteErrs && writeErrs == 0 {
-		fmt.Fprintln(os.Stderr, "expected record_write_errors > 0 under faulted --record-dir, got 0")
+		fmt.Fprintln(errOut, "expected record_write_errors > 0 under faulted --record-dir, got 0")
 		return 1
 	}
 	return 0
@@ -1250,7 +1345,11 @@ func healthURL(chatURL string) string {
 }
 
 func waitHealthDrain(httpClient *http.Client, url string, timeout time.Duration) (healthSnapshot, bool) {
-	deadline := time.Now().Add(timeout)
+	return waitHealthDrainWithClock(httpClient, url, timeout, realSoakClock{})
+}
+
+func waitHealthDrainWithClock(httpClient *http.Client, url string, timeout time.Duration, clk soakClock) (healthSnapshot, bool) {
+	deadline := clk.Now().Add(timeout)
 	var last healthSnapshot
 	var lastOK bool
 	for {
@@ -1279,18 +1378,18 @@ func waitHealthDrain(httpClient *http.Client, url string, timeout time.Duration)
 		} else {
 			cancel()
 		}
-		if time.Now().After(deadline) {
+		if clk.Now().After(deadline) {
 			return last, lastOK
 		}
-		time.Sleep(25 * time.Millisecond)
+		clk.Sleep(25 * time.Millisecond)
 	}
 }
 
-func oneWithCard(tot *totals, httpClient *http.Client, key, url string, seed uint64, cardID string, rng *rand.Rand) {
-	oneRequest(tot, httpClient, key, url, 0, seed, cardID, maxTokensChoices, rng)
+func oneWithCard(tot *totals, httpClient *http.Client, key, url string, seed uint64, cardID string, clk soakClock, rng *rand.Rand) {
+	oneRequest(tot, httpClient, key, url, 0, seed, cardID, maxTokensChoices, clk, rng)
 }
 
-func oneRequest(tot *totals, httpClient *http.Client, key, url string, disconnectPct int, seed uint64, cardID string, tokChoices []int, rng *rand.Rand) {
+func oneRequest(tot *totals, httpClient *http.Client, key, url string, disconnectPct int, seed uint64, cardID string, tokChoices []int, clk soakClock, rng *rand.Rand) {
 	tot.enter()
 	defer tot.inflight.Add(-1)
 	id := uint64(tot.requests.Add(1))
@@ -1359,8 +1458,7 @@ func oneRequest(tot *totals, httpClient *http.Client, key, url string, disconnec
 		buf := make([]byte, 512)
 		_, _ = resp.Body.Read(buf)
 		hold := time.Duration(50+rng.IntN(1450)) * time.Millisecond
-		timer := time.NewTimer(hold)
-		<-timer.C
+		clk.Sleep(hold)
 		if c := box.conn(); c != nil {
 			_ = c.Close()
 		}

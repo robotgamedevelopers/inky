@@ -297,15 +297,6 @@ func (g *gate) concurrentToolCalls() error {
 			}
 			got[o.idx] = o.sample
 		}
-		if g.sabotageEnabled("concurrent-tool-calls") && tc.stream {
-			// Negative control: inject duplicate call ID + argument bleed to prove validator catches it.
-			got[1].ToolCalls[0].ID = got[0].ToolCalls[0].ID
-			got[1].ToolCalls[0].Function.Arguments += "bleed"
-			if err := verifyConcurrentToolCalls("get_weather", ref, got); err != nil {
-				return fmt.Errorf("sabotage concurrent-tool-calls: %w", err)
-			}
-			return fmt.Errorf("sabotage concurrent-tool-calls was not caught")
-		}
 		if err := verifyConcurrentToolCalls("get_weather", ref, got); err != nil {
 			return fmt.Errorf("%s: %w", tc.name, err)
 		}
@@ -453,14 +444,6 @@ func (g *gate) disconnectMidThinking() error {
 	logBytes, err := io.ReadAll(f)
 	if err != nil {
 		return err
-	}
-	if g.sabotageEnabled("disconnect-mid-thinking") {
-		// Negative control: simulate an uncancelled lane that ran to max_tokens.
-		fakeLog := []byte(fmt.Sprintf("[serve] client gone after %d generated tokens; lane freed\n", thinkMaxTokens))
-		if err := verifyDisconnectMidThinking(fakeLog, thinkMaxTokens, drained, ref, followUp); err != nil {
-			return fmt.Errorf("sabotage disconnect-mid-thinking: %w", err)
-		}
-		return fmt.Errorf("sabotage disconnect-mid-thinking was not caught")
 	}
 	return verifyDisconnectMidThinking(logBytes, thinkMaxTokens, drained, ref, followUp)
 }

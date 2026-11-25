@@ -107,13 +107,19 @@ fn read_saved(path: &str) -> Result<Option<u64>, String> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum SavedRecord {
+pub(super) enum SavedRecord {
     Absent,
-    StaleBoot(i64, u64),
+    StaleBoot(String, u64),
     Current(u64),
 }
 
-fn read_saved_record(path: &str, current_boot: Option<i64>) -> Result<SavedRecord, String> {
+fn is_valid_boot_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+pub(super) fn read_saved_record(path: &str, current_boot: Option<&str>) -> Result<SavedRecord, String> {
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.is_file() => {}
         Ok(_) => return Err(format!("the saved limit at {path} is not a regular file")),
@@ -123,20 +129,44 @@ fn read_saved_record(path: &str, current_boot: Option<i64>) -> Result<SavedRecor
     let value = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read the saved limit at {path}: {e}"))?;
     let trimmed = value.trim();
-    if let Some((boot_str, limit_str)) = trimmed.split_once(':') {
-        let boot = boot_str.parse::<i64>()
-            .map_err(|e| format!("could not parse the saved boot time at {path}: {e}"))?;
+    if let Some((boot_tag, limit_str)) = trimmed.split_once(':') {
+        if !is_valid_boot_tag(boot_tag) {
+            return Err(format!("could not parse the saved boot tag at {path}: invalid tag"));
+        }
         let limit = limit_str.parse::<u32>()
             .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))?;
         if let Some(now_boot) = current_boot {
-            if boot != now_boot {
-                return Ok(SavedRecord::StaleBoot(boot, u64::from(limit)));
+            if boot_tag != now_boot {
+                return Ok(SavedRecord::StaleBoot(boot_tag.to_string(), u64::from(limit)));
             }
         }
         return Ok(SavedRecord::Current(u64::from(limit)));
     }
     trimmed.parse::<u32>().map(|v| SavedRecord::Current(u64::from(v)))
         .map_err(|e| format!("could not parse the saved limit at {path}: {e}"))
+}
+
+pub(super) fn write_saved_atomic(path: &str, value: u64, boot: Option<&str>) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(tag) = boot {
+        if !is_valid_boot_tag(tag) {
+            return Err(format!("refusing to write invalid boot tag {tag:?} in {path}"));
+        }
+    }
+    let tmp = format!("{path}.tmp");
+    let body = match boot {
+        Some(tag) => format!("{tag}:{value}\n"),
+        None => format!("{value}\n"),
+    };
+    (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })()
+    .map_err(|e| format!("could not record the saved limit in {path}: {e}"))
 }
 
 pub(super) fn restore_on_startup(saved_path: &str, set: impl Fn(u64) -> Result<(), String>, keep: impl Fn(Option<u64>) -> Result<(), String>) -> Result<Mode, String> {
@@ -152,6 +182,23 @@ pub(super) fn restore_on_startup(saved_path: &str, set: impl Fn(u64) -> Result<(
         }
     }
     Ok(Mode { saved: seed, clients: 0 })
+}
+
+pub(super) fn restore_on_startup_for_boot(
+    saved_path: &str,
+    current_boot: Option<&str>,
+    set: impl Fn(u64) -> Result<(), String>,
+    keep: impl Fn(Option<u64>) -> Result<(), String>,
+) -> Result<Mode, String> {
+    match read_saved_record(saved_path, current_boot)? {
+        SavedRecord::Absent => Ok(Mode::default()),
+        SavedRecord::StaleBoot(old_boot, old_val) => {
+            eprintln!("[inky memd] ignoring stale saved limit {old_val} from earlier boot {old_boot}");
+            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
+            Ok(Mode::default())
+        }
+        SavedRecord::Current(_) => restore_on_startup(saved_path, set, keep),
+    }
 }
 
 fn checked_directory(path: &Path, uid: u32) -> Result<Metadata, String> {
@@ -267,54 +314,112 @@ fn bind_socket(path: &Path, owner: u32, directory_uid: u32, fake: bool) -> Resul
 
 const MAX_MEMD_LINE: usize = 256;
 const MAX_MEMD_CLIENTS: usize = 256;
+const TARGET_SOFT_NOFILE: u64 = 4096;
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-fn boot_time_sec() -> Option<i64> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::timeval>();
+/// Immutable per-boot identifier from XNU (`kern.bootsessionuuid`), unaffected by `settimeofday`
+/// or NTP clock steps.
+fn boot_session_id() -> Option<String> {
+    let name = c"kern.bootsessionuuid";
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
     let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            &mut tv as *mut _ as *mut libc::c_void,
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
             0,
         )
     };
-    (rc == 0 && len == std::mem::size_of::<libc::timeval>() && tv.tv_sec > 0).then_some(tv.tv_sec as i64)
+    if rc != 0 || len == 0 || len > buf.len() {
+        return None;
+    }
+    let end = buf[..len].iter().position(|&b| b == 0).unwrap_or(len);
+    let s = std::str::from_utf8(&buf[..end]).ok()?.trim();
+    is_valid_boot_tag(s).then(|| s.to_string())
 }
 
-fn write_saved_atomic(path: &str, value: u64, boot: Option<i64>) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    let body = match boot {
-        Some(sec) => format!("{sec}:{value}\n"),
-        None => format!("{value}\n"),
+pub(crate) fn effective_max_conns(soft_nofile: u64, desired: usize, reserve_fds: usize) -> usize {
+    let cap = usize::try_from(soft_nofile).unwrap_or(usize::MAX);
+    desired.min(cap.saturating_sub(reserve_fds).max(1))
+}
+
+/// Raise soft `RLIMIT_NOFILE` up toward `TARGET_SOFT_NOFILE` (respecting `rlim_max` and macOS
+/// `OPEN_MAX`) and clamp `desired` connections safely below the confirmed soft descriptor limit.
+pub(crate) fn raise_and_clamp_max_conns(desired: usize, reserve_fds: usize) -> usize {
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return desired.min(192);
+    }
+    let target = TARGET_SOFT_NOFILE as libc::rlim_t;
+    let ceiling = if rlim.rlim_max == libc::RLIM_INFINITY {
+        target
+    } else {
+        rlim.rlim_max.min(target)
     };
-    (|| -> io::Result<()> {
-        let mut f = OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, path)
-    })()
-    .map_err(|e| format!("could not record the saved limit in {path}: {e}"))
+    if rlim.rlim_cur < ceiling {
+        let raised = libc::rlimit { rlim_cur: ceiling, rlim_max: rlim.rlim_max };
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) };
+        let _ = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    }
+    effective_max_conns(rlim.rlim_cur as u64, desired, reserve_fds)
 }
 
-fn restore_on_startup_for_boot(
-    saved_path: &str,
-    current_boot: Option<i64>,
-    set: impl Fn(u64) -> Result<(), String>,
-    keep: impl Fn(Option<u64>) -> Result<(), String>,
-) -> Result<Mode, String> {
-    match read_saved_record(saved_path, current_boot)? {
-        SavedRecord::Absent => Ok(Mode::default()),
-        SavedRecord::StaleBoot(old_boot, old_val) => {
-            eprintln!("[inky memd] ignoring stale saved limit {old_val} from earlier boot {old_boot}");
-            if let Err(e) = keep(None) { eprintln!("[inky memd] {e}"); }
-            Ok(Mode::default())
+/// Bounded exponential accept-error backoff (`10 ms -> 20 ms -> 40 ms -> 50 ms`) with rate-limited
+/// stderr diagnostics so `EMFILE` / `ENFILE` descriptor pressure never spins at 100% CPU or floods logs.
+pub(crate) struct AcceptBackoff {
+    label: &'static str,
+    delay_ms: u64,
+    last_log: Option<Instant>,
+    suppressed: u64,
+}
+
+impl AcceptBackoff {
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self { label, delay_ms: 0, last_log: None, suppressed: 0 }
+    }
+
+    pub(crate) fn on_accept_ok(&mut self) {
+        self.delay_ms = 0;
+    }
+
+    pub(crate) fn step_at(&mut self, err: &io::Error, now: Instant) -> (Duration, Option<String>) {
+        if err.kind() == io::ErrorKind::Interrupted {
+            return (Duration::ZERO, None);
         }
-        SavedRecord::Current(_) => restore_on_startup(saved_path, set, keep),
+        self.delay_ms = match self.delay_ms {
+            0 => 10,
+            d => (d.saturating_mul(2)).min(50),
+        };
+        let should_log = match self.last_log {
+            None => true,
+            Some(prev) => now.saturating_duration_since(prev) >= ACCEPT_LOG_INTERVAL,
+        };
+        let msg = if should_log {
+            let sup = self.suppressed;
+            self.suppressed = 0;
+            self.last_log = Some(now);
+            if sup > 0 {
+                Some(format!("[{}] accept error: {err} (suppressed {sup} earlier accept errors); backing off {} ms", self.label, self.delay_ms))
+            } else {
+                Some(format!("[{}] accept error: {err}; backing off {} ms", self.label, self.delay_ms))
+            }
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        };
+        (Duration::from_millis(self.delay_ms), msg)
+    }
+
+    pub(crate) fn on_accept_err(&mut self, err: &io::Error) {
+        let (sleep_dur, log_line) = self.step_at(err, Instant::now());
+        if let Some(line) = log_line {
+            eprintln!("{line}");
+        }
+        if !sleep_dur.is_zero() {
+            std::thread::sleep(sleep_dur);
+        }
     }
 }
 
@@ -385,17 +490,18 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let set: Arc<dyn Fn(u64) -> Result<(), String> + Send + Sync> = if fake { Arc::new(move |v| { *fl2.lock().unwrap() = v; eprintln!("[inky memd] (fake) limit = {v}"); Ok(()) }) } else { Arc::new(set_limit) };
     // the saved limit on disk (beside the socket with --fake, so tests need no root)
     let saved_path = if fake { format!("{path}.saved") } else { SAVED.to_string() };
-    let boot_time = boot_time_sec();
+    let boot_id = boot_session_id();
+    let boot_for_keep = boot_id.clone();
     let sp = saved_path.clone();
     let keep: Arc<dyn Fn(Option<u64>) -> Result<(), String> + Send + Sync> = Arc::new(move |v| match v {
-        Some(v) => write_saved_atomic(&sp, v, boot_time),
+        Some(v) => write_saved_atomic(&sp, v, boot_for_keep.as_deref()),
         None => match std::fs::remove_file(&sp) { Ok(()) => Ok(()), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), Err(e) => Err(format!("could not forget the saved limit in {sp}: {e}")) },
     });
     // a helper that died while the limit was raised left the limit it found on disk: put it back first (`set`
     // confirms by reading back, so its Ok is the confirmation). If the restore fails, the file is kept and Mode is
     // seeded from it below, so the first connect restores that limit instead of reading the still-raised limit
     // as the found one and overwriting the file with it. Saved files from an earlier macOS boot are ignored.
-    let mode = Arc::new(Mutex::new(restore_on_startup_for_boot(&saved_path, boot_time, |v| set(v), |v| keep(v))?));
+    let mode = Arc::new(Mutex::new(restore_on_startup_for_boot(&saved_path, boot_id.as_deref(), |v| set(v), |v| keep(v))?));
     // SIGTERM (launchctl bootout) and SIGINT: give the memory back, then exit (`set` confirms by reading back,
     // so its Ok is the confirmation; Mode::close keeps its own read-back because its `set` is injected)
     {
@@ -422,14 +528,25 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
             std::process::exit(i32::from(rc != 0));
         });
     }
+    let max_clients = raise_and_clamp_max_conns(MAX_MEMD_CLIENTS, 32);
     let listener = bind_socket(Path::new(path), owner, uid, fake)?;
     let active_clients = Arc::new(AtomicUsize::new(0));
+    let mut backoff = AcceptBackoff::new("inky memd");
     eprintln!("[inky memd] tuning {} ({chip}, {} GB): inky mode raises {LIMIT} to {target}; listening on {path}", tuning.name, tuning.memory_gb);
-    for s in listener.incoming() {
-        let Ok(s) = s else { continue };
+    for incoming in listener.incoming() {
+        let s = match incoming {
+            Ok(s) => {
+                backoff.on_accept_ok();
+                s
+            }
+            Err(e) => {
+                backoff.on_accept_err(&e);
+                continue;
+            }
+        };
         // The socket owner can change its mode, so also check the kernel-supplied peer UID.
         if !peer_uid(&s).is_some_and(|uid| uid == owner || uid == 0) { continue; }
-        let Some(slot) = ClientGuard::try_acquire(&active_clients, MAX_MEMD_CLIENTS) else {
+        let Some(slot) = ClientGuard::try_acquire(&active_clients, max_clients) else {
             let _ = (&s).write_all(b"err too many clients\n");
             continue;
         };
@@ -577,7 +694,7 @@ fn uninstall_helper() -> Result<(), String> {
     // The stopped helper may have left its recovery record if it could not confirm the restore.
     // Keep the record and installed files intact until recovery is confirmed here; discard stale
     // records left from an earlier boot.
-    match read_saved_record(SAVED, boot_time_sec())? {
+    match read_saved_record(SAVED, boot_session_id().as_deref())? {
         SavedRecord::Current(value) => {
             set_limit(value).map_err(|e| format!("restoring {value} failed: {e}; kept {SAVED} and the helper"))?;
             remove_file_if_present(Path::new(SAVED))?;
@@ -637,7 +754,7 @@ fn install_helper() -> Result<(), String> {
     let dir = socket_directory(socket)?;
     check_system_socket_ancestors(dir)?;
     stop_helper()?;
-    read_saved_record(SAVED, boot_time_sec())?;
+    read_saved_record(SAVED, boot_session_id().as_deref())?;
     retire_legacy_socket(Path::new(OLD_SOCKET_DIR))?;
     prepare_socket_directory(dir, 0, false)?;
     remove_socket(socket)?;
@@ -899,15 +1016,20 @@ mod tests {
         let path = base.join("saved");
         let name = path.to_str().unwrap();
 
-        write_saved_atomic(name, 50000, Some(1_700_000_000)).unwrap();
-        assert_eq!(read_saved_record(name, Some(1_700_000_000)), Ok(SavedRecord::Current(50000)));
-        assert_eq!(read_saved_record(name, Some(1_700_009_999)), Ok(SavedRecord::StaleBoot(1_700_000_000, 50000)));
+        let boot1 = "F9A6C86D-08AB-4F34-9755-36CD42A50743";
+        let boot2 = "00112233-4455-6677-8899-AABBCCDDEEFF";
+        write_saved_atomic(name, 50000, Some(boot1)).unwrap();
+        assert_eq!(read_saved_record(name, Some(boot1)), Ok(SavedRecord::Current(50000)));
+        assert_eq!(
+            read_saved_record(name, Some(boot2)),
+            Ok(SavedRecord::StaleBoot(boot1.to_string(), 50000))
+        );
 
         // Stale boot record is ignored (no set() call) and cleaned up via keep(None).
         let removed = Cell::new(false);
         let mode = restore_on_startup_for_boot(
             name,
-            Some(1_700_009_999),
+            Some(boot2),
             |_| panic!("stale pre-reboot saved limit must not be restored"),
             |v| { assert_eq!(v, None); removed.set(true); let _ = fs::remove_file(name); Ok(()) },
         ).unwrap();
@@ -915,17 +1037,74 @@ mod tests {
         assert_eq!(mode.saved, None);
         assert!(!path.exists());
 
-        // Current boot record IS restored.
-        write_saved_atomic(name, 50000, Some(1_700_009_999)).unwrap();
+        // Current boot UUID record IS restored across wall-clock steps.
+        write_saved_atomic(name, 50000, Some(boot2)).unwrap();
         let restored = Cell::new(None);
         let mode2 = restore_on_startup_for_boot(
             name,
-            Some(1_700_009_999),
+            Some(boot2),
             |v| { restored.set(Some(v)); Ok(()) },
             |v| { assert_eq!(v, None); fs::remove_file(name).map_err(|e| e.to_string()) },
         ).unwrap();
         assert_eq!(restored.get(), Some(50000));
         assert_eq!(mode2.saved, None);
+
+        // Malformed boot tags are rejected rather than misread.
+        for bad in [":50000", "bad tag:50000", "boot_underscore:50000"] {
+            fs::write(&path, bad).unwrap();
+            assert!(read_saved_record(name, Some(boot2)).is_err(), "expected {bad:?} to fail");
+        }
+        assert!(write_saved_atomic(name, 50000, Some("bad:tag")).is_err());
+
+        // On macOS, kern.bootsessionuuid is readable and stable across calls.
+        #[cfg(target_os = "macos")]
+        {
+            let live1 = boot_session_id().expect("macOS kern.bootsessionuuid must be present");
+            let live2 = boot_session_id().expect("macOS kern.bootsessionuuid must remain stable");
+            assert_eq!(live1, live2);
+            assert!(is_valid_boot_tag(&live1));
+        }
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn accept_backoff_and_fd_clamping_bound_emfile_pressure() {
+        assert_eq!(effective_max_conns(256, 512, 64), 192);
+        assert_eq!(effective_max_conns(256, 256, 32), 224);
+        assert_eq!(effective_max_conns(4096, 512, 64), 512);
+        assert_eq!(effective_max_conns(16, 512, 64), 1);
+
+        let clamped = raise_and_clamp_max_conns(512, 64);
+        assert!((1..=512).contains(&clamped));
+
+        let mut bo = AcceptBackoff::new("test");
+        let t0 = Instant::now();
+        let eintr = io::Error::from(io::ErrorKind::Interrupted);
+        let (d0, m0) = bo.step_at(&eintr, t0);
+        assert_eq!(d0, Duration::ZERO);
+        assert!(m0.is_none());
+
+        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        let (d1, m1) = bo.step_at(&emfile, t0);
+        assert_eq!(d1, Duration::from_millis(10));
+        assert!(m1.as_deref().unwrap().contains("backing off 10 ms"));
+
+        // Immediate repeat errors step 20 -> 40 -> 50 -> 50 ms while suppressing log spam.
+        let (d2, m2) = bo.step_at(&emfile, t0 + Duration::from_millis(10));
+        let (d3, m3) = bo.step_at(&emfile, t0 + Duration::from_millis(30));
+        let (d4, m4) = bo.step_at(&emfile, t0 + Duration::from_millis(70));
+        let (d5, m5) = bo.step_at(&emfile, t0 + Duration::from_millis(120));
+        assert_eq!([d2.as_millis(), d3.as_millis(), d4.as_millis(), d5.as_millis()], [20, 40, 50, 50]);
+        assert!(m2.is_none() && m3.is_none() && m4.is_none() && m5.is_none());
+
+        // After ACCEPT_LOG_INTERVAL, emits summary with exact suppressed count.
+        let (d6, m6) = bo.step_at(&emfile, t0 + ACCEPT_LOG_INTERVAL + Duration::from_millis(1));
+        assert_eq!(d6, Duration::from_millis(50));
+        assert!(m6.as_deref().unwrap().contains("suppressed 4 earlier accept errors"));
+
+        // Successful accept resets delay back to initial 10 ms step.
+        bo.on_accept_ok();
+        let (d7, _) = bo.step_at(&emfile, t0 + ACCEPT_LOG_INTERVAL + Duration::from_secs(6));
+        assert_eq!(d7, Duration::from_millis(10));
     }
 }

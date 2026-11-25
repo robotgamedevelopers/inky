@@ -1,18 +1,146 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// fakeClock advances virtual time deterministically with zero wall-clock sleeps.
+type fakeClock struct {
+	base time.Time
+	ns   atomic.Int64
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{base: time.Unix(1_700_000_000, 0)}
+}
+
+func (f *fakeClock) Now() time.Time {
+	return f.base.Add(time.Duration(f.ns.Load()))
+}
+
+func (f *fakeClock) Sleep(d time.Duration) {
+	if d > 0 {
+		f.ns.Add(int64(d))
+	}
+}
+
+// memResponseWriter records status, headers, and body in memory with zero TCP sockets.
+type memResponseWriter struct {
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func (w *memResponseWriter) Header() http.Header { return w.header }
+func (w *memResponseWriter) WriteHeader(statusCode int) {
+	if w.code == 0 {
+		w.code = statusCode
+	}
+}
+func (w *memResponseWriter) Write(p []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+func (w *memResponseWriter) Flush() {}
+
+type abortConn struct {
+	closed atomic.Bool
+	close  func() error
+}
+
+func (c *abortConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *abortConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *abortConn) LocalAddr() net.Addr              { return dummyAddr("mem-local") }
+func (c *abortConn) RemoteAddr() net.Addr             { return dummyAddr("mem-remote") }
+func (c *abortConn) SetDeadline(time.Time) error      { return nil }
+func (c *abortConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *abortConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *abortConn) Close() error {
+	c.closed.Store(true)
+	if c.close != nil {
+		return c.close()
+	}
+	return nil
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string { return "mem" }
+func (a dummyAddr) String() string  { return string(a) }
+
+type abortableBody struct {
+	r      *bytes.Reader
+	aborted *atomic.Bool
+}
+
+func (b *abortableBody) Read(p []byte) (int, error) {
+	if b.aborted.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	return b.r.Read(p)
+}
+
+func (b *abortableBody) Close() error {
+	b.aborted.Store(true)
+	return nil
+}
+
+// newInMemoryEnv creates an HTTP client and dialer backed purely by in-memory handlers and pipes
+// (zero loopback sockets, zero sleeps, zero child processes).
+func newInMemoryEnv(handler http.HandlerFunc) (*http.Client, *fakeClock, dialFunc) {
+	clk := newFakeClock()
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clk.Sleep(50 * time.Millisecond)
+		rec := &memResponseWriter{header: make(http.Header)}
+		handler(rec, req)
+		if rec.code == 0 {
+			rec.code = http.StatusOK
+		}
+		var aborted atomic.Bool
+		body := &abortableBody{r: bytes.NewReader(rec.body.Bytes()), aborted: &aborted}
+		if box, ok := req.Context().Value(ctxKey{}).(*dialBox); ok {
+			box.c.Store(&abortConn{close: body.Close})
+		}
+		return &http.Response{
+			StatusCode: rec.code,
+			Status:     fmt.Sprintf("%d %s", rec.code, http.StatusText(rec.code)),
+			Header:     rec.header,
+			Body:       body,
+			Request:    req,
+		}, nil
+	})
+	client := &http.Client{
+		Transport: rt,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	dial := func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			_, _ = io.Copy(io.Discard, c2)
+			_ = c2.Close()
+		}()
+		return c1, nil
+	}
+	return client, clk, dial
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestValidateStream(t *testing.T) {
 	for _, tc := range []struct {
@@ -197,11 +325,7 @@ func TestDriftDetection(t *testing.T) {
 }
 
 func TestSoakVerdict(t *testing.T) {
-	if os.Getenv("SOAK_TEST_CHILD") == "1" {
-		os.Args = []string{"soak", "-url", os.Getenv("SOAK_TEST_URL"), "-duration", "1", "-clients", "1", "-lanes", "1", "-disconnect-pct", "0"}
-		main()
-		return
-	}
+	start := time.Now()
 	for _, tc := range []struct {
 		name           string
 		workloadStatus int
@@ -219,7 +343,7 @@ func TestSoakVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var count atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client, clk, dial := newInMemoryEnv(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/health" {
 					w.Header().Set("Content-Type", "application/json")
 					fmt.Fprint(w, tc.healthBody)
@@ -234,22 +358,41 @@ func TestSoakVerdict(t *testing.T) {
 				}
 				w.WriteHeader(tc.workloadStatus)
 				fmt.Fprint(w, tc.body)
-			}))
-			defer server.Close()
-			cmd := exec.Command(os.Args[0], "-test.run=^TestSoakVerdict$")
-			cmd.Env = append(os.Environ(), "SOAK_TEST_CHILD=1", "SOAK_TEST_URL="+server.URL+"/v1/chat/completions", "INKY_SERVE_KEY=test")
-			out, err := cmd.CombinedOutput()
-			if (err == nil) != tc.success {
-				t.Fatalf("err=%v output=%s", err, out)
+			})
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"-url", "http://mem.test:18090/v1/chat/completions",
+				"-duration", "1",
+				"-clients", "1",
+				"-lanes", "1",
+				"-disconnect-pct", "0",
+				"-max-tokens", "16,32,64",
+			}
+			getenv := func(k string) string {
+				if k == "INKY_SERVE_KEY" {
+					return "test"
+				}
+				return ""
+			}
+			code := runCLI(args, getenv, client, clientConfig{clock: clk, dial: dial, stdout: &stdout, stderr: &stderr})
+			if (code == 0) != tc.success {
+				t.Fatalf("code=%d wantSuccess=%v stdout=%s stderr=%s", code, tc.success, stdout.String(), stderr.String())
+			}
+			if tc.success && !strings.Contains(stdout.String(), "\nmax_tokens=16,32,64\n") {
+				t.Fatalf("receipt did not report configured token mix: %s", stdout.String())
 			}
 			if count.Load() < 2 {
-				t.Fatalf("missing workload/recovery requests")
+				t.Fatalf("missing workload/recovery requests (got %d)", count.Load())
 			}
 		})
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("TestSoakVerdict exceeded unit budget without sleeps: %v", elapsed)
 	}
 }
 
 func TestDisconnectStormVerdict(t *testing.T) {
+	start := time.Now()
 	for _, tc := range []struct {
 		name         string
 		corruptAfter bool
@@ -262,7 +405,7 @@ func TestDisconnectStormVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var reqCount atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client, clk, dial := newInMemoryEnv(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/health" {
 					w.Header().Set("Content-Type", "application/json")
 					if tc.leakHealth && reqCount.Load() > 5 {
@@ -285,32 +428,31 @@ func TestDisconnectStormVerdict(t *testing.T) {
 					return
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
-				flusher, _ := w.(http.Flusher)
 				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think...\"},\"finish_reason\":null}]}\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
-				time.Sleep(5 * time.Millisecond)
 				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}))
-			defer server.Close()
+			})
 
+			var stdout, stderr bytes.Buffer
 			cfg := clientConfig{
-				chatURL:       server.URL + "/v1/chat/completions",
+				chatURL:       "http://mem.test:18090/v1/chat/completions",
 				key:           "test",
 				clients:       8,
 				lanes:         2,
 				seed:          42,
 				stormRequests: 64,
+				clock:         clk,
+				dial:          dial,
+				stdout:        &stdout,
+				stderr:        &stderr,
 			}
-			code := runDisconnectStorm(newSoakHTTPClient(), cfg)
+			code := runDisconnectStorm(client, cfg)
 			if code != tc.wantCode {
-				t.Fatalf("runDisconnectStorm exit=%d, want %d", code, tc.wantCode)
+				t.Fatalf("runDisconnectStorm exit=%d, want %d (stderr=%s)", code, tc.wantCode, stderr.String())
 			}
 		})
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("TestDisconnectStormVerdict exceeded unit budget without sleeps: %v", elapsed)
 	}
 }
 
@@ -318,7 +460,7 @@ func TestFaultCheckAndReferenceCheck(t *testing.T) {
 	var writeErrors atomic.Int64
 	var replyValue atomic.Int64
 	replyValue.Store(391)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client, clk, dial := newInMemoryEnv(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"ok":true,"active_lanes":0,"inflight":0,"queued_requests":0,"record_written":0,"record_write_errors":%d}`, writeErrors.Load())
@@ -333,42 +475,50 @@ func TestFaultCheckAndReferenceCheck(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-	}))
-	defer server.Close()
+	})
 
+	var stdout, stderr bytes.Buffer
 	cfg := clientConfig{
-		chatURL:               server.URL + "/v1/chat/completions",
+		chatURL:               "http://mem.test:18090/v1/chat/completions",
 		key:                   "test",
 		duration:              1 * time.Second,
 		clients:               2,
 		lanes:                 2,
 		seed:                  7,
 		expectRecordWriteErrs: true,
+		clock:                 clk,
+		dial:                  dial,
+		stdout:                &stdout,
+		stderr:                &stderr,
 	}
-	if got := runFaultCheck(newSoakHTTPClient(), cfg); got != 1 {
+	if got := runFaultCheck(client, cfg); got != 1 {
 		t.Fatalf("expected faultCheck without write errors to fail, got %d", got)
 	}
 	writeErrors.Store(4)
-	if got := runFaultCheck(newSoakHTTPClient(), cfg); got != 0 {
+	if got := runFaultCheck(client, cfg); got != 0 {
 		t.Fatalf("expected faultCheck with write errors to pass, got %d", got)
 	}
 
 	refPath := filepath.Join(t.TempDir(), "ref.json")
 	refCfg := clientConfig{
-		chatURL:       server.URL + "/v1/chat/completions",
+		chatURL:       "http://mem.test:18090/v1/chat/completions",
 		key:           "test",
 		lanes:         2,
 		seed:          7,
 		referenceFile: refPath,
+		clock:         clk,
+		dial:          dial,
+		stdout:        &stdout,
+		stderr:        &stderr,
 	}
-	if got := runReferenceCheck(newSoakHTTPClient(), refCfg); got != 0 {
+	if got := runReferenceCheck(client, refCfg); got != 0 {
 		t.Fatalf("initial reference save failed: %d", got)
 	}
-	if got := runReferenceCheck(newSoakHTTPClient(), refCfg); got != 0 {
+	if got := runReferenceCheck(client, refCfg); got != 0 {
 		t.Fatalf("matching post-restart reference check failed: %d", got)
 	}
 	replyValue.Store(999)
-	if got := runReferenceCheck(newSoakHTTPClient(), refCfg); got != 1 {
+	if got := runReferenceCheck(client, refCfg); got != 1 {
 		t.Fatalf("mismatched post-restart reference check should fail, got %d", got)
 	}
 }

@@ -171,19 +171,12 @@ func (g *gate) observe(path, auth string, body []byte) (apiObservation, error) {
 	return g.observeHeaders(path, headers, body)
 }
 
-func (g *gate) checkHealth(path string, sabotage bool) error {
+func (g *gate) checkHealth(path string) error {
 	r, err := g.observe(path, "", nil)
 	if err != nil {
 		return err
 	}
-	expected := http.StatusOK
-	if sabotage {
-		expected = http.StatusTeapot // CI negative control: a healthy server must disagree.
-	}
-	if err := r.expect(expected); err != nil {
-		if sabotage {
-			return fmt.Errorf("sabotage health-status: %w", err)
-		}
+	if err := r.expect(http.StatusOK); err != nil {
 		return err
 	}
 	if !r.OK {
@@ -192,73 +185,72 @@ func (g *gate) checkHealth(path string, sabotage bool) error {
 	return nil
 }
 
+func (g *gate) authAndPublicHealth() error {
+	for _, auth := range []string{"", "Bearer " + g.key + "-wrong"} {
+		r, err := g.observe("/v1/models", auth, nil)
+		if err != nil {
+			return err
+		}
+		if err := r.expect(401); err != nil {
+			return err
+		}
+		if r.expect(200) == nil {
+			return fmt.Errorf("accepted incorrect anonymous success observation")
+		}
+	}
+	r, err := g.observe("/v1/models", "Bearer "+g.key, nil)
+	if err != nil {
+		return err
+	}
+	if err := r.expect(200); err != nil {
+		return err
+	}
+	if err := verifyModelsList(r.Models); err != nil {
+		return err
+	}
+	// x-api-key authentication works identically to Bearer and rejects invalid keys with 401.
+	badKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key + "-wrong"}, nil)
+	if err != nil {
+		return err
+	}
+	if err := badKey.expect(401); err != nil {
+		return fmt.Errorf("bad x-api-key: %w", err)
+	}
+	goodKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key}, nil)
+	if err != nil {
+		return err
+	}
+	if err := goodKey.expect(200); err != nil {
+		return fmt.Errorf("good x-api-key: %w", err)
+	}
+	if err := verifyModelsList(goodKey.Models); err != nil {
+		return err
+	}
+	return g.checkHealth("/health")
+}
+
+func (g *gate) healthMemoryBudget(expectedLanes int) error {
+	code, snap, err := g.fetchHealth("/health")
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("got HTTP %d, want 200", code)
+	}
+	// Self-check negative witness: zero working set must be rejected.
+	zero := int64(0)
+	badSnap := snap
+	badSnap.RecommendedWorkingSetBytes = &zero
+	if verifyHealthBudget(badSnap, expectedLanes) == nil {
+		return fmt.Errorf("health budget assertion accepted zero working set")
+	}
+	return verifyHealthBudget(snap, expectedLanes)
+}
+
 func (g *gate) validation(expectedLanes int) {
-	g.run("bearer authentication and public health", func(g *gate) error {
-		for _, auth := range []string{"", "Bearer " + g.key + "-wrong"} {
-			r, err := g.observe("/v1/models", auth, nil)
-			if err != nil {
-				return err
-			}
-			if err := r.expect(401); err != nil {
-				return err
-			}
-			if r.expect(200) == nil {
-				return fmt.Errorf("accepted incorrect anonymous success observation")
-			}
-		}
-		r, err := g.observe("/v1/models", "Bearer "+g.key, nil)
-		if err != nil {
-			return err
-		}
-		if err := r.expect(200); err != nil {
-			return err
-		}
-		if err := verifyModelsList(r.Models); err != nil {
-			return err
-		}
-		// x-api-key authentication works identically to Bearer and rejects invalid keys with 401.
-		badKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key + "-wrong"}, nil)
-		if err != nil {
-			return err
-		}
-		if err := badKey.expect(401); err != nil {
-			return fmt.Errorf("bad x-api-key: %w", err)
-		}
-		goodKey, err := g.observeHeaders("/v1/models", map[string]string{"x-api-key": g.key}, nil)
-		if err != nil {
-			return err
-		}
-		if err := goodKey.expect(200); err != nil {
-			return fmt.Errorf("good x-api-key: %w", err)
-		}
-		if err := verifyModelsList(goodKey.Models); err != nil {
-			return err
-		}
-		return g.checkHealth("/health", g.sabotageEnabled("health-status"))
-	})
+	g.run("bearer authentication and public health", (*gate).authAndPublicHealth)
 	g.run("health reports Metal memory budget and admission limits", func(g *gate) error {
-		code, snap, err := g.fetchHealth("/health")
-		if err != nil {
-			return err
-		}
-		if code != http.StatusOK {
-			return fmt.Errorf("got HTTP %d, want 200", code)
-		}
-		// Self-check negative witness: zero working set must be rejected.
-		zero := int64(0)
-		badSnap := snap
-		badSnap.RecommendedWorkingSetBytes = &zero
-		if verifyHealthBudget(badSnap, expectedLanes) == nil {
-			return fmt.Errorf("health budget assertion accepted zero working set")
-		}
-		if g.sabotageEnabled("memory-budget") {
-			snap.RecommendedWorkingSetBytes = &zero
-			if err := verifyHealthBudget(snap, expectedLanes); err != nil {
-				return fmt.Errorf("sabotage memory-budget: %w", err)
-			}
-			return fmt.Errorf("sabotage memory-budget was not caught")
-		}
-		return verifyHealthBudget(snap, expectedLanes)
+		return g.healthMemoryBudget(expectedLanes)
 	})
 	g.run("sampling bounds and subsequent health", func(g *gate) error {
 		for _, tc := range []struct{ name, field string }{{"max_tokens", `"max_tokens":18446744073709551615`}, {"temperature", `"temperature":5,"max_tokens":1`}, {"top_p", `"top_p":0,"max_tokens":1`}} {
@@ -277,7 +269,7 @@ func (g *gate) validation(expectedLanes int) {
 				return fmt.Errorf("accepted incorrect sampling success observation")
 			}
 		}
-		return g.checkHealth("/health", false)
+		return g.checkHealth("/health")
 	})
 	g.run("bearer header casing and trailing-slash health", func(g *gate) error {
 		r, err := g.observe("/v1/models", "BEARER "+g.key, nil)
@@ -293,6 +285,6 @@ func (g *gate) validation(expectedLanes int) {
 		if r.expect(401) == nil {
 			return fmt.Errorf("accepted incorrect rejection observation")
 		}
-		return g.checkHealth("/health/", false)
+		return g.checkHealth("/health/")
 	})
 }

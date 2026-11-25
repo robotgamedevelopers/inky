@@ -46,7 +46,9 @@ ReleaseEarly RaisedWhileConnected
 NoPersist RestoredWhenIdle
 LostSeed SavedIsOwner
 StaleSaved RestoredWhenIdle
-NoRollback RefusedRollbackSafe'
+NoRollback RefusedRollbackSafe
+RestoreStale RestoredWhenIdle
+StaleBoot RestoredWhenIdle'
 
 layout_sel() {
     case $1 in
