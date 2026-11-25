@@ -161,17 +161,21 @@ func loadJSONLFile(path string) ([]RecordedEntry, error) {
 	defer f.Close()
 
 	var out []RecordedEntry
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	lineNum := 0
-	for sc.Scan() {
-		lineNum++
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+	reader := bufio.NewReader(f)
+	for lineNum := 1; ; lineNum++ {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("line %d: %w", lineNum, err)
+		}
+		if err == io.EOF && len(line) == 0 {
+			break
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
 			continue
 		}
 		var e RecordedEntry
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
+		if err := json.Unmarshal(line, &e); err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
 		if len(bytes.TrimSpace(e.Request)) == 0 {
@@ -185,9 +189,6 @@ func loadJSONLFile(path string) ([]RecordedEntry, error) {
 			e.Endpoint = "/v1/chat/completions"
 		}
 		out = append(out, e)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
 	}
 	return out, nil
 }

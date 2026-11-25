@@ -470,3 +470,23 @@ func TestCLIReportsRungWhenRequestedTTFTIsUnavailable(t *testing.T) {
 		t.Fatalf("rung measurements missing: %q, %v", tsv, err)
 	}
 }
+
+func TestLoadReplaySetReadsLargeRecorderRowAndFollowingTurn(t *testing.T) {
+	path := filepath.Join(localTempDir(t), "cards.jsonl")
+	first := `{"card_id":"large","turn_index":0,"request":{"metadata":"` + strings.Repeat("x", 16<<20) + `"}}`
+	second := `{"card_id":"large","turn_index":1,"request":{"stream":true}}`
+	if err := os.WriteFile(path, []byte(first+"\n"+second), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cards, err := LoadReplaySet(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != 1 || len(cards[0].Turns) != 2 {
+		t.Fatalf("expected one two-turn card, got %d cards", len(cards))
+	}
+	turns := cards[0].Turns
+	if len(turns[0].Request) != len(`{"metadata":""}`)+(16<<20) || string(turns[1].Request) != `{"stream":true}` {
+		t.Fatal("the loader lost part of the large request or its following turn")
+	}
+}
