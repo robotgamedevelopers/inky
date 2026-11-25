@@ -1012,3 +1012,123 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
         assert_ne!(cur, 0);
     }
 }
+
+#[test]
+fn blocked_slab_alloc_reuse_zero_fill_and_strided_growth() {
+    assert_eq!(BlockedSlab::next_cap(0), 1);
+    assert_eq!(BlockedSlab::next_cap(1), 1);
+    assert_eq!(BlockedSlab::next_cap(2), 2);
+    assert_eq!(BlockedSlab::next_cap(3), 4);
+    assert_eq!(BlockedSlab::next_cap(4), 4);
+    assert_eq!(BlockedSlab::next_cap(5), 8);
+    assert_eq!(BlockedSlab::next_cap(8), 8);
+    assert_eq!(BlockedSlab::next_cap(9), 16);
+
+    if objc2_metal::MTLCreateSystemDefaultDevice().is_none() {
+        return;
+    }
+    let gpu = Gpu::new("#include <metal_stdlib>\nusing namespace metal;\nkernel void noop() {}\n", &[]);
+    let slab = Rc::new(RefCell::new(BlockedSlab::new(16))); // initial stride = 32 u64s
+
+    let alloc_handle = |need_blocks: usize| -> BlockedSlot {
+        let slot_idx = slab.borrow_mut().alloc_slot(&gpu, need_blocks);
+        BlockedSlot { slab: Rc::clone(&slab), slot_idx, bt_blocks: need_blocks }
+    };
+
+    // 1. Allocate 3 slots at initial stride (32 u64s): cap grows 0 -> 1 -> 2 -> 4.
+    let s0 = alloc_handle(16);
+    assert_eq!(s0.slot_idx, 0);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (1, 1, 32));
+
+    let s1 = alloc_handle(32);
+    assert_eq!(s1.slot_idx, 1);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (2, 2, 32));
+
+    let s2 = alloc_handle(20);
+    assert_eq!(s2.slot_idx, 2);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (4, 3, 32));
+
+    // Stamp distinct sentinels in each slot's `cs_buf` and `[full | win]` `bt_buf` slices.
+    {
+        let sb = slab.borrow();
+        let cs = unsafe {
+            std::slice::from_raw_parts_mut(
+                sb.cs_buf.as_ref().unwrap().contents().as_ptr() as *mut f32,
+                sb.cap * CS_STRIDE_F32,
+            )
+        };
+        let bt = unsafe {
+            std::slice::from_raw_parts_mut(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *mut u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        for slot in 0..3usize {
+            cs[sb.cs_f32_base(slot) as usize] = (slot as f32) + 10.5;
+            cs[sb.cs_f32_base(slot) as usize + CS_STRIDE_F32 - 1] = (slot as f32) + 99.25;
+            for swa in [false, true] {
+                let base = sb.bt_u64_base(slot, swa);
+                for b in 0..32usize {
+                    bt[base + b] = ((slot as u64 + 1) << 40) | ((u64::from(swa)) << 32) | (b as u64 + 1);
+                }
+            }
+        }
+    }
+
+    // 2. Drop `s1` then `s0` -> pushed LIFO `[1, 0]`. Re-allocating pops `0` first and zero-fills it!
+    drop(s1);
+    drop(s0);
+    assert_eq!(slab.borrow().free_slots, vec![1, 0]);
+
+    let s0_reused = alloc_handle(16);
+    assert_eq!(s0_reused.slot_idx, 0, "LIFO pop must reuse most recently dropped slot 0");
+    assert_eq!(slab.borrow().used, 3, "reusing free slot must not bump high-water `used`");
+    {
+        let sb = slab.borrow();
+        let cs = unsafe {
+            std::slice::from_raw_parts(
+                sb.cs_buf.as_ref().unwrap().contents().as_ptr() as *const f32,
+                sb.cap * CS_STRIDE_F32,
+            )
+        };
+        let bt = unsafe {
+            std::slice::from_raw_parts(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *const u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        let cs0 = sb.cs_f32_base(0) as usize;
+        assert!(cs[cs0..cs0 + CS_STRIDE_F32].iter().all(|&x| x == 0.0), "reused cs_buf slice must be zeroed");
+        let bt0 = sb.bt_u64_base(0, false);
+        assert!(bt[bt0..bt0 + 2 * sb.bt_stride_u64].iter().all(|&w| w == 0), "reused bt_buf slice must be zeroed");
+        // Live slot 2 must remain completely intact!
+        assert_eq!(cs[sb.cs_f32_base(2) as usize], 12.5);
+    }
+
+    // 3. Request `need_blocks = 65` -> `bt_stride_u64` grows `32 -> 96` (32-aligned) while reusing slot 1!
+    let s1_grown = alloc_handle(65);
+    assert_eq!(s1_grown.slot_idx, 1);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (4, 3, 96));
+    {
+        let sb = slab.borrow();
+        let bt = unsafe {
+            std::slice::from_raw_parts(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *const u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        // Slot 2's `[full | win]` entries must be re-strided to `(2 * 2 + swa) * 96` with zeroed `[32..96)` tail!
+        for swa in [false, true] {
+            let base = sb.bt_u64_base(2, swa);
+            assert_eq!(base, (2 * 2 + usize::from(swa)) * 96);
+            for b in 0..32usize {
+                let want = (3u64 << 40) | ((u64::from(swa)) << 32) | (b as u64 + 1);
+                assert_eq!(bt[base + b], want, "slot 2 swa={swa} b={b} lost across stride growth");
+            }
+            assert!(bt[base + 32..base + 96].iter().all(|&w| w == 0), "grown stride tail must be zeroed");
+        }
+        // Recycled slot 1 must be completely zeroed across all `2 * 96` u64 entries!
+        let bt1 = sb.bt_u64_base(1, false);
+        assert!(bt[bt1..bt1 + 2 * 96].iter().all(|&w| w == 0));
+    }
+}

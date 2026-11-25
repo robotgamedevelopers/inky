@@ -107,10 +107,20 @@ pub fn walk_block_layout(
     Ok(())
 }
 
+fn allow_precond<T>(res: Result<T, SchedulerError>) -> Result<Option<T>, SchedulerError> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(SchedulerError::Precondition(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Execute a deterministic seeded `CacheScheduler` walk exercising:
 ///   - `MaxQueue >= 2` admit bypass (fitting smaller request bypassing larger queued request and incrementing its `wait_ticks`),
 ///   - `BuildStep` `StepBypassed` `wait_ticks` increment on unchosen actionable lanes,
-///   - HTTP 429 refusals, start-point matching, cold SSD spills & restores, mid-step `Cancelling` fence, and completions.
+///   - LRU cold SSD spill order (`p2` older tick evicted before `p1` newer tick),
+///   - `ReclaimColdDisk`, `DropUnreferenced`, `SlideWindow`, `RestoreBlock`, HTTP 429 refusals,
+///     mid-step `Cancelling` fence, and completions, propagating every `Trace`/`InvariantViolation` error (`U194`).
 pub fn walk_cache_scheduler(
     cfg: CacheSchedulerConfig,
     seed: u64,
@@ -126,9 +136,58 @@ pub fn walk_cache_scheduler(
     let min_len = *req_lens.iter().min().unwrap();
     let max_len = *req_lens.iter().max().unwrap();
 
-    // Opening scenario when `max_queue >= 2` and `lanes.len() >= 3` and `max_len > min_len`:
-    // deterministically exercise BOTH `admit` queue-bypass (`wait_ticks += 1`) AND `build_step` `StepBypassed` (`wait_ticks += 1`).
-    if seed % 2 == 0
+    let seal_prefix_on = |sched: &mut CacheScheduler,
+                          ln: &str,
+                          pfx: &str,
+                          ev: &mut dyn TraceSink,
+                          st: &mut dyn TraceSink|
+     -> Result<(), SchedulerError> {
+        sched.arrive(ln, pfx, max_len, ev, st)?;
+        sched.admit(ln, ev, st)?;
+        sched.begin_restore(ln, ev, st)?;
+        sched.finish_restore(ln, ev, st)?;
+        while sched.lanes[ln].pos < sched.prompt_end_of(max_len) {
+            let _ = sched.slide_window(ln, ev, st)?;
+            let Some(plan) = sched.plan_step() else { break };
+            sched.build_step(&plan, ev, st)?;
+            sched.gpu_execute(ev, st)?;
+            sched.finish_step(ev, st)?;
+        }
+        Ok(())
+    };
+
+    if seed == 2
+        && lanes.len() >= 2
+        && prefixes.len() >= 2
+        && max_len >= cfg.block_size * 2
+        && sched.worst_case_for(max_len) <= cfg.mem_budget
+    {
+        // Seed 2 (`U193`): seal `p1` ("p2") FIRST (older `last_used_tick`) and `p0` ("p1") SECOND
+        // (newer `last_used_tick`, lexicographically smaller), cancel so BOTH prefixes sit cold in
+        // memory simultaneously, then trigger `StartColdWriteback` — LRU MUST pick `"p2"`!
+        let p0 = &prefixes[0];
+        let p1 = &prefixes[1];
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+
+        sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[0], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
+        while sched.mem_pressure() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
+        }
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+    } else if seed % 2 == 0
         && cfg.max_queue >= 2
         && lanes.len() >= 3
         && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget
@@ -136,29 +195,127 @@ pub fn walk_cache_scheduler(
     {
         let p0 = &prefixes[0];
         let p1 = prefixes.get(1).unwrap_or(p0);
-        // l0 admitted with min_len -> holds half the admission budget:
         sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
         sched.admit(&lanes[0], event_sink, state_sink)?;
         sched.begin_restore(&lanes[0], event_sink, state_sink)?;
         sched.finish_restore(&lanes[0], event_sink, state_sink)?;
-        // l1 queued with max_len (cannot fit while l0 is active) + l2 queued with min_len (CAN fit!):
         sched.arrive(&lanes[1], p1, max_len, event_sink, state_sink)?;
         sched.arrive(&lanes[2], p0, min_len, event_sink, state_sink)?;
         if lanes.len() >= 4 && cfg.max_queue == 2 {
-            // Queue full + max_len cannot direct-admit -> 429 Refused!
             let _ = sched.arrive(&lanes[3], p1, max_len, event_sink, state_sink)?;
         }
-        // Admit l2: bypasses queued l1 -> increments l1.wait_ticks!
         sched.admit(&lanes[2], event_sink, state_sink)?;
         sched.begin_restore(&lanes[2], event_sink, state_sink)?;
         sched.finish_restore(&lanes[2], event_sink, state_sink)?;
-        // Step ONLY l0 (when step_token_budget == 1 or l2 is prefilling; with decode priority, if l2 is also decoding and fits step_token_budget >= 2, make l2 prefilling or step both then bypass queued l1!):
-        // Wait: in BuildStep, FitUnchosenDecoders requires SumBy(chosen, spans) == StepTokenBudget!
-        // So if l0 has max_len (prefilling, span = 2 == step_token_budget!) or if l2 is prefilling:
         if let Some(plan) = sched.plan_step() {
             sched.build_step(&plan, event_sink, state_sink)?;
             sched.gpu_execute(event_sink, state_sink)?;
             sched.finish_step(event_sink, state_sink)?;
+        }
+    } else if seed == 1
+        && lanes.len() >= 3
+        && prefixes.len() >= 2
+        && max_len >= cfg.block_size * 2
+        && sched.worst_case_for(max_len) <= cfg.mem_budget
+    {
+        // Seed 1: cold spill + `RestoreBlock` + `SlideWindow`:
+        let p0 = &prefixes[0];
+        let p1 = &prefixes[1];
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
+        while sched.mem_pressure() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if sched.disk_used() >= cfg.disk_budget {
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+            }
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
+        }
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+
+        sched.arrive(&lanes[2], p0, max_len, event_sink, state_sink)?;
+        sched.admit(&lanes[2], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[2], event_sink, state_sink)?;
+        let disk_blks: Vec<CacheBlockId> = CacheScheduler::lane_blocks_of(&sched.lanes[&lanes[2]])
+            .into_iter()
+            .filter(|b| sched.blocks[b].tier == "disk")
+            .collect();
+        for b in disk_blks {
+            if sched.mem_used() < cfg.mem_budget {
+                let _ = allow_precond(sched.restore_block(&lanes[2], &b, event_sink, state_sink))?;
+            }
+        }
+        if CacheScheduler::lane_blocks_of(&sched.lanes[&lanes[2]])
+            .iter()
+            .all(|b| sched.blocks[b].in_memory())
+            && sched.start_state_ready(&sched.lanes[&lanes[2]])
+        {
+            sched.finish_restore(&lanes[2], event_sink, state_sink)?;
+        }
+    } else if seed == 3
+        && lanes.len() >= 2
+        && prefixes.len() >= 2
+        && max_len >= cfg.block_size * 2
+        && sched.worst_case_for(max_len) <= cfg.mem_budget
+        && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget
+    {
+        // Seed 3 (`U159, U162`): fill `disk_budget`, run `ReclaimColdDisk` to retire the oldest
+        // start point, and explicitly call `DropUnreferenced` on the orphaned disk blocks!
+        let p0 = &prefixes[0];
+        let p1 = &prefixes[1];
+        seal_prefix_on(&mut sched, &lanes[0], p0, event_sink, state_sink)?;
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+        seal_prefix_on(&mut sched, &lanes[0], p1, event_sink, state_sink)?;
+        while sched.mem_pressure() {
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
+        }
+        sched.cancel(&lanes[0], event_sink, state_sink)?;
+
+        sched.arrive(&lanes[0], p0, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[0], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[0], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[0], event_sink, state_sink)?;
+        sched.arrive(&lanes[1], p1, min_len, event_sink, state_sink)?;
+        sched.admit(&lanes[1], event_sink, state_sink)?;
+        sched.begin_restore(&lanes[1], event_sink, state_sink)?;
+        sched.finish_restore(&lanes[1], event_sink, state_sink)?;
+
+        while sched.mem_pressure() {
+            if sched.disk_used() >= cfg.disk_budget {
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+                let unref_ids: Vec<CacheBlockId> = sched
+                    .blocks
+                    .iter()
+                    .filter(|(id, b)| {
+                        b.present()
+                            && b.ref_count == 0
+                            && !sched.step_pins.contains(*id)
+                            && !sched.step_io.contains(*id)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in unref_ids {
+                    let _ = allow_precond(sched.drop_unreferenced(&id, event_sink, state_sink))?;
+                }
+            }
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
+                sched.complete_step_io(event_sink, state_sink)?;
+            } else {
+                break;
+            }
         }
     }
 
@@ -230,18 +387,33 @@ pub fn walk_cache_scheduler(
             if !sched.step_io.is_empty() {
                 sched.complete_step_io(event_sink, state_sink)?;
             }
+            let unref_ids: Vec<CacheBlockId> = sched
+                .blocks
+                .iter()
+                .filter(|(id, b)| {
+                    b.present()
+                        && b.ref_count == 0
+                        && !sched.step_pins.contains(*id)
+                        && !sched.step_io.contains(*id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in unref_ids {
+                let _ = allow_precond(sched.drop_unreferenced(&id, event_sink, state_sink))?;
+            }
             if !sched.mem_pressure() {
                 break;
             }
-            if sched.evict_clean_or_unref_mem(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?.is_some() {
                 continue;
             }
             if sched.disk_used() >= cfg.disk_budget {
-                let _ = sched.reclaim_cold_disk(event_sink, state_sink);
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+                continue;
             }
-            if sched.start_cold_writeback(event_sink, state_sink).is_ok() {
+            if allow_precond(sched.start_cold_writeback(event_sink, state_sink))?.is_some() {
                 sched.complete_step_io(event_sink, state_sink)?;
-                let _ = sched.evict_clean_or_unref_mem(event_sink, state_sink);
+                let _ = allow_precond(sched.evict_clean_or_unref_mem(event_sink, state_sink))?;
             } else {
                 break;
             }
@@ -255,21 +427,45 @@ pub fn walk_cache_scheduler(
                     .collect();
                 for b in disk_blks {
                     if sched.mem_used() < cfg.mem_budget {
-                        let _ = sched.restore_block(ln, &b, event_sink, state_sink);
+                        let _ = allow_precond(sched.restore_block(ln, &b, event_sink, state_sink))?;
                     }
+                }
+                if !sched.start_state_ready(&sched.lanes[ln])
+                    && sched.state_mem_used() < sched.state_mem_budget()
+                {
+                    let _ = allow_precond(sched.restore_start_state(ln, event_sink, state_sink))?;
                 }
                 if CacheScheduler::lane_blocks_of(&sched.lanes[ln])
                     .iter()
                     .all(|b| sched.blocks[b].in_memory())
+                    && sched.start_state_ready(&sched.lanes[ln])
                 {
                     sched.finish_restore(ln, event_sink, state_sink)?;
                 }
             }
         }
 
+        for _ in 0..4 {
+            if !sched.state_mem_pressure() {
+                break;
+            }
+            if allow_precond(sched.evict_clean_start_state(event_sink, state_sink))?.is_some() {
+                continue;
+            }
+            if sched.state_disk_used() >= sched.state_disk_budget() {
+                let _ = allow_precond(sched.reclaim_cold_disk(event_sink, state_sink))?;
+            }
+            if allow_precond(sched.spill_start_state(event_sink, state_sink))?.is_none() {
+                break;
+            }
+        }
+
         for ln in &lanes {
-            if sched.lane_state(ln) == Some("Ready") && sched.lanes[ln].pos == sched.lanes[ln].target {
-                sched.finish_ready(ln, event_sink, state_sink)?;
+            if sched.lane_state(ln) == Some("Ready") {
+                let _ = sched.slide_window(ln, event_sink, state_sink)?;
+                if sched.lanes[ln].pos == sched.lanes[ln].target {
+                    sched.finish_ready(ln, event_sink, state_sink)?;
+                }
             }
         }
 

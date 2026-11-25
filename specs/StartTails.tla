@@ -15,9 +15,9 @@ EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Lanes, Capacity, B, W, Every, MaxPos, MaxSpan, MaxStarts,
           MaxGeneration, Bug
-ASSUME /\ Lanes \subseteq Nat /\ Capacity >= 2 /\ B > 0 /\ W > 0 /\ Every > 0
-       /\ MaxPos > B /\ MaxSpan > 0 /\ MaxStarts > 0 /\ MaxGeneration > 1
-       /\ Bug \in {"none", "unheld", "prune", "overread", "nozero"}
+ASSUME /\ Capacity >= 2 /\ B > 0 /\ W > 0 /\ Every > 0
+       /\ MaxPos > B /\ MaxSpan > 0 /\ MaxStarts >= 2 /\ MaxGeneration > 1
+       /\ Bug \in {"none", "unheld", "prune", "overread", "nozero", "stale", "badhead"}
 
 Kinds == {"full", "window"}
 Slots == 1..Capacity
@@ -26,6 +26,7 @@ Keys == Kinds \X Blocks
 StartIds == 1..MaxStarts
 Reasons == {"prompt", "every", "head"}
 NoLane == -1
+SymLanes == Permutations(Lanes)
 NoEntry == [slot |-> 0, generation |-> 0]
 EmptyTable == [k \in Keys |-> NoEntry]
 Zeros == [i \in 0..(B - 1) |-> 0]
@@ -173,7 +174,7 @@ Step(l, c) ==
 Finish(l) ==
  /\ running[l]
  /\ running' = [running EXCEPT ![l] = FALSE]
- /\ table' = [table EXCEPT ![l] = EmptyTable]
+ /\ table' = [table EXCEPT ![l] = IF Bug = "stale" THEN @ ELSE EmptyTable]
  /\ pos' = [pos EXCEPT ![l] = 0]
  /\ prompt' = [prompt EXCEPT ![l] = 0]
  /\ starts' = DropHead(starts, head[l])
@@ -184,7 +185,7 @@ Finish(l) ==
 Retire(i) ==
  /\ starts[i].live
  /\ starts' = [starts EXCEPT ![i] = Dead]
- /\ head' = [l \in Lanes |-> IF head[l] = i THEN 0 ELSE head[l]]
+ /\ head' = [l \in Lanes |-> IF Bug # "badhead" /\ head[l] = i THEN 0 ELSE head[l]]
  /\ UNCHANGED <<pool, table, pos, prompt, running, freed>>
 
 Next ==
