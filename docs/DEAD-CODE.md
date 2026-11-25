@@ -16,11 +16,18 @@ Every `allow(dead_code)` attribute in `src/` is audited against two independent 
 | `src/cache_scheduler.rs` | `#![allow(dead_code)]` | `trace-reference` | Standalone Layer 4 reference scheduler bound to `specs/CacheScheduler.tla` by `scripts/check-cache-traces.sh`. |
 | `src/cache_trace.rs` | `#![allow(dead_code)]` | `trace-reference` | Standalone TLA+ trace emitter consumed by `scripts/cache-traces.rs`. |
 | `src/scheduler.rs` | `#![allow(dead_code)]` | `trace-reference` | Layer 4 `ServeStepPlanner` and TLA+ reference helpers bound to `specs/CacheScheduler.tla` by `scripts/check-scheduler-traces.sh`. |
+| `src/scheduler/verify.rs` | `#![allow(dead_code)]` | `held-open-pr` | Bounded speculative verification planner, multi-token budget accounting, and greedy acceptance helpers consumed by `inky verify`, unit tests, and held for serving (`#42`, `#80`). |
 | `src/spill.rs` | `#![allow(dead_code)]` | `trace-reference` | Layer 4 `SpillStore` and `SpillPoolBackend` working-set reservation API consumed by `inky serve`, unit tests, and `scripts/serve-ownership-traces.rs`. |
 | `src/main.rs` | `mod blockbook;` | `trace-reference` | `BlockBook` reference model consumed by `scripts/blockbook-traces.rs` and `scripts/cache-traces.rs` (`EVERY` and `PROMPT` are live in `serve::block_cache`). |
 | `src/gguf.rs` | `AF(Vec<f64>),` | `kept-spec` | GGUF v3 binary metadata array variant populated by `read_val` (`ty == 12`). |
 | `src/gguf.rs` | `pub fn open_bytes(bytes: &[u8]) -> io::Result<Gguf> {` | `kept-api` | Anonymous-mapping in-memory GGUF parser entrypoint consumed by `fuzz/fuzz_targets/gguf_load.rs` and unit tests. |
 | `src/engine.rs` | `pub fn no_grp_dec(&self) -> bool { self.no_grp_dec.get() }` | `kept-api` | Symmetric accessor paired with `Engine::set_no_grp_dec`. |
+| `src/engine.rs` | `pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `SplitCount`, exercised by unit tests and `fixed_attn_batch`. |
+| `src/engine.rs` | `pub const fn split_scratch_slots(max_ctx: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `Slots`, exercised by unit tests and `fixed_attn_batch`. |
+| `src/engine.rs` | `pub const fn fixed_attn_batch(swa: bool, span_end: usize, max_ctx: usize) -> (usize, usize) {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `NSplit` & `Rows`, exercised by unit tests across sliding-window edge splits. |
+| `src/poolgate.rs` | `pub fn borrow_lane_ptrs(&self, ids: &[LaneId]) -> Vec<*const Lane> {` | `kept-api` | Raw lane pointer borrow helper on `Layer3Pool` exercised by unit tests. |
+| `src/verify.rs` | `pub struct FixedDraftProducer {` | `held-open-pr` | Deterministic `DraftProducer` implementation exercised by unit tests and held for speculative serving (`#42`, `#80`). |
+| `src/verify.rs` | `pub struct SamplerDraftProducer<'a> {` | `held-open-pr` | Stochastic `Sampler::draft` `DraftProducer` implementation held for speculative serving (`#42`, `#80`). |
 | `src/engine.rs` | `struct DSparkSpanDesc {` | `held-open-pr` | GPU descriptor for `k_dspark_reject`, exercised by `dspark_gpu_guards_and_rejection_sampling_gate` and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `struct DSparkRejectArgs {` | `held-open-pr` | Uniform argument block for `k_dspark_reject`, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `pub struct SpeculativeVerifySpan<'a> {` | `held-open-pr` | Per-span input to `Engine::verify_speculative_gpu`, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |

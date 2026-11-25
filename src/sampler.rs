@@ -1,5 +1,21 @@
 //! CPU sampler over the GPU logits: softcap -> top-k -> temperature -> top-p -> draw.
 
+pub(crate) fn checked_argmax(logits: &[f32]) -> Result<u32, &'static str> {
+    if logits.is_empty() {
+        return Err("model returned no logits");
+    }
+    let mut best = (0u32, f32::NEG_INFINITY);
+    for (i, &x) in logits.iter().enumerate() {
+        if !x.is_finite() {
+            return Err("model returned non-finite logits");
+        }
+        if x > best.1 {
+            best = (i as u32, x);
+        }
+    }
+    Ok(best.0)
+}
+
 pub struct Sampler {
     pub temp: f32,
     pub top_k: usize,
@@ -637,6 +653,109 @@ mod tests {
             let want_tok = sample_full_sort_ref(&row, temp, top_k, top_p, softcap, &mut ref_state);
             assert_eq!(got_tok, want_tok, "row {row_idx} sampled token mismatch");
             assert_eq!(sampler.state, ref_state, "row {row_idx} RNG state mismatch");
+        }
+    }
+
+    #[test]
+    fn checked_sampling_rejects_invalid_rows_without_advancing_rng() {
+        let mut sampler = Sampler::new(0.5, 64, 1.0, 0.0, 7);
+        let before = sampler.state;
+        for row in [
+            &[][..],
+            &[1.0, f32::NAN],
+            &[f32::INFINITY, 2.0],
+            &[2.0, f32::NEG_INFINITY],
+        ] {
+            assert!(checked_argmax(row).is_err());
+            assert!(sampler.sample_next(row).is_err());
+            assert_eq!(sampler.state, before);
+        }
+        assert_eq!(checked_argmax(&[0.0, 2.0, 2.0]), Ok(1));
+        assert!(sampler.sample_next(&[1.0, 2.0]).is_ok());
+    }
+
+    #[test]
+    fn speculative_verification_matches_direct_sampling_at_topk_ties_and_controls() {
+        const DRAWS: usize = 10_000;
+        // 1. Tied top_k=3 boundary: token 1 leads (1.5), tokens 2, 3, 4, 5 tie at 0.9.
+        //    Shared `(logit_desc, token_id_asc)` ordering must admit {1, 2, 3} and assign
+        //    strictly zero probability to tokens 0, 4, and 5 in BOTH direct sampling and
+        //    draft + verify_round, even when the draft model heavily favors tokens 4 and 5!
+        let target_tied = [0.2f32, 1.5, 0.9, 0.9, 0.9, 0.9];
+        let draft_adversarial = [0.1f32, 0.4, 0.5, 0.6, 2.4, 2.3];
+        let mut direct_tied = [0usize; 6];
+        let mut spec_tied = [0usize; 6];
+        let mut direct_s = Sampler::new(0.8, 3, 1.0, SOFTCAP, 0xA11C_5EED);
+        let mut draft_s = Sampler::draft(0.8, 6, 1.0, SOFTCAP, 0xB0BB_5EED);
+        let mut verify_s = Sampler::new(0.8, 3, 1.0, SOFTCAP, 0xB0BB_5EED);
+        for _ in 0..DRAWS {
+            let d = direct_s.sample_next(&target_tied).unwrap() as usize;
+            direct_tied[d] += 1;
+            let proposed = draft_s.sample_next(&draft_adversarial).unwrap();
+            let accepted = verify_s.verify_round(
+                &[proposed],
+                &[&target_tied, &target_tied],
+                &[&draft_adversarial],
+            );
+            spec_tied[accepted[0] as usize] += 1;
+        }
+        for excluded in [0usize, 4, 5] {
+            assert_eq!(direct_tied[excluded], 0, "direct sampled excluded tied token {excluded}");
+            assert_eq!(spec_tied[excluded], 0, "speculative verify sampled excluded tied token {excluded}");
+        }
+        assert!(direct_tied[2] > 1_000 && direct_tied[3] > 1_000);
+        for tok in 0..6 {
+            let p_dir = direct_tied[tok] as f64 / DRAWS as f64;
+            let p_spec = spec_tied[tok] as f64 / DRAWS as f64;
+            assert!(
+                (p_dir - p_spec).abs() < 0.025,
+                "tied histogram mismatch at token {tok}: direct={p_dir:.4} vs spec={p_spec:.4}"
+            );
+        }
+
+        // 2. Untied top_k=3 control across 10,000 draws.
+        let target_untied = [0.2f32, 1.5, 1.1, 0.8, 0.4, 0.1];
+        let mut direct_untied = [0usize; 6];
+        let mut spec_untied = [0usize; 6];
+        for _ in 0..DRAWS {
+            direct_untied[direct_s.sample_next(&target_untied).unwrap() as usize] += 1;
+            let proposed = draft_s.sample_next(&draft_adversarial).unwrap();
+            let accepted = verify_s.verify_round(
+                &[proposed],
+                &[&target_untied, &target_untied],
+                &[&draft_adversarial],
+            );
+            spec_untied[accepted[0] as usize] += 1;
+        }
+        for excluded in [0usize, 4, 5] {
+            assert_eq!(direct_untied[excluded], 0);
+            assert_eq!(spec_untied[excluded], 0);
+        }
+        for tok in 0..6 {
+            let p_dir = direct_untied[tok] as f64 / DRAWS as f64;
+            let p_spec = spec_untied[tok] as f64 / DRAWS as f64;
+            assert!(
+                (p_dir - p_spec).abs() < 0.025,
+                "untied histogram mismatch at token {tok}: direct={p_dir:.4} vs spec={p_spec:.4}"
+            );
+        }
+
+        // 3. Zero-temperature & near-zero temperature controls on tied and untied rows:
+        //    lowest token ID wins deterministically across direct sampling, greedy verify, and near-zero verify_round.
+        let mut z_direct = Sampler::new(0.0, 3, 1.0, SOFTCAP, 42);
+        let mut nz_verify = Sampler::new(1e-6, 3, 1.0, SOFTCAP, 99);
+        for (row, want_winner) in [
+            (&[0.0f32, 2.0, 2.0, 2.0][..], 1u32),
+            (&[0.0f32, 1.0, 3.0, 2.0][..], 2u32),
+        ] {
+            assert_eq!(checked_argmax(row), Ok(want_winner));
+            assert_eq!(z_direct.sample_next(row), Ok(want_winner));
+            for cand_draft in 0..4u32 {
+                let g = crate::scheduler::accept_greedy(&[cand_draft], &[want_winner, want_winner], &[]);
+                assert_eq!(g.emitted[0], want_winner);
+                let out = nz_verify.verify_round(&[cand_draft], &[row, row], &[row]);
+                assert_eq!(out[0], want_winner);
+            }
         }
     }
 }

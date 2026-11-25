@@ -893,8 +893,42 @@ impl<'a> Layer3Pool<'a> {
         let cb = self.eng.gpu.cmd();
         self.eng.encode_decode(&cb, &sp, true, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        crate::metal::wait_completed(&cb, "poolgate bench_decode", spans[0].1).unwrap();
         (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
+    }
+
+    /// Borrow raw `*const Lane` pointers for live `ids` (caller must not re-allocate `self.lanes` while live).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn borrow_lane_ptrs(&self, ids: &[LaneId]) -> Vec<*const Lane> {
+        let v = self.lanes.borrow();
+        ids.iter()
+            .map(|&id| &v[id].as_ref().expect("live lane").lane as *const Lane)
+            .collect()
+    }
+
+    /// Return `(live_full_bytes, live_window_bytes, total_pool_slab_bytes)` currently held in `BlockPools`.
+    pub fn kv_memory_bytes(&self) -> (usize, usize, usize) {
+        use objc2_metal::MTLBuffer;
+        let pools = self.eng.block_pool().borrow();
+        let live_of = |pool: &crate::blocks::BlockPool| -> usize {
+            let stride = pool.stride_bytes() as usize;
+            let mut count = 0usize;
+            for i in 1..=(pool.len() as u32) {
+                let s = Slot::new(i).unwrap();
+                if pool.record(s).unwrap().refs() > 0 {
+                    count += 1;
+                }
+            }
+            count * stride
+        };
+        let slab_of = |pool: &crate::blocks::BlockPool| -> usize {
+            pool.gpu_slabs().into_iter().map(|b| b.length()).sum()
+        };
+        (
+            live_of(&pools.full),
+            live_of(&pools.window),
+            slab_of(&pools.full) + slab_of(&pools.window),
+        )
     }
 
     pub fn shutdown(&self) {

@@ -4,15 +4,58 @@ use super::*;
 #[test]
 fn disk_staging_holds_each_fixed_split_through_a_resize_interval() {
     for max_ctx in [65_536, 131_072, 131_073, 262_145] {
-        // A small cache forces staging to grow to fit a complete Full split.
-        // The second interval straddles the old 32,768-token failure.
-        for start in [64usize, 32_760] {
+        // Check every 64-position resize interval across the entire 64..=65,536 span,
+        // including the 32,760 -> 32,768 -> 32,824 boundary (`t-audit-engine-disk-split-window`).
+        for start in (64usize..=65_536).step_by(64) {
+            let cache_bytes = (40 * start.min(EXT) + 8 * start) * REC;
+            let half = Run::tier_staging(cache_bytes, max_ctx) / 2 / REC;
+            for pos in [start, start + 7, start + 8, start + 31, start + 63] {
+                if pos >= max_ctx {
+                    continue;
+                }
+                for swa in [true, false] {
+                    let (_, kps, _, _) = decode_split_grid(swa, pos, max_ctx);
+                    assert!(kps <= half, "position={pos} max_ctx={max_ctx} swa={swa}");
+                }
+            }
+        }
+        // Dense per-position check across [32_704..32_896).
+        for start in [32_704usize, 32_760, 32_768, 32_824, 32_832] {
             let cache_bytes = (40 * start.min(EXT) + 8 * start) * REC;
             let half = Run::tier_staging(cache_bytes, max_ctx) / 2 / REC;
             for pos in start..start + 64 {
                 for swa in [true, false] {
                     let (_, kps, _, _) = decode_split_grid(swa, pos, max_ctx);
                     assert!(kps <= half, "position={pos} max_ctx={max_ctx} swa={swa}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_attn_batch_fits_every_row_in_the_arena() {
+    // Production constants check corresponding to `specs/SplitArena.tla` (`t-audit-pr53-port`).
+    for max_ctx in [128usize, 1024, 4096, 32_768, 65_536, 131_072, 262_144] {
+        let slots = split_scratch_slots(max_ctx);
+        let arena_limit = NH * slots;
+        for swa in [true, false] {
+            let kps = if swa { 64 } else { 256 };
+            for &span_end in &[1usize, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096, max_ctx] {
+                if span_end > max_ctx {
+                    continue;
+                }
+                let (nsplit, rows) = fixed_attn_batch(swa, span_end, max_ctx);
+                assert!(rows >= 1, "swa={swa} span_end={span_end} max_ctx={max_ctx}: rows must be >= 1");
+                assert!(rows * NH * nsplit <= arena_limit, "writes exceed arena_limit");
+                // Check edge-row visibility at `r_end = span_end` and `r_end = 1025` if in range.
+                for r_end in [span_end, 1025.min(span_end)] {
+                    let first = if swa && r_end > EXT { r_end - EXT } else { 0 };
+                    let visible_splits = fixed_split_count(first, r_end, kps);
+                    assert!(
+                        visible_splits <= nsplit,
+                        "swa={swa} r_end={r_end} max_ctx={max_ctx}: visible_splits {visible_splits} > reserved {nsplit}"
+                    );
                 }
             }
         }
@@ -42,6 +85,22 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
     };
     assert!(want.iter().all(|x| x.is_finite()));
 
+    // 1. Multi-lane paged candidate (`Layer3Pool` with 2 lanes sharing the prefill step).
+    {
+        let paged_multi = Layer3Pool::new(&eng, 2);
+        let p_long = paged_multi.new_lane(&long_tokens, 128);
+        let p_short = paged_multi.new_lane(&short_tokens, 128);
+        paged_multi.prefill(&[(p_short, 0, prefix)]);
+        paged_multi.prefill(&[(p_long, 0, long_tokens.len()), (p_short, prefix, append)]);
+        let got_paged = paged_multi.logits(1);
+        assert_eq!(got_paged.len(), want.len());
+        assert!(
+            got_paged.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "paged multi-lane logits must match the independent solo lane"
+        );
+    }
+
+    // 2. Multi-lane private Layer 2 candidate (`Layer2` with 2 lanes sharing `sk`/`sv` scratch).
     let private = Layer2::new(&eng, 2);
     let long = private.new_lane(&long_tokens, 128);
     let short = private.new_lane(&short_tokens, 128);
@@ -52,7 +111,8 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
     assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
             "private multi-lane logits must match the independent paged lane");
 
-    // Inspect both K and V after the final private sliding-window layer.
+    // Inspect both K and V across all NKV=8 head groups (serving all NH=24 query heads)
+    // after the final private sliding-window layer.
     let batch = eng.ba.get();
     let stride = EXT + batch.cap + 2 * KGUARD;
     let row_bytes = HD * eng.kvb;
@@ -63,10 +123,89 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
             let first = base as usize * 4 + (group * stride + EXT + KGUARD) * row_bytes;
             let live_end = first + append * row_bytes;
             let tile_end = live_end + 63 * row_bytes;
-            assert!(bytes[first..live_end].iter().any(|&b| b != 0));
+            assert!(bytes[first..live_end].iter().any(|&b| b != 0), "group {group} live rows empty");
             assert!(bytes[live_end..tile_end].iter().all(|&b| b == 0),
-                    "masked scratch rows still hold the previous private lane's values");
+                    "group {group}: masked scratch rows still hold the previous private lane's values");
         }
+    }
+}
+
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+fn debug_single_token_decode_native_checkpoint() {
+    // `t-audit-engine-q8-debug`: single-token decode on the native checkpoint with debug_assertions
+    // active (validating `Engine::seg` Q8_0 / Q6_K / Q4_K geometry and finite logits on M5).
+    let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+    let eng = Engine::load(&model, 128);
+    let lane = Lane::new(&eng);
+    let run = eng.on(&lane);
+    run.reserve(16, false);
+    run.set_tokens(0, &[1, 42]);
+    let cb = eng.gpu.cmd();
+    run.encode_step(&cb, 0, true, true);
+    cb.commit();
+    crate::metal::wait_completed(&cb, "debug decode", 0).unwrap();
+    let lg = run.logits();
+    assert_eq!(lg.len(), eng.n_vocab);
+    assert!(lg.iter().all(|x| x.is_finite()));
+    assert!((run.token_at(1) as usize) < eng.n_vocab);
+}
+
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+fn disk_tier_matches_resident_logits_across_32k_staging_resize_transition() {
+    // `t-audit-engine-disk-split-window`: prefill 32,756 tokens at ctx=65,536 and compare
+    // `--kv-disk` vs resident fp16 decode logits bit-for-bit across positions 32,756..=32,832
+    // (straddling 32,760, the 32,768 split growth, and the 32,824 staging resize).
+    let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+    let ctx = 65_536usize;
+    let pf_len = 32_756usize;
+    let end_pos = 32_832usize;
+    let toks: Vec<u32> = (0..=end_pos + 2).map(|i| ((i * 31 + 17) % 2048 + 10) as u32).collect();
+    let eng = Engine::load(&model, ctx);
+    eng.ensure_batch(eng.chunk);
+
+    let run_trajectory = |use_disk: bool| -> (Vec<u64>, u64) {
+        KV_DISK.store(use_disk, std::sync::atomic::Ordering::Relaxed);
+        let lane = Lane::new(&eng);
+        KV_DISK.store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = eng.on(&lane);
+        r.reserve(end_pos + 4, false);
+        r.set_tokens(0, &toks);
+        let mut p0 = 0usize;
+        while p0 < pf_len {
+            let t = (pf_len - p0).min(eng.chunk);
+            let cb = eng.gpu.cmd();
+            r.encode_prefill(&cb, p0, t, false, false);
+            cb.commit();
+            crate::metal::wait_completed(&cb, "32k prefill", p0).unwrap();
+            p0 += t;
+        }
+        let mut hashes = Vec::with_capacity(end_pos - pf_len + 1);
+        for pos in pf_len..=end_pos {
+            r.gen_reserve(pos);
+            r.step(pos, true, false).wait(pos).unwrap();
+            let lg = r.logits();
+            assert!(lg.iter().all(|x| x.is_finite()), "non-finite logit at pos={pos} disk={use_disk}");
+            let h = lg.iter().fold(0xcbf29ce484222325u64, |acc, x| {
+                (acc ^ u64::from(x.to_bits())).wrapping_mul(0x100000001b3)
+            });
+            hashes.push(h);
+        }
+        let read_bytes = r.tier_io().0;
+        (hashes, read_bytes)
+    };
+
+    let (res_hashes, res_io) = run_trajectory(false);
+    let (dsk_hashes, dsk_io) = run_trajectory(true);
+    assert_eq!(res_io, 0);
+    assert!(dsk_io > 0, "expected --kv-disk to read cold blocks across 32,756..=32,832");
+    for (idx, (&hr, &hd)) in res_hashes.iter().zip(&dsk_hashes).enumerate() {
+        let pos = pf_len + idx;
+        assert_eq!(
+            hd, hr,
+            "--kv-disk logit bits diverged from resident cache at pos={pos} ({hd:016x} != {hr:016x})"
+        );
     }
 }
 
