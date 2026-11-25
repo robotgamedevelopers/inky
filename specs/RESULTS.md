@@ -1,247 +1,171 @@
-# TLC results
+# TLC and trace-conformance results
 
-Run on the designated `mini-m5` bench, 2026-11-23 16:29 UTC, with TLC 2.19
-(revision `5a47802`), Eclipse Temurin Java 21.0.12.1, one TLC worker, a 4 GiB maximum heap
-and Parallel GC. Times below are wall time including JVM startup, measured by
-`run_tlc.zsh`. The healthy state spaces were exhausted; negative runs stopped at
-the first specified invariant violation. Counts for negative runs can vary with
-TLC traversal order.
+Measured on a 64-core `x86_64` Linux bench (Eclipse Adoptium OpenJDK
+`21.0.12.1`, pinned TLA+ `v1.8.0` `tla2tools.jar` SHA-256
+`fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713`, TLC `2026.11.19`
+rev `bc1b506`), 2026-11-25 UTC. Wall seconds include JVM startup. Positive runs
+exhausted their reachable state graphs (`0 states left on queue`, `No error has been found.`);
+reversed witnesses stopped on their exact expected invariant, action-property, or
+temporal violation.
 
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| BlockLayout3 | 2,879 | 1,612 | 0.661 | PASS |
-| BlockLayout4 | 30,908 | 15,182 | 1.730 | PASS |
-| BlockLayoutHigh | 30,908 | 15,182 | 1.709 | PASS |
-| BlockLayoutKv8 | 2,879 | 1,612 | 0.551 | PASS |
-| StaleEntry | 423 | 248 | 0.444 | GenerationMatches violated |
-| WindowOffByOne | 4,955 | 2,552 | 0.721 | WindowCovered violated |
-| SpanTooSmall | 116 | 67 | 0.381 | SpanPinned violated |
-| StartReleased | 795 | 492 | 0.482 | StartRetained violated |
-| Truncate32 | 8 | 8 | 0.368 | Address64 violated |
-| SpanPins512 | 66 | 65 | 0.300 | PASS |
-| SpanPins17 | 2 | 2 | 0.271 | Covered violated |
+## CI tier placement (`scripts/check-tla-tiers.sh`)
 
-Runner negative controls: an empty successful process (`TLC_JAVA=/usr/bin/true`)
-and a failed process (`TLC_JAVA=/usr/bin/false`) were both rejected.
+`scripts/check-tla-tiers.sh` and `scripts/check-tla-tiers.sh --self-test` verify that
+every `.cfg` file, runner entry, trace script, and trace mutation sits in **exactly one**
+CI tier:
 
-`InBlock` on mini-m5, 2026-11-24T05:03Z, by `run_tlc.zsh`: TLC 2.19 (revision `5a47802`), Eclipse Adoptium 21.0.12.1, one worker, a 4 GiB maximum heap (the log reports 3641MB). Wall seconds include JVM startup. The machine clock on the log lines is 2026-11-24 00:03. The action walks the 48 coordinates in order and records each stored address, so the healthy runs are one path of 48 states.
+- **Total**: `143` checks and mutants (`107` per pull request in `.github/workflows/ci.yml`,
+  `36` nightly in `.github/workflows/nightly.yml`), `0` gaps, `0` duplicates.
+- **Self-test**: all `9` planted faults (`PoisonGate4` dropped, `StaleSaved` dropped,
+  `skip-keep` mutant dropped, matrix with no runner, disabled TLA job, `memmode` part
+  unscheduled, `memmode` scheduled in both tiers, unwired `check-planted-traces.sh`, and
+  `traces` dropped from `ci.yml`) failed red with their expected `TIER LOST` / `TIER GAP` /
+  `TIER DUP` diagnostics.
 
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| InBlock | 49 | 48 | 0.717 | PASS |
-| InBlockKv8 | 49 | 48 | 0.712 | PASS |
-| InBlockMajor | 2 | 2 | 0.685 | Ordered violated |
-| InBlockMajorCollide | 5 | 5 | 0.684 | NoCollision violated |
-| InBlockAddrCol | 5 | 5 | 0.658 | NoCollision violated |
-| InBlockTrace | 49 | 48 | 0.669 | PASS |
-| InBlockTraceKv8 | 49 | 48 | 0.695 | PASS |
+## `memmode` PR part (`scripts/check-tla.sh memmode`)
 
-InBlockMajor state 2 is `p = 0`, `k = 0`, `h = 0`, `i = 1`, `addr = 48`, `seen = <<0, 48>>`. The position-major step is `index * (stride / B)`, which is 48 there, and `Formula` is 4. `Ordered` compares the stored address to `Formula`, which the action does not call. InBlockMajorCollide state 5 is `p = 0`, `k = 0`, `h = 1`, `i = 0`, `addr = 0`, `seen = <<0, 48, 96, 144, 0>>`. InBlockAddrCol drops the head term and reaches the same coordinate with `seen = <<0, 4, 8, 12, 0>>`. Both are reached states, each log has two `Error:` lines, and `NoCollision` reads `seen`. The trace files were regenerated from `key_row_at` before this run. The earlier head-term witness is retired.
+10 runs in parallel (`-Xmx2g`, 1 worker per JVM):
 
-Inspected counterexamples:
+| Run | Expected result | Verdict |
+| --- | --- | --- |
+| `MemMode` | Exhaustive safety + `EventuallyRestored` | PASS |
+| `RestoreDefault` | `Invariant RestoredWhenIdle is violated.` | Expected violation |
+| `ReleaseEarly` | `Invariant RaisedWhileConnected is violated.` | Expected violation |
+| `NoPersist` | `Invariant RestoredWhenIdle is violated.` | Expected violation |
+| `LostSeed` | `Invariant SavedIsOwner is violated.` | Expected violation |
+| `StaleSaved` | `Invariant RestoredWhenIdle is violated.` | Expected violation |
+| `StaleSavedOwed` | `Invariant SavedIsOwed is violated.` | Expected violation |
+| `NoRollback` | `Invariant RefusedRollbackSafe is violated.` | Expected violation |
+| `NoRollbackAttempted` | `Invariant RollbackAttempted is violated.` | Expected violation |
+| `UnfairRestart` | `Temporal property EventuallyRestored was violated.` | Expected temporal violation |
 
-- **StaleEntry, state 10:** lane `a` is done with window table entry
-  `(slot=1,generation=1)`; lane `b` allocates window slot 1 at generation 2.
-- **WindowOffByOne, state 15:** lane `a` is idle at position 3. Logical window
-  block 0 has been cleared from its table, although written position 1 lies in it.
-- **SpanTooSmall, state 5:** lane `a` starts a two-token span with budget 2;
-  the specified conservative bound is 3.
-- **StartReleased, state 12:** start point 2 still refers to window slot 1 at
-  generation 1; the pool slot has generation 2 and length 0 after lane `a`
-  allocates it. The start point's full slot remains generation 1 and length 2.
-- **SpanPins17, state 2:** offset 63, pinned blocks `{0,...,16}`, required blocks
-  `{0,...,24}`. The healthy run covers all 64 offsets and checks maximum 25.
+## `blocks` PR part (`scripts/check-tla.sh blocks`)
 
-These runs establish only the bounds and abstractions in [README.md](README.md).
-They do not establish engine trace conformance, general integer-overflow safety,
-allocator-policy independence, or scheduler liveness.
-
-## Grouped layout
-
-On mini-m5, the CI entry point `scripts/check-tla.sh` ran the grouped traversal
-with the pinned v1.8.0 tools jar and one TLC worker. The three-slot run covers
-62 initial snapshots and the four-slot run covers 136. Both exhaust the graph
-with deadlock checking enabled. Times include JVM startup.
+66 runs via `specs/run_tlc.zsh` (`16` single-worker JVMs at a time, `48.8 s` total wall):
 
 | Run | Generated states | Distinct states | Wall seconds | Result |
 | --- | ---: | ---: | ---: | --- |
-| GroupedLayout3 | 579 | 485 | 0.425 | PASS |
-| GroupedLayout4 | 1,553 | 1,329 | 0.509 | PASS |
-| LocalMatch | 1,007 | 981 | 0.392 | VisitedKeys violated |
-| DonorWindow | 361 | 343 | 0.336 | VisitedKeys violated |
-| TilePartial | 357 | 339 | 0.325 | OrderedPartials violated |
-| Restage | 149 | 149 | 0.335 | StagedOnce violated |
-| StalledTraversal | 195 | 195 | 0.397 | TraversalCompletes violated |
+| `PrefixTreeFast` | 232,383 | 10,588 | 48.203 | PASS |
+| `PrefixTreeEvictFast` | 295,009 | 12,916 | 48.452 | PASS |
+| `PrefixTreeShallow` | 6,370 | 3,944 | 7.447 | `DeepestStart` violated |
+| `PrefixTreeStale` | 251,406 | 54,986 | 38.644 | `ResultLive` violated |
+| `PrefixTreeFirstToken` | 3,787 | 2,464 | 3.143 | `MatchExact` violated |
+| `PrefixTreeAnyParent` | 126 | 121 | 2.152 | `ResultIsStart` violated |
+| `PrefixTreePartial` | 28 | 28 | 2.290 | `StartOnBoundary` violated |
+| `PrefixTreeLeak` | 152,792 | 39,822 | 30.696 | `RefsSettledAfterSeek` violated |
+| `PrefixTreeReuseHeld` | 3,874 | 2,459 | 3.182 | `HeldNeverStale` violated |
+| `PrefixTreeStaleInsert` | 26 | 26 | 1.801 | `NoBadInsert` violated |
+| `PrefixTreeTrace` | 67 | 62 | 3.163 | PASS |
+| `BlockLayout3` | 11,106 | 5,788 | 13.754 | PASS |
+| `BlockLayout4` | 33,876 | 16,544 | 23.042 | PASS |
+| `BlockLayoutHigh` | 33,876 | 16,544 | 21.255 | PASS |
+| `BlockLayoutKv8` | 33,876 | 16,544 | 23.299 | PASS |
+| `StaleEntry` | 741 | 426 | 4.294 | `GenerationMatches` violated |
+| `WindowOffByOne` | 605 | 347 | 4.922 | `WindowCovered` violated |
+| `FullDropped` | 4,955 | 2,552 | 12.565 | `FullCovered` violated |
+| `SpanTooSmall` | 317 | 221 | 7.995 | `SpanPinned` violated |
+| `StartReleased` | 1,862 | 1,097 | 7.748 | `StartRetained` violated |
+| `TailNotZeroed` | 741 | 426 | 9.430 | `TailPrivateZero` violated |
+| `WrongTableIndex` | 510 | 293 | 7.767 | `TableIndex` violated |
+| `Truncate32` | 8 | 8 | 8.339 | `Address64` violated |
+| `SlotOverlap` | 95 | 57 | 4.808 | `Address64` violated |
+| `SlabWord` | 8,330 | 570 | 4.939 | PASS |
+| `SlabWordKv8` | 8,330 | 570 | 4.982 | PASS |
+| `SlabWordUnmasked` | 13 | 13 | 5.469 | `ShaderPtrResolves` violated |
+| `SlabWordWrongBind` | 14 | 14 | 4.647 | `ShaderPtrResolves` violated |
+| `SlabWordOverflow` | 6 | 6 | 3.702 | `NoOffsetClobbersSlab` violated |
+| `SlabWordFifthSlab` | 81 | 23 | 4.384 | `SlabCountBounded` violated |
+| `BlockedSlab3` | 42,319 | 10,431 | 15.115 | PASS |
+| `BlockedSlab4` | 41,333 | 10,416 | 13.770 | PASS |
+| `BlockedSlabFlatGrow` | 63 | 38 | 3.793 | `SyncedMatchesCpu` violated |
+| `BlockedSlabNoReuseZero` | 196 | 103 | 4.747 | `CleanSlotZeroed` violated |
+| `BlockedSlabMissedDirty` | 69 | 29 | 4.224 | `SyncedMatchesCpu` violated |
+| `VecAlloc10` | 110 | 109 | 4.279 | PASS |
+| `VecAlloc7` | 110 | 109 | 3.540 | PASS |
+| `VecAlloc6` | 63 | 63 | 3.521 | `NoPoolExhaustion` violated |
+| `VecAllocUnpinnedWeak` | 51 | 51 | 3.193 | `NeverOverwritesLive` violated |
+| `VerifyRollback` | 10,915 | 3,819 | 3.812 | PASS |
+| `VerifyOffByOneCs` | 44 | 44 | 1.842 | `ConvMatchesSequential` violated |
+| `VerifyKeepRejectedKv` | 44 | 44 | 1.800 | `RejectedTailRestored` violated |
+| `VerifySealRejected` | 4 | 4 | 1.751 | `NoRejectedSeal` violated |
+| `KvDiskTier` | 82 | 43 | 1.674 | PASS |
+| `KvDiskNoOverlap` | 3 | 3 | 1.516 | `SplitBoundaryAligned` violated |
+| `KvDiskStagingRace` | 24 | 18 | 1.593 | `StagingHalfSafe` violated |
+| `SwaRing` | 96 | 30 | 1.452 | PASS |
+| `SwaRingShortWriteback` | 3 | 3 | 1.223 | `RingHoldsExactWindow` violated |
+| `SpanPins512` | 66 | 65 | 1.382 | PASS |
+| `SpanPins17` | 2 | 2 | 1.301 | `Covered` violated |
+| `SpanPinsOverBound` | 2 | 2 | 1.203 | `BoundHolds` violated |
+| `SpanPinsMax24` | 65 | 65 | 1.546 | `MaximumIs25` violated |
+| `StartTails2` | 135,945 | 28,946 | 26.030 | PASS (`SYMMETRY SymLanes`, `MaxPos=6, MaxStarts=2`) |
+| `LaneStaleGen` | 148 | 64 | 1.860 | `LaneCovered` violated |
+| `UnheldWindow` | 4,179 | 1,578 | 4.729 | `StartRetained` violated |
+| `PrunedUnderStart` | 21,185 | 7,100 | 6.803 | `StartRetained` violated |
+| `TailOverread` | 14 | 14 | 1.930 | `ReadsWritten` violated |
+| `ReuseNotZeroed` | 3,147 | 1,242 | 4.433 | `TailPrivateZero` violated |
+| `DanglingHead` | 724 | 230 | 2.832 | `HeadsConsistent` violated |
+| `InBlock` | 49 | 48 | 1.758 | PASS |
+| `InBlockKv8` | 49 | 48 | 1.833 | PASS |
+| `InBlockMajor` | 2 | 2 | 1.883 | `Ordered` violated |
+| `InBlockMajorCollide` | 5 | 5 | 1.511 | `NoCollision` violated |
+| `InBlockAddrCol` | 5 | 5 | 1.223 | `NoCollision` violated |
+| `InBlockTrace` | 1,489 | 1,488 | 2.031 | PASS |
+| `InBlockTraceKv8` | 1,489 | 1,488 | 2.085 | PASS |
 
-A test copy with a three-key split and a two-key tile was rejected by the
-divisibility assumption before exploring any states.
+## `grouped` PR part (`scripts/check-tla.sh grouped`)
 
-### Fairness witness and negative control in CI
-
-Run on the `hetzner1` bench (AMD Ryzen 7 PRO 8700GE), 2026-11-24 01:58 UTC, through
-`specs/run_tlc.zsh` with the pinned v1.8.0 tools jar (TLC reports
-2026.11.19, rev `bc1b506`), OpenJDK 21.0.12.1, one TLC worker. Times include JVM
-startup. The whole `run_tlc.zsh` list, all 17 runs, took 27.0 seconds.
-
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| GroupedLayout3 | 579 | 485 | 1.157 | PASS |
-| GroupedLayout4 | 1,553 | 1,329 | 1.676 | PASS |
-| StalledTraversal | 195 | 195 | 1.098 | TraversalCompletes violated |
-| AdvanceUnfair | 579 | 485 | 1.144 | TraversalCompletes violated |
-| RestageOutputs | 18,231 | 13,611 | 1.592 | PASS (expected) |
-
-`StalledTraversal` disables Advance, so the stalled state has no successor and
-weak fairness holds trivially. It cannot tell whether the spec has fairness at
-all. It stays because it is the witness for a lost enabling condition, which no
-fairness can repair.
-
-`AdvanceUnfair` keeps every action and keeps deadlock checking on, so TLC confirms
-that a step exists in every reachable state. Weak fairness covers staging only.
-Its counterexample, inspected: lengths `<<1, 1>>`, nothing shared, no window, one
-tile. State 3 has staged both private slots, so `loaded = Requests` and
-`tile = 0 < TileCount = 1`: Advance is enabled. State 4 stutters forever.
-
-Deleting `WF_vars(FairWork)` from `Spec` in a scratch copy made the healthy
-`GroupedLayout3` run fail with `TraversalCompletes` violated (485 distinct states,
-stuttering at state 4). The healthy runs check the property, so CI catches that
-deletion.
-
-`RestageOutputs` is the negative control that was run by hand before. It runs the
-redundant-load mutant against `VisitedKeys` and `OrderedPartials` only, at four
-slots, and the runner requires a clean exhaustive pass. `Restage` in the same list
-shows that the mutant is live. At three slots the same configuration covers
-2,887 distinct states, the count of the earlier hand run.
-
-Runner checks, by scratch copies: with `RestageOutputs` set to the `localMatch`
-mutant, and with `AdvanceUnfair` set to `Bug = "none"`, `run_tlc.zsh` stopped
-with "Unexpected result" for that run.
-
-### Time budget of the CI TLA step
-
-`scripts/check-tla.sh` on hetzner1, 2026-11-24, with every runner: 355 seconds.
-The CacheScheduler runner took about 305 of them; its DecodePriority run alone
-took 177 seconds (2,210,338 states). On the hosted macOS runner the same step
-took 4 min 58 s for pull request #43. That breaks the two-minute budget, so
-pull request CI no longer runs the CacheScheduler runner. The nightly workflow
-`.github/workflows/nightly.yml` runs everything with `TLA_NIGHTLY=1`. No
-configuration, bound or check was changed. The pull request tier (MemMode, the
-production traces, and all 17 `run_tlc.zsh` runs) took 49.5 seconds on hetzner1.
-
-## Start points and tails
-
-On hetzner1 (16-core x86_64, Linux), 2026-11-24, with the pinned v1.8.0 tools jar
-(SHA-256 `fdffef24…6713`), Eclipse Temurin Java 21.0.12.1, one TLC worker, a
-4 GiB maximum heap and Parallel GC. Times are wall time including JVM startup.
-
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| StartTails2 | 58,565 | 12,907 | 4.5 | PASS |
-| UnheldWindow | 2,023 | 780 | 2.2 | StartRetained violated |
-| PrunedUnderStart | 9,522 | 3,145 | 2.8 | StartRetained violated |
-| TailOverread | 10 | 10 | 0.9 | ReadsWritten violated |
-| ReuseNotZeroed | 1,449 | 584 | 1.9 | TailPrivateZero violated |
-| StartTails3 (nightly, `TLC_NIGHTLY=1`) | 1,800,308 | 372,626 | 61.2 | PASS |
-
-StartTails3, three slots per kind, takes about a minute on one worker, so the
-runner checks it only with `TLC_NIGHTLY=1`, which the nightly workflow's `tla` job
-sets; per push, StartTails2 covers two slots per kind.
-
-Inspected counterexamples:
-
-- **UnheldWindow, state 7:** lane 1 (prompt 2) steps to 2 and keeps a prompt
-  point holding full and window slot 1 at generation 1, then finishes. The
-  point does not hold its window slot, so lane 0 takes window slot 1 at
-  generation 2 for its block 0.
-- **PrunedUnderStart, state 9:** lane 1 keeps the same prompt point at 2, steps
-  to 4 and prunes window block 0, which releases window slot 1 outright
-  (`freed = {<<"window", 1>>}`). After lane 1 finishes, lane 0 takes window slot
-  1 at generation 2 while the live point holds generation 1.
-- **TailOverread, state 3:** lane 0 at position 0 allocates block 0; attention
-  would read one position of it, its length is 0.
-- **ReuseNotZeroed, state 7:** lane 0 writes position 0 and finishes, dropping
-  its tail; the next request takes the same slot at generation 2 with length 0
-  and position 0 still 1.
-
-`scripts/check-blockbook-traces.sh` (CI, after the memmode traces): the
-unmodified `src/blockbook.rs` records 20 walks, 1,006 distinct replayed states,
-reaching every case listed in README.md (19 resumed lanes, 204 reused slots, 15
-windows pruned under a live point, 137 partial tail reads, 76 retired points, 29
-finished tails, 24 prompt and 36 every points, 1,214 refused allocations), and
-TLC finds no error. Each mutation is rejected: `unheld-window`,
-`pruned-under-start` and `kept-tail` by `RefsMatch`, `overread` by `ReadsMatch`,
-`no-zero` by `TailPrivateZero`, `every-off` by `Conforms`. The seven runs go in
-parallel: 32 seconds on a loaded hetzner1. Negative controls
-`TLC_JAVA=/usr/bin/true` and `TLC_JAVA=/usr/bin/false` were both rejected.
-
-## Poisoned-slot gate
-
-Run on `mini-m5`, 2026-11-24 02:30 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+19 runs via `specs/run_tlc.zsh` (`8` single-worker JVMs at a time, `57.5 s` total wall):
 
 | Run | Generated states | Distinct states | Wall seconds | Result |
 | --- | ---: | ---: | ---: | --- |
-| PoisonGate3 | 158,849 | 34,504 | 1.104 | PASS |
-| PoisonGate4 | 3,239,729 | 563,728 | 8.197 | PASS |
-| PoisonUnguarded | 17 | 17 | 0.677 | NoFalsePoison violated |
-| PoisonNoSave | 124 | 79 | 0.673 | LiveIntact violated |
-| PoisonOwnedOnly | 74 | 51 | 0.695 | Coverage violated |
+| `GroupedLayout3` | 579 | 485 | 8.420 | PASS |
+| `GroupedLayout4` | 1,553 | 1,329 | 7.918 | PASS |
+| `LocalMatch` | 1,007 | 981 | 4.952 | `VisitedKeys` violated |
+| `DonorWindow` | 361 | 343 | 5.223 | `VisitedKeys` violated |
+| `TilePartial` | 357 | 339 | 4.793 | `OrderedPartials` violated |
+| `Restage` | 149 | 149 | 3.671 | `StagedOnce` violated |
+| `StalledTraversal` | 195 | 195 | 5.362 | `TraversalCompletes` violated |
+| `AdvanceUnfair` | 270 | 268 | 6.895 | `TraversalCompletes` violated |
+| `RestageOutputs` | 18,231 | 13,611 | 11.972 | PASS (expected negative control) |
+| `PoisonGate3` | 964,473 | 173,840 | 22.086 | PASS |
+| `PoisonGate4` | 5,246,785 | 800,160 | 52.072 | PASS (`SYMMETRY SymLanes`) |
+| `PoisonUnguarded` | 17 | 17 | 6.968 | `NoFalsePoison` violated |
+| `PoisonNoSave` | 142 | 81 | 6.182 | `LiveIntact` violated |
+| `PoisonOwnedOnly` | 86 | 51 | 5.645 | `Coverage` violated |
+| `PoisonNoZero` | 65 | 47 | 3.210 | `NoFalsePoison` violated |
+| `ScratchTail3` | 469,184 | 435,360 | 19.048 | PASS |
+| `ScratchTail4` | 2,359,830 | 2,190,375 | 44.697 | PASS |
+| `ScratchTailOneSpan` | 832 | 728 | 5.246 | PASS (`notail`, one span) |
+| `ScratchTailNoZero` | 1,429 | 1,429 | 4.886 | `NoForeignRead` violated |
 
-Inspected counterexamples, each checked against `poison_plan` by hand:
+## Nightly layout and `CacheScheduler` tiers (`TLA_NIGHTLY=1`)
 
-- **PoisonUnguarded, state 3:** lane `a` takes slot 1 and steps alone; slot 1
-  is poisoned in its own step (`poison_plan(.., guard = false)`, the
-  `INK_POOLGATE_SABOTAGE` run on the GPU).
-- **PoisonNoSave, state 4:** lane `a` owns slot 1, lane `b` steps; slot 1 is
-  poisoned, not saved, and still poison after the restore.
-- **PoisonOwnedOnly, state 4:** lane `a` takes slot 1 (zeroed) and releases it;
-  the next step leaves the free slot 1 unpoisoned.
+- **`layout-nightly`** (`.github/workflows/nightly.yml` `tla-layout-nightly`):
+  - `StartTails3` (`Capacity = 3, B = 2, W = 2, Every = 2, MaxPos = 6, MaxSpan = 1, MaxStarts = 2, SYMMETRY SymLanes`, 1 worker): `6,533,679` generated states, `1,341,035` distinct states, `485.7 s` wall — **PASS**.
+  - `PrefixTreeNightly` (`2` slots, up to `3` sealed nodes), simulated 21-node `PrefixTree` (`256` traces x `128` steps), and three `src/prefix.rs` trace mutants (`no-evict`, `full-match`, `ref-leak`).
+- **`scheduler`** (`.github/workflows/nightly.yml` `tla-scheduler`, `specs/run_cache_scheduler.sh`):
+  all `30` runs (`11` exhaustive safety + liveness + action-property configs and `19` reversed witnesses) — **30/30 PASS**. Full per-run table and counterexamples are recorded in [CACHE_SCHEDULER.md](CACHE_SCHEDULER.md).
 
-## Sliding-window scratch tail
+## `traces` PR part (`scripts/check-tla.sh traces`)
 
-Run on `mini-m5`, 2026-11-24 02:45 UTC, by `run_tlc.zsh` with the same JVM and TLC.
+All seven trace-conformance gates run in parallel (`tla2tools.jar` v1.8.0, zero network/GPU), and every mutation is pinned to the exact TLC counterexample:
 
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| ScratchTail3 | 469,184 | 435,360 | 3.608 | PASS |
-| ScratchTail4 | 2,359,830 | 2,190,375 | 16.883 | PASS |
-| ScratchTailOneSpan | 832 | 728 | 0.864 | PASS (`notail`, one span) |
-| ScratchTailNoZero | 1,429 | 1,429 | 0.923 | NoForeignRead violated |
-
-Inspected counterexample, checked against `layer_b` by hand:
-
-- **ScratchTailNoZero, state 4:** spans `<<[p0 0, t 2], [p0 0, t 1]>>`; span 1
-  writes rows 0 and 1, span 2 writes row 0 and its tile (AK = 2) reads row 1,
-  span 1's key. On the GPU (`INK_POOLGATE_SABOTAGE`): lane 0 (t 23, NaN after
-  the sabotage) then lane 1 (p0 31, t 1, its tile reaching position 63) in one
-  step; lane 1 read lane 0's NaN keys in rows 1 .. 22 and diverged, then lane 2
-  the same way a step later.
-
-## BlockLayout and CacheScheduler trace conformance
-
-`scripts/check-cache-traces.sh` (CI, CPU-only via `rustc` + pinned `tla2tools.jar` v1.8.0):
-replays 16 seeded walks per configuration (`bl_base0`, `bl_high_fp16` above 4 GiB at `kvb=2`,
-`bl_high_kv8` above 4 GiB at `kvb=1`, and `cs` at `MaxQueue=2`) into generated `TraceData.tla` /
-`TraceCheck.tla` bundles (`395` distinct states per `BlockLayout` bundle with `max_gen=2`,
-start-point steps and dual-slot coverage; `2,445` distinct states for `CacheScheduler` covering
-`admit_bypass=91`, `step_bypass=20`, `cancel=18`, `refuse429=331`) and checks all four bundles
-plus seven single-line production mutations (`trunc-real-byte-offset`, `off1-byte-offset`,
-`reissue-gen-reset`, `stale-finish`, `admit-wait-dropped`, `step-bypass-dropped`,
-`priv-tail-dirty`) in parallel, requiring every mutation to fail inside TLC with an invariant or
-action counterexample.
-
-## Private sliding-window prefill scratch
-
-The four `ScratchTail` configurations ran on `mini-m5` on 2026-11-25 at
-05:07 UTC with TLC 2.19, Temurin 21.0.12.1 and one worker.
-
-| Run | Generated states | Distinct states | Wall seconds | Result |
-| --- | ---: | ---: | ---: | --- |
-| ScratchTail3 | 469,184 | 435,360 | 2.553 | PASS |
-| ScratchTail4 | 2,359,830 | 2,190,375 | 11.405 | PASS |
-| ScratchTailOneSpan | 832 | 728 | 0.717 | PASS |
-| ScratchTailNoZero | 1,429 | 1,429 | 0.720 | NoForeignRead violated |
-
-Both three-span configurations kept all reads in bounds and restricted each
-span's reads to its own rows and zeroed rows. The single-span case held across
-three layers with only the initial clear. Omitting the per-span clear in the
-two-span control let a tile read a previous span's row.
+1. **`scripts/check-memmode-traces.sh`** (`src/memd.rs` -> `specs/memmode/TraceCheck.tla`):
+   - Production: `32` walks x `192` ops (`6,208` generated, `6,176` distinct states) — **PASS**.
+   - Pinned mutations (`5/5` rejected): `early-release` (`StepConforms`), `no-rollback` (`RollbackAttempted`), `no-readback` (`StepConforms`), `lost-seed` (`StepConforms`), `skip-keep` (`SavedIsOwner`).
+2. **`scripts/check-blockbook-traces.sh`** (`src/blockbook.rs` -> `specs/StartTailsTrace.tla`):
+   - Production: `20` walks x `90` ops (`1,026` generated, `1,006` distinct states; `resumed=19, reused=204, pruned_under_start=15, partial_tail=137, retired=76, finished_tail=29, prompt=24, every=36, pool_full=1,214`) — **PASS**.
+   - Pinned mutations (`6/6` rejected): `unheld-window` (`RefsMatch`), `pruned-under-start` (`RefsMatch`), `overread` (`ReadsMatch`), `no-zero` (`TailPrivateZero`), `kept-tail` (`RefsMatch`), `every-off` (`StepConforms`).
+3. **`scripts/check-cache-traces.sh`** (`src/blocks.rs` + `src/cache_scheduler.rs` + `src/cache_trace.rs` -> `BlockLayout`, `CacheScheduler`, `SpanPins`):
+   - Production (`5/5` bundles **PASS**): `bl_base0` (`395` states, `slide_steps=16`), `bl_high_fp16` (`395` states, `>= 4 GiB`), `bl_high_kv8` (`395` states, `>= 4 GiB`), `cs` (`3,024` states; `admit_bypass=39, step_bypass=39, cancel=39, refuse429=317, spill=68, restore=40, drop=44, slide=76, reclaim=22`), `sp_512` (`128` states, `64` alignments, `max_win=25`).
+   - Pinned mutations (`10/10` rejected): `trunc-real-byte-offset` (`Address64`), `off1-byte-offset` (`Address64`), `reissue-gen-reset` (`StepConforms`), `stale-finish` (`StepConforms`), `admit-wait-dropped` (`BypassBoundHolds`), `step-bypass-dropped` (`BypassBoundHolds`), `priv-tail-dirty` (`UnsealedPrivateInvisibleZero`), `noop-restore-block` (`ActionConforms`), `non-lru-writeback` (`ActionLruOrder`), `cap17-span-pins` (`Covered`).
+4. **`scripts/check-scheduler-traces.sh`** (`src/scheduler.rs` + `scripts/scheduler-traces.rs` -> `specs/CacheScheduler.tla`):
+   - Production: `18` drained, invariant-checked traces (`3,044` states; `cold_writebacks=47, disk_restores=31, refused_429=230, cancel_in_step=103, cancel_in_restore=9, admit_bypasses=19, step_bypasses=78, slide_windows=69, finished=133`) — **PASS**.
+   - Pinned mutations (`6/6` rejected): `cancel-in-step-early-free` (`StepBlocksInMemoryAndOwned`), `cancel-in-restore-early-free` (`StepBlocksInMemoryAndOwned`), `bypass-bound-exceeded` (`BypassBoundHolds`), `drop-step-bypass-tick` (`BypassBoundHolds`), `drop-admit-bypass-tick` (`BypassBoundHolds`), `noop-restore-stutter` (`ActionConforms`).
+5. **`scripts/check-poisongate-traces.sh`** (`src/poolgate.rs` + `src/blocks.rs` -> `specs/PoisonGateTrace.tla`):
+   - Production: `4` traces (`256` states; `poison_step=46, restore=46, write=64, take_idle=6, share_idle=4, release_idle=44, take_poisoned=36, share_poisoned=2, release_poisoned=4, saved_slots=25`) — **PASS**.
+   - Pinned mutations (`5/5` rejected): `unguarded-stepping` (`NoFalsePoison`), `no-save-live` (`ActionConforms`), `owned-only-poison` (`Coverage`), `skip-restore-copy` (`LiveIntact`), `empty-stepping-action` (`ActionConforms`).
+6. **`scripts/check-serve-step-traces.sh`** (`src/scheduler.rs::ServeStepPlanner` -> `specs/ServeStepTrace.tla`):
+   - Production (`33` workloads x `64` decisions) + source mutations — **PASS**.
+7. **`scripts/check-serve-cache-traces.sh`** (`src/serve/block_cache.rs` -> `specs/ServeCacheTrace.tla`):
+   - Production `ServeBlockCache` trace + `6` source mutations — **PASS**.

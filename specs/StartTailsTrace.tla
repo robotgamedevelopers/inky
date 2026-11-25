@@ -56,7 +56,8 @@ ReplayNext ==
 Replay == ReplayInit /\ [][ReplayNext]_<<vars, trace, at>>
 
 \* Finite recorded prefixes check initial and next-state conformance, not liveness.
-Conforms == Init /\ [][Next]_vars
+InitConforms == (at = 1) => Init
+StepConforms == [][Next]_vars
 
 \* Every kept recurrent state belongs to one live start point.
 StatesMatch == TS[9] = Cardinality({i \in StartIds : starts[i].live})

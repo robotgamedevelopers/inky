@@ -20,12 +20,22 @@
 //!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
+#[cfg(not(standalone_blocks))]
 use crate::blockbook::{EVERY, HEAD, PROMPT};
-use crate::blocks::{BlockEntry, BlockIndex, BlockKind, BlockTable, Slot, BLOCK, WINDOW};
+#[cfg(not(standalone_blocks))]
+use crate::blocks::BlockEntry;
+use crate::blocks::{BlockIndex, BlockKind, BlockTable, Slot};
+#[cfg(not(standalone_blocks))]
+use crate::blocks::{BLOCK, WINDOW};
+#[cfg(not(standalone_blocks))]
 use crate::engine::{Engine, Lane, Span, EXT};
+#[cfg(not(standalone_blocks))]
 use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, SealedId};
+#[cfg(not(standalone_blocks))]
 use objc2_metal::MTLCommandBuffer;
+#[cfg(not(standalone_blocks))]
 use std::cell::{Cell, RefCell};
+#[cfg(not(standalone_blocks))]
 use std::collections::HashMap;
 
 /// A lane's handle, chosen by the path that made it.
@@ -69,6 +79,10 @@ pub trait PoisonPool {
     /// this so the intentionally poisoned lane never publishes corrupted blocks into its shared prefix tree for other
     /// lanes to adopt; any remaining divergence on another lane proves a genuine cross-lane leak in the engine.
     fn note_sabotaged(&self, _lane: LaneId) {}
+    /// Called immediately after `apply` saves non-stepping live slots and poisons unguarded slots.
+    fn note_applied(&self, _stepping_lanes: &[LaneId], _saved: &[(BlockKind, Slot, Vec<u8>)]) {}
+    /// Called immediately after `restore` copies saved slot bytes back into the pool.
+    fn note_restored(&self) {}
 }
 
 /// The candidate is a path with a pool.
@@ -370,15 +384,18 @@ pub fn poisoned(cand: &dyn Candidate, w: &Workload, sabotage: bool) -> Report {
             }
             let ps = plans(cand, &tables, &stepping, !unguard);
             let strict_ps = unguard.then(|| plans(cand, &tables, &stepping, true));
-            let (saved, done) = apply_with_guard_ref(cand, &ps, strict_ps.as_deref());
+            let (StepGuard { saved, checked_poison }, done) = apply_with_guard_ref(cand, &ps, strict_ps.as_deref());
+            let stepping_ids: Vec<LaneId> = who.iter().map(|&i| lane[i].unwrap()).collect();
+            cand.note_applied(&stepping_ids, &saved);
             poisoned += done.poisoned; saved_n += done.saved; absent += done.absent;
             if dec { cand.decode(&dec_spans); }
             else { cand.prefill(&pf_spans); }
-            if let Err(errs) = restore_checked(cand, saved) {
+            if let Err(errs) = restore_checked(cand, StepGuard { saved, checked_poison }) {
                 for err in errs {
                     stray_writes.push(format!("step {steps}: {err}"));
                 }
             }
+            cand.note_restored();
             steps += 1;
             for (k, &i) in who.iter().enumerate() {
                 let (p0, t, _) = work[next[i]];
@@ -416,6 +433,10 @@ pub fn compare(want: &[Record], got: &Report) -> Result<Vec<String>, Vec<String>
     }
     if bad.is_empty() { Ok(vec![format!("{} lanes, {} steps, {} slot poisonings ({} saved and restored, {} planned slots of ended lanes absent): every step's logits and every token identical, zero stray writes", want.len(), got.steps, got.poisoned, got.saved, got.absent)]) } else { Err(bad) }
 }
+
+#[cfg(not(standalone_blocks))]
+mod gpu_paths {
+use super::*;
 
 /// Layer 2's path: each lane owns its own cache buffers. As a pool, lane k's window cache is window slot k + 1 and its
 /// full cache is full slot k + 1; an ended lane's slots have no memory.
@@ -469,7 +490,8 @@ impl PoisonPool for Layer2<'_> {
     fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> { KINDS.iter().map(|&k| (k, slot_at(lane))).collect() }
     fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
         let i = slot.pool_index().get() as usize;
-        self.run(|v| v[i].as_ref().map(|l| self.eng.lane_regions(l)[if kind == BlockKind::Window { 0 } else { 1 }]))
+        // SAFETY: `PoisonPool` runs between GPU steps when nothing is in flight and before any reallocation.
+        self.run(|v| v[i].as_ref().map(|l| unsafe { self.eng.lane_regions(l) }[if kind == BlockKind::Window { 0 } else { 1 }]))
     }
     fn absent_ok(&self, _: BlockKind, slot: Slot) -> bool { self.run(|v| v[slot.pool_index().get() as usize].is_none()) }
 }
@@ -1034,9 +1056,45 @@ impl PoisonPool for Layer3Pool<'_> {
     }
 }
 
+/// Require positive sharing, slot reuse, unsealed-tail drop, and (once crossing `EXT`) live window pruning.
+pub fn verify_l3_workload_stats(st: &L3Stats, lanes: usize, prompt_positions: usize, total_positions: usize) -> Result<(), String> {
+    if prompt_positions >= BLOCK && st.blocks_sealed == 0 {
+        return Err(format!("expected blocks_sealed > 0 for {prompt_positions}-token prompt, got {st:?}"));
+    }
+    if lanes >= 2 && prompt_positions >= BLOCK && st.shared_dedups == 0 {
+        return Err(format!("expected shared_dedups > 0 across {lanes} lanes, got {st:?}"));
+    }
+    if lanes >= 3 && prompt_positions > BLOCK && st.slots_reused == 0 {
+        return Err(format!("expected slots_reused > 0 across {lanes} staggered lanes, got {st:?}"));
+    }
+    if total_positions % BLOCK != 0 && st.tails_dropped == 0 {
+        return Err(format!("expected tails_dropped > 0 for non-block-multiple length {total_positions}, got {st:?}"));
+    }
+    if total_positions >= EXT + BLOCK - 1 && st.window_pruned == 0 {
+        return Err(format!("expected window_pruned > 0 for {total_positions} positions (>= {}), got {st:?}", EXT + BLOCK - 1));
+    }
+    Ok(())
+}
+
+pub(super) fn check_prefix_start_point_inputs(base_len: usize, ctx: usize) -> Result<(), String> {
+    if ctx < 1408 || base_len < 1408 {
+        return Err(format!(
+            "prefix start-point gate requires ctx >= 1408 (got {ctx}) and at least 1408 reference tokens (got {base_len})"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn corrupt_start_cs_for_sabotage(cs: &mut [u8]) {
+    for chunk in cs.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&42.0f32.to_ne_bytes());
+    }
+}
+
 /// Verify deepest start-point prefix matching (`PrefixTree`) + recurrent state & window restoration
 /// + sliding-window pruning past 1024 tokens against cold Layer 2, with all free pool slots poisoned.
-pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize) -> Result<String, String> {
+pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize, sabotage: bool) -> Result<String, String> {
+    check_prefix_start_point_inputs(base.len(), ctx)?;
     let run_cold_l2 = |toks: &[u32], ndec: usize| -> Record {
         let l2 = Layer2::new(eng, 1);
         let lid = l2.new_lane(toks, toks.len() + ndec + 1);
@@ -1123,42 +1181,68 @@ pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize) -> Res
     }
 
     // 2. Every-16-blocks start point at 1024 AND prompt-end start point at 1152 (past WINDOW=1024).
-    let mut tested_window = false;
-    if ctx >= 1408 && base.len() >= 1408 {
-        tested_window = true;
-        let head1152 = base[..1152].to_vec();
-        let (lc, mc) = l3.new_lane_matched(&head1152, 1280);
-        if mc != 192 {
-            l3.end_lane(lc);
-            return Err(format!("expected 1152 prompt to reuse 192 start point, got {mc}"));
-        }
-        // Step to exact block 16 (1024) so EVERY start point is saved, then to 1152 (PROMPT start point).
-        l3.prefill(&[(lc, 192, 320)]);  // -> 512
-        l3.prefill(&[(lc, 512, 512)]);  // -> 1024 (block 16: EVERY start point!)
-        l3.prefill(&[(lc, 1024, 128)]); // -> 1152 (block 18: PROMPT start point, prunes window 0..2 on lane!)
+    let head1152 = base[..1152].to_vec();
+    let (lc, mc) = l3.new_lane_matched(&head1152, 1280);
+    if mc != 192 {
         l3.end_lane(lc);
+        l3.shutdown();
+        return Err(format!("expected 1152 prompt to reuse 192 start point, got {mc}"));
+    }
+    // Step to exact block 16 (1024) so EVERY start point is saved, then to 1152 (PROMPT start point).
+    l3.prefill(&[(lc, 192, 320)]);  // -> 512
+    l3.prefill(&[(lc, 512, 512)]);  // -> 1024 (block 16: EVERY start point!)
+    l3.prefill(&[(lc, 1024, 128)]); // -> 1152 (block 18: PROMPT start point, prunes window 0..2 on lane!)
+    l3.end_lane(lc);
 
-        // Request D diverges after 1024 -> must match the EVERY start point at 1024 (window 0..16 retained!).
-        let mut prompt_d = base[..1024].to_vec();
-        prompt_d.extend_from_slice(&rot(509, 45));
-        let want_d = run_cold_l2(&prompt_d, 4);
-        let got_d = run_matched_l3(&l3, &prompt_d, 1024, 4)?;
-        if want_d != got_d {
-            return Err(format!("EVERY-1024 start-point match differs from Layer 2: want {want_d:?} got {got_d:?}"));
+    if sabotage {
+        let mut corrupted = false;
+        for st_rec in l3.starts.borrow_mut().values_mut() {
+            if st_rec.pos == 1152 {
+                corrupt_start_cs_for_sabotage(&mut st_rec.cs);
+                corrupted = true;
+            }
         }
+        if !corrupted {
+            l3.shutdown();
+            return Err("INK_POOLGATE_START_SABOTAGE: retained start point at 1152 not found".into());
+        }
+        println!("INK_POOLGATE_START_SABOTAGE: corrupted retained start-point state at 1152");
+    }
 
-        // Request E diverges after 1152 -> must match PROMPT start point at 1152 (window 2..18, blocks 0..1 pruned!).
-        let mut prompt_e = base[..1152].to_vec();
-        prompt_e.extend_from_slice(&rot(733, 45));
-        let want_e = run_cold_l2(&prompt_e, 4);
-        let got_e = run_matched_l3(&l3, &prompt_e, 1152, 4)?;
-        if want_e != got_e {
-            return Err(format!("PROMPT-1152 window-pruned start-point match differs from Layer 2: want {want_e:?} got {got_e:?}"));
-        }
+    // Request D diverges after 1024 -> must match the EVERY start point at 1024 (window 0..16 retained!).
+    let mut prompt_d = base[..1024].to_vec();
+    prompt_d.extend_from_slice(&rot(509, 45));
+    let want_d = run_cold_l2(&prompt_d, 4);
+    let got_d = match run_matched_l3(&l3, &prompt_d, 1024, 4) {
+        Ok(r) => r,
+        Err(e) => { l3.shutdown(); return Err(e); }
+    };
+    if want_d != got_d {
+        l3.shutdown();
+        return Err(format!("EVERY-1024 start-point match differs from Layer 2: want {want_d:?} got {got_d:?}"));
+    }
+
+    // Request E diverges after 1152 -> must match PROMPT start point at 1152 (window 2..18, blocks 0..1 pruned!).
+    let mut prompt_e = base[..1152].to_vec();
+    prompt_e.extend_from_slice(&rot(733, 45));
+    let want_e = run_cold_l2(&prompt_e, 4);
+    let got_e = match run_matched_l3(&l3, &prompt_e, 1152, 4) {
+        Ok(r) => r,
+        Err(e) => { l3.shutdown(); return Err(e); }
+    };
+    if want_e != got_e {
+        l3.shutdown();
+        return Err(format!("PROMPT-1152 window-pruned start-point match differs from Layer 2: want {want_e:?} got {got_e:?}"));
     }
 
     let st = l3.stats();
     l3.shutdown();
+    if st.start_points_saved < 3 || st.start_matches < 4 || st.window_pruned == 0 || st.slots_reused == 0 {
+        return Err(format!(
+            "prefix start-point stats incomplete: saved={} matches={} pruned={} reused={}",
+            st.start_points_saved, st.start_matches, st.window_pruned, st.slots_reused
+        ));
+    }
     // Verify zero refcount leaks after shutdown.
     {
         let pools = eng.block_pool().borrow();
@@ -1171,15 +1255,19 @@ pub fn verify_prefix_start_points(eng: &Engine, base: &[u32], ctx: usize) -> Res
         }
     }
     Ok(format!(
-        "prefix start-point reuse identical to Layer 2 (192{}: matches={}, saved={}, pruned={}, reused={})",
-        if tested_window { ", EVERY@1024, PROMPT@1152" } else { "" },
+        "prefix start-point reuse identical to Layer 2 (192, EVERY@1024, PROMPT@1152: matches={}, saved={}, pruned={}, reused={})",
         st.start_matches, st.start_points_saved, st.window_pruned, st.slots_reused
     ))
 }
+}
+
+#[cfg(not(standalone_blocks))]
+pub use gpu_paths::{verify_l3_workload_stats, verify_prefix_start_points, Layer2, Layer3Pool};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     // Slot arithmetic only: no GPU, no time, no files.
     fn check(n: usize, tables: &[Vec<usize>], stepping: &[usize]) {
@@ -1511,5 +1599,37 @@ mod tests {
             errs_free.iter().any(|e| e.contains("unreferenced poisoned slot (Full slot 4, pool index 3)")),
             "expected unreferenced-slot stray write error, got: {errs_free:?}"
         );
+    }
+
+    #[test]
+    #[cfg(not(standalone_blocks))]
+    fn stats_and_start_point_guards_reject_missing_sharing_reuse_pruning_or_short_ctx() {
+        use super::gpu_paths::{check_prefix_start_point_inputs, corrupt_start_cs_for_sabotage, L3Stats};
+        let good_short = L3Stats {
+            slots_taken: 12,
+            slots_reused: 2,
+            blocks_sealed: 3,
+            shared_dedups: 1,
+            start_points_saved: 0,
+            start_matches: 0,
+            window_pruned: 0,
+            tails_dropped: 6,
+        };
+        assert!(verify_l3_workload_stats(&good_short, 3, 72, 80).is_ok());
+        assert!(verify_l3_workload_stats(&L3Stats { shared_dedups: 0, ..good_short }, 3, 72, 80).is_err());
+        assert!(verify_l3_workload_stats(&L3Stats { slots_reused: 0, ..good_short }, 3, 72, 80).is_err());
+        assert!(verify_l3_workload_stats(&L3Stats { tails_dropped: 0, ..good_short }, 3, 72, 80).is_err());
+        // Crossing EXT + BLOCK - 1 (1087) requires window_pruned > 0.
+        assert!(verify_l3_workload_stats(&good_short, 17, 1067, 1131).is_err());
+        assert!(verify_l3_workload_stats(&L3Stats { window_pruned: 17, ..good_short }, 17, 1067, 1131).is_ok());
+
+        // Start-point verifier refuses to skip on short ctx or short token sequence.
+        assert!(check_prefix_start_point_inputs(2404, 1408).is_ok());
+        assert!(check_prefix_start_point_inputs(2404, 1024).is_err());
+        assert!(check_prefix_start_point_inputs(1200, 4096).is_err());
+
+        let mut cs = vec![0u8; 16];
+        corrupt_start_cs_for_sabotage(&mut cs);
+        assert!(cs.iter().any(|&b| b != 0));
     }
 }

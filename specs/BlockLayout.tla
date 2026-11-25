@@ -2,10 +2,10 @@
 EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Lanes, FullCapacity, WindowCapacity, B, W, MaxPos, MaxSpan, MaxGeneration, SlotBase, Kvb, Bug
-ASSUME /\ FullCapacity >= 1 /\ WindowCapacity >= 1 /\ FullCapacity + WindowCapacity >= 3
+ASSUME /\ FullCapacity >= 2 /\ WindowCapacity >= 2
        /\ B >= 2 /\ W > 0 /\ Kvb \in {1, 2}
        /\ MaxPos > B /\ MaxSpan > 0 /\ MaxGeneration > 1 /\ SlotBase >= 0
-       /\ Bug \in {"none", "stale", "window", "span", "start", "trunc32"}
+       /\ Bug \in {"none", "stale", "window", "dropfull", "span", "start", "nozero", "badidx", "trunc32", "overlap"}
 
 Kinds == {"full", "window"}
 Cap(kind) == IF kind = "full" THEN FullCapacity ELSE WindowCapacity
@@ -26,7 +26,15 @@ Offset(kind, s) ==
   LET totalMiB == PoolIndex(s) * StrideMiB(kind)
   IN [hi |-> totalMiB \div GiB4MiB, mib |-> totalMiB % GiB4MiB, sub |-> 0]
 Truncate32(o) == [hi |-> 0, mib |-> o.mib, sub |-> o.sub]
-EntryOffset(kind, s) == IF Bug = "trunc32" THEN Truncate32(Offset(kind, s)) ELSE Offset(kind, s)
+\* Faulted stride sizing an fp16 (`Kvb = 2`) pool with `--kv8` (`kvb = 1`) slot strides,
+\* causing adjacent live slots to overlap while keeping each single slot inside `PoolEnd`.
+OverlapOffset(kind, s) ==
+  LET totalMiB == PoolIndex(s) * (IF kind = "full" THEN 1 ELSE 5)
+  IN [hi |-> totalMiB \div GiB4MiB, mib |-> totalMiB % GiB4MiB, sub |-> 0]
+EntryOffset(kind, s) ==
+  IF Bug = "trunc32" THEN Truncate32(Offset(kind, s))
+  ELSE IF Bug = "overlap" THEN OverlapOffset(kind, s)
+  ELSE Offset(kind, s)
 AddBytes(o, n) ==
   LET totalSub == o.sub + n
       carryMiB == o.mib + (totalSub \div MiBBytes)
@@ -51,7 +59,9 @@ EmptyTable == [k \in Keys |-> NoEntry]
 Ceil(n, d) == (n + d - 1) \div d
 SpanBound(c) == Ceil(W - 1 + c, B) + 1
 Window(lo, hi) == IF hi < lo THEN {} ELSE {p \div B : p \in lo..hi}
-History(n) == Window(IF n > W THEN n - W ELSE 0, n - 1)
+\* Matches `src/serve/block_cache.rs:100` (`pos.saturating_sub(EXT - 1) / BLOCK`):
+\* the next token at `n` attends to at most `W - 1` prior keys `[n - W + 1 .. n - 1]` plus `n` itself.
+History(n) == Window(IF n >= W THEN n - W + 1 ELSE 0, n - 1)
 SpanWindow(n, c) == Window(IF n >= W THEN n - W + 1 ELSE 0, n + c - 1)
 Full(n) == Window(0, n - 1)
 Needed(n, c) == ({"full"} \X Full(n + c))
@@ -108,8 +118,10 @@ Alloc(l, k, s) ==
  /\ \A r \in 1..(s-1) : ~Free(k[1], r) \/ pool[k[1]][r].generation = MaxGeneration
  /\ LET kind == k[1]
         g == pool[kind][s].generation + 1
+        recBlk == IF Bug = "badidx" THEN 0 ELSE k[2]
+        recData == IF Bug = "nozero" THEN pool[kind][s].data ELSE [i \in 0..(B-1) |-> 0]
     IN /\ pool' = [pool EXCEPT ![kind][s] =
-            [generation |-> g, kind |-> kind, block |-> k[2], length |-> 0, data |-> [i \in 0..(B-1) |-> 0]]]
+            [generation |-> g, kind |-> kind, block |-> recBlk, length |-> 0, data |-> recData]]
        /\ table' = [table EXCEPT ![l][k] =
             [slot |-> s, generation |-> g, offset |-> EntryOffset(kind, s), kind |-> kind, kvb |-> Kvb]]
  /\ UNCHANGED <<pos, phase, target, spanStart, budget, pin,
@@ -142,10 +154,11 @@ EndStep(l) ==
 
 SlideWindow(l) ==
  /\ phase[l] = "idle"
- /\ LET keep == IF Bug = "window" /\ pos[l] > W
-                THEN History(pos[l]) \ { (pos[l]-W) \div B }
+ /\ LET keep == IF Bug = "window" /\ pos[l] >= W
+                THEN Window(pos[l] - W + 2, pos[l] - 1)
                 ELSE History(pos[l])
-        t == Restrict(table[l], ({"full"} \X Blocks) \cup ({"window"} \X keep))
+        fullKeep == IF Bug = "dropfull" THEN keep ELSE Blocks
+        t == Restrict(table[l], ({"full"} \X fullKeep) \cup ({"window"} \X keep))
     IN /\ table[l] # t /\ table' = [table EXCEPT ![l] = t]
  /\ UNCHANGED <<pool, pos, phase, target, spanStart, budget, pin,
                  startKept, startPos, startTable, startState>>
@@ -194,9 +207,21 @@ WindowCovered == \A l \in Lanes : phase[l] # "done" =>
  \A b \in History(pos[l]) : table[l][<<"window",b>>] # NoEntry
 FullCovered == \A l \in Lanes : phase[l] # "done" =>
  \A b \in Full(pos[l]) : table[l][<<"full",b>>] # NoEntry
+\* Ground-truth per-query pinning check (`U169`): every query `q` in `[spanStart..target)`
+\* independently checks that every full key `0..q` and every window key `max(0, q+1-W)..q`
+\* maps to a live pinned handle in `pin[l]`, and that the actual pinned window handles do
+\* not exceed the lane's window reservation `budget[l]` (never comparing `SpanBound` or
+\* `Needed` against itself).
+QueryWinStart(q) == IF q + 1 >= W THEN q + 1 - W ELSE 0
 SpanPinned == \A l \in Lanes : phase[l] = "step" =>
- /\ budget[l] >= SpanBound(target[l]-spanStart[l])
- /\ Handles(Restrict(table[l], Needed(spanStart[l],target[l]-spanStart[l]))) \subseteq pin[l]
+ /\ Cardinality({h \in pin[l] : h[1] = "window"}) <= budget[l]
+ /\ \A q \in spanStart[l]..(target[l] - 1) :
+      /\ \A p \in 0..q :
+           /\ table[l][<<"full", p \div B>>] # NoEntry
+           /\ Handle(table[l][<<"full", p \div B>>]) \in pin[l]
+      /\ \A p \in QueryWinStart(q)..q :
+           /\ table[l][<<"window", p \div B>>] # NoEntry
+           /\ Handle(table[l][<<"window", p \div B>>]) \in pin[l]
  /\ \A h \in pin[l] : h[3] = pool[h[1]][h[2]].generation
 StartRetained == startKept =>
  /\ startState = startPos
@@ -217,7 +242,7 @@ ValidOffset(kind, e) ==
  /\ e.offset.hi >= 0
  /\ e.offset.mib \in 0..(GiB4MiB - 1)
  /\ e.offset.sub \in 0..(MiBBytes - 1)
- /\ e.offset = Offset(kind, e.slot)
+ /\ (PoolIndex(e.slot) = 0 => e.offset = ZeroOffset)
  /\ (PoolIndex(e.slot) > 0 => OffsetLt(ZeroOffset, e.offset))
  /\ (PoolIndex(e.slot) * StrideMiB(kind) >= GiB4MiB => e.offset.hi >= 1)
  /\ OffsetLe(AddMiB(e.offset, StrideMiB(kind)), PoolEnd(kind))
@@ -226,8 +251,7 @@ ValidOffset(kind, e) ==
  /\ \A i \in 0..(B - 2) :
       OffsetLt(AddBytes(e.offset, i * Kvb), AddBytes(e.offset, (i + 1) * Kvb))
  /\ \A i \in 0..(B - 1) :
-      /\ AddBytes(e.offset, i * Kvb).sub = (e.offset.sub + i * Kvb) % MiBBytes
-      /\ AddBytes(e.offset, i * Kvb) = AddBytes(Offset(kind, e.slot), i * Kvb)
+      AddBytes(e.offset, i * Kvb).sub = (e.offset.sub + i * Kvb) % MiBBytes
 Address64 ==
  /\ \A l \in Lanes, k \in Keys :
       table[l][k] # NoEntry => ValidOffset(k[1], table[l][k])

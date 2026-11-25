@@ -18,9 +18,22 @@ import (
 	"math"
 	"os"
 	"regexp"
-	"slices"
 	"strings"
 )
+
+type archSpec struct {
+	nLayers  int
+	nExperts int
+	hidden   int
+	ff       int
+}
+
+var defaultArch = archSpec{
+	nLayers:  nLayers,
+	nExperts: nExperts,
+	hidden:   hidden,
+	ff:       ff,
+}
 
 const (
 	nLayers  = 24
@@ -82,9 +95,13 @@ type expertSrc struct {
 }
 
 func newExpertSrc(st *safetensors, layer int, which string) (*expertSrc, error) {
-	s := &expertSrc{st: st, layer: layer, which: which, rows: hidden, k: hidden}
+	return newExpertSrcArch(st, defaultArch, layer, which)
+}
+
+func newExpertSrcArch(st *safetensors, arch archSpec, layer int, which string) (*expertSrc, error) {
+	s := &expertSrc{st: st, layer: layer, which: which, rows: arch.hidden, k: arch.hidden}
 	if which == "w2" {
-		s.k = ff
+		s.k = arch.ff
 	}
 	w, ok := st.tensors[stName(layer, which, "weight")]
 	if !ok {
@@ -92,13 +109,13 @@ func newExpertSrc(st *safetensors, layer int, which string) (*expertSrc, error) 
 	}
 	s.nvfp4 = w.DType == "U8"
 	if s.nvfp4 {
-		if _, err := st.expect(stName(layer, which, "weight"), "U8", nExperts, s.rows, s.k/2); err != nil {
+		if _, err := st.expect(stName(layer, which, "weight"), "U8", arch.nExperts, s.rows, s.k/2); err != nil {
 			return nil, err
 		}
-		if _, err := st.expect(stName(layer, which, "weight_scale"), "F8_E4M3", nExperts, s.rows, s.k/16); err != nil {
+		if _, err := st.expect(stName(layer, which, "weight_scale"), "F8_E4M3", arch.nExperts, s.rows, s.k/16); err != nil {
 			return nil, err
 		}
-		amax, err := st.float32s(stName(layer, which, "weight_amax"), nExperts)
+		amax, err := st.float32s(stName(layer, which, "weight_amax"), arch.nExperts)
 		if err != nil {
 			return nil, err
 		}
@@ -109,7 +126,7 @@ func newExpertSrc(st *safetensors, layer int, which string) (*expertSrc, error) 
 		if len(den) == 0 || math.IsNaN(float64(den[0])) || math.IsInf(float64(den[0]), 0) || den[0] == 0 {
 			return nil, fmt.Errorf("layer %d %s: invalid outer scale denominator %v", layer, which, den)
 		}
-		s.gscale = make([]float32, nExperts)
+		s.gscale = make([]float32, arch.nExperts)
 		for e := range amax {
 			gs := amax[e] / den[0]
 			if math.IsNaN(float64(gs)) || math.IsInf(float64(gs), 0) {
@@ -118,10 +135,10 @@ func newExpertSrc(st *safetensors, layer int, which string) (*expertSrc, error) 
 			s.gscale[e] = gs
 		}
 	} else {
-		if _, err := st.expect(stName(layer, which, "weight"), "F8_E4M3", nExperts, s.rows, s.k); err != nil {
+		if _, err := st.expect(stName(layer, which, "weight"), "F8_E4M3", arch.nExperts, s.rows, s.k); err != nil {
 			return nil, err
 		}
-		if _, err := st.expect(stName(layer, which, "weight_scale"), "U8", nExperts, s.rows, s.k/32); err != nil {
+		if _, err := st.expect(stName(layer, which, "weight_scale"), "U8", arch.nExperts, s.rows, s.k/32); err != nil {
 			return nil, err
 		}
 	}
@@ -172,13 +189,17 @@ func (s *expertSrc) packRow(dst, codes, scales []byte, r int) error {
 
 // srcRow maps a GGUF output row to the official row: GGUF's fused gate_up puts all gate rows first.
 func srcRow(which string, interleaved bool, r int) int {
+	return srcRowFF(which, interleaved, r, ff)
+}
+
+func srcRowFF(which string, interleaved bool, r, archFF int) int {
 	if which != "w13" || !interleaved {
 		return r
 	}
-	if r < ff {
+	if r < archFF {
 		return 2 * r
 	}
-	return 2*(r-ff) + 1
+	return 2*(r-archFF) + 1
 }
 
 func gname(layer int, which string) string {
@@ -238,6 +259,10 @@ func probe(official, refPath string) error {
 			if !ok || rt.Type != tQ8_0 {
 				return fmt.Errorf("reference has no Q8_0 %s", gname(layer, which))
 			}
+			wantDims := []uint64{uint64(s.k), uint64(s.rows), uint64(nExperts)}
+			if !sameDims(rt.Dims, wantDims) {
+				return fmt.Errorf("reference %s: dims %v, want %v", rt.Name, rt.Dims, wantDims)
+			}
 			for _, e := range []int{0, 77} {
 				codes, scales, err := s.expert(e)
 				if err != nil {
@@ -281,6 +306,10 @@ func probe(official, refPath string) error {
 }
 
 func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout string) error {
+	return convertArch(defaultArch, official, basePath, q8Path, q8re, q6re, experts, outPath, layout)
+}
+
+func convertArch(arch archSpec, official, basePath, q8Path, q8re, q6re, experts, outPath, layout string) error {
 	if layout != "interleaved" && layout != "stacked" {
 		return fmt.Errorf("unknown -w13 layout %q: expected interleaved or stacked", layout)
 	}
@@ -302,30 +331,41 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 	var q8 *gguf
 	var re, re6 *regexp.Regexp
 	if q8Path != "" {
+		if q8re == "" && q6re == "" {
+			return fmt.Errorf("-q8 requires -q8-tensors or -q6-tensors")
+		}
 		if q8, err = openGGUF(q8Path); err != nil {
 			return err
 		}
 		defer q8.Close()
 		inputs = append(inputs, q8.f)
-		if re, err = regexp.Compile(q8re); err != nil {
-			return err
+		if q8re != "" {
+			if re, err = regexp.Compile(q8re); err != nil {
+				return err
+			}
 		}
 		if q6re != "" {
 			if re6, err = regexp.Compile(q6re); err != nil {
 				return err
 			}
 		}
-	} else if q6re != "" {
-		return fmt.Errorf("-q6-tensors needs -q8 (the Q8_0 source)")
+	} else if q8re != "" || q6re != "" {
+		return fmt.Errorf("-q8-tensors and -q6-tensors need -q8 (the Q8_0 source)")
 	}
 	if experts != "native" && experts != "base" {
 		return fmt.Errorf("-experts must be native or base")
 	}
 
+	expectedExpertDims := map[string][]uint64{}
+	for layer := 0; layer < arch.nLayers; layer++ {
+		expectedExpertDims[gname(layer, "w13")] = []uint64{uint64(arch.hidden), uint64(2 * arch.ff), uint64(arch.nExperts)}
+		expectedExpertDims[gname(layer, "w2")] = []uint64{uint64(arch.ff), uint64(arch.hidden), uint64(arch.nExperts)}
+	}
+
 	srcs := map[string]*expertSrc{}
-	for layer := 0; layer < nLayers && experts == "native"; layer++ {
+	for layer := 0; layer < arch.nLayers && experts == "native"; layer++ {
 		for _, which := range []string{"w13", "w2"} {
-			s, err := newExpertSrc(st, layer, which)
+			s, err := newExpertSrcArch(st, arch, layer, which)
 			if err != nil {
 				return err
 			}
@@ -343,38 +383,66 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 	}
 	var plans []plan
 	var infos []tensorInfo
+	var expertsSeen, q6Matched, q8Matched int
 	for _, t := range base.tensors {
 		if weight, ok := strings.CutSuffix(t.Name, ".gscale"); ok && srcs[weight+".weight"] != nil {
 			// The generated native projection supplies its own scale when needed.
 			continue
 		}
+		if wantDims, isExp := expectedExpertDims[t.Name]; isExp {
+			if !sameDims(t.Dims, wantDims) {
+				return fmt.Errorf("%s: base shape %v does not match expected %v", t.Name, t.Dims, wantDims)
+			}
+			expertsSeen++
+		}
 		if s, ok := srcs[t.Name]; ok {
 			nt := tensorInfo{Name: t.Name, Dims: t.Dims, Type: s.ggmlType()}
-			if nt.rowLen() != s.k || nt.nRows() != nExperts*s.rows {
-				return fmt.Errorf("%s: base shape %v does not match the official %d x %d", t.Name, t.Dims, s.rows, s.k)
-			}
 			plans = append(plans, plan{t: nt})
 			if s.nvfp4 {
-				plans = append(plans, plan{t: tensorInfo{Name: gscaleName(s.layer, s.which), Dims: []uint64{nExperts}, Type: tF32}})
+				plans = append(plans, plan{t: tensorInfo{Name: gscaleName(s.layer, s.which), Dims: []uint64{uint64(arch.nExperts)}, Type: tF32}})
 			}
 			continue
 		}
 		if re6 != nil && re6.MatchString(t.Name) {
 			qt, ok := q8.tensor(t.Name)
-			if ok && qt.Type == tQ8_0 && qt.rowLen()%256 == 0 {
-				plans = append(plans, plan{t: tensorInfo{Name: t.Name, Dims: qt.Dims, Type: tQ6_K}, src: qt, q6: true})
-				continue
+			if !ok {
+				return fmt.Errorf("%s (matched by -q6-tensors): not in %s", t.Name, q8Path)
 			}
+			if !sameDims(t.Dims, qt.Dims) {
+				return fmt.Errorf("%s (matched by -q6-tensors): -q8 dims %v do not match base dims %v", t.Name, qt.Dims, t.Dims)
+			}
+			if qt.Type != tQ8_0 {
+				return fmt.Errorf("%s (matched by -q6-tensors): -q8 tensor has type %d, want Q8_0", t.Name, qt.Type)
+			}
+			if qt.rowLen()%256 != 0 {
+				return fmt.Errorf("%s (matched by -q6-tensors): row length %d is not a multiple of 256 for Q6_K", t.Name, qt.rowLen())
+			}
+			q6Matched++
+			plans = append(plans, plan{t: tensorInfo{Name: t.Name, Dims: qt.Dims, Type: tQ6_K}, src: qt, q6: true})
+			continue
 		}
-		if q8 != nil && re.MatchString(t.Name) {
+		if re != nil && re.MatchString(t.Name) {
 			qt, ok := q8.tensor(t.Name)
 			if !ok {
 				return fmt.Errorf("%s: not in %s", t.Name, q8Path)
 			}
+			if !sameDims(t.Dims, qt.Dims) {
+				return fmt.Errorf("%s: -q8 dims %v do not match base dims %v", t.Name, qt.Dims, t.Dims)
+			}
+			q8Matched++
 			plans = append(plans, plan{t: tensorInfo{Name: t.Name, Dims: qt.Dims, Type: qt.Type}, from: q8, src: qt})
 			continue
 		}
 		plans = append(plans, plan{t: tensorInfo{Name: t.Name, Dims: t.Dims, Type: t.Type}, from: base, src: t})
+	}
+	if experts == "native" && expertsSeen != len(expectedExpertDims) {
+		return fmt.Errorf("base GGUF %s has %d of %d expected routed-expert tensors", basePath, expertsSeen, len(expectedExpertDims))
+	}
+	if re6 != nil && q6Matched == 0 {
+		return fmt.Errorf("-q6-tensors %q matched 0 non-expert tensors in %s", q6re, basePath)
+	}
+	if re != nil && q8Matched == 0 {
+		return fmt.Errorf("-q8-tensors %q matched 0 tensors in %s", q8re, basePath)
 	}
 	for _, p := range plans {
 		infos = append(infos, p.t)
@@ -387,7 +455,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 	if re6 != nil {
 		note += "; Q6_K (from Q8_0) tensors matching " + q6re
 	}
-	if q8 != nil {
+	if re != nil {
 		note += "; Q8_0 tensors matching " + q8re
 	}
 	kv := appendKVString(append([]byte(nil), base.kvRaw...), conversionKey, note)
@@ -426,7 +494,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 			}
 		case p.t.Type == tF32: // a gscale tensor: the previous plan is its expert tensor
 			s := srcs[plans[i-1].t.Name]
-			buf := make([]byte, 0, 4*nExperts)
+			buf := make([]byte, 0, 4*arch.nExperts)
 			for _, g := range s.gscale {
 				buf = appendF32(buf, g)
 			}
@@ -436,13 +504,13 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout st
 		default:
 			s := srcs[p.t.Name]
 			row := make([]byte, t.rowBytes())
-			for e := 0; e < nExperts; e++ {
+			for e := 0; e < arch.nExperts; e++ {
 				codes, scales, err := s.expert(e)
 				if err != nil {
 					return err
 				}
 				for r := 0; r < s.rows; r++ {
-					if err := s.packRow(row, codes, scales, srcRow(s.which, interleaved, r)); err != nil {
+					if err := s.packRow(row, codes, scales, srcRowFF(s.which, interleaved, r, arch.ff)); err != nil {
 						return fmt.Errorf("%s expert %d row %d: %w", p.t.Name, e, r, err)
 					}
 					if _, err := w.Write(row); err != nil {
@@ -462,6 +530,10 @@ func appendF32(b []byte, f float32) []byte {
 }
 
 func verify(inPath, refPath string) error {
+	return verifyArch(defaultArch, inPath, refPath)
+}
+
+func verifyArch(arch archSpec, inPath, refPath string) error {
 	in, err := openGGUF(inPath)
 	if err != nil {
 		return err
@@ -473,40 +545,57 @@ func verify(inPath, refPath string) error {
 	}
 	defer ref.Close()
 	worst := 0.0
-	for layer := 0; layer < nLayers; layer++ {
+	sampleExperts := []int{0, 31, 64, 127}
+	for i := range sampleExperts {
+		if sampleExperts[i] >= arch.nExperts {
+			sampleExperts[i] = arch.nExperts - 1
+		}
+	}
+	for layer := 0; layer < arch.nLayers; layer++ {
 		for _, which := range []string{"w13", "w2"} {
-			t, ok := in.tensor(gname(layer, which))
+			name := gname(layer, which)
+			t, ok := in.tensor(name)
 			if !ok {
-				return fmt.Errorf("no %s", gname(layer, which))
+				return fmt.Errorf("no %s", name)
 			}
-			rt, ok := ref.tensor(t.Name)
-			width, rows := ff, hidden
-			if which == "w13" {
-				width, rows = hidden, 2*ff
+			if t.Type != tNV4 && t.Type != tMX8 {
+				return fmt.Errorf("%s: unexpected ggml type %d, want NV4 or MX8", name, t.Type)
 			}
-			if !ok || rt.Type != tQ8_0 || !slices.Equal(rt.Dims, []uint64{uint64(width), uint64(rows), nExperts}) {
-				return fmt.Errorf("%s: expected Q8_0 expert tensor with shape [%d %d %d] in reference", t.Name, width, rows, nExperts)
+			rt, ok := ref.tensor(name)
+			if !ok || rt.Type != tQ8_0 {
+				return fmt.Errorf("reference has no Q8_0 %s", name)
 			}
-			if !slices.Equal(t.Dims, rt.Dims) {
-				return fmt.Errorf("%s: candidate shape %v differs from reference %v", t.Name, t.Dims, rt.Dims)
+			wantK, wantRows := arch.hidden, 2*arch.ff
+			if which == "w2" {
+				wantK, wantRows = arch.ff, arch.hidden
+			}
+			wantDims := []uint64{uint64(wantK), uint64(wantRows), uint64(arch.nExperts)}
+			if !sameDims(t.Dims, wantDims) {
+				return fmt.Errorf("%s: dims %v, want %v", name, t.Dims, wantDims)
+			}
+			if !sameDims(rt.Dims, wantDims) {
+				return fmt.Errorf("reference %s: dims %v, want %v", name, rt.Dims, wantDims)
 			}
 			var gs []float32
 			if t.Type == tNV4 {
-				g, ok := in.tensor(gscaleName(layer, which))
-				if !ok || g.Type != tF32 || !slices.Equal(g.Dims, []uint64{nExperts}) {
-					return fmt.Errorf("%s: expected %d F32 expert scales", t.Name, nExperts)
+				gsName := gscaleName(layer, which)
+				g, ok := in.tensor(gsName)
+				if !ok || g.Type != tF32 || !sameDims(g.Dims, []uint64{uint64(arch.nExperts)}) {
+					return fmt.Errorf("missing or invalid gscale tensor %s", gsName)
 				}
 				b, err := in.readRows(g, 0, 1)
 				if err != nil {
 					return err
 				}
-				for i := 0; i < nExperts; i++ {
+				for i := 0; i < arch.nExperts; i++ {
 					gs = append(gs, math.Float32frombits(uint32(b[4*i])|uint32(b[4*i+1])<<8|uint32(b[4*i+2])<<16|uint32(b[4*i+3])<<24))
 				}
 			}
+			rows := int(t.Dims[1])
+			sampleRows := []int{0, min(7, rows-1), min(max(0, arch.ff-1), rows-1), min(arch.ff, rows-1), rows - 1}
 			sum, n := 0.0, 0
-			for _, e := range []int{0, 31, 64, 127} {
-				for _, r := range []int{0, 7, ff - 1, ff, rows - 1} {
+			for _, e := range sampleExperts {
+				for _, r := range sampleRows {
 					a, err := in.readRows(t, e*rows+r, 1)
 					if err != nil {
 						return err

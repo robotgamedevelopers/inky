@@ -48,19 +48,33 @@ check_production() {
     grep -q 'Model checking completed. No error has been found.' "$dir/tlc.log" || { cat "$dir/tlc.log" >&2; return 1; }
     { cat "$dir/tlc.log"; tail -1 "$dir/faults.log"; } > "$dir/result"
 }
-# Each named mutation changes the extracted production source, never the oracle.
+# Each named mutation changes the extracted production source, never the oracle,
+# and must fail TLC on the exact pinned property (`U158`).
+expected_for() {
+    case $1 in
+        early-release)      echo 'Action property StepConforms is violated.' ;;
+        no-rollback)        echo 'Invariant RollbackAttempted is violated.' ;;
+        no-readback)        echo 'Action property StepConforms is violated.' ;;
+        lost-seed)          echo 'Action property StepConforms is violated.' ;;
+        restore-stale-boot) echo 'Invariant SavedIsOwed is violated.' ;;
+        stale-same-boot)    echo 'Invariant RestoredWhenIdle is violated.' ;;
+        skip-keep)          echo 'Invariant SavedIsOwner is violated.' ;;
+        *) echo "unknown mutant $1" >&2; return 1 ;;
+    esac
+}
 check_mutant() {
-    local mutant=$1 dir=$work/$1 status
+    local mutant=$1 dir=$work/$1 status expected
+    expected=$(expected_for "$mutant")
     setup "$mutant"
     python3 "$root/scripts/mutate-memmode.py" "$mutant" "$dir"
     if cmp -s "$dir/mode.rs" "$work/mode.rs" && cmp -s "$dir/startup.rs" "$work/startup.rs"; then
         echo "ERROR: $mutant changed nothing" >&2; return 1
     fi
     if run_trace "$dir" "$mutant"; then echo "ERROR: $mutant passed trace checking" >&2; return 1; else status=$?; fi
-    if [[ $status != 12 && $status != 13 ]] || ! grep -Eq 'Action property .* is violated|Invariant .* is violated' "$dir/tlc.log"; then
-        cat "$dir/tlc.log" >&2; echo "ERROR: $mutant failed without a conformance counterexample (exit $status)" >&2; return 1
+    if [[ $status != 12 && $status != 13 ]] || ! grep -Fxq "Error: $expected" "$dir/tlc.log"; then
+        cat "$dir/tlc.log" >&2; echo "ERROR: $mutant did not fail with pinned 'Error: $expected' (exit $status)" >&2; return 1
     fi
-    echo "$mutant rejected (TLC exit $status)" > "$dir/result"
+    echo "$mutant rejected (TLC exit $status): Error: $expected" > "$dir/result"
 }
 names=() pids=()
 check_production & names+=(production) pids+=($!)

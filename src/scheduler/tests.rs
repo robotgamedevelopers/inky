@@ -38,7 +38,11 @@ fn explicit_lane_lifecycle_and_illegal_transitions() {
     assert_eq!(s.lanes()[0].state, LaneState::Ready);
 
     // Run through prefill (pos 0->2) and decode (pos 2->3->4) to Finished.
+    let mut slid = 0usize;
     while s.lanes()[0].pos < s.lanes()[0].target {
+        if s.slide_window(0) {
+            slid += 1;
+        }
         let step = s.build_step().unwrap().expect("step built");
         assert_eq!(step.lanes, vec![0]);
         assert_eq!(s.lanes()[0].state, LaneState::InStep);
@@ -50,6 +54,7 @@ fn explicit_lane_lifecycle_and_illegal_transitions() {
         assert_eq!(s.lanes()[0].state, LaneState::Ready);
         s.check_invariants().unwrap();
     }
+    assert!(slid >= 1, "explicit slide_window exercised during decode");
     s.finish_ready(0).unwrap();
     assert_eq!(s.lanes()[0].state, LaneState::Finished);
     assert_eq!(s.reserved_total(), 0);
@@ -106,18 +111,15 @@ fn cancel_in_restore_io_waits_for_disk_read_barrier() {
     cfg.disk_budget = 4;
     let mut s = Scheduler::new(cfg).unwrap();
 
-    // Seed a kept start point at (p1, 2) and force its blocks to disk via cold writeback.
-    s.arrive(0, "p1", 2).unwrap();
+    // Seed a kept prefill start point at (p1, 2) (`target = 4` -> `PromptEnd = 2`) and spill its blocks to disk.
+    s.arrive(0, "p1", 4).unwrap();
     s.admit(0).unwrap();
     s.begin_restore(0).unwrap();
     s.finish_restore(0).unwrap();
     s.build_step().unwrap();
     s.gpu_execute().unwrap();
     s.complete_step().unwrap();
-    s.build_step().unwrap();
-    s.gpu_execute().unwrap();
-    s.complete_step().unwrap();
-    s.finish_ready(0).unwrap();
+    s.cancel(0).unwrap();
 
     // Fill memory with p2 on lane 1 so p1's cold blocks spill to disk under pressure.
     s.arrive(1, "p2", 4).unwrap();
@@ -191,6 +193,9 @@ fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
         }
         if s.lanes().iter().all(|l| l.state == LaneState::Finished) {
             break;
+        }
+        for l in 0..4 {
+            s.slide_window(l);
         }
         let _step = s.build_step().unwrap().expect("step built");
         for l in s.lanes() {
@@ -287,6 +292,7 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
     // Now run steps with mid-step client disconnects (lanes 1, 5, 6 disconnect mid-step!)
     // and new 2K arrivals attempting to leapfrog lane 4 while it sits at wait_ticks == W.
     let mut mid_step_cancels = 0usize;
+    let mut disconnected_once = BTreeSet::new();
     let mut completed_2k = 0usize;
     let mut completed_64k = 0usize;
     let mut max_wait_observed = 0u32;
@@ -340,13 +346,25 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
             }
         }
 
-        // Evict cold memory blocks lazily if under pressure.
+        // Evict cold memory blocks and start-point states lazily if under pressure.
         while s.mem_pressure() {
             if s.evict_clean_or_unref_mem() {
                 continue;
             }
             if s.start_cold_writeback().is_some() {
                 s.complete_step_io().unwrap();
+                continue;
+            }
+            if s.reclaim_cold_disk() {
+                continue;
+            }
+            break;
+        }
+        while s.state_mem_pressure() {
+            if s.evict_clean_start_state().is_some() {
+                continue;
+            }
+            if s.spill_start_state().is_some() {
                 continue;
             }
             if s.reclaim_cold_disk() {
@@ -366,6 +384,31 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
                 s.begin_restore(l).unwrap();
             }
             if s.lanes()[l].state == LaneState::Restoring {
+                for b in s.lane_block_set(l) {
+                    if s.blocks().get(&b).is_some_and(|r| r.tier == BlockTier::Disk) {
+                        while s.mem_used() >= s.config().mem_budget {
+                            if !s.evict_clean_or_unref_mem() {
+                                if s.start_cold_writeback().is_some() {
+                                    s.complete_step_io().unwrap();
+                                } else if !s.reclaim_cold_disk() {
+                                    break;
+                                }
+                            }
+                        }
+                        s.restore_block(l, &b).unwrap();
+                    }
+                }
+                if !s.start_state_ready(l) {
+                    while s.state_mem_used() >= s.state_mem_budget() {
+                        if s.evict_clean_start_state().is_none()
+                            && s.spill_start_state().is_none()
+                            && !s.reclaim_cold_disk()
+                        {
+                            break;
+                        }
+                    }
+                    s.restore_start_state(l).unwrap();
+                }
                 s.finish_restore(l).unwrap();
             }
         }
@@ -374,6 +417,9 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
         if s.lanes().iter().all(|l| l.state.is_terminal_or_idle()) {
             break;
         }
+        for l in 0..8 {
+            s.slide_window(l);
+        }
 
         // Build & execute one step, injecting mid-step disconnects on lanes 1, 5, 6 and
         // on a second 64K request if desired.
@@ -381,12 +427,14 @@ fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
             panic!("deadlock at tick {tick}: no lane could make progress");
         };
 
-        // Inject mid-step disconnects while lanes are InStep (before gpu_execute!).
+        // Inject mid-step disconnects once per victim while InStep (before gpu_execute!).
         for &victim in &[1usize, 5, 6] {
-            if step.lanes.contains(&victim)
+            if !disconnected_once.contains(&victim)
+                && step.lanes.contains(&victim)
                 && s.lanes()[victim].state == LaneState::InStep
                 && s.lanes()[victim].pos >= 128
             {
+                disconnected_once.insert(victim);
                 assert_eq!(s.cancel(victim).unwrap(), LaneState::Cancelling);
                 // Verify barrier: slot & reservation remain held while Cancelling!
                 assert!(s.lanes()[victim].reservation > 0);
@@ -609,20 +657,79 @@ fn walk_scheduler_trace_satisfies_invariants_across_seeds() {
     let cfg = small_cfg();
     let mut total_cancel = 0;
     let mut total_step_bypass = 0;
+    let mut total_slide = 0;
     for seed in 0..8 {
         let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 120).unwrap();
         assert!(trace.steps.len() >= 10);
         assert!(stats.max_wait_ticks_seen <= cfg.max_bypass);
         total_cancel += stats.cancel_in_step;
         total_step_bypass += stats.step_bypasses;
+        total_slide += stats.slide_windows;
     }
     assert!(total_cancel > 0, "walks must exercise cancel-in-step");
     assert!(total_step_bypass > 0, "walks must exercise step bypass");
+    assert!(total_slide > 0, "walks must exercise explicit slide_window");
     let (tr, _) = walk_scheduler_trace(cfg, 0, 60).unwrap();
     let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
     assert!(data.contains("MODULE TraceData"));
-    assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
+    assert!(check.contains("InitConforms == (stepIdx = 1) => Init"));
+    assert!(check.contains("StepConforms == [][Next]_vars"));
+    assert!(check.contains("ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>"));
     assert!(tlc_cfg.contains("BypassBoundHolds"));
+    assert!(tlc_cfg.contains("NoDecodeBlocksSealed"));
+    assert!(tlc_cfg.contains("ActionConforms"));
+}
+
+#[test]
+fn multi_block_prefill_span_decode_unsealed_and_start_state_tier() {
+    let cfg = SchedulerConfig {
+        lanes: vec!["a".into(), "b".into(), "c".into()],
+        prefixes: vec!["p1".into(), "p2".into(), "p3".into()],
+        request_lengths: vec![6],
+        block_size: 2,
+        window_size: 2,
+        max_pos: 6,
+        max_span: 4, // crosses 2 blocks (4 tokens) in a single prefill step (`U56`)!
+        step_token_budget: 4,
+        mem_budget: 8,
+        disk_budget: 6,
+        max_queue: 1,
+        max_bypass: 2,
+        start_point_stride_blocks: 1,
+    };
+    let mut s = Scheduler::new(cfg).unwrap();
+    s.arrive(0, "p1", 6).unwrap();
+    s.admit(0).unwrap();
+    s.begin_restore(0).unwrap();
+    s.finish_restore(0).unwrap();
+
+    // Single prefill step advances 0 -> 4 (`PromptEnd(6) = 4`), sealing BOTH (p1, 2) and (p1, 4)!
+    let step = s.build_step().unwrap().unwrap();
+    assert_eq!(step.spans[&0], 4);
+    // Guard `build_step` on in-flight writeback (`U61`) once step completes.
+    s.gpu_execute().unwrap();
+    let done = s.complete_step().unwrap();
+    assert_eq!(done.sealed_boundaries, vec![(0, 2), (0, 4)]);
+    assert!(s.start_points()[&("p1".into(), 2)].kept);
+    assert!(s.start_points()[&("p1".into(), 4)].kept);
+    assert_eq!(s.start_points()[&("p1".into(), 4)].state_tier, BlockTier::Memory);
+
+    // Slide window at pos 4 (`History(4) = {1}`, pruning block 0) before decode steps 4->5->6.
+    assert!(s.slide_window(0));
+    for expected_pos in [5u32, 6] {
+        s.slide_window(0);
+        let dstep = s.build_step().unwrap().unwrap();
+        assert_eq!(dstep.spans[&0], 1);
+        s.gpu_execute().unwrap();
+        let ddone = s.complete_step().unwrap();
+        assert!(ddone.sealed_boundaries.is_empty(), "decode blocks must NEVER seal (U58)");
+        assert_eq!(s.lanes()[0].pos, expected_pos);
+        assert!(!s.start_points().contains_key(&("p1".into(), 6)));
+        assert!(matches!(s.lanes()[0].full.get(&2), Some(BlockId::Priv { lane: 0, idx: 2, .. })));
+        s.check_invariants().unwrap();
+    }
+    s.finish_ready(0).unwrap();
+    s.check_invariants().unwrap();
 }
 
 #[test]

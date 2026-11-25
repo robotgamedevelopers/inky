@@ -134,6 +134,89 @@ fn parse_loopcd_omega(flag: &str, value: &str) -> Result<f32, String> {
     Ok(omega)
 }
 
+fn parse_temp(flag: &str, value: &str) -> Result<f32, String> {
+    let temp: f32 = value
+        .parse()
+        .map_err(|_| format!("{flag} must be a finite nonnegative number"))?;
+    if !temp.is_finite() || temp < 0.0 {
+        return Err(format!("{flag} must be a finite nonnegative number"));
+    }
+    Ok(if temp == 0.0 { 0.0 } else { temp })
+}
+
+fn parse_top_p(flag: &str, value: &str) -> Result<f32, String> {
+    let top_p: f32 = value
+        .parse()
+        .map_err(|_| format!("{flag} must be a finite number in (0, 1]"))?;
+    if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+        return Err(format!("{flag} must be a finite number in (0, 1]"));
+    }
+    Ok(top_p)
+}
+
+fn effort_value(e: &str) -> Result<f64, String> {
+    let trimmed = e.trim();
+    match trimmed {
+        "none" => Ok(0.0),
+        "minimal" => Ok(0.1),
+        "low" => Ok(0.2),
+        "medium" => Ok(0.7),
+        "high" => Ok(0.9),
+        "xhigh" | "max" => Ok(0.99),
+        _ => {
+            let v: f64 = trimmed.parse().map_err(|_| {
+                format!("--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}")
+            })?;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(format!("--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}"));
+            }
+            Ok(v.clamp(0.0, 0.99))
+        }
+    }
+}
+
+fn parse_effort(flag: &str, value: &str) -> Result<String, String> {
+    let _ = effort_value(value).map_err(|e| e.replacen("--effort", flag, 1))?;
+    Ok(value.trim().to_string())
+}
+
+fn is_known_cli_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "help" | "-h" | "--help"
+            | "check" | "rows" | "rollback" | "binv" | "lanes" | "spans" | "xcopy" | "poolgate"
+            | "loopcdgate" | "blockedinv" | "temp1"
+            | "lanebench" | "dbatch" | "sharedkv" | "maxctx" | "debug" | "prof" | "routes" | "vcost" | "prof_pf"
+            | "kmoe" | "kgemm" | "kmoepf" | "ksg" | "qclip" | "lazytest" | "kvprune" | "kvscreen" | "kvdump"
+            | "kpeak" | "kmode" | "bw" | "kbench" | "run" | "chat" | "bench"
+    )
+}
+
+fn check_prompt_fits_ctx(prompt_tokens: usize, ctx: usize) -> Result<(), String> {
+    if prompt_tokens == 0 {
+        return Err("prompt encoded to 0 tokens".into());
+    }
+    if prompt_tokens >= ctx {
+        return Err(format!(
+            "prompt of {prompt_tokens} tokens exceeds context headroom ({} max prompt tokens for -c {ctx}); pass a larger -c/--ctx",
+            ctx.saturating_sub(1)
+        ));
+    }
+    Ok(())
+}
+
+fn entropy_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ (std::process::id() as u64).rotate_left(32)
+}
+
+fn resolve_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(entropy_seed)
+}
+
 fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
@@ -157,7 +240,7 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "-c" | "--ctx" => o.ctx = parse_context(flag, value()?)?,
             "--bind" => bind = value()?,
             "--lanes" => o.lanes = parse_usize(flag, value()?)?,
-            "--effort" => o.effort = value()?.into(),
+            "--effort" => o.effort = parse_effort(flag, value()?)?,
             "-n" => o.max_tokens = parse_usize(flag, value()?)?,
             "--key-env" | "--api-key-env" => {
                 let name = value()?;
@@ -343,20 +426,95 @@ mod cli_tests {
         assert!(cli(&["run", "--loopcd"]).err().unwrap().contains("missing value for --loopcd"));
         assert!(cli(&["run", "--loopcd", "0.3", "--kv-disk"]).err().unwrap().contains("--kv-disk"));
     }
+
+    #[test]
+    fn cli_validates_sampling_effort_seed_zero_kv_disk_and_subcommands() {
+        let cli = |args: &[&str]| {
+            parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        };
+
+        // --temp and --top-p bounds + NaN/Inf rejection before loading weights
+        assert_eq!(cli(&["run", "--temp", "0"]).unwrap().1.temp, 0.0);
+        assert_eq!(cli(&["run", "--temp", "-0.0"]).unwrap().1.temp, 0.0);
+        assert_eq!(cli(&["run", "--temp", "1.25"]).unwrap().1.temp, 1.25);
+        for bad_temp in ["-0.01", "-1", "nan", "NaN", "inf", "-inf", "abc"] {
+            assert!(cli(&["run", "--temp", bad_temp]).is_err(), "accepted bad --temp {bad_temp}");
+        }
+        assert_eq!(cli(&["run", "--top-p", "1.0"]).unwrap().1.top_p, 1.0);
+        assert_eq!(cli(&["run", "--top-p", "0.05"]).unwrap().1.top_p, 0.05);
+        for bad_top_p in ["0", "0.0", "-0.5", "1.01", "nan", "NaN", "inf", "-inf", "abc"] {
+            assert!(cli(&["run", "--top-p", bad_top_p]).is_err(), "accepted bad --top-p {bad_top_p}");
+        }
+
+        // --effort accepts named tiers and finite [0, 1] numbers, rejecting NaN, typos, and out-of-range floats
+        for (eff, rendered) in [
+            ("none", "0"),
+            ("minimal", "0.1"),
+            ("low", "0.2"),
+            ("medium", "0.7"),
+            ("high", "0.9"),
+            ("xhigh", "0.99"),
+            ("max", "0.99"),
+            ("0", "0"),
+            ("0.5", "0.5"),
+            ("1.0", "0.99"),
+        ] {
+            let (_, o) = cli(&["run", "--effort", eff]).unwrap();
+            assert_eq!(effort_str(&o.effort), rendered);
+            assert!(serve_args(&["--effort", eff]).is_ok());
+        }
+        for bad_eff in ["nan", "NaN", "inf", "-inf", "-0.1", "1.01", "meduim", "hig", "turbo"] {
+            assert!(cli(&["run", "--effort", bad_eff]).is_err(), "CLI accepted bad --effort {bad_eff}");
+            assert!(serve_args(&["--effort", bad_eff]).is_err(), "serve accepted bad --effort {bad_eff}");
+        }
+
+        // --seed 0 is preserved as an explicit deterministic seed, distinct from omitted --seed
+        assert_eq!(cli(&["run"]).unwrap().1.seed, None);
+        assert_eq!(cli(&["run", "--seed", "0"]).unwrap().1.seed, Some(0));
+        assert_eq!(resolve_seed(Some(0)), 0);
+        let mut s0_a = Sampler::new(1.0, 8, 0.95, 20.0, resolve_seed(Some(0)));
+        let mut s0_b = Sampler::new(1.0, 8, 0.95, 20.0, resolve_seed(Some(0)));
+        let row = [1.0f32, 1.2, 0.9, 1.1, 0.8, 1.15];
+        for _ in 0..16 {
+            assert_eq!(s0_a.sample_next(&row), s0_b.sample_next(&row));
+        }
+
+        // --kv-disk + --kv8 refused cleanly at CLI parse
+        assert!(cli(&["run", "--kv-disk", "--kv8"]).err().unwrap().contains("--kv-disk cannot be combined with --kv8"));
+        assert!(cli(&["check", "--kv8", "--kv-disk"]).err().unwrap().contains("--kv-disk cannot be combined with --kv8"));
+
+        // Unknown subcommands fail with error instead of printing usage with exit 0
+        for unknown in ["bogus", "sever", "runs", "--unknown-first"] {
+            let err = cli(&[unknown]).err().unwrap();
+            assert!(err.contains("unknown command"), "{unknown}: {err}");
+        }
+        assert_eq!(cli(&[]).unwrap().0, "help");
+        assert_eq!(cli(&["--help"]).unwrap().0, "help");
+
+        // Context headroom check refuses prompts >= ctx cleanly
+        assert!(check_prompt_fits_ctx(0, 64).is_err());
+        assert!(check_prompt_fits_ctx(63, 64).is_ok());
+        assert!(check_prompt_fits_ctx(64, 64).is_err());
+        assert!(check_prompt_fits_ctx(120, 64).is_err());
+    }
 }
 
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
-    system: String, temp: f32, top_p: f32, top_k: usize, seed: u64, hide_thinking: bool, n_set: bool,
+    system: String, temp: f32, top_p: f32, top_k: usize, seed: Option<u64>, hide_thinking: bool, n_set: bool,
     loopcd_omega: f32, kv8: bool, kv_disk: bool, allow_mismatch: bool,
 }
 
 fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
     let mut args = raw_args.iter().map(String::as_str);
-    let cmd = args.next().unwrap_or("help").to_string();
+    let raw_cmd = args.next().unwrap_or("help");
+    if !is_known_cli_command(raw_cmd) {
+        return Err(format!("unknown command {raw_cmd}\n\n{USAGE}"));
+    }
+    let cmd = if matches!(raw_cmd, "help" | "-h" | "--help") { "help".to_string() } else { raw_cmd.to_string() };
     let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
-                       temp: 1.0, top_p: 0.95, top_k: 64, seed: 0, hide_thinking: false, n_set: false,
+                       temp: 1.0, top_p: 0.95, top_k: 64, seed: None, hide_thinking: false, n_set: false,
                        loopcd_omega: 0.0, kv8: false, kv_disk: false,
                        allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0") };
     while let Some(a) = args.next() {
@@ -374,21 +532,24 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--kv8" => o.kv8 = true,
             "--kv-disk" => o.kv_disk = true,
             "--allow-mismatch" => o.allow_mismatch = true,
-            "--effort" => o.effort = v()?.into(),
+            "--effort" => o.effort = parse_effort(a, v()?)?,
             "--system" => o.system = v()?.into(),
-            "--temp" => o.temp = v()?.parse().map_err(|_| format!("{a} requires a number"))?,
-            "--top-p" => o.top_p = v()?.parse().map_err(|_| format!("{a} requires a number"))?,
+            "--temp" => o.temp = parse_temp(a, v()?)?,
+            "--top-p" => o.top_p = parse_top_p(a, v()?)?,
             "--top-k" => o.top_k = parse_usize(a, v()?)?,
-            "--seed" => o.seed = parse_u64(a, v()?)?,
+            "--seed" => o.seed = Some(parse_u64(a, v()?)?),
             "--greedy" => o.temp = 0.0,
             "--hide-thinking" => o.hide_thinking = true,
             "--loopcd" => o.loopcd_omega = parse_loopcd_omega(a, v()?)?,
             "--ref" => o.reference = v()?.into(),
             "-q" => o.quiet = true,
             "--stop" => o.stop = parse_usize(a, v()?)?,
-            "-h" | "--help" => { println!("{USAGE}"); std::process::exit(0) }
+            "-h" | "--help" => return Ok(("help".into(), o)),
             _ => return Err(format!("unknown option {a}\n\n{USAGE}")),
         }
+    }
+    if o.kv_disk && o.kv8 {
+        return Err("--kv-disk cannot be combined with --kv8".into());
     }
     if o.loopcd_omega > 0.0 && o.kv_disk {
         return Err("--loopcd cannot be combined with --kv-disk".into());
@@ -399,18 +560,17 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
 fn parse() -> (String, Opts) {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, mut o) = parse_cli_args(&raw).unwrap_or_else(|e| cli_error(e));
-    if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
-    if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
-    if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64; }
+    if cmd != "help" {
+        if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
+        if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
+        o.seed = Some(resolve_seed(o.seed));
+    }
     (cmd, o)
 }
 
 /// reasoning effort as rendered by the GGUF chat template
 fn effort_str(e: &str) -> String {
-    let v = match e.trim() {
-        "none" => 0.0, "minimal" => 0.1, "low" => 0.2, "medium" => 0.7, "high" => 0.9, "xhigh" | "max" => 0.99,
-        x => x.parse::<f64>().unwrap_or(0.9).clamp(0.0, 0.99),
-    };
+    let v = effort_value(e).expect("validated --effort");
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
 
@@ -432,11 +592,12 @@ fn run(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
-    let mut sess = Session::new(&eng, &tk);
-    if std::env::var("INK_KV_PREALLOC").is_ok() { sess.run().reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
-    let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let toks = tk.encode(&text, true);
+    check_prompt_fits_ctx(toks.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
+    let mut sess = Session::new(&eng, &tk);
+    if std::env::var("INK_KV_PREALLOC").is_ok() { sess.run().reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
+    let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, resolve_seed(o.seed));
     sess.run().prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
     let first = sess.prefill(&toks)?;
     let mut out = std::io::stdout();
@@ -456,7 +617,7 @@ fn chat(o: &Opts) -> Result<(), String> {
     eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
     let mut sess = Session::new(&eng, &tk);
-    let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, o.seed);
+    let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, resolve_seed(o.seed));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     eprintln!("[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
@@ -497,6 +658,7 @@ fn bench(o: &Opts) -> Result<(), String> {
     let n = if o.n_set { o.n } else { 128 };
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let toks = tk.encode(&text, true);
+    check_prompt_fits_ctx(toks.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
     let mut sampler = Sampler::new(0.0, 1, 1.0, eng.softcap, 0);
     // warm-up pass (pipelines, page mappings)
     let warm = {
@@ -621,6 +783,8 @@ fn check(o: &Opts) -> Result<(), String> {
     // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
     let dec_steps = std::env::var("INK_DEC").is_ok();
     if dec_steps { eng.ensure_dbatch(1); }
+    let sabotage = std::env::var("INK_CHECK_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut agree = 0;
     let mut compared = 0;
     let mut worst = 0f32;
@@ -656,13 +820,18 @@ fn check(o: &Opts) -> Result<(), String> {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
             if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
         }
-        let raw: &[f32] = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
+        let raw = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
         if let Some(token) = raw.iter().position(|x| !x.is_finite()) {
             return Err(format!("non-finite engine logit at position {pos}, token {token}"));
         }
-        for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
+        let mut lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
+        if sabotage && !sabotaged {
+            for x in &mut lg { *x = -*x; }
+            println!("INK_CHECK_SABOTAGE: negated engine logits at position {pos}");
+            sabotaged = true;
+        }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
             .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
@@ -677,6 +846,13 @@ fn check(o: &Opts) -> Result<(), String> {
         let (n, (rb, rt)) = (toks.len(), eng.tier_io());
         eprintln!("disk tier: {:.1} MiB in memory, {:.1} MiB on disk only (all in memory: {:.1} MiB); read {:.0} MiB in {:.0} ms",
                   eng.mem().0 as f64 / 1048576.0, eng.kv_disk_bytes(n) as f64 / 1048576.0, eng.kv_exact_bytes(n) as f64 / 1048576.0, rb as f64 / 1048576.0, rt.as_secs_f64() * 1e3);
+    }
+    if sabotage {
+        if !sabotaged || (agree == compared && worst <= 0.01) {
+            eprintln!("INK_CHECK_SABOTAGE: failed to induce disagreement");
+            std::process::exit(2);
+        }
+        return Err(format!("CHECK AGREEMENT FAILED ({agree}/{compared}, worst KL {worst:.9})"));
     }
     check_agreement_gate(agree, compared, o.allow_mismatch)
 }
@@ -774,7 +950,7 @@ fn rows(o: &Opts) {
     let mut ok = true;
     for r in 0..1 + k {
         let got = eng.span_logits(r);
-        let same = got == expect[r].as_slice();
+        let same = &*got == expect[r].as_slice();
         ok &= same;
         println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
     }
@@ -842,7 +1018,7 @@ fn rollback(o: &Opts) {
         eng.encode_verify(&cb, &[Span { lane: &lane, p0, t }], k);
         cb.commit();
         cb.waitUntilCompleted();
-        let logits_same = eng.span_logits(n_keep - 1) == ref_logits.as_slice();
+        let logits_same = &*eng.span_logits(n_keep - 1) == ref_logits.as_slice();
         eng.rollback_verify(&lane, 0, n_keep);
         let pref_ok = eng.lane_hash(&lane) == hash_pref;
         run.set_tokens(reject_at, &[true_tok(reject_at)]);
@@ -870,32 +1046,66 @@ fn binv(o: &Opts) -> Result<(), String> {
     let tk = Tokenizer::load(&eng.g);
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
     // each entry is one way to split the prompt: boundaries joined by '+' ("37+190": three prefills); an entry may repeat,
-    // which tests that the same split gives the same bits run after run
-    let splits: Vec<Vec<usize>> = std::env::var("INK_SPLITS").unwrap_or("0,1,5,16,23,100,1001".into()).split(',')
-        .map(|v| v.split('+').map(|x| x.parse().unwrap()).filter(|&x| x > 0).collect()).collect();
+    // which tests that the same split gives the same bits run after run. At least two schedules are required (refusing e.g. `INK_SPLITS=0` alone).
+    let raw_splits = std::env::var("INK_SPLITS").unwrap_or_else(|_| "0,1,5,16,23,100,1001".into());
+    let splits: Vec<Vec<usize>> = raw_splits
+        .split(',')
+        .map(|v| {
+            if v.trim().is_empty() {
+                eprintln!("[inky] INK_SPLITS contains an empty schedule in {raw_splits:?}");
+                std::process::exit(2);
+            }
+            v.split('+')
+                .map(|x| {
+                    x.trim().parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("[inky] invalid split point {x:?} in INK_SPLITS={raw_splits:?}");
+                        std::process::exit(2);
+                    })
+                })
+                .filter(|&x| x > 0)
+                .collect()
+        })
+        .collect();
+    if splits.len() < 2 {
+        eprintln!("[inky] INK_SPLITS must specify at least two split schedules to compare (got {raw_splits:?})");
+        std::process::exit(2);
+    }
+    let sabotage = std::env::var("INK_BINV_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut first = None;
     let mut base: Vec<f32> = Vec::new();
     let mut ok = true;
     for k in splits {
         let mut sess = Session::new(&eng, &tk);
+        let mut run_toks = toks.clone();
+        if sabotage && first.is_some() && !sabotaged {
+            run_toks[0] = (run_toks[0] + 1) % (eng.n_vocab as u32);
+            println!("INK_BINV_SABOTAGE: perturbed token 0 on second split");
+            sabotaged = true;
+        }
         let mut p = 0;
-        for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b])?; p = b; } }
+        for &b in k.iter().chain(std::iter::once(&run_toks.len())) { if b > p { sess.prefill(&run_toks[p..b])?; p = b; } }
         let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
         let k = if k.is_empty() { "0".to_string() } else { k };
+        let lg = eng.logits();
         let mut h = 0xcbf29ce484222325u64;
-        for x in eng.logits() { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*lg { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         let same = *first.get_or_insert(h) == h;
-        if base.is_empty() { base = eng.logits().to_vec(); }
-        let maxdiff = eng.logits().iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        if base.is_empty() { base = lg.to_vec(); }
+        let maxdiff = lg.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
         ok &= same;
         // KL(first || this) over the soft-capped logits, as sampling sees them
         let cap = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| softcap(x, eng.softcap)).collect() };
-        let (pa, pb) = (cap(&base), cap(eng.logits()));
+        let (pa, pb) = (cap(&base), cap(&lg));
         let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
         let (l1, l2) = (lse(&pa), lse(&pb));
         let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
-        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(eng.logits()));
+        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(&lg));
+    }
+    if sabotage && !sabotaged {
+        eprintln!("INK_BINV_SABOTAGE: need at least two splits in INK_SPLITS");
+        std::process::exit(2);
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
@@ -923,7 +1133,7 @@ fn lanes(o: &Opts) {
         let cb = run.gpu.cmd();
         if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
         cb.commit(); cb.waitUntilCompleted();
-        for x in run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
     };
     // per-step hashes, to name the first step where two runs part
     let trace = |run: &engine::Run, toks: &[u32], other: Option<&engine::Run>| -> Vec<u64> {
@@ -946,6 +1156,12 @@ fn lanes(o: &Opts) {
     let (la, lb) = (Lane::new(&eng), Lane::new(&eng));
     let (ra, rb) = (eng.on(&la), eng.on(&lb));
     for (r, t) in [(&ra, &a), (&rb, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+    if std::env::var("INK_LANES_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        let pos = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
+        let leaked = if a[pos] != b[pos] { b[pos] } else { (a[pos] + 1) % (eng.n_vocab as u32) };
+        ra.set_tokens(pos, &[leaked]);
+        println!("INK_LANES_SABOTAGE: bled lane B token into lane A at position {pos}");
+    }
     let (mut ia, mut ib) = (0xcbf29ce484222325u64, 0xcbf29ce484222325u64);
     for &w in &work { hash_step(&ra, w, &mut ia); hash_step(&rb, w, &mut ib); }
     if std::env::var("INK_LANE_TRACE").is_ok() {
@@ -995,7 +1211,7 @@ fn spans(o: &Opts) {
         let mut hs = Vec::new();
         for &(p0, t) in &work {
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); cb.waitUntilCompleted();
-            hs.push(fnv(eng.logits()));
+            hs.push(fnv(&eng.logits()));
         }
         alone.push((hs, eng.lane_hash(&l)));
     }
@@ -1012,15 +1228,18 @@ fn spans(o: &Opts) {
             for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
             if sp.is_empty() { continue; }
             if sabotage && !sabotaged && sp.len() >= 2 {
-                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
-                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
-                sp[0].lane = &lanes[who[1]];
+                // negative control: swap the first two spans' lanes so every span still names a distinct lane,
+                // while binding both spans to the wrong lane's state; their logits and caches must then differ
+                println!("INK_SPANS_SABOTAGE: spans of lanes {} and {} swapped", who[0], who[1]);
+                let lane0 = sp[0].lane;
+                sp[0].lane = sp[1].lane;
+                sp[1].lane = lane0;
                 sabotaged = true;
             }
             if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
             nsteps += 1;
             let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
-            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
+            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(&*(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) }))); }
         }
         let mut bad = Vec::new();
         for i in 0..n {
@@ -1047,8 +1266,11 @@ fn poolgate(o: &Opts) {
     let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
     let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
     let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
+    let start_sabotage = std::env::var("INK_POOLGATE_START_SABOTAGE").is_ok();
     let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
-    let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
+    let w = poolgate::Workload::from_tokens(&base, n, chunks.clone(), decode);
+    let total_positions: usize = chunks.iter().sum::<usize>() + decode;
+    let prompt_positions: usize = chunks.iter().sum();
     let eng = Engine::load(&o.model, o.ctx);
     let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
     // the candidate: real Layer 3 BlockPool + BlockTable + PrefixTree over the same engine
@@ -1072,7 +1294,11 @@ fn poolgate(o: &Opts) {
             println!("layer 3 stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, tails_dropped={}",
                 st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.tails_dropped);
             if !sabotage {
-                match poolgate::verify_prefix_start_points(&eng, &base, o.ctx) {
+                if let Err(err) = poolgate::verify_l3_workload_stats(&st, n, prompt_positions, total_positions) {
+                    println!("POOL GATE STATS MISSING: {err}");
+                    std::process::exit(1);
+                }
+                match poolgate::verify_prefix_start_points(&eng, &base, o.ctx, start_sabotage) {
                     Ok(msg) => println!("{msg}"),
                     Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); std::process::exit(1); }
                 }
@@ -1107,7 +1333,7 @@ fn xcopy(o: &Opts) {
         let cb = eng.gpu.cmd();
         if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
         cb.commit(); cb.waitUntilCompleted();
-        fnv(if dec { eng.span_logits(0) } else { eng.logits() })
+        fnv(&*(if dec { eng.span_logits(0) } else { eng.logits() }))
     };
     let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
         let mut hs = Vec::new(); let mut p = from;
@@ -1209,7 +1435,7 @@ fn temp1(o: &Opts) {
                     gcb.waitUntilCompleted();
                     r.sampled_token_at(pos).expect("valid GPU sample")
                 } else {
-                    sampler.sample_next(eng.logits()).expect("solo prefill sample")
+                    sampler.sample_next(&eng.logits()).expect("solo prefill sample")
                 };
                 let mut toks = vec![first_tok];
                 while toks.len() < ndec {
@@ -1228,7 +1454,7 @@ fn temp1(o: &Opts) {
                         gcb.waitUntilCompleted();
                         r.sampled_token_at(next_pos).expect("valid GPU sample")
                     } else {
-                        sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
+                        sampler.sample_next(&eng.span_logits(0)).expect("solo decode sample")
                     };
                     pos = next_pos;
                     toks.push(tok);
@@ -1316,10 +1542,14 @@ fn temp1(o: &Opts) {
                             .iter()
                             .map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t })
                             .collect();
+                        let want_logits: Vec<bool> = sp_list
+                            .iter()
+                            .map(|&(i, p0, t)| p0 + t == reqs[i].pf_end)
+                            .collect();
                         let many = spans.len() > 1;
                         eng.poison_scratch();
                         let cb = eng.gpu.cmd();
-                        eng.encode_spans(&cb, &spans, true, false);
+                        eng.encode_spans_logits(&cb, &spans, &want_logits, false);
                         cb.commit();
                         cb.waitUntilCompleted();
                         let mut gpu_pf = Vec::new();
@@ -1330,7 +1560,7 @@ fn temp1(o: &Opts) {
                                     gpu_pf.push((k, i));
                                 } else {
                                     let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                                    let tok = reqs[i].sampler.sample_next(lg).expect("batched pf sample");
+                                    let tok = reqs[i].sampler.sample_next(&lg).expect("batched pf sample");
                                     reqs[i].toks.push(tok);
                                 }
                             }
@@ -1388,7 +1618,7 @@ fn temp1(o: &Opts) {
                             let tok = if reqs[i].sampler.uses_gpu_gumbel() {
                                 eng.on(&reqs[i].lane).sampled_token_at(reqs[i].n_past).expect("valid GPU sample")
                             } else {
-                                reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
+                                reqs[i].sampler.sample_next(&eng.span_logits(k)).expect("batched dec sample")
                             };
                             reqs[i].toks.push(tok);
                         }
@@ -1539,13 +1769,15 @@ fn dbatch(o: &Opts) {
         for q in 0..nd {
             let cb = eng.gpu.cmd();
             if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
-            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(if old { eng.logits() } else { eng.span_logits(0) }));
+            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(&*(if old { eng.logits() } else { eng.span_logits(0) })));
         }
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
     }
     let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
     println!("alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s", if old { "decode path" } else { "decode steps of one lane" }, 1e3 / ms_alone);
+    let sabotage = std::env::var("INK_DBATCH_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
     let mut ok = true;
     for &n in &counts {
         let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
@@ -1553,17 +1785,26 @@ fn dbatch(o: &Opts) {
         let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
         let t0 = std::time::Instant::now();
         for q in 0..nd {
-            let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            let mut b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
+            if sabotage && !sabotaged && n >= 2 && q == 0 {
+                println!("INK_DBATCH_SABOTAGE: lane 0 decode span bound to lane 1 at step 0");
+                b[0].0 = &lanes[1];
+                sabotaged = true;
+            }
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
+            for j in 0..n { hs[j].push(fnv(&*(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) }))); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
         println!("{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}", n as f64 * 1e3 / ms, 1e3 / ms,
                  if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) });
         ok &= bad.is_empty();
+    }
+    if sabotage && !sabotaged {
+        eprintln!("INK_DBATCH_SABOTAGE: need a lane count >= 2 in INK_LANES");
+        std::process::exit(2);
     }
     println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
     if !ok { std::process::exit(1); }
@@ -2479,6 +2720,7 @@ fn debug(o: &Opts) {
     eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
     let toks = tk.encode(&o.prompt, true);
+    check_prompt_fits_ctx(toks.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
     eng.reset();
     eng.set_tokens(0, &toks);
     for pos in 0..toks.len() {
@@ -2591,11 +2833,13 @@ fn routes(o: &Opts) -> Result<(), String> {
     let tk = Tokenizer::load(&eng.g);
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let prompt = tk.encode(&text, true);
+    check_prompt_fits_ctx(prompt.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
     let mut sess = Session::new(&eng, &tk);
     let mut tok = sess.prefill(&prompt)?;
     let mut out = String::new();
     for t in &prompt { out += &format!("P {t}\n"); }
     for _ in 0..o.n {
+        if sess.n_past + 1 >= eng.max_ctx { break; }
         let pos = sess.n_past;
         eng.set_tokens(pos, &[tok]);
         let cb = eng.gpu.cmd();
@@ -2740,6 +2984,7 @@ fn main() {
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            check_prompt_fits_ctx(pt.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
             let t = pt.len().min(eng.chunk);
             eng.reset();
             eng.set_tokens(0, &pt);
@@ -2831,12 +3076,16 @@ fn main() {
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
             let (n, d) = (pt.len(), if o.n_set { o.n } else { 48 });
+            if n <= engine::EXT {
+                cli_error(format!("kvprune requires a prompt longer than {} tokens (got {n})", engine::EXT));
+            }
+            check_prompt_fits_ctx(n + d, eng.max_ctx).unwrap_or_else(|e| cli_error(e));
             eng.reset(); eng.reserve(n + d + 1, false); eng.ensure_batch(n.min(eng.chunk)); eng.qcap_alloc(n);
             eng.set_tokens(0, &pt);
             let mut p0 = 0;
             while p0 < n { let t = (n - p0).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, p0, t, p0 + t == n, false); cb.commit(); cb.waitUntilCompleted(); p0 += t; }
             let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
-            let first = am(eng.logits()) as u32;
+            let first = am(&eng.logits()) as u32;
             let snap = eng.snapshot();
             let run = |toks: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<f32>>, f64) {
                 eng.restore(&snap);
@@ -2883,9 +3132,10 @@ fn main() {
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            check_prompt_fits_ctx(pt.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
             let n = pt.len().min(eng.chunk);
             eng.reset(); eng.reserve(n + 1, false); eng.ensure_batch(n);
-            eng.set_tokens(0, &pt);
+            eng.set_tokens(0, &pt[..n]);
             let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, 0, n, false, false); cb.commit(); cb.waitUntilCompleted();
             println!("last layer, {n} keys, last 48 queries x 24 heads: share of keys within a margin of the best score");
             for (m, mean, worst) in eng.kv_screen(n, 48, &[8.0, 12.0, 17.0, 25.0]) {
@@ -2899,6 +3149,7 @@ fn main() {
             let eng = eng.on(&lane);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
+            check_prompt_fits_ctx(pt.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
             let mut sess = Session::new(&eng, &tk);
             report_cli_result(&cmd, sess.prefill(&pt).map(|_| ()));
             let (swa, full) = eng.kv_dump(pt.len());
@@ -2944,7 +3195,8 @@ fn main() {
         "run" => report_cli_result(&cmd, run(&o)),
         "chat" => report_cli_result(&cmd, chat(&o)),
         "bench" => report_cli_result(&cmd, bench(&o)),
-        _ => println!("{USAGE}"),
+        "help" => println!("{USAGE}"),
+        _ => cli_error(format!("unknown command {cmd}\n\n{USAGE}")),
     }
 }
 

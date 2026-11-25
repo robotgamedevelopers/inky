@@ -46,6 +46,12 @@ func openSafetensors(path string) (*safetensors, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	s := &safetensors{f: f, base: 8 + int64(hl), tensors: map[string]stTensor{}}
+	stInfo, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	fileLen := stInfo.Size()
 	for k, v := range raw {
 		if k == "__metadata__" {
 			continue
@@ -54,6 +60,16 @@ func openSafetensors(path string) (*safetensors, error) {
 		if err := json.Unmarshal(v, &t); err != nil {
 			f.Close()
 			return nil, fmt.Errorf("%s: tensor %s: %w", path, k, err)
+		}
+		for _, d := range t.Shape {
+			if d < 0 {
+				f.Close()
+				return nil, fmt.Errorf("%s: tensor %s: negative dimension in %v", path, k, t.Shape)
+			}
+		}
+		if t.Offsets[0] < 0 || t.Offsets[1] < t.Offsets[0] || s.base+t.Offsets[1] > fileLen {
+			f.Close()
+			return nil, fmt.Errorf("%s: tensor %s: offsets %v out of file bounds (%d bytes)", path, k, t.Offsets, fileLen)
 		}
 		s.tensors[k] = t
 	}

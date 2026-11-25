@@ -132,10 +132,10 @@ func sameReply(a, b replySample) bool {
 }
 
 func (g *gate) seededReplies() error {
-	// Two distinct prompts and seeds overlap on separate lanes so any cross-lane mix-up fails immediately.
+	// Two distinct prompts (different topics, token lengths, and seeds) overlap on separate lanes so any cross-lane mix-up fails immediately.
 	bodies := [2]string{
 		`{"messages":[{"role":"user","content":"Write the integers 1 through 10000 in order, separated by commas. Do not summarize."}],"max_tokens":64,"seed":1729,"temperature":0.8,"stream":true}`,
-		`{"messages":[{"role":"user","content":"Write the lowercase English alphabet repeated 200 times, separated by spaces. Do not summarize."}],"max_tokens":64,"seed":2029,"temperature":0.8,"stream":true}`,
+		`{"messages":[{"role":"user","content":"List alternating Greek letter names alpha beta gamma delta repeated 200 times, separated by spaces, with no headings and no summary."}],"max_tokens":64,"seed":2029,"temperature":0.8,"stream":true}`,
 	}
 	var refs [2]replySample
 	for i, body := range bodies {
@@ -145,8 +145,8 @@ func (g *gate) seededReplies() error {
 		}
 		refs[i] = r
 	}
-	if sameReply(refs[0], refs[1]) {
-		return fmt.Errorf("distinct seeded reference prompts produced identical replies")
+	if sameReply(refs[0], refs[1]) || refs[0].message == refs[1].message || refs[0].usage.Prompt == refs[1].usage.Prompt {
+		return fmt.Errorf("distinct seeded reference prompts did not produce distinct replies and prompt counts")
 	}
 	type outcome struct {
 		idx    int
@@ -192,6 +192,9 @@ func (g *gate) seededReplies() error {
 			return o.err
 		}
 		got[o.idx] = o.sample
+	}
+	if sameReply(got[0], refs[1]) || sameReply(got[1], refs[0]) {
+		return fmt.Errorf("cross-lane reply mix-up between concurrent lanes")
 	}
 	for i := 0; i < 2; i++ {
 		if !sameReply(got[i], refs[i]) {

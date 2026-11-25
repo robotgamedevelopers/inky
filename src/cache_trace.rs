@@ -573,8 +573,10 @@ impl BlockLayoutConfig {
         if uniq.len() != self.lanes.len() {
             return Err(TraceError::InvalidSchema("block_layout.lanes contains duplicates".into()));
         }
-        if self.full_capacity == 0 || self.window_capacity == 0 || self.full_capacity + self.window_capacity < 3 {
-            return Err(TraceError::InvalidSchema("invalid pool capacities".into()));
+        if self.full_capacity < 2 || self.window_capacity < 2 {
+            return Err(TraceError::InvalidSchema(
+                "block_layout capacities must hold at least 2 full and 2 window slots".into(),
+            ));
         }
         if self.block_size < 2 || self.window_size == 0 || self.max_pos <= self.block_size {
             return Err(TraceError::InvalidSchema("invalid block_size/window_size/max_pos".into()));
@@ -1212,6 +1214,38 @@ pub fn render_block_layout_tla_bundle(
         out.push_str(">>");
     };
 
+    let encode_bl_act = |step: &BlockLayoutStep| -> Result<String, TraceError> {
+        let req_lane = |act: &str| -> Result<&str, TraceError> {
+            let l = req_field(&step.args, "lane")?.as_str()?;
+            if !cfg.lanes.iter().any(|x| x == l) {
+                return Err(TraceError::InvalidSchema(format!("{act} unknown lane {l:?}")));
+            }
+            Ok(l)
+        };
+        match step.action.as_str() {
+            "Init" => Ok("<<\"Init\">>".into()),
+            "Prepare" => {
+                let l = req_lane("Prepare")?;
+                let tok = req_field(&step.args, "tokens")?.as_u32()?;
+                Ok(format!("<<\"Prepare\", \"{l}\", {tok}>>"))
+            }
+            "Alloc" => {
+                let l = req_lane("Alloc")?;
+                let k = parse_kind(req_field(&step.args, "kind")?.as_str()?)?;
+                let blk = req_field(&step.args, "block")?.as_u32()?;
+                let slot = req_field(&step.args, "slot")?.as_u32()?;
+                Ok(format!("<<\"Alloc\", \"{l}\", \"{}\", {blk}, {slot}>>", kind_name(k)))
+            }
+            "BeginStep" | "Write" | "EndStep" | "SlideWindow" | "KeepStart" | "Match" | "Finish" => {
+                let l = req_lane(&step.action)?;
+                Ok(format!("<<\"{}\", \"{l}\">>", step.action))
+            }
+            "DropStart" => Ok("<<\"DropStart\">>".into()),
+            "Stutter" => Ok("<<\"Stutter\">>".into()),
+            other => Err(TraceError::InvalidSchema(format!("unknown block_layout action {other:?}"))),
+        }
+    };
+
     for (ti, tr) in traces.iter().enumerate() {
         if ti > 0 {
             data.push_str(",\n");
@@ -1310,7 +1344,8 @@ pub fn render_block_layout_tla_bundle(
             let kept_lit = if st.start_kept { "TRUE" } else { "FALSE" };
             let _ = write!(data, ">>, {kept_lit}, {}, {}, ", st.start_pos, st.start_state);
             write_dense_table(&mut data, &st.start_table);
-            data.push_str(">>");
+            let act_lit = encode_bl_act(step)?;
+            let _ = write!(data, ", {act_lit}>>");
         }
         data.push_str("\n  >>");
     }
@@ -1383,7 +1418,28 @@ ReplayNext ==
        /\\ startTable' = nxt.startTable /\\ startState' = nxt.startState
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+InitConforms == (stepIdx = 1) => Init
+StepConforms == [][Next]_vars
+
+DispatchStep(act) ==
+  IF act[1] = \"Prepare\"          THEN Prepare(act[2], act[3])
+  ELSE IF act[1] = \"Alloc\"       THEN Alloc(act[2], <<act[3], act[4]>>, act[5])
+  ELSE IF act[1] = \"BeginStep\"   THEN BeginStep(act[2])
+  ELSE IF act[1] = \"Write\"       THEN Write(act[2])
+  ELSE IF act[1] = \"EndStep\"     THEN EndStep(act[2])
+  ELSE IF act[1] = \"SlideWindow\" THEN SlideWindow(act[2])
+  ELSE IF act[1] = \"KeepStart\"   THEN KeepStart(act[2])
+  ELSE IF act[1] = \"DropStart\"   THEN DropStart
+  ELSE IF act[1] = \"Match\"       THEN Match(act[2])
+  ELSE IF act[1] = \"Finish\"      THEN Finish(act[2])
+  ELSE IF act[1] = \"Stutter\"     THEN UNCHANGED vars
+  ELSE FALSE
+
+StepActionCheck ==
+  (stepIdx' = stepIdx + 1) =>
+    \\E act \\in {{Traces[traceIdx][stepIdx + 1][14]}} : DispatchStep(act)
+
+ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>
 =============================================================================
 "
     );
@@ -1405,6 +1461,7 @@ CONSTANTS
  Bug = \"none\"
 INVARIANTS
  TypeOK
+ InitConforms
  GenerationMatches
  WindowCovered
  FullCovered
@@ -1414,7 +1471,8 @@ INVARIANTS
  TableIndex
  Address64
 PROPERTIES
- Conforms
+ StepConforms
+ ActionConforms
 ",
         cfg.full_capacity,
         cfg.window_capacity,
@@ -1439,9 +1497,12 @@ pub const CACHE_SCHEDULER_ACTIONS: &[&str] = &[
     "Admit",
     "BeginRestore",
     "RestoreBlock",
+    "RestoreStartState",
     "FinishRestore",
     "EvictCleanOrUnrefMem",
     "StartColdWriteback",
+    "EvictCleanStartState",
+    "SpillStartState",
     "ReclaimColdDisk",
     "DropUnreferenced",
     "SlideWindow",
@@ -1457,7 +1518,7 @@ pub const CACHE_SCHEDULER_ACTIONS: &[&str] = &[
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CacheBlockId {
     Tree { prefix: String, kind: BlockKind, idx: u32 },
-    Priv { lane: String, kind: BlockKind },
+    Priv { lane: String, kind: BlockKind, idx: u32 },
 }
 
 impl Ord for CacheBlockId {
@@ -1470,9 +1531,9 @@ impl Ord for CacheBlockId {
             (CacheBlockId::Tree { .. }, CacheBlockId::Priv { .. }) => std::cmp::Ordering::Less,
             (CacheBlockId::Priv { .. }, CacheBlockId::Tree { .. }) => std::cmp::Ordering::Greater,
             (
-                CacheBlockId::Priv { lane: l1, kind: k1 },
-                CacheBlockId::Priv { lane: l2, kind: k2 },
-            ) => (1u8, l1, kind_rank(*k1)).cmp(&(1u8, l2, kind_rank(*k2))),
+                CacheBlockId::Priv { lane: l1, kind: k1, idx: i1 },
+                CacheBlockId::Priv { lane: l2, kind: k2, idx: i2 },
+            ) => (1u8, l1, kind_rank(*k1), i1).cmp(&(1u8, l2, kind_rank(*k2), i2)),
         }
     }
 }
@@ -1493,7 +1554,7 @@ impl CacheBlockId {
     pub fn encode(&self) -> String {
         match self {
             CacheBlockId::Tree { prefix, kind, idx } => format!("tree:{prefix}:{}:{idx}", kind_name(*kind)),
-            CacheBlockId::Priv { lane, kind } => format!("priv:{lane}:{}", kind_name(*kind)),
+            CacheBlockId::Priv { lane, kind, idx } => format!("priv:{lane}:{}:{idx}", kind_name(*kind)),
         }
     }
 
@@ -1507,9 +1568,12 @@ impl CacheBlockId {
                     .map_err(|_| TraceError::InvalidSchema(format!("bad tree block idx in {s:?}")))?;
                 Ok(CacheBlockId::Tree { prefix: (*p).to_owned(), kind, idx })
             }
-            ["priv", l, k] => {
+            ["priv", l, k, idx_s] => {
                 let kind = parse_kind(k)?;
-                Ok(CacheBlockId::Priv { lane: (*l).to_owned(), kind })
+                let idx = idx_s
+                    .parse::<u32>()
+                    .map_err(|_| TraceError::InvalidSchema(format!("bad priv block idx in {s:?}")))?;
+                Ok(CacheBlockId::Priv { lane: (*l).to_owned(), kind, idx })
             }
             _ => Err(TraceError::InvalidSchema(format!("invalid CacheBlockId {s:?}"))),
         }
@@ -1520,8 +1584,8 @@ impl CacheBlockId {
             CacheBlockId::Tree { prefix, kind, idx } => {
                 format!("<<\"tree\", \"{prefix}\", \"{}\", {idx}>>", kind_name(*kind))
             }
-            CacheBlockId::Priv { lane, kind } => {
-                format!("<<\"priv\", \"{lane}\", \"{}\">>", kind_name(*kind))
+            CacheBlockId::Priv { lane, kind, idx } => {
+                format!("<<\"priv\", \"{lane}\", \"{}\", {idx}>>", kind_name(*kind))
             }
         }
     }
@@ -1560,7 +1624,7 @@ impl CacheSchedulerConfig {
             }
         }
         if self.max_span == 0
-            || self.max_span > self.block_size
+            || self.max_span > self.max_pos
             || self.step_token_budget < self.max_span
             || self.mem_budget < 2
             || self.disk_budget < 2
@@ -1602,7 +1666,9 @@ impl CacheSchedulerConfig {
         }
         for l in &self.lanes {
             for kind in [BlockKind::Full, BlockKind::Window] {
-                out.push(CacheBlockId::Priv { lane: l.clone(), kind });
+                for idx in 0..self.num_blocks() {
+                    out.push(CacheBlockId::Priv { lane: l.clone(), kind, idx });
+                }
             }
         }
         out
@@ -1647,6 +1713,7 @@ pub struct CacheBlockSnapshot {
     pub length: u32,
     pub data: Vec<u8>,
     pub ref_count: u32,
+    pub last_used_tick: u64,
 }
 
 impl CacheBlockSnapshot {
@@ -1662,6 +1729,7 @@ impl CacheBlockSnapshot {
             JsonVal::Arr(self.data.iter().map(|&d| JsonVal::uint(d)).collect()),
         );
         m.insert("ref_count".into(), JsonVal::uint(self.ref_count));
+        m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
     }
 }
@@ -1671,8 +1739,10 @@ pub struct StartPointSnapshot {
     pub prefix: String,
     pub boundary: u32,
     pub state_kept: bool,
+    pub state_tier: String,
     pub full: Vec<CacheBlockId>,
     pub win: Vec<CacheBlockId>,
+    pub last_used_tick: u64,
 }
 
 impl StartPointSnapshot {
@@ -1681,6 +1751,7 @@ impl StartPointSnapshot {
         m.insert("prefix".into(), JsonVal::str(self.prefix.clone()));
         m.insert("boundary".into(), JsonVal::uint(self.boundary));
         m.insert("state_kept".into(), JsonVal::Bool(self.state_kept));
+        m.insert("state_tier".into(), JsonVal::str(self.state_tier.clone()));
         m.insert(
             "full".into(),
             JsonVal::Arr(self.full.iter().map(|b| JsonVal::str(b.encode())).collect()),
@@ -1689,6 +1760,7 @@ impl StartPointSnapshot {
             "win".into(),
             JsonVal::Arr(self.win.iter().map(|b| JsonVal::str(b.encode())).collect()),
         );
+        m.insert("last_used_tick".into(), JsonVal::UInt(self.last_used_tick));
         JsonVal::Obj(m)
     }
 }
@@ -1705,6 +1777,7 @@ pub struct CacheLaneSnapshot {
     pub reservation: u32,
     pub admit_budget: u32,
     pub wait_ticks: u32,
+    pub ghost_bypass: u32,
 }
 
 impl CacheLaneSnapshot {
@@ -1724,6 +1797,7 @@ impl CacheLaneSnapshot {
         m.insert("reservation".into(), JsonVal::uint(self.reservation));
         m.insert("admit_budget".into(), JsonVal::uint(self.admit_budget));
         m.insert("wait_ticks".into(), JsonVal::uint(self.wait_ticks));
+        m.insert("ghost_bypass".into(), JsonVal::uint(self.ghost_bypass));
         JsonVal::Obj(m)
     }
 }
@@ -1938,15 +2012,47 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                 data.push(v as u8);
             }
             let ref_count = req_field(bobj, "ref_count")?.as_u32()?;
-            blocks.push(CacheBlockSnapshot { id, tier, sealed, idx, length, data, ref_count });
+            let last_used_tick = req_field(bobj, "last_used_tick")?.as_u64()?;
+            blocks.push(CacheBlockSnapshot {
+                id,
+                tier,
+                sealed,
+                idx,
+                length,
+                data,
+                ref_count,
+                last_used_tick,
+            });
         }
 
+        let valid_boundaries: BTreeSet<u32> = config.boundaries().into_iter().collect();
         let mut start_points = Vec::new();
+        let mut seen_starts = BTreeSet::new();
         for item in req_field(st_obj, "start_points")?.as_arr()? {
             let sobj = item.as_obj()?;
             let prefix = req_field(sobj, "prefix")?.as_str()?.to_owned();
+            if !config.prefixes.contains(&prefix) {
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point unknown prefix {prefix:?}"
+                )));
+            }
             let boundary = req_field(sobj, "boundary")?.as_u32()?;
+            if !valid_boundaries.contains(&boundary) {
+                return Err(TraceError::InvalidSchema(format!(
+                    "start_point invalid boundary {boundary}"
+                )));
+            }
+            if !seen_starts.insert((prefix.clone(), boundary)) {
+                return Err(TraceError::InvalidSchema("duplicate start_point record in step".into()));
+            }
             let state_kept = req_field(sobj, "state_kept")?.as_bool()?;
+            let state_tier = req_field(sobj, "state_tier")?.as_str()?.to_owned();
+            if !matches!(state_tier.as_str(), "none" | "memory" | "disk" | "both") {
+                return Err(TraceError::InvalidSchema(format!(
+                    "invalid start_point state_tier {state_tier:?}"
+                )));
+            }
+            let last_used_tick = req_field(sobj, "last_used_tick")?.as_u64()?;
             let full = req_field(sobj, "full")?
                 .as_arr()?
                 .iter()
@@ -1957,7 +2063,15 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                 .iter()
                 .map(|v| parse_id(v.as_str()?))
                 .collect::<Result<Vec<_>, _>>()?;
-            start_points.push(StartPointSnapshot { prefix, boundary, state_kept, full, win });
+            start_points.push(StartPointSnapshot {
+                prefix,
+                boundary,
+                state_kept,
+                state_tier,
+                full,
+                win,
+                last_used_tick,
+            });
         }
 
         let lanes_arr = req_field(st_obj, "lanes")?.as_arr()?;
@@ -1984,27 +2098,63 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
                     })
                     .collect()
             };
+            let state_str = req_field(lobj, "state")?.as_str()?.to_owned();
+            if !matches!(
+                state_str.as_str(),
+                "Idle"
+                    | "Refused"
+                    | "Queued"
+                    | "Admitted"
+                    | "Restoring"
+                    | "Ready"
+                    | "InStep"
+                    | "Cancelling"
+                    | "Cancelled"
+                    | "Finished"
+            ) {
+                return Err(TraceError::InvalidSchema(format!("invalid lane state {state_str:?}")));
+            }
+            let pfx_str = req_field(lobj, "prefix")?.as_str()?.to_owned();
+            if !config.prefixes.contains(&pfx_str) {
+                return Err(TraceError::InvalidSchema(format!("lane unknown prefix {pfx_str:?}")));
+            }
+            let wait_ticks = req_field(lobj, "wait_ticks")?.as_u32()?;
+            let ghost_bypass = req_field(lobj, "ghost_bypass")?.as_u32()?;
             lanes.push(CacheLaneSnapshot {
                 lane,
-                state: req_field(lobj, "state")?.as_str()?.to_owned(),
-                prefix: req_field(lobj, "prefix")?.as_str()?.to_owned(),
+                state: state_str,
+                prefix: pfx_str,
                 target: req_field(lobj, "target")?.as_u32()?,
                 pos: req_field(lobj, "pos")?.as_u32()?,
                 full: parse_blk_map(req_field(lobj, "full")?.as_arr()?)?,
                 win: parse_blk_map(req_field(lobj, "win")?.as_arr()?)?,
                 reservation: req_field(lobj, "reservation")?.as_u32()?,
                 admit_budget: req_field(lobj, "admit_budget")?.as_u32()?,
-                wait_ticks: req_field(lobj, "wait_ticks")?.as_u32()?,
+                wait_ticks,
+                ghost_bypass,
             });
         }
 
         let step_lanes = req_field(st_obj, "step_lanes")?
             .as_arr()?
             .iter()
-            .map(|v| v.as_str().map(str::to_owned))
+            .map(|v| {
+                let s = v.as_str()?.to_owned();
+                if !config.lanes.contains(&s) {
+                    return Err(TraceError::InvalidSchema(format!("step_lanes unknown lane {s:?}")));
+                }
+                Ok(s)
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        let step_span_obj = req_field(st_obj, "step_span")?.as_obj()?;
+        if step_span_obj.len() != config.lanes.len() {
+            return Err(TraceError::InvalidSchema("step_span must contain every declared lane".into()));
+        }
         let mut step_span = BTreeMap::new();
-        for (k, v) in req_field(st_obj, "step_span")?.as_obj()? {
+        for (k, v) in step_span_obj {
+            if !config.lanes.contains(k) {
+                return Err(TraceError::InvalidSchema(format!("step_span unknown lane {k:?}")));
+            }
             step_span.insert(k.clone(), v.as_u32()?);
         }
         let step_pins = req_field(st_obj, "step_pins")?
@@ -2018,14 +2168,17 @@ pub fn parse_cache_scheduler_jsonl(input: &str) -> Result<CacheSchedulerTrace, T
             .map(|v| parse_id(v.as_str()?))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let queue_seq = match st_obj.get("queue_seq") {
-            Some(v) => v
-                .as_arr()?
-                .iter()
-                .map(|x| x.as_str().map(str::to_owned))
-                .collect::<Result<Vec<_>, _>>()?,
-            None => Vec::new(),
-        };
+        let queue_seq = req_field(st_obj, "queue_seq")?
+            .as_arr()?
+            .iter()
+            .map(|x| {
+                let s = x.as_str()?.to_owned();
+                if !config.lanes.contains(&s) {
+                    return Err(TraceError::InvalidSchema(format!("queue_seq unknown lane {s:?}")));
+                }
+                Ok(s)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let state = CacheSchedulerState {
             blocks,
             start_points,
@@ -2076,8 +2229,8 @@ pub fn render_cache_scheduler_tla_bundle(
     let empty_data = (0..cfg.block_size).map(|_| "0").collect::<Vec<_>>().join(", ");
     let mut data = String::from("---------------------------- MODULE TraceData ----------------------------\n");
     let _ = writeln!(data, "ED == <<{empty_data}>>");
-    data.push_str("EB == <<0, FALSE, 0, 0, ED, 0>>\n");
-    data.push_str("ES == <<FALSE, FALSE, {}, {}>>\n");
+    data.push_str("EB == <<0, FALSE, 0, 0, ED, 0, 0>>\n");
+    data.push_str("ES == <<FALSE, 0, {}, {}, 0>>\n");
     data.push_str("Traces == <<\n");
 
     let tier_code = |t: &str| -> u8 {
@@ -2087,6 +2240,97 @@ pub fn render_cache_scheduler_tla_bundle(
             "disk" => 2,
             "both" => 3,
             _ => 0,
+        }
+    };
+
+    let encode_cs_act = |step: &CacheSchedulerStep| -> Result<String, TraceError> {
+        let req_lane = |act: &str| -> Result<&str, TraceError> {
+            let l = req_field(&step.args, "lane")?.as_str()?;
+            if !cfg.lanes.iter().any(|x| x == l) {
+                return Err(TraceError::InvalidSchema(format!("{act} unknown lane {l:?}")));
+            }
+            Ok(l)
+        };
+        let req_pfx = |act: &str| -> Result<&str, TraceError> {
+            let p = req_field(&step.args, "prefix")?.as_str()?;
+            if !cfg.prefixes.iter().any(|x| x == p) {
+                return Err(TraceError::InvalidSchema(format!("{act} unknown prefix {p:?}")));
+            }
+            Ok(p)
+        };
+        let req_bcode = |act: &str| -> Result<usize, TraceError> {
+            let bs = req_field(&step.args, "block")?.as_str()?;
+            let bid = CacheBlockId::decode(bs)?;
+            id_to_code
+                .get(&bid)
+                .copied()
+                .ok_or_else(|| TraceError::InvalidSchema(format!("{act} block {bs:?} outside universe")))
+        };
+        match step.action.as_str() {
+            "Init" => Ok("<<\"Init\">>".into()),
+            "Arrive" => {
+                let l = req_lane("Arrive")?;
+                let p = req_pfx("Arrive")?;
+                let tgt = req_field(&step.args, "target")?.as_u32()?;
+                if !cfg.request_lengths.contains(&tgt) {
+                    return Err(TraceError::InvalidSchema(format!("Arrive invalid target {tgt}")));
+                }
+                Ok(format!("<<\"Arrive\", \"{l}\", \"{p}\", {tgt}>>"))
+            }
+            "Refuse429" | "Admit" | "BeginRestore" | "RestoreStartState" | "FinishRestore"
+            | "SlideWindow" | "FinishReady" | "Cancel" => {
+                let l = req_lane(&step.action)?;
+                Ok(format!("<<\"{}\", \"{l}\">>", step.action))
+            }
+            "RestoreBlock" => {
+                let l = req_lane("RestoreBlock")?;
+                let bc = req_bcode("RestoreBlock")?;
+                Ok(format!("<<\"RestoreBlock\", \"{l}\", {bc}>>"))
+            }
+            "EvictCleanOrUnrefMem" | "StartColdWriteback" | "DropUnreferenced" => {
+                let bc = req_bcode(&step.action)?;
+                Ok(format!("<<\"{}\", {bc}>>", step.action))
+            }
+            "EvictCleanStartState" | "SpillStartState" => {
+                let p = req_pfx(&step.action)?;
+                let bnd = req_field(&step.args, "boundary")?.as_u32()?;
+                if !boundaries.contains(&bnd) {
+                    return Err(TraceError::InvalidSchema(format!("{} invalid boundary {bnd}", step.action)));
+                }
+                Ok(format!("<<\"{}\", \"{p}\", {bnd}>>", step.action))
+            }
+            "BuildStep" => {
+                let sp_obj = req_field(&step.args, "spans")?.as_obj()?;
+                let mut chosen = Vec::new();
+                let mut sp_seq = Vec::with_capacity(cfg.lanes.len());
+                for ln in &cfg.lanes {
+                    let tok = match sp_obj.get(ln) {
+                        Some(v) => v.as_u32()?,
+                        None => 0,
+                    };
+                    if tok > 0 {
+                        chosen.push(format!("\"{ln}\""));
+                    }
+                    sp_seq.push(tok.to_string());
+                }
+                for k in sp_obj.keys() {
+                    if !cfg.lanes.contains(k) {
+                        return Err(TraceError::InvalidSchema(format!("BuildStep unknown lane {k:?}")));
+                    }
+                }
+                if chosen.is_empty() {
+                    return Err(TraceError::InvalidSchema("BuildStep spans must choose >= 1 lane".into()));
+                }
+                Ok(format!(
+                    "<<\"BuildStep\", {{{}}}, <<{}>>>>",
+                    chosen.join(", "),
+                    sp_seq.join(", ")
+                ))
+            }
+            "ReclaimColdDisk" | "GpuExecute" | "CompleteStepIO" | "FinishStep" | "Stutter" => {
+                Ok(format!("<<\"{}\">>", step.action))
+            }
+            other => Err(TraceError::InvalidSchema(format!("unknown cache_scheduler action {other:?}"))),
         }
     };
 
@@ -2132,7 +2376,7 @@ pub fn render_cache_scheduler_tla_bundle(
                             }
                             let _ = write!(data, "{dv}");
                         }
-                        let _ = write!(data, ">>, {}>>", b.ref_count);
+                        let _ = write!(data, ">>, {}, {}>>", b.ref_count, b.last_used_tick);
                     }
                 } else {
                     data.push_str("EB");
@@ -2149,7 +2393,7 @@ pub fn render_cache_scheduler_tla_bundle(
                         data.push_str(", ");
                     }
                     if let Some(sp) = sp_map.get(&(pfx.as_str(), bnd)) {
-                        let sk_lit = if sp.state_kept { "TRUE" } else { "FALSE" };
+                        let st_code = tier_code(&sp.state_tier);
                         let f_codes = sp
                             .full
                             .iter()
@@ -2162,7 +2406,11 @@ pub fn render_cache_scheduler_tla_bundle(
                             .map(|id| id_to_code[id].to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        let _ = write!(data, "<<TRUE, {sk_lit}, {{{f_codes}}}, {{{w_codes}}}>>");
+                        let _ = write!(
+                            data,
+                            "<<TRUE, {st_code}, {{{f_codes}}}, {{{w_codes}}}, {}>>",
+                            sp.last_used_tick
+                        );
                     } else {
                         data.push_str("ES");
                     }
@@ -2248,6 +2496,13 @@ pub fn render_cache_scheduler_tla_bundle(
                 }
                 let _ = write!(data, "{}", l.wait_ticks);
             }
+            data.push_str(">>, <<");
+            for (li, l) in st.lanes.iter().enumerate() {
+                if li > 0 {
+                    data.push_str(", ");
+                }
+                let _ = write!(data, "{}", l.ghost_bypass);
+            }
             let sa_lit = if st.step_active { "TRUE" } else { "FALSE" };
             let sl_lit = st
                 .step_lanes
@@ -2280,9 +2535,10 @@ pub fn render_cache_scheduler_tla_bundle(
                 .map(|l| format!("\"{l}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let act_lit = encode_cs_act(step)?;
             let _ = write!(
                 data,
-                ">>, {sa_lit}, {{{sl_lit}}}, <<{ss_lit}>>, {{{sp_lit}}}, {{{sio_lit}}}, {gd_lit}, <<{qs_lit}>>>>"
+                ">>, {sa_lit}, {{{sl_lit}}}, <<{ss_lit}>>, {{{sp_lit}}}, {{{sio_lit}}}, {gd_lit}, <<{qs_lit}>>, {act_lit}>>"
             );
         }
         data.push_str("\n  >>");
@@ -2346,7 +2602,7 @@ LiftBlock(r) ==
 LiftStart(r) ==
   IF ~r[1] THEN EmptyStart
   ELSE [kept      |-> TRUE,
-        stateKept |-> r[2],
+        stateTier |-> DecodeTier(r[2]),
         full      |-> DecodeBlockSet(r[3]),
         win       |-> DecodeBlockSet(r[4])]
 
@@ -2363,13 +2619,15 @@ Lift(s) == [
   reservation |-> [l \\in Lanes |-> s[9][LaneIdx(l)]],
   admitBudget |-> [l \\in Lanes |-> s[10][LaneIdx(l)]],
   waitTicks   |-> [l \\in Lanes |-> s[11][LaneIdx(l)]],
-  stepActive  |-> s[12],
-  stepLanes   |-> s[13],
-  stepSpan    |-> [l \\in Lanes |-> s[14][LaneIdx(l)]],
-  stepPins    |-> DecodeBlockSet(s[15]),
-  stepIO      |-> DecodeBlockSet(s[16]),
-  gpuDone     |-> s[17],
-  queueSeq    |-> s[18]
+  ghostBypass |-> [l \\in Lanes |-> s[12][LaneIdx(l)]],
+  stepActive  |-> s[13],
+  stepLanes   |-> s[14],
+  stepSpan    |-> [l \\in Lanes |-> s[15][LaneIdx(l)]],
+  stepPins    |-> DecodeBlockSet(s[16]),
+  stepIO      |-> DecodeBlockSet(s[17]),
+  gpuDone     |-> s[18],
+  queueSeq    |-> s[19],
+  restoreIO   |-> [l \\in Lanes |-> NoBlock]
 ]
 
 VARIABLES traceIdx, stepIdx
@@ -2380,11 +2638,11 @@ Matches(st) ==
   /\\ laneTarget = st.laneTarget /\\ lanePos = st.lanePos
   /\\ laneFull = st.laneFull /\\ laneWin = st.laneWin
   /\\ reservation = st.reservation /\\ admitBudget = st.admitBudget
-  /\\ waitTicks = st.waitTicks /\\ queueSeq = st.queueSeq
+  /\\ waitTicks = st.waitTicks /\\ ghostBypass = st.ghostBypass /\\ queueSeq = st.queueSeq
   /\\ stepActive = st.stepActive
   /\\ stepLanes = st.stepLanes /\\ stepSpan = st.stepSpan
   /\\ stepPins = st.stepPins /\\ stepIO = st.stepIO
-  /\\ gpuDone = st.gpuDone
+  /\\ gpuDone = st.gpuDone /\\ restoreIO = st.restoreIO
 
 ReplayInit ==
   /\\ traceIdx \\in 1..Len(Traces)
@@ -2401,13 +2659,77 @@ ReplayNext ==
        /\\ laneTarget' = nxt.laneTarget /\\ lanePos' = nxt.lanePos
        /\\ laneFull' = nxt.laneFull /\\ laneWin' = nxt.laneWin
        /\\ reservation' = nxt.reservation /\\ admitBudget' = nxt.admitBudget
-       /\\ waitTicks' = nxt.waitTicks /\\ queueSeq' = nxt.queueSeq /\\ stepActive' = nxt.stepActive
+       /\\ waitTicks' = nxt.waitTicks /\\ ghostBypass' = nxt.ghostBypass
+       /\\ queueSeq' = nxt.queueSeq /\\ stepActive' = nxt.stepActive
        /\\ stepLanes' = nxt.stepLanes /\\ stepSpan' = nxt.stepSpan
        /\\ stepPins' = nxt.stepPins /\\ stepIO' = nxt.stepIO
-       /\\ gpuDone' = nxt.gpuDone
+       /\\ gpuDone' = nxt.gpuDone /\\ restoreIO' = nxt.restoreIO
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+InitConforms == (stepIdx = 1) => Init
+StepConforms == [][Next]_vars
+
+DispatchStep(act) ==
+  IF act[1] = \"Arrive\"                    THEN Arrive(act[2], act[3], act[4])
+  ELSE IF act[1] = \"Refuse429\"            THEN Refuse429(act[2])
+  ELSE IF act[1] = \"Admit\"                THEN Admit(act[2])
+  ELSE IF act[1] = \"BeginRestore\"         THEN BeginRestore(act[2])
+  ELSE IF act[1] = \"RestoreBlock\"         THEN RestoreBlock(act[2], DecodeBlockId(act[3]))
+  ELSE IF act[1] = \"RestoreStartState\"    THEN RestoreStartState(act[2])
+  ELSE IF act[1] = \"FinishRestore\"        THEN FinishRestore(act[2])
+  ELSE IF act[1] = \"EvictCleanOrUnrefMem\" THEN (EvictCleanOrUnrefMem
+                                                  /\\ InMemory(DecodeBlockId(act[2]))
+                                                  /\\ blocks'[DecodeBlockId(act[2])].tier \\notin {{\"memory\", \"both\"}})
+  ELSE IF act[1] = \"StartColdWriteback\"   THEN (StartColdWriteback
+                                                  /\\ stepIO' = {{DecodeBlockId(act[2])}})
+  ELSE IF act[1] = \"EvictCleanStartState\" THEN (EvictCleanStartState
+                                                  /\\ StateInMem(<<act[2], act[3]>>)
+                                                  /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")
+  ELSE IF act[1] = \"SpillStartState\"      THEN (SpillStartState
+                                                  /\\ startPoints[<<act[2], act[3]>>].stateTier = \"memory\"
+                                                  /\\ startPoints'[<<act[2], act[3]>>].stateTier = \"disk\")
+  ELSE IF act[1] = \"ReclaimColdDisk\"      THEN ReclaimColdDisk
+  ELSE IF act[1] = \"DropUnreferenced\"     THEN DropUnreferenced(DecodeBlockId(act[2]))
+  ELSE IF act[1] = \"SlideWindow\"          THEN SlideWindow(act[2])
+  ELSE IF act[1] = \"FinishReady\"          THEN FinishReady(act[2])
+  ELSE IF act[1] = \"BuildStep\"            THEN BuildStep(act[2], [l \\in Lanes |-> act[3][LaneIdx(l)]])
+  ELSE IF act[1] = \"GpuExecute\"           THEN GpuExecute
+  ELSE IF act[1] = \"CompleteStepIO\"       THEN CompleteStepIO
+  ELSE IF act[1] = \"FinishStep\"           THEN FinishStep
+  ELSE IF act[1] = \"Cancel\"               THEN Cancel(act[2])
+  ELSE IF act[1] = \"Stutter\"              THEN UNCHANGED vars
+  ELSE FALSE
+
+StepActionCheck ==
+  (stepIdx' = stepIdx + 1) =>
+    \\E act \\in {{Traces[traceIdx][stepIdx + 1][20]}} : DispatchStep(act)
+
+ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>
+
+BlkTick(s, b) == s[1][BlockIdxOf(b)][7]
+StartTick(s, pk) == s[2][PrefixIdx(pk[1])][BoundaryIdx(pk[2])][5]
+
+LruCheck(s, act) ==
+  IF act[1] = \"EvictCleanOrUnrefMem\"
+  THEN \\A c \\in {{d \\in ColdMemBlocks : OnDisk(d) \\/ blocks[d].refCount = 0}} :
+         BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
+  ELSE IF act[1] = \"StartColdWriteback\"
+  THEN \\A c \\in {{d \\in ColdMemBlocks : blocks[d].tier = \"memory\" /\\ blocks[d].sealed}} :
+         BlkTick(s, DecodeBlockId(act[2])) <= BlkTick(s, c)
+  ELSE IF act[1] = \"EvictCleanStartState\"
+  THEN \\A c \\in {{x \\in ColdMemStates : StateOnDisk(x)}} :
+         StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
+  ELSE IF act[1] = \"SpillStartState\"
+  THEN \\A c \\in {{x \\in ColdMemStates : startPoints[x].stateTier = \"memory\"}} :
+         StartTick(s, <<act[2], act[3]>>) <= StartTick(s, c)
+  ELSE TRUE
+
+StepLruCheck ==
+  (stepIdx' = stepIdx + 1) =>
+    \\E prev \\in {{Traces[traceIdx][stepIdx]}}, act \\in {{Traces[traceIdx][stepIdx + 1][20]}} :
+      LruCheck(prev, act)
+
+ActionLruOrder == [][StepLruCheck]_<<vars, traceIdx, stepIdx>>
 =============================================================================
 "
     );
@@ -2428,11 +2750,14 @@ CONSTANTS
  DiskBudget = {}
  MaxQueue = {}
  MaxBypass = {}
+ AsyncRestore = TRUE
  Bug = \"none\"
 INVARIANTS
  TypeOK
+ InitConforms
  StepBlocksInMemoryAndOwned
  SealedValid
+ NoDecodeBlocksSealed
  UnsealedPrivateInvisibleZero
  LaneHistoryCovered
  RefCountMatchesReferrers
@@ -2443,10 +2768,13 @@ INVARIANTS
  StepBudgetHolds
  QueueBounded
 PROPERTIES
- Conforms
+ StepConforms
+ ActionConforms
+ ActionLruOrder
  ActionSealedImmutable
  ActionNoQueuedRefusal
  ActionLazyColdWriteback
+ ActionWritebackProtected
  ActionDecodePriority
 ",
         cfg.block_size,
@@ -2592,9 +2920,12 @@ pub enum CacheSchedulerEvent {
     Admit { lane: String, wait_ticks: u32 },
     BeginRestore { lane: String, pos: u32, reservation: u32 },
     RestoreBlock { lane: String, prefix: String, kind: BlockKind, block: u32 },
+    RestoreStartState { lane: String, prefix: String, boundary: u32 },
     FinishRestore { lane: String },
     EvictMem { prefix: String, kind: BlockKind, block: u32 },
     StartWriteback { prefix: String, kind: BlockKind, block: u32 },
+    EvictStartState { prefix: String, boundary: u32 },
+    SpillStartState { prefix: String, boundary: u32 },
     CompleteStepIo { prefix: String, kind: BlockKind, block: u32, tier: String },
     ReclaimDisk,
     DropUnreferenced { prefix: String, kind: BlockKind, block: u32 },
@@ -2642,6 +2973,12 @@ impl CacheSchedulerEvent {
                 m.insert("kind".into(), JsonVal::str(kind_name(*kind)));
                 m.insert("block".into(), JsonVal::uint(*block));
             }
+            CacheSchedulerEvent::RestoreStartState { lane, prefix, boundary } => {
+                m.insert("event".into(), JsonVal::str("restore_start_state"));
+                m.insert("lane".into(), JsonVal::str(lane.clone()));
+                m.insert("prefix".into(), JsonVal::str(prefix.clone()));
+                m.insert("boundary".into(), JsonVal::uint(*boundary));
+            }
             CacheSchedulerEvent::FinishRestore { lane } => {
                 m.insert("event".into(), JsonVal::str("finish_restore"));
                 m.insert("lane".into(), JsonVal::str(lane.clone()));
@@ -2657,6 +2994,16 @@ impl CacheSchedulerEvent {
                 m.insert("prefix".into(), JsonVal::str(prefix.clone()));
                 m.insert("kind".into(), JsonVal::str(kind_name(*kind)));
                 m.insert("block".into(), JsonVal::uint(*block));
+            }
+            CacheSchedulerEvent::EvictStartState { prefix, boundary } => {
+                m.insert("event".into(), JsonVal::str("evict_start_state"));
+                m.insert("prefix".into(), JsonVal::str(prefix.clone()));
+                m.insert("boundary".into(), JsonVal::uint(*boundary));
+            }
+            CacheSchedulerEvent::SpillStartState { prefix, boundary } => {
+                m.insert("event".into(), JsonVal::str("spill_start_state"));
+                m.insert("prefix".into(), JsonVal::str(prefix.clone()));
+                m.insert("boundary".into(), JsonVal::uint(*boundary));
             }
             CacheSchedulerEvent::CompleteStepIo { prefix, kind, block, tier } => {
                 m.insert("event".into(), JsonVal::str("complete_step_io"));
@@ -2781,7 +3128,7 @@ mod tests {
         let cfg = BlockLayoutConfig {
             lanes: vec!["a".into(), "b".into()],
             full_capacity: 2,
-            window_capacity: 1,
+            window_capacity: 2,
             block_size: 2,
             window_size: 2,
             max_pos: 4,
@@ -2812,14 +3159,16 @@ mod tests {
                     data: vec![0, 0],
                 })
                 .collect(),
-            window_pool: vec![PoolSlotSnapshot {
-                slot: 1,
-                generation: 0,
-                kind: BlockKind::Window,
-                block: 0,
-                length: 0,
-                data: vec![0, 0],
-            }],
+            window_pool: (1..=2)
+                .map(|s| PoolSlotSnapshot {
+                    slot: s,
+                    generation: 0,
+                    kind: BlockKind::Window,
+                    block: 0,
+                    length: 0,
+                    data: vec![0, 0],
+                })
+                .collect(),
             table: [("a".into(), vec![]), ("b".into(), vec![])].into_iter().collect(),
             pos: [("a".into(), 0), ("b".into(), 0)].into_iter().collect(),
             phase: [("a".into(), "idle".into()), ("b".into(), "idle".into())].into_iter().collect(),
@@ -2873,5 +3222,196 @@ mod tests {
         assert!(parse_block_layout_jsonl("{\"event\":\"config\",\"event\":\"dup\"}\n").is_err());
         assert!(parse_block_layout_jsonl("{\"event\":\"config\",\"version\":1.5}\n").is_err());
         assert!(parse_block_layout_jsonl("{\"event\":\"config\"} trailing\n").is_err());
+    }
+
+    #[test]
+    fn trace_bundles_bind_step_actions_and_refuse_missing_action_arguments() {
+        let bl_cfg = BlockLayoutConfig {
+            lanes: vec!["a".into()],
+            full_capacity: 2,
+            window_capacity: 2,
+            block_size: 2,
+            window_size: 2,
+            max_pos: 4,
+            max_span: 2,
+            max_generation: 2,
+            slot_base: 0,
+            kvb: 2,
+        };
+        let st0 = BlockLayoutState {
+            full_pool: (1..=2)
+                .map(|s| PoolSlotSnapshot {
+                    slot: s,
+                    generation: 0,
+                    kind: BlockKind::Full,
+                    block: 0,
+                    length: 0,
+                    data: vec![0, 0],
+                })
+                .collect(),
+            window_pool: (1..=2)
+                .map(|s| PoolSlotSnapshot {
+                    slot: s,
+                    generation: 0,
+                    kind: BlockKind::Window,
+                    block: 0,
+                    length: 0,
+                    data: vec![0, 0],
+                })
+                .collect(),
+            table: [("a".into(), vec![])].into_iter().collect(),
+            pos: [("a".into(), 0)].into_iter().collect(),
+            phase: [("a".into(), "idle".into())].into_iter().collect(),
+            target: [("a".into(), 0)].into_iter().collect(),
+            span_start: [("a".into(), 0)].into_iter().collect(),
+            budget: [("a".into(), 0)].into_iter().collect(),
+            pin: [("a".into(), vec![])].into_iter().collect(),
+            start_kept: false,
+            start_pos: 0,
+            start_state: 0,
+            start_table: vec![],
+        };
+        let mut ok_args = BTreeMap::new();
+        ok_args.insert("lane".into(), JsonVal::str("a"));
+        ok_args.insert("tokens".into(), JsonVal::uint(2u32));
+        let ok_trace = BlockLayoutTrace {
+            config: bl_cfg.clone(),
+            steps: vec![
+                BlockLayoutStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: st0.clone() },
+                BlockLayoutStep { seq: 1, action: "Prepare".into(), args: ok_args, state: st0.clone() },
+            ],
+        };
+        let (bl_data, bl_check, bl_cfg_txt) = render_block_layout_tla_bundle(&[ok_trace]).unwrap();
+        assert!(bl_data.contains("<<\"Prepare\", \"a\", 2>>"));
+        assert!(bl_check.contains("DispatchStep(act) =="));
+        assert!(bl_check.contains("ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>"));
+        assert!(bl_cfg_txt.contains("ActionConforms"));
+
+        // Missing `tokens` on Prepare must fail closed at bundle rendering.
+        let bad_trace = BlockLayoutTrace {
+            config: bl_cfg,
+            steps: vec![
+                BlockLayoutStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: st0.clone() },
+                BlockLayoutStep { seq: 1, action: "Prepare".into(), args: BTreeMap::new(), state: st0 },
+            ],
+        };
+        assert!(render_block_layout_tla_bundle(&[bad_trace]).is_err());
+    }
+
+    #[test]
+    fn cache_scheduler_parser_rejects_every_missing_required_field_or_bad_domain() {
+        let cfg = CacheSchedulerConfig {
+            lanes: vec!["a".into(), "b".into()],
+            prefixes: vec!["p1".into()],
+            request_lengths: vec![2, 4],
+            block_size: 2,
+            window_size: 2,
+            max_pos: 4,
+            max_span: 2,
+            step_token_budget: 2,
+            mem_budget: 4,
+            disk_budget: 3,
+            max_queue: 1,
+            max_bypass: 2,
+        };
+        let mut sink = MemorySink::new();
+        emit_cache_scheduler_config(&mut sink, &cfg).unwrap();
+        let bid = CacheBlockId::Tree { prefix: "p1".into(), kind: BlockKind::Full, idx: 0 };
+        let wbid = CacheBlockId::Tree { prefix: "p1".into(), kind: BlockKind::Window, idx: 0 };
+        let st = CacheSchedulerState {
+            blocks: vec![
+                CacheBlockSnapshot {
+                    id: bid.clone(),
+                    tier: "memory".into(),
+                    sealed: true,
+                    idx: 0,
+                    length: 2,
+                    data: vec![1, 1],
+                    ref_count: 1,
+                    last_used_tick: 7,
+                },
+                CacheBlockSnapshot {
+                    id: wbid.clone(),
+                    tier: "memory".into(),
+                    sealed: true,
+                    idx: 0,
+                    length: 2,
+                    data: vec![1, 1],
+                    ref_count: 1,
+                    last_used_tick: 7,
+                },
+            ],
+            start_points: vec![StartPointSnapshot {
+                prefix: "p1".into(),
+                boundary: 2,
+                state_kept: true,
+                state_tier: "memory".into(),
+                full: vec![bid],
+                win: vec![wbid],
+                last_used_tick: 7,
+            }],
+            lanes: vec![
+                CacheLaneSnapshot {
+                    lane: "a".into(),
+                    state: "Idle".into(),
+                    prefix: "p1".into(),
+                    target: 2,
+                    pos: 0,
+                    full: vec![None, None],
+                    win: vec![None, None],
+                    reservation: 0,
+                    admit_budget: 0,
+                    wait_ticks: 0,
+                    ghost_bypass: 0,
+                },
+                CacheLaneSnapshot {
+                    lane: "b".into(),
+                    state: "Idle".into(),
+                    prefix: "p1".into(),
+                    target: 2,
+                    pos: 0,
+                    full: vec![None, None],
+                    win: vec![None, None],
+                    reservation: 0,
+                    admit_budget: 0,
+                    wait_ticks: 0,
+                    ghost_bypass: 0,
+                },
+            ],
+            queue_seq: vec![],
+            step_active: false,
+            step_lanes: vec![],
+            step_span: [("a".into(), 0), ("b".into(), 0)].into_iter().collect(),
+            step_pins: vec![],
+            step_io: vec![],
+            gpu_done: false,
+        };
+        emit_cache_scheduler_step(
+            &mut sink,
+            &CacheSchedulerStep { seq: 0, action: "Init".into(), args: BTreeMap::new(), state: st },
+        )
+        .unwrap();
+        let valid = sink.to_jsonl();
+        assert!(parse_cache_scheduler_jsonl(&valid).is_ok());
+
+        for needle in [
+            "\"last_used_tick\":7,",
+            "\"state_tier\":\"memory\",",
+            "\"ghost_bypass\":0,",
+            "\"queue_seq\":[],",
+            "\"a\":0,",
+        ] {
+            let dropped = valid.replacen(needle, "", 1);
+            assert_ne!(dropped, valid, "failed to strip {needle}");
+            assert!(
+                parse_cache_scheduler_jsonl(&dropped).is_err(),
+                "parser silently accepted trace missing {needle}"
+            );
+        }
+
+        let bad_lane_state = valid.replacen("\"state\":\"Idle\"", "\"state\":\"Bogus\"", 1);
+        assert!(parse_cache_scheduler_jsonl(&bad_lane_state).is_err());
+        let bad_prefix = valid.replacen("\"prefix\":\"p1\"", "\"prefix\":\"p99\"", 1);
+        assert!(parse_cache_scheduler_jsonl(&bad_prefix).is_err());
     }
 }

@@ -19,7 +19,10 @@ jobs:
   release-cpu:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        with:
+          toolchain: 1.98.1
       - name: build
         run: cargo build --locked --release
       - name: unit and integration tests (release profile)
@@ -80,15 +83,38 @@ jobs:
     needs: guard
     runs-on: [self-hosted, macOS, ARM64, m5]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: verify pinned Rust toolchain
+        run: |
+          v=$(rustc --version)
+          echo "$v"
+          case "$v" in
+            "rustc 1.98.1 "*) ;;
+            *) echo "expected rustc 1.98.1, got: $v" >&2; exit 1 ;;
+          esac
       - name: build
         run: cargo build --locked --release
       - name: GPU router regression
         if: ${{ !cancelled() }}
-        run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
+        run: |
+          out=$(cargo test --locked --bins --release engine::tests::router_handles_nonfinite_scores -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'router_handles_nonfinite_scores: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: LoopCD model and mixed-lane regressions
         if: ${{ !cancelled() }}
         run: cargo test --locked --release loopcd_ -- --ignored --test-threads=1
+      - name: GPU window attention split-invariance regression
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --bins --release engine::tests::k_attn_b_and_blk_are_split_invariant_across_sliding_window -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'k_attn_b split-invariance: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU pool slot zero-fill on reuse
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --bins --release blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected exactly 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (full set)
         if: ${{ !cancelled() }}
         run: tests/ci.sh full

@@ -19,7 +19,7 @@ pub(super) trait SchedulerEngine {
     fn decode(&self, lanes: &[LaneS<Self::Lane>], chosen: &[usize]) -> Duration;
     fn save_state(&self, lane: &Self::Lane) -> Vec<u8>;
     /// A single-lane prefill writes the engine's logits; all other steps write per-span rows.
-    fn result_logits(&self, row: Option<usize>) -> &[f32];
+    fn result_logits(&self, row: Option<usize>) -> Vec<f32>;
 }
 
 impl SchedulerEngine for Engine {
@@ -79,7 +79,7 @@ impl SchedulerEngine for Engine {
     }
 
     fn save_state(&self, lane: &Lane) -> Vec<u8> { self.on(lane).get_cs() }
-    fn result_logits(&self, row: Option<usize>) -> &[f32] {
-        match row { Some(k) => self.span_logits(k), None => self.logits() }
+    fn result_logits(&self, row: Option<usize>) -> Vec<f32> {
+        match row { Some(k) => self.span_logits(k).to_vec(), None => self.logits().to_vec() }
     }
 }

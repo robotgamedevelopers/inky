@@ -71,6 +71,15 @@ fn private_prefill_clears_the_last_window_tile_between_lanes() {
 }
 
 #[test]
+fn projection_segments_preserve_q8_attention_geometry() {
+    let weights = QW { ty: T_Q8_0, k: E as u32, rows: (NH * HD) as u32,
+        row_bytes: (E / 32 * 34) as u32, ..Default::default() };
+    let seg = Engine::seg(&weights, 12, 34);
+    assert_eq!((seg.wtype, seg.k, seg.nrows, seg.row_bytes),
+               (T_Q8_0, weights.k, weights.rows, weights.row_bytes));
+}
+
+#[test]
 fn prefill_chunk_requires_a_supported_positive_size() {
     assert_eq!(configured_prefill_chunk(Err(std::env::VarError::NotPresent), 16384), Ok(4096));
     assert_eq!(configured_prefill_chunk(Ok("4096".into()), 128), Ok(128));
@@ -93,15 +102,6 @@ fn token_writes_validate_the_whole_range_and_vocabulary() {
 }
 
 #[test]
-fn projection_segments_preserve_q8_attention_geometry() {
-    let weights = QW { ty: T_Q8_0, k: E as u32, rows: (NH * HD) as u32,
-        row_bytes: (E / 32 * 34) as u32, ..Default::default() };
-    let seg = Engine::seg(&weights, 12, 34);
-    assert_eq!((seg.wtype, seg.k, seg.nrows, seg.row_bytes),
-               (T_Q8_0, weights.k, weights.rows, weights.row_bytes));
-}
-
-#[test]
 fn vocabulary_must_fit_the_logits_rows_and_match_the_tokenizer() {
     assert_eq!(check_vocab_lengths(200_058, N_VOCAB_PAD, 200_058, 200_058, 200_006).unwrap(), 200_058);
     assert!(check_vocab_lengths(32, 31, 32, 32, 0).is_err());
@@ -115,33 +115,341 @@ fn vocabulary_must_fit_the_logits_rows_and_match_the_tokenizer() {
 #[ignore = "requires Metal 4"]
 fn router_handles_nonfinite_scores() {
     let src = format!("{}\n{}", include_str!("../kernels.metal"), include_str!("../prefill.metal"));
-    let gpu = Gpu::new(&src, &["k_topk_b"]);
-    let bias = gpu.buffer(NEXP * 4);
-    let act = gpu.buffer((NEXP + 2 * TOPK) * 4);
+    let gpu = Gpu::new(&src, &["k_topk", "k_topk_b", "k_moe_topk_route3"]);
+    let b = BArena::new(0, 64, true, 2, 256);
+    let pb = gpu.buffer(NEXP * 4);
+    let act = gpu.buffer(b.end as usize * 4);
+
+    for (logit_val, bias_val, want_w) in [
+        (f32::NAN, 0.0f32, 0.0f32),
+        (f32::INFINITY, 0.0f32, 1.0f32 / TOPK as f32),
+        (f32::NEG_INFINITY, 0.0f32, 0.0f32),
+        (0.0f32, f32::INFINITY, 0.0f32),
+    ] {
+        unsafe {
+            let bias = std::slice::from_raw_parts_mut(pb.contents().as_ptr().cast::<f32>(), NEXP);
+            let scores = std::slice::from_raw_parts_mut(
+                act.contents().as_ptr().cast::<f32>().add(b.rlog as usize),
+                NEXP,
+            );
+            let sel = std::slice::from_raw_parts_mut(
+                act.contents().as_ptr().cast::<f32>().add(b.sel as usize),
+                2 * TOPK,
+            );
+            bias.fill(bias_val);
+            scores.fill(logit_val);
+            sel.fill(-1.0);
+        }
+
+        // 1. Standalone batched top-k (`k_topk_b` via real `TopkBArgs`).
+        let ta = TopkBArgs {
+            logits_off: b.rlog,
+            bias_off: 0,
+            sel_off: b.sel,
+            t: 1,
+            wscale: 1.0,
+            pad: [0; 3],
+        };
+        let cb = gpu.cmd();
+        let e = Enc::new(&cb);
+        e.buf(&pb, 0, 1);
+        e.buf(&act, 0, 2);
+        e.bytes(&ta, 5);
+        e.pso(&gpu.pso("k_topk_b"));
+        e.dispatch((1, 1, 1), 32);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
+        Engine::assert_cmd_ok(&cb, "router_handles_nonfinite_scores(k_topk_b)");
+        let out = unsafe {
+            std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK)
+        };
+        for (i, &id) in out[..TOPK].iter().enumerate() {
+            assert_eq!(id, i as f32, "k_topk_b id[{i}] on ({logit_val}, {bias_val})");
+        }
+        assert_eq!(out[TOPK..], [want_w; TOPK]);
+
+        // 2. Fused 1-TG router (`k_moe_topk_route3` via real `TopkRoute3Args`).
+        unsafe {
+            std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK)
+                .fill(-1.0);
+        }
+        let tra = TopkRoute3Args {
+            logits_off: b.rlog,
+            bias_off: 0,
+            sel_off: b.sel,
+            t: 1,
+            wscale: 1.0,
+            perm_off: b.perm,
+            inv_off: b.inv,
+            aw_off: b.aw,
+            ind_off: b.ind,
+            gu_y: (FF / 32) as u32,
+            dn_y: (E / 64) as u32,
+            tiles_off: b.tl,
+            pad: [0; 3],
+        };
+        let cb2 = gpu.cmd();
+        let e2 = Enc::new(&cb2);
+        e2.buf(&pb, 0, 1);
+        e2.buf(&act, 0, 2);
+        e2.bytes(&tra, 5);
+        e2.pso(&gpu.pso("k_moe_topk_route3"));
+        e2.dispatch((1, 1, 1), 1024);
+        e2.end();
+        cb2.commit();
+        cb2.waitUntilCompleted();
+        Engine::assert_cmd_ok(&cb2, "router_handles_nonfinite_scores(k_moe_topk_route3)");
+        let out2 = unsafe {
+            std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(b.sel as usize), 2 * TOPK)
+        };
+        for (i, &id) in out2[..TOPK].iter().enumerate() {
+            assert_eq!(id, i as f32, "k_moe_topk_route3 id[{i}] on ({logit_val}, {bias_val})");
+        }
+        assert_eq!(out2[TOPK..], [want_w; TOPK]);
+        let ind = unsafe {
+            std::slice::from_raw_parts(act.contents().as_ptr().cast::<u32>().add(b.ind as usize), 8)
+        };
+        assert_eq!(ind[0], 0, "class 0 tile count must be 0 for t=1");
+        assert_eq!(ind[4], TOPK as u32, "class 1 must emit 1 tile per distinct expert");
+    }
+}
+
+#[test]
+#[ignore = "requires Metal 4"]
+fn k_attn_b_and_blk_are_split_invariant_across_sliding_window() {
+    use crate::blocks::{key_row, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, BLOCK as KV_BLOCK, CLEARED_GPU_TABLE_ENTRY};
+
+    let src = format!("{}\n{}", include_str!("../kernels.metal"), include_str!("../prefill.metal"));
+    let gpu = Gpu::new(&src, &["k_attn_b", "k_attn_b_blk"]);
+
+    let total = 1100usize; // > EXT (1024), crossing multiple 64-token blocks and expired window block 0
+    let n_blks = total.div_ceil(KV_BLOCK);
+    let f16 = |v: f32| -> u16 {
+        let bits = v.to_bits();
+        let sign = (bits >> 16) & 0x8000;
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        if v == 0.0 || exp <= 0 {
+            sign as u16
+        } else {
+            (sign | ((exp as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16
+        }
+    };
+
+    let pb = gpu.buffer(EXT * NREL * 4 + 256);
+    let qp_len = total * NH * HD;
+    let rp_len = total * NH * NREL;
+    let sink_len = total * NH;
+    let gate_len = total * NH * HD;
+    let out_len = total * NH * HD;
+    let qp_off = 0usize;
+    let rp_off = qp_off + qp_len;
+    let sink_off = rp_off + rp_len;
+    let gate_off = sink_off + sink_len;
+    let out_unsplit_off = gate_off + gate_len;
+    let out_split_off = out_unsplit_off + out_len;
+    let act = gpu.buffer((out_split_off + out_len) * 4);
+    let kv_lin = gpu.buffer(2 * NKV * total * HD * 2);
+
+    let mut pools = BlockPools::gpu(&gpu.dev, n_blks, 1, 2);
+    let mut table = BlockTable::new(n_blks as u32).unwrap();
+    for b in 0..n_blks {
+        let (slot, _) = pools.window.take_free().unwrap();
+        let gen = pools.window.record(slot).unwrap().generation();
+        table.fill(&mut pools.window, BlockIndex::new(b as u32), slot, gen).unwrap();
+    }
+    let bt_buf = gpu.buffer(n_blks * 8);
+    let mut host_bt = vec![CLEARED_GPU_TABLE_ENTRY; n_blks];
+    table.sync_dirty_to_slice(BlockKind::Window, &pools.window, &mut host_bt).unwrap();
+    assert_eq!(host_bt[0], 0, "Slot(1) of slab 0 encodes as 0, distinct from CLEARED_GPU_TABLE_ENTRY");
+    assert!(host_bt.iter().all(|&w| w != CLEARED_GPU_TABLE_ENTRY));
+
+    let mut st = 0x1234_5678_9abc_def0u64;
+    let mut rnd = || -> f32 {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        ((st >> 40) as f32 / (1u64 << 24) as f32) * 1.6 - 0.8
+    };
+
     unsafe {
-        let bias = std::slice::from_raw_parts_mut(bias.contents().as_ptr().cast::<f32>(), NEXP);
-        let scores = std::slice::from_raw_parts_mut(act.contents().as_ptr().cast::<f32>(), NEXP);
-        bias.fill(0.0);
-        scores.fill(f32::NAN);
+        let pb_f = std::slice::from_raw_parts_mut(pb.contents().as_ptr().cast::<f32>(), EXT * NREL);
+        for x in pb_f.iter_mut() { *x = rnd() * 0.25; }
+
+        let a_f = std::slice::from_raw_parts_mut(
+            act.contents().as_ptr().cast::<f32>(),
+            out_split_off + out_len,
+        );
+        for i in 0..gate_off + gate_len { a_f[i] = rnd(); }
+
+        let kv_h = std::slice::from_raw_parts_mut(
+            kv_lin.contents().as_ptr().cast::<u16>(),
+            2 * NKV * total * HD,
+        );
+        let slabs = pools.window.gpu_slabs();
+        for p in 0..total {
+            let blk = p / KV_BLOCK;
+            let in_blk = (p % KV_BLOCK) as u32;
+            let word = host_bt[blk];
+            let slab_idx = (word >> 62) as usize;
+            let slab_off = (word & ((1u64 << 62) - 1)) as usize;
+            let slab_base = slabs[slab_idx].contents().as_ptr() as *mut u8;
+            for g in 0..NKV {
+                let k_blk_off = key_row(0, BlockKind::Window, 2, 0, Kv::Key, g as u32, in_blk).unwrap() as usize;
+                let v_blk_off = key_row(0, BlockKind::Window, 2, 0, Kv::Value, g as u32, in_blk).unwrap() as usize;
+                let k_dst = slab_base.add(slab_off + k_blk_off) as *mut u16;
+                let v_dst = slab_base.add(slab_off + v_blk_off) as *mut u16;
+                for d in 0..HD {
+                    let hk = f16(rnd());
+                    let hv = f16(rnd());
+                    kv_h[(g * total + p) * HD + d] = hk;
+                    kv_h[(NKV * total + g * total + p) * HD + d] = hv;
+                    *k_dst.add(d) = hk;
+                    *v_dst.add(d) = hv;
+                }
+            }
+        }
     }
 
-    let args = [0, 0, NEXP as u32, 1, 1.0f32.to_bits(), 0, 0, 0];
-    let cb = gpu.cmd();
-    let e = Enc::new(&cb);
-    e.buf(&bias, 0, 1);
-    e.buf(&act, 0, 2);
-    e.bytes(&args, 5);
-    e.pso(&gpu.pso("k_topk_b"));
-    e.dispatch((1, 1, 1), 32);
-    e.end();
-    cb.commit();
-    cb.waitUntilCompleted();
-    assert!(cb.error().is_none());
-    let out = unsafe {
-        std::slice::from_raw_parts(act.contents().as_ptr().cast::<f32>().add(NEXP), 2 * TOPK)
+    let run_linear = |ranges: &[(usize, usize)], out_base: usize| {
+        unsafe {
+            let a_f = std::slice::from_raw_parts_mut(
+                act.contents().as_ptr().cast::<f32>().add(out_base),
+                out_len,
+            );
+            a_f.fill(f32::NAN);
+        }
+        for &(p0, chunk_t) in ranges {
+            let aa = AttnBArgs {
+                t: chunk_t as u32,
+                p0: p0 as u32,
+                ring: 0,
+                cap: total as u32,
+                k_base: 0,
+                v_base: (NKV * total * HD) as u32,
+                window: EXT as u32,
+                qp_off: (qp_off + p0 * NH * HD) as u32,
+                rp_off: (rp_off + p0 * NH * NREL) as u32,
+                sink_off: (sink_off + p0 * NH) as u32,
+                gate_off: (gate_off + p0 * NH * HD) as u32,
+                out_off: (out_base + p0 * NH * HD) as u32,
+                relbias_w: 0,
+                ghalf: 0,
+                kpos0: 0,
+                pad: 0,
+            };
+            let cb = gpu.cmd();
+            let e = Enc::new(&cb);
+            e.buf(&pb, 0, 1);
+            e.buf(&act, 0, 2);
+            e.buf(&kv_lin, 0, 3);
+            e.bytes(&aa, 5);
+            e.pso(&gpu.pso("k_attn_b"));
+            e.dispatch((chunk_t.div_ceil(8), NKV, 1), 128);
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
+            Engine::assert_cmd_ok(&cb, "k_attn_b");
+        }
     };
-    for (i, &id) in out[..TOPK].iter().enumerate() { assert_eq!(id, i as f32); }
-    assert_eq!(out[TOPK..], [0.0; TOPK]);
+
+    let run_blocked = |ranges: &[(usize, usize)], out_base: usize, clear_expired: bool| {
+        unsafe {
+            let a_f = std::slice::from_raw_parts_mut(
+                act.contents().as_ptr().cast::<f32>().add(out_base),
+                out_len,
+            );
+            a_f.fill(f32::NAN);
+        }
+        let slabs = pools.window.gpu_slabs();
+        for &(p0, chunk_t) in ranges {
+            let lo_win_blk = p0.saturating_sub(EXT - 1) / KV_BLOCK;
+            unsafe {
+                let bt_dst = std::slice::from_raw_parts_mut(bt_buf.contents().as_ptr().cast::<u64>(), n_blks);
+                bt_dst.copy_from_slice(&host_bt);
+                if clear_expired {
+                    for b in 0..lo_win_blk {
+                        bt_dst[b] = CLEARED_GPU_TABLE_ENTRY;
+                    }
+                }
+            }
+            let aa = AttnBArgs {
+                t: chunk_t as u32,
+                p0: p0 as u32,
+                ring: 0,
+                cap: 0,
+                k_base: 0,
+                v_base: 0,
+                window: EXT as u32,
+                qp_off: (qp_off + p0 * NH * HD) as u32,
+                rp_off: (rp_off + p0 * NH * NREL) as u32,
+                sink_off: (sink_off + p0 * NH) as u32,
+                gate_off: (gate_off + p0 * NH * HD) as u32,
+                out_off: (out_base + p0 * NH * HD) as u32,
+                relbias_w: 0,
+                ghalf: 0,
+                kpos0: 0,
+                pad: 0,
+            };
+            let cb = gpu.cmd();
+            let e = Enc::new(&cb);
+            e.buf(&pb, 0, 1);
+            e.buf(&act, 0, 2);
+            e.buf(slabs[0], 0, 3);
+            e.bytes(&aa, 5);
+            e.buf(&bt_buf, 0, 8);
+            e.buf(slabs.get(1).copied().unwrap_or(slabs[0]), 0, 10);
+            e.buf(slabs.get(2).copied().unwrap_or(slabs[0]), 0, 11);
+            e.buf(slabs.get(3).copied().unwrap_or(slabs[0]), 0, 12);
+            e.pso(&gpu.pso("k_attn_b_blk"));
+            e.dispatch((chunk_t.div_ceil(8), NKV, 1), 128);
+            e.end();
+            cb.commit();
+            cb.waitUntilCompleted();
+            Engine::assert_cmd_ok(&cb, "k_attn_b_blk");
+        }
+    };
+
+    let assert_bits_eq = |label: &str| {
+        let (u, s) = unsafe {
+            let base = act.contents().as_ptr().cast::<f32>();
+            (
+                std::slice::from_raw_parts(base.add(out_unsplit_off), out_len),
+                std::slice::from_raw_parts(base.add(out_split_off), out_len),
+            )
+        };
+        for (idx, (&a, &b)) in u.iter().zip(s.iter()).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "{label}: non-finite output at {idx} ({a}, {b})");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: bit mismatch at flat={idx} (pos={}, elem={}): unsplit={a} ({:#010x}) vs split={b} ({:#010x})",
+                idx / (NH * HD),
+                idx % (NH * HD),
+                a.to_bits(),
+                b.to_bits(),
+            );
+        }
+    };
+
+    // Non-32-aligned splits across the 1024-token window + expired block-0 tail [1089..1100).
+    let splits_a = [(0, 23), (23, 1032), (1055, 34), (1089, 11)];
+    let splits_b = [(0, 17), (17, 514), (531, 494), (1025, 62), (1087, 13)];
+
+    run_linear(&[(0, total)], out_unsplit_off);
+    run_linear(&splits_a, out_split_off);
+    assert_bits_eq("k_attn_b unsplit vs splits_a");
+    run_linear(&splits_b, out_split_off);
+    assert_bits_eq("k_attn_b unsplit vs splits_b");
+
+    // Blocked `k_attn_b_blk` must also match `k_attn_b` unsplit AND stay bit-identical when expired
+    // window blocks (`0..lo_win_blk`) are marked `CLEARED_GPU_TABLE_ENTRY` (`u64::MAX`).
+    run_blocked(&[(0, total)], out_split_off, false);
+    assert_bits_eq("k_attn_b vs k_attn_b_blk unsplit");
+    run_blocked(&splits_a, out_split_off, true);
+    assert_bits_eq("k_attn_b vs k_attn_b_blk splits_a (expired block cleared)");
+    run_blocked(&splits_b, out_split_off, true);
+    assert_bits_eq("k_attn_b vs k_attn_b_blk splits_b (expired block cleared)");
 }
 
 /// Chunk 4096 keeps `min(t, MAX_SPANS)` vocabulary rows. A verify span of k=3 needs 4 of them.
@@ -170,23 +478,53 @@ fn verify_cs_image_is_one_convolution_state() {
 
 #[test]
 fn shader_arg_structs_match_metal_abi_sizes() {
-    assert_eq!(std::mem::size_of::<MoeArgs>(), 32 * 4);
-    assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
-    assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
-    assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
-    assert_eq!(std::mem::size_of::<LoopCdArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<EmbedArgs>(), 8 * 4);
     assert_eq!(std::mem::size_of::<DecodeSpanDesc>(), 16 * 4);
     assert_eq!(std::mem::align_of::<DecodeSpanDesc>(), 4);
     assert_eq!(std::mem::size_of::<EmbedDecArgs>(), 8 * 4);
-    assert_eq!(std::mem::size_of::<CombineArgs>(), 8 * 4);
     assert_eq!(std::mem::size_of::<CombineDecArgs>(), 8 * 4);
-    assert_eq!(std::mem::size_of::<AttnBlkDecArgs>(), 16 * 4);
     assert_eq!(std::mem::size_of::<DecAttnGroup>(), 6 * 4);
     assert_eq!(std::mem::align_of::<DecAttnGroup>(), 4);
     assert_eq!(std::mem::size_of::<KvPrepDecArgs>(), 20 * 4);
     assert_eq!(std::mem::size_of::<AttnGrpDecArgs>(), 12 * 4);
     assert_eq!(std::mem::size_of::<PostConvDecArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<MixJob>(), 50 * 4);
+    assert_eq!(std::mem::size_of::<Seg>(), 20 * 4);
+    assert_eq!(std::mem::size_of::<MvArgs>(), (8 + 12 * 20) * 4);
+    assert_eq!(std::mem::size_of::<CtrlJob>(), 10 * 4);
+    assert_eq!(std::mem::size_of::<CtrlArgs>(), (4 + 4 * 10) * 4);
+    assert_eq!(std::mem::size_of::<AttnArgs>(), 34 * 4);
+    assert_eq!(std::mem::size_of::<DevCopyArgs>(), 4 * 4);
+    assert_eq!(std::mem::size_of::<CombineArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<EpiArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<MoeArgs>(), 32 * 4);
+    assert_eq!(std::mem::size_of::<GSeg>(), 12 * 4);
+    assert_eq!(std::mem::size_of::<ToHalfArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<HSeg>(), 12 * 4);
+    assert_eq!(std::mem::size_of::<GemmHArgs>(), (4 + 10 * 12) * 4);
+    assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
+    assert_eq!(std::mem::size_of::<CtrlBJob>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<CtrlGfJob>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<CtrlGfArgs>(), (4 + 4 * 8) * 4);
+    assert_eq!(std::mem::size_of::<CtrlBArgs>(), (4 + 4 * 8) * 4);
+    assert_eq!(std::mem::size_of::<GemmArgs>(), (4 + 10 * 12) * 4);
+    assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
+    assert_eq!(std::mem::size_of::<TopkBArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<RouteArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<Route3Args>(), 12 * 4);
     assert_eq!(std::mem::size_of::<TopkRoute3Args>(), 16 * 4);
+    assert_eq!(std::mem::size_of::<MoeCombArgs>(), 4 * 4);
+    assert_eq!(std::mem::size_of::<ConvBArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<StateArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<StateKeepArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<KvPrepArgs>(), 24 * 4);
+    assert_eq!(std::mem::size_of::<AttnBArgs>(), 16 * 4);
+    assert_eq!(std::mem::size_of::<KvCopyArgs>(), 12 * 4);
+    assert_eq!(std::mem::size_of::<ArgmaxArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<LoopCdArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<BenchArgs>(), 8 * 4);
+    assert_eq!(std::mem::size_of::<TouchArgs>(), 4 * 4);
 
     // Verify exact field offsets of `DecodeSpanDesc` match `kernels.metal`.
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, tok_id), 0);
@@ -206,7 +544,7 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_tau), 56);
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad1), 60);
 
-    // Verify `CombineArgs`, `CombineDecArgs`, `AttnBlkDecArgs`, `PostConvDecArgs`, and `TopkRoute3Args` offsets match Metal structs.
+    // Verify key field offsets across decode, prefill, sampling, and bench structs match Metal declarations.
     assert_eq!(std::mem::offset_of!(CombineArgs, part_off), 0);
     assert_eq!(std::mem::offset_of!(CombineArgs, nsplit), 4);
     assert_eq!(std::mem::offset_of!(CombineArgs, gate_off), 8);
@@ -219,11 +557,6 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::offset_of!(CombineDecArgs, swa), 12);
     assert_eq!(std::mem::offset_of!(CombineDecArgs, hout), 16);
     assert_eq!(std::mem::offset_of!(CombineDecArgs, pad), 20);
-    assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, desc_off), 0);
-    assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, swa), 12);
-    assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, kdyn_off), 36);
-    assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, vdyn_off), 40);
-    assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, relbias_w), 60);
     assert_eq!(std::mem::offset_of!(DecAttnGroup, abs_sp), 0);
     assert_eq!(std::mem::offset_of!(DecAttnGroup, count), 4);
     assert_eq!(std::mem::offset_of!(DecAttnGroup, span_idx), 8);
@@ -248,6 +581,7 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::offset_of!(LoopCdArgs, n), 4);
     assert_eq!(std::mem::offset_of!(LoopCdArgs, stride), 8);
     assert_eq!(std::mem::offset_of!(LoopCdArgs, softcap), 16);
+    assert_eq!(std::mem::offset_of!(TopkBArgs, wscale), 16);
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, logits_off), 0);
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, bias_off), 4);
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, sel_off), 8);
@@ -261,6 +595,10 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, dn_y), 40);
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, tiles_off), 44);
     assert_eq!(std::mem::offset_of!(TopkRoute3Args, pad), 52);
+    assert_eq!(std::mem::offset_of!(AttnBArgs, window), 24);
+    assert_eq!(std::mem::offset_of!(AttnBArgs, kpos0), 56);
+    assert_eq!(std::mem::offset_of!(BenchArgs, x_off), 20);
+    assert_eq!(std::mem::offset_of!(TouchArgs, n16), 8);
 }
 
 #[test]
@@ -470,12 +808,95 @@ fn grouped_decode_layout_invariants_and_boundaries() {
     assert_eq!(grps_20.len(), 68);
 }
 
+fn run_shader_compiler_validation<F4, F3>(
+    mut probe_and_compile_v4: F4,
+    mut probe_and_compile_v3: F3,
+    full_src: &str,
+    dec_src: &str,
+) -> Result<&'static str, String>
+where
+    F4: FnMut(&str, bool) -> Result<(), String>,
+    F3: FnMut(&str) -> Result<(), String>,
+{
+    let probe = "#include <metal_stdlib>\nkernel void probe() {}\n";
+    match probe_and_compile_v4(probe, false) {
+        Ok(()) => {
+            probe_and_compile_v4(full_src, true)
+                .map_err(|e| format!("Metal 4.0 fp16 compile failed:\n{e}"))?;
+            let kv8_src = format!("#define KV8 1\n{full_src}");
+            probe_and_compile_v4(&kv8_src, true)
+                .map_err(|e| format!("Metal 4.0 KV8 compile failed:\n{e}"))?;
+            Ok("metal4.0")
+        }
+        Err(e4) => match probe_and_compile_v3(probe) {
+            Ok(()) => {
+                probe_and_compile_v3(dec_src)
+                    .map_err(|e| format!("Metal 3.1 decode kernels (fp16) compile failed:\n{e}"))?;
+                let dec_kv8_src = format!("#define KV8 1\n{dec_src}");
+                probe_and_compile_v3(&dec_kv8_src)
+                    .map_err(|e| format!("Metal 3.1 decode kernels (KV8) compile failed:\n{e}"))?;
+                Ok("metal3.1")
+            }
+            Err(e3) => Err(format!(
+                "no Metal shader compiler ran (refusing silent pass); Metal 4.0 probe error: {e4}; Metal 3.1 probe error: {e3}"
+            )),
+        },
+    }
+}
+
+#[test]
+fn shader_validation_fails_when_no_compiler_runs() {
+    let err = run_shader_compiler_validation(
+        |_, _| Err("v4 unavailable".into()),
+        |_| Err("v3 unavailable".into()),
+        "kernel void a() {}",
+        "kernel void b() {}",
+    )
+    .unwrap_err();
+    assert!(err.contains("no Metal shader compiler ran"), "{err}");
+
+    // Verify BOTH fp16 and KV8 variants are compiled and checked in each tier.
+    let mut seen = Vec::new();
+    let tier = run_shader_compiler_validation(
+        |src, check_syms| {
+            seen.push((src.starts_with("#define KV8 1\n"), check_syms));
+            Ok(())
+        },
+        |_| unreachable!(),
+        "full_shader_body",
+        "dec_shader_body",
+    )
+    .unwrap();
+    assert_eq!(tier, "metal4.0");
+    assert_eq!(seen, vec![(false, false), (false, true), (true, true)]);
+}
+
 #[test]
 fn metal_shader_declarations_and_compiler_validation() {
+    use objc2_foundation::NSString;
+    use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode};
+
     let kernels_src = include_str!("../kernels.metal");
     let prefill_src = include_str!("../prefill.metal");
     let bench_src = include_str!("../bench_kernels.metal");
     let full_src = format!("{kernels_src}\n{prefill_src}\n{bench_src}");
+
+    // Validate dead kernels have been removed and do not linger in shader sources.
+    for dead in [
+        "kernel void k_norm(",
+        "kernel void k_ctrl_down(",
+        "kernel void k_attn_blk(",
+        "kernel void k_attn_blk_dec(",
+        "struct NormJob",
+        "struct NormArgs",
+        "struct AttnBlkDecArgs",
+        "template<int NR, int NSG> void kg_s(",
+        "template<int BM, int BN, int NSG> void kg_d(",
+        "template<int BM, int BN, int NSG> void kg_db(",
+        "template<int NSG, int FUSE, int NACT> void kg_h(",
+    ] {
+        assert!(!full_src.contains(dead), "dead shader declaration `{dead}` must be removed");
+    }
 
     // Validate every kernel listed in `KERNELS` is declared in the shader source.
     for &name in KERNELS {
@@ -492,15 +913,15 @@ fn metal_shader_declarations_and_compiler_validation() {
         "struct EmbedDecArgs",
         "struct CombineArgs",
         "struct CombineDecArgs",
-        "struct AttnBlkDecArgs",
         "struct DecAttnGroup",
         "struct KvPrepDecArgs",
         "struct AttnGrpDecArgs",
         "struct PostConvDecArgs",
         "struct TopkRoute3Args",
         "struct LoopCdArgs",
+        "mem_flags::mem_device | mem_flags::mem_threadgroup",
+        "#define KV_CLEARED_ENTRY (~0UL)",
         "kernel void k_embed_dec(",
-        "kernel void k_attn_blk_dec(",
         "kernel void k_kvprep_dec(",
         "kernel void k_attn_dec_solo(",
         "kernel void k_attn_grp_dec(",
@@ -512,62 +933,275 @@ fn metal_shader_declarations_and_compiler_validation() {
         assert!(full_src.contains(s), "missing expected Metal declaration `{s}`");
     }
 
-    // Compile via `xcrun -sdk macosx metal`: full shader when `-std=metal4.0` is supported,
-    // otherwise compile `kernels.metal` + `k_moe_topk_route3` + `k_postconv_state_dec` under `-std=metal3.1` if available.
-    let compile_metal = |std_flag: &str, src: &str, tag: &str| -> Result<(), String> {
-        let pid = std::process::id();
-        let tmp_in = std::env::temp_dir().join(format!("inky_check_{pid}_{tag}.metal"));
-        let tmp_out = std::env::temp_dir().join(format!("inky_check_{pid}_{tag}.air"));
-        std::fs::write(&tmp_in, src).map_err(|e| format!("write temp shader: {e}"))?;
-        let res = std::process::Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", std_flag, "-ffast-math", "-c"])
-            .arg(&tmp_in)
-            .arg("-o")
-            .arg(&tmp_out)
-            .output();
-        let _ = std::fs::remove_file(&tmp_in);
-        let _ = std::fs::remove_file(&tmp_out);
-        match res {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
-            Err(e) => Err(format!("spawn xcrun: {e}")),
-        }
-    };
+    let stripped_kernels = kernels_src
+        .replace("#include <metal_tensor>\n", "")
+        .replace("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n", "");
+    let topk_route_start = prefill_src
+        .find("struct TopkRoute3Args")
+        .expect("TopkRoute3Args in prefill.metal");
+    let topk_route_end = prefill_src[topk_route_start..]
+        .find("\n// ---- expert sum per token")
+        .map(|rel| topk_route_start + rel)
+        .unwrap_or(prefill_src.len());
+    let postconv_start = prefill_src
+        .find("struct PostConvDecArgs")
+        .expect("PostConvDecArgs in prefill.metal");
+    let postconv_end = prefill_src[postconv_start..]
+        .find("\n// ---- per-position conv state")
+        .map(|rel| postconv_start + rel)
+        .unwrap_or(prefill_src.len());
+    let dec_src = format!(
+        "{stripped_kernels}\n#define NTC 2\n{}\n{}\n",
+        &prefill_src[topk_route_start..topk_route_end],
+        &prefill_src[postconv_start..postconv_end],
+    );
 
-    if compile_metal("-std=metal4.0", "#include <metal_stdlib>\nkernel void probe() {}\n", "probe4").is_ok() {
-        compile_metal("-std=metal4.0", &full_src, "full_fp16")
-            .unwrap_or_else(|e| panic!("Metal 4.0 fp16 compile failed:\n{e}"));
-        let kv8_src = format!("#define KV8 1\n{full_src}");
-        compile_metal("-std=metal4.0", &kv8_src, "full_kv8")
-            .unwrap_or_else(|e| panic!("Metal 4.0 KV8 compile failed:\n{e}"));
-    } else if compile_metal("-std=metal3.1", "#include <metal_stdlib>\nkernel void probe() {}\n", "probe3").is_ok() {
-        let stripped_kernels = kernels_src
-            .replace("#include <metal_tensor>\n", "")
-            .replace("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n", "");
-        let topk_route_start = prefill_src
-            .find("struct TopkRoute3Args")
-            .expect("TopkRoute3Args in prefill.metal");
-        let topk_route_end = prefill_src[topk_route_start..]
-            .find("\n// ---- expert sum per token")
-            .map(|rel| topk_route_start + rel)
-            .unwrap_or(prefill_src.len());
-        let postconv_start = prefill_src
-            .find("struct PostConvDecArgs")
-            .expect("PostConvDecArgs in prefill.metal");
-        let postconv_end = prefill_src[postconv_start..]
-            .find("\n// ---- per-position conv state")
-            .map(|rel| postconv_start + rel)
-            .unwrap_or(prefill_src.len());
-        let dec_src = format!(
-            "{stripped_kernels}\n#define NTC 2\n{}\n{}\n",
-            &prefill_src[topk_route_start..topk_route_end],
-            &prefill_src[postconv_start..postconv_end],
+    let bench_kernels_live = [
+        "k_layout_sg",
+        "k_layout_att",
+        "kb_dev_2_2",
+        "kb_dev_2_4",
+        "kb_dev_4_2",
+        "kb_dev_4_4",
+        "kb_dev_8_2",
+        "kb_dev_1_4",
+        "kb_blk_2_4",
+        "kb_blk_4_4",
+        "kb_blk_8_2",
+        "kb_blk_4_8",
+        "kd_dev_4_4",
+        "kd_dev_2_4",
+        "kd_tg_2_8",
+        "kd_dev_1_4",
+        "kd_dev_2_2",
+        "kd_dev_1_8",
+        "kd_dev_2_8",
+        "kd_dev_1_2",
+        "kg_iso0_3",
+        "kg_iso2_3",
+        "kgb_64_128_8",
+        "kgb_64_64_4",
+        "kgs_64_128_8",
+        "kgs_64_64_4",
+        "kgs_64_32_4",
+        "kgs_64_96_6",
+        "kgs_64_112_7",
+        "kgs_64_192_12",
+        "kgs_64_256_16",
+        "kgsg_4",
+        "kgsg_8",
+        "kgsg_16",
+        "kgsgf0_4",
+        "kgsgf0_8",
+        "kgsgf0_16",
+        "kgmode_0_0",
+        "kgmode_1_0",
+        "kgmode_0_1",
+        "kgmode_1_1",
+        "kgpeak_8_0",
+        "kgpeak_8_32",
+        "kgpeak_8_128",
+        "kgpeak_8_576",
+        "kgpeak_1_0",
+        "kgpeak_4_0",
+    ];
+
+    if let Some(dev) = MTLCreateSystemDefaultDevice() {
+        // Primary path: compile in-memory via Metal's API (zero temp files, zero subprocesses)
+        // and verify every symbol in `KERNELS` + live `bench_kernels.metal` entry points resolves.
+        let compile_in_mem = |ver: MTLLanguageVersion, src: &str, check_all: bool| -> Result<(), String> {
+            let opts = MTLCompileOptions::new();
+            opts.setMathMode(MTLMathMode::Fast);
+            opts.setLanguageVersion(ver);
+            let lib = dev
+                .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
+                .map_err(|e| e.localizedDescription().to_string())?;
+            if check_all {
+                for &name in KERNELS.iter().chain(bench_kernels_live.iter()) {
+                    if lib.newFunctionWithName(&NSString::from_str(name)).is_none() {
+                        return Err(format!("compiled MTLLibrary missing kernel function `{name}`"));
+                    }
+                }
+            }
+            Ok(())
+        };
+        run_shader_compiler_validation(
+            |src, check_all| compile_in_mem(MTLLanguageVersion::Version4_0, src, check_all),
+            |src| compile_in_mem(MTLLanguageVersion::Version3_1, src, false),
+            &full_src,
+            &dec_src,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    } else {
+        // Headless fallback when no `MTLDevice` exists: stay strictly inside `./target/shader-check`.
+        let work_dir = std::path::Path::new("target").join(format!("shader-check-{}", std::process::id()));
+        std::fs::create_dir_all(&work_dir).expect("create ./target/shader-check dir");
+        let seq = Cell::new(0usize);
+        let compile_xcrun = |std_flag: &str, src: &str| -> Result<(), String> {
+            let id = seq.get() + 1;
+            seq.set(id);
+            let tmp_in = work_dir.join(format!("s_{id}.metal"));
+            let tmp_out = work_dir.join(format!("s_{id}.air"));
+            std::fs::write(&tmp_in, src).map_err(|e| format!("write {}: {e}", tmp_in.display()))?;
+            let res = std::process::Command::new("xcrun")
+                .args(["-sdk", "macosx", "metal", std_flag, "-ffast-math", "-c"])
+                .arg(&tmp_in)
+                .arg("-o")
+                .arg(&tmp_out)
+                .output();
+            let _ = std::fs::remove_file(&tmp_in);
+            let _ = std::fs::remove_file(&tmp_out);
+            match res {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(format!("spawn xcrun: {e}")),
+            }
+        };
+        let res = run_shader_compiler_validation(
+            |src, _| compile_xcrun("-std=metal4.0", src),
+            |src| compile_xcrun("-std=metal3.1", src),
+            &full_src,
+            &dec_src,
         );
-        compile_metal("-std=metal3.1", &dec_src, "dec_fp16")
-            .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (fp16) compile failed:\n{e}"));
-        let dec_kv8_src = format!("#define KV8 1\n{dec_src}");
-        compile_metal("-std=metal3.1", &dec_kv8_src, "dec_kv8")
-            .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (KV8) compile failed:\n{e}"));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        res.unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+#[test]
+fn step_input_rejects_duplicate_lanes_and_zero_ink_splits() {
+    assert!(check_distinct_lane_ptrs(&[]).is_err());
+    assert!(check_distinct_lane_ptrs(&[0x1000]).is_ok());
+    assert!(check_distinct_lane_ptrs(&[0x1000, 0x2000, 0x3000]).is_ok());
+    let dup_err = check_distinct_lane_ptrs(&[0x1000, 0x2000, 0x1000]).unwrap_err();
+    assert!(dup_err.contains("spans 0 and 2 name the same lane"), "{dup_err}");
+    let too_many: Vec<usize> = (1..=MAX_SPANS + 1).collect();
+    assert!(check_distinct_lane_ptrs(&too_many).is_err());
+
+    assert_eq!(configured_split_target(Err(std::env::VarError::NotPresent)), Ok(8));
+    assert_eq!(configured_split_target(Ok("1".into())), Ok(1));
+    assert_eq!(configured_split_target(Ok("256".into())), Ok(256));
+    for bad in ["0", "257", "-1", "", "nan", "1,2"] {
+        assert!(configured_split_target(Ok(bad.into())).is_err(), "INK_SPLITS={bad:?} must be refused");
+    }
+}
+
+#[test]
+fn prefill_scratch_zero_range_excludes_logits_and_skips_unread_span_lmhead() {
+    for &(lean, kvb) in &[(true, 2usize), (false, 2), (true, 1)] {
+        let b = BArena::new(0, 4096, lean, kvb, N_VOCAB_PAD);
+        let [start, count] = prefill_scratch_zero_range(&b);
+        assert_eq!(start, b.sk);
+        assert_eq!(start + count, b.lg, "k_zero must stop at b.lg and never clear vocabulary logits rows");
+        assert!(b.lg + b.lg_rows * (N_VOCAB_PAD as u32) <= b.perm);
+        assert!(count < b.perm - b.sk, "zero range must be strictly smaller than old [b.sk, b.perm)");
+    }
+    assert!(prefill_span_reads_logits(true, None, 0));
+    assert!(!prefill_span_reads_logits(false, None, 0));
+    let mask = [false, true, false, true];
+    assert!(!prefill_span_reads_logits(true, Some(&mask), 0));
+    assert!(prefill_span_reads_logits(true, Some(&mask), 1));
+    assert!(!prefill_span_reads_logits(true, Some(&mask), 2));
+    assert!(prefill_span_reads_logits(true, Some(&mask), 3));
+    assert!(!prefill_span_reads_logits(false, Some(&mask), 1));
+}
+
+#[test]
+fn validate_lane_block_span_checks_interior_blocks_in_all_profiles() {
+    use crate::blocks::{BlockIndex, BlockKind, BlockPools, BlockTable, CLEARED_GPU_TABLE_ENTRY};
+
+    let mut pools = BlockPools::new(8);
+    let mut table = BlockTable::new(8).unwrap();
+    for b in 0..4u32 {
+        let (wf, _) = pools.full.take_free().unwrap();
+        let gf = pools.full.record(wf).unwrap().generation();
+        table.fill(&mut pools.full, BlockIndex::new(b), wf, gf).unwrap();
+        let (ww, _) = pools.window.take_free().unwrap();
+        let gw = pools.window.record(ww).unwrap().generation();
+        table.fill(&mut pools.window, BlockIndex::new(b), ww, gw).unwrap();
+    }
+    // First slot in slab 0 encodes as 0, strictly distinct from CLEARED_GPU_TABLE_ENTRY (`u64::MAX`).
+    let first_entry = table.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap();
+    assert_eq!(pools.full.gpu_table_entry(first_entry).unwrap(), 0);
+    assert_ne!(0, CLEARED_GPU_TABLE_ENTRY);
+
+    // Valid 4-block span [0, 256) passes.
+    assert!(validate_lane_block_span(&table, &pools, 0, 256).is_ok());
+
+    // Clear ONLY interior block 2 (endpoints 0 and 3 remain valid!) -> MUST fail in both debug and release builds!
+    table.clear_kind_entry(&mut pools.full, BlockIndex::new(2)).unwrap();
+    let err = validate_lane_block_span(&table, &pools, 0, 256).unwrap_err();
+    assert!(err.contains("missing required Full block 2"), "{err}");
+
+    // Restore block 2, then recycle interior Window block 1 so a stale table clone still holds gen 1 while endpoints 0 & 3 stay live!
+    let (wf2, _) = pools.full.take_free().unwrap();
+    let gf2 = pools.full.record(wf2).unwrap().generation();
+    table.fill(&mut pools.full, BlockIndex::new(2), wf2, gf2).unwrap();
+    assert!(validate_lane_block_span(&table, &pools, 0, 256).is_ok());
+
+    let stale_table = table.clone();
+    let win1 = table.get(BlockKind::Window, BlockIndex::new(1)).unwrap().unwrap();
+    table.clear_kind_entry(&mut pools.window, BlockIndex::new(1)).unwrap();
+    pools.window.take(win1.slot()).unwrap();
+    let stale_err = validate_lane_block_span(&stale_table, &pools, 0, 256).unwrap_err();
+    assert!(stale_err.contains("Window block 1 entry invalid"), "{stale_err}");
+}
+
+#[test]
+fn engine_slice_bounds_and_refcell_borrow_lifetime_guard() {
+    assert_eq!(checked_byte_end(0, 4, 4, 16, "t"), Ok(16));
+    assert!(checked_byte_end(1, 4, 4, 16, "t").is_err());
+    assert!(checked_byte_end(usize::MAX, 1, 4, 16, "t").is_err());
+    assert!(checked_byte_end(0, (usize::MAX / 4) + 1, 4, usize::MAX, "t").is_err());
+
+    if let Some(dev) = objc2_metal::MTLCreateSystemDefaultDevice() {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        let buf = dev.newBufferWithLength_options(64, MTLResourceOptions::StorageModeShared).unwrap();
+        unsafe {
+            let s = std::slice::from_raw_parts_mut(buf.contents().as_ptr().cast::<f32>(), 16);
+            for (i, v) in s.iter_mut().enumerate() { *v = (i + 1) as f32; }
+        }
+        let cell = RefCell::new(buf);
+        {
+            let view = borrow_buf_slice::<f32>(&cell, 4, 8, "test_slice");
+            assert_eq!(&*view, &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+            // While `Ref<'_, [f32]>` is alive, any mutable reallocation (`ensure_batch` / `release_batch` / `ensure_dbatch`)
+            // cannot mutably borrow `cell`, preventing dangling slice references structurally.
+            assert!(cell.try_borrow_mut().is_err());
+        }
+        assert!(cell.try_borrow_mut().is_ok());
+    }
+}
+
+#[test]
+fn loopcd_weak_buffer_sizing_and_budget_accounting() {
+    assert_eq!(Engine::loopcd_weak_bytes_for(0, N_VOCAB_PAD), N_VOCAB_PAD * 4);
+    assert_eq!(Engine::loopcd_weak_bytes_for(1, N_VOCAB_PAD), N_VOCAB_PAD * 4);
+    assert_eq!(Engine::loopcd_weak_bytes_for(16, N_VOCAB_PAD), 16 * N_VOCAB_PAD * 4);
+    assert_eq!(Engine::loopcd_weak_bytes_for(64, N_VOCAB_PAD), 64 * N_VOCAB_PAD * 4);
+
+    // Verify BlockedSlab initializes unmapped GPU block-table entries to `CLEARED_GPU_TABLE_ENTRY` (`u64::MAX`).
+    if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+        let gpu = Gpu::new("#include <metal_stdlib>\nkernel void p() {}\n", &["p"]);
+        let mut slab = BlockedSlab::new(64);
+        let s0 = slab.alloc_slot(&gpu, 64);
+        assert_eq!(s0, 0);
+        let bt_words = unsafe {
+            std::slice::from_raw_parts(
+                slab.bt_buf.as_ref().unwrap().contents().as_ptr().cast::<u64>(),
+                2 * slab.bt_stride_u64,
+            )
+        };
+        assert!(bt_words.iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY));
+        // Write 0 (valid slab-0 Slot(1) encoding!) into entry 0, recycle slot 0, and confirm re-alloc resets it to `CLEARED_GPU_TABLE_ENTRY`.
+        unsafe {
+            *slab.bt_buf.as_ref().unwrap().contents().as_ptr().cast::<u64>() = 0;
+        }
+        slab.free_slots.push(s0);
+        let s0_reused = slab.alloc_slot(&gpu, 64);
+        assert_eq!(s0_reused, 0);
+        let word0 = unsafe { *slab.bt_buf.as_ref().unwrap().contents().as_ptr().cast::<u64>() };
+        assert_eq!(word0, crate::blocks::CLEARED_GPU_TABLE_ENTRY);
     }
 }
 
@@ -759,46 +1393,6 @@ fn moe_class0_empty_invariant_for_n_le_64() {
         assert_eq!(ts_65[0], TOPK);
         assert_eq!(ts_65[1], 0);
     }
-}
-
-#[test]
-#[ignore = "requires Metal 4"]
-fn loopcd_mixed_batch_preserves_disabled_rows() {
-    // In binary32, softcapping the first row can round its distinct logits to a tie.
-    let a = 20.0f32;
-    let next = f32::from_bits(a.to_bits() + 1);
-    let strong = [a, next, 1.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0, f32::NAN, 4.0];
-    let weak = [f32::NAN, 0.0, 3.0, -2.0, 0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, 2.0, f32::NAN];
-    let omegas = [0.0f32, 0.5, 0.5, 0.5, 0.5];
-    let args = LoopCdArgs {
-        logits_off: 0, n: 2, stride: 2, pad0: 0, softcap: 30.0, pad1: 0, pad2: 0, pad3: 0,
-    };
-    let gpu = Gpu::new(include_str!("../kernels.metal"), &["k_loopcd_blend"]);
-    let strong_buf = gpu.buffer_with(&strong.map(f32::to_ne_bytes).concat());
-    let weak_buf = gpu.buffer_with(&weak.map(f32::to_ne_bytes).concat());
-    let cb = gpu.cmd();
-    let e = Enc::new(&cb);
-    e.pso(&gpu.pso("k_loopcd_blend"));
-    e.buf(&strong_buf, 0, 2);
-    e.bytes(&args, 5);
-    e.bytes_slice(&omegas, 8);
-    e.buf(&weak_buf, 0, 9);
-    e.dispatch((1, omegas.len(), 1), 1024);
-    e.end();
-    cb.commit();
-    cb.waitUntilCompleted();
-    assert!(cb.error().is_none());
-
-    let actual = unsafe { std::slice::from_raw_parts(strong_buf.contents().as_ptr().cast::<f32>(), strong.len()) };
-    assert_eq!(&actual[..2], &strong[..2]);
-    let mut expected = [strong[2], strong[3]];
-    loopcd_blend_row(&mut expected, &weak[2..4], args.softcap, omegas[1]);
-    for (&got, &want) in actual[2..].iter().zip(&expected) {
-        assert!((got - want).abs() < 1e-5, "got {got}, expected {want}");
-    }
-    // Even a zero adaptive weight must not conceal an invalid required weak logit.
-    assert!(actual[4..].iter().all(|x| x.is_nan()), "{actual:?}");
-    assert_eq!(guided_rows(&omegas), 0b11110);
 }
 
 #[test]
@@ -1100,9 +1694,7 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
         });
     }
 
-    // Step across 64 consecutive decode positions `pos = 64..128` (the entire second 64-token block):
-    // - `pos == 64` allocates block 1 -> `dirty_range == Some((1, 1))` -> writes `(1, 1)` table words.
-    // - `pos == 65..128` (63 steady-state decode steps) -> `dirty_range == None` -> writes `(0, 0)` words!
+    // Step across 64 consecutive decode positions `pos = 64..128`:
     for pos in 64..128 {
         ensure_blocks(&mut pools, &lane, pos, 1);
         if pos == 64 {
@@ -1121,7 +1713,6 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
         finish_span(&mut pools, &lane, pos, 1, false);
     }
 
-    // Sentinels in `[2..32)` are still completely untouched after all 64 decode steps.
     for swa in [false, true] {
         lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
             let dst = unsafe {
@@ -1134,7 +1725,6 @@ fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
         });
     }
 
-    // Next block boundary at `pos = 128` allocates block 2 -> writes `(1, 1)` table words.
     ensure_blocks(&mut pools, &lane, 128, 1);
     assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((2, 2)));
     assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((2, 2)));
@@ -1194,4 +1784,217 @@ fn engine_encode_decode_64_positions_syncs_once_then_63_zero_steps() {
     }
     let mut pools = eng.block_pool().borrow_mut();
     lane.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
+}
+
+#[test]
+#[ignore = "requires Metal 4"]
+fn loopcd_mixed_batch_preserves_disabled_rows() {
+    // In binary32, softcapping the first row can round its distinct logits to a tie.
+    let a = 20.0f32;
+    let next = f32::from_bits(a.to_bits() + 1);
+    let strong = [a, next, 1.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0, f32::NAN, 4.0];
+    let weak = [f32::NAN, 0.0, 3.0, -2.0, 0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, 2.0, f32::NAN];
+    let omegas = [0.0f32, 0.5, 0.5, 0.5, 0.5];
+    let args = LoopCdArgs {
+        logits_off: 0, n: 2, stride: 2, pad0: 0, softcap: 30.0, pad1: 0, pad2: 0, pad3: 0,
+    };
+    let gpu = Gpu::new(include_str!("../kernels.metal"), &["k_loopcd_blend"]);
+    let strong_buf = gpu.buffer_with(&strong.map(f32::to_ne_bytes).concat());
+    let weak_buf = gpu.buffer_with(&weak.map(f32::to_ne_bytes).concat());
+    let cb = gpu.cmd();
+    let e = Enc::new(&cb);
+    e.pso(&gpu.pso("k_loopcd_blend"));
+    e.buf(&strong_buf, 0, 2);
+    e.bytes(&args, 5);
+    e.bytes_slice(&omegas, 8);
+    e.buf(&weak_buf, 0, 9);
+    e.dispatch((1, omegas.len(), 1), 1024);
+    e.end();
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert!(cb.error().is_none());
+
+    let actual = unsafe { std::slice::from_raw_parts(strong_buf.contents().as_ptr().cast::<f32>(), strong.len()) };
+    assert_eq!(&actual[..2], &strong[..2]);
+    let mut expected = [strong[2], strong[3]];
+    loopcd_blend_row(&mut expected, &weak[2..4], args.softcap, omegas[1]);
+    for (&got, &want) in actual[2..].iter().zip(&expected) {
+        assert!((got - want).abs() < 1e-5, "got {got}, expected {want}");
+    }
+    // Even a zero adaptive weight must not conceal an invalid required weak logit.
+    assert!(actual[4..].iter().all(|x| x.is_nan()), "{actual:?}");
+    assert_eq!(guided_rows(&omegas), 0b11110);
+}
+
+#[test]
+fn blocked_slab_alloc_reuse_zero_fill_and_strided_growth() {
+    assert_eq!(BlockedSlab::next_cap(0), 1);
+    assert_eq!(BlockedSlab::next_cap(1), 1);
+    assert_eq!(BlockedSlab::next_cap(2), 2);
+    assert_eq!(BlockedSlab::next_cap(3), 4);
+    assert_eq!(BlockedSlab::next_cap(4), 4);
+    assert_eq!(BlockedSlab::next_cap(5), 8);
+    assert_eq!(BlockedSlab::next_cap(8), 8);
+    assert_eq!(BlockedSlab::next_cap(9), 16);
+
+    if objc2_metal::MTLCreateSystemDefaultDevice().is_none() {
+        return;
+    }
+    let gpu = Gpu::new("#include <metal_stdlib>\nusing namespace metal;\nkernel void noop() {}\n", &[]);
+    let slab = Rc::new(RefCell::new(BlockedSlab::new(16))); // initial stride = 32 u64s
+
+    let alloc_handle = |need_blocks: usize| -> BlockedSlot {
+        let slot_idx = slab.borrow_mut().alloc_slot(&gpu, need_blocks);
+        BlockedSlot { slab: Rc::clone(&slab), slot_idx, bt_blocks: need_blocks }
+    };
+
+    // 1. Allocate 3 slots at initial stride (32 u64s): cap grows 0 -> 1 -> 2 -> 4.
+    let s0 = alloc_handle(16);
+    assert_eq!(s0.slot_idx, 0);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (1, 1, 32));
+
+    let s1 = alloc_handle(32);
+    assert_eq!(s1.slot_idx, 1);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (2, 2, 32));
+
+    let s2 = alloc_handle(20);
+    assert_eq!(s2.slot_idx, 2);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (4, 3, 32));
+
+    // Stamp distinct sentinels in each slot's `cs_buf` and `[full | win]` `bt_buf` slices.
+    {
+        let sb = slab.borrow();
+        let cs = unsafe {
+            std::slice::from_raw_parts_mut(
+                sb.cs_buf.as_ref().unwrap().contents().as_ptr() as *mut f32,
+                sb.cap * CS_STRIDE_F32,
+            )
+        };
+        let bt = unsafe {
+            std::slice::from_raw_parts_mut(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *mut u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        for slot in 0..3usize {
+            cs[sb.cs_f32_base(slot) as usize] = (slot as f32) + 10.5;
+            cs[sb.cs_f32_base(slot) as usize + CS_STRIDE_F32 - 1] = (slot as f32) + 99.25;
+            for swa in [false, true] {
+                let base = sb.bt_u64_base(slot, swa);
+                for b in 0..32usize {
+                    bt[base + b] = ((slot as u64 + 1) << 40) | ((u64::from(swa)) << 32) | (b as u64 + 1);
+                }
+            }
+        }
+    }
+
+    // 2. Drop `s1` then `s0` -> pushed LIFO `[1, 0]`. Re-allocating pops `0` first and zero-fills it!
+    drop(s1);
+    drop(s0);
+    assert_eq!(slab.borrow().free_slots, vec![1, 0]);
+
+    let s0_reused = alloc_handle(16);
+    assert_eq!(s0_reused.slot_idx, 0, "LIFO pop must reuse most recently dropped slot 0");
+    assert_eq!(slab.borrow().used, 3, "reusing free slot must not bump high-water `used`");
+    {
+        let sb = slab.borrow();
+        let cs = unsafe {
+            std::slice::from_raw_parts(
+                sb.cs_buf.as_ref().unwrap().contents().as_ptr() as *const f32,
+                sb.cap * CS_STRIDE_F32,
+            )
+        };
+        let bt = unsafe {
+            std::slice::from_raw_parts(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *const u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        let cs0 = sb.cs_f32_base(0) as usize;
+        assert!(cs[cs0..cs0 + CS_STRIDE_F32].iter().all(|&x| x == 0.0), "reused cs_buf slice must be zeroed");
+        let bt0 = sb.bt_u64_base(0, false);
+        assert!(bt[bt0..bt0 + 2 * sb.bt_stride_u64].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY), "reused bt_buf slice must be reset to CLEARED_GPU_TABLE_ENTRY");
+        // Live slot 2 must remain completely intact!
+        assert_eq!(cs[sb.cs_f32_base(2) as usize], 12.5);
+    }
+
+    // 3. Request `need_blocks = 65` -> `bt_stride_u64` grows `32 -> 96` (32-aligned) while reusing slot 1!
+    let s1_grown = alloc_handle(65);
+    assert_eq!(s1_grown.slot_idx, 1);
+    assert_eq!((slab.borrow().cap, slab.borrow().used, slab.borrow().bt_stride_u64), (4, 3, 96));
+    {
+        let sb = slab.borrow();
+        let bt = unsafe {
+            std::slice::from_raw_parts(
+                sb.bt_buf.as_ref().unwrap().contents().as_ptr() as *const u64,
+                sb.cap * 2 * sb.bt_stride_u64,
+            )
+        };
+        // Slot 2's `[full | win]` entries must be re-strided to `(2 * 2 + swa) * 96` with zeroed `[32..96)` tail!
+        for swa in [false, true] {
+            let base = sb.bt_u64_base(2, swa);
+            assert_eq!(base, (2 * 2 + usize::from(swa)) * 96);
+            for b in 0..32usize {
+                let want = (3u64 << 40) | ((u64::from(swa)) << 32) | (b as u64 + 1);
+                assert_eq!(bt[base + b], want, "slot 2 swa={swa} b={b} lost across stride growth");
+            }
+            assert!(bt[base + 32..base + 96].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY), "grown stride tail must be CLEARED_GPU_TABLE_ENTRY");
+        }
+        // Recycled slot 1 must be completely zeroed across all `2 * 96` u64 entries!
+        let bt1 = sb.bt_u64_base(1, false);
+        assert!(bt[bt1..bt1 + 2 * 96].iter().all(|&w| w == crate::blocks::CLEARED_GPU_TABLE_ENTRY));
+    }
+}
+
+#[test]
+fn kv_tier_file_opens_exclusively_rejects_symlinks_and_locks_fd() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::path::PathBuf::from("target").join(format!("test-kv-tier-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Pre-existing regular file must never be truncated or overwritten.
+    let existing = dir.join("existing.bin");
+    std::fs::write(&existing, b"keep-me").unwrap();
+    assert_eq!(create_locked_kv_tier_file_at(&existing).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
+    // 2. Planted symlink (even dangling) must never be followed.
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let symlink = dir.join("planted-link.bin");
+    std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+    assert!(create_locked_kv_tier_file_at(&symlink).is_err());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+    let dangling = dir.join("dangling-link.bin");
+    std::os::unix::fs::symlink(dir.join("nonexistent-target"), &dangling).unwrap();
+    assert!(create_locked_kv_tier_file_at(&dangling).is_err());
+    assert!(!dir.join("nonexistent-target").exists());
+
+    // 3. Fresh path opens with mode 0600 and holds LOCK_EX; open_exclusive_kv_tier_file unlinks immediately.
+    let fresh = dir.join("fresh.bin");
+    let f1 = create_locked_kv_tier_file_at(&fresh).unwrap();
+    let mode = f1.metadata().unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let f2 = std::fs::OpenOptions::new().read(true).write(true).open(&fresh).unwrap();
+    let lock_rc = unsafe { libc::flock(f2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(lock_rc, 0, "second open description must observe LOCK_EX held by tier file");
+    drop(f2);
+    drop(f1);
+
+    let unlinked = open_exclusive_kv_tier_file(&dir).unwrap();
+    assert_eq!(unlinked.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    drop(unlinked);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn snapshot_validation_checks_conv_and_window_buffer_fit() {
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 4096, 4096).is_ok());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES - 4, CS_STRIDE_BYTES, 4096, 4096).is_err());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 8192, 4096).is_err());
+    assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 2048, 4096).is_err());
 }

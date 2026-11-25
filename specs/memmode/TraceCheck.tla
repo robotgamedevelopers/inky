@@ -34,5 +34,6 @@ ReplayNext == /\ UNCHANGED trace
               /\ owner' = Traces[trace][pos'].owner
 Replay == ReplayInit /\ [][ReplayNext]_<<vars, trace, pos>>
 \* Finite observed prefixes check initial and next-state conformance, not fairness.
-Conforms == Init /\ [][[Next]_vars /\ Protocol(Traces[trace][pos], Traces[trace][pos'], Target)]_<<vars, trace, pos>>
+InitConforms == (pos = 1) => Init
+StepConforms == [][[Next]_vars /\ Protocol(Traces[trace][pos], Traces[trace][pos'], Target)]_<<vars, trace, pos>>
 =============================================================================
