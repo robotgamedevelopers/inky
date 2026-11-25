@@ -1892,7 +1892,7 @@ impl Engine {
     }
 
     fn seg(w: &QW, in_off: u32, out_off: u32) -> Seg {
-        debug_assert!(w.ty == T_Q4_K || w.ty == T_Q6_K);
+        debug_assert!(matches!(w.ty, T_Q4_K | T_Q6_K | T_Q8_0));
         Seg { w_lo: w.off as u32, w_hi: (w.off >> 32) as u32, row_bytes: w.row_bytes, wtype: w.ty, nrows: w.rows, k: w.k,
               in_off, in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0, out_off, ..Default::default() }
     }
@@ -4150,6 +4150,15 @@ mod tests {
         assert!(validate_token_write(usize::MAX, &[0], 4, 4).is_err());
         assert!(validate_token_write(2, &[0, 4], 4, 4).is_err());
         assert!(validate_token_write(0, &[u32::MAX], 4, 4).is_err());
+    }
+
+    #[test]
+    fn projection_segments_preserve_q8_attention_geometry() {
+        let weights = QW { ty: T_Q8_0, k: E as u32, rows: (NH * HD) as u32,
+            row_bytes: (E / 32 * 34) as u32, ..Default::default() };
+        let seg = Engine::seg(&weights, 12, 34);
+        assert_eq!((seg.wtype, seg.k, seg.nrows, seg.row_bytes),
+                   (T_Q8_0, weights.k, weights.rows, weights.row_bytes));
     }
 
     #[test]

@@ -217,14 +217,20 @@ func q6check(basePath, refPath string) error {
 			want, _ := dequantRow(tQ8_0, rb, rt.rowLen(), 1)
 			ours := make([]byte, rt.rowLen()/256*q6kBytes)
 			quantizeQ6K(ours, want)
-			e2, _ := relErr(dequantQ6K(ours, rt.rowLen()), want)
+			e2, _, err := relErr(dequantQ6K(ours, rt.rowLen()), want)
+			if err != nil {
+				return fmt.Errorf("%s row %d: %w", name, r, err)
+			}
 			relOurs += e2
 			if bt.Type == tQ6_K {
 				bb, err := base.readRows(bt, r, 1)
 				if err != nil {
 					return err
 				}
-				e1, _ := relErr(dequantQ6K(bb, bt.rowLen()), want)
+				e1, _, err := relErr(dequantQ6K(bb, bt.rowLen()), want)
+				if err != nil {
+					return fmt.Errorf("%s row %d: %w", name, r, err)
+				}
 				relLC += e1
 			}
 			n++
