@@ -818,7 +818,7 @@ fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCa
     cache.shutdown(&mut pools);
 }
 
-const SERVE_STEP_MAX_BYPASS: u32 = 4;
+const SERVE_STEP_MAX_BYPASS: u32 = 16;
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>, active_lanes: Arc<AtomicUsize>, metrics: &Mutex<Counters>) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
@@ -979,10 +979,22 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     continue;
                 }
                 let spans: Vec<Span> = live_sp.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
+                let many = spans.len() > 1;
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_spans(&cb, &spans, true, false);
-                let many = spans.len() > 1;
+                for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
+                    let l = &lanes[i];
+                    let a = l.job.as_ref().unwrap();
+                    let next_pos = p0 + t;
+                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                        if many {
+                            eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        } else {
+                            eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        }
+                    }
+                }
                 if let Err(e) = commit_step(&cb, "prefill") {
                     fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
@@ -1008,8 +1020,8 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     }
                 }
                 metrics.lock().unwrap_or_else(|e| e.into_inner()).input += live_sp.iter().map(|&(_, _, t)| t).sum::<usize>();
-                let mut gpu_pf: Vec<(usize, usize)> = Vec::new();
                 for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
+
                     let l = &mut lanes[i];
                     let a = l.job.as_mut().unwrap();
                     a.timing.prefill.add(t, elapsed);
@@ -1021,7 +1033,8 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     }
                     if a.n_past == a.pf_end {
                         if a.sampler.uses_gpu_gumbel() {
-                            gpu_pf.push((k, i));
+                            let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
+                            a.pending = Some(tok);
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
                             match a.sampler.sample_next_with_ban(lg, a.think.ban_token(&sp)) {
@@ -1037,33 +1050,6 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         }
                     } else if a.job.out.send(Ev::Alive).is_err() {
                         let _ = planner.request_cancel(i);
-                    }
-                }
-                if !gpu_pf.is_empty() {
-                    let gumbel_began = Instant::now();
-                    let gcb = eng.gpu.cmd();
-                    for &(k, i) in &gpu_pf {
-                        let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
-                        if many {
-                            eng.encode_gumbel_span(&gcb, k, &l.lane, a.n_past, a.job.seed, a.n_past, a.job.temp, a.think.ban_token(&sp));
-                        } else {
-                            eng.encode_gumbel_solo(&gcb, &l.lane, a.n_past, a.job.seed, a.n_past, a.job.temp, a.think.ban_token(&sp));
-                        }
-                    }
-                    if let Err(e) = commit_step(&gcb, "gumbel") {
-                        fail_step(eng, &mut cache, &mut lanes, gpu_pf.iter().map(|&(_, i)| i), e, metrics, &mut tick_seq);
-                        let _ = planner.complete_step();
-                        for &(_, i) in &gpu_pf { planner.on_finish(i); }
-                        continue;
-                    }
-                    let gumbel_elapsed = gumbel_began.elapsed();
-                    for &(_, i) in &gpu_pf {
-                        let l = &mut lanes[i];
-                        let a = l.job.as_mut().unwrap();
-                        a.timing.prefill.add(0, gumbel_elapsed);
-                        let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                        a.pending = Some(tok);
                     }
                 }
                 for cancelled_i in planner.complete_step() {
@@ -1103,6 +1089,14 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode(&cb, &spans, true, false);
+                for (k, &i) in live_dec.iter().enumerate() {
+                    let l = &lanes[i];
+                    let a = l.job.as_ref().unwrap();
+                    if !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                        let next_pos = a.n_past + 1;
+                        eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                    }
+                }
                 if let Err(e) = commit_step(&cb, "decode") {
                     fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
@@ -1116,25 +1110,6 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         let pos = l.job.as_ref().unwrap().n_past;
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.finish_decode_span(&mut pools, &mut tbl, &mut l.blocks, pos);
-                    }
-                }
-                let gpu_dec: Vec<(usize, usize)> = live_dec.iter().enumerate()
-                    .filter(|&(_, &i)| lanes[i].job.as_ref().unwrap().sampler.uses_gpu_gumbel())
-                    .map(|(k, &i)| (k, i))
-                    .collect();
-                if !gpu_dec.is_empty() {
-                    let gcb = eng.gpu.cmd();
-                    for &(k, i) in &gpu_dec {
-                        let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
-                        let next_pos = a.n_past + 1;
-                        eng.encode_gumbel_span(&gcb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
-                    }
-                    if let Err(e) = commit_step(&gcb, "gumbel") {
-                        fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
-                        let _ = planner.complete_step();
-                        for i in live_dec { planner.on_finish(i); }
-                        continue;
                     }
                 }
                 let elapsed = began.elapsed();
@@ -4221,4 +4196,32 @@ mod tests {
         assert_eq!(t3_out, cold3, "Turn 3 cached greedy tokens must match cold uncached solo token-for-token");
     }
 
+
+    #[test] fn serve_step_max_bypass_bursts_sixteen_decodes_before_prefill() {
+        assert_eq!(SERVE_STEP_MAX_BYPASS, 16);
+        let mut planner = crate::scheduler::ServeStepPlanner::new(2, SERVE_STEP_MAX_BYPASS);
+        planner.on_admit(0);
+        planner.on_admit(1);
+        let mut dec_pos = 64usize;
+        for step in 1..=SERVE_STEP_MAX_BYPASS {
+            let inputs = [
+                crate::scheduler::ServeLaneInput { runnable: true, n_past: dec_pos, pf_end: 64, has_pending_decode: true },
+                crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: 4096, has_pending_decode: false },
+            ];
+            let plan = planner.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+            assert_eq!(plan, crate::scheduler::ServeStepPlan::Decode(vec![0]));
+            assert_eq!(planner.wait_ticks(1), step);
+            dec_pos += 1;
+            assert!(planner.complete_step().is_empty());
+        }
+        let inputs = [
+            crate::scheduler::ServeLaneInput { runnable: true, n_past: dec_pos, pf_end: 64, has_pending_decode: true },
+            crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: 4096, has_pending_decode: false },
+        ];
+        let plan = planner.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, crate::scheduler::ServeStepPlan::Prefill(vec![(1, 0, 4096)]));
+        assert_eq!(planner.wait_ticks(1), 0);
+        assert_eq!(planner.wait_ticks(0), 1);
+        assert!(planner.complete_step().is_empty());
+    }
 }
