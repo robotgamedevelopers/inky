@@ -645,8 +645,8 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | A quality replay: landed cards run again and compared with a reference route (later) | ❌ |
 | The lowest thinking effort that still lands cards, per kind of card (later) | ❌ |
 | The 8-bit cache, behind the quality replay (later) | ❌ |
-| Far-key pruning on the full-attention passes, behind the quality replay (later) | ❌ |
-| Smaller weight quantizations, behind the quality replay (later) | ❌ |
+| Far-key pruning on the full-attention passes, behind the quality replay (later) | ✅ |
+| Smaller weight quantizations, behind the quality replay (later) | ✅ |
 | Tool calls constrained to valid JSON while sampling (later) | ✅ |
 | Sampling on the GPU (later) | ❌ |
 | General fixes sent upstream to inkling (later) | ❌ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve (later) | ❌ |
-| complete | 47% |
+| complete | 52% |
 
 [Source data](roadmap.sexp)
 

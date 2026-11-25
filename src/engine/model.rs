@@ -147,7 +147,7 @@ impl Engine {
         let _ = crate::tokenizer::Tokenizer::try_load(&g)?;
         let embed_shape = [E, N_VOCAB_PAD];
         let tok_embd = qw(&g, "token_embd.weight", &embed_shape, &[T_Q4_K, T_Q8_0])?;
-        let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K, T_Q8_0])?;
+        let output = qw(&g, "output.weight", &embed_shape, &[T_Q6_K, T_Q8_0, T_Q4_K, T_Q3_K, T_Q2_K])?;
 
         let eps = g.f(&a("attention.layer_norm_rms_epsilon"))?;
         let log_alpha = g.f(&a("attention.log_scale_alpha"))?;
@@ -180,19 +180,19 @@ impl Engine {
                         pb.f32(&g, &n("attn_v_inp_norm.weight"), &[E])? as i32,
                         pb.f32(&g, &n("attn_res_query.weight"), &[E, 3])? as i32,
                         3,
-                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
-                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0])?),
+                        Some(qw(&g, &n("attn_k_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0, T_Q3_K, T_Q2_K])?),
+                        Some(qw(&g, &n("attn_v_conv_proj.weight"), &[E, NKV * CONV_TAPS], &[T_Q4_K, T_Q6_K, T_Q8_0, T_Q3_K, T_Q2_K])?),
                     )
                 };
             layers.push(Layer {
                 swa,
-                wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
-                wgate: qw(&g, &n("attn_gate.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0])?,
-                wk: qw(&g, &n("attn_k.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q8_0])?,
-                wv: qw(&g, &n("attn_v.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q6_K, T_Q8_0])?,
-                wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K, T_Q8_0])?,
-                wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K, T_Q8_0])?,
-                wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K, T_Q8_0])?,
+                wq: qw(&g, &n("attn_q.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wgate: qw(&g, &n("attn_gate.weight"), &[E, NH * HD], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wk: qw(&g, &n("attn_k.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wv: qw(&g, &n("attn_v.weight"), &[E, NKV * HD], &[T_Q4_K, T_Q6_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wo: qw(&g, &n("attn_output.weight"), &[NH * HD, E], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wrel: qw(&g, &n("attn_rel.weight"), &[E, NH * NREL], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
+                wsink: qw(&g, &n("attn_sink_proj.weight"), &[E, NH], &[T_Q4_K, T_Q8_0, T_Q3_K, T_Q2_K])?,
                 kconvp, vconvp,
                 attn_norm, q_inp_norm, k_inp_norm, v_inp_norm, attn_res_query, n_attn_q,
                 ffn_res_query: pb.f32(&g, &n("ffn_res_query.weight"), &[E])?,
@@ -206,8 +206,8 @@ impl Engine {
                 ffn_post_conv: pb.f32(&g, &n("ffn_post_conv.weight"), &[CONV_TAPS, E])?,
                 router: pb.bf16(&g, &n("ffn_gate_inp.weight"), &[E, NEXP])?,
                 exp_bias: pb.f32(&g, &n("exp_probs_b.bias"), &[NEXP])?,
-                gu: qw(&g, &n("ffn_gate_up_exps.weight"), &[E, 2 * FF, NEXP], &[T_Q4_K, T_Q8_0, T_NV4, T_MX8])?,
-                dn: qw(&g, &n("ffn_down_exps.weight"), &[FF, E, NEXP], &[T_Q8_0, T_Q5_0, T_NV4, T_MX8])?,
+                gu: qw(&g, &n("ffn_gate_up_exps.weight"), &[E, 2 * FF, NEXP], &[T_Q4_K, T_Q8_0, T_NV4, T_MX8, T_Q3_K, T_Q2_K, T_Q3_0])?,
+                dn: qw(&g, &n("ffn_down_exps.weight"), &[FF, E, NEXP], &[T_Q8_0, T_Q5_0, T_NV4, T_MX8, T_Q3_0])?,
             });
         }
         let mut loops = Vec::new();
@@ -276,6 +276,10 @@ impl Engine {
             guided_logit_rows: Cell::new(0),
             lg_weak: RefCell::new(None),
             no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
+            full_attn_budget: Cell::new(match FULL_ATTN_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                b => Some(b),
+            }),
         };
         let mut eng = eng;
         eng.ensure_batch(64);

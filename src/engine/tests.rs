@@ -681,7 +681,7 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_nsplit), 48);
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_tau), 52);
     assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_tau), 56);
-    assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad1), 60);
+    assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_recent_start), 60);
 
     // Verify key field offsets across decode, prefill, sampling, and bench structs match Metal declarations.
     assert_eq!(std::mem::offset_of!(CombineArgs, part_off), 0);
@@ -2136,4 +2136,679 @@ fn snapshot_validation_checks_conv_and_window_buffer_fit() {
     assert!(validate_snapshot_lengths(CS_STRIDE_BYTES - 4, CS_STRIDE_BYTES, 4096, 4096).is_err());
     assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 8192, 4096).is_err());
     assert!(validate_snapshot_lengths(CS_STRIDE_BYTES, CS_STRIDE_BYTES, 2048, 4096).is_err());
+}
+
+#[test]
+fn full_attn_decode_plan_reduces_key_reads_above_budget_and_matches_default_when_none() {
+    let max_ctx = 16_384;
+    // Default (None): bit-identical to decode_split_grid across all positions.
+    for pos in [0usize, 63, 64, 511, 512, 1023, 1024, 4095, 4096, 8191] {
+        let p = full_attn_decode_plan(pos, max_ctx, None);
+        let (_, kps, _, nsplit) = decode_split_grid(false, pos, max_ctx);
+        assert_eq!(p.nkeys, pos + 1);
+        assert_eq!(p.kps, kps);
+        assert_eq!(p.nsplit, nsplit);
+        assert_eq!(p.recent_start, 0);
+    }
+
+    // Active budget = 1024: unpruned for pos < 1024, pruned to 64 sink + 960 recent for pos >= 1024.
+    let budget = Some(1024usize);
+    let p_in = full_attn_decode_plan(1023, max_ctx, budget);
+    assert_eq!(p_in.recent_start, 0);
+    assert_eq!(p_in.nkeys, 1024);
+
+    let p_4k = full_attn_decode_plan(4607, max_ctx, budget);
+    assert_eq!(p_4k.nkeys, 1024);
+    assert_eq!(p_4k.recent_start, 4608 - (1024 - FULL_ATTN_SINK));
+    assert!(p_4k.nsplit < decode_split_grid(false, 4607, max_ctx).3);
+    assert_eq!(p_4k.nsplit, 3, "4608 keys pruned to 1024 touches split 0 (sink) + splits 7 and 8");
+
+    // Verify Layer 3 group builder drops middle splits completely when pruned.
+    let ranges = vec![(0usize, 4607usize), (0usize, 4607usize)];
+    let recent_starts = vec![p_4k.recent_start, p_4k.recent_start];
+    let groups = build_full_decode_groups(&ranges, &recent_starts, p_4k.kps, false, |_si, blk| {
+        Some((1 + blk as u32, 1))
+    });
+    let mut visited_splits: Vec<u32> = groups.iter().map(|g| g.abs_sp).collect();
+    visited_splits.sort_unstable();
+    visited_splits.dedup();
+    // Middle splits 1..recent_sp_lo must NOT be dispatched at all.
+    assert!(visited_splits.contains(&0));
+    for skipped in 1..p_4k.recent_sp_lo as u32 {
+        assert!(!visited_splits.contains(&skipped), "middle split {skipped} should be pruned");
+    }
+    assert!(visited_splits.contains(&(p_4k.recent_sp_lo as u32)));
+    assert!(visited_splits.contains(&((4607 / p_4k.kps) as u32)));
+}
+
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+fn full_attn_budget_default_bit_identical_and_pruned_4k_coherent_on_m5() {
+    use crate::poolgate::{Layer3Pool, StepPath};
+
+    let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+    let ctx = 4608usize;
+    let eng = Engine::load(&model, ctx);
+    let tk = crate::tokenizer::Tokenizer::load(&eng.g);
+
+    // 1. Default (None) is 100% bit-identical to explicit set_full_attn_budget(None),
+    //    and a budget >= seq_len is also 100% bit-identical!
+    let short_prompt = "The capital of France is";
+    let short_toks = tk.encode(short_prompt, true);
+    eng.set_full_attn_budget(None);
+    let base_logits = {
+        let paged = Layer3Pool::new(&eng, 1);
+        let l = paged.new_lane(&short_toks, ctx);
+        paged.prefill(&[(l, 0, short_toks.len())]);
+        paged.logits(0)
+    };
+    eng.set_full_attn_budget(Some(1024));
+    let within_budget_logits = {
+        let paged = Layer3Pool::new(&eng, 1);
+        let l = paged.new_lane(&short_toks, ctx);
+        paged.prefill(&[(l, 0, short_toks.len())]);
+        paged.logits(0)
+    };
+    assert_eq!(base_logits.len(), within_budget_logits.len());
+    assert!(
+        base_logits.iter().zip(&within_budget_logits).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "within-budget full_attn_budget must be bit-identical to default None"
+    );
+
+    // 2. Above 4K context: compare unpruned vs --full-attn-budget 1024 on Layer 3 blocked prefill + decode.
+    let mut long_toks = tk.encode("System note: remember the number 42. ", true);
+    let filler = tk.encode("The quick brown fox jumps over the lazy dog near the river bank. ", false);
+    while long_toks.len() < 4160 {
+        long_toks.extend_from_slice(&filler);
+    }
+    long_toks.truncate(4160);
+    let suffix = tk.encode("Now write one short English sentence about oceans:", false);
+    long_toks.extend_from_slice(&suffix);
+    let prompt_len = long_toks.len();
+    assert!(prompt_len > 4160 && prompt_len + 32 <= ctx);
+
+    let plan_unpruned = full_attn_decode_plan(prompt_len, ctx, None);
+    let plan_pruned = full_attn_decode_plan(prompt_len, ctx, Some(1024));
+    assert_eq!(plan_unpruned.nkeys, prompt_len + 1);
+    assert_eq!(plan_pruned.nkeys, 1024);
+    assert!(plan_pruned.nkeys * 4 <= plan_unpruned.nkeys, "expected >=4x full-attention key read reduction");
+    assert!(plan_pruned.nsplit < plan_unpruned.nsplit);
+
+    // Generate 16 greedy tokens with --full-attn-budget 1024 on Layer 3 blocked path and verify finite & coherent.
+    eng.set_full_attn_budget(Some(1024));
+    let paged = Layer3Pool::new(&eng, 1);
+    let lane = paged.new_lane(&long_toks, ctx);
+    let mut p0 = 0usize;
+    while p0 < prompt_len {
+        let n = (prompt_len - p0).min(1024);
+        paged.prefill(&[(lane, p0, n)]);
+        p0 += n;
+    }
+    let mut gen_ids = Vec::new();
+    let mut next_tok = crate::sampler::checked_argmax(&paged.logits(0)).unwrap() as u32;
+    gen_ids.push(next_tok);
+    for step in 0..15usize {
+        let pos = prompt_len + step;
+        paged.set_token(lane, pos, next_tok);
+        paged.decode(&[(lane, pos)]);
+        let lg = paged.logits(0);
+        assert!(lg.iter().all(|x| x.is_finite()), "non-finite logit at pruned decode step {step}");
+        next_tok = crate::sampler::checked_argmax(&lg).unwrap() as u32;
+        gen_ids.push(next_tok);
+    }
+    let decoded: String = gen_ids.iter().flat_map(|&id| tk.decode_bytes(id)).map(char::from).collect();
+    eprintln!(
+        "[full_attn_budget_m5] prompt_len={prompt_len} keys: {} -> {} ({:.2}x reduction), splits: {} -> {}, gen={:?}",
+        plan_unpruned.nkeys,
+        plan_pruned.nkeys,
+        plan_unpruned.nkeys as f64 / plan_pruned.nkeys as f64,
+        plan_unpruned.nsplit,
+        plan_pruned.nsplit,
+        decoded
+    );
+    assert!(!decoded.trim().is_empty(), "pruned 4K generation produced empty text");
+    eng.set_full_attn_budget(None);
+}
+
+#[test]
+#[ignore = "requires Metal GPU on M5"]
+fn sub4bit_quant_metal_kernels_match_cpu_and_save_bytes() {
+    use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+
+    fn f32_to_f16_bits(f: f32) -> u16 {
+        let b = f.to_bits();
+        let sign = ((b >> 16) as u16) & 0x8000;
+        let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        let man = b & 0x7FFFFF;
+        if exp >= 31 {
+            return sign | 0x7C00;
+        }
+        if exp <= 0 {
+            return sign;
+        }
+        let h = ((exp as u32) << 10) | (man >> 13);
+        let rem = man & 0x1FFF;
+        let h = if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) { h + 1 } else { h };
+        sign | (h as u16)
+    }
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let s = if (h & 0x8000) != 0 { -1.0f32 } else { 1.0f32 };
+        let e = ((h >> 10) & 31) as i32;
+        let m = (h & 1023) as f32;
+        if e == 0 {
+            s * (m / 1024.0) * 2f32.powi(-14)
+        } else {
+            s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+        }
+    }
+
+    fn encode_q3k_row(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
+        let nb = w.len() / 256;
+        let mut out = vec![0u8; nb * 110];
+        let mut dq = vec![0f32; w.len()];
+        for blk in 0..nb {
+            let xb = &w[blk * 256..(blk + 1) * 256];
+            let o = &mut out[blk * 110..(blk + 1) * 110];
+            let mut sub_scales = [0f32; 16];
+            let mut max_abs = 0f32;
+            for ib in 0..16 {
+                let amax = xb[ib * 16..(ib + 1) * 16].iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let s = amax / 3.5;
+                sub_scales[ib] = s;
+                max_abs = max_abs.max(s.abs());
+            }
+            if max_abs < 1e-12 {
+                continue;
+            }
+            let dh = f32_to_f16_bits(max_abs / 31.0);
+            o[108..110].copy_from_slice(&dh.to_le_bytes());
+            let d = f16_to_f32(dh);
+            let mut sc_int = [0i32; 16];
+            for ib in 0..16 {
+                let sv = (sub_scales[ib] / d).round().clamp(-32.0, 31.0) as i32;
+                sc_int[ib] = sv;
+                let u = (sv + 32) as u8;
+                let j = ib & 3;
+                if ib < 8 {
+                    o[96 + ib] |= u & 0x0F;
+                } else {
+                    o[96 + ib - 8] |= (u & 0x0F) << 4;
+                }
+                o[96 + 8 + j] |= ((u >> 4) & 0x03) << (2 * (ib >> 2));
+            }
+            for n in 0..2 {
+                for g in 0..4 {
+                    let sh = 2 * g;
+                    let m = 1u8 << (4 * n + g);
+                    for hp in 0..2 {
+                        let is = 8 * n + 2 * g + hp;
+                        let dl = d * (sc_int[is] as f32);
+                        for i in 0..16 {
+                            let wi = 128 * n + 32 * g + 16 * hp + i;
+                            let q = if dl.abs() > 1e-12 {
+                                (xb[wi] / dl).round().clamp(-4.0, 3.0) as i32
+                            } else {
+                                0
+                            };
+                            let u = (q + 4) as u8;
+                            let idx = 16 * hp + i;
+                            o[32 + 32 * n + idx] |= (u & 3) << sh;
+                            if u >= 4 {
+                                o[idx] |= m;
+                            }
+                            dq[blk * 256 + wi] = dl * (q as f32);
+                        }
+                    }
+                }
+            }
+        }
+        (out, dq)
+    }
+
+    fn encode_q2k_row(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
+        let nb = w.len() / 256;
+        let mut out = vec![0u8; nb * 84];
+        let mut dq = vec![0f32; w.len()];
+        for blk in 0..nb {
+            let xb = &w[blk * 256..(blk + 1) * 256];
+            let o = &mut out[blk * 84..(blk + 1) * 84];
+            let mut sc_f = [0f32; 16];
+            let mut min_f = [0f32; 16];
+            let (mut ms, mut mm) = (0f32, 0f32);
+            for ib in 0..16 {
+                let sub = &xb[ib * 16..(ib + 1) * 16];
+                let lo = sub.iter().fold(0f32, |a, &v| a.min(v));
+                let hi = sub.iter().fold(lo, |a, &v| a.max(v));
+                sc_f[ib] = (hi - lo) / 3.0;
+                min_f[ib] = -lo;
+                ms = ms.max(sc_f[ib]);
+                mm = mm.max(min_f[ib]);
+            }
+            let dh = if ms > 1e-12 { f32_to_f16_bits(ms / 15.0) } else { 0 };
+            let mh = if mm > 1e-12 { f32_to_f16_bits(mm / 15.0) } else { 0 };
+            o[80..82].copy_from_slice(&dh.to_le_bytes());
+            o[82..84].copy_from_slice(&mh.to_le_bytes());
+            let (d, dmin) = (f16_to_f32(dh), f16_to_f32(mh));
+            for ib in 0..16 {
+                let ls = if d > 0.0 { (sc_f[ib] / d).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                let lm = if dmin > 0.0 { (min_f[ib] / dmin).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                o[ib] = ls | (lm << 4);
+            }
+            for n in 0..2 {
+                for g in 0..4 {
+                    let sh = 2 * g;
+                    for hp in 0..2 {
+                        let sc = o[8 * n + 2 * g + hp];
+                        let dl = d * ((sc & 0x0F) as f32);
+                        let ml = dmin * ((sc >> 4) as f32);
+                        for i in 0..16 {
+                            let wi = 128 * n + 32 * g + 16 * hp + i;
+                            let q = if dl > 0.0 { ((xb[wi] + ml) / dl).round().clamp(0.0, 3.0) as u8 } else { 0 };
+                            o[16 + 32 * n + 16 * hp + i] |= q << sh;
+                            dq[blk * 256 + wi] = dl * (q as f32) - ml;
+                        }
+                    }
+                }
+            }
+        }
+        (out, dq)
+    }
+
+    fn encode_q3_0_row(w: &[f32]) -> (Vec<u8>, Vec<f32>) {
+        let nb = w.len() / 32;
+        let mut out = vec![0u8; nb * 14];
+        let mut dq = vec![0f32; w.len()];
+        for blk in 0..nb {
+            let xb = &w[blk * 32..(blk + 1) * 32];
+            let o = &mut out[blk * 14..(blk + 1) * 14];
+            let amax = xb.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            if amax < 1e-12 {
+                continue;
+            }
+            let dh = f32_to_f16_bits(amax / 3.5);
+            o[0..2].copy_from_slice(&dh.to_le_bytes());
+            let d = f16_to_f32(dh);
+            let mut qh = 0u32;
+            for j in 0..32 {
+                let q = (xb[j] / d).round().clamp(-4.0, 3.0) as i32;
+                let u = (q + 4) as u32;
+                o[6 + (j >> 2)] |= ((u & 3) as u8) << ((j & 3) * 2);
+                if (u & 4) != 0 {
+                    qh |= 1u32 << j;
+                }
+                dq[blk * 32 + j] = d * (q as f32);
+            }
+            o[2..6].copy_from_slice(&qh.to_le_bytes());
+        }
+        (out, dq)
+    }
+
+    let src = format!(
+        "{}\n{}\n{}",
+        include_str!("../kernels.metal"),
+        include_str!("../prefill.metal"),
+        include_str!("../bench_kernels.metal")
+    );
+    let gpu = Gpu::new(&src, &["k_mv", "k_gemm"]);
+
+    let rows = 64usize;
+    let k = 512usize;
+    let x: Vec<f32> = (0..k).map(|i| 0.5 + ((i as f32) * 0.113).sin() * 0.7 + ((i as f32) * 0.37).cos() * 0.3).collect();
+
+    for (label, wtype, encode_fn, row_bytes, ref_row_bytes) in [
+        ("Q3_K", T_Q3_K, encode_q3k_row as fn(&[f32]) -> (Vec<u8>, Vec<f32>), (k / 256) * 110, (k / 256) * 144),
+        ("Q2_K", T_Q2_K, encode_q2k_row as fn(&[f32]) -> (Vec<u8>, Vec<f32>), (k / 256) * 84, (k / 256) * 144),
+        ("Q3_0", T_Q3_0, encode_q3_0_row as fn(&[f32]) -> (Vec<u8>, Vec<f32>), (k / 32) * 14, (k / 32) * 22),
+    ] {
+        assert!(row_bytes < ref_row_bytes);
+        let mut w_bytes = Vec::with_capacity(rows * row_bytes);
+        let mut want_mv = vec![0f32; rows];
+        let mut want_f32 = vec![0f32; rows];
+        let mut all_orig = Vec::with_capacity(rows * k);
+        let mut all_dq = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            let bias = ((r as f32) - 31.5) * 0.015;
+            let row_w: Vec<f32> = (0..k)
+                .map(|c| bias + (((r * 131 + c * 17) as f32) * 0.097).sin() * 0.4 + (((r * 29 + c * 7) as f32) * 0.23).cos() * 0.25)
+                .collect();
+            let (enc, dq) = encode_fn(&row_w);
+            assert_eq!(enc.len(), row_bytes);
+            w_bytes.extend_from_slice(&enc);
+            all_orig.extend_from_slice(&row_w);
+            all_dq.extend_from_slice(&dq);
+            want_mv[r] = dq.iter().zip(&x).map(|(a, b)| a * b).sum();
+            want_f32[r] = row_w.iter().zip(&x).map(|(a, b)| a * b).sum();
+        }
+        let w_dot: f64 = all_dq.iter().zip(&all_orig).map(|(&a, &b)| (a as f64) * (b as f64)).sum();
+        let w_na: f64 = all_dq.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>().sqrt();
+        let w_nb: f64 = all_orig.iter().map(|&b| (b as f64) * (b as f64)).sum::<f64>().sqrt();
+        let w_cos = w_dot / (w_na * w_nb);
+
+        let wbuf = gpu.buffer_with(&w_bytes);
+        let pbuf = gpu.buffer(256);
+        let csbuf = gpu.buffer(256);
+        let ctrbuf = gpu.buffer(256);
+        let mut arena = vec![0f32; k + rows * 2];
+        arena[..k].copy_from_slice(&x);
+        let arena_bytes: Vec<u8> = arena.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let abuf = gpu.buffer_with(&arena_bytes);
+
+        // 1. Decode matvec (`k_mv`)
+        let mut mv_args = MvArgs { nseg: 1, ..Default::default() };
+        mv_args.seg[0] = Seg {
+            w_lo: 0, w_hi: 0, row_bytes: row_bytes as u32, wtype,
+            nrows: rows as u32, k: k as u32, tg_start: 0, in_off: 0,
+            in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0,
+            out_off: k as u32, epi: 0, res_off: -1, cs_off: 0,
+            convw_off: 0, pad: [0; 3],
+        };
+        let cb = gpu.cmd();
+        {
+            let e = Enc::new(&cb);
+            e.pso(&gpu.pso("k_mv"));
+            e.buf(&wbuf, 0, 0);
+            e.buf(&pbuf, 0, 1);
+            e.buf(&abuf, 0, 2);
+            e.buf(&csbuf, 0, 4);
+            e.bytes(&mv_args, 5);
+            e.buf(&ctrbuf, 0, 7);
+            e.dispatch((rows.div_ceil(8), 1, 1), 128);
+            e.end();
+        }
+        cb.commit();
+        cb.waitUntilCompleted();
+        let got_mv = unsafe { std::slice::from_raw_parts((abuf.contents().as_ptr() as *const f32).add(k), rows) };
+        let max_mv_err = got_mv.iter().zip(&want_mv).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max_mv_err < 1e-3, "{label} k_mv GPU vs CPU max_abs_err={max_mv_err}");
+
+        // 2. Prefill GEMM (`k_gemm` via `deq16`)
+        let mut g_args = GemmArgs { nseg: 1, t: 1, pad: [0; 2], seg: [GSeg::default(); 10] };
+        g_args.seg[0] = GSeg {
+            w_lo: 0, w_hi: 0, row_bytes: row_bytes as u32, wtype,
+            nrows: rows as u32, k: k as u32, tile_start: 0, in_off: 0,
+            out_off: (k + rows) as u32, ldo: rows as u32, wsrc: 0, in2: 0,
+        };
+        let cb2 = gpu.cmd();
+        {
+            let e = Enc::new(&cb2);
+            e.pso(&gpu.pso("k_gemm"));
+            e.buf(&wbuf, 0, 0);
+            e.buf(&pbuf, 0, 1);
+            e.buf(&abuf, 0, 2);
+            e.bytes(&g_args, 5);
+            e.dispatch((rows.div_ceil(64), 1, 1), 128);
+            e.end();
+        }
+        cb2.commit();
+        cb2.waitUntilCompleted();
+        let got_gemm = unsafe { std::slice::from_raw_parts((abuf.contents().as_ptr() as *const f32).add(k + rows), rows) };
+        let max_gemm_err = got_gemm.iter().zip(&want_mv).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max_gemm_err < 0.05, "{label} k_gemm GPU vs CPU max_abs_err={max_gemm_err}");
+
+        // Cosine similarity vs exact f32 matvec.
+        let dot: f64 = got_mv.iter().zip(&want_f32).map(|(&a, &b)| (a as f64) * (b as f64)).sum();
+        let na: f64 = got_mv.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>().sqrt();
+        let nb: f64 = want_f32.iter().map(|&b| (b as f64) * (b as f64)).sum::<f64>().sqrt();
+        let cos = dot / (na * nb);
+        let savings_pct = 100.0 * (1.0 - (row_bytes as f64) / (ref_row_bytes as f64));
+        eprintln!(
+            "[sub4bit_m5] {label}: row_bytes={row_bytes} vs ref={ref_row_bytes} ({savings_pct:.1}% saved) | k_mv_err={max_mv_err:.6} k_gemm_err={max_gemm_err:.6} | w_cos={w_cos:.5} out_cos={cos:.5}"
+        );
+        let min_cos = if wtype == T_Q2_K { 0.94 } else { 0.985 };
+        assert!(w_cos >= min_cos, "{label} weight cosine {w_cos} < {min_cos}");
+        assert!(cos >= min_cos, "{label} output cosine {cos} < {min_cos}");
+    }
+}
+
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF on M5"]
+fn sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5() {
+    use objc2_metal::{MTLBuffer, MTLCommandBuffer};
+
+    fn f32_to_f16(f: f32) -> u16 {
+        let b = f.to_bits();
+        let sign = ((b >> 16) as u16) & 0x8000;
+        let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        let man = b & 0x7FFFFF;
+        if exp >= 31 { return sign | 0x7C00; }
+        if exp <= 0 { return sign; }
+        let h = ((exp as u32) << 10) | (man >> 13);
+        let rem = man & 0x1FFF;
+        let h = if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) { h + 1 } else { h };
+        sign | (h as u16)
+    }
+    fn f16_to_f32(h: u16) -> f32 {
+        let s = if (h & 0x8000) != 0 { -1.0f32 } else { 1.0f32 };
+        let e = ((h >> 10) & 31) as i32;
+        let m = (h & 1023) as f32;
+        if e == 0 { s * (m / 1024.0) * 2f32.powi(-14) } else { s * (1.0 + m / 1024.0) * 2f32.powi(e - 15) }
+    }
+    fn dequant_q6k_row(row: &[u8], out: &mut [f32]) {
+        for blk in 0..(out.len() / 256) {
+            let o = &row[blk * 210..(blk + 1) * 210];
+            let d = f16_to_f32(u16::from_le_bytes([o[208], o[209]]));
+            let y = &mut out[blk * 256..(blk + 1) * 256];
+            for n in 0..2 {
+                let ql = &o[64 * n..];
+                let qh = &o[128 + 32 * n..];
+                let sc = &o[192 + 8 * n..];
+                for i in 0..32 {
+                    let is = i / 16;
+                    let q1 = ((ql[i] & 15) | ((qh[i] & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[i + 32] & 15) | (((qh[i] >> 2) & 3) << 4)) as i32 - 32;
+                    let q3 = ((ql[i] >> 4) | (((qh[i] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[i + 32] >> 4) | (((qh[i] >> 6) & 3) << 4)) as i32 - 32;
+                    y[128 * n + i] = d * (sc[is] as i8 as f32) * (q1 as f32);
+                    y[128 * n + i + 32] = d * (sc[is + 2] as i8 as f32) * (q2 as f32);
+                    y[128 * n + i + 64] = d * (sc[is + 4] as i8 as f32) * (q3 as f32);
+                    y[128 * n + i + 96] = d * (sc[is + 6] as i8 as f32) * (q4 as f32);
+                }
+            }
+        }
+    }
+    fn quant_q3k_row(w: &[f32], out: &mut [u8]) {
+        out.fill(0);
+        for blk in 0..(w.len() / 256) {
+            let xb = &w[blk * 256..(blk + 1) * 256];
+            let o = &mut out[blk * 110..(blk + 1) * 110];
+            let mut sub_s = [0f32; 16];
+            let mut max_abs = 0f32;
+            for ib in 0..16 {
+                let amax = xb[ib * 16..(ib + 1) * 16].iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let s = amax / 3.5;
+                sub_s[ib] = s;
+                max_abs = max_abs.max(s);
+            }
+            if max_abs < 1e-12 { continue; }
+            let dh = f32_to_f16(max_abs / 31.0);
+            o[108..110].copy_from_slice(&dh.to_le_bytes());
+            let d = f16_to_f32(dh);
+            let mut sc_int = [0i32; 16];
+            for ib in 0..16 {
+                let sv = (sub_s[ib] / d).round().clamp(-32.0, 31.0) as i32;
+                sc_int[ib] = sv;
+                let u = (sv + 32) as u8;
+                let j = ib & 3;
+                if ib < 8 { o[96 + ib] |= u & 0x0F; } else { o[96 + ib - 8] |= (u & 0x0F) << 4; }
+                o[96 + 8 + j] |= ((u >> 4) & 0x03) << (2 * (ib >> 2));
+            }
+            for n in 0..2 {
+                for g in 0..4 {
+                    let sh = 2 * g;
+                    let m = 1u8 << (4 * n + g);
+                    for hp in 0..2 {
+                        let dl = d * (sc_int[8 * n + 2 * g + hp] as f32);
+                        for i in 0..16 {
+                            let wi = 128 * n + 32 * g + 16 * hp + i;
+                            let q = if dl.abs() > 1e-12 { (xb[wi] / dl).round().clamp(-4.0, 3.0) as i32 } else { 0 };
+                            let u = (q + 4) as u8;
+                            let idx = 16 * hp + i;
+                            o[32 + 32 * n + idx] |= (u & 3) << sh;
+                            if u >= 4 { o[idx] |= m; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn quant_q2k_row(w: &[f32], out: &mut [u8]) {
+        out.fill(0);
+        for blk in 0..(w.len() / 256) {
+            let xb = &w[blk * 256..(blk + 1) * 256];
+            let o = &mut out[blk * 84..(blk + 1) * 84];
+            let mut sc_f = [0f32; 16];
+            let mut min_f = [0f32; 16];
+            let (mut ms, mut mm) = (0f32, 0f32);
+            for ib in 0..16 {
+                let sub = &xb[ib * 16..(ib + 1) * 16];
+                let lo = sub.iter().fold(0f32, |a, &v| a.min(v));
+                let hi = sub.iter().fold(lo, |a, &v| a.max(v));
+                sc_f[ib] = (hi - lo) / 3.0;
+                min_f[ib] = -lo;
+                ms = ms.max(sc_f[ib]);
+                mm = mm.max(min_f[ib]);
+            }
+            let dh = if ms > 1e-12 { f32_to_f16(ms / 15.0) } else { 0 };
+            let mh = if mm > 1e-12 { f32_to_f16(mm / 15.0) } else { 0 };
+            o[80..82].copy_from_slice(&dh.to_le_bytes());
+            o[82..84].copy_from_slice(&mh.to_le_bytes());
+            let (d, dmin) = (f16_to_f32(dh), f16_to_f32(mh));
+            for ib in 0..16 {
+                let ls = if d > 0.0 { (sc_f[ib] / d).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                let lm = if dmin > 0.0 { (min_f[ib] / dmin).round().clamp(0.0, 15.0) as u8 } else { 0 };
+                o[ib] = ls | (lm << 4);
+            }
+            for n in 0..2 {
+                for g in 0..4 {
+                    let sh = 2 * g;
+                    for hp in 0..2 {
+                        let sc = o[8 * n + 2 * g + hp];
+                        let dl = d * ((sc & 0x0F) as f32);
+                        let ml = dmin * ((sc >> 4) as f32);
+                        for i in 0..16 {
+                            let wi = 128 * n + 32 * g + 16 * hp + i;
+                            let q = if dl > 0.0 { ((xb[wi] + ml) / dl).round().clamp(0.0, 3.0) as u8 } else { 0 };
+                            o[16 + 32 * n + 16 * hp + i] |= q << sh;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+    let eng = Engine::load(&model, 128);
+    let tk = crate::tokenizer::Tokenizer::load(&eng.g);
+
+    // Collect real final normalized hidden states `ar.fout` across 5 diverse prompts.
+    let prompts = [
+        "The capital of France is",
+        "In Rust, a HashMap maps keys to",
+        "2 + 2 =",
+        "Water freezes at 0 degrees",
+        "fn main() { println!(\"Hello,",
+    ];
+    let mut hiddens: Vec<Vec<f32>> = Vec::with_capacity(prompts.len());
+    let mut base_logits_all: Vec<Vec<f32>> = Vec::with_capacity(prompts.len());
+    let lane = Lane::new(&eng);
+    let run = eng.on(&lane);
+    for prompt in prompts {
+        run.reset();
+        let toks = tk.encode(prompt, true);
+        run.set_tokens(0, &toks);
+        let cb = eng.gpu.cmd();
+        for p in 0..toks.len() {
+            let last = p + 1 == toks.len();
+            run.encode_step(&cb, p, last, false);
+        }
+        cb.commit();
+        cb.waitUntilCompleted();
+        let act = eng.act.borrow();
+        let fptr = act.contents().as_ptr() as *const f32;
+        let h = unsafe { std::slice::from_raw_parts(fptr.add(eng.ar.fout as usize), E) }.to_vec();
+        let lg = unsafe { std::slice::from_raw_parts(fptr.add(eng.ar.logits as usize), eng.n_vocab) }.to_vec();
+        hiddens.push(h);
+        base_logits_all.push(lg);
+    }
+
+    // Re-quantize the real LM-head `output.weight` (Q6_K, [2304, N_VOCAB_PAD]) into Q3_K and Q2_K in RAM.
+    let out_t = eng.g.opt("output.weight").expect("output.weight");
+    assert_eq!(out_t.ty, T_Q6_K, "expected Q6_K output.weight in Q4_K_M GGUF");
+    let raw_out = eng.g.bytes(out_t);
+    let n_rows = eng.n_vocab;
+    let q3k_rb = (E / 256) * 110;
+    let q2k_rb = (E / 256) * 84;
+    let mut q3k_buf = vec![0u8; n_rows * q3k_rb];
+    let mut q2k_buf = vec![0u8; n_rows * q2k_rb];
+    let mut tmp_f32 = vec![0f32; E];
+    for r in 0..n_rows {
+        dequant_q6k_row(&raw_out[r * out_t.row_bytes..(r + 1) * out_t.row_bytes], &mut tmp_f32);
+        quant_q3k_row(&tmp_f32, &mut q3k_buf[r * q3k_rb..(r + 1) * q3k_rb]);
+        quant_q2k_row(&tmp_f32, &mut q2k_buf[r * q2k_rb..(r + 1) * q2k_rb]);
+    }
+
+    let pbuf = eng.gpu.buffer(256);
+    let csbuf = eng.gpu.buffer(256);
+    let ctrbuf = eng.gpu.buffer(256);
+    let q6k_bytes = n_rows * out_t.row_bytes;
+    let q4k_equiv_bytes = n_rows * (E / 256) * 144;
+    for (label, wtype, wdata, row_bytes, min_cos) in [
+        ("Q3_K", T_Q3_K, &q3k_buf, q3k_rb, 0.990f64),
+        ("Q2_K", T_Q2_K, &q2k_buf, q2k_rb, 0.960f64),
+    ] {
+        let wbuf = eng.gpu.buffer_with(wdata);
+        let mut cos_sum = 0.0f64;
+        let mut top1_match = 0usize;
+        for (pi, h) in hiddens.iter().enumerate() {
+            let mut arena = vec![0f32; E + n_rows];
+            arena[..E].copy_from_slice(h);
+            let abytes: Vec<u8> = arena.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let abuf = eng.gpu.buffer_with(&abytes);
+            let mut mv_args = MvArgs { nseg: 1, ..Default::default() };
+            mv_args.seg[0] = Seg {
+                w_lo: 0, w_hi: 0, row_bytes: row_bytes as u32, wtype,
+                nrows: n_rows as u32, k: E as u32, tg_start: 0, in_off: 0,
+                in2_off: -1, norm_off: -1, ss_off: -1, ss_n: 0,
+                out_off: E as u32, epi: 0, res_off: -1, cs_off: 0,
+                convw_off: 0, pad: [0; 3],
+            };
+            let cb = eng.gpu.cmd();
+            {
+                let e = Enc::new(&cb);
+                e.pso(&eng.gpu.pso("k_mv"));
+                e.buf(&wbuf, 0, 0);
+                e.buf(&pbuf, 0, 1);
+                e.buf(&abuf, 0, 2);
+                e.buf(&csbuf, 0, 4);
+                e.bytes(&mv_args, 5);
+                e.buf(&ctrbuf, 0, 7);
+                e.dispatch((n_rows.div_ceil(8), 1, 1), 128);
+                e.end();
+            }
+            cb.commit();
+            cb.waitUntilCompleted();
+            let got = unsafe { std::slice::from_raw_parts((abuf.contents().as_ptr() as *const f32).add(E), n_rows) };
+            let want = &base_logits_all[pi];
+            let dot: f64 = got.iter().zip(want).map(|(&a, &b)| (a as f64) * (b as f64)).sum();
+            let na: f64 = got.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>().sqrt();
+            let nb: f64 = want.iter().map(|&b| (b as f64) * (b as f64)).sum::<f64>().sqrt();
+            cos_sum += dot / (na * nb);
+            let got_top1 = crate::sampler::checked_argmax(got).unwrap();
+            let want_top1 = crate::sampler::checked_argmax(want).unwrap();
+            if got_top1 == want_top1 {
+                top1_match += 1;
+            }
+        }
+        let mean_cos = cos_sum / (prompts.len() as f64);
+        let save_vs_q6k = 100.0 * (1.0 - (wdata.len() as f64) / (q6k_bytes as f64));
+        let save_vs_q4k = 100.0 * (1.0 - (wdata.len() as f64) / (q4k_equiv_bytes as f64));
+        eprintln!(
+            "[real_lmhead_m5] {label}: {:.1} MiB ({save_vs_q4k:.1}% smaller than Q4_K, {save_vs_q6k:.1}% smaller than Q6_K) | mean_logit_cos={mean_cos:.5} | top1={top1_match}/{}",
+            wdata.len() as f64 / (1024.0 * 1024.0),
+            prompts.len()
+        );
+        assert!(mean_cos >= min_cos, "{label} real LM-head logit cosine {mean_cos} < {min_cos}");
+        assert!(top1_match >= 4, "{label} real LM-head top-1 agreement {top1_match}/{} too low", prompts.len());
+    }
 }

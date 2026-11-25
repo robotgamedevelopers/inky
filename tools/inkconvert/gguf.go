@@ -26,12 +26,15 @@ const (
 	tQ4_0 = 2
 	tQ5_0 = 6
 	tQ8_0 = 8
+	tQ2_K = 10
+	tQ3_K = 11
 	tQ4_K = 12
 	tQ5_K = 13
 	tQ6_K = 14
 	tBF16 = 30
 	tNV4  = 200 // 32 weights: 2 FP8 E4M3 scales (one per 16) + 16 bytes of FP4 E2M1 nibbles, 18 bytes
 	tMX8  = 201 // 32 weights: fp16 power-of-two scale + 32 FP8 E4M3 values, 34 bytes
+	tQ3_0 = 202 // 32 weights: fp16 scale + qh[4] + qs[8], 14 bytes (3.5 bpw, fits K % 32 == 0)
 )
 
 // typeBlock returns (bytes per block, weights per block).
@@ -47,6 +50,10 @@ func typeBlock(t uint32) (int, int, error) {
 		return 22, 32, nil
 	case tQ8_0:
 		return 34, 32, nil
+	case tQ2_K:
+		return 84, 256, nil
+	case tQ3_K:
+		return 110, 256, nil
 	case tQ4_K:
 		return 144, 256, nil
 	case tQ5_K:
@@ -57,6 +64,8 @@ func typeBlock(t uint32) (int, int, error) {
 		return 18, 32, nil
 	case tMX8:
 		return 34, 32, nil
+	case tQ3_0:
+		return 14, 32, nil
 	}
 	return 0, 0, fmt.Errorf("unknown ggml type %d", t)
 }
