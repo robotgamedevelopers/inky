@@ -939,9 +939,14 @@ fn scheduler(
     let mut pool_deferred = vec![false; nlanes];
     let mut prev_lanes_released = cache.stats().lanes_released;
     let mut prev_window_pruned = cache.stats().window_pruned;
+    let mut prev_starts_spilled = 0;
     let mut checkpoints_sealed = false;
     loop {
         let cur_stats = cache.stats();
+        if cur_stats.starts_spilled != prev_starts_spilled {
+            metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled = cur_stats.starts_spilled;
+            prev_starts_spilled = cur_stats.starts_spilled;
+        }
         if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
             pool_deferred.fill(false);
             prev_lanes_released = cur_stats.lanes_released;
@@ -1942,6 +1947,7 @@ fn health_body(cx: &Ctx) -> String {
         ("model_bytes".into(), json!(cx.budget.model_bytes)),
         ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
         ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
+        ("starts_spilled".into(), json!(cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled)),
         ("queued_requests".into(), json!(cx.admission.queued())),
     ]);
     if let Some(rec) = &cx.recorder {
@@ -3799,15 +3805,18 @@ mod tests {
             "inflight": 0,
             "recommended_working_set_bytes": b.recommended_working_set_bytes,
             "model_bytes": b.model_bytes,
+            "starts_spilled": 0,
             "per_lane_worst_case_bytes": b.per_lane_worst_case_bytes,
             "max_admitted_lanes": b.max_admitted_lanes,
             "queued_requests": 0,
         }));
         let p = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
+        cx.metrics.lock().unwrap().starts_spilled = 2;
         let busy: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(busy["ok"], true);
         assert_eq!(busy["active_lanes"], 1);
+        assert_eq!(busy["starts_spilled"], 2);
         assert_eq!(busy["inflight"], 1);
         assert_eq!(busy["queued_requests"], 0);
         assert_eq!(busy["max_admitted_lanes"], 4);

@@ -157,18 +157,19 @@ func (t *totals) note(code int) {
 }
 
 type healthSnapshot struct {
-	OK                         bool   `json:"ok"`
-	ActiveLanes                *int   `json:"active_lanes"`
-	Inflight                   *int   `json:"inflight"`
-	QueuedRequests             *int   `json:"queued_requests"`
-	RecommendedWorkingSetBytes *int64 `json:"recommended_working_set_bytes"`
-	ModelBytes                 *int64 `json:"model_bytes"`
-	PerLaneWorstCaseBytes      *int64 `json:"per_lane_worst_case_bytes"`
-	MaxAdmittedLanes           *int   `json:"max_admitted_lanes"`
-	RecordWritten              *int64 `json:"record_written,omitempty"`
-	RecordDropped              *int64 `json:"record_dropped,omitempty"`
-	RecordWriteErrors          *int64 `json:"record_write_errors,omitempty"`
-	RecordRotations            *int64 `json:"record_rotations,omitempty"`
+	OK                         bool    `json:"ok"`
+	ActiveLanes                *int    `json:"active_lanes"`
+	Inflight                   *int    `json:"inflight"`
+	QueuedRequests             *int    `json:"queued_requests"`
+	RecommendedWorkingSetBytes *int64  `json:"recommended_working_set_bytes"`
+	ModelBytes                 *int64  `json:"model_bytes"`
+	PerLaneWorstCaseBytes      *int64  `json:"per_lane_worst_case_bytes"`
+	MaxAdmittedLanes           *int    `json:"max_admitted_lanes"`
+	StartsSpilled              *uint64 `json:"starts_spilled"`
+	RecordWritten              *int64  `json:"record_written,omitempty"`
+	RecordDropped              *int64  `json:"record_dropped,omitempty"`
+	RecordWriteErrors          *int64  `json:"record_write_errors,omitempty"`
+	RecordRotations            *int64  `json:"record_rotations,omitempty"`
 }
 
 func (h healthSnapshot) isDrained() bool {
@@ -198,6 +199,7 @@ type epochSample struct {
 }
 
 type driftConfig struct {
+	MinSteadySamples    int
 	WarmupEpochs        int
 	MaxRSSDriftPct      float64
 	MaxRSSDriftBytes    int64
@@ -275,15 +277,20 @@ func analyzeDrift(samples []epochSample, cfg driftConfig) driftReport {
 	if warmup < 0 {
 		warmup = 0
 	}
-	if warmup > 0 && len(samples) > warmup {
+	if warmup > 0 && len(samples) >= warmup {
 		rep.RSSWarmupBytes = samples[warmup-1].ServerRSSBytes
 	}
 	steadyStart := warmup
-	if steadyStart >= len(samples) {
-		steadyStart = len(samples) - 1
+	if steadyStart > len(samples) {
+		steadyStart = len(samples)
 	}
 	steady := samples[steadyStart:]
 	rep.EpochsSteady = len(steady)
+	if len(steady) < cfg.MinSteadySamples {
+		rep.OK = false
+		rep.Reason = fmt.Sprintf("collected %d steady epochs, need %d", len(steady), cfg.MinSteadySamples)
+		return rep
+	}
 	if len(steady) == 0 {
 		return rep
 	}
@@ -420,12 +427,15 @@ func measureDirBytes(dir string) (int64, int, error) {
 	}
 	var total int64
 	var count int
-	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			if os.IsNotExist(walkErr) {
+			if path != dir && os.IsNotExist(walkErr) {
 				return nil
 			}
 			return walkErr
+		}
+		if path == dir && !d.IsDir() {
+			return fmt.Errorf("%s is not a directory", dir)
 		}
 		if d.IsDir() {
 			return nil
@@ -441,9 +451,6 @@ func measureDirBytes(dir string) (int64, int, error) {
 		count++
 		return nil
 	})
-	if os.IsNotExist(err) {
-		return 0, 0, nil
-	}
 	return total, count, err
 }
 
@@ -501,6 +508,17 @@ type clientConfig struct {
 	referenceFile         string
 }
 
+func formatTokens(tokens []int) string {
+	if len(tokens) == 0 {
+		tokens = maxTokensChoices
+	}
+	values := make([]string, len(tokens))
+	for i, v := range tokens {
+		values[i] = strconv.Itoa(v)
+	}
+	return strings.Join(values, ",")
+}
+
 func main() {
 	urlFlag := flag.String("url", "http://127.0.0.1:18090/v1/chat/completions", "chat completions URL")
 	durationFlag := flag.String("duration", "3600", "run duration (seconds or Go duration like 60s, 72h)")
@@ -526,6 +544,18 @@ func main() {
 	referenceFile := flag.String("reference-file", "", "path to save/compare seeded solo reference in reference-check mode")
 	selfCheck := flag.Bool("self-check", false, "check prompt lengths and exit")
 	flag.Parse()
+	parsedMaxTokens := maxTokensChoices
+	if strings.TrimSpace(*maxTokensFlag) != "" {
+		parsedMaxTokens = nil
+		for _, part := range strings.Split(*maxTokensFlag, ",") {
+			v, convErr := strconv.Atoi(strings.TrimSpace(part))
+			if convErr != nil || v < 1 {
+				fmt.Fprintf(os.Stderr, "bad -max-tokens: %s\n", *maxTokensFlag)
+				os.Exit(2)
+			}
+			parsedMaxTokens = append(parsedMaxTokens, v)
+		}
+	}
 
 	if *selfCheck {
 		for i, k := range promptKinds {
@@ -543,7 +573,7 @@ func main() {
 		fmt.Printf("prompt_short_bytes=%d\n", lenShort)
 		fmt.Printf("prompt_medium_bytes=%d\n", lenMedium)
 		fmt.Printf("prompt_long_bytes=%d\n", lenLong)
-		fmt.Printf("max_tokens=%d,%d,%d\n", maxTokensChoices[0], maxTokensChoices[1], maxTokensChoices[2])
+		fmt.Printf("max_tokens=%s\n", formatTokens(parsedMaxTokens))
 		fmt.Println("self_check=ok")
 		return
 	}
@@ -564,18 +594,6 @@ func main() {
 	if *clients < 1 || *lanes < 1 || *queue < 0 || *disconnect < 0 || *disconnect > 100 || *stormRequests < 1 || *minEpochs < 0 {
 		fmt.Fprintln(os.Stderr, "clients, lanes, queue, storm-requests, min-epochs, or disconnect-pct is out of range")
 		os.Exit(2)
-	}
-	parsedMaxTokens := maxTokensChoices
-	if strings.TrimSpace(*maxTokensFlag) != "" {
-		parsedMaxTokens = nil
-		for _, part := range strings.Split(*maxTokensFlag, ",") {
-			v, convErr := strconv.Atoi(strings.TrimSpace(part))
-			if convErr != nil || v < 1 {
-				fmt.Fprintf(os.Stderr, "bad -max-tokens: %s\n", *maxTokensFlag)
-				os.Exit(2)
-			}
-			parsedMaxTokens = append(parsedMaxTokens, v)
-		}
 	}
 	key := os.Getenv("INKY_SERVE_KEY")
 	if key == "" {
@@ -632,6 +650,20 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	epochDur := chooseEpochDuration(cfg.duration, cfg.epoch)
 	hURL := healthURL(cfg.chatURL)
 
+	var initialSpills uint64
+	minSteady := 0
+	if cfg.serverPID > 0 || cfg.recordDir != "" {
+		minSteady = 2
+	}
+	if cfg.spillDir != "" {
+		minSteady = 3 // the disk growth check compares three drained snapshots
+		initial, ok := waitHealthDrain(httpClient, hURL, 5*time.Second)
+		if !ok || !initial.isDrained() || initial.StartsSpilled == nil {
+			fmt.Fprintln(os.Stderr, "missing initial spill counter on drained server")
+			return 1
+		}
+		initialSpills = *initial.StartsSpilled
+	}
 	var samples []epochSample
 	epochIdx := 0
 
@@ -671,9 +703,17 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 		cancelEpoch()
 
 		snap, healthOK := waitHealthDrain(httpClient, hURL, 10*time.Second)
-		rssBytes, _ := rssSampler(cfg.serverPID)
-		recBytes, recFiles, _ := measureDirBytes(cfg.recordDir)
-		spillBytes, _, _ := measureDirBytes(cfg.spillDir)
+		rssBytes, rssErr := rssSampler(cfg.serverPID)
+		if cfg.serverPID > 0 && (rssErr != nil || rssBytes <= 0) {
+			fmt.Fprintf(os.Stderr, "epoch %d RSS probe for pid %d: bytes=%d err=%v\n", epochIdx, cfg.serverPID, rssBytes, rssErr)
+			return 1
+		}
+		recBytes, recFiles, recErr := measureDirBytes(cfg.recordDir)
+		spillBytes, _, spillErr := measureDirBytes(cfg.spillDir)
+		if recErr != nil || spillErr != nil {
+			fmt.Fprintf(os.Stderr, "epoch %d directory measurement failed: record=%v spill=%v\n", epochIdx, recErr, spillErr)
+			return 1
+		}
 
 		s := epochSample{
 			Epoch:          epochIdx,
@@ -694,6 +734,14 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 		epochIdx++
 	}
 
+	if cfg.spillDir != "" {
+		last := samples[len(samples)-1].Health.StartsSpilled
+		if last == nil || *last <= initialSpills {
+			fmt.Fprintln(os.Stderr, "no successful spill observed during the workload")
+			return 1
+		}
+		fmt.Printf("starts_spilled=%d\n", *last-initialSpills)
+	}
 	inflightEnd := tot.inflight.Load()
 	probeOK := 0
 	if inflightEnd == 0 {
@@ -708,6 +756,7 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	}
 
 	drift := analyzeDrift(samples, driftConfig{
+		MinSteadySamples:    minSteady,
 		WarmupEpochs:        cfg.warmupEpochs,
 		MaxRSSDriftPct:      cfg.maxRSSDriftPct,
 		MaxRSSDriftBytes:    cfg.maxRSSDriftBytes,
@@ -724,7 +773,7 @@ func runSoak(httpClient *http.Client, cfg clientConfig, rssSampler func(int) (in
 	fmt.Printf("prompt_short_bytes=%d\n", lenShort)
 	fmt.Printf("prompt_medium_bytes=%d\n", lenMedium)
 	fmt.Printf("prompt_long_bytes=%d\n", lenLong)
-	fmt.Printf("max_tokens=%d,%d,%d\n", maxTokensChoices[0], maxTokensChoices[1], maxTokensChoices[2])
+	fmt.Printf("max_tokens=%s\n", formatTokens(cfg.maxTokensChoices))
 	fmt.Printf("requests=%d\n", tot.requests.Load())
 	fmt.Printf("http_200=%d\n", tot.http200.Load())
 	fmt.Printf("http_4xx=%d\n", tot.http4xx.Load())
@@ -969,8 +1018,9 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 				if idx%10 == 9 {
 					stage = stageComplete
 				}
-				stageCounts[stage].Add(1)
-				runStormOne(&tot, httpClient, cfg.key, cfg.chatURL, stage, cfg.seed^uint64(idx), rng)
+				if runStormOne(&tot, httpClient, cfg.key, cfg.chatURL, stage, cfg.seed^uint64(idx), rng) {
+					stageCounts[stage].Add(1)
+				}
 			}
 		}(w)
 	}
@@ -1000,6 +1050,7 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	fmt.Printf("storm_http_5xx=%d\n", tot.http5xx.Load())
 	fmt.Printf("storm_disconnected=%d\n", tot.disconnected.Load())
 	fmt.Printf("storm_completed=%d\n", tot.completed.Load())
+	fmt.Printf("storm_transport_errors=%d\n", tot.transport.Load())
 	fmt.Printf("storm_stream_errors=%d\n", tot.streamErrors.Load())
 	fmt.Printf("drain_ok=%d\n", boolInt(drained))
 	fmt.Printf("server_active_lanes_end=%d\n", ptrIntVal(snap.ActiveLanes))
@@ -1009,15 +1060,21 @@ func runDisconnectStorm(httpClient *http.Client, cfg clientConfig) int {
 	fmt.Printf("recovery_completed=%d\n", probeOK)
 	fmt.Printf("recovery_requested=%d\n", cfg.lanes)
 
+	for i := range stageCounts {
+		if stageCounts[i].Load() == 0 {
+			fmt.Fprintf(os.Stderr, "storm did not reach %s\n", disconnectStage(i))
+			return 1
+		}
+	}
 	if tot.http5xx.Load() != 0 || tot.http401.Load() != 0 || tot.unexpected.Load() != 0 ||
-		tot.streamErrors.Load() != 0 || tot.timeouts.Load() != 0 ||
+		tot.transport.Load() != 0 || tot.streamErrors.Load() != 0 || tot.timeouts.Load() != 0 ||
 		!drained || !refMatch || probeOK != cfg.lanes {
 		return 1
 	}
 	return 0
 }
 
-func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stage disconnectStage, reqSeed uint64, rng *rand.Rand) {
+func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stage disconnectStage, reqSeed uint64, rng *rand.Rand) bool {
 	tot.enter()
 	defer tot.inflight.Add(-1)
 	id := uint64(tot.requests.Add(1))
@@ -1025,21 +1082,18 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 	u, err := neturl.Parse(chatURL)
 	if err != nil || u.Host == "" {
 		tot.transport.Add(1)
-		return
+		return false
 	}
 
 	if stage == stageZeroMs {
 		c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 		if err != nil {
 			tot.transport.Add(1)
-			return
-		}
-		if rng.IntN(2) == 0 {
-			_, _ = c.Write([]byte("POST /v1/chat/completions HTTP/1.1\r\n"))
+			return false
 		}
 		_ = c.Close()
 		tot.disconnected.Add(1)
-		return
+		return true
 	}
 
 	payload := buildStormPayload(stage, id, reqSeed, rng)
@@ -1047,7 +1101,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 		c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 		if err != nil {
 			tot.transport.Add(1)
-			return
+			return false
 		}
 		partialLen := len(payload) / 2
 		if partialLen < 1 {
@@ -1055,12 +1109,15 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 		}
 		hdr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
 			u.RequestURI(), u.Host, key, len(payload))
-		_, _ = c.Write([]byte(hdr))
-		_, _ = c.Write(payload[:partialLen])
+		if _, err := c.Write(append([]byte(hdr), payload[:partialLen]...)); err != nil {
+			_ = c.Close()
+			tot.transport.Add(1)
+			return false
+		}
 		time.Sleep(time.Duration(1+rng.IntN(5)) * time.Millisecond)
 		_ = c.Close()
 		tot.disconnected.Add(1)
-		return
+		return true
 	}
 
 	box := &dialBox{}
@@ -1070,7 +1127,7 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL, bytes.NewReader(payload))
 	if err != nil {
 		tot.transport.Add(1)
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+key)
@@ -1084,53 +1141,41 @@ func runStormOne(tot *totals, httpClient *http.Client, key, chatURL string, stag
 		} else {
 			tot.transport.Add(1)
 		}
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	tot.note(resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
-		return
+		return false
 	}
 
-	if stage == stageComplete {
-		if err := validateStream(resp.Body); err != nil {
-			tot.streamErrors.Add(1)
-			return
-		}
-		tot.completed.Add(1)
-		return
+	reached, err := readStreamUntil(resp.Body, stage)
+	if err != nil {
+		tot.streamErrors.Add(1)
+		return false
 	}
-
-	if c := box.conn(); c != nil {
-		_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
-	}
-	switch stage {
-	case stageTTFT:
-		buf := make([]byte, 1)
-		_, _ = resp.Body.Read(buf)
-	case stageMidThinking:
-		r := bufio.NewReader(resp.Body)
-		for i := 0; i < 16; i++ {
-			line, readErr := r.ReadString('\n')
-			if strings.Contains(line, "reasoning_content") || readErr != nil {
-				break
+	if reached {
+		if stage == stageComplete {
+			tot.completed.Add(1)
+		} else {
+			if c := box.conn(); c != nil {
+				_ = c.Close()
 			}
+			tot.disconnected.Add(1)
 		}
-		time.Sleep(time.Duration(1+rng.IntN(25)) * time.Millisecond)
-	case stageMidDecode:
-		buf := make([]byte, 512)
-		_, _ = resp.Body.Read(buf)
-		time.Sleep(time.Duration(15+rng.IntN(160)) * time.Millisecond)
 	}
-	if c := box.conn(); c != nil {
-		_ = c.Close()
-	}
-	tot.disconnected.Add(1)
+	return reached
 }
 
 func buildStormPayload(stage disconnectStage, id, reqSeed uint64, rng *rand.Rand) []byte {
 	var r chatReq
 	switch {
+	case stage == stageMidDecode:
+		r = chatReq{
+			Model:     "inkling-2-mini",
+			Messages:  []chatMsg{{Role: "user", Content: fmt.Sprintf("Write a paragraph about the ocean (trial %d).", id)}},
+			MaxTokens: 128, ReasoningEffort: "none", Stream: true, Seed: reqSeed,
+		}
 	case stage == stageMidThinking || id%3 == 1:
 		r = chatReq{
 			Model:           "inkling-2-mini",
@@ -1383,10 +1428,16 @@ func oneRequest(tot *totals, httpClient *http.Client, key, url string, disconnec
 // validateStream requires both an application finish reason and the SSE terminator.
 // A successful HTTP status alone does not mean generation completed.
 func validateStream(r io.Reader) error {
+	_, err := readStreamUntil(r, stageComplete)
+	return err
+}
+
+func readStreamUntil(r io.Reader, stage disconnectStage) (bool, error) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 4096), 1024*1024)
 	finished, done := false, false
 	var dataLines []string
+	visibleEvents := 0
 	for s.Scan() {
 		line := s.Text()
 		if line != "" {
@@ -1401,7 +1452,7 @@ func validateStream(r io.Reader) error {
 		data := strings.Join(dataLines, "\n")
 		dataLines = nil
 		if done {
-			return fmt.Errorf("data after DONE")
+			return false, fmt.Errorf("data after DONE")
 		}
 		if data == "[DONE]" {
 			done = true
@@ -1410,31 +1461,57 @@ func validateStream(r io.Reader) error {
 		var event struct {
 			Error   json.RawMessage `json:"error"`
 			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
+				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			return err
+			return false, err
 		}
 		if len(event.Error) > 0 && string(event.Error) != "null" {
-			return fmt.Errorf("stream error")
+			return false, fmt.Errorf("stream error")
 		}
 		for _, choice := range event.Choices {
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finished = true
 			}
+			if finished {
+				continue
+			}
+			visible := choice.Delta.Content != ""
+			thinking := choice.Delta.Reasoning != ""
+			if visible {
+				visibleEvents++
+			}
+			switch stage {
+			case stageTTFT:
+				if visible || thinking {
+					return true, nil
+				}
+			case stageMidThinking:
+				if thinking {
+					return true, nil
+				}
+			case stageMidDecode:
+				if visibleEvents >= 2 {
+					return true, nil
+				}
+			}
 		}
 	}
 	if len(dataLines) > 0 {
-		return fmt.Errorf("unterminated SSE event")
+		return false, fmt.Errorf("unterminated SSE event")
 	}
 	if err := s.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if !finished || !done {
-		return fmt.Errorf("incomplete stream")
+		return false, fmt.Errorf("incomplete stream")
 	}
-	return nil
+	return stage == stageComplete, nil
 }
 
 func probe(httpClient *http.Client, key, url string, seed uint64) bool {
