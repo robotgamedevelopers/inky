@@ -722,6 +722,38 @@ impl Engine {
         let n_full = ((rem_bytes / full_stride) as usize).clamp(1, max_full_slab);
         (n_window, n_full)
     }
+    /// Bound `kv_budget_bytes` to what `max_lanes` at `max_ctx` can usefully address (including
+    /// retained prefix checkpoints), so small-context servers (such as `tests/serve.sh` at
+    /// `-c 6144 --lanes 1..4`) allocate a few GiB rather than wiring the entire machine's working
+    /// set, while production `-c 65536..131072` servers still use the full `kv_budget_bytes`.
+    pub fn capped_serve_kv_budget(
+        kv_budget_bytes: u64,
+        kvb: u32,
+        chunk: usize,
+        max_ctx: usize,
+        max_lanes: usize,
+    ) -> u64 {
+        use crate::blocks::{span_bound, stride_at, BlockKind, BLOCK, WINDOW};
+        let win_stride = stride_at(BlockKind::Window, kvb).expect("valid kvb");
+        let full_stride = stride_at(BlockKind::Full, kvb).expect("valid kvb");
+        let lanes = max_lanes.max(1) as u64;
+        let blocks_per_lane = max_ctx.div_ceil(BLOCK).max(1) as u64;
+        let win_per_lane = ((WINDOW / BLOCK) + 2) as u64;
+        let active_span_win = span_bound(chunk.min(max_ctx.max(BLOCK))) as u64;
+        let useful_win = lanes
+            .saturating_mul(win_per_lane)
+            .saturating_mul(2)
+            .saturating_add(active_span_win)
+            .saturating_add(32);
+        let useful_full = lanes
+            .saturating_mul(blocks_per_lane)
+            .saturating_mul(2)
+            .saturating_add(64);
+        let useful_bytes = useful_win
+            .saturating_mul(win_stride)
+            .saturating_add(useful_full.saturating_mul(full_stride));
+        kv_budget_bytes.min(useful_bytes)
+    }
     /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`.
     /// Returns `(n_window, n_full)`.
     pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {

@@ -2236,7 +2236,14 @@ pub fn serve(o: ServeOpts) {
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let pool_kv_budget = Engine::capped_serve_kv_budget(
+        budget.available_kv_budget_bytes,
+        eng.kvb as u32,
+        eng.chunk,
+        o.ctx,
+        effective_lanes,
+    );
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(pool_kv_budget, effective_lanes);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
@@ -4040,6 +4047,18 @@ mod tests {
         let pro_total = (pro_win as u64) * crate::blocks::stride_at(crate::blocks::BlockKind::Window, 2).unwrap()
             + (pro_full as u64) * crate::blocks::stride_at(crate::blocks::BlockKind::Full, 2).unwrap();
         assert!(pro_total <= m5_pro.available_kv_budget_bytes, "pool allocation must never exceed available KV budget");
+
+        // Production 128K configs retain 100% of available KV budget; small-context serve probes stay <= 5 GiB.
+        assert_eq!(
+            Engine::capped_serve_kv_budget(m5_max.available_kv_budget_bytes, 2, 4096, 131072, 32),
+            m5_max.available_kv_budget_bytes
+        );
+        assert_eq!(
+            Engine::capped_serve_kv_budget(m5_pro.available_kv_budget_bytes, 2, 4096, 131072, 16),
+            m5_pro.available_kv_budget_bytes
+        );
+        let probe_cap = Engine::capped_serve_kv_budget(m5_max.available_kv_budget_bytes, 2, 4096, 6144, 4);
+        assert!(probe_cap <= 5 * gib, "4-lane -c 6144 probe pool budget ({probe_cap}) must stay <= 5 GiB");
     }
 
     /// End-to-end Metal GPU integration test: 3-turn 10,000+-token conversation (>= EXT = 1024)
