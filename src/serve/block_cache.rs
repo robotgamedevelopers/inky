@@ -318,6 +318,7 @@ impl ServeBlockCache {
     /// Pool-pressure admission guard: returns true if `pools` has enough free + evictable slots
     /// for this request's uncached prompt suffix plus bounded decode reserve. Always returns true
     /// when `active_lanes == 0` so at least one request always makes progress and never deadlocks.
+    #[allow(dead_code)]
     pub fn can_admit(
         &mut self,
         pools: &BlockPools,
@@ -1013,8 +1014,9 @@ mod tests {
                 cache.can_admit_with_shared(&pools, i, &lanes[i].toks, 128, chunk, shared_ckpt),
                 "lane {i} should admit under singleflight shared prefix accounting"
             );
-            assert!(cache.match_and_bind(&mut pools, &mut lanes[i].tbl, &mut lanes[i].blocks, &lanes[i].toks).is_none());
-            lanes[i].active = true;
+            let l = &mut lanes[i];
+            assert!(cache.match_and_bind(&mut pools, &mut l.tbl, &mut l.blocks, &l.toks).is_none());
+            l.active = true;
             planner.on_admit(i);
         }
 
