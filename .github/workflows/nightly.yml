@@ -118,7 +118,8 @@ jobs:
       - name: one-hour steady-state soak
         if: ${{ !cancelled() }}
         run: |
-          export INKY_SERVE_KEY="$(openssl rand -hex 16)"
+          INKY_SERVE_KEY=$(openssl rand -hex 16)
+          export INKY_SERVE_KEY
           tests/soak.sh --inky "$PWD/target/release/inky" --duration 1h --epoch 10m --seed 20261125
       - name: soak fault qualification
         if: ${{ !cancelled() }}
