@@ -488,7 +488,7 @@ func TestMemorySamplePeaksAndUnavailableOutput(t *testing.T) {
 	samples.observe(healthTelemetry{ProcessFootprintBytes: 360, ActiveLanes: 1, ModelBytes: 100, PerLaneWorstCaseBytes: 100})
 	samples.observe(healthTelemetry{ProcessFootprintBytes: 220, ActiveLanes: 4, ModelBytes: 100, PerLaneWorstCaseBytes: 100})
 	if samples.observed != 360 || samples.budget != 500 {
-		t.Fatalf("unexpected independent peaks: %+v", samples)
+		t.Fatalf("unexpected independent peaks: observed=%d budget=%d", samples.observed, samples.budget)
 	}
 	rungs := []RungMetrics{{Lanes: 1, PeakBudgetEstimateBytes: 500, CardsCompleted: 1}}
 	tsv := strings.Split(strings.TrimSpace(FormatTSV(rungs)), "\n")
