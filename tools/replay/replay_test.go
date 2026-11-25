@@ -100,6 +100,33 @@ func TestLoadReplaySet_GroupsAndOrdersMultiTurnCards(t *testing.T) {
 	}
 }
 
+func TestLoadReplaySetKeepsGenerationAndDeliveryOutcomes(t *testing.T) {
+	const rows = `{"schema_version":1,"card_id":"sample","turn_index":0,"request":{"messages":[]},"response":{"finish_reason":"stop","status_code":200}}
+{"schema_version":1,"card_id":"sample","turn_index":1,"request":{"messages":[]},"response":{"finish_reason":"cancelled","status_code":499,"generation_finish_reason":"end_turn","delivery_status":"failed"}}
+{"schema_version":1,"card_id":"sample","turn_index":2,"request":{"messages":[]},"response":{"finish_reason":"length","status_code":200,"generation_finish_reason":"length","delivery_status":"written"}}`
+	path := filepath.Join(t.TempDir(), "cards.jsonl")
+	if err := os.WriteFile(path, []byte(rows), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cards, err := LoadReplaySet(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != 1 || len(cards[0].Turns) != 3 {
+		t.Fatalf("unexpected replay set: %+v", cards)
+	}
+	want := []ResponseMetrics{
+		{StatusCode: 200, FinishReason: "stop"},
+		{StatusCode: 499, FinishReason: "cancelled", GenerationFinishReason: "end_turn", DeliveryStatus: "failed"},
+		{StatusCode: 200, FinishReason: "length", GenerationFinishReason: "length", DeliveryStatus: "written"},
+	}
+	for i, turn := range cards[0].Turns {
+		if turn.Response != want[i] {
+			t.Errorf("turn %d: got %+v, want %+v", i, turn.Response, want[i])
+		}
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	now := time.Date(2026, 11, 24, 18, 0, 0, 0, time.UTC)
 	if d, ok := ParseRetryAfter("5", now); !ok || d != 5*time.Second {

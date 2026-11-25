@@ -2195,7 +2195,7 @@ fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
     })
 }
 
-/// The scheduler's outcome is provisional until the handler has flushed the response.
+/// Keep the observed generation result across failures writing the response.
 struct TurnDelivery {
     start: Instant,
     first_token: Option<Instant>,
@@ -2204,6 +2204,7 @@ struct TurnDelivery {
     phase_ms: (u64, u64, u64),
     finish_reason: &'static str,
     status_code: u16,
+    generation_finish_reason: Option<&'static str>,
 }
 
 impl TurnDelivery {
@@ -2221,6 +2222,7 @@ impl TurnDelivery {
         self.prompt_tokens = prompt;
         self.completion_tokens = generated;
         self.phase_ms = (timing.queue_ms, timing.prefill_ms, timing.decode_ms);
+        self.generation_finish_reason = Some(reason);
         self.status(200, reason);
     }
 }
@@ -2231,12 +2233,17 @@ fn record_delivery(
 ) -> std::io::Result<()> {
     let mut turn = TurnDelivery {
         start: Instant::now(), first_token: None, prompt_tokens: 0, completion_tokens: 0,
-        phase_ms: (0, 0, 0), finish_reason: "cancelled", status_code: 499,
+        phase_ms: (0, 0, 0), finish_reason: "cancelled", status_code: 499, generation_finish_reason: None,
     };
     let recording = cx.recorder.as_ref().map(|rec| (rec, rec.allocate_turn(card_id)));
     let result = respond(&mut turn);
     if let Some((rec, (card_id, turn_index))) = recording {
         if result.is_err() { turn.status(499, "cancelled"); }
+        let delivery = if turn.status_code == 499 {
+            crate::record::DeliveryStatus::Failed
+        } else {
+            crate::record::DeliveryStatus::Written
+        };
         let total_ms = turn.start.elapsed().as_millis() as u64;
         let ttft_ms = turn.first_token.map(|t| t.duration_since(turn.start).as_millis() as u64).unwrap_or(total_ms);
         let (queue_ms, prefill_ms, decode_ms) = turn.phase_ms;
@@ -2246,6 +2253,7 @@ fn record_delivery(
             response: crate::record::ResponseMetrics {
                 prompt_tokens: turn.prompt_tokens, completion_tokens: turn.completion_tokens, ttft_ms, total_ms,
                 queue_ms, prefill_ms, decode_ms, finish_reason: turn.finish_reason.into(), status_code: turn.status_code,
+                generation_finish_reason: turn.generation_finish_reason.map(str::to_owned), delivery_status: Some(delivery),
             },
         });
     }
@@ -4816,6 +4824,10 @@ mod tests {
             let reason = if failed { "cancelled" } else if endpoint == "/v1/messages" { "end_turn" } else { "stop" };
             assert_eq!((m.status_code, m.finish_reason.as_str()), (if failed { 499 } else { 200 }, reason));
             assert_eq!((m.queue_ms, m.prefill_ms, m.decode_ms), if finished { (1, 2, 3) } else { (0, 0, 0) });
+            let response = m.to_json();
+            assert_eq!(response["delivery_status"], if failed { "failed" } else { "written" });
+            let model_reason = if endpoint == "/v1/messages" { "end_turn" } else { "stop" };
+            assert_eq!(response["generation_finish_reason"].as_str(), finished.then_some(model_reason));
         }
     }
 
