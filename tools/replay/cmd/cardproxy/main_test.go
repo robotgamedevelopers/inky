@@ -23,7 +23,7 @@ func TestProxyKeepsTurnsTogetherAndSeparatesCards(t *testing.T) {
 		r.Header.Set("X-Inky-Card-Id", "spoofed")
 		r.Header.Set("Authorization", "Bearer test-key")
 		w := httptest.NewRecorder()
-		proxyFor(u, id).ServeHTTP(w, r)
+		proxyFor(u, id, "").ServeHTTP(w, r)
 		if w.Code != 200 || w.Body.String() != "data: ok\n\n" {
 			t.Fatalf("bad response: %d %q", w.Code, w.Body.String())
 		}
@@ -46,5 +46,21 @@ func TestValidateRejectsUnsafeConfiguration(t *testing.T) {
 	}
 	if _, err := validate("http://host:18096", "card-1", "127.0.0.1:0"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProxyInjectsConfiguredKey(t *testing.T) {
+	seen := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization") + ":" + r.Header.Get("X-Api-Key")
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	r := httptest.NewRequest("POST", "http://localhost/v1/messages", strings.NewReader("{}"))
+	r.Header.Set("Authorization", "Bearer placeholder")
+	r.Header.Set("X-Api-Key", "placeholder")
+	proxyFor(u, "card", "upstream-secret").ServeHTTP(httptest.NewRecorder(), r)
+	if got := <-seen; got != "Bearer upstream-secret:" {
+		t.Fatalf("unexpected auth %q", got)
 	}
 }

@@ -9,11 +9,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
 
-func proxyFor(upstream *url.URL, cardID string) http.Handler {
+func proxyFor(upstream *url.URL, cardID, upstreamKey string) http.Handler {
 	p := httputil.NewSingleHostReverseProxy(upstream)
 	original := p.Director
 	p.Director = func(r *http.Request) {
@@ -21,6 +22,10 @@ func proxyFor(upstream *url.URL, cardID string) http.Handler {
 		r.Host = upstream.Host
 		// A client cannot change the identity of this dedicated card proxy.
 		r.Header.Set("X-Inky-Card-Id", cardID)
+		if upstreamKey != "" {
+			r.Header.Del("X-Api-Key")
+			r.Header.Set("Authorization", "Bearer "+upstreamKey)
+		}
 	}
 	p.FlushInterval = -1 // preserve streaming responses
 	return p
@@ -52,17 +57,25 @@ func validate(upstream, cardID, listen string) (*url.URL, error) {
 func main() {
 	upstream := flag.String("upstream", "", "Inky server origin")
 	cardID := flag.String("card-id", "", "unique ID for this agent run")
+	keyEnv := flag.String("key-env", "", "environment variable holding the upstream key (optional)")
 	listen := flag.String("listen", "127.0.0.1:0", "local loopback listen address")
 	flag.Parse()
 	u, err := validate(*upstream, *cardID, *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
+	key := ""
+	if *keyEnv != "" {
+		key = os.Getenv(*keyEnv)
+		if key == "" {
+			log.Fatal("upstream key environment variable is empty")
+		}
+	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("CARD_PROXY_URL=http://%s\n", ln.Addr())
-	s := &http.Server{Handler: proxyFor(u, *cardID), ReadHeaderTimeout: 10 * time.Second}
+	s := &http.Server{Handler: proxyFor(u, *cardID, key), ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(s.Serve(ln))
 }
