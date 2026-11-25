@@ -127,6 +127,13 @@ impl DecodeStep {
 pub static KV8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// process-wide override for `Engine::load`: force non-MPP Metal 3 simdgroup kernels (`--no-mpp` / `INKY_DISABLE_MPP=1`)
 pub static DISABLE_MPP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Number of initial sink tokens always retained when `--full-attn-budget` pruning is active.
+pub const FULL_ATTN_SINK: usize = 64;
+/// Minimum allowed `--full-attn-budget` (64 sink + at least 64 recent keys).
+pub const FULL_ATTN_MIN_BUDGET: usize = 128;
+/// Process-wide default for `Engine::load`: opt-in far-key pruning budget on full-attention passes
+/// (`0` = disabled / exact unpruned default).
+pub static FULL_ATTN_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// initial capacity (positions) of the K/V buffers; they grow with the context
 const KV_CAP0: usize = 64;
 /// MoE tile classes of the fp16 prefill path: (kernel, max tokens per tile, threads per threadgroup)
@@ -306,7 +313,7 @@ struct DecodeSpanDesc {
     full_nsplit: u32,
     full_tau: f32,
     swa_tau: f32,
-    pad1: u32,
+    full_recent_start: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1369,6 +1376,8 @@ pub struct Engine {
     lg_weak: RefCell<Option<Buf>>,
     /// Force `count = 1` groups in Layer 3 `k_attn_grp_dec` (`INK_NO_GRP_DEC=1` for A/B parity testing).
     no_grp_dec: Cell<bool>,
+    /// Opt-in far-key pruning budget on full-attention passes (`None` = exact unpruned default).
+    full_attn_budget: Cell<Option<usize>>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
     pub gpu: Gpu,
     pub g: Gguf,
@@ -2237,6 +2246,17 @@ impl Engine {
     /// Current default adaptive LoopCD-Logits contrast weight (`0.0` = disabled).
     pub fn loopcd_omega(&self) -> f32 {
         self.loopcd_omega.get()
+    }
+    /// Configure opt-in far-key pruning budget on full-attention passes (`None` = exact unpruned default).
+    pub fn set_full_attn_budget(&self, budget: Option<usize>) {
+        if let Some(b) = budget {
+            assert!(b >= FULL_ATTN_MIN_BUDGET, "full_attn_budget must be >= {FULL_ATTN_MIN_BUDGET}");
+        }
+        self.full_attn_budget.set(budget);
+    }
+    /// Current opt-in full-attention key budget (`None` = exact unpruned default).
+    pub fn full_attn_budget(&self) -> Option<usize> {
+        self.full_attn_budget.get()
     }
     /// True iff output row `span_idx` of the most recent forward step ran `k_loopcd_blend` (`omega > 0.0`).
     pub fn span_loopcd(&self, span_idx: usize) -> bool {
@@ -3265,7 +3285,7 @@ impl Engine {
     }
 
     fn seg(w: &QW, in_off: u32, out_off: u32) -> Seg {
-        debug_assert!(matches!(w.ty, T_Q4_K | T_Q6_K | T_Q8_0));
+        debug_assert!(matches!(w.ty, T_Q4_K | T_Q6_K | T_Q8_0 | T_Q3_K | T_Q2_K | T_Q3_0));
         Seg {
             w_lo: w.off as u32,
             w_hi: (w.off >> 32) as u32,
@@ -3898,19 +3918,67 @@ impl Engine {
                 ..Default::default()
             };
             run.bind_kv(e, l.swa);
-            let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
-            let nkeys = pos + 1 - first_pos;
-            let aa = AttnArgs {
-                nkeys: nkeys as u32,
-                first_pos: first_pos as u32,
-                ring: l.swa as u32,
-                kps: kps as u32,
-                nsplit: nsplit as u32,
-                pad: self.sep_comb as u32,
-                ..base
+            let nsplit = if !l.swa {
+                let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
+                if fp.recent_start > 0 {
+                    let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+                    let total_splits = 1 + recent_splits;
+                    let a_sink = AttnArgs {
+                        nkeys: FULL_ATTN_SINK as u32,
+                        first_pos: 0,
+                        ring: 0,
+                        kps: FULL_ATTN_SINK as u32,
+                        nsplit: total_splits as u32,
+                        sp0: 0,
+                        noown: 1,
+                        pad: 1 | 4,
+                        ..base
+                    };
+                    self.go(e, C_ATTN, "k_attn", &a_sink, (1, NKV, 1), 128);
+                    let a_rec = AttnArgs {
+                        nkeys: (pos + 1 - fp.recent_start) as u32,
+                        first_pos: fp.recent_start as u32,
+                        ring: 0,
+                        kps: recent_kps as u32,
+                        nsplit: total_splits as u32,
+                        sp0: 1,
+                        noown: 0,
+                        pad: 1 | rel_flag,
+                        ..base
+                    };
+                    self.go(e, C_ATTN, "k_attn", &a_rec, (recent_splits, NKV, 1), 128);
+                    total_splits
+                } else {
+                    let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(false, pos, self.max_ctx);
+                    let nkeys = pos + 1 - first_pos;
+                    let aa = AttnArgs {
+                        nkeys: nkeys as u32,
+                        first_pos: first_pos as u32,
+                        ring: 0,
+                        kps: kps as u32,
+                        nsplit: nsplit as u32,
+                        pad: self.sep_comb as u32,
+                        ..base
+                    };
+                    self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                    nsplit
+                }
+            } else {
+                let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(true, pos, self.max_ctx);
+                let nkeys = pos + 1 - first_pos;
+                let aa = AttnArgs {
+                    nkeys: nkeys as u32,
+                    first_pos: first_pos as u32,
+                    ring: 1,
+                    kps: kps as u32,
+                    nsplit: nsplit as u32,
+                    pad: self.sep_comb as u32,
+                    ..base
+                };
+                self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                nsplit
             };
-            self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
-            if self.sep_comb {
+            if self.sep_comb || (!l.swa && self.full_attn_budget().is_some_and(|b| pos + 1 > b)) {
                 let ca = CombineArgs {
                     part_off: ar.part,
                     nsplit: nsplit as u32,
@@ -4857,6 +4925,8 @@ impl Engine {
             let full_kps = decode_split_kps(false, self.max_ctx);
             let mut swa_ranges = Vec::with_capacity(n);
             let mut full_ranges = Vec::with_capacity(n);
+            let mut full_recent_starts = Vec::with_capacity(n);
+            let full_budget = self.full_attn_budget();
             let slab = self.blocked_slab.borrow();
             {
                 let act = self.act.borrow();
@@ -4874,11 +4944,11 @@ impl Engine {
                     let tok_id = unsafe { *(sp.lane.toks.contents().as_ptr() as *const i32).add(pos) };
                     let (swa_first_pos, _sk, _swa_sp_lo, swa_nsplit) = decode_split_grid(true, pos, self.max_ctx);
                     let swa_nkeys = pos + 1 - swa_first_pos;
-                    let (_full_first_pos, _fk, _full_sp_lo, full_nsplit) = decode_split_grid(false, pos, self.max_ctx);
-                    let full_nkeys = pos + 1;
+                    let fp = full_attn_decode_plan(pos, self.max_ctx, full_budget);
                     let full_tau = 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln();
                     swa_ranges.push((swa_first_pos, pos));
                     full_ranges.push((0usize, pos));
+                    full_recent_starts.push(fp.recent_start);
                     dst[si] = DecodeSpanDesc {
                         tok_id,
                         pos: pos as u32,
@@ -4892,12 +4962,12 @@ impl Engine {
                         swa_first_pos: swa_first_pos as u32,
                         swa_kps: swa_kps as u32,
                         swa_nsplit: swa_nsplit as u32,
-                        full_nkeys: full_nkeys as u32,
+                        full_nkeys: fp.nkeys as u32,
                         full_kps: full_kps as u32,
-                        full_nsplit: full_nsplit as u32,
+                        full_nsplit: fp.nsplit as u32,
                         full_tau,
                         swa_tau: 1.0,
-                        pad1: 0,
+                        full_recent_start: fp.recent_start as u32,
                     };
                 }
             }
@@ -4912,7 +4982,7 @@ impl Engine {
                     .flatten()
                     .map(|e| (e.slot().get(), e.generation()))
             });
-            let full_groups = build_decode_groups(&full_ranges, full_kps, no_grp, |si, blk| {
+            let full_groups = build_full_decode_groups(&full_ranges, &full_recent_starts, full_kps, no_grp, |si, blk| {
                 tables[si]
                     .get(crate::blocks::BlockKind::Full, crate::blocks::BlockIndex::new(blk as u32))
                     .ok()
@@ -5531,30 +5601,78 @@ impl Engine {
                     istr: HD as u32,
                     ..Default::default()
                 };
-                let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(l.swa, pos, self.max_ctx);
-                let nkeys = pos + 1 - first_pos;
-                let aa = AttnArgs {
-                    nkeys: nkeys as u32,
-                    first_pos: first_pos as u32,
-                    ring: l.swa as u32,
-                    kps: kps as u32,
-                    nsplit: nsplit as u32,
-                    pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
-                    ..base
+                let nsplit = if !l.swa {
+                    let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
+                    if fp.recent_start > 0 {
+                        let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+                        let total_splits = 1 + recent_splits;
+                        let a_sink = AttnArgs {
+                            nkeys: FULL_ATTN_SINK as u32,
+                            first_pos: 0,
+                            ring: 0,
+                            kps: FULL_ATTN_SINK as u32,
+                            nsplit: total_splits as u32,
+                            sp0: 0,
+                            noown: 1,
+                            pad: 1 | 4 | ((dry_state as u32) << 1),
+                            ..base
+                        };
+                        self.go_nb(e, C_ATTN, "k_attn", &a_sink, (1, NKV, 1), 128);
+                        let a_rec = AttnArgs {
+                            nkeys: (pos + 1 - fp.recent_start) as u32,
+                            first_pos: fp.recent_start as u32,
+                            ring: 0,
+                            kps: recent_kps as u32,
+                            nsplit: total_splits as u32,
+                            sp0: 1,
+                            noown: 0,
+                            pad: 1 | rel_flag | ((dry_state as u32) << 1),
+                            ..base
+                        };
+                        self.go_nb(e, C_ATTN, "k_attn", &a_rec, (recent_splits, NKV, 1), 128);
+                        total_splits
+                    } else {
+                        let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(false, pos, self.max_ctx);
+                        let nkeys = pos + 1 - first_pos;
+                        let aa = AttnArgs {
+                            nkeys: nkeys as u32,
+                            first_pos: first_pos as u32,
+                            ring: 0,
+                            kps: kps as u32,
+                            nsplit: nsplit as u32,
+                            pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                            ..base
+                        };
+                        self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                        nsplit
+                    }
+                } else {
+                    let (first_pos, kps, _sp_lo, nsplit) = decode_split_grid(true, pos, self.max_ctx);
+                    let nkeys = pos + 1 - first_pos;
+                    let aa = AttnArgs {
+                        nkeys: nkeys as u32,
+                        first_pos: first_pos as u32,
+                        ring: 1,
+                        kps: kps as u32,
+                        nsplit: nsplit as u32,
+                        pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                        ..base
+                    };
+                    self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
+                    nsplit
                 };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
-                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
                 let comb_out = if direct_half {
                     b.agh + (r0 * (NH * HD / 2)) as u32
                 } else if self.hgemm {
-                    aa.out_off
+                    base.out_off
                 } else {
                     b.attn_g + (r0 * (NH * HD)) as u32
                 };
                 combs.push(CombineArgs {
-                    part_off: aa.part_off,
+                    part_off: base.part_off,
                     nsplit: nsplit as u32,
-                    gate_off: aa.gate_off,
+                    gate_off: base.gate_off,
                     out_off: comb_out,
                     hout: direct_half as u32,
                     pad: [0; 3],
@@ -5661,6 +5779,7 @@ impl Engine {
                 };
                 self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
                 self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
+                let full_budget_arg = if l.swa { 0u32 } else { self.full_attn_budget().unwrap_or(0) as u32 };
                 let aa = AttnBArgs {
                     t: tt,
                     p0: p0 as u32,
@@ -5677,7 +5796,7 @@ impl Engine {
                     relbias_w: l.rel_bias,
                     ghalf: 0,
                     kpos0: 0,
-                    pad: 0,
+                    pad: full_budget_arg,
                 };
                 if hatt {
                     let ah = AttnBArgs {
@@ -5816,6 +5935,7 @@ impl Engine {
             self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
             self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
             // ---- attention (causal, query-tiled)
+            let full_budget_arg = if l.swa { 0u32 } else { self.full_attn_budget().unwrap_or(0) as u32 };
             let aa = AttnBArgs {
                 t: tt,
                 p0: p0 as u32,
@@ -5832,7 +5952,7 @@ impl Engine {
                 relbias_w: l.rel_bias,
                 ghalf: 0,
                 kpos0,
-                pad: 0,
+                pad: full_budget_arg,
             };
             if hatt {
                 let ah = AttnBArgs {
@@ -7581,6 +7701,24 @@ impl<'a> Run<'a> {
             self.bind_kv(e, false);
             self.go(e, C_ATTN, "k_attn", &a, (n2, NKV, 1), 128);
             nsplit = n1 + n2;
+        } else if !l.swa && self.full_attn_budget().is_some_and(|b| pos + 1 > b) {
+            self.bind_kv(e, false);
+            let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
+            let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+            let total_splits = 1 + recent_splits;
+            let a_sink = AttnArgs {
+                nkeys: FULL_ATTN_SINK as u32, first_pos: 0, ring: 0, kps: FULL_ATTN_SINK as u32,
+                nsplit: total_splits as u32, sp0: 0, noown: 1,
+                pad: 1 | 4 | ((dry_state as u32) << 1), ..base
+            };
+            self.go(e, C_ATTN, "k_attn", &a_sink, (1, NKV, 1), 128);
+            let a_rec = AttnArgs {
+                nkeys: (pos + 1 - fp.recent_start) as u32, first_pos: fp.recent_start as u32, ring: 0,
+                kps: recent_kps as u32, nsplit: total_splits as u32, sp0: 1, noown: 0,
+                pad: 1 | rel_flag | ((dry_state as u32) << 1), ..base
+            };
+            self.go(e, C_ATTN, "k_attn", &a_rec, (recent_splits, NKV, 1), 128);
+            nsplit = total_splits;
         } else {
             // ---- attention (split-K) with the split combine + output gate fused into the last split per kv group
             self.bind_kv(e, l.swa);
@@ -7599,7 +7737,7 @@ impl<'a> Run<'a> {
             self.go(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
         }
         let e = &cx.e;
-        if self.sep_comb || self.tier_on() || self.lane.prune.borrow().is_some() {
+        if self.sep_comb || self.tier_on() || self.lane.prune.borrow().is_some() || (!l.swa && self.full_attn_budget().is_some_and(|b| pos + 1 > b)) {
             let ca = CombineArgs {
                 part_off: ar.part,
                 nsplit: nsplit as u32,
@@ -8089,6 +8227,210 @@ where
         i = j;
     }
 
+    out
+}
+
+/// Cache-fixed full-attention decode split plan when opt-in `--full-attn-budget` is configured.
+/// When `budget` is `None` or `pos + 1 <= budget`, `recent_start == 0` and every field matches
+/// `decode_split_grid(false, pos, max_ctx)` identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FullAttnDecodePlan {
+    pub nkeys: usize,
+    pub kps: usize,
+    pub nsplit: usize,
+    pub recent_start: usize,
+    pub recent_splits: usize,
+    pub recent_sp_lo: usize,
+}
+
+#[inline]
+pub fn full_attn_decode_plan(pos: usize, max_ctx: usize, budget: Option<usize>) -> FullAttnDecodePlan {
+    let (_first_pos, kps, _sp_lo, full_nsplit) = decode_split_grid(false, pos, max_ctx);
+    let Some(b) = budget else {
+        return FullAttnDecodePlan {
+            nkeys: pos + 1,
+            kps,
+            nsplit: full_nsplit,
+            recent_start: 0,
+            recent_splits: full_nsplit,
+            recent_sp_lo: 0,
+        };
+    };
+    debug_assert!(b >= FULL_ATTN_MIN_BUDGET);
+    if pos < b {
+        return FullAttnDecodePlan {
+            nkeys: pos + 1,
+            kps,
+            nsplit: full_nsplit,
+            recent_start: 0,
+            recent_splits: full_nsplit,
+            recent_sp_lo: 0,
+        };
+    }
+    let recent_len = b - FULL_ATTN_SINK;
+    let recent_start = (pos + 1) - recent_len;
+    let recent_sp_lo = recent_start / kps;
+    let sp_hi = pos / kps;
+    let recent_splits = sp_hi - recent_sp_lo + 1;
+    let nsplit = if recent_sp_lo == 0 { sp_hi + 1 } else { 1 + recent_splits };
+    debug_assert!(nsplit <= MAX_SPLIT);
+    FullAttnDecodePlan {
+        nkeys: b,
+        kps,
+        nsplit,
+        recent_start,
+        recent_splits,
+        recent_sp_lo,
+    }
+}
+
+/// Split sizing for the Layer 2 `k_attn` recent-range dispatch when `fp.recent_start > 0`,
+/// guaranteeing `1 + recent_splits <= MAX_SPLIT` even at maximum context.
+#[inline]
+fn full_attn_layer2_recent_splits(pos: usize, fp: FullAttnDecodePlan) -> (usize, usize, u32) {
+    if fp.recent_splits < MAX_SPLIT {
+        (fp.kps, fp.recent_splits, 0)
+    } else {
+        let recent_len = pos + 1 - fp.recent_start;
+        let kps = recent_len.div_ceil(MAX_SPLIT - 1).next_multiple_of(32);
+        let splits = recent_len.div_ceil(kps);
+        (kps, splits, 4)
+    }
+}
+
+/// Build `DecAttnGroup` descriptors for full-attention decode lanes, supporting optional
+/// per-lane far-key pruning (`recent_starts[si] > 0` retains `[0, 64) ∪ [recent_start, pos + 1)`).
+/// When every lane has `recent_starts[si] == 0`, delegates directly to `build_decode_groups`
+/// so default unpruned behavior is 100% bit-identical.
+pub fn build_full_decode_groups<F>(
+    ranges: &[(usize, usize)],
+    recent_starts: &[usize],
+    kps: usize,
+    no_grp: bool,
+    mut block_entry: F,
+) -> Vec<DecAttnGroup>
+where
+    F: FnMut(usize, usize) -> Option<(u32, u32)>,
+{
+    debug_assert_eq!(ranges.len(), recent_starts.len());
+    if recent_starts.iter().all(|&rs| rs == 0) {
+        return build_decode_groups(ranges, kps, no_grp, block_entry);
+    }
+    let blks_per_split = kps / crate::blocks::BLOCK;
+    let n = ranges.len();
+    let mut out = Vec::with_capacity(n * 16);
+    let mut interior: Vec<(u32, u64, u16)> = Vec::new();
+    for (si, &(_first_pos, pos)) in ranges.iter().enumerate() {
+        let recent_start = recent_starts[si];
+        let sp_hi = pos / kps;
+        if recent_start == 0 {
+            for abs_sp in 0..=sp_hi {
+                let split_end = (abs_sp + 1) * kps;
+                let is_interior = !no_grp && n > 1 && pos >= split_end;
+                if is_interior {
+                    let blk0 = abs_sp * blks_per_split;
+                    if let Some((slot, gen)) = block_entry(si, blk0).filter(|&(s, g)| s != 0 && g != 0) {
+                        interior.push((abs_sp as u32, ((slot as u64) << 32) | (gen as u64), si as u16));
+                        continue;
+                    }
+                }
+                let mut g = DecAttnGroup { abs_sp: abs_sp as u32, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                g.span_idx[0] = si as u16;
+                out.push(g);
+            }
+        } else {
+            // Split 0 carries the 64-token sink (or gapped sink + early recent) as a solo dispatch.
+            let mut g0 = DecAttnGroup { abs_sp: 0, count: 1, span_idx: [0; DEC_GRP_MAX] };
+            g0.span_idx[0] = si as u16;
+            out.push(g0);
+            let rlo = (recent_start / kps).max(1);
+            for abs_sp in rlo..=sp_hi {
+                let split_start = abs_sp * kps;
+                let split_end = split_start + kps;
+                let is_interior = !no_grp && n > 1 && recent_start <= split_start && pos >= split_end;
+                if is_interior {
+                    let blk0 = abs_sp * blks_per_split;
+                    if let Some((slot, gen)) = block_entry(si, blk0).filter(|&(s, g)| s != 0 && g != 0) {
+                        interior.push((abs_sp as u32, ((slot as u64) << 32) | (gen as u64), si as u16));
+                        continue;
+                    }
+                }
+                let mut g = DecAttnGroup { abs_sp: abs_sp as u32, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                g.span_idx[0] = si as u16;
+                out.push(g);
+            }
+        }
+    }
+    if interior.is_empty() {
+        return out;
+    }
+    interior.sort_unstable();
+    let mut i = 0;
+    while i < interior.len() {
+        let abs_sp = interior[i].0;
+        let first_key = interior[i].1;
+        let mut j = i + 1;
+        while j < interior.len() && interior[j].0 == abs_sp && interior[j].1 == first_key {
+            j += 1;
+        }
+        let run = &interior[i..j];
+        if run.len() == 1 || blks_per_split == 1 {
+            for chunk in run.chunks(DEC_GRP_MAX) {
+                let mut g = DecAttnGroup { abs_sp, count: chunk.len() as u32, span_idx: [0; DEC_GRP_MAX] };
+                for (u, item) in chunk.iter().enumerate() {
+                    g.span_idx[u] = item.2;
+                }
+                out.push(g);
+            }
+        } else {
+            let blk0 = abs_sp as usize * blks_per_split;
+            let mut open: Vec<(usize, DecAttnGroup)> = Vec::new();
+            for &(_, _, si_u16) in run {
+                let si = si_u16 as usize;
+                let mut all_valid = true;
+                for b in 1..blks_per_split {
+                    if !matches!(block_entry(si, blk0 + b), Some((s, g)) if s != 0 && g != 0) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+                if !all_valid {
+                    let mut g = DecAttnGroup { abs_sp, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                    g.span_idx[0] = si_u16;
+                    out.push(g);
+                    continue;
+                }
+                let mut placed = false;
+                for (rep_si, grp) in open.iter_mut() {
+                    if (grp.count as usize) >= DEC_GRP_MAX {
+                        continue;
+                    }
+                    let mut same = true;
+                    for b in 1..blks_per_split {
+                        if block_entry(si, blk0 + b) != block_entry(*rep_si, blk0 + b) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if same {
+                        grp.span_idx[grp.count as usize] = si_u16;
+                        grp.count += 1;
+                        placed = true;
+                        break;
+                    }
+                }
+                if !placed {
+                    let mut g = DecAttnGroup { abs_sp, count: 1, span_idx: [0; DEC_GRP_MAX] };
+                    g.span_idx[0] = si_u16;
+                    open.push((si, g));
+                }
+            }
+            for (_, g) in open {
+                out.push(g);
+            }
+        }
+        i = j;
+    }
     out
 }
 

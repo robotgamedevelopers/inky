@@ -103,6 +103,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/engine/tests.rs",
+            "full_attn_budget_default_bit_identical_and_pruned_4k_coherent_on_m5",
+            "tests/nightly.sh",
+            "engine::tests::full_attn_budget_default_bit_identical_and_pruned_4k_coherent_on_m5",
+        ),
+        (
+            "src/engine/tests.rs",
             "k_attn_b_and_blk_are_split_invariant_across_sliding_window",
             ".github/workflows/ci.yml",
             "engine::tests::k_attn_b_and_blk_are_split_invariant_across_sliding_window",
@@ -124,6 +130,18 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "router_handles_nonfinite_scores",
             ".github/workflows/ci.yml",
             "engine::tests::router_handles_nonfinite_scores",
+        ),
+        (
+            "src/engine/tests.rs",
+            "sub4bit_quant_metal_kernels_match_cpu_and_save_bytes",
+            "tests/nightly.sh",
+            "engine::tests::sub4bit_quant_metal_kernels_match_cpu_and_save_bytes",
+        ),
+        (
+            "src/engine/tests.rs",
+            "sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5",
+            "tests/nightly.sh",
+            "engine::tests::sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5",
         ),
         (
             "src/loopcd_tests.rs",

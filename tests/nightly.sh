@@ -64,6 +64,9 @@ print -r -- "$spill_kill_out"
 for m5_test in \
     engine::tests::debug_single_token_decode_native_checkpoint \
     engine::tests::disk_tier_matches_resident_logits_across_32k_staging_resize_transition \
+    engine::tests::full_attn_budget_default_bit_identical_and_pruned_4k_coherent_on_m5 \
+    engine::tests::sub4bit_quant_metal_kernels_match_cpu_and_save_bytes \
+    engine::tests::sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5 \
     session::tests::cli_session_recovers_from_injected_prefill_and_decode_failures; do
     if m5_out=$(cargo test --locked --release --bin inky "$m5_test" -- --ignored --exact --nocapture 2>&1); then
         grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$m5_out" || { echo "FAIL: $m5_test did not match 1 passed; 0 failed" >&2; fail=1; }

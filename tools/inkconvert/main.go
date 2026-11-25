@@ -45,7 +45,7 @@ const (
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
-		log.Fatal("usage: inkconvert probe|convert|verify|q6check|mtp [flags]  (mtp: -in mtp.safetensors -official model-00001-of-00001.safetensors -out drafter.gguf)")
+		log.Fatal("usage: inkconvert probe|convert|verify|q6check|mtp|requant [flags]  (mtp: -in mtp.safetensors -official model-00001-of-00001.safetensors -out drafter.gguf)")
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	official := fs.String("official", "", "official model-00001-of-00001.safetensors")
@@ -55,9 +55,11 @@ func main() {
 	q8re := fs.String("q8-tensors", "", "regexp of tensor names to take from -q8")
 	q6re := fs.String("q6-tensors", "", "regexp of tensor names to re-quantize from -q8's Q8_0 to Q6_K (checked before -q8-tensors)")
 	experts := fs.String("experts", "native", "routed experts: native (NV4 / MX8 from -official) or base (copied from -base)")
-	in := fs.String("in", "", "converted GGUF to verify")
+	in := fs.String("in", "", "input GGUF (for verify, mtp, requant)")
 	out := fs.String("out", "", "output GGUF")
 	w13 := fs.String("w13", "interleaved", "official w13 row order: interleaved (gate, up, gate, ...; what probe found in the release) or stacked")
+	quant := fs.String("quant", "q3k", "sub-4-bit target quantization for requant: q3k (Q3_K + Q3_0) or q2k (Q2_K + Q3_0)")
+	tensorsRe := fs.String("tensors", `ffn_(gate_up|down)_exps\.weight$`, "regexp of weight tensor names to re-quantize in requant")
 	_ = fs.Parse(os.Args[2:])
 	var err error
 	switch os.Args[1] {
@@ -71,6 +73,8 @@ func main() {
 		err = verify(*in, *ref)
 	case "mtp":
 		err = convertMTP(*in, *official, *out)
+	case "requant":
+		err = requantGGUF(*in, *out, *quant, *tensorsRe)
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}

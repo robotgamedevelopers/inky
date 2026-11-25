@@ -87,6 +87,8 @@ pub struct ServeOpts {
     pub dspark: Option<std::path::PathBuf>,
     /// draft tokens per speculative verify step in `1..=4` (`--draft-k`, default 3)
     pub draft_k: usize,
+    /// opt-in far-key pruning budget on full-attention passes (`--full-attn-budget`; None = exact unpruned)
+    pub full_attn_budget: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -5281,6 +5283,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
     let _mode_guard = enter_mode();
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     crate::engine::DISABLE_MPP.store(o.no_mpp, Ordering::Relaxed);
+    crate::engine::FULL_ATTN_BUDGET.store(o.full_attn_budget.unwrap_or(0), Ordering::Relaxed);
     let eng = match prepared.into_engine(o.kv8, chunk) {
         Ok(eng) => eng,
         Err(err) => {
@@ -5288,6 +5291,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
             std::process::exit(1);
         }
     };
+    eng.set_full_attn_budget(o.full_attn_budget);
     if !eng.use_mpp {
         eprintln!("[serve] non-MPP Metal 3 simdgroup path active (use_mpp=false)");
     }
@@ -11245,6 +11249,7 @@ mod tests {
             no_mpp: false,
             dspark: None,
             draft_k: crate::scheduler::DEFAULT_DRAFT_K,
+            full_attn_budget: None,
         };
         let (code, msg) = validate_serve_pre_mode(&opts).err().expect("bad model must fail pre-mode");
         assert_eq!(code, 1);
