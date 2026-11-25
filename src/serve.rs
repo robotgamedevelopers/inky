@@ -1265,20 +1265,17 @@ fn scheduler(
                         continue;
                     }
                     if a.n_past == a.pf_end {
-                        if a.sampler.uses_gpu_gumbel() {
-                            let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                            a.pending = Some(tok);
+                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                            eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                            match a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
-                                Ok(tok) => {
-                                    let tok = a.think.observe(tok, &sp);
-                                    a.pending = Some(tok);
-                                }
-                                Err(e) => {
-                                    l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
-                                    planner.on_finish(i);
-                                }
+                            a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap())
+                        };
+                        match sampled {
+                            Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
+                            Err(e) => {
+                                l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
+                                planner.on_finish(i);
                             }
                         }
                     } else if a.job.out.send(Ev::Alive).is_err() {
@@ -1387,11 +1384,13 @@ fn scheduler(
                     a.n_past += 1;
                     if a.job.out.cancelled() {
                         let _ = planner.request_cancel(i);
-                    } else if a.sampler.uses_gpu_gumbel() {
-                        let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                        a.pending = Some(tok);
                     } else {
-                        match a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
+                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                            eng.on(&l.lane).sampled_token_at(a.n_past)
+                        } else {
+                            a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap())
+                        };
+                        match sampled {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
                             Err(e) => {
                                 l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
