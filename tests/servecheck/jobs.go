@@ -34,8 +34,9 @@ func (g *gate) jobRequest(ctx context.Context, prompt string, limit int, stream 
 }
 
 type jobStream struct {
-	body  io.ReadCloser
-	lines *bufio.Scanner
+	completedTokens int
+	body            io.ReadCloser
+	lines           *bufio.Scanner
 }
 
 func (g *gate) startStream(ctx context.Context, prompt string, limit int) (*jobStream, error) {
@@ -47,7 +48,7 @@ func (g *gate) startStream(ctx context.Context, prompt string, limit int) (*jobS
 		res.Body.Close()
 		return nil, fmt.Errorf("expected accepted stream, got HTTP %s", res.Status)
 	}
-	return &jobStream{res.Body, bufio.NewScanner(res.Body)}, nil
+	return &jobStream{body: res.Body, lines: bufio.NewScanner(res.Body)}, nil
 }
 
 type jobEvent struct {
@@ -76,6 +77,7 @@ func (s *jobStream) read(firstDelta bool) error {
 		}
 		if data == "[DONE]" {
 			if !firstDelta && tokens > 0 {
+				s.completedTokens = tokens
 				return nil
 			}
 			return fmt.Errorf("stream ended without expected output")
@@ -308,14 +310,18 @@ func (g *gate) queueJobs() {
 		ctx, cancel := context.WithTimeout(g.ctx, 60*time.Second)
 		defer cancel()
 		var streams []*jobStream
-		for _, limit := range []int{256, 256} {
-			s, e := g.startStream(ctx, countPrompt, limit)
+		// Use the same finite 64-token decode as the seeded overlap probe.
+		// Submit both holders before waiting for their first generated tokens.
+		for range 2 {
+			s, e := g.startStream(ctx, countPrompt, 64)
 			if e != nil {
 				return e
 			}
 			defer s.body.Close()
 			streams = append(streams, s)
-			if e = s.read(true); e != nil {
+		}
+		for _, s := range streams {
+			if e := s.read(true); e != nil {
 				return e
 			}
 		}
@@ -345,22 +351,21 @@ func (g *gate) queueJobs() {
 		if !observedQueued {
 			return fmt.Errorf("third request did not appear in /health as queued_requests=1 active_lanes=2 inflight=3")
 		}
-		var overflow [2]queueResult
-		for i := range overflow {
+		for i := range 2 {
 			r, e := g.jobRequest(ctx, countPrompt, 4, true)
 			if e != nil {
 				return e
 			}
 			bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
-			overflow[i] = queueResult{r.StatusCode, r.Header.Get("Retry-After"), string(bodyBytes)}
+			result := queueResult{r.StatusCode, r.Header.Get("Retry-After"), string(bodyBytes)}
 			r.Body.Close()
+			if err := result.check(); err != nil {
+				return fmt.Errorf("overflow request %d: %w", i+4, err)
+			}
+			fifth = result
 		}
-		fifth = overflow[1]
 		if (queueResult{200, "5", ""}).check() == nil {
 			return fmt.Errorf("queue assertion accepted fourth request")
-		}
-		if e := overflow[0].check(); e != nil {
-			return e
 		}
 		for i, s := range streams {
 			if e := s.read(false); e != nil {
@@ -378,6 +383,8 @@ func (g *gate) queueJobs() {
 		if _, e := g.waitHealthDrained(5 * time.Second); e != nil {
 			return e
 		}
+		fmt.Printf("queue observed 2 active, 1 queued, and two HTTP 429s; completed streams reported %d, %d, %d tokens\n",
+			streams[0].completedTokens, streams[1].completedTokens, q3.stream.completedTokens)
 		firstPass = true
 		return nil
 	})
@@ -396,7 +403,7 @@ func (g *gate) queueJobs() {
 		errs := make(chan error, 3)
 		for range 3 {
 			go func() {
-				s, err := g.startStream(ctx, countPrompt, 32)
+				s, err := g.startStream(ctx, countPrompt, 8)
 				if err != nil {
 					errs <- err
 					return

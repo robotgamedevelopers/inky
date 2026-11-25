@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -94,13 +95,33 @@ func readyURL(output string) (string, error) {
 	return "", nil
 }
 
-func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue int, checks func(*gate)) error {
+// Report a bounded server-side diagnostic before the temporary directory is removed.
+func serverLogTail(log *os.File) string {
+	const limit = 8 << 10
+	info, err := log.Stat()
+	if err != nil {
+		return err.Error()
+	}
+	tail, err := io.ReadAll(io.NewSectionReader(log, max(0, info.Size()-limit), limit))
+	if err != nil {
+		return err.Error()
+	}
+	return string(tail)
+}
+
+func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue int, checks func(*gate)) (err error) {
 	g.log = filepath.Join(dir, fmt.Sprintf("lanes-%d.log", lanes))
 	log, err := os.Create(g.log)
 	if err != nil {
 		return err
 	}
 	defer log.Close()
+	var checksFailed bool
+	defer func() {
+		if err != nil || checksFailed {
+			fmt.Fprintf(os.Stderr, "server diagnostics (%s):\n%s\n", filepath.Base(g.log), serverLogTail(log))
+		}
+	}()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "serve", "-m", model, "-c", "6144", "-n", "4096", "--lanes", strconv.Itoa(lanes), "--queue", strconv.Itoa(queue), "--key-env", "INKY_SERVE_TEST_KEY", "--effort", "none", "--bind", "127.0.0.1:0")
@@ -125,8 +146,7 @@ func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue 
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			data, _ := os.ReadFile(g.log)
-			return fmt.Errorf("server startup: %v\n%s", processErr, data)
+			return fmt.Errorf("server startup: %v", processErr)
 		case <-deadline.C:
 			return errors.New("server startup timed out")
 		case <-tick.C:
@@ -140,16 +160,16 @@ func (g *gate) server(ctx context.Context, bin, model, dir string, lanes, queue 
 			}
 			if url != "" {
 				server := *g
-				server.ctx, server.url = ctx, url
+				server.ctx, server.url, server.failed = ctx, url, false
 				checks(&server)
-				g.failed = server.failed
+				checksFailed = server.failed
+				g.failed = g.failed || checksFailed
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				select {
 				case <-done:
-					data, _ := os.ReadFile(g.log)
-					return fmt.Errorf("server exited during checks: %v\n%s", processErr, data)
+					return fmt.Errorf("server exited during checks: %v", processErr)
 				default:
 					return nil
 				}
