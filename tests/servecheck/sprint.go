@@ -225,7 +225,7 @@ func parseOpenAIUsageStream(r io.Reader) (openAIUsageStreamSummary, error) {
 }
 
 func (g *gate) claudeHarnessMessagesLoop() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 90*time.Second)
 	defer cancel()
 
 	// Reject malformed thinking budget_tokens < 1024 with HTTP 400 (PR #36).
@@ -403,7 +403,7 @@ func (g *gate) claudeHarnessMessagesLoop() error {
 }
 
 func (g *gate) opencodeHarnessChatLoop() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 90*time.Second)
 	defer cancel()
 
 	tools := []map[string]any{

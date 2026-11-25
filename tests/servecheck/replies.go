@@ -47,7 +47,7 @@ func (s replySample) valid() bool {
 
 func (g *gate) sampleReply(body string, stream bool, first func(string)) (replySample, error) {
 	var result replySample
-	req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(g.ctx, http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		return result, err
 	}
@@ -322,7 +322,7 @@ func (g *gate) defaultSeed() error {
 }
 
 func (g *gate) replies() {
-	g.run("overlapping seeded replies", g.seededReplies)
-	g.run("follow-up cached prompt length", g.followupCache)
-	g.run("unseeded replies across repeats, key order, and streaming", g.defaultSeed)
+	g.run("overlapping seeded replies", (*gate).seededReplies)
+	g.run("follow-up cached prompt length", (*gate).followupCache)
+	g.run("unseeded replies across repeats, key order, and streaming", (*gate).defaultSeed)
 }
