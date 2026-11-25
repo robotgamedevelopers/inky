@@ -4558,6 +4558,18 @@ mod tests {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let entered_bg = entered.clone();
         let release_bg = release.clone();
+        struct ReadHookGuard(Vec<Arc<(Mutex<bool>, Condvar)>>);
+        impl Drop for ReadHookGuard {
+            fn drop(&mut self) {
+                crate::spill::set_test_spill_read_hook(None);
+                for b in &self.0 {
+                    *b.0.lock().unwrap() = true;
+                    b.1.notify_all();
+                }
+            }
+        }
+        let hold = Arc::new((Mutex::new(false), Condvar::new()));
+        let _hook_guard = ReadHookGuard(vec![release.clone(), hold.clone()]);
         crate::spill::set_test_spill_read_hook(Some(Arc::new(move |d, _key| {
             if d == target_dir {
                 let mut e = entered_bg.0.lock().unwrap();
@@ -4590,6 +4602,7 @@ mod tests {
         match cache.begin_admit_bind(&mut pools, 1, &mut tbl1, &mut st1, &p0_cont) {
             AdmitBindOutcome::Restoring { target_pos } => {
                 assert_eq!(target_pos, 512);
+                planner.admit_queued(1, crate::scheduler::LaneState::Queued);
                 planner.start_restore(1);
             }
             other => panic!("expected Restoring from reloaded spill index, got {other:?}"),
@@ -4668,7 +4681,6 @@ mod tests {
         let tip2 = retain_test_prompt(&mut cache, &mut pools, &mut tbl2, &mut st2, &p2, 0x77);
         assert!(cache.evict_start(&mut pools, tip2));
 
-        let hold = Arc::new((Mutex::new(false), Condvar::new()));
         let hold_bg = hold.clone();
         let dir2 = dir.0.clone();
         crate::spill::set_test_spill_read_hook(Some(Arc::new(move |d, _| {
@@ -4685,6 +4697,7 @@ mod tests {
             cache.begin_admit_bind(&mut pools, 2, &mut tbl2, &mut st2, &p2_cont),
             AdmitBindOutcome::Restoring { target_pos: 256 }
         ));
+        planner.admit_queued(2, crate::scheduler::LaneState::Queued);
         planner.start_restore(2);
         // Disconnect mid-restore!
         assert!(planner.request_cancel(2));

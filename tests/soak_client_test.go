@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -603,7 +604,7 @@ func TestSoakProbeVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var workloadStarted atomic.Bool
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client, clk, dial := newInMemoryEnv(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/health" {
 					counter := tc.initialSpills
 					if workloadStarted.Load() {
@@ -618,18 +619,19 @@ func TestSoakProbeVerdict(t *testing.T) {
 				}
 				workloadStarted.Store(true)
 				fmt.Fprint(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-			}))
-			defer server.Close()
-			// Force exactly the requested epochs even when the race detector slows HTTP.
+			})
+			var stdout, stderr bytes.Buffer
+			// Force exactly the requested epochs deterministically via fakeClock with zero sockets.
 			cfg := clientConfig{
-				chatURL: server.URL + "/v1/chat/completions", clients: 1, lanes: 1,
-				duration: 10 * time.Millisecond, epoch: 10 * time.Millisecond,
+				chatURL: "http://mem.test:18090/v1/chat/completions", clients: 1, lanes: 1,
+				duration: 10 * time.Millisecond, epoch: 50 * time.Millisecond,
 				minEpochs: tc.epochs, warmupEpochs: tc.warmup,
 				serverPID: tc.pid, recordDir: tc.recordDir, spillDir: tc.spillDir,
+				clock: clk, dial: dial, stdout: &stdout, stderr: &stderr,
 			}
-			code := runSoak(server.Client(), cfg, func(int) (int64, error) { return tc.rss, tc.rssErr })
+			code := runSoak(client, cfg, func(int) (int64, error) { return tc.rss, tc.rssErr })
 			if code != tc.want {
-				t.Fatalf("soak exited %d, want %d", code, tc.want)
+				t.Fatalf("soak exited %d, want %d (stderr=%s)", code, tc.want, stderr.String())
 			}
 		})
 	}

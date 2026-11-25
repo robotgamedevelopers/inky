@@ -563,17 +563,6 @@ func formatTokens(tokens []int) string {
 	return strings.Join(values, ",")
 }
 
-func formatTokens(tokens []int) string {
-	if len(tokens) == 0 {
-		tokens = maxTokensChoices
-	}
-	values := make([]string, len(tokens))
-	for i, v := range tokens {
-		values[i] = strconv.Itoa(v)
-	}
-	return strings.Join(values, ",")
-}
-
 func main() {
 	os.Exit(runCLI(os.Args[1:], os.Getenv, nil, clientConfig{}))
 }

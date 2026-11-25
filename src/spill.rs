@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 mod store;
-pub use store::{read_block_from_dir, RawDiskRead, SpillStore, SpillStoreStats};
+pub use store::{read_block_from_dir, RawDiskRead, SpillStore};
 
 /// Positions in one sealed block (`docs/DESIGN.md`, Blocks).
 pub const BLOCK_POSITIONS: usize = 64;

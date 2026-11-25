@@ -1074,12 +1074,15 @@ mod tests {
                 decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         let sample_len = serde_json::to_vec(&mk(200).to_json()).unwrap().len() + 1;
         let rec = Recorder {
             tx: Some(tx),
             worker: None,
+            anonymous_nonce: "test".into(),
             next_card_seq: AtomicU64::new(1),
             turns: Mutex::new(TurnTracker::default()),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1133,6 +1136,8 @@ mod tests {
                 decode_ms: 2,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         let mut raw = Vec::new();

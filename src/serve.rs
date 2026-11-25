@@ -1505,6 +1505,7 @@ const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const BODY_READ_TIMEOUT: Duration = REQUEST_READ_TIMEOUT;
 const MAX_STREAM_DURATION: Duration = Duration::from_secs(600);
 const MAX_STREAM_WRITE_TIME: Duration = Duration::from_secs(15);
@@ -1580,10 +1581,12 @@ impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> 
 trait ConnIo: Read + Write {
     fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
     fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    #[cfg(test)]
     fn set_nonblocking_opt(&mut self, nonblocking: bool) -> std::io::Result<()> {
         let _ = nonblocking;
         Ok(())
     }
+    #[cfg(test)]
     fn peer_ip(&self) -> IpAddr {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     }
@@ -1597,9 +1600,11 @@ impl ConnIo for TcpStream {
     fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
         self.set_write_timeout(dur)
     }
+    #[cfg(test)]
     fn set_nonblocking_opt(&mut self, nonblocking: bool) -> std::io::Result<()> {
         self.set_nonblocking(nonblocking)
     }
+    #[cfg(test)]
     fn peer_ip(&self) -> IpAddr {
         self.peer_addr()
             .map(|a| a.ip())
@@ -4511,7 +4516,7 @@ mod tests {
                 for &id in &tokens { job.out.send(Ev::Tok(id)).unwrap(); }
                 job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
                 worker.join().unwrap().unwrap();
-                assert_eq!(job.toks, prompt, "submitted assistant turn changed during rendering");
+                assert_eq!(&*job.toks, prompt.as_slice(), "submitted assistant turn changed during rendering");
             });
             let body = std::str::from_utf8(&output).unwrap().split_once("\r\n\r\n").unwrap().1;
             if !stream {
@@ -4770,7 +4775,7 @@ mod tests {
                 }
                 sent
             });
-            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell<usize>::new(0) };
+            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::<usize>::new(0) };
             if use_chat {
                 chat(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
             } else {
