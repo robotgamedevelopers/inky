@@ -1,6 +1,6 @@
 # inky
 
-> The engine's full guide, written by its original author, Eris, for [inkling](https://github.com/Eriskii/erisinky), with the program renamed inky. The design for many lanes is [DESIGN.md](DESIGN.md) and the work in progress is [ROADMAP.md](ROADMAP.md).
+> The engine's full guide, written by its original author, Eris, for [inkling](https://github.com/Eriskii/erisinky), with the program renamed inky. The performance benchmarks are in [PERFORMANCE.md](PERFORMANCE.md), the design for many lanes is [DESIGN.md](DESIGN.md), and the work in progress is [ROADMAP.md](ROADMAP.md).
 
 ## Target hardware and tuning
 
