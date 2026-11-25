@@ -90,11 +90,15 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn new(src: &str, kernels: &[&str]) -> Gpu {
+        Self::new_with_lang(src, kernels, true)
+    }
+
+    pub fn new_with_lang(src: &str, kernels: &[&str], metal4: bool) -> Gpu {
         let dev = MTLCreateSystemDefaultDevice().expect("no Metal device");
         let queue = dev.newCommandQueue().expect("queue");
         let opts = MTLCompileOptions::new();
         opts.setMathMode(MTLMathMode::Fast);
-        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        opts.setLanguageVersion(if metal4 { MTLLanguageVersion::Version4_0 } else { MTLLanguageVersion::Version3_2 });
         let lib = dev
             .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
             .unwrap_or_else(|e| panic!("Metal compile failed:\n{}", e.localizedDescription()));

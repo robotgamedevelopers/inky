@@ -228,9 +228,23 @@ impl Engine {
         let output_norm = pb.f32(&g, "output_norm.weight", &[E])?;
         let output_res_query = pb.f32(&g, "output_res_query.weight", &[E])?;
 
-        let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("../kernels.metal"), include_str!("../prefill.metal"), include_str!("../bench_kernels.metal"));
+        let (chip, mem) = crate::tuning::this_machine();
+        let tuning = crate::tuning::select(&chip, mem);
+        let disable_mpp = DISABLE_MPP.load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var("INKY_DISABLE_MPP").is_ok_and(|v| !v.is_empty() && v != "0")
+            || std::env::var("INK_NO_TENSOR").is_ok()
+            || !tuning.use_mpp;
+        let use_mpp = !disable_mpp;
+        let src = format!(
+            "{}{}{}\n{}\n{}",
+            if kv8 { "#define KV8 1\n" } else { "" },
+            if !use_mpp { "#define NO_MPP 1\n" } else { "" },
+            include_str!("../kernels.metal"),
+            include_str!("../prefill.metal"),
+            include_str!("../bench_kernels.metal")
+        );
         let kvb = if kv8 { 1 } else { 2 };
-        let gpu = Gpu::new(&src, KERNELS);
+        let gpu = Gpu::new_with_lang(&src, if use_mpp { KERNELS } else { KERNELS_NON_MPP }, use_mpp);
         if g.map_len() > gpu.dev.maxBufferLength() {
             return Err(invalid_model("GGUF exceeds the Metal buffer size limit"));
         }
@@ -262,8 +276,12 @@ impl Engine {
             eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
             slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
-            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
-            hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
+            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk,
+            use_mpp,
+            kv_window_pct: tuning.kv_window_pct,
+            decode_splits: tuning.decode_splits,
+            tensor: use_mpp,
+            hgemm: use_mpp && std::env::var("INK_NO_HGEMM").is_err(),
             sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
             tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
             skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),

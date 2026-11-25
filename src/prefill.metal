@@ -721,6 +721,7 @@ kernel void k_attn_b(device const uchar * PB [[buffer(1)]], device float * A [[b
     }
 }
 
+#ifndef NO_MPP
 // ======================= tensor-core (M5 neural accelerator) GEMM variants via MetalPerformancePrimitives =======================
 typedef mpp::tensor_ops::matmul2d<
     mpp::tensor_ops::matmul2d_descriptor(GM_BN, GM_BM, GM_BK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
@@ -1092,6 +1093,7 @@ kernel void k_layout_att(device float * A [[buffer(2)]], device kv_t * KV [[buff
     }
     o[63] = co.get_capacity();
 }
+#endif // NO_MPP
 
 // ---- batched loop-controller apply: out = u*(1 - tanh(f)) + tanh(g)*m, then RMSNorm(weight). grid (T, nC), 256 threads
 struct CtrlBJob { uint u_off, m_off, g_off, f_off, out_off, norm_w; int h_off; uint nof32; };   // h_off >= 0: also (nof32: only) half output
@@ -1262,6 +1264,7 @@ inline void wstage(device const uchar * wr, uint wtype, uint k0, uint hp, thread
 // whose tokens do not exist simply skip the matmul, so ragged token counts cost 16-token granularity instead of a whole tile.
 // Register epilogues rely on the op's accumulator layout: 8 quads of 4 consecutive rows per thread, quads q and q+4 holding rows
 // r and r+32 of the same token. Engine::load verifies this with k_layout_sg before enabling the path.
+#ifndef NO_MPP
 #define SGOP(mm) mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, HB_M, HB_K, false, true, false, \
     mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm
 
@@ -1438,6 +1441,7 @@ kernel void k_layout_sg(device float * A [[buffer(2)]], constant uint & out_off 
     }
     o[63] = cT.get_capacity();
 }
+#endif // NO_MPP
 
 // =============================================================================================
 // Layer 3 block-addressed prefill K/V write and causal attention kernels.
@@ -1609,6 +1613,7 @@ kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A
     }
 }
 
+#ifndef NO_MPP
 kernel void k_attn_bt_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
                           device uchar * KV0 [[buffer(3)]], constant AttnBArgs & a [[buffer(5)]],
                           device const ulong * BT [[buffer(8)]],
@@ -1843,3 +1848,4 @@ kernel void k_attn_h_blk(device const uchar * PB [[buffer(1)]], device float * A
         }
     }
 }
+#endif // NO_MPP

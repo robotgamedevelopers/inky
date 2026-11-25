@@ -1,11 +1,26 @@
 //! Tunings: one machine's settings, matched by chip and memory. Each is a file in tunings/ (compiled in); contributors
 //! add theirs. A machine with no tuning runs on defaults derived from its memory.
 
-pub struct Tuning { pub name: String, pub chip: String, pub memory_gb: u64, pub wired_limit_mb: u64, pub lane_margin_gib: f64, pub default_lanes: usize }
+pub struct Tuning {
+    pub name: String,
+    pub chip: String,
+    pub memory_gb: u64,
+    pub wired_limit_mb: u64,
+    pub lane_margin_gib: f64,
+    pub default_lanes: usize,
+    /// Whether Metal 4 / MPP `tensor_ops` are enabled (`false` on Metal 3 GPUs like Apple M3 Ultra).
+    pub use_mpp: bool,
+    /// Target share (percent) of KV pool budget allocated to sliding-window blocks (remainder goes to Full).
+    pub kv_window_pct: u64,
+    /// Default decode attention split-K target when `INK_SPLITS` is unset.
+    pub decode_splits: usize,
+}
 
 const FILES: &[&str] = &[
     include_str!("../tunings/m5-max-128gb.tuning"),
     include_str!("../tunings/m5-pro-64gb.tuning"),
+    include_str!("../tunings/m3-ultra-192gb.tuning"),
+    include_str!("../tunings/m3-ultra-512gb.tuning"),
 ];
 
 /// Parse a tuning file: `key = value` lines, `#` comments. Refuses a file missing a key.
@@ -23,8 +38,34 @@ pub fn parse(text: &str) -> Result<Tuning, String> {
         Some(v) => v.parse::<usize>().map_err(|e| format!("default_lanes: {e}"))?,
         None => 64,
     };
+    let use_mpp = match kv.get("use_mpp").map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        Some(other) => return Err(format!("use_mpp: expected true or false, got {other:?}")),
+        None => true,
+    };
+    let kv_window_pct = match kv.get("kv_window_pct") {
+        Some(v) => {
+            let pct = v.parse::<u64>().map_err(|e| format!("kv_window_pct: {e}"))?;
+            if !(1..=45).contains(&pct) {
+                return Err(format!("kv_window_pct: expected 1..=45, got {pct}"));
+            }
+            pct
+        }
+        None => 15,
+    };
+    let decode_splits = match kv.get("decode_splits") {
+        Some(v) => {
+            let splits = v.parse::<usize>().map_err(|e| format!("decode_splits: {e}"))?;
+            if !(1..=256).contains(&splits) {
+                return Err(format!("decode_splits: expected 1..=256, got {splits}"));
+            }
+            splits
+        }
+        None => 8,
+    };
     Ok(Tuning { name: get("name")?, chip: get("chip")?, memory_gb: num("memory_gb")? as u64, wired_limit_mb: num("wired_limit_mb")? as u64,
-                lane_margin_gib: num("lane_margin_gib")?, default_lanes })
+                lane_margin_gib: num("lane_margin_gib")?, default_lanes, use_mpp, kv_window_pct, decode_splits })
 }
 
 /// The tuning for a machine with this chip and memory, or the defaults for its memory.
@@ -36,7 +77,12 @@ pub fn select(chip: &str, memory_bytes: u64) -> Tuning {
     }
     // defaults: leave max(8 GB, 10%) for macOS
     let mb = memory_bytes / (1 << 20);
-    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb.saturating_sub((mb / 10).max(8192)), lane_margin_gib: 4.0, default_lanes: 64 }
+    let use_mpp = !chip.starts_with("Apple M1")
+        && !chip.starts_with("Apple M2")
+        && !chip.starts_with("Apple M3")
+        && !chip.starts_with("Apple M4");
+    Tuning { name: "default".into(), chip: chip.into(), memory_gb: gb, wired_limit_mb: mb.saturating_sub((mb / 10).max(8192)),
+             lane_margin_gib: 4.0, default_lanes: 64, use_mpp, kv_window_pct: 15, decode_splits: 8 }
 }
 
 /// This machine's chip name and memory, from sysctl.
@@ -70,9 +116,48 @@ mod tests {
     #[test] fn every_tuning_parses() { for f in FILES { parse(f).unwrap(); } }
     #[test] fn selects_the_macbook_pro() {
         let t = select("Apple M5 Max", 128 << 30);
-        assert_eq!((t.name.as_str(), t.wired_limit_mb, t.default_lanes), ("m5-max-128gb", 118000, 64));
+        assert_eq!((t.name.as_str(), t.wired_limit_mb, t.default_lanes, t.use_mpp, t.kv_window_pct, t.decode_splits),
+                   ("m5-max-128gb", 118000, 64, true, 15, 8));
         let p = select("Apple M5 Pro", 64 << 30);
-        assert_eq!((p.name.as_str(), p.wired_limit_mb, p.default_lanes), ("m5-pro-64gb", 57344, 32));
+        assert_eq!((p.name.as_str(), p.wired_limit_mb, p.default_lanes, p.use_mpp, p.kv_window_pct, p.decode_splits),
+                   ("m5-pro-64gb", 57344, 32, true, 15, 8));
+    }
+    #[test] fn selects_m3_ultra_across_192gb_and_512gb() {
+        let u192 = select("Apple M3 Ultra", 192 << 30);
+        assert_eq!(u192.name, "m3-ultra-192gb");
+        assert_eq!(u192.chip, "Apple M3 Ultra");
+        assert_eq!(u192.memory_gb, 192);
+        assert_eq!(u192.wired_limit_mb, 180224);
+        assert_eq!(u192.lane_margin_gib, 4.0);
+        assert_eq!(u192.default_lanes, 64);
+        assert!(!u192.use_mpp);
+        assert_eq!(u192.kv_window_pct, 20);
+        assert_eq!(u192.decode_splits, 16);
+
+        let u512 = select("Apple M3 Ultra", 512 << 30);
+        assert_eq!(u512.name, "m3-ultra-512gb");
+        assert_eq!(u512.chip, "Apple M3 Ultra");
+        assert_eq!(u512.memory_gb, 512);
+        assert_eq!(u512.wired_limit_mb, 491520);
+        assert_eq!(u512.lane_margin_gib, 4.0);
+        assert_eq!(u512.default_lanes, 128);
+        assert!(!u512.use_mpp);
+        assert_eq!(u512.kv_window_pct, 15);
+        assert_eq!(u512.decode_splits, 16);
+
+        // Unmatched M3 memory size falls back safely to non-MPP defaults with OS headroom.
+        let u96 = select("Apple M3 Max", 96 << 30);
+        assert_eq!(u96.name, "default");
+        assert!(!u96.use_mpp);
+        assert_eq!(u96.lane_margin_gib, 4.0);
+    }
+    #[test] fn rejects_invalid_optional_tuning_fields() {
+        let base = "name = x\nchip = y\nmemory_gb = 64\nwired_limit_mb = 57344\nlane_margin_gib = 4\n";
+        assert!(parse(&format!("{base}use_mpp = maybe\n")).is_err());
+        assert!(parse(&format!("{base}kv_window_pct = 0\n")).is_err());
+        assert!(parse(&format!("{base}kv_window_pct = 46\n")).is_err());
+        assert!(parse(&format!("{base}decode_splits = 0\n")).is_err());
+        assert!(parse(&format!("{base}decode_splits = 257\n")).is_err());
     }
     #[test] fn defaults_leave_room_for_macos() {
         let t = select("Apple M9", 64 << 30);

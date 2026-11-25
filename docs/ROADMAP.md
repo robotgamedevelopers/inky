@@ -632,7 +632,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 
 | feature | done |
 |---|:---:|
-| The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ❌ |
+| The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ✅ |
 | Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ❌ |
 | One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
 | A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve (later) | ❌ |
-| complete | 47% |
+| complete | 50% |
 
 [Source data](roadmap.sexp)
 

@@ -71,7 +71,9 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
                       pub max_spill_bytes: u64,
                       /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
-                      pub kv8: bool }
+                      pub kv8: bool,
+                      /// Force non-MPP Metal 3 simdgroup kernels (`--no-mpp` / `INKY_DISABLE_MPP=1`)
+                      pub no_mpp: bool }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
@@ -3516,7 +3518,11 @@ pub fn serve(o: ServeOpts) {
     let faults = ServeFaults::from_lookup(|k| std::env::var(k).ok()).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2); });
     let max_conns = crate::memd::raise_and_clamp_max_conns(MAX_CONNS, 64);
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
+    crate::engine::DISABLE_MPP.store(o.no_mpp, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
+    if !eng.use_mpp {
+        eprintln!("[serve] non-MPP Metal 3 simdgroup path active (use_mpp=false)");
+    }
     eng.set_loopcd_omega(o.loopcd_omega);
     eng.reserve_loopcd_weak(o.lanes);
     eng.ensure_batch(eng.chunk);

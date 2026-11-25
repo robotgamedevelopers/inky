@@ -62,6 +62,7 @@ options:
                     temporary file and is read back for every token (slower generation)
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
+  --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   --raw             do not apply the chat template; print special tokens";
 
 
@@ -88,6 +89,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
+  --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -237,6 +239,7 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
         kv8: false,
+        no_mpp: false,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
@@ -270,6 +273,7 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
             "--kv8" => o.kv8 = true,
+            "--no-mpp" => o.no_mpp = true,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -519,13 +523,23 @@ mod cli_tests {
         assert!(check_prompt_fits_ctx(63, 64).is_ok());
         assert!(check_prompt_fits_ctx(64, 64).is_err());
         assert!(check_prompt_fits_ctx(120, 64).is_err());
+
+        // --no-mpp is accepted by both inference CLI and serve
+        assert!(!cli(&["run", "-p", "hi"]).unwrap().1.no_mpp);
+        assert!(cli(&["run", "--no-mpp", "-p", "hi"]).unwrap().1.no_mpp);
+        assert!(cli(&["check", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["dbatch", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["sharedkv", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["bench", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(!serve_args(&[]).unwrap().no_mpp);
+        assert!(serve_args(&["--no-mpp"]).unwrap().no_mpp);
     }
 }
 
 struct Opts {
     model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
     system: String, temp: f32, top_p: f32, top_k: usize, seed: Option<u64>, hide_thinking: bool, n_set: bool,
-    loopcd_omega: f32, kv8: bool, kv_disk: bool, allow_mismatch: bool,
+    loopcd_omega: f32, kv8: bool, kv_disk: bool, no_mpp: bool, allow_mismatch: bool,
 }
 
 fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
@@ -538,7 +552,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
     let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
                        raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
                        temp: 1.0, top_p: 0.95, top_k: 64, seed: None, hide_thinking: false, n_set: false,
-                       loopcd_omega: 0.0, kv8: false, kv_disk: false,
+                       loopcd_omega: 0.0, kv8: false, kv_disk: false, no_mpp: false,
                        allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0") };
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| format!("missing value for {a}"));
@@ -554,6 +568,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--raw" => o.raw = true,
             "--kv8" => o.kv8 = true,
             "--kv-disk" => o.kv_disk = true,
+            "--no-mpp" => o.no_mpp = true,
             "--allow-mismatch" => o.allow_mismatch = true,
             "--effort" => o.effort = parse_effort(a, v()?)?,
             "--system" => o.system = v()?.into(),
@@ -586,6 +601,7 @@ fn parse() -> (String, Opts) {
     if cmd != "help" {
         if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
         if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
+        if o.no_mpp { engine::DISABLE_MPP.store(true, std::sync::atomic::Ordering::Relaxed); }
         o.seed = Some(resolve_seed(o.seed));
     }
     (cmd, o)

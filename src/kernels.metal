@@ -2,8 +2,10 @@
 // Buffers: 0 = W (mmapped GGUF, quantized weights), 1 = PB (small f32 params + bf16 matrices),
 //          2 = A (f32 activation arena), 3 = KV (K/V cache), 4 = CS (f32 conv state), 5 = args.
 #include <metal_stdlib>
+#ifndef NO_MPP
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 using namespace metal;
 
 #define E      2304
