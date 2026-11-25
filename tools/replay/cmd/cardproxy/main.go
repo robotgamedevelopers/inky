@@ -14,16 +14,15 @@ import (
 )
 
 func proxyFor(upstream *url.URL, cardID string) http.Handler {
-	p := httputil.NewSingleHostReverseProxy(upstream)
-	original := p.Director
-	p.Director = func(r *http.Request) {
-		original(r)
-		r.Host = upstream.Host
-		// A client cannot change the identity of this dedicated card proxy.
-		r.Header.Set("X-Inky-Card-Id", cardID)
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(upstream)
+			r.SetXForwarded()
+			// Stamp the run identity after the proxy has cleaned the outbound headers.
+			r.Out.Header.Set("X-Inky-Card-Id", cardID)
+		},
+		FlushInterval: -1,
 	}
-	p.FlushInterval = -1 // preserve streaming responses
-	return p
 }
 
 func validate(upstream, cardID, listen string) (*url.URL, error) {
