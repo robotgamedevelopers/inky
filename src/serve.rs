@@ -1540,6 +1540,8 @@ fn models_body() -> String {
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
+// Cap buffered body capacity and the input represented by live decoded requests.
+const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1548,30 +1550,35 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// rather than resetting a timeout on every read syscall.
 struct DeadlineReader<R, N, S> {
     inner: R,
-    deadline: Option<Instant>,
+    deadline: Instant,
     now: N,
     set_timeout: S,
 }
 
 impl<R, N, S> DeadlineReader<R, N, S> {
     fn new(inner: R, deadline: Instant, now: N, set_timeout: S) -> Self {
-        Self { inner, deadline: Some(deadline), now, set_timeout }
+        Self { inner, deadline, now, set_timeout }
     }
 
-    fn clear_deadline(&mut self) {
-        self.deadline = None;
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+}
+
+impl<R, N: FnMut() -> Instant, S> DeadlineReader<R, N, S> {
+    fn remaining(&mut self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since((self.now)());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request read deadline exceeded"));
+        }
+        Ok(remaining)
     }
 }
 
 impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> Read for DeadlineReader<R, N, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(deadline) = self.deadline {
-            let rem = deadline.saturating_duration_since((self.now)());
-            if rem.is_zero() {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request header read deadline exceeded"));
-            }
-            (self.set_timeout)(rem)?;
-        }
+        let remaining = self.remaining()?;
+        (self.set_timeout)(remaining)?;
         self.inner.read(buf)
     }
 }
@@ -1607,17 +1614,98 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
 }
 
-/// Why a chunked body was refused: over the cap (413) or malformed framing (400).
+struct BodyBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl BodyBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: AtomicUsize::new(0), limit }
+    }
+
+    fn reserve(&self, bytes: usize) -> Result<BodyCharge<'_>, BodyError> {
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&total| total <= self.limit)
+        }).map_err(|_| BodyError::Busy)?;
+        Ok(BodyCharge { budget: self, bytes })
+    }
+}
+
+struct BodyCharge<'a> {
+    budget: &'a BodyBudget,
+    bytes: usize,
+}
+
+impl Drop for BodyCharge<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+struct RequestBody<'a> {
+    bytes: Vec<u8>,
+    charge: BodyCharge<'a>,
+}
+
+struct DecodedBody<'a> {
+    value: Value,
+    _charge: BodyCharge<'a>,
+}
+
+impl<'a> RequestBody<'a> {
+    fn new(budget: &'a BodyBudget) -> Self {
+        Self { bytes: Vec::new(), charge: BodyCharge { budget, bytes: 0 } }
+    }
+
+    fn grow(&mut self, len: usize, max: usize) -> Result<(), BodyError> {
+        if len > self.charge.bytes {
+            let capacity = len.max(self.charge.bytes.saturating_mul(2)).min(max);
+            // Keep the old allocation charged during the copy.
+            let charge = self.charge.budget.reserve(capacity)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(capacity).map_err(|_| BodyError::Busy)?;
+            bytes.extend_from_slice(&self.bytes);
+            self.bytes = bytes;
+            self.charge = charge;
+        }
+        self.bytes.resize(len, 0);
+        Ok(())
+    }
+
+    fn decode(self) -> Result<DecodedBody<'a>, serde_json::Error> {
+        // Charge the source bytes while the JSON tree is built and for its
+        // lifetime, including admission and recording in downstream handlers.
+        let value = serde_json::from_slice(&self.bytes);
+        let Self { bytes, charge } = self;
+        drop(bytes);
+        value.map(|value| DecodedBody { value, _charge: charge })
+    }
+}
+
 #[derive(Debug)]
-enum BodyError { TooLarge, Malformed(String) }
+enum BodyError {
+    TooLarge,
+    Busy,
+    Incomplete,
+    Malformed(String),
+    InvalidJson(serde_json::Error),
+}
+
+fn read_fixed<'a>(r: &mut impl Read, len: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
+    let mut body = RequestBody::new(budget);
+    body.grow(len, len)?;
+    r.read_exact(&mut body.bytes).map_err(|_| BodyError::Incomplete)?;
+    Ok(body)
+}
 
 /// A chunked request body decoded under `max`: chunk sizes are hex with
 /// optional extensions, each chunk is followed by CRLF, the zero chunk is
 /// followed by header-like trailers and an empty line. Anything else fails
 /// closed; the cap is checked before a chunk's bytes are read.
-fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
+fn read_chunked<'a>(r: &mut impl BufRead, max: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
     let bad = |m: &str| BodyError::Malformed(m.to_string());
-    let mut body = Vec::new();
+    let mut body = RequestBody::new(budget);
     let mut framing = 0usize;
     loop {
         let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
@@ -1633,10 +1721,10 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
             }
             return Err(bad("too many trailers"));
         }
-        if n > max - body.len().min(max) { return Err(BodyError::TooLarge); }
-        let at = body.len();
-        body.resize(at + n, 0);
-        r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
+        if n > max - body.bytes.len() { return Err(BodyError::TooLarge); }
+        let at = body.bytes.len();
+        body.grow(at + n, max)?;
+        r.read_exact(&mut body.bytes[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
         let mut eol = [0u8; 1];
         r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
         let eol_len = if eol[0] == b'\r' {
@@ -2697,6 +2785,7 @@ pub fn serve(o: ServeOpts) {
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, o.ctx, o.effort, effective_queue);
     std::thread::spawn(move || {
+        let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
             if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
@@ -2706,6 +2795,7 @@ pub fn serve(o: ServeOpts) {
                 let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
                 continue;
             }
+            let body_budget = body_budget.clone();
             std::thread::spawn(move || {
                 struct Conn(Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
@@ -2713,8 +2803,6 @@ pub fn serve(o: ServeOpts) {
                 let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
                 let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
                 let Ok(h) = read_head(&mut r) else { return };
-                r.get_mut().clear_deadline();
-                let _ = s.set_read_timeout(Some(BODY_READ_TIMEOUT));
                 let path = route_path(&h.path);
                 let method = h.method.clone();
                 // the key is checked before any body is read
@@ -2739,37 +2827,60 @@ pub fn serve(o: ServeOpts) {
                     if let Err(e) = result { eprintln!("[serve] client: {e}"); }
                     return;
                 }
-                // the body is read only now, after the header gate above
+                r.get_mut().set_deadline(Instant::now() + BODY_READ_TIMEOUT);
                 let body = if h.chunked {
-                    match read_chunked(&mut r, MAX_BODY) {
-                        Ok(b) => b,
-                        Err(BodyError::TooLarge) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
-                        Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
-                    }
+                    read_chunked(&mut r, MAX_BODY, &body_budget)
                 } else {
-                    let mut body = vec![0u8; h.len];
-                    if r.read_exact(&mut body).is_err() { return; }
-                    body
+                    read_fixed(&mut r, h.len, &body_budget)
                 };
+                // A completed body may have come entirely from BufReader's
+                // buffer. Check the deadline even if no socket read was needed.
+                let body = body.and_then(|body| match r.get_mut().remaining() {
+                    Ok(_) => Ok(body),
+                    Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
+                    Err(_) => Err(BodyError::Incomplete),
+                });
                 drop(r);
                 let _ = s.set_read_timeout(None);
+                let anthropic = matches!(route, Route::Messages | Route::CountTokens);
+                let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
+                    Ok(decoded) => decoded,
+                    Err(BodyError::Busy) => {
+                        let message = "inky is busy: the request body budget is full";
+                        let retry = cx.admission.retry_after_secs();
+                        let _ = if anthropic {
+                            anthropic_overloaded(&mut s, retry, message)
+                        } else {
+                            openai_overloaded(&mut s, retry, message)
+                        };
+                        return;
+                    }
+                    Err(BodyError::Incomplete) => return,
+                    Err(e) => {
+                        let (code, kind, message) = match e {
+                            BodyError::TooLarge => (413, "request_too_large", format!("the body is over {MAX_BODY} bytes")),
+                            BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
+                            BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
+                            BodyError::Busy | BodyError::Incomplete => unreachable!(),
+                        };
+                        let result = if anthropic {
+                            anthropic_error(&mut s, code, kind, &message)
+                        } else {
+                            respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
+                        };
+                        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+                        return;
+                    }
+                };
                 let card_id = h.card_id.as_deref();
-                let r = match route {
-                    Route::Chat => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
-                    },
-                    Route::Messages => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
-                    Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => count_tokens(&cx, &v, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
+                let result = match route {
+                    Route::Chat => chat_with_card(&cx, &decoded.value, card_id, &mut s),
+                    Route::Messages => messages_with_card(&cx, &decoded.value, card_id, &mut s),
+                    Route::CountTokens => count_tokens(&cx, &decoded.value, &mut s),
                     _ => unreachable!("bodyless routes were handled above"),
                 };
-                if let Err(e) = r { eprintln!("[serve] client: {e}"); }
+                drop(decoded);
+                if let Err(e) = result { eprintln!("[serve] client: {e}"); }
             });
         }
     });
@@ -2780,6 +2891,11 @@ pub fn serve(o: ServeOpts) {
 mod tests {
     use super::*;
     fn anthropic_to_openai(req: &Value) -> Result<Value, String> { translate_messages(req).map(|(chat, _)| chat) }
+
+    fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
+        let budget = BodyBudget::new(2 * max);
+        super::read_chunked(r, max, &budget).map(|body| body.bytes)
+    }
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
@@ -2955,6 +3071,77 @@ mod tests {
         // saturating: a huge prompt can never wrap into fitting
         assert!(context_over(usize::MAX, 1, 100));
         assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
+    }
+
+    #[test]
+    fn request_body_budget_covers_fixed_chunked_and_decoded_bodies() {
+        use std::io::Cursor;
+
+        let budget = BodyBudget::new(8);
+        let body = read_fixed(&mut Cursor::new(b"[123]"), 5, &budget).unwrap();
+        let decoded = body.decode().unwrap();
+        assert_eq!(decoded.value, json!([123]));
+
+        let mut chunks = Cursor::new(b"4\r\nnull\r\n0\r\n\r\n");
+        let mut fixed = Cursor::new(b"null");
+        assert!(matches!(super::read_chunked(&mut chunks, 8, &budget), Err(BodyError::Busy)));
+        assert_eq!(chunks.position(), 3, "only the size line should be read");
+        assert!(matches!(read_fixed(&mut fixed, 4, &budget), Err(BodyError::Busy)));
+        assert_eq!(fixed.position(), 0);
+
+        drop(decoded);
+        chunks.set_position(0);
+        let body = super::read_chunked(&mut chunks, 8, &budget).unwrap();
+        assert_eq!(body.bytes, b"null");
+        assert_eq!(read_fixed(&mut fixed, 4, &budget).unwrap().bytes, b"null");
+    }
+
+    #[test]
+    fn request_body_budget_is_released_after_read_and_parse_errors() {
+        use std::io::Cursor;
+
+        let budget = BodyBudget::new(8);
+        assert!(matches!(read_fixed(&mut Cursor::new(b"{"), 8, &budget), Err(BodyError::Incomplete)));
+        let truncated = b"1\r\nx\r\n4\r\ny";
+        assert!(matches!(super::read_chunked(&mut Cursor::new(truncated), 8, &budget), Err(BodyError::Malformed(_))));
+        let body = read_fixed(&mut Cursor::new(b"invalid!"), 8, &budget).unwrap();
+        assert!(body.decode().is_err());
+        assert!(budget.reserve(8).is_ok());
+    }
+
+    #[test]
+    fn body_deadline_replaces_header_deadline_without_resetting_on_reads() {
+        use std::io::Cursor;
+
+        struct OneByte<R>(R);
+        impl<R: Read> Read for OneByte<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                self.0.read(&mut buf[..len])
+            }
+        }
+
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let tick = Duration::from_millis(1);
+        let mut reader = BufReader::with_capacity(
+            1,
+            DeadlineReader::new(
+                OneByte(Cursor::new(b"null")),
+                start + tick,
+                || {
+                    let now = clock.get();
+                    clock.set(now + tick);
+                    now
+                },
+                |_| Ok(()),
+            ),
+        );
+        clock.set(start + tick);
+        reader.get_mut().set_deadline(start + 3 * tick);
+        let budget = BodyBudget::new(4);
+        assert!(matches!(read_fixed(&mut reader, 4, &budget), Err(BodyError::Incomplete)));
+        assert!(budget.reserve(4).is_ok());
     }
 
     #[test] fn chunked_bodies_decode_bounded_and_fail_closed() {
@@ -4019,7 +4206,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(timeouts.borrow().windows(2).all(|w| w[1] < w[0]), "remaining timeout must strictly shrink");
 
-        // Fast request within deadline succeeds and preserves buffered body bytes after clear_deadline().
+        // Fast request within deadline succeeds and preserves buffered body bytes after setting the body deadline.
         let fast_clock = std::cell::Cell::new(start);
         let dr_ok = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
@@ -4031,7 +4218,7 @@ mod tests {
         let head = read_head(&mut r_ok).unwrap();
         assert_eq!(head.method, "GET");
         assert_eq!(head.path, "/health");
-        r_ok.get_mut().clear_deadline();
+        r_ok.get_mut().set_deadline(fast_clock.get() + BODY_READ_TIMEOUT);
         let mut tail = Vec::new();
         r_ok.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"body");
