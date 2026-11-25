@@ -517,8 +517,8 @@ pub struct Engine {
     blocked_slab: Rc<RefCell<BlockedSlab>>,
     /// Maximum adaptive LoopCD contrast weight (`0.0` = disabled, `0.0..=4.0`).
     loopcd_omega: Cell<f32>,
-    /// True iff the most recent forward step ran `k_loopcd_blend` (so output logits are already post-softcap).
-    last_step_loopcd: Cell<bool>,
+    /// One bit for each output row whose logits have already been softcapped by LoopCD.
+    guided_logit_rows: Cell<u128>,
     /// Lazy-allocated GPU buffer for weak-pass logits `z_1` (`n_lanes * vocab_pad * 4` bytes).
     lg_weak: RefCell<Option<Buf>>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
@@ -1040,12 +1040,10 @@ impl Engine {
         self.loopcd_omega.set(omega);
     }
     /// Current default adaptive LoopCD-Logits contrast weight (`0.0` = disabled).
-    #[allow(dead_code)]
     pub fn loopcd_omega(&self) -> f32 { self.loopcd_omega.get() }
-    /// Effective softcap for downstream GPU `k_gumbel` or CPU `Sampler` over the last step's logits:
-    /// `0.0` when `k_loopcd_blend` already applied exact softcap in-place, otherwise `self.softcap`.
-    pub fn effective_sampler_softcap(&self) -> f32 {
-        if self.last_step_loopcd.get() { 0.0 } else { self.softcap }
+    /// The sampler applies the model softcap only to raw rows of the last forward step.
+    pub fn effective_sampler_softcap(&self, row: usize) -> f32 {
+        if self.guided_logit_rows.get() & (1u128 << row) == 0 { self.softcap } else { 0.0 }
     }
     fn ensure_lg_weak(&self, n_rows: usize) -> Buf {
         let need_bytes = n_rows.max(1) * self.vocab_pad() * 4;
@@ -1055,7 +1053,7 @@ impl Engine {
         }
         slot.as_ref().unwrap().clone()
     }
-    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
+    fn encode_gumbel_at(&self, cb: &CmdBuf, logits_off: u32, row: usize, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
         assert!(out_index * 4 < lane.toks.length(), "encode_gumbel: out_index {out_index} out of bounds");
         let sa = SampArgs {
             logits_off,
@@ -1065,7 +1063,7 @@ impl Engine {
             pos: pos as u32,
             ban_tok: ban_tok.unwrap_or(u32::MAX),
             temp,
-            softcap: self.effective_sampler_softcap(),
+            softcap: self.effective_sampler_softcap(row),
         };
         let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
         let am = ArgmaxArgs { logits_off, n: self.n_vocab as u32, part_off: self.ar.part, nparts, out_index: out_index as u32, pad: [0; 3] };
@@ -1084,7 +1082,7 @@ impl Engine {
         let b = self.ba.get();
         assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
         let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
-        self.encode_gumbel_at(cb, logits_off, lane, out_index, seed, pos, temp, ban_tok);
+        self.encode_gumbel_at(cb, logits_off, span_idx, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// Batched GPU Gumbel-max sampling for multiple batch spans inside a SINGLE `MTLComputeCommandEncoder`:
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
@@ -1108,7 +1106,6 @@ impl Engine {
         }
         let e = Enc::new(cb);
         self.bind_eng(&e);
-        let eff_softcap = self.effective_sampler_softcap();
         let gumbel_grid = (self.n_vocab.div_ceil(256), 1, 1);
         for item in items {
             let logits_off = b.lg + (item.span_idx * vp) as u32;
@@ -1120,7 +1117,7 @@ impl Engine {
                 pos: item.pos as u32,
                 ban_tok: item.ban_tok.unwrap_or(u32::MAX),
                 temp: item.temp,
-                softcap: eff_softcap,
+                softcap: self.effective_sampler_softcap(item.span_idx),
             };
             self.go_nb(&e, C_ARGMAX, "k_gumbel", &sa, gumbel_grid, 256);
         }
@@ -1157,7 +1154,7 @@ impl Engine {
     /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
     /// the exact same RNG/sampling kernel for bit-identical `temperature = 1.0` equivalence.
     pub fn encode_gumbel_solo(&self, cb: &CmdBuf, lane: &Lane, out_index: usize, seed: u64, pos: usize, temp: f32, ban_tok: Option<u32>) {
-        self.encode_gumbel_at(cb, self.ar.logits, lane, out_index, seed, pos, temp, ban_tok);
+        self.encode_gumbel_at(cb, self.ar.logits, 0, lane, out_index, seed, pos, temp, ban_tok);
     }
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
@@ -1361,7 +1358,7 @@ impl Engine {
             block_pool,
             blocked_slab,
             loopcd_omega: Cell::new(0.0),
-            last_step_loopcd: Cell::new(false),
+            guided_logit_rows: Cell::new(0),
             lg_weak: RefCell::new(None),
         };
         let mut eng = eng;
@@ -2089,7 +2086,7 @@ impl Engine {
     /// This is the decode-path reference the `dbatch` harness checks (`INK_DB_OLD`), not the serving path:
     /// `inky serve` decodes through `encode_decode`.
     pub fn encode_dbatch(&self, cb: &CmdBuf, lanes: &[(&Lane, usize)], logits: bool) {
-        self.last_step_loopcd.set(false);
+        self.guided_logit_rows.set(0);
         let n = lanes.len();
         let (start, tot) = (self.dstart.get(), self.ar.total);
         assert!(n >= 1 && start >= self.ar.total && start >= self.ba.get().end && self.act.borrow().length() >= (start + n as u32 * tot) as usize * 4,
@@ -2440,7 +2437,7 @@ impl Engine {
         self.encode_spans_x(cb, spans, logits, argmax, true, None, Some(omegas));
     }
     fn encode_spans_x(&self, cb: &CmdBuf, spans: &[Span], logits: bool, argmax: bool, dec: bool, verify_k: Option<usize>, omegas: Option<&[f32]>) {
-        self.last_step_loopcd.set(false);
+        self.guided_logit_rows.set(0);
         assert!(!spans.is_empty() && spans.len() <= MAX_SPANS);
         let lane_omegas: Vec<f32> = if dec && logits {
             match omegas {
@@ -2658,7 +2655,7 @@ impl Engine {
                 e.bytes_slice(&lane_omegas, 8);
                 e.buf(weak_buf, 0, 9);
                 self.go(&e, C_LMHEAD, "k_loopcd_blend", &la, (1, n, 1), 1024);
-                self.last_step_loopcd.set(true);
+                self.guided_logit_rows.set(guided_rows(&lane_omegas));
             }
             if argmax {
                 for (si, sp) in spans.iter().enumerate() {
@@ -3777,7 +3774,7 @@ impl<'a> Run<'a> {
         cx.e.end();
     }
     fn encode_step_cx(&self, cx: &mut Cx, pos: usize, logits: bool, argmax: bool) {
-        self.last_step_loopcd.set(false);
+        self.guided_logit_rows.set(0);
         let omega = self.loopcd_omega.get();
         let run_loopcd = logits && omega > 0.0;
         assert!(!run_loopcd || !self.tier_on(), "--loopcd cannot be combined with --kv-disk");
@@ -3852,7 +3849,7 @@ impl<'a> Run<'a> {
                 e.bytes_slice(&omegas, 8);
                 e.buf(weak_buf, 0, 9);
                 self.go(e, C_LMHEAD, "k_loopcd_blend", &la, (1, 1, 1), 1024);
-                self.last_step_loopcd.set(true);
+                self.guided_logit_rows.set(1);
             }
         }
         if logits && argmax {
@@ -4032,7 +4029,16 @@ impl<'a> Run<'a> {
     // ======================================================================== batched prefill
     /// Encode prefill of `t` tokens (toks[p0..p0+t]) of this lane as one batch: a step with one span.
     pub fn encode_prefill(&self, cb: &CmdBuf, p0: usize, t: usize, logits: bool, argmax: bool) {
-        self.eng.encode_spans(cb, &[Span { lane: self.lane, p0, t }], logits, argmax);
+        if logits && self.loopcd_omega() > 0.0 {
+            // A guided first draw needs both the one-pass and full-depth logits at the last
+            // prompt position. Feed it through the same private decode path as later draws.
+            if t > 1 {
+                self.eng.encode_spans(cb, &[Span { lane: self.lane, p0, t: t - 1 }], false, false);
+            }
+            self.encode_step(cb, p0 + t - 1, true, argmax);
+        } else {
+            self.eng.encode_spans(cb, &[Span { lane: self.lane, p0, t }], logits, argmax);
+        }
     }
 }
 
@@ -4073,25 +4079,26 @@ fn use_fused_topk_route3(hgemm: bool, n: usize) -> bool {
     hgemm && n <= 64
 }
 
+fn guided_rows(omegas: &[f32]) -> u128 {
+    const { assert!(MAX_SPANS <= u128::BITS as usize); }
+    let mut mask = 0;
+    for (i, &omega) in omegas.iter().enumerate() {
+        if omega > 0.0 { mask |= 1u128 << i; }
+    }
+    mask
+}
+
 /// Pure Rust reference implementation of `k_loopcd_blend` (Liu et al., 2026, arXiv:2610.02185,
 /// Eqs. 3-4 & Appendix A.1-A.3) with exact logit softcapping:
 ///   s3(v) = softcap(z3(v)), s1(v) = softcap(z1(v))
 ///   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
 ///   z3[v] <- s3(v) + omega_t * (s3(v) - s1(v))
-/// Returns the computed adaptive weight `omega_t`.
+/// Returns the adaptive weight. A disabled row stays raw for its regular sampler.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32) -> f32 {
     assert_eq!(z3.len(), z1.len(), "loopcd_blend_row: z3 and z1 must have equal length");
     let cap = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
-    if z3.is_empty() {
-        return 0.0;
-    }
-    if omega_max <= 0.0 {
-        if softcap > 0.0 {
-            for x in z3.iter_mut() { *x = cap(*x); }
-        }
-        return 0.0;
-    }
+    if z3.is_empty() || omega_max <= 0.0 { return 0.0; }
     let mut max1 = f32::NEG_INFINITY;
     let mut max2 = f32::NEG_INFINITY;
     for &raw in z3.iter() {
@@ -4115,6 +4122,10 @@ pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32
         0.0
     };
     for (dst, &raw1) in z3.iter_mut().zip(z1.iter()) {
+        if !dst.is_finite() || !raw1.is_finite() {
+            *dst = f32::NAN;
+            continue;
+        }
         let s3 = cap(*dst);
         if omega_t > 0.0 {
             let s1 = cap(raw1);
@@ -4610,19 +4621,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Metal 4"]
+    fn loopcd_mixed_batch_preserves_disabled_rows() {
+        // In binary32, softcapping the first row can round its distinct logits to a tie.
+        let a = 20.0f32;
+        let next = f32::from_bits(a.to_bits() + 1);
+        let strong = [a, next, 1.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0, f32::NAN, 4.0];
+        let weak = [f32::NAN, 0.0, 3.0, -2.0, 0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, 2.0, f32::NAN];
+        let omegas = [0.0f32, 0.5, 0.5, 0.5, 0.5];
+        let args = LoopCdArgs {
+            logits_off: 0, n: 2, stride: 2, pad0: 0, softcap: 30.0, pad1: 0, pad2: 0, pad3: 0,
+        };
+        let gpu = Gpu::new(include_str!("kernels.metal"), &["k_loopcd_blend"]);
+        let strong_buf = gpu.buffer_with(&strong.map(f32::to_ne_bytes).concat());
+        let weak_buf = gpu.buffer_with(&weak.map(f32::to_ne_bytes).concat());
+        let cb = gpu.cmd();
+        let e = Enc::new(&cb);
+        e.pso(&gpu.pso("k_loopcd_blend"));
+        e.buf(&strong_buf, 0, 2);
+        e.bytes(&args, 5);
+        e.bytes_slice(&omegas, 8);
+        e.buf(&weak_buf, 0, 9);
+        e.dispatch((1, omegas.len(), 1), 1024);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert!(cb.error().is_none());
+
+        let actual = unsafe { std::slice::from_raw_parts(strong_buf.contents().as_ptr().cast::<f32>(), strong.len()) };
+        assert_eq!(&actual[..2], &strong[..2]);
+        let mut expected = [strong[2], strong[3]];
+        loopcd_blend_row(&mut expected, &weak[2..4], args.softcap, omegas[1]);
+        for (&got, &want) in actual[2..].iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-5, "got {got}, expected {want}");
+        }
+        // Even a zero adaptive weight must not conceal an invalid required weak logit.
+        assert!(actual[4..].iter().all(|x| x.is_nan()), "{actual:?}");
+        assert_eq!(guided_rows(&omegas), 0b11110);
+    }
+
+    #[test]
     fn loopcd_blend_reference_identities_and_adaptive_schedule() {
         let softcap = 20.0f32;
         let cap = |x: f32| softcap * (x / softcap).tanh();
 
-        // 1. omega_max == 0.0 produces exact softcap(z3) with zero contrast.
+        // 1. A disabled lane retains its raw logits and its normal sampling path.
         let z3_raw = [18.0f32, 12.5, -3.0, -40.0, 0.0];
         let z1_raw = [-5.0f32, 22.0, 10.0, 15.0, 3.0];
         let mut out0 = z3_raw;
         let w0 = loopcd_blend_row(&mut out0, &z1_raw, softcap, 0.0);
         assert_eq!(w0, 0.0);
-        for (got, &raw) in out0.iter().zip(z3_raw.iter()) {
-            assert!((got - cap(raw)).abs() < 1e-6);
-        }
+        assert_eq!(out0, z3_raw);
 
         // 2. Dominant token (p_{3,(1)} -> 1, p_{3,(2)} -> 0): omega_t -> 0 (deterministic syntax/tool-calls preserved).
         let mut z3_dom = [-50.0f32; 64];

@@ -1147,7 +1147,7 @@ kernel void k_gumbel(device float * A [[buffer(2)]], constant SampArgs & a [[buf
 // top-2 probabilities (p_{3,(1)}, p_{3,(2)}) of softmax(s3), adaptive weight
 //   omega_t = omega_max * clamp(1 - (p_{3,(1)} - p_{3,(2)}), 0, 1)
 // and overwrites Z3[v] <- s3(v) + omega_t * (s3(v) - s1(v)) in-place.
-// Downstream k_gumbel / CPU Sampler MUST pass softcap = 0.0 for blended rows.
+// The sampler skips its softcap only for rows with omega_max > 0.
 // Grid: (1, n_lanes, 1), 1024 threads (32 simdgroups).
 struct LoopCdArgs { uint logits_off, n, stride, pad0; float softcap; uint pad1, pad2, pad3; };
 inline void top2_merge(thread float & m1, thread float & m2, float b1, float b2) {
@@ -1173,16 +1173,8 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
     threadgroup float sm1[32], sm2[32], ssum[32];
     threadgroup float g_shared[3];
 
-    // Fast path when this lane disables LoopCD (omega_max <= 0): apply exact softcap only
-    // so every lane in a mixed decode batch produces post-softcap logits consistently.
-    if (omega_max <= 0.0f) {
-        if (c > 0.0f) {
-            for (uint v = tid; v < a.n; v += 1024u) {
-                Z3[v] = c * precise::tanh(Z3[v] / c);
-            }
-        }
-        return;
-    }
+    // An unguided lane keeps the same raw logits it receives when decoding alone.
+    if (omega_max <= 0.0f) return;
 
     // Pass 1: exact global top-2 of softcapped strong logits s3 across all 1024 threads.
     float m1 = -INFINITY, m2 = -INFINITY;
@@ -1236,10 +1228,16 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
     // Pass 3: write guided post-softcap logits s3 + omega_t * (s3 - s1) back to Z3.
     const float omega = g_shared[2];
     for (uint v = tid; v < a.n; v += 1024u) {
-        const float raw3 = Z3[v];
+        const float raw3 = Z3[v], raw1 = Z1[v];
+        // Softcap maps infinities to finite values. Preserve any invalid model output
+        // for the sampler, including when the adaptive weight rounds to zero.
+        if ((as_type<uint>(raw3) & 0x7f800000u) == 0x7f800000u ||
+            (as_type<uint>(raw1) & 0x7f800000u) == 0x7f800000u) {
+            Z3[v] = as_type<float>(0x7fc00000u);
+            continue;
+        }
         const float s3 = c > 0.0f ? c * precise::tanh(raw3 / c) : raw3;
         if (omega > 0.0f) {
-            const float raw1 = Z1[v];
             const float s1 = c > 0.0f ? c * precise::tanh(raw1 / c) : raw1;
             Z3[v] = s3 + omega * (s3 - s1);
         } else {

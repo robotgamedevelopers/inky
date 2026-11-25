@@ -85,7 +85,7 @@ impl<'a> Session<'a> {
             first
         } else {
             sampler
-                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
+                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap(0))
                 .expect("model sampling failed")
         };
         let mut n = 1usize;
@@ -131,7 +131,7 @@ impl<'a> Session<'a> {
                 eng.step(self.n_past, true, false).waitUntilCompleted();
                 self.n_past += 1;
                 tok = sampler
-                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
+                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap(0))
                     .expect("model sampling failed");
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
