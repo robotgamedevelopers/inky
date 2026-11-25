@@ -35,7 +35,6 @@ elapsed_since() { perl -MTime::HiRes=time -e 'printf "%.3f", time - $ARGV[0]' "$
 # its own model and generated trace, so concurrent runs never modify the checkout.
 prepare_prefix_trace() {
     local name=$1 dir=$2 from to
-    mkdir -p "$dir"
     cp "$root"/{PrefixTree.tla,PrefixTreeTrace.tla,PrefixTreeTrace.cfg} "$dir/"
     cp "$root/../src/prefix.rs" "$dir/"
     case $name in
@@ -53,13 +52,23 @@ prepare_prefix_trace() {
         MUT_FROM="$from" MUT_TO="$to" perl -0pi -e \
             's/\Q$ENV{MUT_FROM}\E/$ENV{MUT_TO}/ or die "plant not applied\n"' "$dir/prefix.rs"
     fi
-    rustc --edition=2021 --cfg standalone_blocks --crate-type rlib "$root/../src/blocks.rs" -o "$dir/libblocks.rlib"
     printf '%s\n' 'extern crate blocks;' 'mod prefix;' > "$dir/main.rs"
     rustc --edition=2021 --extern blocks="$dir/libblocks.rlib" -A dead_code --test "$dir/main.rs" -o "$dir/walk"
     rm -f "$dir/PrefixTreeTraceData.tla"
     INKY_PREFIX_TRACE_OUT="$dir/PrefixTreeTraceData.tla" "$dir/walk" \
         --exact prefix::tests::prefix_trace_dump --ignored > "$dir/walk.log"
     grep -Fq 'test result: ok. 1 passed;' "$dir/walk.log" && [[ -s "$dir/PrefixTreeTraceData.tla" ]] || { echo >&2 "prefix trace dump failed: $name"; exit 1; }
+}
+
+# Use the same address generator as "inky inblock-trace", without linking Metal.
+prepare_inblock_trace() {
+    local name=$1 dir=$2
+    cp "$root/InBlockTrace.tla" "$root/$name.cfg" "$dir/"
+    printf '%s\n' 'fn main() -> std::io::Result<()> {' \
+        '    blocks::write_inblock_trace(&std::env::args().nth(1).unwrap())' '}' > "$dir/main.rs"
+    rustc --edition=2021 --extern blocks="$dir/libblocks.rlib" "$dir/main.rs" -o "$dir/generate"
+    rm -f "$dir/InBlockTraceData.tla"
+    "$dir/generate" "$dir/InBlockTraceData.tla"
 }
 
 # run_one NAME MODULE EXPECTED KIND: one TLC run; EXPECTED is - for a run that must pass. Its table row goes to
@@ -69,10 +78,17 @@ run_one() {
     local specdir=$root config=$name workers=1
     if [[ $name = PrefixTreeNightly ]]; then workers=${TLC_WORKERS:-1}; fi
     if [[ $expected = - ]]; then expected=; fi
-    if [[ $module = PrefixTreeTrace ]]; then
+    if [[ $module = PrefixTreeTrace || $module = InBlockTrace ]]; then
         specdir=$output/$name-trace
-        config=PrefixTreeTrace
-        prepare_prefix_trace "$name" "$specdir"
+        mkdir -p "$specdir"
+        rustc --edition=2021 --cfg standalone_blocks --crate-type rlib \
+            "$root/../src/blocks.rs" -o "$specdir/libblocks.rlib"
+        if [[ $module = PrefixTreeTrace ]]; then
+            config=PrefixTreeTrace
+            prepare_prefix_trace "$name" "$specdir"
+        else
+            prepare_inblock_trace "$name" "$specdir"
+        fi
     fi
     local started elapsed rc
     started=$(now)
@@ -136,9 +152,17 @@ run_one() {
         [[ $rc -eq 0 ]] || ok=false
         if grep -q "^Error:" "$log"; then ok=false; fi
         grep -Fxq "Model checking completed. No error has been found." "$log" || ok=false
+        if [[ $module = InBlockTrace ]]; then
+            # Both element widths enumerate 2 passes x 2 planes x 3 heads x 4 positions.
+            grep -Eq '^[0-9,]+ states generated, 48 distinct states found, 0 states left on queue\.' "$log" || ok=false
+        fi
     fi
     if [[ $ok != true ]]; then
         echo >&2 "Unexpected result for $name (exit $rc); inspect $log"
+        exit 1
+    fi
+    if [[ $module = InBlockTrace ]] && ! cmp -s "$specdir/InBlockTraceData.tla" "$root/InBlockTraceData.tla"; then
+        echo >&2 "InBlockTraceData.tla is stale; regenerate it with inky inblock-trace. Fresh trace: $specdir/InBlockTraceData.tla"
         exit 1
     fi
     local counts
