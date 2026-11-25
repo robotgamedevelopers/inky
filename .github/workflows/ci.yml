@@ -68,6 +68,8 @@ jobs:
         run: cargo build --release
       - name: GPU router regression
         run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
+      - name: LoopCD model and mixed-lane regressions
+        run: cargo test --locked --release loopcd_ -- --ignored --test-threads=1
       - name: tests
         run: tests/ci.sh
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
