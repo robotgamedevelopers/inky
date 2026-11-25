@@ -100,3 +100,30 @@ func TestValidateRejectsUnsafeConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAnonymousCallerDoesNotAcquireAuthorization(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer expected" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	gateway := proxyFor(u, "card")
+	for _, tc := range []struct {
+		auth string
+		want int
+	}{{"", http.StatusUnauthorized}, {"Bearer expected", http.StatusNoContent}} {
+		r := httptest.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", nil)
+		if tc.auth != "" {
+			r.Header.Set("Authorization", tc.auth)
+		}
+		w := httptest.NewRecorder()
+		gateway.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Fatalf("authorization present=%t: status %d, want %d", tc.auth != "", w.Code, tc.want)
+		}
+	}
+}
