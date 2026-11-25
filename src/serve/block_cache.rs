@@ -87,6 +87,13 @@ struct SpilledStart {
     last_used_tick: u64,
 }
 
+/// Only blocks leaving the sliding window during this span need their table entries cleared.
+/// A cached prefix binds the still-live window at its checkpoint, so the same range applies on a hit.
+fn newly_expired_window_blocks(start: usize, end: usize) -> std::ops::Range<usize> {
+    let first_needed = |pos: usize| pos.saturating_sub(EXT - 1) / BLOCK;
+    first_needed(start)..first_needed(end)
+}
+
 fn to_spill_kind(kind: BlockKind) -> SpillBlockKind {
     match kind {
         BlockKind::Full => SpillBlockKind::Full,
@@ -1236,12 +1243,8 @@ impl ServeBlockCache {
         Ok(())
     }
 
-    fn prune_expired_window(&mut self, pools: &mut BlockPools, tbl: &mut BlockTable, next_pos: usize) {
-        let min_win_blk = next_pos.saturating_sub(EXT - 1) / BLOCK;
-        if min_win_blk == 0 {
-            return;
-        }
-        for b in 0..min_win_blk {
+    fn prune_expired_window(&mut self, pools: &mut BlockPools, tbl: &mut BlockTable, start: usize, end: usize) {
+        for b in newly_expired_window_blocks(start, end) {
             let bi = BlockIndex::new(b as u32);
             if tbl.get(BlockKind::Window, bi).expect("window block in range").is_some() {
                 tbl.clear_kind_entry(&mut pools.window, bi)
@@ -1384,7 +1387,7 @@ impl ServeBlockCache {
                 }
             }
         }
-        self.prune_expired_window(pools, tbl, end);
+        self.prune_expired_window(pools, tbl, p0, end);
     }
 
     /// Post-decode bookkeeping: update unsealed block length (never sealed into `EntryTree`)
@@ -1411,7 +1414,7 @@ impl ServeBlockCache {
                 .set_length(block_len)
                 .expect("set decode length");
         }
-        self.prune_expired_window(pools, tbl, end);
+        self.prune_expired_window(pools, tbl, pos, end);
     }
 
     /// Release a lane's block-table references and unpin its `EntryTree` path so private/unsealed
@@ -1447,6 +1450,22 @@ mod tests {
 
     fn fake_cs(tag: u8) -> Vec<u8> {
         vec![tag; 16]
+    }
+
+    #[test]
+    fn window_pruning_visits_each_expired_block_once() {
+        // A cold prefill or a single span that advances a restored checkpoint.
+        assert_eq!(newly_expired_window_blocks(0, 2048), 0..16);
+        assert_eq!(newly_expired_window_blocks(2048, 4096), 16..48);
+        // At 128K context, 64 consecutive decode steps expire exactly one block.
+        let pos = 131072;
+        let first_live = (pos - EXT) / BLOCK;
+        let visited: Vec<_> = (pos..pos + BLOCK)
+            .flat_map(|p| newly_expired_window_blocks(p, p + 1))
+            .collect();
+        assert_eq!(visited, vec![first_live]);
+        assert_eq!(newly_expired_window_blocks(pos, pos + BLOCK - 2), first_live..first_live);
+        assert_eq!(newly_expired_window_blocks(pos + BLOCK - 2, pos + BLOCK - 1), first_live..first_live + 1);
     }
 
     #[test]
@@ -1515,6 +1534,15 @@ mod tests {
             .expect("Turn 2 must match Turn 1 prompt checkpoint");
         assert_eq!(matched, 8256);
         assert_eq!(cs, fake_cs((8256 / BLOCK) as u8));
+        // The first window block restored with this checkpoint stays live up to the boundary.
+        let oldest = BlockIndex::new(((matched - EXT) / BLOCK) as u32);
+        let near_boundary = matched + BLOCK - 2;
+        for (start, end) in [(matched, near_boundary), (near_boundary, near_boundary + 1)] {
+            cache.ensure_span_blocks(&mut pools, &mut tbl, start, end - start).unwrap();
+            cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &turn2, start, end - start, || fake_cs(0));
+            assert_eq!(tbl.get(BlockKind::Window, oldest).unwrap().is_some(), end == near_boundary);
+            assert!(tbl.get(BlockKind::Full, oldest).unwrap().is_some());
+        }
         cache.release_lane(&mut pools, &mut tbl, &mut st);
 
         // Card 2: shares first 6,500 tokens (system+tools), diverges after -> must hit 6,144!
