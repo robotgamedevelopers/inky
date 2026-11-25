@@ -814,6 +814,30 @@ mod tests {
     }
 
     #[test]
+    fn pin_on_a_child_checks_its_entries_and_seek_checks_its_path() {
+        let mut live = LiveTree::new(FakeRecords::default());
+        let parent = live.insert(None, 0, &block(1), handles(1, 1)).unwrap();
+        let child_handles = handles_win(2, 1, 3, 1);
+        let child = live.insert(Some(parent), BLOCK, &block(2), child_handles).unwrap();
+        live.retain_start(child).unwrap();
+        live.records.reuse(Slot::new(1).unwrap(), BlockKind::Full);
+
+        assert_eq!(live.insert(Some(parent), BLOCK, &block(2), child_handles).unwrap(), child);
+        assert!(live.pin(child).unwrap());
+        assert_eq!(live.pin_count(parent), 0);
+        for e in child_handles.entries() {
+            assert_eq!(live.records.refs(e.slot(), e.kind()), 1);
+        }
+
+        let matched = live.deepest_start(&[block(1), block(2), block(3)].concat()).unwrap();
+        assert_eq!(matched.at, 0);
+        assert!(live.handle(child).is_none());
+        for e in child_handles.entries() {
+            assert_eq!(live.records.refs(e.slot(), e.kind()), 0);
+        }
+    }
+
+    #[test]
     fn a_fresh_block_is_never_lost_to_its_stale_twin() {
         // the stale twin is still in the tree when the fresh block is
         // sealed at the slot's new generation: the dedupe must evict

@@ -1,26 +1,27 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# Keep the documented zsh entry point usable; CI also runs this script with bash.
 # Run on the designated bench; negative controls must fail for the right reason.
-set -eu
-zmodload zsh/datetime
-root=${0:A:h}
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")" && pwd)
 jar=${TLC_JAR:-$HOME/sdk/tla/tla2tools.jar}
 java=${TLC_JAVA:-$HOME/sdk/bin/java}
 output=${TLC_OUTPUT:-$PWD/tlc-results}
 mkdir -p "$output"
-output=${output:A}
-[[ -r "$jar" ]] || { print -u2 "Missing TLC jar: $jar"; exit 1; }
+output=$(cd -- "$output" && pwd)
+[[ -r "$jar" ]] || { echo >&2 "Missing TLC jar: $jar"; exit 1; }
 
 check() {
     local name=$1 module=$2 expected=${3:-} kind=${4:-invariant} log="$output/$1.log"
-    local started=$EPOCHREALTIME elapsed rc
+    local started elapsed rc
+    started=$(perl -MTime::HiRes=time -e 'print time')
     if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC \
-        -workers 1 -metadir "$output/$name-states" \
+        -workers 1 -noGenerateSpecTE -metadir "$output/$name-states" \
         -config "$root/$name.cfg" "$root/$module.tla" >"$log" 2>&1; then
         rc=0
     else
         rc=$?
     fi
-    elapsed=$(( EPOCHREALTIME - started ))
+    elapsed=$(perl -MTime::HiRes=time -e 'printf "%.3f", time - $ARGV[0]' "$started")
     local ok=true
     # An initial-state violation stops before TLC prints a state count.
     if [[ $kind != initial ]]; then
@@ -60,7 +61,7 @@ check() {
         grep -Fxq "Model checking completed. No error has been found." "$log" || ok=false
     fi
     if [[ $ok != true ]]; then
-        print -u2 "Unexpected result for $name (exit $rc); inspect $log"
+        echo >&2 "Unexpected result for $name (exit $rc); inspect $log"
         exit 1
     fi
     local counts
@@ -71,7 +72,7 @@ check() {
     fi
     printf "%s | %s | %.3f | %s\n" "$name" "$counts" "$elapsed" "${expected:-PASS}"
 }
-print "run | generated | distinct | wall seconds | result"
+echo "run | generated | distinct | wall seconds | result"
 check PrefixTreeFast PrefixTree
 check PrefixTreeEvictFast PrefixTree
 check PrefixTreeShallow PrefixTree DeepestStart
@@ -86,7 +87,7 @@ check PrefixTreeStaleInsert PrefixTree NoBadInsert
 # test, then check every emitted state is a behaviour of the spec.
 (cd "$root/.." && INKY_PREFIX_TRACE_OUT="$root/PrefixTreeTraceData.tla" \
     cargo test --locked prefix::tests::prefix_trace_dump -- --ignored --exact >/dev/null) \
-    || { print -u2 "prefix trace dump failed"; exit 1; }
+    || { echo >&2 "prefix trace dump failed"; exit 1; }
 check PrefixTreeTrace PrefixTreeTrace
 
 # Mutants of the trace binding: each plant below must turn
@@ -101,22 +102,22 @@ mutant() {
     local tmp=$(mktemp -d)
     mkdir "$tmp/repo"
     (cd "$root/.." && tar --exclude=target --exclude=.git --exclude=tlc-results -cf - .) \
-        | (cd "$tmp/repo" && tar -xf -) || { print -u2 "mutant $name: copy failed"; exit 1; }
+        | (cd "$tmp/repo" && tar -xf -) || { echo >&2 "mutant $name: copy failed"; exit 1; }
     MUT_FROM="$from" MUT_TO="$to" perl -0pi -e \
         's/\Q$ENV{MUT_FROM}\E/$ENV{MUT_TO}/ or die "plant not applied\n"' \
         "$tmp/repo/src/prefix.rs" \
-        || { print -u2 "mutant $name: plant not applied"; rm -rf "$tmp"; exit 1; }
+        || { echo >&2 "mutant $name: plant not applied"; rm -rf "$tmp"; exit 1; }
     (cd "$tmp/repo" && CARGO_TARGET_DIR="$output/mutant-target" \
         INKY_PREFIX_TRACE_OUT="$tmp/repo/specs/PrefixTreeTraceData.tla" \
         cargo test --locked prefix::tests::prefix_trace_dump -- --ignored --exact >/dev/null 2>&1) \
-        || { print -u2 "mutant $name: the plant broke the trace walk itself"; rm -rf "$tmp"; exit 1; }
+        || { echo >&2 "mutant $name: the plant broke the trace walk itself"; rm -rf "$tmp"; exit 1; }
     if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC \
-        -workers 1 -metadir "$output/mutant-$name-states" \
+        -workers 1 -noGenerateSpecTE -metadir "$output/mutant-$name-states" \
         -config "$tmp/repo/specs/PrefixTreeTrace.cfg" "$tmp/repo/specs/PrefixTreeTrace.tla" \
         >"$log" 2>&1; then rc=0; else rc=$?; fi
     rm -rf "$tmp"
     if [[ $rc -eq 0 ]] || ! grep -Fxq "Error: $expected." "$log"; then
-        print -u2 "mutant $name did not go red as $expected; inspect $log"
+        echo >&2 "mutant $name did not go red as $expected; inspect $log"
         exit 1
     fi
     printf "mutant-%s | red as required (%s)\n" "$name" "$expected"
@@ -138,7 +139,7 @@ mutant ref-leak \
     'Ok::<(), BlockError>(())' \
     'Invariant PoolBooks is violated'
 if [[ -n "${INKY_TLC_NIGHTLY:-}" ]]; then
-check PrefixTree PrefixTree
+    check PrefixTree PrefixTree
 fi
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
@@ -166,6 +167,19 @@ check ReuseNotZeroed StartTails TailPrivateZero
 # Three slots per kind takes about a minute on one worker: the nightly workflow's tla job sets TLC_NIGHTLY.
 if [[ -n ${TLC_NIGHTLY:-} ]]; then
     check StartTails3 StartTails
+    # Cover branching and simultaneous slot identities within an exhaustible state space.
+    check PrefixTreeNightly PrefixTree
+    # Sample the original 21-node configuration too. Each of the 20 non-root
+    # nodes has six possible slot pairs, yielding at least 6^20 states.
+    sim_log="$output/PrefixTreeSimulation.log"
+    "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC \
+        -workers 1 -noGenerateSpecTE -metadir "$output/PrefixTreeSimulation-states" \
+        -simulate num=256 -depth 128 -seed 431273 \
+        -config "$root/PrefixTree.cfg" "$root/PrefixTree.tla" >"$sim_log" 2>&1 || {
+        echo >&2 "PrefixTree simulation failed; inspect $sim_log"
+        exit 1
+    }
+    grep '^Progress: .*256 traces generated (trace length: mean=128,' "$sim_log"
 fi
 check PoisonGate3 PoisonGate
 check PoisonGate4 PoisonGate
