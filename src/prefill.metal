@@ -414,6 +414,23 @@ kernel void k_state_upd(device float * A [[buffer(2)]], device float * CS [[buff
     h[0] = v[0]; h[1] = v[1]; h[2] = v[2];
 }
 
+// ---- fused decode post-conv + conv-state update across all lanes in a decode batch.
+// grid (E/256, nspans, 1), 256 threads. Bit-identical to `k_postconv_b` (T=1) followed by `k_state_upd` (T=1).
+struct PostConvDecArgs { uint desc_off, y_off, res_off, out_off, cs_slot_off, convw_off, has_res, pad; };
+kernel void k_postconv_state_dec(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device float * CS [[buffer(4)]],
+                                 constant PostConvDecArgs & a [[buffer(5)]],
+                                 uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const uint c = tgp.x * 256 + tid, si = tgp.y;
+    device const DecodeSpanDesc & d = ((device const DecodeSpanDesc *) (A + a.desc_off))[si];
+    device float * h = CS + d.cs_base + a.cs_slot_off + c * 3;
+    device const float * w = (device const float *) (PB + a.convw_off) + c * 4;
+    const float h0 = h[0], h1 = h[1], h2 = h[2];
+    const float y = A[a.y_off + si * E + c];
+    const float o = (y + w[0] * h0 + w[1] * h1 + w[2] * h2 + w[3] * y) * 0.4472135954999579f;
+    A[a.out_off + si * E + c] = (a.has_res ? A[a.res_off + si * E + c] : 0.0f) + o;
+    h[0] = h1; h[1] = h2; h[2] = y;
+}
+
 // ---- per-position conv state for a verify span. Same rule as k_state_upd, for every prefix length m = 1..T,
 // written into a side image that has cs's layout. Does not write CS. There is no second forward.
 struct StateKeepArgs { uint x_off, ldx, cs_off, nch, T, snap_off, stride, pad; };

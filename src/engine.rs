@@ -6,6 +6,7 @@ use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLDevice};
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::unix::fs::FileExt;
+use std::rc::Rc;
 
 pub const E: usize = 2304;
 pub const NH: usize = 24;
@@ -25,6 +26,13 @@ pub const LOOP_START: usize = 6;
 pub const LOOP_END: usize = 18;
 pub const N_PASS: usize = 3;
 pub const N_SLOT: usize = N_PHYS + (N_PASS - 1) * (LOOP_END - LOOP_START);
+const CS_STRIDE_F32: usize = N_SLOT * NCH * 3;
+const CS_STRIDE_BYTES: usize = CS_STRIDE_F32 * 4;
+/// Align each blocked lane's `full` and `win` GPU block tables to 32 `u64`s (256 bytes)
+/// so `setBuffer_offset_atIndex` is always 256-byte aligned on Apple Silicon.
+const BT_STRIDE_ALIGN_U64: usize = 32;
+const _: () = assert!(CS_STRIDE_BYTES % 256 == 0);
+const _: () = assert!((BT_STRIDE_ALIGN_U64 * 8) % 256 == 0);
 const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
 const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
@@ -101,16 +109,48 @@ const C_MIXF: u32 = 6; const C_ROUTER: u32 = 7; const C_GU: u32 = 8; const C_DOW
 const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
-    "k_embed", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_combine",
+    "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_attn_combine", "k_attn_combine_dec",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel",
     "k_topk", "k_norm",
-    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
+    "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
 ];
 
 // ----------------------------------------------------------------------------- kernel arg structs (mirror kernels.metal)
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct EmbedArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out0: u32, out1: u32, tok_index: u32, eps: f32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct DecodeSpanDesc {
+    tok_id: i32,
+    pos: u32,
+    cs_base: u32,
+    bt_full_base: u32,
+    bt_win_base: u32,
+    part_off: u32,
+    swa_nkeys: u32,
+    swa_first_pos: u32,
+    swa_kps: u32,
+    swa_nsplit: u32,
+    full_nkeys: u32,
+    full_kps: u32,
+    full_nsplit: u32,
+    full_tau: f32,
+    pad0: u32,
+    pad1: u32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32 }
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct AttnBlkDecArgs {
+    desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
+    q_off: u32, k_off: u32, v_off: u32, r_off: u32,
+    sink_off: u32, kdyn_off: i32, vdyn_off: i32, kconv_w: u32,
+    vconv_w: u32, qclip_w: u32, relclip_w: u32, relbias_w: u32,
+}
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct PostConvDecArgs { desc_off: u32, y_off: u32, res_off: u32, out_off: u32, cs_slot_off: u32, convw_off: u32, has_res: u32, pad: u32 }
 
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct MixJob { n_s: u32, n_q: u32, s_off: [u32; 6], q_off: i32, out_off: [u32; 4], norm_off: [i32; 4], eps: f32, tstride: u32, ncopy: [[i32; 3]; 4], ntok: u32,
@@ -463,9 +503,139 @@ pub struct Engine {
     /// splitting into at most four slabs at `maxBufferLength`. Attention does not read them yet. The table lives on the lane.
     /// `RefCell` because a step mutates the pool through `&Engine`.
     block_pool: std::cell::RefCell<crate::blocks::BlockPools>,
+    /// Shared GPU slab for all Layer 3 blocked lanes' `cs` and 64-bit GPU block tables (`full` + `win`),
+    /// with free-list slot recycling on `Drop` of `Lane`.
+    blocked_slab: Rc<RefCell<BlockedSlab>>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
     pub gpu: Gpu,
     pub g: Gguf,
+}
+
+/// Shared GPU slab backing all Layer 3 blocked lanes' convolution states (`cs_buf`) and 64-bit
+/// block tables (`bt_buf`, storing `[full | win]` per slot, each 256-byte aligned).
+struct BlockedSlab {
+    cs_buf: Option<Buf>,
+    bt_buf: Option<Buf>,
+    cap: usize,
+    used: usize,
+    bt_stride_u64: usize,
+    free_slots: Vec<usize>,
+}
+
+impl BlockedSlab {
+    fn new(default_blocks: usize) -> BlockedSlab {
+        let bt_stride_u64 = default_blocks.max(1).div_ceil(BT_STRIDE_ALIGN_U64) * BT_STRIDE_ALIGN_U64;
+        BlockedSlab {
+            cs_buf: None,
+            bt_buf: None,
+            cap: 0,
+            used: 0,
+            bt_stride_u64,
+            free_slots: Vec::new(),
+        }
+    }
+
+    fn next_cap(need: usize) -> usize {
+        if need <= 1 {
+            1
+        } else if need <= 8 {
+            need.next_power_of_two()
+        } else {
+            need.div_ceil(8) * 8
+        }
+    }
+
+    #[inline]
+    fn cs_f32_base(&self, slot_idx: usize) -> u32 {
+        u32::try_from(slot_idx * CS_STRIDE_F32).expect("blocked cs offset fits u32")
+    }
+
+    #[inline]
+    fn bt_u64_base(&self, slot_idx: usize, swa: bool) -> usize {
+        (slot_idx * 2 + usize::from(swa)) * self.bt_stride_u64
+    }
+
+    fn alloc_slot(&mut self, gpu: &Gpu, need_blocks: usize) -> usize {
+        let slot_idx = if let Some(idx) = self.free_slots.pop() {
+            idx
+        } else {
+            let idx = self.used;
+            self.used += 1;
+            idx
+        };
+        let need_stride = need_blocks.max(1).div_ceil(BT_STRIDE_ALIGN_U64) * BT_STRIDE_ALIGN_U64;
+        let new_cap = if self.used > self.cap { Self::next_cap(self.used) } else { self.cap };
+        let stride_grew = need_stride > self.bt_stride_u64;
+        if new_cap > self.cap {
+            let nb = gpu.buffer(new_cap * CS_STRIDE_BYTES);
+            unsafe {
+                let dst = nb.contents().as_ptr() as *mut u8;
+                let old_bytes = self.cap * CS_STRIDE_BYTES;
+                if let Some(old) = &self.cs_buf {
+                    std::ptr::copy_nonoverlapping(old.contents().as_ptr() as *const u8, dst, old_bytes);
+                }
+                std::ptr::write_bytes(dst.add(old_bytes), 0, new_cap * CS_STRIDE_BYTES - old_bytes);
+            }
+            self.cs_buf = Some(nb);
+        }
+        if new_cap > self.cap || stride_grew {
+            let old_stride = self.bt_stride_u64;
+            let new_stride = old_stride.max(need_stride);
+            let new_bytes = new_cap * 2 * new_stride * 8;
+            let nb = gpu.buffer(new_bytes);
+            unsafe {
+                let dst_u8 = nb.contents().as_ptr() as *mut u8;
+                std::ptr::write_bytes(dst_u8, 0, new_bytes);
+                if let Some(old) = &self.bt_buf {
+                    if stride_grew {
+                        let src_u64 = old.contents().as_ptr() as *const u64;
+                        let dst_u64 = dst_u8 as *mut u64;
+                        for s in 0..self.cap {
+                            std::ptr::copy_nonoverlapping(
+                                src_u64.add(s * 2 * old_stride),
+                                dst_u64.add(s * 2 * new_stride),
+                                old_stride,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                src_u64.add((s * 2 + 1) * old_stride),
+                                dst_u64.add((s * 2 + 1) * new_stride),
+                                old_stride,
+                            );
+                        }
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            old.contents().as_ptr() as *const u8,
+                            dst_u8,
+                            self.cap * 2 * old_stride * 8,
+                        );
+                    }
+                }
+            }
+            self.bt_buf = Some(nb);
+            self.bt_stride_u64 = new_stride;
+        }
+        self.cap = new_cap;
+        // Zero-fill this slot's cs and both block tables (required when recycling a slot).
+        unsafe {
+            let cs_ptr = (self.cs_buf.as_ref().unwrap().contents().as_ptr() as *mut u8).add(slot_idx * CS_STRIDE_BYTES);
+            std::ptr::write_bytes(cs_ptr, 0, CS_STRIDE_BYTES);
+            let bt_ptr = (self.bt_buf.as_ref().unwrap().contents().as_ptr() as *mut u8).add(slot_idx * 2 * self.bt_stride_u64 * 8);
+            std::ptr::write_bytes(bt_ptr, 0, 2 * self.bt_stride_u64 * 8);
+        }
+        slot_idx
+    }
+}
+
+struct BlockedSlot {
+    slab: Rc<RefCell<BlockedSlab>>,
+    slot_idx: usize,
+    bt_blocks: usize,
+}
+
+impl Drop for BlockedSlot {
+    fn drop(&mut self) {
+        self.slab.borrow_mut().free_slots.push(self.slot_idx);
+    }
 }
 
 /// One stream's state: everything a token's computation reads or writes besides the weights and the scratch arenas.
@@ -474,18 +644,38 @@ pub struct Lane {
     /// K/V cache (fp16). Sliding-window layers keep exactly their window (a ring of EXT keys per slot), full-attention
     /// layers every key. Both buffers are sized to the context and grow with it.
     kv_swa: RefCell<Buf>, kv_full: RefCell<Buf>, swa_cap: Cell<usize>, full_cap: Cell<usize>,
-    /// causal-convolution rows of every slot (the recurrent state)
-    cs: Buf,
+    /// causal-convolution rows of every slot for Layer 2 lanes (Layer 3 blocked lanes sub-allocate from `Engine::blocked_slab`)
+    cs_own: Option<Buf>,
     /// the stream's tokens by position (greedy decoding writes each step's argmax here, GPU to GPU)
     pub toks: Buf,
     tier: Option<Tier>,
     pub prune: RefCell<Option<Prune>>,
     /// `RefCell` because a step mutates the table through `&Lane`.
     block_table: std::cell::RefCell<crate::blocks::BlockTable>,
-    /// True when this lane reads/writes K/V through `Engine::block_pool` and `bt_*_gpu`.
+    /// True when this lane reads/writes K/V through `Engine::block_pool` and `Engine::blocked_slab`.
     use_blocks: Cell<bool>,
-    bt_win_gpu: RefCell<Option<Buf>>,
-    bt_full_gpu: RefCell<Option<Buf>>,
+    /// Sub-allocated slot inside `Engine::blocked_slab` for Layer 3 blocked lanes (recycled on `Drop`).
+    blocked_slot: Option<BlockedSlot>,
+}
+
+/// One lane's GPU Gumbel-max sampling request for [`Engine::encode_gumbel_spans`].
+#[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
+#[derive(Clone, Copy)]
+pub struct GumbelSpan<'a> {
+    pub span_idx: usize,
+    pub lane: &'a Lane,
+    pub out_index: usize,
+    pub seed: u64,
+    pub pos: usize,
+    pub temp: f32,
+    pub ban_tok: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct DecBatchMeta {
+    desc_off: u32,
+    max_swa_nsplit: usize,
+    max_full_nsplit: usize,
 }
 
 /// The engine working on one lane. Methods that touch a stream's state are on `Run`; the rest are the engine's, which
@@ -542,42 +732,61 @@ impl Lane {
             kv_swa: RefCell::new(gpu.buffer(n_swa * 2 * NKV * cap0 * HD * eng.kvb)),
             kv_full: RefCell::new(gpu.buffer(n_full * 2 * NKV * cap0 * HD * eng.kvb)),
             swa_cap: Cell::new(cap0), full_cap: Cell::new(cap0),
-            cs: gpu.buffer(N_SLOT * NCH * 3 * 4),
+            cs_own: Some(gpu.buffer(CS_STRIDE_BYTES)),
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
             tier, prune: RefCell::new(None),
             block_table: std::cell::RefCell::new(crate::blocks::BlockTable::empty()),
             use_blocks: Cell::new(false),
-            bt_win_gpu: RefCell::new(None),
-            bt_full_gpu: RefCell::new(None),
+            blocked_slot: None,
         }
     }
 
     /// A Layer 3 block-addressed lane: no contiguous Layer 2 KV cache buffers; K/V lives in
-    /// `Engine::block_pool` and is addressed via 64-bit offsets in `bt_win_gpu`/`bt_full_gpu`.
+    /// `Engine::block_pool`, while `cs` and 64-bit block tables are sub-allocated from `Engine::blocked_slab`
+    /// and recycled on `Drop`.
     pub fn new_blocked(eng: &Engine, max_pos: usize) -> Lane {
         let gpu = &eng.gpu;
         let blocks = max_pos.div_ceil(crate::blocks::BLOCK).max(1);
         let blocks_u32 = u32::try_from(blocks).expect("block count fits u32");
-        let cs = gpu.buffer(N_SLOT * NCH * 3 * 4);
-        unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, cs.length()); }
-        let bt_win = gpu.buffer(blocks * 8);
-        let bt_full = gpu.buffer(blocks * 8);
-        unsafe {
-            std::ptr::write_bytes(bt_win.contents().as_ptr() as *mut u8, 0, bt_win.length());
-            std::ptr::write_bytes(bt_full.contents().as_ptr() as *mut u8, 0, bt_full.length());
-        }
+        let slot_idx = eng.blocked_slab.borrow_mut().alloc_slot(gpu, blocks);
         Lane {
             kv_swa: RefCell::new(gpu.buffer(16)),
             kv_full: RefCell::new(gpu.buffer(16)),
             swa_cap: Cell::new(0), full_cap: Cell::new(0),
-            cs,
+            cs_own: None,
             toks: gpu.buffer((eng.max_ctx + 8) * 4),
             tier: None, prune: RefCell::new(None),
             block_table: RefCell::new(crate::blocks::BlockTable::new(blocks_u32).expect("block table")),
             use_blocks: Cell::new(true),
-            bt_win_gpu: RefCell::new(Some(bt_win)),
-            bt_full_gpu: RefCell::new(Some(bt_full)),
+            blocked_slot: Some(BlockedSlot {
+                slab: eng.blocked_slab.clone(),
+                slot_idx,
+                bt_blocks: blocks,
+            }),
         }
+    }
+
+    /// Access `(buffer, byte_offset, byte_len)` for this lane's convolution state.
+    #[inline]
+    fn with_cs_buf<R>(&self, f: impl FnOnce(&Buf, usize, usize) -> R) -> R {
+        if let Some(slot) = &self.blocked_slot {
+            let slab = slot.slab.borrow();
+            let buf = slab.cs_buf.as_ref().expect("blocked slab missing cs_buf");
+            f(buf, slot.slot_idx * CS_STRIDE_BYTES, CS_STRIDE_BYTES)
+        } else {
+            let buf = self.cs_own.as_ref().expect("Layer 2 lane missing cs buffer");
+            f(buf, 0, buf.length())
+        }
+    }
+
+    /// Access `(buffer, byte_offset, n_blocks)` for this blocked lane's 64-bit GPU block table.
+    #[inline]
+    fn with_bt_buf<R>(&self, swa: bool, f: impl FnOnce(&Buf, usize, usize) -> R) -> R {
+        let slot = self.blocked_slot.as_ref().expect("blocked lane missing slab slot");
+        let slab = slot.slab.borrow();
+        let buf = slab.bt_buf.as_ref().expect("blocked slab missing bt_buf");
+        let base_u64 = slab.bt_u64_base(slot.slot_idx, swa);
+        f(buf, base_u64 * 8, slot.bt_blocks)
     }
 
     #[allow(dead_code)]
@@ -622,14 +831,29 @@ impl Engine {
     /// dev: a hash of a lane's cache (both buffers) and convolution rows, to compare two runs bit for bit
     pub fn lane_hash(&self, lane: &Lane) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
-        let mut eat = |b: &Buf| { let p = b.contents().as_ptr() as *const u64; for i in 0..b.length() / 8 { h = (h ^ unsafe { *p.add(i) }).wrapping_mul(0x100000001b3); } };
-        eat(&lane.kv_swa.borrow()); eat(&lane.kv_full.borrow()); eat(&lane.cs);
+        let mut eat_slice = |b: &Buf, off: usize, len: usize| {
+            let p = unsafe { (b.contents().as_ptr() as *const u8).add(off) as *const u64 };
+            for i in 0..len / 8 { h = (h ^ unsafe { *p.add(i) }).wrapping_mul(0x100000001b3); }
+        };
+        { let b = lane.kv_swa.borrow(); eat_slice(&b, 0, b.length()); }
+        { let b = lane.kv_full.borrow(); eat_slice(&b, 0, b.length()); }
+        lane.with_cs_buf(|b, off, len| eat_slice(b, off, len));
         h
     }
     /// dev: make `dst` a copy of `src` (cache and convolution rows); `dst` must have been reserved to the same capacity
     pub fn copy_lane(&self, src: &Lane, dst: &Lane) {
         let cp = |a: &Buf, b: &Buf| { assert_eq!(a.length(), b.length()); unsafe { std::ptr::copy_nonoverlapping(a.contents().as_ptr() as *const u8, b.contents().as_ptr() as *mut u8, a.length()); } };
-        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow()); cp(&src.cs, &dst.cs);
+        cp(&src.kv_swa.borrow(), &dst.kv_swa.borrow()); cp(&src.kv_full.borrow(), &dst.kv_full.borrow());
+        src.with_cs_buf(|sb, soff, slen| dst.with_cs_buf(|db, doff, dlen| {
+            assert_eq!(slen, dlen);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (sb.contents().as_ptr() as *const u8).add(soff),
+                    (db.contents().as_ptr() as *mut u8).add(doff),
+                    slen,
+                );
+            }
+        }));
     }
     /// dev: make `dst` hold `src`'s first `n` positions (cache rows of every slot, convolution rows); the two may have
     /// different capacities
@@ -641,7 +865,16 @@ impl Engine {
             assert_eq!(rows, db.borrow().length() / (dc * HD * self.kvb));
             for r in 0..rows { unsafe { std::ptr::copy_nonoverlapping(sp.add(r * sc * HD * self.kvb), dp.add(r * dc * HD * self.kvb), nk * HD * self.kvb); } }
         }
-        unsafe { std::ptr::copy_nonoverlapping(src.cs.contents().as_ptr() as *const u8, dst.cs.contents().as_ptr() as *mut u8, src.cs.length()); }
+        src.with_cs_buf(|sb, soff, slen| dst.with_cs_buf(|db, doff, dlen| {
+            assert_eq!(slen, dlen);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (sb.contents().as_ptr() as *const u8).add(soff),
+                    (db.contents().as_ptr() as *mut u8).add(doff),
+                    slen,
+                );
+            }
+        }));
     }
     /// dev, the poisoned-pool gate (src/poolgate.rs): CPU views of a layer-2 lane's cache: its window buffer and
     /// its full buffer. Valid until the lane's next `reserve`; nothing may be in flight on the GPU.
@@ -815,6 +1048,72 @@ impl Engine {
         assert!(span_idx < b.lg_rows as usize, "encode_gumbel_span: row {span_idx} >= {}", b.lg_rows);
         let logits_off = b.lg + (span_idx * self.vocab_pad()) as u32;
         self.encode_gumbel_at(cb, logits_off, lane, out_index, seed, pos, temp, ban_tok);
+    }
+    /// Batched GPU Gumbel-max sampling for multiple batch spans inside a SINGLE `MTLComputeCommandEncoder`:
+    /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
+    /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
+    /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item.
+    #[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
+    pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
+        if items.is_empty() { return; }
+        let b = self.ba.get();
+        let vp = self.vocab_pad();
+        let nparts = self.n_vocab.div_ceil(1024).min(256) as u32;
+        const PART_STRIDE: usize = 512; // 2 * 256 floats per span partial buffer
+        assert!(
+            items.len() * PART_STRIDE <= NH * MAX_SPLIT * (HD + 2),
+            "encode_gumbel_spans: {} spans exceed ar.part scratch capacity",
+            items.len()
+        );
+        for item in items {
+            assert!(item.span_idx < b.lg_rows as usize, "encode_gumbel_spans: row {} >= {}", item.span_idx, b.lg_rows);
+            assert!(item.out_index * 4 < item.lane.toks.length(), "encode_gumbel_spans: out_index {} out of bounds", item.out_index);
+        }
+        let e = Enc::new(cb);
+        self.bind_eng(&e);
+        let gumbel_grid = (self.n_vocab.div_ceil(256), 1, 1);
+        for item in items {
+            let logits_off = b.lg + (item.span_idx * vp) as u32;
+            let sa = SampArgs {
+                logits_off,
+                n: self.n_vocab as u32,
+                seed_lo: item.seed as u32,
+                seed_hi: (item.seed >> 32) as u32,
+                pos: item.pos as u32,
+                ban_tok: item.ban_tok.unwrap_or(u32::MAX),
+                temp: item.temp,
+                softcap: self.softcap,
+            };
+            self.go_nb(&e, C_ARGMAX, "k_gumbel", &sa, gumbel_grid, 256);
+        }
+        e.barrier();
+        for (idx, item) in items.iter().enumerate() {
+            let logits_off = b.lg + (item.span_idx * vp) as u32;
+            let am = ArgmaxArgs {
+                logits_off,
+                n: self.n_vocab as u32,
+                part_off: self.ar.part + (idx * PART_STRIDE) as u32,
+                nparts,
+                out_index: item.out_index as u32,
+                pad: [0; 3],
+            };
+            self.go_nb(&e, C_ARGMAX, "k_argmax1", &am, (nparts as usize, 1, 1), 1024);
+        }
+        e.barrier();
+        for (idx, item) in items.iter().enumerate() {
+            let logits_off = b.lg + (item.span_idx * vp) as u32;
+            let am = ArgmaxArgs {
+                logits_off,
+                n: self.n_vocab as u32,
+                part_off: self.ar.part + (idx * PART_STRIDE) as u32,
+                nparts,
+                out_index: item.out_index as u32,
+                pad: [0; 3],
+            };
+            e.buf(&item.lane.toks, 0, 6);
+            self.go_nb(&e, C_ARGMAX, "k_argmax2", &am, (1, 1, 1), 32);
+        }
+        e.end();
     }
     /// GPU Gumbel-max sampling for a single-span prefill whose logits live in `ar.logits`.
     /// Ensures solo (`spans.len() == 1`) and batched (`spans.len() > 1`) prefills draw from
@@ -1008,6 +1307,7 @@ impl Engine {
             path.rsplit('/').next().unwrap_or(path), g.file_len() as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
         // KV_CAP0 positions is one block. Further slots come from `BlockPool::grow`.
         let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
+        let blocked_slab = Rc::new(RefCell::new(BlockedSlab::new(max_ctx.div_ceil(crate::blocks::BLOCK))));
         let eng = Engine {
             eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
             g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
@@ -1021,6 +1321,7 @@ impl Engine {
             max_ctx, n_vocab,
             verify_keep: RefCell::new(None), verify_record: Cell::new(false),
             block_pool,
+            blocked_slab,
         };
         let mut eng = eng;
         eng.ensure_batch(64);
@@ -1464,7 +1765,9 @@ impl Engine {
     }
     /// bind a lane's cache (sliding-window buffer), convolution rows and tokens
     fn bind_lane(&self, e: &Enc, lane: &Lane) {
-        e.buf(&lane.kv_swa.borrow(), 0, 3); e.buf(&lane.cs, 0, 4); e.buf(&lane.toks, 0, 6);
+        e.buf(&lane.kv_swa.borrow(), 0, 3);
+        lane.with_cs_buf(|b, off, _| e.buf(b, off, 4));
+        e.buf(&lane.toks, 0, 6);
     }
     /// Bind the 1..=4 GPU slab buffers of `kind` (`Window` if `swa`, else `Full`) at buffer slots 3, 10, 11, 12.
     fn bind_pool_slabs(&self, e: &Enc, swa: bool) {
@@ -1479,40 +1782,66 @@ impl Engine {
     }
     /// Bind a blocked lane's 64-bit GPU block table (`Window` if `swa`, else `Full`) at buffer slot 8.
     fn bind_lane_bt(e: &Enc, lane: &Lane, swa: bool) {
-        let bt = if swa { lane.bt_win_gpu.borrow() } else { lane.bt_full_gpu.borrow() };
-        e.buf(bt.as_ref().expect("blocked lane missing GPU block table"), 0, 8);
+        lane.with_bt_buf(swa, |b, off, _| e.buf(b, off, 8));
     }
-    /// Validate every block needed by span `[p0, p0 + t)` and upload the lane's 64-bit block tables to GPU memory.
+    /// Validate required blocks for span `[p0, p0 + t)` and incrementally upload ONLY the lane's dirty
+    /// 64-bit block-table range `[dirty_lo..=dirty_hi]` to GPU memory (0 bytes written on clean decode steps).
     pub fn sync_lane_block_table(&self, lane: &Lane, p0: usize, t: usize) {
         use crate::blocks::{BlockIndex, BlockKind, BLOCK as KV_BLOCK};
         assert!(lane.use_blocks.get(), "sync_lane_block_table called on a Layer 2 lane");
-        let table = lane.block_table.borrow();
+        let mut table = lane.block_table.borrow_mut();
         let pools = self.block_pool.borrow();
         let n_blk = table.blocks_per_kind() as usize;
         assert!(t >= 1 && p0 + t <= n_blk * KV_BLOCK, "Layer 3 span [{p0}, {}) exceeds block table ({} blocks)", p0 + t, n_blk);
+        let lo_span_blk = p0 / KV_BLOCK;
         let hi_blk = (p0 + t - 1) / KV_BLOCK;
         let lo_win_blk = p0.saturating_sub(EXT - 1) / KV_BLOCK;
-        for (kind, lo, bt_cell) in [
-            (BlockKind::Full, 0usize, &lane.bt_full_gpu),
-            (BlockKind::Window, lo_win_blk, &lane.bt_win_gpu),
+        for (kind, lo) in [
+            (BlockKind::Full, 0usize),
+            (BlockKind::Window, lo_win_blk),
         ] {
             let pool = pools.of(kind);
-            let bt_guard = bt_cell.borrow();
-            let bt_buf = bt_guard.as_ref().expect("blocked lane missing GPU block table");
-            let dst = unsafe { std::slice::from_raw_parts_mut(bt_buf.contents().as_ptr() as *mut u64, n_blk) };
-            for b in 0..n_blk {
+            // O(1) boundary validation in release builds; full `[lo..=hi_blk]` verification in debug builds.
+            for check_b in [lo, lo_span_blk, hi_blk] {
+                let bi = BlockIndex::new(check_b as u32);
+                let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
+                    panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {check_b}", p0 + t)
+                });
+                let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
+                    panic!(
+                        "Layer 3 {kind:?} block {check_b} entry invalid for slot {} gen {}: {err}",
+                        entry.slot().get(),
+                        entry.generation()
+                    )
+                });
+            }
+            #[cfg(debug_assertions)]
+            for b in lo..=hi_blk {
                 let bi = BlockIndex::new(b as u32);
-                match table.get(kind, bi).expect("block index in range") {
-                    Some(entry) => {
-                        dst[b] = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
-                            panic!("Layer 3 {kind:?} block {b} entry invalid for slot {} gen {}: {err}", entry.slot().get(), entry.generation())
-                        });
-                    }
-                    None => {
-                        assert!(!(b >= lo && b <= hi_blk), "Layer 3 span [{p0}, {}) missing required {kind:?} block {b}", p0 + t);
-                        dst[b] = 0;
-                    }
-                }
+                let entry = table.get(kind, bi).expect("block index in range").unwrap_or_else(|| {
+                    panic!("Layer 3 span [{p0}, {}) missing required {kind:?} block {b}", p0 + t)
+                });
+                let _ = pool.gpu_table_entry(entry).unwrap_or_else(|err| {
+                    panic!(
+                        "Layer 3 {kind:?} block {b} entry invalid for slot {} gen {}: {err}",
+                        entry.slot().get(),
+                        entry.generation()
+                    )
+                });
+            }
+            if table.dirty_range(kind).is_some() {
+                lane.with_bt_buf(kind == BlockKind::Window, |bt_buf, byte_off, cap_blk| {
+                    assert!(n_blk <= cap_blk, "blocked lane GPU table smaller than BlockTable");
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                            n_blk,
+                        )
+                    };
+                    table.sync_dirty_to_slice(kind, pool, dst).unwrap_or_else(|err| {
+                        panic!("Layer 3 {kind:?} dirty block-table sync failed: {err}")
+                    });
+                });
             }
         }
     }
@@ -1960,11 +2289,13 @@ impl Engine {
             assert!(end <= rec.p0 + t);
             if n_keep < t { assert!(end < rec.p0 + t, "a rejected tail is not sealed"); }
             let bytes = stride * 4;
-            assert_eq!(bytes, lane.cs.length());
-            unsafe {
-                let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
-                std::ptr::copy_nonoverlapping(src, lane.cs.contents().as_ptr() as *mut u8, bytes);
-            }
+            lane.with_cs_buf(|dst_buf, dst_off, dst_len| {
+                assert_eq!(bytes, dst_len);
+                unsafe {
+                    let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
+                    std::ptr::copy_nonoverlapping(src, (dst_buf.contents().as_ptr() as *mut u8).add(dst_off), bytes);
+                }
+            });
             rec.kv.iter().skip(n_keep).cloned().collect::<Vec<_>>()
         };
         for undo in &tail { self.restore_kv_pos(lane, undo); }
@@ -2071,23 +2402,96 @@ impl Engine {
         { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
         let e = Enc::new(cb);
         self.bind_eng(&e);
-        self.bind_lane(&e, spans[0].lane);
-        // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step or Layer 3 block path does not use it)
-        if !dec && !blocked {
-            let bz = self.ba.get();
-            let zr = [bz.sk, bz.perm - bz.sk];
-            e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
-            e.barrier();
-        }
         let b = self.ba.get();
-        for (si, sp) in spans.iter().enumerate() {
-            let r0 = (row0[si] * E) as u32;
-            let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
-                                 norm_off: self.tok_norm, out0: b.vec(0) + r0, out1: b.vec(0) + r0, tok_index: sp.p0 as u32, eps: self.eps };
-            e.buf(&sp.lane.toks, 0, 6);
-            self.go_nb(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
-        }
-        e.barrier();
+        let dec_meta = if dec && blocked {
+            let desc_off = self.dstart.get();
+            let desc_floats = spans.len() * (std::mem::size_of::<DecodeSpanDesc>() / 4);
+            assert!(
+                desc_floats <= self.ar.part as usize,
+                "decode span descriptors ({desc_floats} floats) exceed pre-partial scratch ({})",
+                self.ar.part
+            );
+            let slab = self.blocked_slab.borrow();
+            let mut max_swa_nsplit = 1usize;
+            let mut max_full_nsplit = 1usize;
+            {
+                let act = self.act.borrow();
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (act.contents().as_ptr() as *mut f32).add(desc_off as usize) as *mut DecodeSpanDesc,
+                        spans.len(),
+                    )
+                };
+                for (si, sp) in spans.iter().enumerate() {
+                    let slot = sp.lane.blocked_slot.as_ref().expect("blocked lane missing slab slot");
+                    assert!(Rc::ptr_eq(&slot.slab, &self.blocked_slab), "blocked lane belongs to a different Engine");
+                    let pos = sp.p0;
+                    assert!(pos * 4 < sp.lane.toks.length(), "decode pos {pos} out of bounds for lane.toks");
+                    let tok_id = unsafe { *(sp.lane.toks.contents().as_ptr() as *const i32).add(pos) };
+                    let swa_nkeys = (pos + 1).min(EXT);
+                    let swa_first_pos = pos + 1 - swa_nkeys;
+                    let swa_kps = Run::split_kps(swa_nkeys);
+                    let swa_nsplit = swa_nkeys.div_ceil(swa_kps);
+                    let full_nkeys = pos + 1;
+                    let full_kps = Run::split_kps(full_nkeys);
+                    let full_nsplit = full_nkeys.div_ceil(full_kps);
+                    let full_tau = 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln();
+                    max_swa_nsplit = max_swa_nsplit.max(swa_nsplit);
+                    max_full_nsplit = max_full_nsplit.max(full_nsplit);
+                    dst[si] = DecodeSpanDesc {
+                        tok_id,
+                        pos: pos as u32,
+                        cs_base: slab.cs_f32_base(slot.slot_idx),
+                        bt_full_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, false)).expect("bt_full_base fits u32"),
+                        bt_win_base: u32::try_from(slab.bt_u64_base(slot.slot_idx, true)).expect("bt_win_base fits u32"),
+                        part_off: desc_off + si as u32 * self.ar.total + self.ar.part,
+                        swa_nkeys: swa_nkeys as u32,
+                        swa_first_pos: swa_first_pos as u32,
+                        swa_kps: swa_kps as u32,
+                        swa_nsplit: swa_nsplit as u32,
+                        full_nkeys: full_nkeys as u32,
+                        full_kps: full_kps as u32,
+                        full_nsplit: full_nsplit as u32,
+                        full_tau,
+                        pad0: 0,
+                        pad1: 0,
+                    };
+                }
+            }
+            // Bind shared blocked `CS` (buffer 4) and `BT` (buffer 8) ONCE for the entire decode step.
+            e.buf(slab.cs_buf.as_ref().expect("blocked slab missing cs_buf"), 0, 4);
+            e.buf(slab.bt_buf.as_ref().expect("blocked slab missing bt_buf"), 0, 8);
+            let ea = EmbedDecArgs {
+                emb_lo: self.tok_embd.off as u32,
+                emb_hi: (self.tok_embd.off >> 32) as u32,
+                row_bytes: self.tok_embd.row_bytes,
+                norm_off: self.tok_norm,
+                out_off: b.vec(0),
+                desc_off,
+                eps: self.eps,
+                pad: 0,
+            };
+            self.go(&e, C_EMBED, "k_embed_dec", &ea, (spans.len(), 1, 1), 256);
+            Some(DecBatchMeta { desc_off, max_swa_nsplit, max_full_nsplit })
+        } else {
+            self.bind_lane(&e, spans[0].lane);
+            // the window K/V scratch (sk, then sv) starts every prefill at zero: see k_zero (a decode step or Layer 3 block path does not use it)
+            if !dec && !blocked {
+                let bz = self.ba.get();
+                let zr = [bz.sk, bz.perm - bz.sk];
+                e.pso(&self.gpu.pso("k_zero")); e.bytes(&zr, 5); e.dispatch(((zr[1] as usize).div_ceil(1024), 1, 1), 256);
+                e.barrier();
+            }
+            for (si, sp) in spans.iter().enumerate() {
+                let r0 = (row0[si] * E) as u32;
+                let ea = EmbedArgs { emb_lo: self.tok_embd.off as u32, emb_hi: (self.tok_embd.off >> 32) as u32, row_bytes: self.tok_embd.row_bytes,
+                                     norm_off: self.tok_norm, out0: b.vec(0) + r0, out1: b.vec(0) + r0, tok_index: sp.p0 as u32, eps: self.eps };
+                e.buf(&sp.lane.toks, 0, 6);
+                self.go_nb(&e, C_EMBED, "k_embed", &ea, (sp.t, 1, 1), 256);
+            }
+            e.barrier();
+            None
+        };
         // Last layer: nothing after the batch reads its outputs except the final token (logits) and the conv states (last 3
         // rows of the two branch outputs). It is a full-attention layer, so K/V still cover every token, but queries, attention,
         // output projection and FFN only run from row t-8: the conv/residual chain makes rows >= t-2 of the result exact.
@@ -2098,7 +2502,7 @@ impl Engine {
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
         if verify_k.is_some() { self.verify_record.set(true); }
-        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in 0..LOOP_START { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
@@ -2106,10 +2510,10 @@ impl Engine {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
             let pinned: Vec<usize> = { let mut p = vec![prelude]; if pass > 0 { p.push(bank.0); p.push(bank.1); } p };
-            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
+            for ip in LOOP_START..LOOP_END { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, slot_of(pass, ip), ip, cur, &mut blocks, msg, &mut va, &pinned, 0); }
             bank = (blocks[prelude_blocks.len() + 1], cur);
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
+        for ip in LOOP_END..N_PHYS { cur = self.layer_b(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip]); }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -2173,7 +2577,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
+    fn layer_b(&self, e: &Enc, spans: &[Span], row0: &[usize], t: usize, dec: bool, dec_meta: Option<DecBatchMeta>, slot: usize, ip: usize, cur: usize, blocks: &mut Vec<usize>,
                msg: Option<(usize, usize)>, va: &mut VecAlloc, pinned: &[usize], ts: usize) -> usize {
         let l = &self.layers[ip];
         let b = self.ba.get();
@@ -2251,26 +2655,48 @@ impl Engine {
         let scap = (EXT + b.cap + 2 * KGUARD) as u32;
         let blocked = spans[0].lane.use_blocks.get();
         let pass_idx = self.slot_kind[slot].1 as u32;
-        if dec {
-            // a decode step: each lane's token through the decode path's fused attention (K/V conv from the lane's state,
-            // cache write, split-K attention over the lane's cache, combine + output gate), into qp as f32 rows. The lanes'
-            // attention dispatches are independent (own cache, state, rows and split partials): no barrier between them.
+        if let Some(dm) = dec_meta {
+            // Layer 3 blocked 3D-batched decode attention + 2D-batched combine: 1 dispatch each across all spans.
+            // Shared `CS` (buffer 4) and `BT` (buffer 8) stay bound for the entire decode step.
+            assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
+            self.bind_pool_slabs(e, l.swa);
+            let aa = AttnBlkDecArgs {
+                desc_off: dm.desc_off,
+                pass_idx,
+                cs_slot,
+                swa: l.swa as u32,
+                q_off: b.q,
+                k_off: b.k,
+                v_off: b.v,
+                r_off: b.rel,
+                sink_off: b.sink,
+                kdyn_off: if l.swa { -1 } else { b.kdyn as i32 },
+                vdyn_off: if l.swa { -1 } else { b.vdyn as i32 },
+                kconv_w: l.k_conv,
+                vconv_w: l.v_conv,
+                qclip_w: l.q_clip,
+                relclip_w: l.rel_clip,
+                relbias_w: l.rel_bias,
+            };
+            let max_nsplit = if l.swa { dm.max_swa_nsplit } else { dm.max_full_nsplit };
+            self.go(e, C_ATTN, "k_attn_blk_dec", &aa, (max_nsplit, NKV, spans.len()), 128);
+            let ca = CombineDecArgs { desc_off: dm.desc_off, gate_off: b.gate, out_off: b.qp, swa: l.swa as u32 };
+            self.go(e, C_COMB, "k_attn_combine_dec", &ca, (NH, spans.len(), 1), 128);
+            e.buf(&self.act.borrow(), 0, 3);
+            // f32 attention outputs -> the half rows the output projection reads
+            self.tohalf(e, C_WO, b.qp, NH * HD, b.agh, NH * HD, NH * HD, t, None);
+            e.barrier();
+        } else if dec {
+            // Layer 2 decode step: each lane's token through the decode path's fused attention.
             let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
-            if blocked { self.bind_pool_slabs(e, l.swa); }
             for (si, sp) in spans.iter().enumerate() {
                 let run = self.on(sp.lane);
                 let (pos, r0) = (sp.p0, row0[si]);
                 let tau = if l.swa { 1.0 } else { 1.0 + self.log_alpha * (((pos + 1) as f32 / self.log_floor).max(1.0)).ln() };
                 let ar = self.ar;
-                let (kb, vb, kcap) = if blocked {
-                    e.buf(&sp.lane.cs, 0, 4); e.buf(&sp.lane.toks, 0, 6);
-                    Self::bind_lane_bt(e, sp.lane, l.swa);
-                    (pass_idx, 0, 0)
-                } else {
-                    self.bind_lane(e, sp.lane);
-                    run.bind_kv(e, l.swa);
-                    run.kv_slot(slot)
-                };
+                self.bind_lane(e, sp.lane);
+                run.bind_kv(e, l.swa);
+                let (kb, vb, kcap) = run.kv_slot(slot);
                 let base = AttnArgs {
                     pos: pos as u32, cap: kcap, k_base: kb, v_base: vb, cs_off: cs_slot,
                     q_off: b.q + (r0 * NH * HD) as u32, k_off: b.k + (r0 * NKV * HD) as u32, v_off: b.v + (r0 * NKV * HD) as u32,
@@ -2286,7 +2712,7 @@ impl Engine {
                 let aa = AttnArgs { nkeys: nkeys as u32, first_pos: (pos + 1 - nkeys) as u32, ring: l.swa as u32, kps: kps as u32, nsplit: nsplit as u32,
                                     pad: self.sep_comb as u32, ..base };
                 assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
-                self.go_nb(e, C_ATTN, if blocked { "k_attn_blk" } else { "k_attn" }, &aa, (nsplit, NKV, 1), 128);
+                self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
                 combs.push(CombineArgs { part_off: aa.part_off, nsplit: nsplit as u32, gate_off: aa.gate_off, out_off: aa.out_off });
             }
             e.barrier();
@@ -2307,7 +2733,7 @@ impl Engine {
         let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
         let (n, nn_) = (t - ts, (t - ts) as u32);
         let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
-        e.buf(&sp.lane.cs, 0, 4);
+        sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
         let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
         let qpd = if hatt { NH * HD / 2 } else { NH * HD };
         if blocked {
@@ -2405,23 +2831,37 @@ impl Engine {
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
-        // post-conv and its state: span by span (the convolution runs along each lane's own rows, from its own state)
-        // (each span's convolution reads its lane's state before the state update overwrites it; spans are independent)
-        for (si, sp) in spans.iter().enumerate() {
-            let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
-            e.buf(&sp.lane.cs, 0, 4);
-            let cv = ConvBArgs { y_off: b.wo_y + q0, ldy: es, res_off: vo(cur) + q0, out_off: vo(mid) + q0, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
-                                 convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
-            self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+        // post-conv and its state: fused single 2D dispatch for Layer 3 decode, span by span otherwise.
+        if let Some(dm) = dec_meta {
+            debug_assert!(ts == 0 && !self.verify_record.get());
+            let pc = PostConvDecArgs {
+                desc_off: dm.desc_off,
+                y_off: b.wo_y,
+                res_off: vo(cur),
+                out_off: vo(mid),
+                cs_slot_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                convw_off: l.attn_post_conv,
+                has_res: (!block_start) as u32,
+                pad: 0,
+            };
+            self.go(e, C_WOPOST, "k_postconv_state_dec", &pc, (E / 256, spans.len(), 1), 256);
+        } else {
+            for (si, sp) in spans.iter().enumerate() {
+                let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
+                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                let cv = ConvBArgs { y_off: b.wo_y + q0, ldy: es, res_off: vo(cur) + q0, out_off: vo(mid) + q0, cs_off: cs_slot + (2 * NKV * HD * 3) as u32,
+                                     convw_off: l.attn_post_conv, has_res: (!block_start) as u32, pad: 0 };
+                self.go_nb(e, C_WOPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+            }
+            e.barrier();
+            for (si, sp) in spans.iter().enumerate() {
+                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
+                self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            }
+            e.barrier();
         }
-        e.barrier();
-        for (si, sp) in spans.iter().enumerate() {
-            e.buf(&sp.lane.cs, 0, 4);
-            let su = StateArgs { x_off: b.wo_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + (2 * NKV * HD * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-            self.keep_state(e, si, &su, C_WOPOST, (E / 256, 1, 1));
-            self.go_nb(e, C_WOPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
-        }
-        e.barrier();
         if block_start { blocks.push(cur); }
         // ---- FFN input
         let mut st: Vec<u32> = blocks.iter().map(|&v| sh(vo(v), E)).collect(); st.push(sh(vo(mid), E));
@@ -2509,21 +2949,36 @@ impl Engine {
         else { self.go(e, C_DOWN, "k_moe_comb_b", &ca, (E / 256, t, 1), 256); }
         let mut live: Vec<usize> = blocks.clone(); live.push(mid); live.extend_from_slice(pinned);
         let out = va.alloc(&live);
-        for (si, sp) in spans.iter().enumerate() {
-            let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
-            e.buf(&sp.lane.cs, 0, 4);
-            let cv = ConvBArgs { y_off: b.ffn_y + q0, ldy: es, res_off: vo(mid) + q0, out_off: vo(out) + q0, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
-                                 convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
-            self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+        if let Some(dm) = dec_meta {
+            debug_assert!(ts == 0 && !self.verify_record.get());
+            let pc = PostConvDecArgs {
+                desc_off: dm.desc_off,
+                y_off: b.ffn_y,
+                res_off: vo(mid),
+                out_off: vo(out),
+                cs_slot_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                convw_off: l.ffn_post_conv,
+                has_res: 1,
+                pad: 0,
+            };
+            self.go(e, C_FFNPOST, "k_postconv_state_dec", &pc, (E / 256, spans.len(), 1), 256);
+        } else {
+            for (si, sp) in spans.iter().enumerate() {
+                let (q0, qn) = (((row0[si] + ts) * E) as u32, sp.t - ts);
+                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                let cv = ConvBArgs { y_off: b.ffn_y + q0, ldy: es, res_off: vo(mid) + q0, out_off: vo(out) + q0, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32,
+                                     convw_off: l.ffn_post_conv, has_res: 1, pad: 0 };
+                self.go_nb(e, C_FFNPOST, "k_postconv_b", &cv, (E / 256, qn, 1), 256);
+            }
+            e.barrier();
+            for (si, sp) in spans.iter().enumerate() {
+                sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
+                let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
+                self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
+                self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
+            }
+            e.barrier();
         }
-        e.barrier();
-        for (si, sp) in spans.iter().enumerate() {
-            e.buf(&sp.lane.cs, 0, 4);
-            let su = StateArgs { x_off: b.ffn_y + (row0[si] * E) as u32, ldx: es, cs_off: cs_slot + ((2 * NKV * HD + E) * 3) as u32, nch: es, t: sp.t as u32, pad: [0; 3] };
-            self.keep_state(e, si, &su, C_FFNPOST, (E / 256, 1, 1));
-            self.go_nb(e, C_FFNPOST, "k_state_upd", &su, (E / 256, 1, 1), 256);
-        }
-        e.barrier();
         out
     }
 
@@ -2535,7 +2990,7 @@ impl<'a> Run<'a> {
     /// bind everything a kernel may read: the engine's buffers and this lane's cache, convolution rows and tokens
     fn bind(&self, e: &Enc) {
         self.bind_eng(e);
-        e.buf(&self.lane.kv_swa.borrow(), 0, 3); e.buf(&self.lane.cs, 0, 4); e.buf(&self.lane.toks, 0, 6);
+        self.bind_lane(e, self.lane);
     }
     /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
     /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
@@ -2941,11 +3396,11 @@ impl<'a> Run<'a> {
     /// conv state and sliding-window rings, to rerun the same decode steps
     pub fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
         let g = |b: &Buf| unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()).to_vec() };
-        (g(&self.lane.cs), g(&self.lane.kv_swa.borrow()))
+        (self.get_cs(), g(&self.lane.kv_swa.borrow()))
     }
     pub fn restore(&self, s: &(Vec<u8>, Vec<u8>)) {
+        self.set_cs(&s.0);
         unsafe {
-            std::ptr::copy_nonoverlapping(s.0.as_ptr(), self.lane.cs.contents().as_ptr() as *mut u8, s.0.len());
             std::ptr::copy_nonoverlapping(s.1.as_ptr(), self.lane.kv_swa.borrow().contents().as_ptr() as *mut u8, s.1.len());
         }
     }
@@ -3126,12 +3581,23 @@ impl<'a> Run<'a> {
     }
 
     /// a copy of this lane's convolution rows (its recurrent state at the current position)
-    pub fn get_cs(&self) -> Vec<u8> { unsafe { std::slice::from_raw_parts(self.lane.cs.contents().as_ptr() as *const u8, self.lane.cs.length()).to_vec() } }
+    pub fn get_cs(&self) -> Vec<u8> {
+        self.lane.with_cs_buf(|b, off, len| unsafe {
+            std::slice::from_raw_parts((b.contents().as_ptr() as *const u8).add(off), len).to_vec()
+        })
+    }
     /// put back convolution rows `get_cs` copied. Nothing may be in flight on the GPU.
-    pub fn set_cs(&self, v: &[u8]) { assert_eq!(v.len(), self.lane.cs.length()); unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.lane.cs.contents().as_ptr() as *mut u8, v.len()); } }
+    pub fn set_cs(&self, v: &[u8]) {
+        self.lane.with_cs_buf(|b, off, len| {
+            assert_eq!(v.len(), len);
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), (b.contents().as_ptr() as *mut u8).add(off), len); }
+        });
+    }
     pub fn reset(&self) {
         self.tier_reset();
-        unsafe { std::ptr::write_bytes(self.lane.cs.contents().as_ptr() as *mut u8, 0, self.lane.cs.length()); }
+        self.lane.with_cs_buf(|b, off, len| unsafe {
+            std::ptr::write_bytes((b.contents().as_ptr() as *mut u8).add(off), 0, len);
+        });
     }
 
     pub fn set_tokens(&self, start: usize, toks: &[u32]) {
@@ -3471,5 +3937,147 @@ mod tests {
         assert_eq!(std::mem::size_of::<MoeGemmArgs>(), 20 * 4);
         assert_eq!(std::mem::size_of::<MoeGemmHArgs>(), 20 * 4);
         assert_eq!(std::mem::size_of::<SampArgs>(), 8 * 4);
+        assert_eq!(std::mem::size_of::<DecodeSpanDesc>(), 16 * 4);
+        assert_eq!(std::mem::align_of::<DecodeSpanDesc>(), 4);
+        assert_eq!(std::mem::size_of::<EmbedDecArgs>(), 8 * 4);
+        assert_eq!(std::mem::size_of::<CombineDecArgs>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<AttnBlkDecArgs>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<PostConvDecArgs>(), 8 * 4);
+
+        // Verify exact field offsets of `DecodeSpanDesc` match `kernels.metal`.
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, tok_id), 0);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pos), 4);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, cs_base), 8);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, bt_full_base), 12);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, bt_win_base), 16);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, part_off), 20);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_nkeys), 24);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_first_pos), 28);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_kps), 32);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_nsplit), 36);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_nkeys), 40);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_kps), 44);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_nsplit), 48);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_tau), 52);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad0), 56);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad1), 60);
+
+        // Verify `AttnBlkDecArgs` and `PostConvDecArgs` field offsets match Metal structs.
+        assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, desc_off), 0);
+        assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, swa), 12);
+        assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, kdyn_off), 36);
+        assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, vdyn_off), 40);
+        assert_eq!(std::mem::offset_of!(AttnBlkDecArgs, relbias_w), 60);
+        assert_eq!(std::mem::offset_of!(PostConvDecArgs, desc_off), 0);
+        assert_eq!(std::mem::offset_of!(PostConvDecArgs, cs_slot_off), 16);
+        assert_eq!(std::mem::offset_of!(PostConvDecArgs, has_res), 24);
+    }
+
+    #[test]
+    fn blocked_slab_geometry_and_decode_scratch_invariants() {
+        assert_eq!(CS_STRIDE_BYTES, 3_833_856);
+        assert_eq!(CS_STRIDE_BYTES % 256, 0);
+        assert_eq!(BT_STRIDE_ALIGN_U64 * 8, 256);
+        assert_eq!(BlockedSlab::next_cap(1), 1);
+        assert_eq!(BlockedSlab::next_cap(2), 2);
+        assert_eq!(BlockedSlab::next_cap(3), 4);
+        assert_eq!(BlockedSlab::next_cap(8), 8);
+        assert_eq!(BlockedSlab::next_cap(9), 16);
+        assert_eq!(BlockedSlab::next_cap(32), 32);
+
+        let slab = BlockedSlab::new(2048);
+        assert_eq!(slab.bt_stride_u64, 2048);
+        assert_eq!(slab.cs_f32_base(0), 0);
+        assert_eq!(slab.cs_f32_base(31) as usize, 31 * CS_STRIDE_F32);
+        assert_eq!(slab.bt_u64_base(0, false), 0);
+        assert_eq!(slab.bt_u64_base(0, true), 2048);
+        assert_eq!(slab.bt_u64_base(5, false), 10 * 2048);
+        assert_eq!(slab.bt_u64_base(5, true), 11 * 2048);
+        assert_eq!((slab.bt_u64_base(5, true) * 8) % 256, 0);
+
+        let ar = Arena::new(MAX_SPLIT, N_VOCAB_PAD);
+        let max_desc_floats = MAX_SPANS * (std::mem::size_of::<DecodeSpanDesc>() / 4);
+        assert!(max_desc_floats <= ar.part as usize, "DecodeSpanDesc[{MAX_SPANS}] must fit before ar.part");
+        // Batched Gumbel argmax1 partials use 512 floats per span inside `ar.part`.
+        assert!(MAX_SPANS * 512 <= NH * MAX_SPLIT * (HD + 2));
+    }
+
+    #[test]
+    fn metal_shader_declarations_and_compiler_validation() {
+        let kernels_src = include_str!("kernels.metal");
+        let prefill_src = include_str!("prefill.metal");
+        let bench_src = include_str!("bench_kernels.metal");
+        let full_src = format!("{kernels_src}\n{prefill_src}\n{bench_src}");
+
+        // Validate every kernel listed in `KERNELS` is declared in the shader source.
+        for &name in KERNELS {
+            let decl = format!("kernel void {name}(");
+            let macro_decl = name.starts_with("k_mix_b_")
+                || name.starts_with("k_gemm_sg")
+                || name.starts_with("k_moe_sg");
+            if !macro_decl {
+                assert!(full_src.contains(&decl), "missing Metal kernel declaration `{decl}`");
+            }
+        }
+        for s in [
+            "struct DecodeSpanDesc",
+            "struct EmbedDecArgs",
+            "struct CombineDecArgs",
+            "struct AttnBlkDecArgs",
+            "struct PostConvDecArgs",
+            "kernel void k_embed_dec(",
+            "kernel void k_attn_blk_dec(",
+            "kernel void k_attn_combine_dec(",
+            "kernel void k_postconv_state_dec(",
+        ] {
+            assert!(full_src.contains(s), "missing expected Metal declaration `{s}`");
+        }
+
+        // Compile via `xcrun -sdk macosx metal`: full shader when `-std=metal4.0` is supported,
+        // otherwise compile `kernels.metal` + `k_postconv_state_dec` under `-std=metal3.1` if available.
+        let compile_metal = |std_flag: &str, src: &str, tag: &str| -> Result<(), String> {
+            let pid = std::process::id();
+            let tmp_in = std::env::temp_dir().join(format!("inky_check_{pid}_{tag}.metal"));
+            let tmp_out = std::env::temp_dir().join(format!("inky_check_{pid}_{tag}.air"));
+            std::fs::write(&tmp_in, src).map_err(|e| format!("write temp shader: {e}"))?;
+            let res = std::process::Command::new("xcrun")
+                .args(["-sdk", "macosx", "metal", std_flag, "-ffast-math", "-c"])
+                .arg(&tmp_in)
+                .arg("-o")
+                .arg(&tmp_out)
+                .output();
+            let _ = std::fs::remove_file(&tmp_in);
+            let _ = std::fs::remove_file(&tmp_out);
+            match res {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(format!("spawn xcrun: {e}")),
+            }
+        };
+
+        if compile_metal("-std=metal4.0", "#include <metal_stdlib>\nkernel void probe() {}\n", "probe4").is_ok() {
+            compile_metal("-std=metal4.0", &full_src, "full_fp16")
+                .unwrap_or_else(|e| panic!("Metal 4.0 fp16 compile failed:\n{e}"));
+            let kv8_src = format!("#define KV8 1\n{full_src}");
+            compile_metal("-std=metal4.0", &kv8_src, "full_kv8")
+                .unwrap_or_else(|e| panic!("Metal 4.0 KV8 compile failed:\n{e}"));
+        } else if compile_metal("-std=metal3.1", "#include <metal_stdlib>\nkernel void probe() {}\n", "probe3").is_ok() {
+            let stripped_kernels = kernels_src
+                .replace("#include <metal_tensor>\n", "")
+                .replace("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n", "");
+            let postconv_start = prefill_src
+                .find("struct PostConvDecArgs")
+                .expect("PostConvDecArgs in prefill.metal");
+            let postconv_end = prefill_src[postconv_start..]
+                .find("\n// ---- per-position conv state")
+                .map(|rel| postconv_start + rel)
+                .unwrap_or(prefill_src.len());
+            let dec_src = format!("{stripped_kernels}\n{}\n", &prefill_src[postconv_start..postconv_end]);
+            compile_metal("-std=metal3.1", &dec_src, "dec_fp16")
+                .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (fp16) compile failed:\n{e}"));
+            let dec_kv8_src = format!("#define KV8 1\n{dec_src}");
+            compile_metal("-std=metal3.1", &dec_kv8_src, "dec_kv8")
+                .unwrap_or_else(|e| panic!("Metal 3.1 decode kernels (KV8) compile failed:\n{e}"));
+        }
     }
 }
