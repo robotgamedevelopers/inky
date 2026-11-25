@@ -1226,7 +1226,7 @@
      ("l8-gate-card" "done" "t-l8-gate-card")
    ))
   (:id "t-l8-provider" :type :task :title "A provider entry for an agent fleet: local billing, concurrency equal to the lane count, a priority ceiling" :state :done :evidence ("docs/FLEET-SPRINT.md" "scripts/inky-fleet-serve.sh (concurrency=64, local zero-cost billing, flash priority ceiling)"))
-  (:id "t-l8-remote" :type :task :title "Harness and tools run on other machines and reach the endpoint over a private network" :state :done :evidence ("src/serve.rs: is_private_ip (Tailscale 100.64.0.0/10)" "tests/fleet_gate.sh (live cross-machine card amd-3 -> mini-m5 100.65.89.96:18096)"))
+  (:id "t-l8-remote" :type :task :title "Harness and tools run on other machines and reach the endpoint over a private network" :state :done :evidence ("src/serve.rs: is_private_ip (Tailscale 100.64.0.0/10)" "tests/fleet_gate.sh (live cross-machine card, Linux bench to M5 Pro host)"))
   (:id "t-l8-gate-card" :type :task :title "Gate: a real low-priority card lands from the fleet" :state :doing :evidence ("docs/FLEET-SPRINT.md (real claude 2.1.311 & cross-machine amd-3 -> mini-m5 opencode 1.18.20 cards landed, go test ./... PASS)" "src/serve.rs: clamped_chat_max (clamps opencode default max_tokens=128000 to lane context)"))
   (:id "layer-9" :type :roadmap :title "Layer 8: soak"
    :rows (
