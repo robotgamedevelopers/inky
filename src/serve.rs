@@ -121,7 +121,7 @@ impl From<&str> for RenderError {
 
 /// The chat template of the GGUF, rendered to tokens: tool declarations, system, user, assistant (text and tool calls),
 /// tool results, the thinking-effort line. Earlier assistant turns are rendered exactly as the client sends them.
-fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize) -> Result<Vec<u32>, RenderError> {
+fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str, limit: usize, continued_assistants: &[usize]) -> Result<Vec<u32>, RenderError> {
     let text = |t: &mut Vec<u32>, s: &str| {
         if tk.encode_plain_limited(s, t, limit) { Ok(()) } else { Err(RenderError::TooLong) }
     };
@@ -152,11 +152,17 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
     };
     let mut effort_done = false;
     let mut call_names = std::collections::HashMap::new();
-    for m in msgs { for tc in m["tool_calls"].as_array().into_iter().flatten() { if let (Some(id), Some(n)) = (tc["id"].as_str(), tc["function"]["name"].as_str()) { call_names.insert(id.to_string(), n.to_string()); } } }
-    for m in msgs {
+    for (message_index, m) in msgs.iter().enumerate() {
         let role = m["role"].as_str().ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
         if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
+        if role == "assistant" {
+            for call in m["tool_calls"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str()) {
+                    call_names.insert(id, name);
+                }
+            }
+        }
         match role {
             "system" | "user" => {
                 let h = if role == "system" { sp.msg_system } else { sp.msg_user };
@@ -167,13 +173,13 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                 }
             }
             "tool" => {
-                let name = m["name"].as_str().map(|s| s.to_string()).or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).cloned())).unwrap_or_default();
+                let name = m["name"].as_str().or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).copied())).unwrap_or_default();
                 let mut parts = content_parts(&m["content"]);
                 if parts.is_empty() { parts.push(""); }
                 let is_error = m["is_error"].as_bool().unwrap_or(false);
                 for (i, p) in parts.iter().enumerate() {
                     marks(&mut t, &[sp.msg_tool])?;
-                    text(&mut t, &name)?;
+                    text(&mut t, name)?;
                     marks(&mut t, &[sp.c_text])?;
                     if is_error && i == 0 { text(&mut t, "Error: ")?; }
                     text(&mut t, p)?;
@@ -183,35 +189,36 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
             "assistant" => {
                 let asst_name = m["name"].as_str().filter(|n| !n.is_empty());
                 let reasoning = m["reasoning_content"].as_str().filter(|r| !r.is_empty());
-                if let Some(r) = reasoning {
-                    marks(&mut t, &[sp.msg_model])?;
-                    if let Some(name) = asst_name { text(&mut t, name)?; }
-                    marks(&mut t, &[sp.c_think])?;
-                    text(&mut t, r)?;
-                    marks(&mut t, &[sp.end])?;
-                }
+                let model_part = |tokens: &mut Vec<u32>, kind, body: &str| {
+                    marks(tokens, &[sp.msg_model])?;
+                    if let Some(name) = asst_name { text(tokens, name)?; }
+                    marks(tokens, &[kind])?;
+                    text(tokens, body)?;
+                    marks(tokens, &[sp.end])
+                };
+                if let Some(r) = reasoning { model_part(&mut t, sp.c_think, r)?; }
                 let calls: Vec<&Value> = m["tool_calls"].as_array().into_iter().flatten().collect();
                 match &m["content"] {
                     Value::Null => {}
                     Value::String(s) => {
                         if !s.is_empty() || (calls.is_empty() && reasoning.is_none()) {
-                            marks(&mut t, &[sp.msg_model])?;
-                            if let Some(name) = asst_name { text(&mut t, name)?; }
-                            marks(&mut t, &[sp.c_text])?;
-                            text(&mut t, s)?;
-                            marks(&mut t, &[sp.end])?;
+                            model_part(&mut t, sp.c_text, s)?;
                         }
                     }
-                    other => {
-                        let content = content_parts(other).join("");
-                        if !content.is_empty() || (calls.is_empty() && reasoning.is_none()) {
-                            marks(&mut t, &[sp.msg_model])?;
-                            if let Some(name) = asst_name { text(&mut t, name)?; }
-                            marks(&mut t, &[sp.c_text])?;
-                            text(&mut t, &content)?;
-                            marks(&mut t, &[sp.end])?;
+                    Value::Array(parts) => {
+                        for part in parts {
+                            let value = if let Some(s) = part.as_str() { s } else {
+                                if let Some(kind) = part.get("type") {
+                                    if !matches!(kind.as_str(), Some("text" | "input_text")) {
+                                        return Err(format!("unsupported assistant content part type {kind}").into());
+                                    }
+                                }
+                                part["text"].as_str().unwrap_or("")
+                            };
+                            model_part(&mut t, sp.c_text, value)?;
                         }
                     }
+                    _ => return Err("assistant content must be a string, array or null".into()),
                 }
                 for tc in calls {
                     let name = tc["function"]["name"].as_str().ok_or("tool call without a name")?;
@@ -226,7 +233,9 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                     text(&mut t, &format!("{{\"name\":{},\"args\":{}}}", Value::String(name.into()), args))?;
                     marks(&mut t, &[sp.end])?;
                 }
-                marks(&mut t, &[sp.end_sampling])?;
+                if continued_assistants.binary_search(&message_index).is_err() {
+                    marks(&mut t, &[sp.end_sampling])?;
+                }
             }
             r => return Err(format!("unknown role {r}").into()),
         }
@@ -237,36 +246,61 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
 
 #[cfg(test)]
 fn render(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &str) -> Result<Vec<u32>, RenderError> {
-    render_limited(tk, sp, req, default_effort, usize::MAX)
+    render_limited(tk, sp, req, default_effort, usize::MAX, &[])
 }
 
-/// A generated reply split into thinking, text and tool calls.
-struct Parsed { text: String, thinking: String, calls: Vec<(String, Value)> }
-fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
+enum ReplyPart { Text(String), Thinking(String), Tool(String, Value) }
+
+fn parse_tool_call(header: &[u8], body: &[u8]) -> (String, Value) {
+    let s = String::from_utf8_lossy(body);
+    let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+    let name = v["name"].as_str().map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(header).into_owned());
+    let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
+    (name, args)
+}
+
+/// Visit complete blocks in generation order. Final text is retained on length stops;
+/// a truncated tool body must never become a call.
+fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut(ReplyPart)) {
     #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
     let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
-    let mut p = Parsed { text: String::new(), thinking: String::new(), calls: vec![] };
     for &t in toks {
-        if t == sp.msg_model { mode = M::Header; header.clear(); cur.clear(); continue; }
-        if t == sp.c_think { mode = M::Think; cur.clear(); continue; }
-        if t == sp.c_text { mode = M::Text; cur.clear(); continue; }
-        if t == sp.c_tool { mode = M::Tool; cur.clear(); continue; }
-        if t == sp.end || t == sp.end_sampling || t == tk.eos {
-            let s = String::from_utf8_lossy(&cur).to_string();
+        let ends = t == sp.end || t == sp.end_sampling || t == tk.eos;
+        if t == sp.msg_model || t == sp.c_think || t == sp.c_text || t == sp.c_tool || ends {
+            if t == sp.c_text && mode == M::Text { continue; }
             match mode {
-                M::Think => p.thinking += &s, M::Text => p.text += &s,
-                M::Tool => { let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-                             let name = v["name"].as_str().map(|s| s.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&header).to_string());
-                             p.calls.push((name, if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) })); }
+                M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
+                M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
+                M::Tool if ends => {
+                    let (name, args) = parse_tool_call(&header, &cur);
+                    emit(ReplyPart::Tool(name, args));
+                }
                 _ => {}
             }
-            mode = M::None; cur.clear(); continue;
+            cur.clear();
+            mode = if t == sp.msg_model { header.clear(); M::Header }
+                else if t == sp.c_think { M::Think } else if t == sp.c_text { M::Text }
+                else if t == sp.c_tool { M::Tool } else { M::None };
+        } else {
+            match mode { M::Header => header.extend(tk.decode_bytes(t)), M::None => {}, _ => cur.extend(tk.decode_bytes(t)) }
         }
-        let b = tk.decode_bytes(t);
-        match mode { M::Header => header.extend(b), M::None => {}, _ => cur.extend(b) }
     }
-    let s = String::from_utf8_lossy(&cur).to_string();
-    match mode { M::Text => p.text += &s, M::Think => p.thinking += &s, _ => {} }
+    match mode {
+        M::Text => emit(ReplyPart::Text(String::from_utf8_lossy(&cur).into_owned())),
+        M::Think => emit(ReplyPart::Thinking(String::from_utf8_lossy(&cur).into_owned())),
+        _ => {}
+    }
+}
+
+/// Chat represents text, reasoning and tool calls in separate fields.
+struct Parsed { text: String, thinking: String, calls: Vec<(String, Value)> }
+fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
+    let mut p = Parsed { text: String::new(), thinking: String::new(), calls: Vec::new() };
+    visit_reply(tk, sp, toks, |part| match part {
+        ReplyPart::Text(s) => p.text.push_str(&s),
+        ReplyPart::Thinking(s) => p.thinking.push_str(&s),
+        ReplyPart::Tool(name, args) => p.calls.push((name, args)),
+    });
     p
 }
 
@@ -275,19 +309,20 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 // to the OpenAI shape above and rendered by the same `render`, so an Anthropic conversation and the
 // equivalent chat conversation are the same token stream and a lane's kept prompt is reused across
 // either API (decision 4). Thinking has no block in either direction here: a reply's thinking is
-// dropped, and thinking blocks in a sent history are dropped with it. Custom stop sequences,
-// `tool_choice` and `top_k` have no counterpart in the chat path and are ignored.
+// dropped, and thinking blocks in a sent history are dropped with it.
 
 /// An Anthropic request as the OpenAI request the chat path renders: `system` becomes leading
 /// system messages, a `system` role inside `messages[]` (Claude Code 2.1.330) becomes a system
 /// message in place so its order is kept, text blocks keep their order and their per-block
 /// rendering, a user message's tool results become tool messages in place, and an assistant
-/// message's text and tool uses become its content and tool calls (rendered text first, as the
-/// chat path renders them).
-fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
+/// message's tool uses and text retain their order. Chat renders text before tool calls, so a text
+/// block after a tool starts a new group in the same turn. The caller suppresses the intermediate
+/// end-of-sampling markers at the returned (ascending) group indices.
+fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), String> {
     let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
     if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
     let mut msgs: Vec<Value> = Vec::new();
+    let mut continued_assistants = Vec::new();
     match &req["system"] {
         Value::Null => {}
         Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
@@ -345,11 +380,17 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                 if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
             }
             ("assistant", Value::Array(blocks)) => {
-                let mut text = String::new();
+                let mut texts = Vec::new();
                 let mut calls: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b["type"].as_str() {
-                        Some("text") => text.push_str(b["text"].as_str().unwrap_or("")),
+                        Some("text") => {
+                            if !calls.is_empty() {
+                                continued_assistants.push(msgs.len());
+                                msgs.push(json!({"role": "assistant", "content": std::mem::take(&mut texts), "tool_calls": std::mem::take(&mut calls)}));
+                            }
+                            texts.push(b["text"].as_str().unwrap_or(""));
+                        }
                         Some("tool_use") => {
                             let id = b["id"].as_str().ok_or("tool_use without id")?;
                             let name = b["name"].as_str().ok_or("tool_use without a name")?;
@@ -360,7 +401,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                         t => return Err(format!("unsupported content block type {} in an assistant message", t.unwrap_or("none"))),
                     }
                 }
-                let mut msg = json!({"role": "assistant", "content": text});
+                let mut msg = json!({"role": "assistant", "content": texts});
                 if !calls.is_empty() { msg["tool_calls"] = json!(calls); }
                 msgs.push(msg);
             }
@@ -381,7 +422,7 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
             out["tools"] = json!(mapped);
         }
     }
-    Ok(out)
+    Ok((out, continued_assistants))
 }
 
 /// The thinking effort a Messages request asks for, as the `reasoning_effort`
@@ -446,14 +487,19 @@ fn startup_nonce() -> String {
 
 fn tool_use_id(nonce: &str, seq: u64, i: usize) -> String { format!("toolu_{nonce}_{seq}_{i}") }
 
-/// A parsed reply as Anthropic content blocks: the text, then each tool call.
-fn anthropic_content(p: &Parsed, nonce: &str, seq: u64) -> Vec<Value> {
-    let mut c = Vec::new();
-    if !p.text.is_empty() { c.push(json!({"type": "text", "text": p.text})); }
-    for (i, (name, args)) in p.calls.iter().enumerate() {
-        c.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, i), "name": name, "input": args}));
-    }
-    c
+/// Messages represents each visible text or tool block in generation order.
+fn anthropic_content(tk: &Tokenizer, sp: &Specials, toks: &[u32], nonce: &str, seq: u64) -> Vec<Value> {
+    let mut content = Vec::new();
+    let mut calls = 0;
+    visit_reply(tk, sp, toks, |part| match part {
+        ReplyPart::Text(text) => content.push(json!({"type": "text", "text": text})),
+        ReplyPart::Tool(name, args) => {
+            content.push(json!({"type": "tool_use", "id": tool_use_id(nonce, seq, calls), "name": name, "input": args}));
+            calls += 1;
+        }
+        ReplyPart::Thinking(_) => {}
+    });
+    content
 }
 
 /// Usage in Anthropic's split: `input_tokens` is the part of the prompt no lane reused,
@@ -508,10 +554,7 @@ impl BlockStream {
         self.pend.clear();
     }
     fn emit_tool(&mut self, out: &mut Vec<String>) {
-        let s = String::from_utf8_lossy(&self.tool).to_string();
-        let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
-        let name = v["name"].as_str().map(|x| x.to_string()).unwrap_or_else(|| String::from_utf8_lossy(&self.header).to_string());
-        let args = if v["args"].is_object() { v["args"].clone() } else { json!({"_unparsed": s}) };
+        let (name, args) = parse_tool_call(&self.header, &self.tool);
         let index = self.next; self.next += 1;
         let id = tool_use_id(&self.nonce, self.seq, self.calls); self.calls += 1;
         out.push(sse_text("content_block_start", &json!({"type": "content_block_start", "index": index,
@@ -1485,6 +1528,8 @@ fn models_body() -> String {
 /// A request's line and headers; the body is read only after the caller has checked the key.
 struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
 const MAX_BODY: usize = 32 << 20;
+// Cap buffered body capacity and the input represented by live decoded requests.
+const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1493,30 +1538,35 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// rather than resetting a timeout on every read syscall.
 struct DeadlineReader<R, N, S> {
     inner: R,
-    deadline: Option<Instant>,
+    deadline: Instant,
     now: N,
     set_timeout: S,
 }
 
 impl<R, N, S> DeadlineReader<R, N, S> {
     fn new(inner: R, deadline: Instant, now: N, set_timeout: S) -> Self {
-        Self { inner, deadline: Some(deadline), now, set_timeout }
+        Self { inner, deadline, now, set_timeout }
     }
 
-    fn clear_deadline(&mut self) {
-        self.deadline = None;
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+}
+
+impl<R, N: FnMut() -> Instant, S> DeadlineReader<R, N, S> {
+    fn remaining(&mut self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since((self.now)());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request read deadline exceeded"));
+        }
+        Ok(remaining)
     }
 }
 
 impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> Read for DeadlineReader<R, N, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(deadline) = self.deadline {
-            let rem = deadline.saturating_duration_since((self.now)());
-            if rem.is_zero() {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request header read deadline exceeded"));
-            }
-            (self.set_timeout)(rem)?;
-        }
+        let remaining = self.remaining()?;
+        (self.set_timeout)(remaining)?;
         self.inner.read(buf)
     }
 }
@@ -1552,17 +1602,98 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
 }
 
-/// Why a chunked body was refused: over the cap (413) or malformed framing (400).
+struct BodyBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl BodyBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: AtomicUsize::new(0), limit }
+    }
+
+    fn reserve(&self, bytes: usize) -> Result<BodyCharge<'_>, BodyError> {
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&total| total <= self.limit)
+        }).map_err(|_| BodyError::Busy)?;
+        Ok(BodyCharge { budget: self, bytes })
+    }
+}
+
+struct BodyCharge<'a> {
+    budget: &'a BodyBudget,
+    bytes: usize,
+}
+
+impl Drop for BodyCharge<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+struct RequestBody<'a> {
+    bytes: Vec<u8>,
+    charge: BodyCharge<'a>,
+}
+
+struct DecodedBody<'a> {
+    value: Value,
+    _charge: BodyCharge<'a>,
+}
+
+impl<'a> RequestBody<'a> {
+    fn new(budget: &'a BodyBudget) -> Self {
+        Self { bytes: Vec::new(), charge: BodyCharge { budget, bytes: 0 } }
+    }
+
+    fn grow(&mut self, len: usize, max: usize) -> Result<(), BodyError> {
+        if len > self.charge.bytes {
+            let capacity = len.max(self.charge.bytes.saturating_mul(2)).min(max);
+            // Keep the old allocation charged during the copy.
+            let charge = self.charge.budget.reserve(capacity)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(capacity).map_err(|_| BodyError::Busy)?;
+            bytes.extend_from_slice(&self.bytes);
+            self.bytes = bytes;
+            self.charge = charge;
+        }
+        self.bytes.resize(len, 0);
+        Ok(())
+    }
+
+    fn decode(self) -> Result<DecodedBody<'a>, serde_json::Error> {
+        // Charge the source bytes while the JSON tree is built and for its
+        // lifetime, including admission and recording in downstream handlers.
+        let value = serde_json::from_slice(&self.bytes);
+        let Self { bytes, charge } = self;
+        drop(bytes);
+        value.map(|value| DecodedBody { value, _charge: charge })
+    }
+}
+
 #[derive(Debug)]
-enum BodyError { TooLarge, Malformed(String) }
+enum BodyError {
+    TooLarge,
+    Busy,
+    Incomplete,
+    Malformed(String),
+    InvalidJson(serde_json::Error),
+}
+
+fn read_fixed<'a>(r: &mut impl Read, len: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
+    let mut body = RequestBody::new(budget);
+    body.grow(len, len)?;
+    r.read_exact(&mut body.bytes).map_err(|_| BodyError::Incomplete)?;
+    Ok(body)
+}
 
 /// A chunked request body decoded under `max`: chunk sizes are hex with
 /// optional extensions, each chunk is followed by CRLF, the zero chunk is
 /// followed by header-like trailers and an empty line. Anything else fails
 /// closed; the cap is checked before a chunk's bytes are read.
-fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
+fn read_chunked<'a>(r: &mut impl BufRead, max: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
     let bad = |m: &str| BodyError::Malformed(m.to_string());
-    let mut body = Vec::new();
+    let mut body = RequestBody::new(budget);
     let mut framing = 0usize;
     loop {
         let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
@@ -1578,10 +1709,10 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
             }
             return Err(bad("too many trailers"));
         }
-        if n > max - body.len().min(max) { return Err(BodyError::TooLarge); }
-        let at = body.len();
-        body.resize(at + n, 0);
-        r.read_exact(&mut body[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
+        if n > max - body.bytes.len() { return Err(BodyError::TooLarge); }
+        let at = body.bytes.len();
+        body.grow(at + n, max)?;
+        r.read_exact(&mut body.bytes[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
         let mut eol = [0u8; 1];
         r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
         let eol_len = if eol[0] == b'\r' {
@@ -1595,6 +1726,29 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route { Models, Health, Chat, Messages, CountTokens, NotFound }
+
+/// Only accept generation controls that the scheduler and response encoders can honor.
+fn check_generation_controls(req: &Value, route: Route) -> Result<(), String> {
+    let (stop_field, messages) = match route {
+        Route::Chat => ("stop", false),
+        Route::Messages => ("stop_sequences", true),
+        _ => unreachable!("only generation routes validate generation controls"),
+    };
+    let stops = &req[stop_field];
+    if !stops.is_null() && !stops.as_array().is_some_and(Vec::is_empty) {
+        return Err(format!("{stop_field} is unsupported. Omit it to use the model's own stop tokens"));
+    }
+    if !messages && !matches!(req.get("parallel_tool_calls"), None | Some(Value::Null | Value::Bool(true))) {
+        return Err("parallel_tool_calls must be true or omitted".into());
+    }
+    let choice = &req["tool_choice"];
+    if choice.is_null() { return Ok(()); }
+    let auto = if messages {
+        choice["type"] == "auto" && matches!(choice.get("disable_parallel_tool_use"), None | Some(Value::Null | Value::Bool(false)))
+    } else { choice == "auto" };
+    if !auto { return Err("tool_choice supports only automatic tool selection".into()); }
+    Ok(())
+}
 
 fn route(method: &str, path: &str) -> Route {
     match (method, path) {
@@ -2048,46 +2202,69 @@ fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
     })
 }
 
-fn record_turn_outcome(
-    cx: &Ctx,
-    turn: Option<(String, u64)>,
-    endpoint: &str,
-    req: &Value,
-    req_start: Instant,
-    first_tok: Option<Instant>,
+/// Keep the observed generation result across failures writing the response.
+struct TurnDelivery {
+    start: Instant,
+    first_token: Option<Instant>,
     prompt_tokens: usize,
     completion_tokens: usize,
-    timing: Option<&TimingSnapshot>,
-    finish_reason: &str,
+    phase_ms: (u64, u64, u64),
+    finish_reason: &'static str,
     status_code: u16,
-) {
-    let (Some(rec), Some((card_id, turn_index))) = (&cx.recorder, turn) else { return };
-    let total_ms = req_start.elapsed().as_millis() as u64;
-    let ttft_ms = first_tok
-        .map(|t| t.saturating_duration_since(req_start).as_millis() as u64)
-        .unwrap_or(total_ms);
-    let (queue_ms, prefill_ms, decode_ms) = timing
-        .map(|t| (t.queue_ms, t.prefill_ms, t.decode_ms))
-        .unwrap_or((0, 0, 0));
-    rec.record(crate::record::RecordEntry {
-        schema_version: crate::record::SCHEMA_VERSION,
-        recorded_at_ms: crate::record::now_ms(),
-        card_id,
-        turn_index,
-        endpoint: endpoint.to_string(),
-        request: req.clone(),
-        response: crate::record::ResponseMetrics {
-            prompt_tokens,
-            completion_tokens,
-            ttft_ms,
-            total_ms,
-            queue_ms,
-            prefill_ms,
-            decode_ms,
-            finish_reason: finish_reason.to_string(),
-            status_code,
-        },
-    });
+    generation_finish_reason: Option<&'static str>,
+}
+
+impl TurnDelivery {
+    fn status(&mut self, code: u16, reason: &'static str) {
+        self.status_code = code;
+        self.finish_reason = reason;
+    }
+
+    fn token(&mut self) {
+        self.first_token.get_or_insert_with(Instant::now);
+        self.completion_tokens += 1;
+    }
+
+    fn completed(&mut self, prompt: usize, generated: usize, timing: &TimingSnapshot, reason: &'static str) {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = generated;
+        self.phase_ms = (timing.queue_ms, timing.prefill_ms, timing.decode_ms);
+        self.generation_finish_reason = Some(reason);
+        self.status(200, reason);
+    }
+}
+
+fn record_delivery(
+    cx: &Ctx, req: &Value, card_id: Option<&str>, endpoint: &str,
+    respond: impl FnOnce(&mut TurnDelivery) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut turn = TurnDelivery {
+        start: Instant::now(), first_token: None, prompt_tokens: 0, completion_tokens: 0,
+        phase_ms: (0, 0, 0), finish_reason: "cancelled", status_code: 499, generation_finish_reason: None,
+    };
+    let recording = cx.recorder.as_ref().map(|rec| (rec, rec.allocate_turn(card_id)));
+    let result = respond(&mut turn);
+    if let Some((rec, (card_id, turn_index))) = recording {
+        if result.is_err() { turn.status(499, "cancelled"); }
+        let delivery = if turn.status_code == 499 {
+            crate::record::DeliveryStatus::Failed
+        } else {
+            crate::record::DeliveryStatus::Written
+        };
+        let total_ms = turn.start.elapsed().as_millis() as u64;
+        let ttft_ms = turn.first_token.map(|t| t.duration_since(turn.start).as_millis() as u64).unwrap_or(total_ms);
+        let (queue_ms, prefill_ms, decode_ms) = turn.phase_ms;
+        rec.record(crate::record::RecordEntry {
+            schema_version: crate::record::SCHEMA_VERSION, recorded_at_ms: crate::record::now_ms(),
+            card_id, turn_index, endpoint: endpoint.to_string(), request: req.clone(),
+            response: crate::record::ResponseMetrics {
+                prompt_tokens: turn.prompt_tokens, completion_tokens: turn.completion_tokens, ttft_ms, total_ms,
+                queue_ms, prefill_ms, decode_ms, finish_reason: turn.finish_reason.into(), status_code: turn.status_code,
+                generation_finish_reason: turn.generation_finish_reason.map(str::to_owned), delivery_status: Some(delivery),
+            },
+        });
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2096,14 +2273,16 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
 }
 
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
-    let mut first_tok: Option<Instant> = None;
+    record_delivery(cx, req, card_id, "/v1/chat/completions", |turn| chat_response(cx, req, s, turn))
+}
+
+fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
     // every client-controlled number is checked here, never in the scheduler
     let mut bad = |m: String| {
-        record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+        turn.status(400, "invalid_request");
         respond(s, 400, &json!({"error": {"message": m}}).to_string())
     };
+    if let Err(message) = check_generation_controls(req, Route::Chat) { return bad(message); }
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -2151,16 +2330,16 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "overloaded", 429);
+            turn.status(429, "overloaded");
             return openai_overloaded(s, cx.admission.retry_after_secs(), e);
         }
         Err(AdmitError::ClientGone) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "cancelled", 499);
+            turn.status(499, "cancelled");
             return Ok(());
         }
     };
     let prompt_limit = cx.ctx.saturating_sub(3);
-    let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit);
+    let rendered = render_limited(&cx.tk, &cx.sp, req, &cx.effort, prompt_limit, &[]);
     drop(preprocess);
     let toks = match rendered {
         Ok(t) => t,
@@ -2170,7 +2349,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 RenderError::Invalid(message) => message,
                 RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
             };
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2178,7 +2357,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         Ok(m) => m,
         Err(message) => {
             drop(permit);
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2190,9 +2369,10 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         h
     });
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    turn.prompt_tokens = toks.len();
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
-        record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
+        turn.status(503, "unavailable");
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
     let stream = req["stream"].as_bool().unwrap_or(false);
@@ -2213,7 +2393,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
                 continue;
@@ -2223,15 +2403,15 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         match ev {
             Ev::Alive => {
                 if s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
             }
             Ev::Tok(t) => {
-                if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                turn.token();
                 gen.push(t);
                 if gen.len() % 16 == 0 && s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
                 if !stream { continue; }
@@ -2261,8 +2441,8 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
-                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, prompt, ng, Some(&timing), finish, 200);
-                let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
+                turn.completed(prompt, ng, &timing, finish);
+                let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{}_{seq}_{i}", cx.nonce), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
                 eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
@@ -2290,7 +2470,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             }
             Ev::Err(ref message) | Ev::Failed(ref message) => {
                 let (code, kind) = if matches!(ev, Ev::Err(_)) { (400, "invalid_request_error") } else { (500, "server_error") };
-                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, kind, code);
+                turn.status(code, kind);
                 let error = json!({"error": {"type": kind, "message": message}});
                 if stream {
                     write!(s, "data: {error}\n\n")?;
@@ -2311,8 +2491,8 @@ fn anthropic_error<W: Write + ?Sized>(s: &mut W, code: u16, kind: &str, msg: &st
 }
 
 fn render_messages(cx: &Ctx, req: &Value, limit: usize) -> Result<Vec<u32>, RenderError> {
-    let openai = anthropic_to_openai(req)?;
-    render_limited(&cx.tk, &cx.sp, &openai, &cx.effort, limit)
+    let (chat, continued_assistants) = translate_messages(req)?;
+    render_limited(&cx.tk, &cx.sp, &chat, &cx.effort, limit, &continued_assistants)
 }
 
 #[cfg(test)]
@@ -2321,17 +2501,19 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
 }
 
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
-    let mut first_tok: Option<Instant> = None;
-    let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
-        record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
-    };
+    record_delivery(cx, req, card_id, "/v1/messages", |turn| messages_response(cx, req, s, turn))
+}
+
+fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
     // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+    if let Err(message) = check_generation_controls(req, Route::Messages) {
+        turn.status(400, "invalid_request_error");
+        return anthropic_error(s, 400, "invalid_request_error", &message);
+    }
     let max = match req["max_tokens"].as_u64() {
-        Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
+        Some(0) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
+        None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
@@ -2339,7 +2521,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         None | Some(Value::Null) => 64,
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
             Some(k) => k,
-            None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
         },
     };
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
@@ -2353,17 +2535,17 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         Some(v) => match v.as_f64() {
             Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
             _ => {
-                record_err(first_tok, 400, "invalid_request_error", 0);
+                turn.status(400, "invalid_request_error");
                 return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4");
             }
         },
     };
-    if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if !(0.0..=2.0).contains(&temp) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(AdmitError::Overloaded(e)) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
-        Err(AdmitError::ClientGone) => { record_err(first_tok, 499, "cancelled", 0); return Ok(()); }
+        Err(AdmitError::Overloaded(e)) => { turn.status(429, "rate_limit_error"); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
+        Err(AdmitError::ClientGone) => { turn.status(499, "cancelled"); return Ok(()); }
     };
     let prompt_limit = cx.ctx.saturating_sub(3);
     let rendered = render_messages(cx, req, prompt_limit);
@@ -2377,7 +2559,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                 // Retain the numeric error format used by clients for reactive compaction.
                 RenderError::TooLong => format!("prompt is too long: {} tokens > {prompt_limit} maximum", prompt_limit + 1),
             };
-            record_err(first_tok, 400, "invalid_request_error", 0);
+            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &message);
         }
     };
@@ -2386,7 +2568,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         Ok(m) => m,
         Err(e) => {
             drop(permit);
-            record_err(first_tok, 400, "invalid_request_error", 0);
+            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &e);
         }
     };
@@ -2398,8 +2580,9 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         h
     };
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
-    if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    turn.prompt_tokens = toks.len();
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    if enqueue(cx, job).is_err() { turn.status(503, "api_error"); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -2416,27 +2599,27 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
                     write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    record_err(first_tok, 500, "api_error", received);
+                    turn.status(500, "api_error");
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
                     return s.flush();
                 }
             };
             match ev {
-                Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
                 Ev::Tok(t) => {
-                    if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                    turn.token();
                     received += 1;
-                    if received % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    if received % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
                     for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
                 }
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
-                    for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
-                    record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
+                    turn.completed(prompt, ng, &timing, stop);
+                    for text in bs.close_all() { write!(s, "{text}")?; }
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {}", timing.summary, calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
@@ -2445,13 +2628,13 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                     return s.flush();
                 }
                 Ev::Err(e) => {
-                    record_err(first_tok, 400, "invalid_request_error", received);
+                    turn.status(400, "invalid_request_error");
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
                     return s.flush();
                 }
                 Ev::Failed(message) => {
-                    record_err(first_tok, 500, "api_error", received);
+                    turn.status(500, "api_error");
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
                     return s.flush();
                 }
@@ -2462,27 +2645,28 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     loop {
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } continue; }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
         };
         match ev {
-            Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } }
+            Ev::Alive => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } }
             Ev::Tok(t) => {
-                if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); }
+                if gen.len() % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
-                let p = parse(&cx.tk, &sp, &gen);
-                let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
-                record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
-                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
+                let content = anthropic_content(&cx.tk, &sp, &gen, &cx.nonce, seq);
+                let calls: Vec<&str> = content.iter().filter_map(|block| block["name"].as_str()).collect();
+                let stop = anthropic_stop_reason(!calls.is_empty(), reason);
+                turn.completed(prompt, ng, &timing, stop);
+                eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", calls.join(","), timing.summary);
                 return respond_with_timing(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
-                    "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
+                    "content": content, "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string(), &timing);
             }
-            Ev::Err(e) => { record_err(first_tok, 400, "invalid_request_error", gen.len()); return anthropic_error(s, 400, "invalid_request_error", &e); }
-            Ev::Failed(message) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", &message); }
+            Ev::Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+            Ev::Failed(message) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", &message); }
         }
     }
 }
@@ -2618,6 +2802,7 @@ pub fn serve(o: ServeOpts) {
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
     std::thread::spawn(move || {
+        let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
         for c in l.incoming() {
             let Ok(mut s) = c else { continue };
             if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
@@ -2627,6 +2812,7 @@ pub fn serve(o: ServeOpts) {
                 let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
                 continue;
             }
+            let body_budget = body_budget.clone();
             std::thread::spawn(move || {
                 struct Conn(Arc<std::sync::atomic::AtomicUsize>);
                 impl Drop for Conn { fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
@@ -2634,8 +2820,6 @@ pub fn serve(o: ServeOpts) {
                 let header_deadline = Instant::now() + HEADER_READ_TIMEOUT;
                 let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
                 let Ok(h) = read_head(&mut r) else { return };
-                r.get_mut().clear_deadline();
-                let _ = s.set_read_timeout(Some(BODY_READ_TIMEOUT));
                 let path = route_path(&h.path);
                 let method = h.method.clone();
                 // the key is checked before any body is read
@@ -2660,37 +2844,60 @@ pub fn serve(o: ServeOpts) {
                     if let Err(e) = result { eprintln!("[serve] client: {e}"); }
                     return;
                 }
-                // the body is read only now, after the header gate above
+                r.get_mut().set_deadline(Instant::now() + BODY_READ_TIMEOUT);
                 let body = if h.chunked {
-                    match read_chunked(&mut r, MAX_BODY) {
-                        Ok(b) => b,
-                        Err(BodyError::TooLarge) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 413, "request_too_large", &format!("the body is over {} bytes", MAX_BODY)) } else { respond(&mut s, 413, &json!({"error": {"message": format!("the body is over {} bytes", MAX_BODY)}}).to_string()) }; return; }
-                        Err(BodyError::Malformed(m)) => { drop(r); let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, 400, "invalid_request_error", &format!("malformed chunked body: {m}")) } else { respond(&mut s, 400, &json!({"error": {"message": format!("malformed chunked body: {m}")}}).to_string()) }; return; }
-                    }
+                    read_chunked(&mut r, MAX_BODY, &body_budget)
                 } else {
-                    let mut body = vec![0u8; h.len];
-                    if r.read_exact(&mut body).is_err() { return; }
-                    body
+                    read_fixed(&mut r, h.len, &body_budget)
                 };
+                // A completed body may have come entirely from BufReader's
+                // buffer. Check the deadline even if no socket read was needed.
+                let body = body.and_then(|body| match r.get_mut().remaining() {
+                    Ok(_) => Ok(body),
+                    Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
+                    Err(_) => Err(BodyError::Incomplete),
+                });
                 drop(r);
                 let _ = s.set_read_timeout(None);
+                let anthropic = matches!(route, Route::Messages | Route::CountTokens);
+                let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
+                    Ok(decoded) => decoded,
+                    Err(BodyError::Busy) => {
+                        let message = "inky is busy: the request body budget is full";
+                        let retry = cx.admission.retry_after_secs();
+                        let _ = if anthropic {
+                            anthropic_overloaded(&mut s, retry, message)
+                        } else {
+                            openai_overloaded(&mut s, retry, message)
+                        };
+                        return;
+                    }
+                    Err(BodyError::Incomplete) => return,
+                    Err(e) => {
+                        let (code, kind, message) = match e {
+                            BodyError::TooLarge => (413, "request_too_large", format!("the body is over {MAX_BODY} bytes")),
+                            BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
+                            BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
+                            BodyError::Busy | BodyError::Incomplete => unreachable!(),
+                        };
+                        let result = if anthropic {
+                            anthropic_error(&mut s, code, kind, &message)
+                        } else {
+                            respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
+                        };
+                        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+                        return;
+                    }
+                };
                 let card_id = h.card_id.as_deref();
-                let r = match route {
-                    Route::Chat => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => chat_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => respond(&mut s, 400, &json!({"error": {"message": e.to_string()}}).to_string()),
-                    },
-                    Route::Messages => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => messages_with_card(&cx, &v, card_id, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
-                    Route::CountTokens => match serde_json::from_slice::<Value>(&body) {
-                        Ok(v) => count_tokens(&cx, &v, &mut s),
-                        Err(e) => anthropic_error(&mut s, 400, "invalid_request_error", &e.to_string()),
-                    },
+                let result = match route {
+                    Route::Chat => chat_with_card(&cx, &decoded.value, card_id, &mut s),
+                    Route::Messages => messages_with_card(&cx, &decoded.value, card_id, &mut s),
+                    Route::CountTokens => count_tokens(&cx, &decoded.value, &mut s),
                     _ => unreachable!("bodyless routes were handled above"),
                 };
-                if let Err(e) = r { eprintln!("[serve] client: {e}"); }
+                drop(decoded);
+                if let Err(e) = result { eprintln!("[serve] client: {e}"); }
             });
         }
     });
@@ -2700,6 +2907,13 @@ pub fn serve(o: ServeOpts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn anthropic_to_openai(req: &Value) -> Result<Value, String> { translate_messages(req).map(|(chat, _)| chat) }
+
+    fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> {
+        let budget = BodyBudget::new(2 * max);
+        super::read_chunked(r, max, &budget).map(|body| body.bytes)
+    }
+
     include!("serve/physical_context_tests.rs");
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
@@ -2844,7 +3058,7 @@ mod tests {
         let (cx, _) = admission_test_ctx(1);
         let req = json!({"messages": [{"role": "user", "content": "hello"}]});
         let expected = render(&cx.tk, &cx.sp, &req, &cx.effort).unwrap();
-        let render_to = |limit| render_limited(&cx.tk, &cx.sp, &req, &cx.effort, limit);
+        let render_to = |limit| render_limited(&cx.tk, &cx.sp, &req, &cx.effort, limit, &[]);
         assert_eq!(render_to(expected.len()).unwrap(), expected);
         assert!(matches!(render_to(expected.len() - 1), Err(RenderError::TooLong)), "the final message marker takes one position");
         assert!(matches!(render_to(2), Err(RenderError::TooLong)), "the effort text must fit as well");
@@ -2876,6 +3090,77 @@ mod tests {
         // saturating: a huge prompt can never wrap into fitting
         assert!(context_over(usize::MAX, 1, 100));
         assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
+    }
+
+    #[test]
+    fn request_body_budget_covers_fixed_chunked_and_decoded_bodies() {
+        use std::io::Cursor;
+
+        let budget = BodyBudget::new(8);
+        let body = read_fixed(&mut Cursor::new(b"[123]"), 5, &budget).unwrap();
+        let decoded = body.decode().unwrap();
+        assert_eq!(decoded.value, json!([123]));
+
+        let mut chunks = Cursor::new(b"4\r\nnull\r\n0\r\n\r\n");
+        let mut fixed = Cursor::new(b"null");
+        assert!(matches!(super::read_chunked(&mut chunks, 8, &budget), Err(BodyError::Busy)));
+        assert_eq!(chunks.position(), 3, "only the size line should be read");
+        assert!(matches!(read_fixed(&mut fixed, 4, &budget), Err(BodyError::Busy)));
+        assert_eq!(fixed.position(), 0);
+
+        drop(decoded);
+        chunks.set_position(0);
+        let body = super::read_chunked(&mut chunks, 8, &budget).unwrap();
+        assert_eq!(body.bytes, b"null");
+        assert_eq!(read_fixed(&mut fixed, 4, &budget).unwrap().bytes, b"null");
+    }
+
+    #[test]
+    fn request_body_budget_is_released_after_read_and_parse_errors() {
+        use std::io::Cursor;
+
+        let budget = BodyBudget::new(8);
+        assert!(matches!(read_fixed(&mut Cursor::new(b"{"), 8, &budget), Err(BodyError::Incomplete)));
+        let truncated = b"1\r\nx\r\n4\r\ny";
+        assert!(matches!(super::read_chunked(&mut Cursor::new(truncated), 8, &budget), Err(BodyError::Malformed(_))));
+        let body = read_fixed(&mut Cursor::new(b"invalid!"), 8, &budget).unwrap();
+        assert!(body.decode().is_err());
+        assert!(budget.reserve(8).is_ok());
+    }
+
+    #[test]
+    fn body_deadline_replaces_header_deadline_without_resetting_on_reads() {
+        use std::io::Cursor;
+
+        struct OneByte<R>(R);
+        impl<R: Read> Read for OneByte<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = buf.len().min(1);
+                self.0.read(&mut buf[..len])
+            }
+        }
+
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let tick = Duration::from_millis(1);
+        let mut reader = BufReader::with_capacity(
+            1,
+            DeadlineReader::new(
+                OneByte(Cursor::new(b"null")),
+                start + tick,
+                || {
+                    let now = clock.get();
+                    clock.set(now + tick);
+                    now
+                },
+                |_| Ok(()),
+            ),
+        );
+        clock.set(start + tick);
+        reader.get_mut().set_deadline(start + 3 * tick);
+        let budget = BodyBudget::new(4);
+        assert!(matches!(read_fixed(&mut reader, 4, &budget), Err(BodyError::Incomplete)));
+        assert!(budget.reserve(4).is_ok());
     }
 
     #[test] fn chunked_bodies_decode_bounded_and_fail_closed() {
@@ -2961,7 +3246,7 @@ mod tests {
         assert_eq!(o["messages"][0], json!({"role": "system", "content": [{"type": "text", "text": "Be terse."}, {"type": "text", "text": "Be kind."}]}));
         assert_eq!(o["messages"][1], json!({"role": "user", "content": [{"type": "text", "text": "Weather in SF?"}]}));
         assert_eq!(o["messages"][2]["role"], "assistant");
-        assert_eq!(o["messages"][2]["content"], "Checking.");
+        assert_eq!(o["messages"][2]["content"], json!(["Checking."]));
         assert_eq!(o["messages"][2]["tool_calls"][0]["id"], "toolu_1");
         assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(o["messages"][2]["tool_calls"][0]["function"]["arguments"], json!({"city": "SF"}));
@@ -3022,7 +3307,7 @@ mod tests {
         assert!(anthropic_to_openai(&json!({"tools": [{"description": "x"}], "messages": [{"role": "user", "content": "x"}]})).is_err(), "a tool without a name");
         // a thinking block in a sent history is the one block dropped: it has no rendering in either API here
         let o = anthropic_to_openai(&json!({"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "Done"}]}]})).unwrap();
-        assert_eq!(o["messages"][0]["content"], "Done");
+        assert_eq!(o["messages"][0]["content"], json!(["Done"]));
     }
 
     #[test] fn anthropic_and_chat_requests_render_the_same_tokens() {
@@ -3119,6 +3404,165 @@ mod tests {
         assert_eq!(only["messages"][0]["content"][0], json!({"type": "text", "text": "[image]"}));
     }
 
+    #[test]
+    fn unsupported_generation_controls_return_400_before_scheduling() {
+        for stream in [false, true] {
+            for (route, field, value) in [
+                (Route::Chat, "tool_choice", json!("none")),
+                (Route::Messages, "tool_choice", json!({"type": "none"})),
+                (Route::Chat, "tool_choice", json!("required")),
+                (Route::Chat, "parallel_tool_calls", json!(false)),
+                (Route::Messages, "tool_choice", json!({"type": "tool", "name": "get_weather"})),
+                (Route::Messages, "tool_choice", json!({"type": "auto", "disable_parallel_tool_use": true})),
+                (Route::Chat, "stop", json!("ell")),
+                (Route::Chat, "stop", json!(["ell"])),
+                (Route::Messages, "stop_sequences", json!(["ell"])),
+            ] {
+                let (cx, jobs) = admission_test_ctx(1);
+                let mut req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": stream});
+                req[field] = value;
+                // Dropping the channel lets an accidentally accepted request fail immediately.
+                drop(jobs);
+                let mut out = Vec::new();
+                if route == Route::Messages { messages(&cx, &req, &mut out).unwrap(); }
+                else { chat(&cx, &req, &mut out).unwrap(); }
+                let response = String::from_utf8(out).unwrap();
+                assert!(response.starts_with("HTTP/1.1 400") && response.contains(field), "{response}");
+                assert!(!response.contains("text/event-stream"), "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn openai_tool_ids_include_the_process_nonce_in_both_response_modes() {
+        for stream in [false, true] {
+            for nonce in ["firstprocess", "secondprocess"] {
+                let (mut cx, jobs) = admission_test_ctx(1);
+                cx.nonce = nonce.into();
+                let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8,
+                                 "tool_choice": "auto", "stop": [], "stream": stream});
+                let tokens = reply_stream(&cx.tk, &cx.sp);
+                let worker = std::thread::spawn(move || {
+                    let job = jobs.recv().unwrap();
+                    for &t in &tokens { job.out.send(Ev::Tok(t)).unwrap(); }
+                    job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
+                });
+                let mut out = Vec::new();
+                chat(&cx, &req, &mut out).unwrap();
+                assert!(String::from_utf8(out).unwrap().contains(&format!("call_{nonce}_1_0")));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn historical_tool_names_resolve_against_preceding_assistant_calls() {
+        let (cx, _) = admission_test_ctx(1);
+        let req = json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "call_1_0", "function": {"name": "first", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1_0", "content": "earlier result"},
+            {"role": "assistant", "tool_calls": [{"id": "call_1_0", "function": {"name": "second", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1_0", "content": "later result"}
+        ]});
+        let toks = render(&cx.tk, &cx.sp, &req, "low").unwrap();
+        let mut names = Vec::new();
+        for (i, &t) in toks.iter().enumerate() {
+            if t == cx.sp.msg_tool {
+                let bytes = toks[i + 1..].iter().take_while(|&&id| id != cx.sp.c_text)
+                    .flat_map(|&id| cx.tk.decode_bytes(id)).collect();
+                names.push(String::from_utf8(bytes).unwrap());
+            }
+        }
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[test]
+    fn multipart_assistant_content_matches_the_gguf_template() {
+        let tk = Tokenizer::for_byte_test();
+        let sp = test_sp(&tk);
+        let req = json!({"messages": [
+            {"role":"assistant","name":"writer","content":["one",{"type":"text","text":""},{"type":"input_text","text":"two"}]},
+            {"role":"assistant","content":[]}
+        ]});
+        // tokenizer.chat_template in Inkling-2-Mini-Q4_K_M.gguf emits a named header
+        // and end_message for every text part, then one end_sampling for each turn.
+        let golden = concat!("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+            "<|message_model|>writer<|content_text|>one<|end_message|>",
+            "<|message_model|>writer<|content_text|><|end_message|>",
+            "<|message_model|>writer<|content_text|>two<|end_message|>",
+            "<|content_model_end_sampling|><|content_model_end_sampling|>");
+        assert_eq!(render(&tk, &sp, &req, "high").unwrap(), tk.encode(golden, true));
+        for kind in ["image", "input_audio", "unknown"] {
+            let req = json!({"messages":[{"role":"assistant","content":[{"type":kind}]}]});
+            assert!(matches!(render(&tk, &sp, &req, "high"), Err(RenderError::Invalid(_))));
+        }
+    }
+
+    #[test]
+    fn messages_round_trips_interleaved_assistant_blocks_in_both_response_modes() {
+        let (mut cx, jobs) = admission_test_ctx(1);
+        cx.ctx = 2048;
+        let tk = Tokenizer::for_byte_test();
+        cx.sp = test_sp(&tk);
+        cx.tk = Arc::new(tk);
+        let name = "lookup";
+        let expected_content = json!([
+            {"type":"text","text":"before"},
+            {"type":"tool_use","id":"toolu_test_1_0","name":name,"input":{}},
+            {"type":"text","text":""},
+            {"type":"text","text":"after"}
+        ]);
+        let wire = concat!("<|message_model|><|content_text|>before<|end_message|>",
+            "<|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{}}<|end_message|>",
+            "<|message_model|><|content_text|><|end_message|>",
+            "<|message_model|><|content_text|>after<|end_message|><|content_model_end_sampling|>");
+        let req = json!({"max_tokens":256,"messages":[
+            {"role":"assistant","content":expected_content},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_test_1_0","content":"ok"}]}
+        ]});
+        let prompt = cx.tk.encode(&format!("<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|>{wire}<|message_tool|>lookup<|content_text|>ok<|end_message|>"), true);
+        for stream in [false, true] {
+            let mut req = req.clone();
+            req["stream"] = json!(stream);
+            let mut output = Vec::new();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| messages(&cx, &req, &mut output));
+                let job = jobs.recv_timeout(Duration::from_secs(5)).unwrap();
+                let tokens = cx.tk.encode(wire, true);
+                for &id in &tokens { job.out.send(Ev::Tok(id)).unwrap(); }
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
+                worker.join().unwrap().unwrap();
+                assert_eq!(job.toks, prompt, "submitted assistant turn changed during rendering");
+            });
+            let body = std::str::from_utf8(&output).unwrap().split_once("\r\n\r\n").unwrap().1;
+            if !stream {
+                let reply: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(reply["content"], expected_content);
+                assert_eq!(reply["stop_reason"], "tool_use");
+            } else {
+                let mut blocks: Vec<Value> = Vec::new();
+                for data in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
+                    let e: Value = serde_json::from_str(data).unwrap();
+                    match e["type"].as_str() {
+                        Some("content_block_start") => blocks.push(e["content_block"].clone()),
+                        Some("content_block_delta") if e["delta"]["type"] == "text_delta" => {
+                            let b = &mut blocks[e["index"].as_u64().unwrap() as usize];
+                            b["text"] = json!(format!("{}{}", b["text"].as_str().unwrap(), e["delta"]["text"].as_str().unwrap()));
+                        }
+                        Some("content_block_delta") if e["delta"]["type"] == "input_json_delta" => {
+                            blocks[e["index"].as_u64().unwrap() as usize]["input"] = serde_json::from_str(e["delta"]["partial_json"].as_str().unwrap()).unwrap();
+                        }
+                        Some("message_delta") => assert_eq!(e["delta"]["stop_reason"], "tool_use"),
+                        _ => {}
+                    }
+                }
+                let mut expected = expected_content.clone();
+                expected[1]["id"] = json!("toolu_test_2_0");
+                assert_eq!(Value::Array(blocks), expected);
+            }
+        }
+    }
+
     #[test] fn a_generated_reply_parses_to_anthropic_blocks() {
         let tk = Tokenizer::for_test();
         let sp = test_sp(&tk);
@@ -3127,7 +3571,7 @@ mod tests {
         assert_eq!(p.thinking, "hmm");
         assert_eq!(p.calls.len(), 1);
         assert_eq!(p.calls[0], ("get_weather".to_string(), json!({"city": "SF"})));
-        let content = anthropic_content(&p, "abc123", 7);
+        let content = anthropic_content(&tk, &sp, &reply_stream(&tk, &sp), "abc123", 7);
         assert_eq!(content[0], json!({"type": "text", "text": "Hello"}));
         assert_eq!(content[1], json!({"type": "tool_use", "id": "toolu_abc123_7_0", "name": "get_weather", "input": {"city": "SF"}}));
         assert_eq!(anthropic_stop_reason(true, "stop"), "tool_use");
@@ -3793,7 +4237,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(timeouts.borrow().windows(2).all(|w| w[1] < w[0]), "remaining timeout must strictly shrink");
 
-        // Fast request within deadline succeeds and preserves buffered body bytes after clear_deadline().
+        // Fast request within deadline succeeds and preserves buffered body bytes after setting the body deadline.
         let fast_clock = std::cell::Cell::new(start);
         let dr_ok = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
@@ -3805,7 +4249,7 @@ mod tests {
         let head = read_head(&mut r_ok).unwrap();
         assert_eq!(head.method, "GET");
         assert_eq!(head.path, "/health");
-        r_ok.get_mut().clear_deadline();
+        r_ok.get_mut().set_deadline(fast_clock.get() + BODY_READ_TIMEOUT);
         let mut tail = Vec::new();
         r_ok.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"body");
@@ -4325,6 +4769,92 @@ mod tests {
         assert_eq!(delta.1["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(delta.1["usage"]["input_tokens"], prompt_len - 40);
         assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    #[test]
+    fn recorder_tracks_delivery_failures_and_completed_responses() {
+        struct Writer {
+            bytes: Vec<u8>,
+            fail_on_write: Option<&'static [u8]>,
+            fail_on_flush: Option<&'static [u8]>,
+        }
+        impl Writer {
+            fn contains(&self, marker: Option<&[u8]>) -> bool {
+                marker.is_some_and(|m| self.bytes.windows(m.len()).any(|bytes| bytes == m))
+            }
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                if self.contains(self.fail_on_write) { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.contains(self.fail_on_flush) { return Err(std::io::ErrorKind::TimedOut.into()); }
+                Ok(())
+            }
+        }
+        impl ClientWrite for Writer { fn client_gone(&self) -> bool { false } }
+
+        let dir = std::env::temp_dir().join(format!("inky-record-delivery-{}-{}", std::process::id(), startup_nonce()));
+        let (mut cx, jobs) = admission_test_ctx(1);
+        cx.recorder = Some(Arc::new(crate::record::Recorder::new(dir.clone())));
+        let mut expected = Vec::new();
+        for is_messages in [false, true] {
+            let endpoint = if is_messages { "/v1/messages" } else { "/v1/chat/completions" };
+            for stream in [false, true] {
+                let terminal: &[u8] = if !stream { b"200 OK" } else if is_messages { b"event: message_stop" } else { b"[DONE]" };
+                let mut failures = vec![(None, None, true), (Some(terminal), None, true), (None, Some(terminal), true)];
+                if stream {
+                    // The first visible character follows the two model/text markers.
+                    let first_text: &[u8] = if is_messages { br#""text":"H""# } else { br#""content":"H""# };
+                    failures.push((Some(first_text), None, false));
+                }
+                for (write, flush, finished) in failures {
+                    let mut w = Writer { bytes: vec![], fail_on_write: write, fail_on_flush: flush };
+                    let req = json!({"max_tokens": 12, "stream": stream, "messages": [{"role": "user", "content": "Hi"}]});
+                    let mut generated = vec![cx.sp.msg_model, cx.sp.c_text];
+                    generated.extend(cx.tk.encode("Hello", false));
+                    generated.push(cx.sp.end);
+                    let (result, rprompt) = std::thread::scope(|scope| {
+                        let handler = scope.spawn(|| {
+                            if is_messages { messages_with_card(&cx, &req, Some("test-card"), &mut w) }
+                            else { chat_with_card(&cx, &req, Some("test-card"), &mut w) }
+                        });
+                        let job = jobs.recv_timeout(Duration::from_secs(2)).unwrap();
+                        let prompt = job.toks.len();
+                        for &t in &generated { let _ = job.out.send(Ev::Tok(t)); }
+                        let _ = job.out.send(Ev::Done { prompt, cached: 0, gen: generated.len(), reason: "stop",
+                            timing: TimingSnapshot { queue_ms: 1, prefill_ms: 2, decode_ms: 3, ..Default::default() } });
+                        (handler.join().unwrap(), prompt)
+                    });
+                    let failed = write.is_some() || flush.is_some();
+                    assert_eq!(result.is_err(), failed, "{endpoint} streaming={stream}");
+                    expected.push((endpoint, failed, rprompt, if finished { generated.len() } else { 3 }, finished));
+                }
+            }
+        }
+        drop(cx); // Join the recorder before inspecting the written entries.
+        let mut entries = Vec::new();
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let file = std::fs::read_to_string(f.unwrap().path()).unwrap();
+            entries.extend(crate::record::parse_jsonl(&file).unwrap());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        entries.sort_by_key(|e| e.turn_index);
+        assert_eq!(entries.len(), expected.len());
+        for (i, (entry, (endpoint, failed, prompt, generated, finished))) in entries.iter().zip(expected).enumerate() {
+            assert_eq!((entry.card_id.as_str(), entry.turn_index, entry.endpoint.as_str()), ("test-card", i as u64, endpoint));
+            let m = &entry.response;
+            assert_eq!((m.prompt_tokens, m.completion_tokens), (prompt, generated));
+            let reason = if failed { "cancelled" } else if endpoint == "/v1/messages" { "end_turn" } else { "stop" };
+            assert_eq!((m.status_code, m.finish_reason.as_str()), (if failed { 499 } else { 200 }, reason));
+            assert_eq!((m.queue_ms, m.prefill_ms, m.decode_ms), if finished { (1, 2, 3) } else { (0, 0, 0) });
+            let response = m.to_json();
+            assert_eq!(response["delivery_status"], if failed { "failed" } else { "written" });
+            let model_reason = if endpoint == "/v1/messages" { "end_turn" } else { "stop" };
+            assert_eq!(response["generation_finish_reason"].as_str(), finished.then_some(model_reason));
+        }
     }
 
     #[test] fn health_body_reports_recorder_telemetry_when_enabled() {

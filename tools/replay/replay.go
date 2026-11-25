@@ -27,6 +27,10 @@ type ResponseMetrics struct {
 	TotalMs          uint64 `json:"total_ms"`
 	FinishReason     string `json:"finish_reason"`
 	StatusCode       int    `json:"status_code"`
+	// Legacy recordings omit both fields. An absent generation reason also covers turns
+	// that ended before the scheduler reported a completion.
+	GenerationFinishReason string `json:"generation_finish_reason,omitempty"`
+	DeliveryStatus         string `json:"delivery_status,omitempty"`
 }
 
 // RecordedEntry mirrors one JSONL line written by `inky serve --record-dir`.

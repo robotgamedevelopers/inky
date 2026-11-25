@@ -21,6 +21,12 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 const MAX_TRACKED_CARDS: usize = 16_384;
 const MAX_CARD_ID_LEN: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Written,
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResponseMetrics {
     pub prompt_tokens: usize,
@@ -32,11 +38,13 @@ pub struct ResponseMetrics {
     pub decode_ms: u64,
     pub finish_reason: String,
     pub status_code: u16,
+    pub generation_finish_reason: Option<String>,
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 impl ResponseMetrics {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut response = json!({
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "ttft_ms": self.ttft_ms,
@@ -46,7 +54,17 @@ impl ResponseMetrics {
             "decode_ms": self.decode_ms,
             "finish_reason": self.finish_reason,
             "status_code": self.status_code,
-        })
+        });
+        if let Some(reason) = &self.generation_finish_reason {
+            response["generation_finish_reason"] = json!(reason);
+        }
+        if let Some(delivery) = self.delivery_status {
+            response["delivery_status"] = json!(match delivery {
+                DeliveryStatus::Written => "written",
+                DeliveryStatus::Failed => "failed",
+            });
+        }
+        response
     }
 
     pub fn from_json(v: &Value) -> Result<Self, String> {
@@ -82,7 +100,18 @@ impl ResponseMetrics {
             .and_then(|x| x.as_u64())
             .and_then(|x| u16::try_from(x).ok())
             .ok_or("response.status_code missing or invalid")?;
+        let generation_finish_reason = obj.get("generation_finish_reason")
+            .map(|v| v.as_str().map(str::to_owned).ok_or("invalid response.generation_finish_reason"))
+            .transpose()?;
+        let delivery_status = match obj.get("delivery_status") {
+            None => None,
+            Some(v) if v == "written" => Some(DeliveryStatus::Written),
+            Some(v) if v == "failed" => Some(DeliveryStatus::Failed),
+            Some(_) => return Err("invalid response.delivery_status".into()),
+        };
         Ok(Self {
+            generation_finish_reason,
+            delivery_status,
             prompt_tokens,
             completion_tokens,
             ttft_ms,
@@ -576,11 +605,26 @@ mod tests {
                 decode_ms: 391,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         let line = serde_json::to_string(&entry.to_json()).unwrap();
         let parsed = parse_jsonl(&format!("{line}\n")).unwrap();
         assert_eq!(parsed, vec![entry]);
+    }
+
+    #[test]
+    fn historical_metrics_do_not_infer_outcomes_from_the_http_status() {
+        for (code, finish) in [(200, "stop"), (499, "cancelled")] {
+            let old = json!({"prompt_tokens": 10, "completion_tokens": 4, "ttft_ms": 5, "total_ms": 12,
+                "status_code": code, "finish_reason": finish});
+            let metrics = ResponseMetrics::from_json(&old).unwrap();
+            assert_eq!(metrics.delivery_status, None);
+            assert_eq!(metrics.generation_finish_reason, None);
+            assert!(metrics.to_json().get("delivery_status").is_none());
+            assert!(metrics.to_json().get("generation_finish_reason").is_none());
+        }
     }
 
     #[test]
@@ -602,6 +646,8 @@ mod tests {
                 decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         let entries = vec![
@@ -652,6 +698,8 @@ mod tests {
                         decode_ms: 0,
                         finish_reason: "stop".into(),
                         status_code: 200,
+                        generation_finish_reason: None,
+                        delivery_status: None,
                     },
                 }));
             }
@@ -714,6 +762,8 @@ mod tests {
                     decode_ms: 0,
                     finish_reason: "stop".into(),
                     status_code: 200,
+                    generation_finish_reason: None,
+                    delivery_status: None,
                 },
             });
         }
@@ -753,6 +803,8 @@ mod tests {
                 decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         });
         assert!(ok);
@@ -796,6 +848,8 @@ mod tests {
                 decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         assert!(rec.record(mk()));
@@ -828,6 +882,8 @@ mod tests {
                 decode_ms: 0,
                 finish_reason: "stop".into(),
                 status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
             },
         };
         let stats = {
@@ -907,6 +963,8 @@ mod tests {
                     decode_ms: 0,
                     finish_reason: "stop".into(),
                     status_code: 200,
+                    generation_finish_reason: None,
+                    delivery_status: None,
                 },
             }));
         }
