@@ -12,6 +12,7 @@ check's expected source.
 
 - `unit`
 - `go`
+- `audit` (the dependency audit workflow)
 - `tla (memmode)`
 - `tla (blocks)`
 - `tla (grouped)`
