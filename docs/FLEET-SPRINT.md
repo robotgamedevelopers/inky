@@ -4,7 +4,7 @@
 
 ## 1. Host Service Wrapper (`scripts/inky-fleet-serve.sh`)
 
-[`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) launches `inky serve` bound to the host's Tailscale IPv4 address (`tailscale ip -4`, port `18096` by default so existing port `8096` services stay untouched) with `--key-env INKY_SERVE_KEY`, `--lanes 64` (the measured M5 Max knee from [`docs/LANE-SWEEP.md`](LANE-SWEEP.md)), `-c 16384`, `-n 8192`, and `--record-dir` enabled:
+[`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) launches `inky serve` bound to the host's Tailscale IPv4 address (`tailscale ip -4`, port `18096` by default so existing port `8096` services stay untouched) with `--key-env INKY_SERVE_KEY`, `--lanes 64` (the M5 Max profile default, configurable with `INKY_LANES`), `-c 16384`, `-n 8192`, and `--record-dir` enabled:
 
 ```sh
 nova-secrets exec --only INKY_SERVE_KEY -- \
@@ -30,7 +30,7 @@ nova-config service add inky-fleet \
   --reason "Register M5 Max Tailscale inky serve fleet service (64 lanes)" \
   --dry-run
 
-# 2. Provider entry: concurrency equals chosen lane knee (64)
+# 2. Provider entry: concurrency equals the configured M5 Max lane count (64)
 nova-config provider add inky \
   --url http://<server-tailnet-ip>:18096 \
   --api openai \
@@ -40,7 +40,7 @@ nova-config provider add inky \
   --note "M5 Max 128GB Tailscale inky serve (64 lanes, c=16384)" \
   --enabled true \
   --actor emma \
-  --reason "Wire inky private-network fleet provider at 64-lane knee" \
+  --reason "Wire inky private-network fleet provider at the 64-lane M5 Max setting" \
   --dry-run
 
 # 3. Model entry: zero API billing (price_in=0, price_out=0, price_cache_read=0)

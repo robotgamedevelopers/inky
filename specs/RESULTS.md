@@ -228,3 +228,20 @@ plus seven single-line production mutations (`trunc-real-byte-offset`, `off1-byt
 `reissue-gen-reset`, `stale-finish`, `admit-wait-dropped`, `step-bypass-dropped`,
 `priv-tail-dirty`) in parallel, requiring every mutation to fail inside TLC with an invariant or
 action counterexample.
+
+## Private sliding-window prefill scratch
+
+The four `ScratchTail` configurations ran on `mini-m5` on 2026-11-25 at
+05:07 UTC with TLC 2.19, Temurin 21.0.12.1 and one worker.
+
+| Run | Generated states | Distinct states | Wall seconds | Result |
+| --- | ---: | ---: | ---: | --- |
+| ScratchTail3 | 469,184 | 435,360 | 2.553 | PASS |
+| ScratchTail4 | 2,359,830 | 2,190,375 | 11.405 | PASS |
+| ScratchTailOneSpan | 832 | 728 | 0.717 | PASS |
+| ScratchTailNoZero | 1,429 | 1,429 | 0.720 | NoForeignRead violated |
+
+Both three-span configurations kept all reads in bounds and restricted each
+span's reads to its own rows and zeroed rows. The single-span case held across
+three layers with only the initial clear. Omitting the per-span clear in the
+two-span control let a tile read a previous span's row.

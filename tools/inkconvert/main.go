@@ -14,11 +14,12 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
 	"regexp"
+	"slices"
+	"strings"
 )
 
 const (
@@ -50,7 +51,7 @@ func main() {
 	case "probe":
 		err = probe(*official, *ref)
 	case "convert":
-		err = convert(*official, *base, *q8, *q8re, *q6re, *experts, *out, *w13 == "interleaved")
+		err = convert(*official, *base, *q8, *q8re, *q6re, *experts, *out, *w13)
 	case "q6check":
 		err = q6check(*base, *ref)
 	case "verify":
@@ -264,7 +265,10 @@ func probe(official, refPath string) error {
 							if err != nil {
 								return err
 							}
-							rel, sc := relErr(got, want)
+							rel, sc, err := relErr(got, want)
+							if err != nil {
+								return fmt.Errorf("%s: %w", line, err)
+							}
 							line += fmt.Sprintf(" | il=%-5v hi=%-5v rel %.4f fit %.4f", il, hi, rel, sc)
 						}
 					}
@@ -276,7 +280,11 @@ func probe(official, refPath string) error {
 	return nil
 }
 
-func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, interleaved bool) error {
+func convert(official, basePath, q8Path, q8re, q6re, experts, outPath, layout string) error {
+	if layout != "interleaved" && layout != "stacked" {
+		return fmt.Errorf("unknown -w13 layout %q: expected interleaved or stacked", layout)
+	}
+	interleaved := layout == "interleaved"
 	if official == "" || basePath == "" || outPath == "" {
 		return fmt.Errorf("convert needs -official, -base and -out")
 	}
@@ -290,6 +298,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 		return err
 	}
 	defer base.Close()
+	inputs := []*os.File{st.f, base.f}
 	var q8 *gguf
 	var re, re6 *regexp.Regexp
 	if q8Path != "" {
@@ -297,6 +306,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 			return err
 		}
 		defer q8.Close()
+		inputs = append(inputs, q8.f)
 		if re, err = regexp.Compile(q8re); err != nil {
 			return err
 		}
@@ -334,6 +344,10 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 	var plans []plan
 	var infos []tensorInfo
 	for _, t := range base.tensors {
+		if weight, ok := strings.CutSuffix(t.Name, ".gscale"); ok && srcs[weight+".weight"] != nil {
+			// The generated native projection supplies its own scale when needed.
+			continue
+		}
 		if s, ok := srcs[t.Name]; ok {
 			nt := tensorInfo{Name: t.Name, Dims: t.Dims, Type: s.ggmlType()}
 			if nt.rowLen() != s.k || nt.nRows() != nExperts*s.rows {
@@ -368,7 +382,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 	note := "routed experts copied from the base file"
 	if experts == "native" {
 		note = fmt.Sprintf("routed experts from thinkingmachines/Inkling-2-Mini@b85c3cfa: NV4 (NVFP4) or MX8 (MXFP8), w13 %s",
-			map[bool]string{true: "interleaved", false: "stacked"}[interleaved])
+			layout)
 	}
 	if re6 != nil {
 		note += "; Q6_K (from Q8_0) tensors matching " + q6re
@@ -376,11 +390,12 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 	if q8 != nil {
 		note += "; Q8_0 tensors matching " + q8re
 	}
-	kv := appendKVString(append([]byte(nil), base.kvRaw...), "inkserve.experts", note)
-	w, err := createGGUF(outPath, base.nKV+1, kv, infos)
+	kv := appendKVString(append([]byte(nil), base.kvRaw...), conversionKey, note)
+	w, err := createGGUF(outPath, base.nKV+1, kv, infos, inputs...)
 	if err != nil {
 		return err
 	}
+	defer w.discard()
 	for i, p := range plans {
 		t, err := w.beginTensor(p.t.Name)
 		if err != nil {
@@ -406,9 +421,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 			}
 			log.Printf("%s: Q6_K from Q8_0", p.t.Name)
 		case p.from != nil:
-			sz, _ := p.src.size()
-			sec := io.NewSectionReader(p.from.f, p.from.dataBase+int64(p.src.Off), int64(sz))
-			if _, err := io.Copy(w, sec); err != nil {
+			if err := p.from.copyTensor(w, p.src); err != nil {
 				return err
 			}
 		case p.t.Type == tF32: // a gscale tensor: the previous plan is its expert tensor
@@ -440,7 +453,7 @@ func convert(official, basePath, q8Path, q8re, q6re, experts, outPath string, in
 			log.Printf("%s: %s", p.t.Name, map[uint32]string{tNV4: "NV4", tMX8: "MX8"}[p.t.Type])
 		}
 	}
-	return w.Close()
+	return w.publish()
 }
 
 func appendF32(b []byte, f float32) []byte {
@@ -466,10 +479,23 @@ func verify(inPath, refPath string) error {
 			if !ok {
 				return fmt.Errorf("no %s", gname(layer, which))
 			}
-			rt, _ := ref.tensor(gname(layer, which))
+			rt, ok := ref.tensor(t.Name)
+			width, rows := ff, hidden
+			if which == "w13" {
+				width, rows = hidden, 2*ff
+			}
+			if !ok || rt.Type != tQ8_0 || !slices.Equal(rt.Dims, []uint64{uint64(width), uint64(rows), nExperts}) {
+				return fmt.Errorf("%s: expected Q8_0 expert tensor with shape [%d %d %d] in reference", t.Name, width, rows, nExperts)
+			}
+			if !slices.Equal(t.Dims, rt.Dims) {
+				return fmt.Errorf("%s: candidate shape %v differs from reference %v", t.Name, t.Dims, rt.Dims)
+			}
 			var gs []float32
 			if t.Type == tNV4 {
-				g, _ := in.tensor(gscaleName(layer, which))
+				g, ok := in.tensor(gscaleName(layer, which))
+				if !ok || g.Type != tF32 || !slices.Equal(g.Dims, []uint64{nExperts}) {
+					return fmt.Errorf("%s: expected %d F32 expert scales", t.Name, nExperts)
+				}
 				b, err := in.readRows(g, 0, 1)
 				if err != nil {
 					return err
@@ -478,7 +504,6 @@ func verify(inPath, refPath string) error {
 					gs = append(gs, math.Float32frombits(uint32(b[4*i])|uint32(b[4*i+1])<<8|uint32(b[4*i+2])<<16|uint32(b[4*i+3])<<24))
 				}
 			}
-			rows := int(t.Dims[1])
 			sum, n := 0.0, 0
 			for _, e := range []int{0, 31, 64, 127} {
 				for _, r := range []int{0, 7, ff - 1, ff, rows - 1} {
@@ -502,7 +527,10 @@ func verify(inPath, refPath string) error {
 					if err != nil {
 						return err
 					}
-					rel, _ := relErr(got, want)
+					rel, _, err := relErr(got, want)
+					if err != nil {
+						return fmt.Errorf("%s expert %d row %d: %w", t.Name, e, r, err)
+					}
 					sum += rel
 					n++
 					worst = max(worst, rel)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -138,8 +139,68 @@ func TestQ6KRoundTrip(t *testing.T) {
 	}
 	buf := make([]byte, 2*q6kBytes)
 	quantizeQ6K(buf, x)
-	rel, _ := relErr(dequantQ6K(buf, len(x)), x)
+	rel, _, err := relErr(dequantQ6K(buf, len(x)), x)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rel > 0.03 {
 		t.Errorf("Q6_K round trip error %.4f", rel)
+	}
+}
+
+func TestRelativeErrorVerifiesZeroAndNonfiniteWeights(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		got, want []float32
+		rel       float64
+		fail      bool
+	}{
+		{"zero rows", []float32{0, 0}, []float32{0, 0}, 0, false},
+		{"zero output", []float32{0}, []float32{2}, 1, false},
+		{"nonzero against zero", []float32{1}, []float32{0}, 0, true},
+		{"nan after mismatch", []float32{2, float32(math.NaN())}, []float32{1, 1}, 0, true},
+		{"infinite reference", []float32{1}, []float32{float32(math.Inf(1))}, 0, true},
+		{"matching infinities", []float32{float32(math.Inf(-1))}, []float32{float32(math.Inf(-1))}, 0, true},
+		{"different widths", []float32{1}, []float32{1, 0}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel, _, err := relErr(tc.got, tc.want)
+			if (err != nil) != tc.fail || rel != tc.rel {
+				t.Fatalf("relErr = %v, %v", rel, err)
+			}
+		})
+	}
+}
+
+func TestHalfNonfiniteScale(t *testing.T) {
+	if !math.IsInf(float64(f16(0x7c00)), 1) || !math.IsInf(float64(f16(0xfc00)), -1) ||
+		!math.IsNaN(float64(f16(0x7c01))) {
+		t.Fatal("nonfinite fp16 weight scales must decode as nonfinite")
+	}
+}
+
+func TestRejectUnknownExpertLayoutBeforeOpeningFiles(t *testing.T) {
+	err := convert("", "", "", "", "", "native", "", "interleavd")
+	if err == nil || !strings.Contains(err.Error(), "-w13") {
+		t.Fatalf("invalid -w13 layout: got %v", err)
+	}
+}
+
+func TestExpertRowOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		interleaved bool
+		rows        []int
+	}{
+		{"interleaved", true, []int{0, 2, 1, 3}},
+		{"stacked", false, []int{0, 1, ff, ff + 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i, output := range []int{0, 1, ff, ff + 1} {
+				if got := srcRow("w13", tc.interleaved, output); got != tc.rows[i] {
+					t.Errorf("W13 source for row %d = %d, want %d", output, got, tc.rows[i])
+				}
+			}
+		})
 	}
 }

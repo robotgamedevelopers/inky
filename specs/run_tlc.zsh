@@ -1,11 +1,9 @@
-#!/bin/zsh
-# Run on the designated bench; negative controls must fail for the right reason.
-# The `check` lines below queue their runs; the queue then runs TLC_JOBS at a time (default: one per available core), each a
-# single-worker TLC in its own process, and the table prints in file order once every run has finished.
-# `run_tlc.zsh --list` prints the names of the selected checks and runs nothing: scripts/check-tla-tiers.sh reads it.
-set -eu
-zmodload zsh/datetime
-root=${0:A:h} self=${0:A}
+#!/usr/bin/env bash
+# zsh specs/run_tlc.zsh remains a supported entry point. The queue uses Bash 3+.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")" && pwd)
+self=$root/run_tlc.zsh
 jar=${TLC_JAR:-$HOME/sdk/tla/tla2tools.jar}
 java=${TLC_JAVA:-$HOME/sdk/bin/java}
 mode=run
@@ -13,13 +11,13 @@ case ${1:-} in
     '') ;;
     --list) mode=list ;;
     --one) mode=one ;;  # internal: one queued run, started by xargs below
-    *) print -u2 "usage: run_tlc.zsh [--list]"; exit 2 ;;
+    *) echo >&2 "usage: run_tlc.zsh [--list]"; exit 2 ;;
 esac
 if [[ $mode != list ]]; then
     output=${TLC_OUTPUT:-$PWD/tlc-results}
     mkdir -p "$output"
-    output=${output:A}
-    [[ -r "$jar" ]] || { print -u2 "Missing TLC jar: $jar"; exit 1; }
+    output=$(cd -- "$output" && pwd)
+    [[ -r "$jar" ]] || { echo >&2 "Missing TLC jar: $jar"; exit 1; }
 fi
 
 # TLC_ONLY=<modules> runs only the checks of those modules; TLC_EXCEPT=<modules> runs every other check (comma lists).
@@ -27,22 +25,96 @@ fi
 # scripts/check-tla.sh splits its layout part this way into parallel CI jobs. A selection that runs nothing, or names
 # a module with no check, fails.
 only=${TLC_ONLY:-} except=${TLC_EXCEPT:-} nightly_only=${TLC_NIGHTLY_ONLY:-} ran=0
-typeset -A seen
-typeset -a queue
+seen=,
+queue=()
+
+now() { perl -MTime::HiRes=time -e 'print time'; }
+elapsed_since() { perl -MTime::HiRes=time -e 'printf "%.3f", time - $ARGV[0]' "$1"; }
+
+# Compile the production prefix walk with the host slot records. Each case gets
+# its own model and generated trace, so concurrent runs never modify the checkout.
+prepare_prefix_trace() {
+    local name=$1 dir=$2 from to
+    cp "$root"/{PrefixTree.tla,PrefixTreeTrace.tla,PrefixTreeTrace.cfg} "$dir/"
+    cp "$root/../src/prefix.rs" "$dir/"
+    case $name in
+        mutant-no-evict)
+            from='.filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))'
+            to='.filter(|(_, _h)| false)' ;;
+        mutant-full-match)
+            from='!tokens.is_empty() && m.at == tokens.len()'
+            to='false && m.at == tokens.len()' ;;
+        mutant-ref-leak)
+            from='self.records.drop_ref(e.slot(), e.kind(), e.generation())'
+            to='Ok::<(), BlockError>(())' ;;
+    esac
+    if [[ -n ${from:-} ]]; then
+        MUT_FROM="$from" MUT_TO="$to" perl -0pi -e \
+            's/\Q$ENV{MUT_FROM}\E/$ENV{MUT_TO}/ or die "plant not applied\n"' "$dir/prefix.rs"
+    fi
+    printf '%s\n' 'extern crate blocks;' 'mod prefix;' > "$dir/main.rs"
+    rustc --edition=2021 --extern blocks="$dir/libblocks.rlib" -A dead_code --test "$dir/main.rs" -o "$dir/walk"
+    rm -f "$dir/PrefixTreeTraceData.tla"
+    INKY_PREFIX_TRACE_OUT="$dir/PrefixTreeTraceData.tla" "$dir/walk" \
+        --exact prefix::tests::prefix_trace_dump --ignored > "$dir/walk.log"
+    grep -Fq 'test result: ok. 1 passed;' "$dir/walk.log" && [[ -s "$dir/PrefixTreeTraceData.tla" ]] || { echo >&2 "prefix trace dump failed: $name"; exit 1; }
+}
+
+# Use the same address generator as "inky inblock-trace", without linking Metal.
+prepare_inblock_trace() {
+    local name=$1 dir=$2
+    cp "$root/InBlockTrace.tla" "$root/$name.cfg" "$dir/"
+    printf '%s\n' 'fn main() -> std::io::Result<()> {' \
+        '    blocks::write_inblock_trace(&std::env::args().nth(1).unwrap())' '}' > "$dir/main.rs"
+    rustc --edition=2021 --extern blocks="$dir/libblocks.rlib" "$dir/main.rs" -o "$dir/generate"
+    rm -f "$dir/InBlockTraceData.tla"
+    "$dir/generate" "$dir/InBlockTraceData.tla"
+}
 
 # run_one NAME MODULE EXPECTED KIND: one TLC run; EXPECTED is - for a run that must pass. Its table row goes to
 # $output/NAME.result, which exists only when the run gave exactly the expected result.
 run_one() {
-    local name=$1 module=$2 expected=${3:#-} kind=$4 log="$output/$1.log"
-    local started=$EPOCHREALTIME elapsed rc
+    local name=$1 module=$2 expected=$3 kind=$4 log="$output/$1.log"
+    local specdir=$root config=$name workers=1
+    if [[ $name = PrefixTreeNightly ]]; then workers=${TLC_WORKERS:-1}; fi
+    if [[ $expected = - ]]; then expected=; fi
+    if [[ $module = PrefixTreeTrace || $module = InBlockTrace ]]; then
+        specdir=$output/$name-trace
+        mkdir -p "$specdir"
+        rustc --edition=2021 --cfg standalone_blocks --crate-type rlib \
+            "$root/../src/blocks.rs" -o "$specdir/libblocks.rlib"
+        if [[ $module = PrefixTreeTrace ]]; then
+            config=PrefixTreeTrace
+            prepare_prefix_trace "$name" "$specdir"
+        else
+            prepare_inblock_trace "$name" "$specdir"
+        fi
+    fi
+    local started elapsed rc
+    started=$(now)
+    if [[ $kind = simulation ]]; then
+        "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC -noGenerateSpecTE \
+            -workers 1 -metadir "$output/$name-states" -simulate num=256 -depth 128 -seed 431273 \
+            -config "$root/$name.cfg" "$root/$module.tla" >"$log" 2>&1
+        grep '^Progress: .*256 traces generated (trace length: mean=128,' "$log" > "$output/$name.result"
+        return
+    fi
     if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC -noGenerateSpecTE \
-        -workers 1 -metadir "$output/$name-states" \
-        -config "$root/$name.cfg" "$root/$module.tla" >"$log" 2>&1; then
+        -workers "$workers" -metadir "$output/$name-states" \
+        -config "$specdir/$config.cfg" "$specdir/$module.tla" >"$log" 2>&1; then
         rc=0
     else
         rc=$?
     fi
-    elapsed=$(( EPOCHREALTIME - started ))
+    elapsed=$(elapsed_since "$started")
+    if [[ $kind = trace-mutant ]]; then
+        if [[ $rc -eq 0 ]] || ! grep -Fxq "Error: $expected." "$log"; then
+            echo >&2 "$name failed to produce its $expected witness; inspect $log"
+            exit 1
+        fi
+        printf "%s | red as required (%s)\n" "$name" "$expected" > "$output/$name.result"
+        return
+    fi
     local ok=true
     # An initial-state violation stops before TLC prints a state count.
     if [[ $kind != initial ]]; then
@@ -80,9 +152,17 @@ run_one() {
         [[ $rc -eq 0 ]] || ok=false
         if grep -q "^Error:" "$log"; then ok=false; fi
         grep -Fxq "Model checking completed. No error has been found." "$log" || ok=false
+        if [[ $module = InBlockTrace ]]; then
+            # Both element widths enumerate 2 passes x 2 planes x 3 heads x 4 positions.
+            grep -Eq '^[0-9,]+ states generated, 48 distinct states found, 0 states left on queue\.' "$log" || ok=false
+        fi
     fi
     if [[ $ok != true ]]; then
-        print -u2 "Unexpected result for $name (exit $rc); inspect $log"
+        echo >&2 "Unexpected result for $name (exit $rc); inspect $log"
+        exit 1
+    fi
+    if [[ $module = InBlockTrace ]] && ! cmp -s "$specdir/InBlockTraceData.tla" "$root/InBlockTraceData.tla"; then
+        echo >&2 "InBlockTraceData.tla is stale; regenerate it with inky inblock-trace. Fresh trace: $specdir/InBlockTraceData.tla"
         exit 1
     fi
     local counts
@@ -100,7 +180,7 @@ select_check() {
     if [[ -n $only && ",$only," != *",$module,"* ]] || [[ -n $except && ",$except," == *",$module,"* ]]; then
         return 0
     fi
-    ran=$(( ran + 1 )); seen[$module]=1
+    ran=$(( ran + 1 )); seen="$seen$module,"
     queue+=("$name" "$module" "${expected:--}" "$kind")
 }
 
@@ -126,7 +206,17 @@ check PrefixTreeLeak PrefixTree RefsSettledAfterSeek
 check PrefixTreeReuseHeld PrefixTree HeldNeverStale
 check PrefixTreeStaleInsert PrefixTree NoBadInsert
 check PrefixTreeTrace PrefixTreeTrace
-check_nightly PrefixTree PrefixTree
+# The 21-node full config has at least 6^20 slot assignments. Nightly CI
+# exhausts two slots with up to three sealed nodes and simulates the full config.
+check_nightly PrefixTreeNightly PrefixTree
+if [[ -n ${INKY_TLC_NIGHTLY:-} && -z $nightly_only ]]; then
+    check_nightly PrefixTree PrefixTree
+else
+    check_nightly PrefixTree PrefixTree - simulation
+fi
+check_nightly mutant-no-evict PrefixTreeTrace 'Deadlock reached' trace-mutant
+check_nightly mutant-full-match PrefixTreeTrace 'Deadlock reached' trace-mutant
+check_nightly mutant-ref-leak PrefixTreeTrace 'Invariant PoolBooks is violated' trace-mutant
 check BlockLayout3 BlockLayout
 check BlockLayout4 BlockLayout
 check BlockLayoutHigh BlockLayout
@@ -173,74 +263,34 @@ check InBlockAddrCol InBlock NoCollision
 check InBlockTrace InBlockTrace
 check InBlockTraceKv8 InBlockTrace
 
-(( ran > 0 )) || { print -u2 "run_tlc.zsh: no check selected (TLC_ONLY=$only TLC_EXCEPT=$except TLC_NIGHTLY_ONLY=$nightly_only)"; exit 1; }
-for m in ${(s:,:)only}; do
-    [[ -n ${seen[$m]:-} ]] || { print -u2 "run_tlc.zsh: TLC_ONLY names $m, which has no check"; exit 1; }
-done
+(( ran > 0 )) || { echo >&2 "run_tlc.zsh: no check selected (TLC_ONLY=$only TLC_EXCEPT=$except TLC_NIGHTLY_ONLY=$nightly_only)"; exit 1; }
+if [[ -n $only ]]; then
+    IFS=, read -r -a requested <<< "$only"
+    for module in "${requested[@]}"; do
+        [[ $seen = *",$module,"* ]] || { echo >&2 "run_tlc.zsh: TLC_ONLY names $module, which has no check"; exit 1; }
+    done
+fi
+names=()
+for (( i=0; i<${#queue[@]}; i+=4 )); do names+=("${queue[i]}"); done
 if [[ $mode = list ]]; then
-    for (( i = 1; i <= $#queue; i += 4 )); do print -r -- $queue[i]; done
+    printf '%s\n' "${names[@]}"
     exit 0
 fi
 
-# Mutants of the PrefixTree trace binding (Cargo + Metal-crate build on macOS):
-# run in the nightly layout-nightly tier (no PR timeout), sharing one cargo target dir.
-mutant() {
-    local name=$1 from=$2 to=$3 expected=$4 log="$output/mutant-$1.log" rc
-    local tmp=$(mktemp -d)
-    mkdir "$tmp/repo"
-    (cd "$root/.." && tar --exclude=target --exclude=.git --exclude=tlc-results -cf - .) \
-        | (cd "$tmp/repo" && tar -xf -) || { print -u2 "mutant $name: copy failed"; exit 1; }
-    MUT_FROM="$from" MUT_TO="$to" perl -0pi -e \
-        's/\Q$ENV{MUT_FROM}\E/$ENV{MUT_TO}/ or die "plant not applied\n"' \
-        "$tmp/repo/src/prefix.rs" \
-        || { print -u2 "mutant $name: plant not applied"; rm -rf "$tmp"; exit 1; }
-    (cd "$tmp/repo" && CARGO_TARGET_DIR="$output/mutant-target" \
-        INKY_PREFIX_TRACE_OUT="$tmp/repo/specs/PrefixTreeTraceData.tla" \
-        cargo test --locked prefix::tests::prefix_trace_dump -- --ignored --exact >/dev/null 2>&1) \
-        || { print -u2 "mutant $name: the plant broke the trace walk itself"; rm -rf "$tmp"; exit 1; }
-    if "$java" -XX:+UseParallelGC -Xmx4g -cp "$jar" tlc2.TLC -noGenerateSpecTE \
-        -workers 1 -metadir "$output/mutant-$name-states" \
-        -config "$tmp/repo/specs/PrefixTreeTrace.cfg" "$tmp/repo/specs/PrefixTreeTrace.tla" \
-        >"$log" 2>&1; then rc=0; else rc=$?; fi
-    rm -rf "$tmp"
-    if [[ $rc -eq 0 ]] || ! grep -Fxq "Error: $expected." "$log"; then
-        print -u2 "mutant $name did not go red as $expected; inspect $log"
-        exit 1
-    fi
-    printf "mutant-%s | red as required (%s)\n" "$name" "$expected"
-}
-
-njobs=${TLC_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)}  # nproc honours a CPU reservation
-[[ $njobs = <1-> ]] || { print -u2 "run_tlc.zsh: TLC_JOBS must be a positive integer, not $njobs"; exit 1; }
-for (( i = 1; i <= $#queue; i += 4 )); do rm -f "$output/$queue[i].result"; done
+njobs=${TLC_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)}
+[[ $njobs =~ ^[1-9][0-9]*$ ]] || { echo >&2 "run_tlc.zsh: TLC_JOBS must be a positive integer"; exit 1; }
+for name in "${names[@]}"; do rm -f "$output/$name.result"; done
 export TLC_JAR=$jar TLC_JAVA=$java TLC_OUTPUT=$output
-started=$EPOCHREALTIME xrc=0
-print -rN -- "${queue[@]}" | xargs -0 -n 4 -P "$njobs" zsh "$self" --one || xrc=$?
-print "run | generated | distinct | wall seconds | result"
-typeset -a failed
-for (( i = 1; i <= $#queue; i += 4 )); do
-    if [[ -f $output/$queue[i].result ]]; then cat "$output/$queue[i].result"; else failed+=($queue[i]); fi
+started=$(now)
+xrc=0
+printf '%s\0' "${queue[@]}" | xargs -0 -n 4 -P "$njobs" bash "$self" --one || xrc=$?
+echo "run | generated | distinct | wall seconds | result"
+failed=
+for name in "${names[@]}"; do
+    if [[ -s $output/$name.result ]]; then cat "$output/$name.result"; else failed="$failed $name"; fi
 done
-printf "%d runs, %d at a time: %.3f s wall\n" $(( $#queue / 4 )) $njobs $(( EPOCHREALTIME - started ))
-if (( $#failed || xrc )); then
-    print -u2 "run_tlc.zsh: failed: ${failed[*]:-none missing, but xargs exited $xrc}"
+printf "%d runs, %d at a time: %s s wall\n" "${#names[@]}" "$njobs" "$(elapsed_since "$started")"
+if [[ -n $failed || $xrc != 0 ]]; then
+    echo >&2 "run_tlc.zsh: failed:$failed (xargs exit $xrc)"
     exit 1
-fi
-
-if [[ -n $nightly_only && $(uname -s) = Darwin ]]; then
-    (cd "$root/.." && INKY_PREFIX_TRACE_OUT="$root/PrefixTreeTraceData.tla" \
-        cargo test --locked prefix::tests::prefix_trace_dump -- --ignored --exact >/dev/null) \
-        || { print -u2 "prefix trace dump failed"; exit 1; }
-    mutant no-evict \
-        '.filter(|(_, h)| h.entries().any(|e| self.records.generation(e.slot(), e.kind()) != Some(e.generation())))' \
-        '.filter(|(_, _h)| false)' \
-        'Deadlock reached'
-    mutant full-match \
-        '!tokens.is_empty() && m.at == tokens.len()' \
-        'false && m.at == tokens.len()' \
-        'Deadlock reached'
-    mutant ref-leak \
-        'self.records.drop_ref(e.slot(), e.kind(), e.generation())' \
-        'Ok::<(), BlockError>(())' \
-        'Invariant PoolBooks is violated'
 fi

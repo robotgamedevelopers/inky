@@ -264,10 +264,11 @@ func convertMTP(mtpPath, official, outPath string) error {
 		infos[i] = tensorInfo{Name: t.name, Dims: t.dims, Type: t.typ}
 	}
 	kv := appendKVString(nil, "inkserve.mtp", "Inkling 2 Mini DSpark drafter (mtp.safetensors) for inkserve's erisinky branch; see DSPARK.md")
-	gw, err := createGGUF(outPath, 1, kv, infos)
+	gw, err := createGGUF(outPath, 1, kv, infos, st.f, off.f)
 	if err != nil {
 		return err
 	}
+	defer gw.discard()
 	for _, t := range ts {
 		info, err := gw.beginTensor(t.name)
 		if err != nil {
@@ -285,5 +286,5 @@ func convertMTP(mtpPath, official, outPath string) error {
 			return err
 		}
 	}
-	return gw.Close()
+	return gw.publish()
 }

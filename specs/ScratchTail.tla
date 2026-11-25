@@ -1,6 +1,6 @@
 ---------------------------- MODULE ScratchTail ----------------------------
 \* The sliding-window K/V scratch of one multi-span prefill step: its row
-\* layout and who last wrote each row (src/engine.rs layer_b; k_zero, k_kvcopy,
+\* layout and who last wrote each row (src/engine.rs layer_b_ex; k_zero, k_kvcopy,
 \* k_kvprep_b and k_attn_h in src/prefill.metal). Every span of the step, in
 \* every sliding-window layer, uses the same scratch. Rows are relative to the
 \* row of the span's first key (EXT + KGUARD in the code): the span copies its
@@ -46,7 +46,7 @@ Init == /\ \E n \in 1 .. MaxSpans : spans \in [1 .. n -> Span]
         /\ layer = 1 /\ s = 1 /\ pc = "write"
 
 \* span s, this layer: history copy (k_kvcopy), its keys (k_kvprep_b), and the fix
-\* (k_kvcopy with to_ring = 2 over rows t .. Reach - 1, when the step has several spans)
+\* (k_kvcopy in ClearScratch mode over rows t .. Reach - 1, when the step has several spans)
 Write == /\ pc = "write"
          /\ LET sp == spans[s] IN
             scratch' = [r \in Rows |->

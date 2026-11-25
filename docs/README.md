@@ -60,7 +60,7 @@ To enable inky mode, the Mac's owner installs the memory helper once from the ch
 sudo ./target/release/inky tune-memory
 ```
 
-The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while inky is connected. It restores the prior limit after the last inky process disconnects. Inky runs under the owner's account and logs whether it entered inky mode. Without the helper, the server uses the macOS default limit. To remove it, run `sudo ./target/release/inky tune-memory --undo`.
+The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while inky is connected. It restores the prior limit after the last inky process disconnects. If the helper restarts, it restores the saved limit at startup. Processes that held a lease reconnect automatically and raise the limit again. Inky runs under the owner's account and logs when it enters, loses, or regains its connection. Without the helper, the server uses the macOS default limit. To remove it, run `sudo ./target/release/inky tune-memory --undo`.
 
 ### Start the server
 
@@ -78,11 +78,12 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
 | `--key-env NAME` (`--api-key-env NAME`) | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allows a non-loopback listen address without a key. |
-| `--lanes N` | 16 | Concurrent requests |
+| `--lanes N` | Machine tuning (32 on M5 Pro 64 GB, otherwise 64) | Concurrent requests, subject to the memory budget |
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
 | `--kv8` | off | 8-bit K/V cache: doubles paged `BlockPool` capacity and halves KV read bandwidth (NOT exact; default is fp16) |
+| `--loopcd OMEGA` | 0 | Maximum adaptive contrast weight (0 to 4). Both generation APIs accept a per-request `loopcd_omega` override. |
 | `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
 An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.
@@ -91,13 +92,19 @@ An extending request can reuse a lane's previous prompt while its sliding-window
 
 `GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini` and `inky/inkling-2-mini`. `POST /v1/messages` supports streaming, thinking effort mapping, and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, `stream_options.include_usage: true`, model `inkling-2-mini` or `inky/inkling-2-mini`, and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 
+Both generation endpoints support automatic tool selection. Omit `tool_choice` or use `"auto"` for Chat Completions and `{"type":"auto"}` for Messages. Requests that disable or force tools, disable parallel tool use, or supply custom stop strings (`stop` or `stop_sequences`) receive HTTP 400 before generation starts.
+
 Each completed request logs its queue wait (`queue_ms`), prefill time (`prefill_ms`), decode time (`decode_ms`), and occupied lanes at admission (`lanes_busy_start`), records them in `--record-dir` JSONL entries, and exposes them on non-streaming responses via `X-Inky-Queue-Ms`, `X-Inky-Prefill-Ms`, and `X-Inky-Decode-Ms`. Once a minute, including idle periods, the server logs a time-weighted utilization summary (`lanes_busy_avg`, `input_tok_s`, `output_tok_s`, `queue_depth`).
 
-The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. Up to four requests can translate and tokenize prompts concurrently, including `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
+A recording directory keeps active `cards-YYYYMMDD.jsonl` files and their rotated `.jsonl.1` backups. Directory replay reads both. Requests with an `X-Inky-Card-Id` retain that identifier across turns. Anonymous requests receive a fresh single-turn ID, including after a recorder restart. The `--record-max-bytes` cap includes the terminating newline. An oversized row is dropped before rotation and increments `record_dropped` in `/health`.
+
+New recordings include `response.delivery_status`. A value of `written` means the server finished writing and flushing the response. A disconnect or write failure records `failed`. When the handler receives the completed generation, it also records `response.generation_finish_reason`, even if the final response write fails. The existing `status_code` and `finish_reason` continue to describe the overall request. Older recordings omit the new fields and their delivery outcome is unknown.
+
+The server accepts at most `--lanes` plus `--queue` generation jobs at a time, up to the 512-connection limit. Each job holds its slot from before rendering until the scheduler finishes or discards it. The number of concurrent prompt translations and tokenizations is the greater of four and the effective lane count. This limit includes `count_tokens` calls. When either limit is full, the server returns HTTP 429 with `Retry-After: 5`. Wait at least that many seconds before retrying.
 
 Generation prompt rendering stops early once the applicable token limit is exceeded. A prompt token count reported for an early rejection is a lower bound. To get the exact rendered count for a Messages request, use `count_tokens`, which can count past the lane context. A full output buffer pauses its own lane, and a socket write that stalls for five seconds closes the connection and cancels any remaining generation.
 
-Each completed request logs its queue wait (`queue_ms`), the time spent readying its lane after admission (`prep_ms`: prefix match/restore, reset, kept state, and prompt upload) and the number of occupied lanes at admission, including its own (`lanes_busy_start`). Prefill and generation times sum the wall time of the engine batches that served the lane. Each participating lane receives the full batch duration. Prefill tokens/s counts newly evaluated prompt tokens. Generation tokens/s counts decode steps; the first output token comes from prefill, so a one-token response has zero decode time and rate.
+Each completed request logs its queue wait (`queue_ms`), the time spent readying its lane after admission (`prep_ms`: prefix match/restore, reset, kept state, and prompt upload) and the number of occupied lanes at admission, including its own (`lanes_busy_start`). Prefill and generation times sum the wall time of the engine batches that served the lane. Each participating lane receives the full batch duration. Prefill tokens/s counts newly evaluated prompt tokens. Generation tokens/s counts steps after the first output token. With LoopCD enabled, the final prompt token runs through guided decode and counts toward prefill time. Its KV stays private to the current request. A one-token response has zero generation time and rate.
 
 Once a minute, including idle periods, the summary reports the time-weighted mean occupied lanes, newly prefilled and sampled output tokens per second over the whole interval, and the number of requests currently waiting for a lane. Use these interval-wide rates to distinguish slow inference from idle time between tool turns.
 
@@ -161,7 +168,8 @@ cargo build --release
 ./target/release/inky bench -f prompt.txt -n 256  # prefill + decode throughput
 ```
 Options: `--effort none|minimal|low|medium|high|xhigh`, `--temp/--top-p/--top-k/--seed`, `--system`, `-c CTX`,
-`--hide-thinking`, `--raw`, `--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
+`--hide-thinking`, `--raw`, `--loopcd OMEGA` (0 to 4, starting with the first output token and incompatible with `--kv-disk`),
+`--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
 generation, bit-identical output), `--kv8` (half-size 8-bit K/V cache, not exact - both in the limits section),
 `-m model.gguf` (default: LM Studio's Inkling-2-Mini Q4_K_M). Requires macOS with Metal 4
 (M5 neural accelerators are used for prefill GEMMs and prefill attention).
