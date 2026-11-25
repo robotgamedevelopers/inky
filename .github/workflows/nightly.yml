@@ -86,9 +86,17 @@ jobs:
       - name: GPU router regression
         if: ${{ !cancelled() }}
         run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
+      - name: LoopCD model and mixed-lane regressions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --release loopcd_ -- --ignored --test-threads=1
       - name: GPU gates (full set)
         if: ${{ !cancelled() }}
         run: tests/ci.sh full
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: ${{ !cancelled() }}
+        with:
+          distribution: temurin
+          java-version: '21'
       # The long poisoned-slot gate (17 lanes, 64 decode steps; about 126-140 s), from #55.
       - name: long GPU gates
         if: ${{ !cancelled() }}

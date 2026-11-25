@@ -16,6 +16,17 @@ TLC_OUTPUT=/tmp/block-layout-results zsh specs/run_tlc.zsh
 
 The runner defaults to `~/sdk/bin/java` and `~/sdk/tla/tla2tools.jar`;
 set `TLC_JAVA` or `TLC_JAR` to override those paths.
+The per-PR `blocks` and `grouped` jobs select disjoint parts of this inventory.
+CI runs the selectors with Bash. The nightly workflow invokes
+`TLA_NIGHTLY=1 scripts/check-tla.sh layout-nightly` for the prefix trace
+mutations, `StartTails3`, and `PrefixTreeNightly`. The latter exhaustively
+checks two distinct slots and up to three sealed nodes including the root.
+It can explore siblings and stale ancestors. The nightly separately simulates
+256 traces of 128 steps on the original 21-node `PrefixTree.cfg`. To request
+an exhaustive run at that bound, set `INKY_TLC_NIGHTLY=1` when running
+`specs/run_tlc.zsh` directly. Assigning slot pairs to its 20 non-root nodes
+alone permits at least 6^20 states.
+
 The runner requires complete successful output for positive runs and the exact
 expected invariant failure for each witness. It keeps full TLC output, including
 counterexamples, in the output directory. For an individual run, from `specs/`:
@@ -201,40 +212,47 @@ one-line mutations of `src/blockbook.rs` must each be rejected by TLC:
 
 ## Serve scheduler traces
 
-On a Mac with the Rust toolchain, write one deterministic trace from the serve
-scheduler. The test uses a fake inference engine and an in-process client
-workload. It opens no sockets and loads no model.
+The per-PR `traces` job runs two checks for `src/scheduler.rs`.
+`check-scheduler-traces.sh` replays the resource and request lifecycle of
+`Scheduler` against `CacheScheduler.tla`, including cancellation and queue
+bypass. `check-serve-step-traces.sh` replays decisions taken by the serving
+step planner against `ServeStepTrace.tla`. Both require source mutations to
+produce TLC counterexamples.
+
+Serving emits one homogeneous decode or prefill batch per decision. Decode has
+priority until a runnable prefiller has waited 16 bypasses and every runnable
+decoder has waited fewer. Within a phase, older lanes are served first. Lane index breaks ties. Prefill reservations for other lanes at the
+ceiling, chunk alignment, backpressure and the token budget influence the spans.
+The model checks the phase, the selected spans and each lane's new wait counter
+for every recorded invocation. Request admission, cache ownership, GPU results
+and delivery to the client have separate checks.
+
+The portable driver calls the same step entry point as the serving loop. Its 33
+deterministic workloads each include a complete decode burst, preemption and an
+idle decision. To record one seed and replay its 64 decisions, set
+`TLA2TOOLS_JAR` to the pinned jar and run:
 
 ```sh
 INKY_SCHED_TRACE_SEED=1 INKY_SCHED_TRACE_OUT=/tmp/serve-seed-1.jsonl \
   cargo test --locked serve::scheduler_trace::dump -- --ignored --exact
+bash scripts/check-serve-step-traces.sh --replay /tmp/serve-seed-1.jsonl
 ```
 
-The first JSON line records the schema version (currently 2), seed, lane count, queue limit,
-prefill chunk budget and context. Each subsequent line records one event in
-execution order. Request IDs (`job`) identify arrivals through termination.
-Lane indices and token positions start at zero.
+To replay the actual serving loop, record the existing three-turn Metal regression
+on a Mac with the test GGUF, then run the same checker. The M5 nightly job
+runs this workload and verifies every captured decision.
 
-| Event | Observation |
-| --- | --- |
-| `arrive`, `refuse429` | The client submits a request with prompt length and generation limit. A refusal is the outcome of the same atomic capacity claim used by both HTTP handlers. |
-| `admit` | The scheduler assigns a request to a free lane (`lane`) and records its cached prefix length (`cached`) and where that prefix comes from: `source` is `cold` (nothing cached, `cached` is 0), `own` (the lane's own kept prompt) or `copy` (copied from the busy lane `from`, whose prefill has just finished). `from` equals `lane` unless `source` is `copy`. |
-| `refuse_ctx` | The request reached a free lane but its prompt plus generation limit plus two reserved tokens exceeds one lane's context. The scheduler refuses it; this ends the request. |
-| `build_step` | The scheduler submits a prefill or decode batch. Each span names its lane, request, starting position and token count. |
-| `finish_step` | The submitted batch has completed. This is the engine fence for that step. |
-| `disconnect`, `cancel` | The simulated client drops its receiver; the scheduler observes delivery failure and releases the lane. These can occur on different ticks. |
-| `finish` | The request reaches its stop or length condition. The event includes the generated token count. |
+```sh
+INKY_SCHED_TRACE_OUT=/tmp/serve-metal.jsonl \
+  cargo test --locked --release serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo -- --ignored --exact
+bash scripts/check-serve-step-traces.sh --replay /tmp/serve-metal.jsonl
+```
 
-The fake supplies cache state and logits at the engine boundary. The production
-scheduler still chooses lanes and builds batches, samples tokens, sends events
-and observes disconnects. The trace covers the current serving decisions.
-The default test repeats 33 seeds with two lanes and one queued request and
-checks that the trace drains. Some prompts extend the previous prompt, so the
-seeds cover cold, own-lane and cross-lane admissions; each walk also submits one
-request too long for a lane, which ends in `refuse_ctx`. A constant winning
-token means normal generation ends at the requested length. Model output and GPU
-execution have separate tests. A TLC replay against
-CacheScheduler is a separate verification step.
+Each JSONL line is a version 2 frame. Arrays are in zero-based Rust lane order.
+`runnable`, `pending`, `pos` and `endPos` are planner inputs. `before` and
+`after` are the wait counters around the call. `budget`, `align` and `ceiling`
+are its limits. `mode`, `starts` and `spans` describe the returned decision.
+An unselected lane has zero start and span.
 
 ## Poisoned-slot gate
 

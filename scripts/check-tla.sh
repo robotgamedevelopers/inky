@@ -19,10 +19,10 @@
 set -eu
 
 parts='memmode blocks grouped layout-nightly scheduler traces'
-# The trace-conformance scripts, scripts/check-<name>-traces.sh: memmode, blockbook, cache and scheduler
+# The trace-conformance scripts, scripts/check-<name>-traces.sh: memmode, blockbook, cache, scheduler and serve-step
 # all live on main and run in parallel. A check-*-traces.sh that is not named here fails the traces part
 # and the tier check.
-trace_scripts='memmode blockbook cache scheduler'
+trace_scripts='memmode blockbook cache scheduler serve-step'
 grouped_modules=GroupedLayout,PoisonGate,ScratchTail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -34,6 +34,9 @@ if [ "${1:-}" = --list ]; then
 fi
 section=${1:-all}
 case $section in
+    --serve-trace)
+        [ -z "$listing" ] && [ "$#" -eq 2 ] || { echo 'usage: scripts/check-tla.sh --serve-trace TRACE.jsonl' >&2; exit 2; }
+        ;;
     all|memmode|layout|blocks|grouped|layout-nightly|scheduler|traces) ;;
     *) echo "usage: scripts/check-tla.sh [--list] [all|memmode|layout|blocks|grouped|layout-nightly|scheduler|traces]" >&2; exit 2 ;;
 esac
@@ -63,7 +66,9 @@ if [ -n "$listing" ]; then
             memmode) echo "$memmode_checks" | while read -r name _; do echo "memmode:$name"; done ;;
             blocks|grouped|layout-nightly)
                 [ -f "$root/specs/BlockLayout.tla" ] || continue
-                env $(layout_sel "$p") zsh "$root/specs/run_tlc.zsh" --list | sed 's/^/layout:/' ;;
+                names=$(env $(layout_sel "$p") bash "$root/specs/run_tlc.zsh" --list) || exit 1
+                [ -n "$names" ] || { echo "$p selected no layout checks" >&2; exit 1; }
+                printf '%s\n' "$names" | sed 's/^/layout:/' ;;
             scheduler)
                 [ -f "$root/specs/CacheScheduler.tla" ] || continue
                 sh "$root/specs/run_cache_scheduler.sh" --list | sed 's/^/scheduler:/' ;;
@@ -127,6 +132,11 @@ java_bin=${TLC_JAVA:-java}
 export TLA2TOOLS_JAR="$jar" TLC_JAR="$jar" TLC_JAVA="$java_bin"
 export TLC_WORKERS="${TLC_WORKERS:-2}"
 
+if [ "$section" = --serve-trace ]; then
+    bash "$root/scripts/check-serve-step-traces.sh" --replay "$2"
+    exit 0
+fi
+
 memmode=$root/specs/memmode
 # check_memmode NAME [INVARIANT]: one TLC run of specs/memmode/NAME.cfg; its line goes to $work/memmode-NAME.result.
 check_memmode() {
@@ -181,20 +191,22 @@ fi
 for p in blocks grouped; do
     want "$p" && [ -f "$root/specs/BlockLayout.tla" ] || continue
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
-    env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" zsh "$root/specs/run_tlc.zsh" || {
+    env $(layout_sel "$p") TLC_OUTPUT="$work/block-layout-$p" bash "$root/specs/run_tlc.zsh" || {
         find "$work/block-layout-$p" -name '*.log' -exec tail -n 60 {} \; >&2
         exit 1
     }
+    sh "$root/tests/check-layout-coverage.sh" "$work/block-layout-$p" "$p"
 done
 
 if want layout-nightly && [ -f "$root/specs/BlockLayout.tla" ]; then
     [ -f "$root/specs/run_tlc.zsh" ] || { echo 'BlockLayout runner missing' >&2; exit 1; }
     case "${TLA_NIGHTLY:-0}" in
         1)
-            env $(layout_sel layout-nightly) TLC_OUTPUT="$work/block-layout-nightly" zsh "$root/specs/run_tlc.zsh" || {
+            env $(layout_sel layout-nightly) TLC_OUTPUT="$work/block-layout-nightly" bash "$root/specs/run_tlc.zsh" || {
                 find "$work/block-layout-nightly" -name '*.log' -exec tail -n 60 {} \; >&2
                 exit 1
             }
+            sh "$root/tests/check-layout-coverage.sh" "$work/block-layout-nightly" layout-nightly
             ;;
         0)
             echo 'layout-nightly (PrefixTree, StartTails3): not run here; nightly only (.github/workflows/nightly.yml)'

@@ -203,11 +203,25 @@ func execute() error {
 	g := gate{ctx: ctx, key: "local-gate-test", sabotage: sabotage}
 	bin, model := os.Args[1], os.Args[2]
 	g.run("lane limit checked before model load", func(g *gate) error { return checkLaneRange(g.ctx, bin, dir) })
+	// Run the cold reference on a separate server so it cannot seed the warm server's cache.
+	window := windowMessages()
+	var cold replySample
 	if err = g.server(ctx, bin, model, dir, 1, 1, func(g *gate) {
+		g.run("cold reference for the retained-window check", func(check *gate) error {
+			var err error
+			cold, err = check.requestReply(window, 32)
+			return err
+		})
+	}); err != nil {
+		return err
+	}
+	if err = g.server(ctx, bin, model, dir, 1, 1, func(g *gate) {
+		g.run("follow-up after window overwrite matches cold generation", func(check *gate) error {
+			return check.overwrittenWindow(window, cold)
+		})
 		g.validation(1)
 		g.cancelJobs()
 		g.run("disconnect in mid-thinking stops generation", (*gate).disconnectMidThinking)
-		g.run("follow-up after window overwrite matches cold generation", (*gate).overwrittenWindow)
 	}); err != nil {
 		return err
 	}

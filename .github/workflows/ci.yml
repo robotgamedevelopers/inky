@@ -23,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@v2
+      - name: soak qualification shell tests
+        run: tests/soak_qualification_test.sh
       - name: unit and integration tests (debug assertions)
         run: cargo test --locked --bins --tests
       # tests/serve.sh's in-process header test runs here, not in m5-serve. Like serve.sh, require exactly one

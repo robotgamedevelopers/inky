@@ -454,17 +454,70 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Enter inky mode for the life of this process, if the helper is installed. The connection is kept open until the
-/// process ends; nothing else is needed to leave. Returns the limit the helper set.
-pub fn enter(path: &str) -> Option<u64> {
+fn connect_lease(path: &str) -> Option<(UnixStream, u64)> {
     let s = UnixStream::connect(path).ok()?;
     if path == SOCKET && peer_uid(&s) != Some(0) { return None; }
+    let timeout = Some(Duration::from_secs(2));
+    s.set_write_timeout(timeout).ok()?;
+    s.set_read_timeout(timeout).ok()?;
     (&s).write_all(format!("enter {}\n", std::process::id()).as_bytes()).ok()?;
     let mut r = BufReader::new(&s);
     let line = read_bounded_line(&mut r, MAX_MEMD_LINE).ok()??;
     let v = line.strip_prefix("ok ")?.trim().parse().ok()?;
-    Box::leak(Box::new(s));     // held open until the process exits
-    Some(v)
+    Some((s, v))
+}
+
+/// Keeps the reservation alive until its owner drops it, including across helper restarts.
+pub struct Lease {
+    pub initial_limit: u64,
+    stop: UnixStream,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = self.stop.shutdown(std::net::Shutdown::Both);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+fn maintain_lease(path: String, initial: UnixStream, stop: UnixStream) {
+    let mut connection = Some(initial);
+    let mut retry_ms = 100;
+    loop {
+        // An acknowledged helper sends no further data. EOF, an error, or an unexpected
+        // message ends that lease. Poll the stop socket too so idle leases need no timer.
+        let mut fds = [
+            libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: connection.as_ref().map_or(-1, AsRawFd::as_raw_fd), events: libc::POLLIN, revents: 0 },
+        ];
+        let timeout = if connection.is_some() { -1 } else { retry_ms };
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted { continue; }
+            eprintln!("[inky] cannot monitor memory-helper connection: {err}");
+            return;
+        }
+        if fds[0].revents != 0 { return; }
+        if connection.take().is_some() {
+            eprintln!("[inky] lost memory-helper connection; retrying");
+            retry_ms = 100;
+        } else if let Some((stream, limit)) = connect_lease(&path) {
+            eprintln!("[inky] memory-helper connection restored; GPU wired limit {limit} MB");
+            connection = Some(stream);
+        } else {
+            retry_ms = (retry_ms * 2).min(2_000);
+        }
+    }
+}
+
+pub fn enter(path: &str) -> Option<Lease> {
+    let (stream, initial_limit) = connect_lease(path)?;
+    let (stop, monitor) = UnixStream::pair().ok()?;
+    let path = path.to_owned();
+    let worker = std::thread::Builder::new().name("inky-memd-lease".into())
+        .spawn(move || maintain_lease(path, stream, monitor)).ok()?;
+    Some(Lease { initial_limit, stop, worker: Some(worker) })
 }
 
 /// `sudo inky tune-memory [--undo]`: install (or remove) the helper as a root LaunchDaemon. The helper runs a root-owned
@@ -690,8 +743,52 @@ fn install_helper() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    // bind_socket temporarily sets process-wide umask(0o177); serialize filesystem tests within this binary.
+    // Coordinate the filesystem fixtures in this module.
     static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
+
+    // Darwin bounds the full pathname stored in sockaddr_un, including the scratch directory.
+    struct SocketTestDir(std::path::PathBuf);
+
+    impl SocketTestDir {
+        fn new() -> Self {
+            let mut template = *b"/tmp/inky-memd-XXXXXX\0";
+            let dir = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+            assert!(!dir.is_null(), "creating socket test directory: {}", io::Error::last_os_error());
+            let path = std::ffi::CStr::from_bytes_until_nul(&template).unwrap().to_str().unwrap();
+            Self(path.into())
+        }
+    }
+
+    impl Drop for SocketTestDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn dropping_client_lease_closes_its_connection() {
+        let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scratch = SocketTestDir::new();
+        let path = scratch.0.join("owned.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let helper = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let request = read_bounded_line(&mut reader, MAX_MEMD_LINE).unwrap().unwrap();
+            assert_eq!(request, format!("enter {}\n", std::process::id()));
+            stream.write_all(b"ok 12345\n").unwrap();
+            stream
+        });
+        let lease = enter(path.to_str().unwrap()).unwrap();
+        let mut peer = helper.join().unwrap();
+        assert_eq!(lease.initial_limit, 12345);
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(peer.read(&mut byte).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        drop(lease);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
+
     #[test] fn raised_while_connected_and_restored_after_the_last() {
         let (lim, disk) = (Cell::new(50000u64), Cell::new(None));
         let mut m = Mode::default();
@@ -811,10 +908,22 @@ mod tests {
     }
     #[test]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
+        // bind_socket changes the process umask around bind. Run the real operation
+        // in its own process so other tests can create directories concurrently.
+        const CHILD: &str = "INKY_TEST_MEMD_BIND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "memd::tests::fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed;"),
+                "isolated socket check failed: {stdout} {}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-bind-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let path = base.join("memd.sock");
+        let scratch = SocketTestDir::new();
+        let path = scratch.0.join("helper").join("memd.sock");
         let uid = unsafe { libc::geteuid() };
         drop(bind_socket(&path, uid, uid, true).unwrap());
         let listener = bind_socket(&path, uid, uid, true).unwrap();
@@ -823,14 +932,12 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         assert_eq!(peer_uid(&client), Some(uid));
         assert_eq!(peer_uid(&accepted), Some(uid));
-        drop(listener);
-        fs::remove_dir_all(&base).unwrap();
     }
     #[test]
     fn legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-old-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
+        let scratch = SocketTestDir::new();
+        let base = scratch.0.join("legacy");
         fs::create_dir(&base).unwrap();
         let socket = base.join("memd.sock");
         drop(UnixListener::bind(&socket).unwrap());

@@ -1,9 +1,10 @@
 //! A generation session: owns the context (tokens + KV/conv state on the GPU), prefill and decode loops.
 
 use crate::engine::{Engine, Lane, Run};
-use crate::metal::CmdBuf;
+use crate::metal::{wait_all, wait_completed, wait_or_drain};
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
+use crate::stream_text::stream_text;
 use objc2_metal::MTLCommandBuffer;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -41,7 +42,8 @@ impl<'a> Session<'a> {
 
     /// Feed `toks` (preceded by any pending sampled token) through the model in prefill chunks.
     /// Returns the greedy next token (argmax of the last position); logits stay available in the engine.
-    pub fn prefill(&mut self, toks: &[u32]) -> u32 {
+    /// After an error, discard or reset the lane before using it for another inference.
+    pub fn prefill(&mut self, toks: &[u32]) -> Result<u32, String> {
         let mut all: Vec<u32> = self.pending.take().into_iter().collect();
         all.extend_from_slice(toks);
         assert!(!all.is_empty());
@@ -54,20 +56,25 @@ impl<'a> Session<'a> {
         self.eng.ensure_batch(all.len().min(self.eng.chunk));
         self.stats.peak_scratch = self.stats.peak_scratch.max(self.run().mem().1);
         let mut p0 = self.n_past;
-        let mut last: Option<CmdBuf> = None;
+        let mut last = None;
         while p0 < end {
             let t = (end - p0).min(self.eng.chunk);
             let cb = self.eng.gpu.cmd();
             self.run().encode_prefill(&cb, p0, t, p0 + t == end, true);
             cb.commit();
-            last = Some(cb);
+            // Let Metal run the next chunk while the CPU checks the previous one.
+            if let Some((pos, prev)) = last.replace((p0, cb)) {
+                wait_or_drain((pos, &prev), last.as_ref().map(|(pos, cb)| (*pos, cb)),
+                              |(pos, cb)| wait_completed(cb, "prefill", pos))?;
+            }
             p0 += t;
         }
-        last.unwrap().waitUntilCompleted();
+        let (pos, cb) = last.unwrap();
+        wait_completed(&cb, "prefill", pos)?;
         self.n_past = end;
         self.stats.prompt_tokens += all.len();
         self.stats.prompt_time += t0.elapsed();
-        self.run().token_at(end)
+        Ok(self.run().token_at(end))
     }
 
     /// Generate up to `max` tokens after a prefill. `on_token` returns false to stop early.
@@ -75,18 +82,19 @@ impl<'a> Session<'a> {
     /// never sits between steps. Exactly two steps are kept in flight, so the in-flight step always processes the token
     /// just emitted: when generation stops, the context (KV + conv state) is exactly "everything emitted so far".
     /// Sampling reads the logits back each step.
-    pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> usize {
+    /// After an error, discard or reset the lane before using it for another inference.
+    pub fn generate(&mut self, first: u32, max: usize, sampler: &mut Sampler, mut on_token: impl FnMut(u32) -> bool) -> Result<usize, String> {
         let t0 = Instant::now();
         let eng = self.eng.on(&self.lane);
         let eos = self.tk.eos;
         eng.release_batch();      // the prefill arena is not needed while generating
-        if max == 0 { return 0; }
+        if max == 0 { return Ok(0); }
         let mut tok = if sampler.greedy() {
             first
         } else {
             sampler
-                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
-                .expect("model sampling failed")
+                .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap(0))
+                .map_err(|err| format!("model sampling failed: {err:?}"))?
         };
         let mut n = 1usize;
         let mut stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
@@ -94,7 +102,7 @@ impl<'a> Session<'a> {
             if stop { self.pending = Some(tok); }
             else {
                 eng.set_tokens(self.n_past, &[tok]);
-                let mut inflight: VecDeque<(usize, CmdBuf)> = VecDeque::new();
+                let mut inflight = VecDeque::with_capacity(2);
                 let step = |pos: usize| (pos, eng.step(pos, true, true));
                 eng.gen_reserve(self.n_past);
                 inflight.push_back(step(self.n_past));
@@ -103,13 +111,13 @@ impl<'a> Session<'a> {
                         let pos = inflight.back().unwrap().0 + 1;
                         if pos >= eng.gen_capacity() {
                             // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
-                            for (_, cb) in inflight.iter() { cb.waitUntilCompleted(); }
+                            wait_all(&inflight, |(pos, cmd)| cmd.wait(*pos))?;
                             eng.gen_reserve(pos);
                         }
                         inflight.push_back(step(pos));
                     }
-                    let (pos, cb) = inflight.pop_front().unwrap();
-                    cb.waitUntilCompleted();
+                    let (pos, cmd) = inflight.pop_front().unwrap();
+                    wait_or_drain(&(pos, cmd), &inflight, |(pos, cmd)| cmd.wait(*pos))?;
                     self.n_past = pos + 1;
                     tok = eng.token_at(pos + 1);
                     n += 1;
@@ -117,7 +125,11 @@ impl<'a> Session<'a> {
                     if stop {
                         // the remaining in-flight step consumes `tok` (a real token): keep it in the context
                         match inflight.pop_front() {
-                            Some((p2, cb2)) => { cb2.waitUntilCompleted(); self.n_past = p2 + 1; self.pending = None; }
+                            Some((p2, cmd)) => {
+                                cmd.wait(p2)?;
+                                self.n_past = p2 + 1;
+                                self.pending = None;
+                            }
                             None => self.pending = Some(tok),
                         }
                         break;
@@ -128,11 +140,11 @@ impl<'a> Session<'a> {
             while !stop {
                 eng.set_tokens(self.n_past, &[tok]);
                 eng.gen_reserve(self.n_past);
-                eng.step(self.n_past, true, false).waitUntilCompleted();
+                eng.step(self.n_past, true, false).wait(self.n_past)?;
                 self.n_past += 1;
                 tok = sampler
-                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap())
-                    .expect("model sampling failed");
+                    .sample_next_with_ban_and_softcap(eng.logits(), None, self.eng.effective_sampler_softcap(0))
+                    .map_err(|err| format!("model sampling failed: {err:?}"))?;
                 n += 1;
                 stop = tok == eos || !on_token(tok) || n >= max || self.ctx_left() < 2;
             }
@@ -140,7 +152,7 @@ impl<'a> Session<'a> {
         }
         self.stats.gen_tokens += n;
         self.stats.gen_time += t0.elapsed();
-        n
+        Ok(n)
     }
 }
 
@@ -153,6 +165,7 @@ impl Renderer {
     pub fn push(&mut self, tk: &Tokenizer, t: u32, out: &mut impl std::io::Write) {
         if self.raw { self.emit(&tk.decode_bytes(t), out); return; }
         if tk.is_special(t) {
+            self.flush_text(true, out);
             let s = String::from_utf8_lossy(&tk.decode_bytes(t)).to_string();
             match s.as_str() {
                 "<|content_thinking|>" => {
@@ -173,17 +186,93 @@ impl Renderer {
 
     fn emit(&mut self, bytes: &[u8], out: &mut impl std::io::Write) {
         self.buf.extend_from_slice(bytes);
-        let valid = match std::str::from_utf8(&self.buf) { Ok(_) => self.buf.len(), Err(e) => e.valid_up_to() };
-        if valid > 0 {
-            let _ = out.write_all(&self.buf[..valid]);
+        self.flush_text(false, out);
+    }
+
+    fn flush_text(&mut self, end: bool, out: &mut impl std::io::Write) {
+        stream_text(&mut self.buf, end, |text| {
+            let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
-            self.buf.drain(..valid);
-        }
-        if self.buf.len() > 8 { self.buf.clear(); }
+        });
     }
 
     pub fn end(&mut self, out: &mut impl std::io::Write) {
+        self.flush_text(true, out);
         if self.thinking && self.show_thinking { let _ = write!(out, "\x1b[0m"); }
         let _ = out.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_bytes(renderer: &mut Renderer, tk: &Tokenizer, bytes: &[u8], out: &mut Vec<u8>) {
+        for &byte in bytes {
+            renderer.push(tk, tk.eos + 1 + u32::from(byte), out);
+        }
+    }
+
+    #[test]
+    fn renderer_recovers_valid_text_and_flushes_at_end() {
+        let tk = Tokenizer::for_byte_test();
+        for raw in [false, true] {
+            let mut renderer = Renderer::new(false, raw);
+            let mut out = Vec::new();
+            push_bytes(&mut renderer, &tk, b"\xffvalid text\xe2", &mut out);
+            assert_eq!(out, "�valid text".as_bytes());
+            push_bytes(&mut renderer, &tk, b"\x82\xac\xf0\x9f", &mut out);
+            assert_eq!(out, "�valid text€".as_bytes());
+            renderer.end(&mut out);
+            assert_eq!(out, "�valid text€�".as_bytes());
+        }
+    }
+
+    #[test]
+    fn renderer_does_not_join_utf8_across_content_boundaries() {
+        let tk = Tokenizer::for_byte_test();
+        let mut renderer = Renderer::new(false, false);
+        let mut out = Vec::new();
+        push_bytes(&mut renderer, &tk, b"\xe2", &mut out);
+        for token in tk.encode("<|content_thinking|>hidden<|end_message|><|content_text|>", true) {
+            renderer.push(&tk, token, &mut out);
+        }
+        push_bytes(&mut renderer, &tk, b"\x82\xactext", &mut out);
+        renderer.end(&mut out);
+        assert_eq!(out, "�\x1b[2m(thinking…)\x1b[0m ��text".as_bytes());
+    }
+
+    #[test]
+    fn failed_command_drains_later_work_without_consuming_results() {
+        let mut waited = Vec::new();
+        let mut consumed = false;
+        let result = wait_or_drain(0, [1, 2], |command| {
+            waited.push(command);
+            if command == 0 { Err("first command failed".into()) } else { Ok(()) }
+        }).map(|_| consumed = true);
+        assert_eq!(result, Err("first command failed".into()));
+        assert_eq!(waited, [0, 1, 2]);
+        assert!(!consumed);
+
+        waited.clear();
+        wait_or_drain(0, [1], |command| { waited.push(command); Ok(()) }).unwrap();
+        assert_eq!(waited, [0]);
+    }
+
+    #[test]
+    fn wait_all_preserves_first_error_and_checks_final_command() {
+        for (failures, expected) in [
+            ([true, true, false], Err("command 0".into())),
+            ([false, false, true], Err("command 2".into())),
+            ([false, false, false], Ok(())),
+        ] {
+            let mut waited = Vec::new();
+            let result = wait_all(failures.into_iter().enumerate(), |(command, failed)| {
+                waited.push(command);
+                if failed { Err(format!("command {command}")) } else { Ok(()) }
+            });
+            assert_eq!(result, expected);
+            assert_eq!(waited, [0, 1, 2]);
+        }
     }
 }

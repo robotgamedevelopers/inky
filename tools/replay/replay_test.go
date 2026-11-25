@@ -84,7 +84,7 @@ func TestLoadReplaySet_GroupsAndOrdersMultiTurnCards(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "cards-20261124.jsonl"), []byte(lineA1+"\n"+lineBad+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "cards-20261123.jsonl"), []byte(lineA0+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "cards-20261124.jsonl.1"), []byte(lineA0+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,6 +97,33 @@ func TestLoadReplaySet_GroupsAndOrdersMultiTurnCards(t *testing.T) {
 	}
 	if dirCards[0].Turns[0].TurnIndex != 0 || dirCards[0].Turns[1].TurnIndex != 1 {
 		t.Fatalf("turns not sorted: %+v", dirCards[0].Turns)
+	}
+}
+
+func TestLoadReplaySetKeepsGenerationAndDeliveryOutcomes(t *testing.T) {
+	const rows = `{"schema_version":1,"card_id":"sample","turn_index":0,"request":{"messages":[]},"response":{"finish_reason":"stop","status_code":200}}
+{"schema_version":1,"card_id":"sample","turn_index":1,"request":{"messages":[]},"response":{"finish_reason":"cancelled","status_code":499,"generation_finish_reason":"end_turn","delivery_status":"failed"}}
+{"schema_version":1,"card_id":"sample","turn_index":2,"request":{"messages":[]},"response":{"finish_reason":"length","status_code":200,"generation_finish_reason":"length","delivery_status":"written"}}`
+	path := filepath.Join(t.TempDir(), "cards.jsonl")
+	if err := os.WriteFile(path, []byte(rows), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cards, err := LoadReplaySet(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != 1 || len(cards[0].Turns) != 3 {
+		t.Fatalf("unexpected replay set: %+v", cards)
+	}
+	want := []ResponseMetrics{
+		{StatusCode: 200, FinishReason: "stop"},
+		{StatusCode: 499, FinishReason: "cancelled", GenerationFinishReason: "end_turn", DeliveryStatus: "failed"},
+		{StatusCode: 200, FinishReason: "length", GenerationFinishReason: "length", DeliveryStatus: "written"},
+	}
+	for i, turn := range cards[0].Turns {
+		if turn.Response != want[i] {
+			t.Errorf("turn %d: got %+v, want %+v", i, turn.Response, want[i])
+		}
 	}
 }
 
@@ -139,9 +166,9 @@ func TestPickKnee(t *testing.T) {
 
 	t.Run("p95 TTFT ceiling and per-lane floor stop earlier", func(t *testing.T) {
 		rungs := []RungMetrics{
-			{Lanes: 8, TotalTokS: 320, PerLaneTokS: 40, TTFTP95Ms: 50, CardsCompleted: 8, CardsPerHour: 100},
-			{Lanes: 16, TotalTokS: 600, PerLaneTokS: 37.5, TTFTP95Ms: 90, CardsCompleted: 16, CardsPerHour: 190},
-			{Lanes: 32, TotalTokS: 1000, PerLaneTokS: 31.25, TTFTP95Ms: 250, CardsCompleted: 32, CardsPerHour: 320},
+			{Lanes: 8, TotalTokS: 320, PerLaneTokS: 40, TTFTSamples: 1, TTFTP95Ms: 50, CardsCompleted: 8, CardsPerHour: 100},
+			{Lanes: 16, TotalTokS: 600, PerLaneTokS: 37.5, TTFTSamples: 1, TTFTP95Ms: 90, CardsCompleted: 16, CardsPerHour: 190},
+			{Lanes: 32, TotalTokS: 1000, PerLaneTokS: 31.25, TTFTSamples: 1, TTFTP95Ms: 250, CardsCompleted: 32, CardsPerHour: 320},
 		}
 		res, err := PickKnee(rungs, KneeConfig{MinMarginalGain: 0.05, MaxTTFTP95Ms: 200})
 		if err != nil {
@@ -277,8 +304,11 @@ func TestRunSweep_HttptestMultiTurnAndHealthAnd429Retry(t *testing.T) {
 			t.Fatalf("expected positive rates in %+v", r)
 		}
 		// 1_000_000 + 4 * 250_000 = 2_000_000
-		if r.PeakMemoryBytes != 2_000_000 {
-			t.Fatalf("peak_memory_bytes=%d, want 2000000", r.PeakMemoryBytes)
+		if r.PeakBudgetEstimateBytes != 2_000_000 || r.PeakMemoryBytes != 0 {
+			t.Fatalf("budget-only health promoted to measured memory or estimated incorrectly: %+v", r)
+		}
+		if r.TTFTSamples != 7 {
+			t.Fatalf("expected only the seven streaming turns to contribute to TTFT: %+v", r)
 		}
 	}
 
@@ -322,7 +352,7 @@ func TestRunCLI_MarkdownAndTSVOutputs(t *testing.T) {
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			return
 		}
-		fmt.Fprint(w, `{"usage":{"completion_tokens":8}}`)
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"completion_tokens":8}}`)
 	}))
 	defer srv.Close()
 
@@ -360,5 +390,130 @@ func TestRunCLI_MarkdownAndTSVOutputs(t *testing.T) {
 	}
 	if !strings.Contains(string(tsvBytes), "\n2\t") || !strings.Contains(string(tsvBytes), "\n4\t") {
 		t.Fatalf("missing lane rows in TSV:\n%s", tsvBytes)
+	}
+}
+
+func TestReplayMissingIDsAndLegacyRestarts(t *testing.T) {
+	dir := localTempDir(t)
+	for i, name := range []string{"cards.jsonl", "cards.jsonl.1"} {
+		data := fmt.Sprintf(`{"request":{}, "recorded_at_ms":%d}
+{"card_id":"card-1", "turn_index":0, "request":{}, "recorded_at_ms":%d}
+`, i+1, i+1)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cards, err := LoadReplaySet(dir)
+	if err != nil || len(cards) != 4 {
+		t.Fatalf("cards = %+v, err = %v", cards, err)
+	}
+	for _, card := range cards {
+		if len(card.Turns) != 1 {
+			t.Fatalf("unrelated turns were grouped as one card: %+v", card)
+		}
+	}
+}
+
+func TestKneeCannotCrossFailedRung(t *testing.T) {
+	rungs := []RungMetrics{
+		{Lanes: 32, CardsCompleted: 32, TotalTokS: 300},
+		{Lanes: 8, CardsCompleted: 8, TotalTokS: 100},
+		{Lanes: 16, Errors: 16},
+	}
+	res, err := PickKnee(rungs, DefaultKneeConfig())
+	if err != nil || res.RecommendedLanes != 8 || !strings.Contains(res.Reason, "16 lanes") {
+		t.Fatalf("failed rung was skipped: %+v, %v", res, err)
+	}
+	for _, cfg := range []KneeConfig{{MinPerLaneTokS: 1}, {MaxTTFTP95Ms: 1000}} {
+		if res, err := PickKnee(rungs, cfg); err == nil || res.RecommendedLanes != 0 {
+			t.Fatalf("no rung satisfies the limits: %+v, %v", res, err)
+		}
+	}
+}
+
+func TestNegativeDurationRejectedBeforeTraffic(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cfg := SweepConfig{BaseURL: srv.URL, Duration: -time.Second, CardsPerRung: 1, LaneCounts: []int{1}}
+	if _, _, err := RunSweep(ctx, cfg, []Card{{ID: "sample"}}); err == nil || !strings.Contains(err.Error(), "duration") || calls.Load() != 0 {
+		t.Fatalf("err = %v, requests = %d", err, calls.Load())
+	}
+	var out, stderr bytes.Buffer
+	code := runCLI([]string{"--input", "testdata/sample_cards.jsonl", "--duration=-1s", "--url", srv.URL}, os.Getenv, &out, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--duration") || calls.Load() != 0 {
+		t.Fatalf("exit = %d, requests = %d, stderr = %s", code, calls.Load(), stderr.String())
+	}
+}
+
+func TestMemorySamplePeaksAndUnavailableOutput(t *testing.T) {
+	var samples memorySamples
+	samples.observe(healthTelemetry{ProcessFootprintBytes: 360, ActiveLanes: 1, ModelBytes: 100, PerLaneWorstCaseBytes: 100})
+	samples.observe(healthTelemetry{ProcessFootprintBytes: 220, ActiveLanes: 4, ModelBytes: 100, PerLaneWorstCaseBytes: 100})
+	if samples.observed != 360 || samples.budget != 500 {
+		t.Fatalf("unexpected independent peaks: %+v", samples)
+	}
+	rungs := []RungMetrics{{Lanes: 1, PeakBudgetEstimateBytes: 500, CardsCompleted: 1}}
+	tsv := strings.Split(strings.TrimSpace(FormatTSV(rungs)), "\n")
+	head, row := strings.Split(tsv[0], "\t"), strings.Split(tsv[1], "\t")
+	values := map[string]string{}
+	for i, name := range head {
+		values[name] = row[i]
+	}
+	for field, want := range map[string]string{"ttft_samples": "0", "ttft_p95_ms": "n/a", "ttft_p50_ms": "n/a", "peak_memory_bytes": "n/a", "peak_budget_estimate_bytes": "500"} {
+		if values[field] != want {
+			t.Fatalf("%s = %q, want %q", field, values[field], want)
+		}
+	}
+}
+
+func TestCLIReportsRungWhenRequestedTTFTIsUnavailable(t *testing.T) {
+	dir := localTempDir(t)
+	input := filepath.Join(dir, "recording.jsonl")
+	if err := os.WriteFile(input, []byte(`{"request":{"stream":false},"card_id":"buffered"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			fmt.Fprint(w, `{"ok":true,"process_footprint_bytes":321}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}`)
+	}))
+	defer srv.Close()
+	var out, stderr bytes.Buffer
+	tsvPath := filepath.Join(dir, "summary.tsv")
+	code := runCLI([]string{"--input", input, "--url", srv.URL, "--lanes", "1", "--max-ttft-p95-ms", "1000", "--out-tsv", tsvPath}, os.Getenv, &out, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "no streaming TTFT samples") || strings.Contains(out.String(), "Recommended default") {
+		t.Fatalf("exit=%d, stderr=%s, report=%s", code, stderr.String(), out.String())
+	}
+	tsv, err := os.ReadFile(tsvPath)
+	if err != nil || !strings.Contains(string(tsv), "\tn/a\tn/a\t321\t1\t") {
+		t.Fatalf("rung measurements missing: %q, %v", tsv, err)
+	}
+}
+
+func TestLoadReplaySetReadsLargeRecorderRowAndFollowingTurn(t *testing.T) {
+	path := filepath.Join(localTempDir(t), "cards.jsonl")
+	first := `{"card_id":"large","turn_index":0,"request":{"metadata":"` + strings.Repeat("x", 16<<20) + `"}}`
+	second := `{"card_id":"large","turn_index":1,"request":{"stream":true}}`
+	if err := os.WriteFile(path, []byte(first+"\n"+second), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cards, err := LoadReplaySet(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != 1 || len(cards[0].Turns) != 2 {
+		t.Fatalf("expected one two-turn card, got %d cards", len(cards))
+	}
+	turns := cards[0].Turns
+	if len(turns[0].Request) != len(`{"metadata":""}`)+(16<<20) || string(turns[1].Request) != `{"stream":true}` {
+		t.Fatal("the loader lost part of the large request or its following turn")
 	}
 }

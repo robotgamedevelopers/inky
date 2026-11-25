@@ -91,12 +91,14 @@ BlockAt(s, k) == SubSeq(s, (k - 1) * BlockLen + 1, k * BlockLen)
 
 WinLive(s) == IF winSlotOf[s] = 0 THEN TRUE ELSE winGenOf[s] = poolGen[winSlotOf[s]]
 
+EntriesLive(s) == genOf[s] = poolGen[slotOf[s]] /\ WinLive(s)
+
 \* Every block-boundary prefix of s is sealed at its slots' current
 \* generations. The empty prefix needs nothing and is always live.
 Live(s) ==
     \A q \in BlockSeqs :
         (IsPrefix(q, s) /\ Len(q) > 0) =>
-            q \in sealed /\ genOf[q] = poolGen[slotOf[q]] /\ WinLive(q)
+            q \in sealed /\ EntriesLive(q)
 
 Held == {s \in BlockSeqs : starts[s] > 0}
 
@@ -181,6 +183,7 @@ SealClaimed(s, slot, gen) ==
 \* its own entries, whichever slots the caller named.
 Dedup(s) ==
     /\ s \in sealed \ {<<>>}
+    /\ EntriesLive(s)
     /\ UNCHANGED <<sealed, starts, slotOf, genOf, winSlotOf, winGenOf,
                     poolGen, refs, badInsert>>
     /\ sought' = FALSE
@@ -192,7 +195,7 @@ Dedup(s) ==
 \* its place, at their slots' current generations, unpinned.
 ReSeal(s, slot, wslot) ==
     /\ s \in sealed \ {<<>>}
-    /\ ~Live(s)
+    /\ ~EntriesLive(s)
     /\ slot \in Slots
     /\ wslot \in Slots \cup {0}
     /\ sealed' = {u \in sealed : ~IsPrefix(s, u)} \cup {s}
@@ -216,7 +219,7 @@ ReSeal(s, slot, wslot) ==
 Pin(s) ==
     /\ s \in sealed \ {<<>>}
     /\ refs[s] = 0
-    /\ Live(s)
+    /\ EntriesLive(s)
     /\ refs' = [refs EXCEPT ![s] = 1]
     /\ UNCHANGED <<sealed, starts, slotOf, genOf, winSlotOf, winGenOf,
                     poolGen, badInsert>>
@@ -306,7 +309,7 @@ SeekResult ==
       [] OTHER -> ExpectedResult
 
 \* Stale blocks and everything below them: what a seek evicts.
-StaleSet == {s \in sealed : Len(s) > 0 /\ (genOf[s] # poolGen[slotOf[s]] \/ ~WinLive(s))}
+StaleSet == {s \in sealed : Len(s) > 0 /\ ~EntriesLive(s)}
 Evicted == {t \in sealed : \E s \in StaleSet : IsPrefix(s, t)}
 
 Seek ==
@@ -338,7 +341,7 @@ SealedBound == Cardinality(sealed) <= MaxSealed
 
 \* The per-PR bound further: one chain only. A match walks a single
 \* chain from the root, so the deepest-start properties live there;
-\* branching is covered by the Rust tests and the any-parent witness.
+\* the nightly bound also explores siblings.
 ChainBound ==
     \A a, b \in sealed : IsPrefix(a, b) \/ IsPrefix(b, a)
 
@@ -379,16 +382,21 @@ RefsSettledAfterSeek ==
 \* under it. The "reuse-held" witness breaks exactly this.
 HeldNeverStale ==
     \A s \in sealed \ {<<>>} :
-        refs[s] = 1 => Live(s)
+        refs[s] = 1 => EntriesLive(s)
+
+\* A pin covers one node's entries. LiveTree::pin does not recursively
+\* pin its ancestors. The serving lane binds the entire matched chain.
+\* A completely pinned chain must remain suitable for reuse.
+PinnedPathLive ==
+    \A s \in sealed :
+        (\A q \in sealed \ {<<>>} : IsPrefix(q, s) => refs[q] = 1) => Live(s)
 
 \* No insert was ever accepted at a generation its slot had moved
 \* past. The "stale-insert" witness breaks exactly this.
 NoBadInsert == ~badInsert
 
 \* After a seek no stale block remains sealed: the seek evicted every
-\* one of them, on the matched path or not. In the guarded configs
-\* this is vacuous (nothing can be stale at a seek); the "evict"
-\* config is where it bites.
+\* one of them, wherever they were in the tree.
 NoStaleAfterSeek == sought => StaleSet = {}
 
 \* The result is a held start point (or position 0).

@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# CPU-only Layer 4 scheduler trace conformance gate against specs/CacheScheduler.tla:
-# zero Cargo, Metal, root, or network access. Compiles real src/scheduler.rs directly
-# with rustc, checks multi-seed + edge-case traces in TLC, and requires 4 single-line
-# production mutations (reversed witnesses) to fail inside TLC with a counterexample.
+# Compile the reference scheduler and run its CacheScheduler traces and source mutations
+# in TLC. The traces tier separately runs check-serve-step-traces.sh for the live planner.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)

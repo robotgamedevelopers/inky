@@ -1,5 +1,11 @@
 # CacheScheduler model and TLC results
 
+The reference `Scheduler` in `src/scheduler.rs` generates traces for this model.
+The live server uses `ServeStepPlanner` to choose homogeneous batches from its
+runnable lanes. Its decode priority, preemption at 16 bypasses, and exact token
+spans are checked in `ServeStepTrace.tla`. See [the replay commands](README.md#serve-scheduler-traces).
+
+
 Read against the **Blocks**, **Scheduler**, and **Models** sections of
 [docs/DESIGN.md](../docs/DESIGN.md), alongside `specs/BlockLayout.tla` (PR #9).
 Where `BlockLayout` models physical pool slot reuse, generation counters, and

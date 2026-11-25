@@ -244,28 +244,46 @@ func (g *gate) followupCache() error {
 	return nil
 }
 
-// Layer 3 seals 64-token prompt blocks immutable from decode tail writes, so a follow-up past the
-// 1024-token sliding window reuses the sealed prompt blocks while matching cold generation bit-for-bit.
-func (g *gate) overwrittenWindow() error {
-	head := replyMessage{Role: "user", Content: strings.Repeat(" apple", 1040) + " Write a detailed recipe using apples, with five steps."}
-	followup := []replyMessage{head, {Role: "user", Content: "Include the time for each step."}}
-	cold, err := g.requestReply(followup, 32)
-	if err != nil {
-		return err
+func windowMessages() []replyMessage {
+	return []replyMessage{
+		{Role: "user", Content: strings.Repeat(" apple", 1040) + " Write a detailed recipe using apples, with five steps."},
+		{Role: "user", Content: "Include the time for each step."},
 	}
-	base, err := g.requestReply([]replyMessage{head}, 32)
+}
+
+// The base and follow-up are the first two requests to a fresh single-lane server.
+// Any checkpoint the follow-up reuses must have come from the base.
+func (g *gate) overwrittenWindow(messages []replyMessage, cold replySample) error {
+	base, err := g.requestReply(messages[:1], 32)
 	if err != nil {
-		return err
+		return fmt.Errorf("warm-up base: %w", err)
+	}
+	next, err := g.requestReply(messages, 32)
+	if err != nil {
+		return fmt.Errorf("warm follow-up: %w", err)
+	}
+	return verifyWindowReuse(cold, base, next)
+}
+
+func verifyWindowReuse(cold, base, next replySample) error {
+	if cached := cold.usage.Details.Cached; cached == nil || *cached != 0 {
+		return fmt.Errorf("cold reference must report zero cached tokens")
+	}
+	if cached := base.usage.Details.Cached; cached == nil || *cached != 0 {
+		return fmt.Errorf("warm-up base must report zero cached tokens")
 	}
 	if base.usage.Prompt < 1024 || base.usage.Generated < 3 {
 		return fmt.Errorf("fixture did not overwrite retained window rows: %+v", base.usage)
 	}
-	next, err := g.requestReply(followup, 32)
-	if err != nil {
-		return err
+	if next.usage.Prompt <= base.usage.Prompt {
+		return fmt.Errorf("follow-up prompt %d must extend base prompt %d", next.usage.Prompt, base.usage.Prompt)
 	}
-	if cached := next.usage.Details.Cached; cached == nil || *cached < 1024 || *cached%64 != 0 {
-		return fmt.Errorf("follow-up did not reuse sealed Layer 3 prompt blocks: cached=%v", cached)
+	cached := next.usage.Details.Cached
+	if cached == nil {
+		return fmt.Errorf("follow-up omitted cached_tokens")
+	}
+	if *cached < 1024 || *cached%64 != 0 || *cached > base.usage.Prompt {
+		return fmt.Errorf("follow-up cached %d tokens; expected sealed 64-token blocks from the %d-token base", *cached, base.usage.Prompt)
 	}
 	if !sameReply(cold, next) {
 		return fmt.Errorf("follow-up differs from cold generation")

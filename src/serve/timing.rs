@@ -75,13 +75,14 @@ pub(super) struct Counters {
     busy: usize,
     lane_seconds: f64,
     pub(super) queued: usize,
+    pub(super) starts_spilled: u64,
     pub(super) input: usize,
     pub(super) output: usize,
 }
 
 impl Counters {
     pub(super) fn new(now: Instant) -> Self {
-        Self { start: now, last_change: now, busy: 0, lane_seconds: 0.0, queued: 0, input: 0, output: 0 }
+        Self { start: now, last_change: now, busy: 0, lane_seconds: 0.0, queued: 0, starts_spilled: 0, input: 0, output: 0 }
     }
 
     fn accrue(&mut self, now: Instant) {

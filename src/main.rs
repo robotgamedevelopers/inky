@@ -16,6 +16,7 @@ mod poolgate;
 mod record;
 mod serve;
 mod spill;
+mod stream_text;
 mod tuning;
 mod tokenizer;
 mod unicode_tables;
@@ -61,7 +62,6 @@ options:
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --raw             do not apply the chat template; print special tokens";
 
-const DEFAULT_SERVE_LANES: usize = 64;
 
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
@@ -73,7 +73,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
                     alias for --key-env
   --allow-unauthenticated-non-loopback
                     explicitly allow a non-loopback bind without a key
-  --lanes N         active inference lanes (default 64)
+  --lanes N         active inference lanes (defaults to this machine's tuning)
   --queue N         waiting requests (default 64)
   --effort E        default reasoning effort (default medium)
   --thinking-budget N
@@ -81,7 +81,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --loopcd OMEGA    default adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --record-dir DIR  record requests and response metrics as cards-YYYYMMDD.jsonl in DIR
   --record-max-bytes N
-                    max bytes per cards-YYYYMMDD.jsonl before rotating to .1 (default 104857600)
+                    max bytes per segment before rotating to .1 (default 104857600); larger rows are dropped
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
@@ -91,6 +91,13 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
 fn cli_error(error: String) -> ! {
     eprintln!("{error}");
     std::process::exit(2);
+}
+
+fn report_cli_result(command: &str, result: Result<(), String>) {
+    if let Err(err) = result {
+        eprintln!("{command}: {err}");
+        std::process::exit(1);
+    }
 }
 
 fn parse_usize(flag: &str, value: &str) -> Result<usize, String> {
@@ -131,9 +138,9 @@ fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
 
-fn parse_serve(args: &[String], read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
+fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: DEFAULT_SERVE_LANES, effort: "medium".into(),
+        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: default_lanes, effort: "medium".into(),
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
@@ -188,13 +195,21 @@ mod cli_tests {
     use super::*;
 
     fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
-        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), |name| match name {
+        parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), 64, |name| match name {
             "PRESENT" => Ok("configured-key".into()),
             "EMPTY" => Ok(String::new()),
             "BLANK" => Ok(" \t".into()),
             "NONUNICODE" => Err(std::env::VarError::NotUnicode("secret data".into())),
             _ => Err(std::env::VarError::NotPresent),
         })
+    }
+
+    #[test]
+    fn serving_uses_machine_lane_default_unless_overridden() {
+        let lanes = tuning::select("Apple M5 Pro", 64 << 30).default_lanes;
+        assert_eq!(parse_serve(&[], lanes, |_| unreachable!()).unwrap().lanes, 32);
+        let args = ["--lanes".to_string(), "8".to_string()];
+        assert_eq!(parse_serve(&args, lanes, |_| unreachable!()).unwrap().lanes, 8);
     }
 
     #[test]
@@ -387,7 +402,7 @@ fn token_rate(tokens: usize, elapsed: std::time::Duration) -> f64 {
     if elapsed.is_zero() { 0.0 } else { tokens as f64 / elapsed.as_secs_f64() }
 }
 
-fn run(o: &Opts) {
+fn run(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
@@ -397,18 +412,20 @@ fn run(o: &Opts) {
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let toks = tk.encode(&text, true);
     sess.run().prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
-    let first = sess.prefill(&toks);
+    let first = sess.prefill(&toks)?;
     let mut out = std::io::stdout();
     let mut r = Renderer::new(!o.hide_thinking, o.raw);
-    sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
+    let generated = sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
     r.end(&mut out);
+    generated?;
     let s = sess.stats;
     eprintln!("\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
               s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, token_rate(s.gen_tokens, s.gen_time),
               if sampler.greedy() { " (greedy)" } else { "" }, kv_note(sess.run(), sess.n_past), sess.n_past);
+    Ok(())
 }
 
-fn chat(o: &Opts) {
+fn chat(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     let tk = Tokenizer::load(&eng.g);
@@ -430,21 +447,23 @@ fn chat(o: &Opts) {
         let before = sess.stats;
         let toks = tk.encode(&text, true);
         if sess.ctx_left() < toks.len() + 64 { eprintln!("[context full: /reset]"); continue; }
-        let first = sess.prefill(&toks);
+        let first = sess.prefill(&toks)?;
         has_turn = true;
         let mut r = Renderer::new(!o.hide_thinking, o.raw);
         let max = o.n.min(sess.ctx_left().saturating_sub(4));
-        sess.generate(first, max, &mut sampler, |t| { r.push(&tk, t, &mut out); true });
+        let generated = sess.generate(first, max, &mut sampler, |t| { r.push(&tk, t, &mut out); true });
         r.end(&mut out);
+        generated?;
         let s = sess.stats;
         let (pt, gt) = (s.prompt_tokens - before.prompt_tokens, s.gen_tokens - before.gen_tokens);
         eprintln!("\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
                   pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(), token_rate(gt, s.gen_time - before.gen_time),
                   sess.n_past, eng.max_ctx, kv_note(sess.run(), sess.n_past));
     }
+    Ok(())
 }
 
-fn bench(o: &Opts) {
+fn bench(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     if let Ok(v) = std::env::var("INK_SKIP") { eng.skip.set(v.parse().unwrap()); }
@@ -456,14 +475,14 @@ fn bench(o: &Opts) {
     // warm-up pass (pipelines, page mappings)
     let warm = {
         let mut s = Session::new(&eng, &tk);
-        let f = s.prefill(&toks[..toks.len().min(64)]);
-        if n > 0 { s.generate(f, 8, &mut sampler, |_| true); }
+        let f = s.prefill(&toks[..toks.len().min(64)])?;
+        if n > 0 { s.generate(f, 8, &mut sampler, |_| true)?; }
         s.into_lane()
     };
     let mut sess = Session::with_lane(&eng, &tk, warm);     // the warm-up's buffers, already mapped
     sess.run().prepare(toks.len(), toks.len());       // as `run` does: working memory allocated and mapped before the clock starts
-    let first = sess.prefill(&toks);
-    sess.generate(first, n, &mut sampler, |_| true);
+    let first = sess.prefill(&toks)?;
+    sess.generate(first, n, &mut sampler, |_| true)?;
     let s = sess.stats;
     println!("prompt {:5} tok: {:8.1} ms  {:7.1} tok/s | decode {:4} tok: {:8.1} ms  {:6.2} tok/s",
              s.prompt_tokens, s.prompt_time.as_secs_f64() * 1e3, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
@@ -475,6 +494,7 @@ fn bench(o: &Opts) {
         println!("K/V file: {:.0} MiB read per token, {:.1} GiB/s, {:.1} ms of each token's {:.1} ms", rb as f64 / 1048576.0 / s.gen_tokens as f64,
                  rb as f64 / 1073741824.0 / rt.as_secs_f64(), rt.as_secs_f64() * 1e3 / s.gen_tokens as f64, s.gen_time.as_secs_f64() * 1e3 / s.gen_tokens as f64);
     }
+    Ok(())
 }
 
 /// the K/V cache as it is held right now (with --kv-disk: the part in memory and the part that is only in the file)
@@ -570,7 +590,6 @@ fn check(o: &Opts) -> Result<(), String> {
     let mut bits_hash = 0xcbf29ce484222325u64;       // over the raw bits of every logit of every checked step
     for pos in 0..toks.len() {
         if pf > 0 && pos + 1 < pf { continue; }
-        let cb = eng.gpu.cmd();
         if pf > 0 && pos + 1 == pf {
             let mut p0 = 0;
             while p0 < pf {
@@ -578,17 +597,22 @@ fn check(o: &Opts) -> Result<(), String> {
                 let cbp = eng.gpu.cmd();
                 eng.encode_prefill(&cbp, p0, t, p0 + t == pf, false);
                 cbp.commit();
-                cbp.waitUntilCompleted();
+                metal::wait_completed(&cbp, "prefill", p0)?;
                 p0 += t;
             }
         } else if kv_disk {
             eng.gen_reserve(pos);
-            eng.step(pos, true, false).waitUntilCompleted();
-        } else if dec_steps {
-            eng.encode_decode(&cb, &[engine::Span { lane: eng.lane, p0: pos, t: 1 }], true, false);
-        } else { eng.encode_step(&cb, pos, true, false); }
-        cb.commit();
-        cb.waitUntilCompleted();
+            eng.step(pos, true, false).wait(pos)?;
+        } else {
+            let cb = eng.gpu.cmd();
+            if dec_steps {
+                eng.encode_decode(&cb, &[engine::Span { lane: eng.lane, p0: pos, t: 1 }], true, false);
+            } else {
+                eng.encode_step(&cb, pos, true, false);
+            }
+            cb.commit();
+            metal::wait_completed(&cb, "decode", pos)?;
+        }
         // dev: INK_KVQ=kbits,vbits rounds the cache as it is written, to measure what a coarser cache would cost
         if let Ok(v) = std::env::var("INK_KVQ") {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
@@ -600,7 +624,7 @@ fn check(o: &Opts) -> Result<(), String> {
         }
         for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap())).collect();
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
             .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
@@ -789,7 +813,7 @@ fn rollback(o: &Opts) {
 
 /// dev: batch invariance. Prefill the same tokens split at different points and hash the final logits: the hashes must be
 /// equal, since a split moves every later token to a different batch, tile slot and set of neighbours.
-fn binv(o: &Opts) {
+fn binv(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
@@ -805,7 +829,7 @@ fn binv(o: &Opts) {
     for k in splits {
         let mut sess = Session::new(&eng, &tk);
         let mut p = 0;
-        for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b]); p = b; } }
+        for &b in k.iter().chain(std::iter::once(&toks.len())) { if b > p { sess.prefill(&toks[p..b])?; p = b; } }
         let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
         let k = if k.is_empty() { "0".to_string() } else { k };
         let mut h = 0xcbf29ce484222325u64;
@@ -825,6 +849,7 @@ fn binv(o: &Opts) {
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
     if !ok { std::process::exit(1); }
+    Ok(())
 }
 
 /// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
@@ -1132,7 +1157,7 @@ fn temp1(o: &Opts) {
                     eng.encode_gumbel_solo(&gcb, &l, pos, req_seed, pos, 1.0, None);
                     gcb.commit();
                     gcb.waitUntilCompleted();
-                    r.token_at(pos)
+                    r.sampled_token_at(pos).expect("valid GPU sample")
                 } else {
                     sampler.sample_next(eng.logits()).expect("solo prefill sample")
                 };
@@ -1151,7 +1176,7 @@ fn temp1(o: &Opts) {
                         eng.encode_gumbel_span(&gcb, 0, &l, next_pos, req_seed, next_pos, 1.0, None);
                         gcb.commit();
                         gcb.waitUntilCompleted();
-                        r.token_at(next_pos)
+                        r.sampled_token_at(next_pos).expect("valid GPU sample")
                     } else {
                         sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
                     };
@@ -1274,7 +1299,7 @@ fn temp1(o: &Opts) {
                             gcb.waitUntilCompleted();
                             for &(_, i) in &gpu_pf {
                                 let p = reqs[i].n_past;
-                                let tok = eng.on(&reqs[i].lane).token_at(p);
+                                let tok = eng.on(&reqs[i].lane).sampled_token_at(p).expect("valid GPU sample");
                                 reqs[i].toks.push(tok);
                             }
                         }
@@ -1311,7 +1336,7 @@ fn temp1(o: &Opts) {
                         for (k, &i) in dec_lanes.iter().enumerate() {
                             reqs[i].n_past += 1;
                             let tok = if reqs[i].sampler.uses_gpu_gumbel() {
-                                eng.on(&reqs[i].lane).token_at(reqs[i].n_past)
+                                eng.on(&reqs[i].lane).sampled_token_at(reqs[i].n_past).expect("valid GPU sample")
                             } else {
                                 reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
                             };
@@ -1816,7 +1841,7 @@ fn prof_pf(o: &Opts) {
 }
 
 /// dev: greedy-generate and log tokens + per-layer expert routing of every step (for speculation analysis)
-fn routes(o: &Opts) {
+fn routes(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
@@ -1825,7 +1850,7 @@ fn routes(o: &Opts) {
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let prompt = tk.encode(&text, true);
     let mut sess = Session::new(&eng, &tk);
-    let mut tok = sess.prefill(&prompt);
+    let mut tok = sess.prefill(&prompt)?;
     let mut out = String::new();
     for t in &prompt { out += &format!("P {t}\n"); }
     for _ in 0..o.n {
@@ -1833,7 +1858,8 @@ fn routes(o: &Opts) {
         eng.set_tokens(pos, &[tok]);
         let cb = eng.gpu.cmd();
         eng.encode_step(&cb, pos, true, true);
-        cb.commit(); cb.waitUntilCompleted();
+        cb.commit();
+        metal::wait_completed(&cb, "routes decode", pos)?;
         sess.n_past += 1;
         let r = eng.routes();
         out += &format!("G {tok} {}\n", r.iter().map(|x| x.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join(";"));
@@ -1841,6 +1867,7 @@ fn routes(o: &Opts) {
         if tok == tk.eos { break; }
     }
     std::fs::write(&o.reference, out).unwrap();
+    Ok(())
 }
 
 /// dev: cost of a batched pass of T tokens vs one decode step
@@ -1865,13 +1892,26 @@ fn vcost(o: &Opts) {
     }
 }
 
-fn enter_inky_mode() {
+fn enter_inky_mode() -> Option<memd::Lease> {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-    match memd::enter(&sock) {
-        Some(v) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while this runs", t.name, t.default_lanes, v),
+    let lease = memd::enter(&sock);
+    match &lease {
+        Some(lease) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, lease.initial_limit),
         None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
+    }
+    lease
+}
+
+/// Current physical footprint charged to this process by the macOS kernel, in bytes.
+fn process_footprint_bytes() -> Option<u64> {
+    unsafe {
+        let mut usage: libc::rusage_info_v4 = std::mem::zeroed();
+        let result = libc::proc_pid_rusage(
+            libc::getpid(), libc::RUSAGE_INFO_V4, &mut usage as *mut _ as *mut libc::rusage_info_t,
+        );
+        (result == 0).then_some(usage.ri_phys_footprint)
     }
 }
 
@@ -1894,14 +1934,15 @@ fn main() {
                 println!("{SERVE_USAGE}");
                 return;
             }
-            let options = parse_serve(args, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
-            enter_inky_mode();
+            let (chip, memory) = tuning::this_machine();
+            let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
+            let _lease = enter_inky_mode();
             serve::serve(options);
             return;
         }
         Some("mode") => {
             // Hold inky mode for the requested interval, then leave by exiting.
-            enter_inky_mode();
+            let _lease = enter_inky_mode();
             let secs: u64 = raw.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_secs(secs));
             return;
@@ -1909,17 +1950,12 @@ fn main() {
         _ => {}
     }
     let (cmd, o) = parse();
-    if !matches!(cmd.as_str(), "help" | "-h" | "--help") { enter_inky_mode(); }
+    let _lease = if matches!(cmd.as_str(), "help" | "-h" | "--help") { None } else { enter_inky_mode() };
     match cmd.as_str() {
-        "check" => {
-            if let Err(err) = check(&o) {
-                eprintln!("check: {err}");
-                std::process::exit(1);
-            }
-        }
+        "check" => report_cli_result(&cmd, check(&o)),
         "rows" => rows(&o),
         "rollback" => rollback(&o),
-        "binv" => binv(&o),
+        "binv" => report_cli_result(&cmd, binv(&o)),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
@@ -1931,7 +1967,7 @@ fn main() {
         "maxctx" => maxctx(&o),
         "debug" => debug(&o),
         "prof" => prof(&o),
-        "routes" => routes(&o),
+        "routes" => report_cli_result(&cmd, routes(&o)),
         "vcost" => vcost(&o),
         "prof_pf" => prof_pf(&o),
         "kmoe" => {
@@ -1999,7 +2035,7 @@ fn main() {
             // the GPU's first touch of a page cost?
             let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_w(device uint * B [[buffer(0)]], constant uint2 & a [[buffer(1)]], uint gid [[thread_position_in_grid]]) { B[a.x + gid * a.y] += gid + 1; }\n";
             let gpu = metal::Gpu::new(src, &["k_w"]);
-            let foot = || unsafe { let mut ri: libc::rusage_info_v4 = std::mem::zeroed(); libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t); ri.ri_phys_footprint as f64 / 1048576.0 };
+            let foot = || process_footprint_bytes().expect("read process physical footprint") as f64 / 1048576.0;
             let len = 1usize << 30;
             let f0 = foot();
             let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) } as *mut u8;
@@ -2120,7 +2156,7 @@ fn main() {
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
             let mut sess = Session::new(&eng, &tk);
-            sess.prefill(&pt);
+            report_cli_result(&cmd, sess.prefill(&pt).map(|_| ()));
             let (swa, full) = eng.kv_dump(pt.len());
             std::fs::write(format!("{}.swa", o.reference), &swa).unwrap();
             std::fs::write(format!("{}.full", o.reference), &full).unwrap();
@@ -2161,9 +2197,12 @@ fn main() {
                          eng.kbench_down(n, nr * nsg, 32 * nsg, 8), eng.kbench_down(n, nr * nsg, 32 * nsg, 6));
             }
         }
-        "run" => run(&o),
-        "chat" => chat(&o),
-        "bench" => bench(&o),
+        "run" => report_cli_result(&cmd, run(&o)),
+        "chat" => report_cli_result(&cmd, chat(&o)),
+        "bench" => report_cli_result(&cmd, bench(&o)),
         _ => println!("{USAGE}"),
     }
 }
+
+#[cfg(test)]
+mod loopcd_tests;
