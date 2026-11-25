@@ -147,12 +147,15 @@ impl<'a> Session<'a> {
 /// Streams model output: hides protocol tokens, dims the reasoning, emits valid UTF-8 only.
 pub struct Renderer { buf: Vec<u8>, pub thinking: bool, pub show_thinking: bool, pub raw: bool, think_note: bool }
 
+const UTF8_REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+
 impl Renderer {
     pub fn new(show_thinking: bool, raw: bool) -> Renderer { Renderer { buf: Vec::new(), thinking: false, show_thinking, raw, think_note: false } }
 
     pub fn push(&mut self, tk: &Tokenizer, t: u32, out: &mut impl std::io::Write) {
         if self.raw { self.emit(&tk.decode_bytes(t), out); return; }
         if tk.is_special(t) {
+            self.flush_incomplete(out);
             let s = String::from_utf8_lossy(&tk.decode_bytes(t)).to_string();
             match s.as_str() {
                 "<|content_thinking|>" => {
@@ -173,17 +176,84 @@ impl Renderer {
 
     fn emit(&mut self, bytes: &[u8], out: &mut impl std::io::Write) {
         self.buf.extend_from_slice(bytes);
-        let valid = match std::str::from_utf8(&self.buf) { Ok(_) => self.buf.len(), Err(e) => e.valid_up_to() };
-        if valid > 0 {
-            let _ = out.write_all(&self.buf[..valid]);
-            let _ = out.flush();
-            self.buf.drain(..valid);
+        let mut wrote = false;
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(valid) => {
+                    if !valid.is_empty() {
+                        let _ = out.write_all(valid.as_bytes());
+                        wrote = true;
+                    }
+                    self.buf.clear();
+                    break;
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0 {
+                        let _ = out.write_all(&self.buf[..valid_len]);
+                        wrote = true;
+                    }
+                    match err.error_len() {
+                        Some(bad_len) => {
+                            let _ = out.write_all(UTF8_REPLACEMENT);
+                            wrote = true;
+                            self.buf.drain(..valid_len + bad_len);
+                        }
+                        None => {
+                            if valid_len > 0 {
+                                self.buf.drain(..valid_len);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        if self.buf.len() > 8 { self.buf.clear(); }
+        if wrote {
+            let _ = out.flush();
+        }
+    }
+
+    fn flush_incomplete(&mut self, out: &mut impl std::io::Write) {
+        if !self.buf.is_empty() {
+            self.buf.clear();
+            let _ = out.write_all(UTF8_REPLACEMENT);
+        }
     }
 
     pub fn end(&mut self, out: &mut impl std::io::Write) {
+        self.flush_incomplete(out);
         if self.thinking && self.show_thinking { let _ = write!(out, "\x1b[0m"); }
         let _ = out.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renderer_replaces_bad_utf8_with_replacement_char_and_keeps_following_text() {
+        // Standalone invalid byte followed by >8 bytes of valid ASCII in one chunk and subsequent chunks.
+        let mut r = Renderer::new(true, true);
+        let mut out = Vec::new();
+        r.emit(b"\xffhello, world!", &mut out);
+        r.emit(b" more text", &mut out);
+        r.end(&mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "\u{FFFD}hello, world! more text");
+
+        // Split valid 4-byte emoji across four 1-byte chunks, then an incomplete 3-byte prefix followed by valid ASCII,
+        // then a trailing incomplete 2-byte prefix flushed at end().
+        let mut r2 = Renderer::new(true, true);
+        let mut out2 = Vec::new();
+        for &b in "🦀".as_bytes() {
+            r2.emit(&[b], &mut out2);
+        }
+        r2.emit(&[0xE2, 0x82], &mut out2);
+        assert_eq!(String::from_utf8(out2.clone()).unwrap(), "🦀");
+        r2.emit(b"kept after truncated sequence", &mut out2);
+        r2.emit(&[0xC3], &mut out2);
+        r2.end(&mut out2);
+        assert_eq!(String::from_utf8(out2).unwrap(), "🦀\u{FFFD}kept after truncated sequence\u{FFFD}");
     }
 }

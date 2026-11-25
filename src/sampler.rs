@@ -104,10 +104,7 @@ impl Sampler {
         if self.cand.is_empty() {
             self.cand.push((best_val, best_tok));
         }
-        self.cand.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        if self.top_k > 0 && self.cand.len() > self.top_k {
-            self.cand.truncate(self.top_k);
-        }
+        truncate_and_sort_top_k(&mut self.cand, self.top_k);
         let mut p: Vec<f32> = self.cand.iter().map(|&(x, _)| {
             let x = capped(x);
             let centered = if scaled_max.is_finite() { x / t - scaled_max } else { (x - max_cap) / t };
@@ -227,24 +224,28 @@ pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
 struct Mass { token: u32, p: f32, q: f32 }
 
+#[inline]
+fn cmp_cand(a: &(f32, u32), b: &(f32, u32)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+fn truncate_and_sort_top_k(cand: &mut Vec<(f32, u32)>, top_k: usize) {
+    if top_k > 0 && cand.len() > top_k {
+        cand.select_nth_unstable_by(top_k - 1, cmp_cand);
+        cand.truncate(top_k);
+    }
+    cand.sort_unstable_by(cmp_cand);
+}
+
 fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<(), &'static str> {
     if k == 0 { return Err("no sampling candidates"); }
     cand.clear();
-    let mut floor = 0;
     for (i, &x) in logits.iter().enumerate() {
         if !x.is_finite() { return Err("model returned non-finite logits"); }
-        if cand.len() < k {
-            let j = cand.len();
-            cand.push((x, i as u32));
-            if x < cand[floor].0 { floor = j; }
-        } else if x > cand[floor].0 {
-            cand[floor] = (x, i as u32);
-            floor = 0;
-            for j in 1..k {
-                if cand[j].0 < cand[floor].0 { floor = j; }
-            }
-        }
+        cand.push((x, i as u32));
     }
+    if cand.is_empty() { return Err("no sampling candidates"); }
+    truncate_and_sort_top_k(cand, k);
     Ok(())
 }
 
@@ -252,7 +253,7 @@ fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<
 /// top-k tokens: they extend the support with probability 0 and are not in the softmax.
 fn side_probs(cand: &mut Vec<(f32, u32)>, zeros: &[u32], softcap: f32, temp: f32, top_p: f32) -> Vec<(u32, f32)> {
     if cand.is_empty() { return Vec::new(); }
-    cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    cand.sort_unstable_by(cmp_cand);
     let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
     let max = capped(cand[0].0);
     let scaled_max = max / temp;
@@ -524,6 +525,107 @@ mod tests {
             let t1 = s_raw.sample_next_with_ban(&raw, Some(3)).unwrap();
             let t2 = s_pre.sample_next_with_ban_and_softcap(&pre_capped, Some(3), 0.0).unwrap();
             assert_eq!(t1, t2, "zero softcap override on pre-softcapped logits must match raw softcapped draw");
+        }
+    }
+
+    #[test]
+    fn top_k_selection_matches_full_sort_and_sampling_across_1000_rows() {
+        fn full_sort_ref(cand: &[(f32, u32)], top_k: usize) -> Vec<(f32, u32)> {
+            let mut out = cand.to_vec();
+            out.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            if top_k > 0 && out.len() > top_k {
+                out.truncate(top_k);
+            }
+            out
+        }
+
+        fn sample_full_sort_ref(logits: &[f32], temp: f32, top_k: usize, top_p: f32, softcap: f32, state: &mut u64) -> u32 {
+            let best_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let best_tok = logits.iter().position(|&x| x == best_val).unwrap() as u32;
+            let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
+            let max_cap = capped(best_val);
+            let scaled_max = max_cap / temp;
+            let raw_cut = {
+                let y = temp * (scaled_max - 30.0);
+                let rc = if softcap <= 0.0 { y } else if y <= -softcap { f32::NEG_INFINITY } else { softcap * (y / softcap).atanh() };
+                if rc.is_finite() { rc - 1e-3 * rc.abs() - 1e-3 } else { f32::NEG_INFINITY }
+            };
+            let mut cand: Vec<(f32, u32)> = logits.iter().enumerate()
+                .filter(|&(_, &x)| x >= raw_cut)
+                .map(|(i, &x)| (x, i as u32))
+                .collect();
+            if cand.is_empty() { cand.push((best_val, best_tok)); }
+            cand = full_sort_ref(&cand, top_k);
+            let mut p: Vec<f32> = cand.iter().map(|&(x, _)| (capped(x) / temp - scaled_max).exp()).collect();
+            let sum: f32 = p.iter().sum();
+            for v in &mut p { *v /= sum; }
+            let mut cum = 0.0;
+            let mut n = p.len();
+            for (i, &v) in p.iter().enumerate() { cum += v; if cum >= top_p { n = i + 1; break; } }
+            let total: f32 = p[..n].iter().sum();
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let mut r = ((z >> 40) as f32 / (1u64 << 24) as f32) * total;
+            let mut last = 0;
+            for (i, &mass) in p[..n].iter().enumerate() {
+                if mass == 0.0 { continue; }
+                last = i;
+                r -= mass;
+                if r <= 0.0 { return cand[i].1; }
+            }
+            cand[last].1
+        }
+
+        let mut rng = 0xD1CE_5EED_1234_5678u64;
+        let mut next_u64 = || {
+            rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        let ks = [0usize, 1, 2, 7, 16, 64, 128, 300];
+        for row_idx in 0..1_000usize {
+            let vocab = 64 + (row_idx % 257);
+            let mut row = Vec::with_capacity(vocab);
+            for i in 0..vocab {
+                let u = next_u64();
+                let x = if row_idx % 5 == 0 {
+                    // Heavy multi-way exact ties right across top_k boundaries (including -0.0 vs +0.0).
+                    match u % 8 {
+                        0 => -0.0f32,
+                        1 => 0.0f32,
+                        b => (b as f32) * 0.5,
+                    }
+                } else {
+                    (((u & 0xFFFF) as f32) / 2048.0) - 16.0 + ((i % 7) as f32) * 0.25
+                };
+                row.push(x);
+            }
+            let top_k = ks[row_idx % ks.len()];
+            let cand_in: Vec<(f32, u32)> = row.iter().enumerate().map(|(i, &x)| (x, i as u32)).collect();
+            let mut got = cand_in.clone();
+            truncate_and_sort_top_k(&mut got, top_k);
+            let want = full_sort_ref(&cand_in, top_k);
+            assert_eq!(got.len(), want.len(), "row {row_idx} k={top_k} len");
+            for ((gx, gt), (wx, wt)) in got.iter().zip(&want) {
+                assert_eq!((gx.to_bits(), *gt), (wx.to_bits(), *wt), "row {row_idx} k={top_k} order mismatch");
+            }
+
+            let seed = 0x1000_0000u64 + row_idx as u64;
+            let temp = if row_idx % 3 == 0 { 0.7 } else { 1.1 };
+            let top_p = if row_idx % 4 == 0 { 1.0 } else { 0.9 };
+            let softcap = if row_idx % 2 == 0 { 20.0 } else { 0.0 };
+            let mut sampler = Sampler::new(temp, top_k, top_p, softcap, seed);
+            let mut ref_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let got_tok = sampler.sample_next(&row).unwrap();
+            let want_tok = sample_full_sort_ref(&row, temp, top_k, top_p, softcap, &mut ref_state);
+            assert_eq!(got_tok, want_tok, "row {row_idx} sampled token mismatch");
+            assert_eq!(sampler.state, ref_state, "row {row_idx} RNG state mismatch");
         }
     }
 }

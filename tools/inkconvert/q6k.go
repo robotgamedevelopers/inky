@@ -207,14 +207,20 @@ func q6check(basePath, refPath string) error {
 		if !ok1 || !ok2 || rt.Type != tQ8_0 {
 			return fmt.Errorf("%s: missing, or the reference isn't Q8_0", name)
 		}
+		if !sameDims(bt.Dims, rt.Dims) || rt.rowLen() < 256 || rt.rowLen()%256 != 0 || bt.nRows() < 1 {
+			return fmt.Errorf("%s: incompatible dimensions base=%v ref=%v", name, bt.Dims, rt.Dims)
+		}
 		var relLC, relOurs float64
 		n := 0
-		for _, r := range []int{0, 1, 17, 333, bt.nRows() - 1} {
+		for _, r := range []int{0, min(1, bt.nRows()-1), min(17, bt.nRows()-1), min(333, bt.nRows()-1), bt.nRows() - 1} {
 			rb, err := ref.readRows(rt, r, 1)
 			if err != nil {
 				return err
 			}
-			want, _ := dequantRow(tQ8_0, rb, rt.rowLen(), 1)
+			want, err := dequantRow(tQ8_0, rb, rt.rowLen(), 1)
+			if err != nil {
+				return err
+			}
 			ours := make([]byte, rt.rowLen()/256*q6kBytes)
 			quantizeQ6K(ours, want)
 			e2, _ := relErr(dequantQ6K(ours, rt.rowLen()), want)

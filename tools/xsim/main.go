@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -36,34 +37,70 @@ func popc(x uint64) int {
 	return n
 }
 
-func load(p string) []tok {
-	f, _ := os.Open(p)
-	defer f.Close()
+func loadReader(r io.Reader) ([]tok, error) {
 	var out []tok
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 1<<20), 4<<20)
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		parts := strings.Fields(sc.Text())
-		if parts[0] != "G" {
+		if len(parts) == 0 || parts[0] == "P" {
 			continue
 		}
+		if parts[0] != "G" {
+			return nil, fmt.Errorf("line %d: unexpected record tag %q", lineNo, parts[0])
+		}
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("line %d: malformed G record (need token and %d layer passes)", lineNo, L)
+		}
+		if _, err := strconv.Atoi(parts[1]); err != nil {
+			return nil, fmt.Errorf("line %d: invalid token id %q: %w", lineNo, parts[1], err)
+		}
+		passes := strings.Split(parts[2], ";")
+		if len(passes) != L {
+			return nil, fmt.Errorf("line %d: got %d layer passes, want %d", lineNo, len(passes), L)
+		}
 		var t tok
-		for l, s := range strings.Split(parts[2], ";") {
+		for l, s := range passes {
+			if s == "" {
+				return nil, fmt.Errorf("line %d: empty expert list at pass %d", lineNo, l)
+			}
 			for _, e := range strings.Split(s, ",") {
-				v, _ := strconv.Atoi(e)
+				v, err := strconv.Atoi(e)
+				if err != nil || v < 0 || v >= E {
+					return nil, fmt.Errorf("line %d: invalid expert id %q at pass %d (want 0..%d)", lineNo, e, l, E-1)
+				}
 				t[l].set(v)
 			}
 		}
 		out = append(out, t)
 	}
-	return out
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) < 2 {
+		return nil, fmt.Errorf("need at least 2 generated (G) tokens, got %d", len(out))
+	}
+	return out, nil
+}
+
+func load(p string) ([]tok, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	toks, err := loadReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", p, err)
+	}
+	return toks, nil
 }
 
 type lane struct{ f, i int } // file, position (i>=1 so i-1 predicts)
 
-var files [][]tok
-
-func distinct(ls []lane, prev bool) [L]uint128 {
+func distinct(files [][]tok, ls []lane, prev bool) [L]uint128 {
 	var u [L]uint128
 	for _, x := range ls {
 		i := x.i
@@ -76,8 +113,8 @@ func distinct(ls []lane, prev bool) [L]uint128 {
 	}
 	return u
 }
-func cost(ls []lane) float64 {
-	u := distinct(ls, false)
+func cost(files [][]tok, ls []lane) float64 {
+	u := distinct(files, ls, false)
 	n := 0
 	for l := 0; l < L; l++ {
 		n += pop(u[l])
@@ -85,7 +122,7 @@ func cost(ls []lane) float64 {
 	return float64(n) / L
 }
 
-func randLane(r *rand.Rand, f int) lane {
+func randLane(files [][]tok, r *rand.Rand, f int) lane {
 	if f < 0 {
 		f = r.Intn(len(files))
 	}
@@ -93,18 +130,24 @@ func randLane(r *rand.Rand, f int) lane {
 }
 
 // greedy: from pool, seed with pool[0] (the oldest waiter), then add the lane whose predicted (previous-token) experts add fewest new ones
-func greedy(pool []lane, B int, oracle bool) []lane {
+func greedy(files [][]tok, pool []lane, B int, oracle bool) []lane {
+	if len(pool) == 0 || B <= 0 {
+		return nil
+	}
+	if B > len(pool) {
+		B = len(pool)
+	}
 	used := make([]bool, len(pool))
 	batch := []lane{pool[0]}
 	used[0] = true
-	u := distinct(batch, !oracle)
+	u := distinct(files, batch, !oracle)
 	for len(batch) < B {
 		best, bi := math.MaxInt, -1
 		for j, c := range pool {
 			if used[j] {
 				continue
 			}
-			d := distinct([]lane{c}, !oracle)
+			d := distinct(files, []lane{c}, !oracle)
 			n := 0
 			for l := 0; l < L; l++ {
 				n += pop(or(u[l], d[l])) - pop(u[l])
@@ -113,9 +156,12 @@ func greedy(pool []lane, B int, oracle bool) []lane {
 				best, bi = n, j
 			}
 		}
+		if bi < 0 {
+			break
+		}
 		used[bi] = true
 		batch = append(batch, pool[bi])
-		d := distinct([]lane{pool[bi]}, !oracle)
+		d := distinct(files, []lane{pool[bi]}, !oracle)
 		for l := 0; l < L; l++ {
 			u[l] = or(u[l], d[l])
 		}
@@ -125,31 +171,44 @@ func greedy(pool []lane, B int, oracle bool) []lane {
 
 func gb(x float64) float64 { return sharedGB + L*x*expertGB }
 
-func main() {
-	for _, p := range os.Args[1:] {
-		files = append(files, load(p))
+func runXsim(paths []string, trials int, stdout, stderr io.Writer) int {
+	if len(paths) == 0 {
+		fmt.Fprintln(stderr, "usage: xsim <routes-file>...")
+		return 2
+	}
+	if trials < 1 {
+		fmt.Fprintln(stderr, "trials must be positive")
+		return 2
+	}
+	var files [][]tok
+	for _, p := range paths {
+		toks, err := load(p)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		files = append(files, toks)
 	}
 	r := rand.New(rand.NewSource(1))
-	const trials = 300
-	fmt.Println("experts per layer pass touched by one decode step of B lanes (mean of", trials, "trials); weight GB per step in brackets; K/V reads not included")
-	fmt.Printf("%4s %10s %16s %16s %16s %16s %16s\n", "B", "uniform", "random mix", "same task", "greedy pool 4B", "oracle pool 4B", "greedy pool 16B")
+	fmt.Fprintln(stdout, "experts per layer pass touched by one decode step of B lanes (mean of", trials, "trials); weight GB per step in brackets; K/V reads not included")
+	fmt.Fprintf(stdout, "%4s %10s %16s %16s %16s %16s %16s\n", "B", "uniform", "random mix", "same task", "greedy pool 4B", "oracle pool 4B", "greedy pool 16B")
 	for _, B := range []int{1, 4, 8, 16, 32, 64, 128} {
 		var rm, st, g4, o4, g16 float64
 		for t := 0; t < trials; t++ {
 			mk := func(n, f int) []lane {
 				ls := make([]lane, n)
 				for i := range ls {
-					ls[i] = randLane(r, f)
+					ls[i] = randLane(files, r, f)
 				}
 				return ls
 			}
-			rm += cost(mk(B, -1))
-			st += cost(mk(B, r.Intn(len(files))))
+			rm += cost(files, mk(B, -1))
+			st += cost(files, mk(B, r.Intn(len(files))))
 			p4 := mk(4*B, -1)
-			g4 += cost(greedy(p4, B, false))
-			o4 += cost(greedy(p4, B, true))
+			g4 += cost(files, greedy(files, p4, B, false))
+			o4 += cost(files, greedy(files, p4, B, true))
 			if B <= 32 {
-				g16 += cost(greedy(mk(16*B, -1), B, false))
+				g16 += cost(files, greedy(files, mk(16*B, -1), B, false))
 			}
 		}
 		n := float64(trials)
@@ -159,6 +218,11 @@ func main() {
 		if B <= 32 {
 			g16s = cell(g16 / n)
 		}
-		fmt.Printf("%4d %10s %16s %16s %16s %16s %16s\n", B, cell(uni), cell(rm/n), cell(st/n), cell(g4/n), cell(o4/n), g16s)
+		fmt.Fprintf(stdout, "%4d %10s %16s %16s %16s %16s %16s\n", B, cell(uni), cell(rm/n), cell(st/n), cell(g4/n), cell(o4/n), g16s)
 	}
+	return 0
+}
+
+func main() {
+	os.Exit(runXsim(os.Args[1:], 300, os.Stdout, os.Stderr))
 }

@@ -42,13 +42,16 @@ type toolEvent struct {
 }
 
 type toolSample struct {
-	ID        string
-	Role      string
-	Content   string
-	Reasoning string
-	Finish    string
-	ToolCalls []toolCallItem
-	Usage     replyUsage
+	ID         string
+	Role       string
+	Content    string
+	Reasoning  string
+	Finish     string
+	ToolCalls  []toolCallItem
+	Usage      replyUsage
+	StartedAt  time.Time
+	ActiveAt   time.Time
+	FinishedAt time.Time
 }
 
 func toolCallRequestBody(stream bool) (string, error) {
@@ -97,10 +100,12 @@ func (g *gate) sampleToolReply(ctx context.Context, body string, stream bool) (t
 	}
 	req.Header.Set("Authorization", "Bearer "+g.key)
 	req.Header.Set("Content-Type", "application/json")
+	startedAt := time.Now()
 	resp, err := replyClient.Do(req)
 	if err != nil {
 		return result, err
 	}
+	activeAt := time.Now()
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -116,16 +121,21 @@ func (g *gate) sampleToolReply(ctx context.Context, body string, stream bool) (t
 		}
 		ch := event.Choices[0]
 		result = toolSample{
-			ID:        event.ID,
-			Role:      ch.Message.Role,
-			Content:   ch.Message.Content,
-			Reasoning: ch.Message.Reasoning,
-			Finish:    ch.Finish,
-			ToolCalls: ch.Message.ToolCalls,
-			Usage:     event.Usage,
+			ID:         event.ID,
+			Role:       ch.Message.Role,
+			Content:    ch.Message.Content,
+			Reasoning:  ch.Message.Reasoning,
+			Finish:     ch.Finish,
+			ToolCalls:  ch.Message.ToolCalls,
+			Usage:      event.Usage,
+			StartedAt:  startedAt,
+			ActiveAt:   activeAt,
+			FinishedAt: time.Now(),
 		}
 		return result, nil
 	}
+	result.StartedAt = startedAt
+	result.ActiveAt = activeAt
 	lines := bufio.NewScanner(resp.Body)
 	lines.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	done := false
@@ -170,6 +180,7 @@ func (g *gate) sampleToolReply(ctx context.Context, body string, stream bool) (t
 	if !done {
 		return result, fmt.Errorf("missing SSE [DONE]")
 	}
+	result.FinishedAt = time.Now()
 	return result, nil
 }
 
@@ -246,6 +257,23 @@ func verifyConcurrentToolCalls(wantName string, ref toolSample, got []toolSample
 		if s.Usage.Prompt != ref.Usage.Prompt || s.Usage.Generated != ref.Usage.Generated {
 			return fmt.Errorf("reply %d: usage mismatch: got (%d, %d), want (%d, %d)", i, s.Usage.Prompt, s.Usage.Generated, ref.Usage.Prompt, ref.Usage.Generated)
 		}
+		if s.StartedAt.IsZero() || s.FinishedAt.IsZero() || s.FinishedAt.Before(s.StartedAt) {
+			return fmt.Errorf("reply %d: missing or inverted request timing (%v .. %v)", i, s.StartedAt, s.FinishedAt)
+		}
+	}
+	latestStart := got[0].StartedAt
+	earliestFinish := got[0].FinishedAt
+	for _, s := range got[1:] {
+		if s.StartedAt.After(latestStart) {
+			latestStart = s.StartedAt
+		}
+		if s.FinishedAt.Before(earliestFinish) {
+			earliestFinish = s.FinishedAt
+		}
+	}
+	if !latestStart.Before(earliestFinish) {
+		return fmt.Errorf("concurrent tool calls did not overlap in flight: latest start %s >= earliest finish %s",
+			latestStart.Format(time.RFC3339Nano), earliestFinish.Format(time.RFC3339Nano))
 	}
 	return nil
 }

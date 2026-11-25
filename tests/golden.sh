@@ -10,9 +10,17 @@ nv=200058
 for f in haiku long; do cp ref/$f.tokens $D/$f.tokens; head -c $((nv * 4)) /dev/zero > $D/$f.logits; done
 h() { grep -o 'hash [0-9a-f]*' | sed 's/hash //'; }
 echo "decode haiku         $($B check --ref $D/haiku -c 4096 2>&1 | h)"
-echo "decode long          $($B check --ref $D/long -c 4096 2>&1 | h)"
+dec_long=$($B check --ref $D/long -c 4096 2>&1 | h)
+echo "decode long          $dec_long"
 echo "prefill+decode long  $(INK_PF=1500 $B check --ref $D/long -c 4096 2>&1 | h)"
 echo "kv8 decode haiku     $($B check --kv8 --ref $D/haiku -c 4096 2>&1 | h)"
+kvd_aligned_out=$($B check --kv-disk --ref $D/long -c 4096 2>&1)
+kvd_aligned=$(print -r -- "$kvd_aligned_out" | h)
+if [ "$kvd_aligned" != "$dec_long" ] || ! print -r -- "$kvd_aligned_out" | grep -q '^disk tier:' || print -r -- "$kvd_aligned_out" | grep -q 'hot ring shorter than a split'; then
+    print -ru2 -- "FAIL: aligned --kv-disk ($kvd_aligned) did not match in-memory decode long ($dec_long)"
+    print -ru2 -- "$kvd_aligned_out"
+    exit 1
+fi
 echo "kv-disk decode long  $(INK_TIER_HOT=256 $B check --kv-disk --ref $D/long -c 4096 2>&1 | h)"
 echo "binv long            $($B binv --ref ref/long.tokens -c 4096 2>&1 | grep -c same) splits same"
 echo "run greedy           $($B run -p 'Write a function in C that reverses a singly linked list.' --greedy -n 300 --effort low 2>/dev/null | shasum | cut -c1-16)"

@@ -5,12 +5,15 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func intPtr(v int) *int       { return &v }
 func int64Ptr(v int64) *int64 { return &v }
 
 func sampleToolReplyFixture(seq int, args string) toolSample {
+	base := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
+	start := base.Add(time.Duration(seq) * time.Millisecond)
 	return toolSample{
 		ID:     fmt.Sprintf("chatcmpl-%d", seq),
 		Role:   "assistant",
@@ -26,7 +29,10 @@ func sampleToolReplyFixture(seq int, args string) toolSample {
 				},
 			},
 		},
-		Usage: replyUsage{Prompt: 42, Generated: 15},
+		Usage:      replyUsage{Prompt: 42, Generated: 15},
+		StartedAt:  start,
+		ActiveAt:   start.Add(5 * time.Millisecond),
+		FinishedAt: base.Add(100*time.Millisecond + time.Duration(seq)*time.Millisecond),
 	}
 }
 
@@ -69,6 +75,21 @@ func TestVerifyConcurrentToolCalls(t *testing.T) {
 	// Fewer than 4 concurrent replies must fail.
 	if err := verifyConcurrentToolCalls("get_weather", ref, good[:3]); err == nil {
 		t.Fatalf("expected <4 concurrent replies to fail")
+	}
+
+	// Missing timing metadata must fail.
+	noTiming := append([]toolSample(nil), good...)
+	noTiming[2].StartedAt = time.Time{}
+	if err := verifyConcurrentToolCalls("get_weather", ref, noTiming); err == nil || !strings.Contains(err.Error(), "missing or inverted request timing") {
+		t.Fatalf("expected missing timing rejection, got %v", err)
+	}
+
+	// Serialized (non-overlapping) requests where request 3 started after request 0 finished must fail.
+	serial := append([]toolSample(nil), good...)
+	serial[3].StartedAt = serial[0].FinishedAt
+	serial[3].FinishedAt = serial[3].StartedAt.Add(50 * time.Millisecond)
+	if err := verifyConcurrentToolCalls("get_weather", ref, serial); err == nil || !strings.Contains(err.Error(), "did not overlap in flight") {
+		t.Fatalf("expected non-overlapping concurrent tool calls to fail, got %v", err)
 	}
 }
 

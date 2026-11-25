@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -33,6 +34,10 @@ func parseLaneList(raw string) ([]int, error) {
 }
 
 func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	return runCLIWithDeps(args, getenv, nil, nil, stdout, stderr)
+}
+
+func runCLIWithDeps(args []string, getenv func(string) string, client *http.Client, clk Clock, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	url := fs.String("url", "http://127.0.0.1:8080", "base URL of inky serve")
@@ -88,6 +93,8 @@ func runCLI(args []string, getenv func(string) string, stdout, stderr io.Writer)
 			MaxTTFTP95Ms:    *maxTTFTP95Ms,
 			MinPerLaneTokS:  *minPerLaneTokS,
 		},
+		Client: client,
+		Clock:  clk,
 	}
 
 	rungs, knee, err := RunSweep(context.Background(), cfg, cards)

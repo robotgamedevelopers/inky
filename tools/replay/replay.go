@@ -46,7 +46,7 @@ type Card struct {
 	Turns []RecordedEntry
 }
 
-// Clock abstracts time and sleep for deterministic socket/httptest unit tests.
+// Clock abstracts time and sleep for deterministic in-memory unit tests.
 type Clock interface {
 	Now() time.Time
 	Sleep(d time.Duration)
@@ -344,23 +344,31 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	}
 
 	var peakMem atomic.Uint64
+	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &peakMem)
+
+	start := clk.Now()
+	_, useRealTimers := clk.(realClock)
 	healthCtx, cancelHealth := context.WithCancel(ctx)
 	var healthWG sync.WaitGroup
-	healthWG.Add(1)
-	go func() {
-		defer healthWG.Done()
-		pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &peakMem)
-		ticker := time.NewTicker(healthInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-healthCtx.Done():
-				return
-			case <-ticker.C:
-				pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &peakMem)
+	var nextHealthPollNs atomic.Int64
+	nextHealthPollNs.Store(start.Add(healthInterval).UnixNano())
+	if useRealTimers {
+		healthWG.Add(1)
+		go func() {
+			defer healthWG.Done()
+			timer := time.NewTimer(healthInterval)
+			defer timer.Stop()
+			for {
+				select {
+				case <-healthCtx.Done():
+					return
+				case <-timer.C:
+					pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &peakMem)
+					timer.Reset(healthInterval)
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	totalCards := cfg.CardsPerRung
 	if cfg.Duration == 0 && totalCards <= 0 {
@@ -379,7 +387,6 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	var ttftMu sync.Mutex
 	var ttftsMs []float64
 
-	start := clk.Now()
 	var deadline time.Time
 	if cfg.Duration > 0 {
 		deadline = start.Add(cfg.Duration)
@@ -407,6 +414,13 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 				for _, turn := range template.Turns {
 					toks, ttftMs, retries, err := executeTurn(ctx, client, clk, baseURL, cfg.APIKey, replayCardID, turn, maxRetries)
 					retry429Count.Add(int64(retries))
+					if !useRealTimers {
+						nowNs := clk.Now().UnixNano()
+						targetNs := nextHealthPollNs.Load()
+						if nowNs >= targetNs && nextHealthPollNs.CompareAndSwap(targetNs, nowNs+healthInterval.Nanoseconds()) {
+							pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &peakMem)
+						}
+					}
 					if err != nil {
 						errCount.Add(1)
 						cardOK = false
