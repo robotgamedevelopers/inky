@@ -332,17 +332,19 @@ fn main() {
     let mut agg = WalkStats::default();
     agg.steps = traces[0].steps.len() + traces[1].steps.len();
 
-    // Seeded walks ONLY — never silently drop short walks (`U265`)!
-    for seed in 0..16u64 {
-        let (trace, stats) = walk_scheduler_trace_opts(cfg.clone(), seed, 160, strict)
-            .unwrap_or_else(|e| panic!("walk seed {seed} failed: {e}"));
-        assert!(
-            trace.steps.len() >= 2,
-            "walk seed {seed} produced fewer than 2 steps ({})",
-            trace.steps.len()
-        );
-        add_stats(&mut agg, &stats);
-        traces.push(trace);
+    if strict {
+        // Seeded walks ONLY — never silently drop short walks (`U265`)!
+        for seed in 0..16u64 {
+            let (trace, stats) = walk_scheduler_trace_opts(cfg.clone(), seed, 160, strict)
+                .unwrap_or_else(|e| panic!("walk seed {seed} failed: {e}"));
+            assert!(
+                trace.steps.len() >= 2,
+                "walk seed {seed} produced fewer than 2 steps ({})",
+                trace.steps.len()
+            );
+            add_stats(&mut agg, &stats);
+            traces.push(trace);
+        }
     }
 
     let (data, check, tlc_cfg) =

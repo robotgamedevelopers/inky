@@ -3,9 +3,10 @@
 # M5 Mac after `cargo build --release`. Each line is one gate; every one runs, and any failure fails the night.
 #  - planted-bug negative controls for check, binv, lanes, and dbatch (each must exit 1 with its exact failure line;
 #    a crash or any other exit code fails the gate).
-#  - inky poolgate, long: 17 lanes, prompts of 1067 tokens in chunks of 1 to 256 (across many 64-position blocks and
-#    past the 1024-token sliding window), 64 greedy decode steps (1131 positions total, exercising live window pruning),
-#    every pool slot outside the step poisoned; must give layer 2's outputs bit for bit.
+#  - inky poolgate, long: 17 lanes over ServeBlockCache, prompts of 1067 tokens in chunks of 1 to 256 (across many
+#    64-position blocks and past the 1024-token sliding window), 64 greedy decode steps (1131 positions total,
+#    exercising sharing, reuse, and live window pruning), every pool slot outside the step poisoned; must give layer 2's
+#    outputs bit for bit.
 #  - SSD spill/restore model logit exactness test (`restored_long_prefix_and_early_fork_match_cold_logits`).
 set -e
 set -o pipefail
@@ -13,7 +14,6 @@ cd "${0:A:h}/.."
 B=${INKY_BIN:-./target/release/inky}
 REF=${INKY_REF:-$HOME/inky-ci/ref}
 fail=0
-
 chk_out=$(INK_CHECK_SABOTAGE=1 "$B" check --ref "$REF/short" -c 4096 2>&1) && chk_rc=0 || chk_rc=$?
 if [ "$chk_rc" = 1 ] && print -r -- "$chk_out" | grep -q 'CHECK AGREEMENT FAILED'; then echo "nightly check sabotage: detected, as required"; else echo "FAIL: nightly check sabotage not detected (exit $chk_rc)"; fail=1; fi
 
@@ -31,9 +31,13 @@ INK_POOLGATE_LANES=17 INK_POOLGATE_CHUNKS=31,1,23,7,17,1,29,64,127,61,1,256,256,
 # A fresh path makes a skipped test or a disconnected trace hook fail the replay.
 trace_work=$(mktemp -d "${TMPDIR:-/tmp}/inky-nightly-serve.XXXXXX")
 trap 'rm -rf "$trace_work"' EXIT
-if ! INKY_SCHED_TRACE_OUT="$trace_work/serve.jsonl" cargo test --locked --release \
-        serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo -- --ignored --exact ||
-   ! scripts/check-tla.sh --serve-trace "$trace_work/serve.jsonl"; then
+if trace_result=$(INKY_SCHED_TRACE_OUT="$trace_work/serve.jsonl" cargo test --locked --release --bin inky \
+        serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo -- --ignored --exact --nocapture 2>&1); then
+    print -r -- "$trace_result"
+    grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$trace_result" || { echo "FAIL: serve_layer3_three_turn_10k_cached_matches_cold_solo did not match 1 passed; 0 failed" >&2; fail=1; }
+    scripts/check-tla.sh --serve-trace "$trace_work/serve.jsonl" || { echo "FAIL: three-turn serve trace"; fail=1; }
+else
+    print -r -- "$trace_result"
     echo "FAIL: three-turn serve trace"
     fail=1
 fi
@@ -44,7 +48,7 @@ if [ "$bi_rc" = 1 ] && print -r -- "$bi_out" | grep -q 'BLOCKED NOT INVARIANT'; 
 # Verify a real SSD restore and early prefix fork against both sets of cold model logits.
 spill_test=serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits
 if spill_result=$(cargo test --locked --release --bin inky "$spill_test" -- --ignored --exact --nocapture 2>&1); then
-    grep -Fq 'test result: ok. 1 passed;' <<< "$spill_result" || fail=1
+    grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$spill_result" || { echo "FAIL: $spill_test did not match 1 passed; 0 failed" >&2; fail=1; }
 else
     fail=1
 fi

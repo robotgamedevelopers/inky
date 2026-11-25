@@ -211,7 +211,7 @@ fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
         s.complete_step().unwrap();
     }
     assert!(s.lanes().iter().all(|l| l.state == LaneState::Finished));
-    assert!(max_seen >= 1 && max_seen <= 2);
+    assert!((1..=2).contains(&max_seen));
 }
 
 /// Layer 4 Gate (`docs/ROADMAP.md:139`):
@@ -673,7 +673,7 @@ fn walk_scheduler_trace_satisfies_invariants_across_seeds() {
     let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
     assert!(data.contains("MODULE TraceData"));
     assert!(check.contains("InitConforms == (stepIdx = 1) => Init"));
-    assert!(check.contains("StepConforms == [][Next]_vars"));
+    assert!(check.contains("StepConforms == [][TraceNext]_vars"));
     assert!(check.contains("ActionConforms == [][StepActionCheck]_<<vars, traceIdx, stepIdx>>"));
     assert!(tlc_cfg.contains("BypassBoundHolds"));
     assert!(tlc_cfg.contains("NoDecodeBlocksSealed"));

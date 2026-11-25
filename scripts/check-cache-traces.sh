@@ -11,6 +11,9 @@ jar=$(cd "$(dirname "$TLA2TOOLS_JAR")" && pwd)/$(basename "$TLA2TOOLS_JAR")
 work=$(mktemp -d "${TMPDIR:-/tmp}/inky-cache-traces.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
+JOBS=${INKY_TRACE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+if [[ "$JOBS" -lt 1 ]]; then JOBS=1; fi
+
 orig_blocks=$work/blocks.original
 orig_sched=$work/cache_scheduler.original
 cp "$root/src/blocks.rs" "$orig_blocks"
@@ -22,18 +25,26 @@ compile_gen() {
     cp "$root/src/cache_scheduler/walk.rs" "$dir/cache_scheduler/"
     cp "$root/src/blockbook.rs" "$root/src/cache_trace.rs" "$dir/"
     cp "$root/scripts/cache-traces.rs" "$dir/main.rs"
-    rustc --edition=2021 --cfg standalone_blocks $warn_flag -O "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
+    # Unoptimized codegen compiles ~4x faster on 4-core CI runners while the deterministic
+    # walk itself finishes in < 50 ms; -C debug-assertions=on preserves all debug checks.
+    rustc --edition=2021 --cfg standalone_blocks -C debug-assertions=on -C debuginfo=0 $warn_flag "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || {
         cat "$dir/rustc.log" >&2
         return 1
     }
 }
 
 run_tlc_bundle() {
-    local bdir=$1 spec_file=$2
+    local bdir=$1 spec_file=$2 workers=${3:-1} mode=${4:-fast}
     cp "$spec_file" "$bdir/"
-    (cd "$bdir" && "${TLC_JAVA:-java}" -Xmx2g -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
-        -noGenerateSpecTE -workers 1 -metadir "$bdir/states" \
-        -config TraceCheck.cfg TraceCheck.tla) > "$bdir/tlc.log" 2>&1
+    if [[ "$mode" == "c2" ]]; then
+        (cd "$bdir" && "${TLC_JAVA:-java}" -Xmx1536m -XX:+UseParallelGC -XX:CICompilerCount=2 -cp "$jar" tlc2.TLC \
+            -noGenerateSpecTE -workers "$workers" -metadir "$bdir/states" \
+            -config TraceCheck.cfg TraceCheck.tla) > "$bdir/tlc.log" 2>&1
+    else
+        (cd "$bdir" && "${TLC_JAVA:-java}" -Xmx1536m -XX:+UseParallelGC -XX:TieredStopAtLevel=1 -cp "$jar" tlc2.TLC \
+            -noGenerateSpecTE -workers 1 -metadir "$bdir/states" \
+            -config TraceCheck.cfg TraceCheck.tla) > "$bdir/tlc.log" 2>&1
+    fi
 }
 
 check_production() {
@@ -47,23 +58,28 @@ check_production() {
         cat "$dir/walk.log" >&2
         return 1
     fi
+    local bpids=() bnames=(cs bl_base0 bl_high_fp16 bl_high_kv8 sp_512)
+    run_tlc_bundle "$dir/cs" "$root/specs/CacheScheduler.tla" 2 c2 &
+    bpids+=($!)
     for b in bl_base0 bl_high_fp16 bl_high_kv8; do
-        run_tlc_bundle "$dir/$b" "$root/specs/BlockLayout.tla" || { cat "$dir/$b/tlc.log" >&2; return 1; }
-        grep -Fq 'Model checking completed. No error has been found.' "$dir/$b/tlc.log" || {
-            cat "$dir/$b/tlc.log" >&2
-            return 1
-        }
+        run_tlc_bundle "$dir/$b" "$root/specs/BlockLayout.tla" 1 fast &
+        bpids+=($!)
     done
-    run_tlc_bundle "$dir/cs" "$root/specs/CacheScheduler.tla" || { cat "$dir/cs/tlc.log" >&2; return 1; }
-    grep -Fq 'Model checking completed. No error has been found.' "$dir/cs/tlc.log" || {
-        cat "$dir/cs/tlc.log" >&2
-        return 1
-    }
-    run_tlc_bundle "$dir/sp_512" "$root/specs/SpanPins.tla" || { cat "$dir/sp_512/tlc.log" >&2; return 1; }
-    grep -Fq 'Model checking completed. No error has been found.' "$dir/sp_512/tlc.log" || {
-        cat "$dir/sp_512/tlc.log" >&2
-        return 1
-    }
+    run_tlc_bundle "$dir/sp_512" "$root/specs/SpanPins.tla" 1 fast &
+    bpids+=($!)
+
+    local brc=0
+    for i in "${!bpids[@]}"; do
+        local b=${bnames[$i]}
+        if ! wait "${bpids[$i]}"; then
+            cat "$dir/$b/tlc.log" >&2
+            brc=1
+        elif ! grep -Fq 'Model checking completed. No error has been found.' "$dir/$b/tlc.log"; then
+            cat "$dir/$b/tlc.log" >&2
+            brc=1
+        fi
+    done
+    [[ $brc = 0 ]] || return 1
     {
         for b in bl_base0 bl_high_fp16 bl_high_kv8 cs sp_512; do
             echo "$b: $(grep -Em1 '^[0-9,]+ states generated' "$dir/$b/tlc.log")"
@@ -99,7 +115,8 @@ pathlib.Path(dst).write_text(s.replace(old, new, 1))
         return 1
     fi
     compile_gen "$dir" || return 1
-    "$dir/generate" "$dir" "$bundle" --mutant 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
+    local gen_mode="${bundle}_mutant"
+    "$dir/generate" "$dir" "$gen_mode" "$name" 2> "$dir/walk.log" || { cat "$dir/walk.log" >&2; return 1; }
     [[ -f "$dir/$bundle/TraceCheck.tla" ]] || {
         cat "$dir/walk.log" >&2
         echo "ERROR: $name produced no TraceCheck.tla" >&2
@@ -120,7 +137,27 @@ pathlib.Path(dst).write_text(s.replace(old, new, 1))
 }
 
 names=() pids=()
-start() { names+=("$1"); "${@:2}" & pids+=($!); }
+has_slot() {
+    local n=0 pid st
+    for pid in "${pids[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ st _ < "/proc/$pid/stat" 2>/dev/null || continue
+            [[ "$st" != "Z" ]] && n=$((n + 1))
+        elif kill -0 "$pid" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    [[ "$n" -lt "$JOBS" ]]
+}
+start() {
+    while ! has_slot; do
+        sleep 0.05
+    done
+    names+=("$1")
+    "${@:2}" &
+    pids+=($!)
+}
 
 start production check_production
 

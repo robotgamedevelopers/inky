@@ -3,9 +3,9 @@
 # Mixed prompt lengths, mixed max_tokens, random mid-response disconnects, longitudinal
 # post-drain RSS/lane/block/disk drift monitoring, and bounded --record-dir rotation.
 #
-# The bearer is INKY_SERVE_KEY, injected by nova-secrets exec into serve and the
-# client (or already present in INKY_SERVE_KEY). This script never expands that
-# variable on stdout/argv. Do not run it under xtrace.
+# The bearer key is read from INKY_SERVE_KEY in the environment by both `inky serve`
+# and the soak client. This script never expands that variable on stdout or argv.
+# Do not run it under xtrace.
 set -eu
 setopt pipefail
 
@@ -107,34 +107,15 @@ if [[ -z $model ]]; then
 fi
 [[ -f $model ]] || { print -r -- "model file not found: $model"; exit 4 }
 
-use_env_key=0
-if [[ -n ${INKY_SERVE_KEY:-} ]]; then
-    use_env_key=1
-else
-    secrets=${NOVA_SECRETS:-}
-    if [[ -z $secrets ]]; then
-        secrets=$(command -v nova-secrets || true)
-    fi
-    if [[ -z $secrets ]]; then
-        secrets=$HOME/.local/bin/nova-secrets
-    fi
-    [[ -x $secrets ]] || { print -r -- "nova-secrets not found"; exit 4 }
-    [[ -x /opt/homebrew/bin/sops ]] || { print -r -- "sops not found at /opt/homebrew/bin/sops"; exit 4 }
-    host_id=$(hostname -s)
-    if [[ -f "$HOME/.config/nova-secrets/${host_id}.key" ]]; then
-        secrets_as=$host_id
-        secrets_key="$HOME/.config/nova-secrets/${host_id}.key"
-    else
-        secrets_as=mini-m5
-        secrets_key="$HOME/.config/nova-secrets/mini-m5.key"
-    fi
-    [[ -f $secrets_key ]] || { print -r -- "nova-secrets key not found: $secrets_key"; exit 4 }
+if [[ -z ${INKY_SERVE_KEY:-} ]]; then
+    print -r -- "INKY_SERVE_KEY must be set in the environment"
+    exit 4
 fi
 
 command -v curl >/dev/null || { print -r -- "curl not found"; exit 4 }
 command -v go >/dev/null || { print -r -- "go not found (needed to build tests/soak_client.go)"; exit 4 }
 
-if (( allow_existing == 0 )) && ps -ax -o command= | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
+if (( allow_existing == 0 )) && ps -ax -o pid=,command= | awk -v self="$$" '$1 != self { $1=""; print substr($0, 2) }' | grep -E '(^|[ /])[i]nky( |$)|[c]argo (build|test|check|run)' >/dev/null; then
     print -r -- "refusing: inky or a cargo build is already running on this machine; not starting a second server"
     exit 3
 fi
@@ -221,30 +202,8 @@ client_args=(
 )
 add_spill_args "$spill_dir" "$spill_max_bytes"
 
-if (( use_env_key == 1 )); then
-    serve_cmd=( "${serve_args[@]}" )
-    client_cmd_prefix=( )
-else
-    serve_cmd=(
-        "$secrets" exec
-        --store "$HOME/.local/share/nova/secrets"
-        --as "$secrets_as"
-        --key "$secrets_key"
-        --sops /opt/homebrew/bin/sops
-        --only INKY_SERVE_KEY
-        --
-        "${serve_args[@]}"
-    )
-    client_cmd_prefix=(
-        "$secrets" exec
-        --store "$HOME/.local/share/nova/secrets"
-        --as "$secrets_as"
-        --key "$secrets_key"
-        --sops /opt/homebrew/bin/sops
-        --only INKY_SERVE_KEY
-        --
-    )
-fi
+serve_cmd=( "${serve_args[@]}" )
+client_cmd_prefix=( )
 
 print -r -- "command: ${serve_cmd[*]}"
 

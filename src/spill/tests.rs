@@ -789,14 +789,14 @@ fn kill9_writer_helper() {
     let mut seq = 0u64;
     loop {
         let id = (round << 32) | seq;
-        let kind = if seq % 4 == 0 {
+        let kind = if seq.is_multiple_of(4) {
             SpillBlockKind::Window
         } else {
             SpillBlockKind::Full
         };
         let key = SpillKey::new(kind, id);
         let kv = deterministic_kv(key, kv_len);
-        let st = if seq % 3 == 0 {
+        let st = if seq.is_multiple_of(3) {
             Some(deterministic_state(key, state_len))
         } else {
             None
@@ -828,6 +828,7 @@ fn kill9_writer_helper() {
 ///   ground-truth recomputation with bit-identical outputs.
 #[cfg(unix)]
 #[test]
+#[ignore = "spawns SIGKILL writer subprocesses; run explicitly in CI unit job"]
 fn kill9_mid_write_loses_cache_never_correctness() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -1075,6 +1076,7 @@ fn concurrent_restores_of_shared_disk_block_deduplicate_without_slot_leak() {
 
 #[test]
 fn full_scale_block_and_recurrent_state_roundtrip() {
+    const FULL_STRIDE: usize = 2 * 1024 * 1024;
     let scratch = ScratchTestDir::new("full-scale");
     let dir = scratch.path().join("spill");
     // Real Layer 3 Full block (2 MiB) + Inkling 2 Mini recurrent state (~3.66 MiB).

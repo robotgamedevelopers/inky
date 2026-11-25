@@ -16,6 +16,7 @@ changes = {
     ),
     "stale-same-boot": ("if boot_tag != now_boot {", "if true {"),
     "skip-keep": ('keep(Some(found)).map_err(|e| format!("the saved limit could not be written; not raising it: {e}"))?;', "// omitted persistence"),
+    "lower-higher": ("if found >= target {", "if false && found >= target {"),
 }
 old, new = changes[mutant]
 source = path.read_text()

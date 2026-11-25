@@ -21,7 +21,7 @@ set -eu
 parts='memmode blocks grouped layout-nightly scheduler traces'
 # These trace-conformance scripts run in parallel. Both the trace and tier checks
 # reject a check-*-traces.sh file that does not appear in this inventory.
-trace_scripts='memmode blockbook cache scheduler poisongate serve-step serve-cache'
+trace_scripts='memmode blockbook cache scheduler poisongate serve-step serve-cache serve-ownership'
 grouped_modules=GroupedLayout,PoisonGate,ScratchTail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -58,6 +58,7 @@ NoRollback RefusedRollbackSafe
 NoRollbackAttempted RollbackAttempted
 RestoreStale RestoredWhenIdle
 StaleBoot RestoredWhenIdle
+LowerHigher RaisedWhileConnected
 UnfairRestart EventuallyRestored temporal'
 
 layout_sel() {
@@ -241,7 +242,7 @@ if want layout-nightly && [ -f "$root/specs/BlockLayout.tla" ]; then
 fi
 
 # The CacheScheduler runner takes more than two minutes (its DecodePriority run
-# alone took 159 s on hetzner1, and the whole cpu TLA step 4 min 58 s on the
+# alone took 159 s on a 4-core Linux box, and the whole cpu TLA step 4 min 58 s on the
 # hosted runner, 2026-11-24). Pull request CI therefore leaves it to the nightly
 # workflow, which sets TLA_NIGHTLY=1. The runner must still exist. Asked for by
 # name (the scheduler part) without TLA_NIGHTLY=1, this script refuses above.
@@ -268,6 +269,7 @@ fi
 # check-*-traces.sh that trace_scripts does not name fails here rather than going unrun.
 if want traces; then
     [ -f "$root/scripts/check-memmode-traces.sh" ] || { echo 'memmode trace checker missing' >&2; exit 1; }
+    (cd "$root" && rustc --version >/dev/null)
     for f in "$root"/scripts/check-*-traces.sh; do
         t=${f##*/check-}; t=${t%-traces.sh}
         case " $trace_scripts " in
@@ -276,12 +278,21 @@ if want traces; then
         esac
     done
     pids= names=
+    total_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    light_jobs=$(( (total_cpus + 1) / 2 ))
+    [ "$light_jobs" -ge 2 ] || light_jobs=2
+    heavy_jobs=$total_cpus
+    [ "$heavy_jobs" -ge 2 ] || heavy_jobs=2
     for t in $trace_scripts; do
         if [ ! -f "$root/scripts/check-$t-traces.sh" ]; then
             echo "traces: scripts/check-$t-traces.sh missing" >&2
             exit 1
         fi
-        bash "$root/scripts/check-$t-traces.sh" >"$work/traces-$t.log" 2>&1 &
+        case $t in
+            cache) def_jobs=$heavy_jobs ;;
+            *) def_jobs=$light_jobs ;;
+        esac
+        INKY_TRACE_JOBS="${INKY_TRACE_JOBS:-$def_jobs}" bash "$root/scripts/check-$t-traces.sh" >"$work/traces-$t.log" 2>&1 &
         pids="$pids $!" names="$names $t"
     done
     failed=0

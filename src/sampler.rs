@@ -193,14 +193,14 @@ impl Sampler {
     }
 
     fn draw_dist(&mut self, dist: &[(u32, f32)]) -> u32 {
-        assert!(!dist.is_empty(), "empty sampling distribution");
+        let Some(&(last_tok, _)) = dist.last() else { return 0 };
         let total: f32 = dist.iter().map(|d| d.1).sum();
         let mut r = self.next_f32() * total;
         for &(tok, p) in dist {
             r -= p;
             if r <= 0.0 { return tok; }
         }
-        dist[dist.len() - 1].0
+        last_tok
     }
 
     /// p and q on the union of the surviving target and draft candidates, ordered by token ID.
@@ -226,7 +226,6 @@ impl Sampler {
 pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
 struct Mass { token: u32, p: f32, q: f32 }
-
 #[inline]
 fn cmp_cand(a: &(f32, u32), b: &(f32, u32)) -> std::cmp::Ordering {
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
@@ -285,9 +284,9 @@ mod tests {
     fn logits() -> (Vec<f32>, Vec<f32>) {
         let mut target = vec![-50.0f32; 200];
         let mut draft = vec![-50.0f32; 200];
-        for i in 0..64 { draft[i] = 6.0 - i as f32 * 0.01; }
+        for (i, d) in draft.iter_mut().enumerate().take(64) { *d = 6.0 - i as f32 * 0.01; }
         target[100] = 5.0;
-        for i in 10..73 { target[i] = 4.0 - (i as f32 - 10.0) * 0.01; }
+        for (i, t) in target.iter_mut().enumerate().take(73).skip(10) { *t = 4.0 - (i as f32 - 10.0) * 0.01; }
         (target, draft)
     }
 

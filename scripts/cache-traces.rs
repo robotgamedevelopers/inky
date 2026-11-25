@@ -266,17 +266,172 @@ fn gen_sp(out_root: &Path, name: &str, strict: bool) {
     write_bundle(&out_root.join(name), (data, check, cfg));
 }
 
+fn gen_bl_mutant(out_root: &Path, name: &str, slot_base: u32, kvb: u32) {
+    let cfg = BlockLayoutConfig {
+        lanes: vec!["a".into(), "b".into()],
+        full_capacity: 2,
+        window_capacity: 2,
+        block_size: 2,
+        window_size: 2,
+        max_pos: 4,
+        max_span: 2,
+        max_generation: 2,
+        slot_base,
+        kvb,
+    };
+    let mut traces = Vec::new();
+    for seed in 0..4 {
+        let mut ev = NullSink;
+        let mut st = MemorySink::new();
+        let _ = walk_block_layout(cfg.clone(), seed, &mut ev, &mut st);
+        if let Ok(t) = parse_block_layout_jsonl(&st.to_jsonl()) {
+            if t.steps.len() >= 2 {
+                traces.push(t);
+                if traces.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+    if !traces.is_empty() {
+        write_bundle(&out_root.join(name), render_block_layout_tla_bundle(&traces).unwrap());
+    }
+}
+
+fn gen_cs_mutant(out_root: &Path, name: &str, target: &str) {
+    if matches!(target, "noop-restore-block" | "non-lru-writeback") {
+        gen_cs(out_root, name, false);
+        return;
+    }
+    let cfg = CacheSchedulerConfig {
+        lanes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        prefixes: vec!["p1".into(), "p2".into()],
+        request_lengths: vec![2, 4],
+        block_size: 2,
+        window_size: 2,
+        max_pos: 4,
+        max_span: 2,
+        step_token_budget: 2,
+        mem_budget: 4,
+        disk_budget: 3,
+        max_queue: 2,
+        max_bypass: 2,
+    };
+    let mut best_admit: Option<(usize, cache_trace::CacheSchedulerTrace)> = None;
+    let mut best_step: Option<(usize, cache_trace::CacheSchedulerTrace)> = None;
+    let mut best_priv: Option<(usize, cache_trace::CacheSchedulerTrace)> = None;
+    let mut fallback: Option<cache_trace::CacheSchedulerTrace> = None;
+
+    for seed in 0..16 {
+        let mut ev = NullSink;
+        let mut st = MemorySink::new();
+        let _ = walk_cache_scheduler(cfg.clone(), seed, &mut ev, &mut st);
+        let Ok(t) = parse_cache_scheduler_jsonl(&st.to_jsonl()) else {
+            continue;
+        };
+        if t.steps.len() < 2 {
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some(t.clone());
+        }
+        for (idx, step) in t.steps.iter().enumerate() {
+            if step
+                .state
+                .blocks
+                .iter()
+                .any(|b| !b.sealed && b.tier != "none" && b.length < cfg.block_size)
+                && best_priv.as_ref().map_or(true, |(best, _)| idx < *best)
+            {
+                let mut trimmed = t.clone();
+                trimmed.steps.truncate((idx + 2).max(2).min(t.steps.len()));
+                best_priv = Some((idx, trimmed));
+                break;
+            }
+        }
+        for (idx, w) in t.steps.windows(2).enumerate() {
+            let admitted_lane = w[0]
+                .state
+                .lanes
+                .iter()
+                .zip(&w[1].state.lanes)
+                .find(|(l0, l1)| l0.state == "Queued" && l1.state == "Admitted")
+                .map(|(l0, _)| l0.lane.as_str());
+            if let Some(adm) = admitted_lane {
+                let older_queued = w[0]
+                    .state
+                    .queue_seq
+                    .iter()
+                    .take_while(|q| q.as_str() != adm)
+                    .any(|q| w[1].state.lanes.iter().any(|l| l.lane == *q && l.state == "Queued"));
+                if older_queued && best_admit.as_ref().map_or(true, |(best, _)| idx < *best) {
+                    let mut trimmed = t.clone();
+                    trimmed.steps.truncate((idx + 3).min(t.steps.len()));
+                    best_admit = Some((idx, trimmed));
+                }
+            }
+            if w[1].action == "BuildStep"
+                && w[0].state.lanes.iter().any(|l0| {
+                    matches!(l0.state.as_str(), "Admitted" | "Restoring" | "Ready")
+                        && !w[1].state.step_lanes.contains(&l0.lane)
+                })
+                && best_step.as_ref().map_or(true, |(best, _)| idx < *best)
+            {
+                let mut trimmed = t.clone();
+                trimmed.steps.truncate((idx + 3).min(t.steps.len()));
+                best_step = Some((idx, trimmed));
+            }
+        }
+    }
+
+    let mut traces = Vec::new();
+    let chosen = match target {
+        "admit-wait-dropped" => best_admit.take(),
+        "step-bypass-dropped" => best_step.take(),
+        "priv-tail-dirty" => best_priv.take(),
+        _ => None,
+    };
+    if let Some((_, t)) = chosen {
+        traces.push(t);
+    } else {
+        for candidate in [best_admit, best_step, best_priv] {
+            if let Some((_, t)) = candidate {
+                if traces.iter().all(|existing: &cache_trace::CacheSchedulerTrace| existing.steps != t.steps) {
+                    traces.push(t);
+                }
+            }
+        }
+    }
+    if traces.is_empty() {
+        if let Some(mut t) = fallback {
+            t.steps.truncate(t.steps.len().min(32));
+            traces.push(t);
+        }
+    }
+    if !traces.is_empty() {
+        write_bundle(&out_root.join(name), render_cache_scheduler_tla_bundle(&traces).unwrap());
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let out_root = Path::new(args.get(1).map(String::as_str).unwrap_or("."));
     let mode = args.get(2).map(String::as_str).unwrap_or("all");
-    let strict = args.get(3).map(String::as_str) != Some("--mutant");
+    let third = args.get(3).map(String::as_str).unwrap_or("");
+    let strict = third != "--mutant";
     match mode {
         "bl_base0" => gen_bl(out_root, "bl_base0", 0, 2, strict),
         "bl_high_fp16" => gen_bl(out_root, "bl_high_fp16", 2048, 2, strict),
         "bl_high_kv8" => gen_bl(out_root, "bl_high_kv8", 4096, 1, strict),
+        "bl_base0_mutant" => gen_bl_mutant(out_root, "bl_base0", 0, 2),
+        "bl_high_fp16_mutant" => gen_bl_mutant(out_root, "bl_high_fp16", 2048, 2),
         "cs" => gen_cs(out_root, "cs", strict),
+        "cs_mutant" if matches!(third, "noop-restore-block" | "non-lru-writeback") => {
+            gen_cs(out_root, "cs", false)
+        }
+        "cs_mutant" => gen_cs_mutant(out_root, "cs", third),
         "sp_512" => gen_sp(out_root, "sp_512", strict),
+        "sp_512_mutant" => gen_sp(out_root, "sp_512", false),
         "all" => {
             gen_bl(out_root, "bl_base0", 0, 2, strict);
             gen_bl(out_root, "bl_high_fp16", 2048, 2, strict);
