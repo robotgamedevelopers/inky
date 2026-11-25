@@ -149,11 +149,17 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
     };
     let mut effort_done = false;
     let mut call_names = std::collections::HashMap::new();
-    for m in msgs { for tc in m["tool_calls"].as_array().into_iter().flatten() { if let (Some(id), Some(n)) = (tc["id"].as_str(), tc["function"]["name"].as_str()) { call_names.insert(id.to_string(), n.to_string()); } } }
     for m in msgs {
         let role = m["role"].as_str().ok_or("message without role")?;
         let role = if role == "developer" { "system" } else { role };
         if !effort_done && role != "system" { emit_effort(&mut t)?; effort_done = true; }
+        if role == "assistant" {
+            for call in m["tool_calls"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str()) {
+                    call_names.insert(id, name);
+                }
+            }
+        }
         match role {
             "system" | "user" => {
                 let h = if role == "system" { sp.msg_system } else { sp.msg_user };
@@ -164,13 +170,13 @@ fn render_limited(tk: &Tokenizer, sp: &Specials, req: &Value, default_effort: &s
                 }
             }
             "tool" => {
-                let name = m["name"].as_str().map(|s| s.to_string()).or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).cloned())).unwrap_or_default();
+                let name = m["name"].as_str().or_else(|| m["tool_call_id"].as_str().and_then(|id| call_names.get(id).copied())).unwrap_or_default();
                 let mut parts = content_parts(&m["content"]);
                 if parts.is_empty() { parts.push(""); }
                 let is_error = m["is_error"].as_bool().unwrap_or(false);
                 for (i, p) in parts.iter().enumerate() {
                     marks(&mut t, &[sp.msg_tool])?;
-                    text(&mut t, &name)?;
+                    text(&mut t, name)?;
                     marks(&mut t, &[sp.c_text])?;
                     if is_error && i == 0 { text(&mut t, "Error: ")?; }
                     text(&mut t, p)?;
@@ -272,8 +278,7 @@ fn parse(tk: &Tokenizer, sp: &Specials, toks: &[u32]) -> Parsed {
 // to the OpenAI shape above and rendered by the same `render`, so an Anthropic conversation and the
 // equivalent chat conversation are the same token stream and a lane's kept prompt is reused across
 // either API (decision 4). Thinking has no block in either direction here: a reply's thinking is
-// dropped, and thinking blocks in a sent history are dropped with it. Custom stop sequences,
-// `tool_choice` and `top_k` have no counterpart in the chat path and are ignored.
+// dropped, and thinking blocks in a sent history are dropped with it.
 
 /// An Anthropic request as the OpenAI request the chat path renders: `system` becomes leading
 /// system messages, a `system` role inside `messages[]` (Claude Code 2.1.330) becomes a system
@@ -1608,6 +1613,29 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> Result<Vec<u8>, BodyError> 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route { Models, Health, Chat, Messages, CountTokens, NotFound }
 
+/// Only accept generation controls that the scheduler and response encoders can honor.
+fn check_generation_controls(req: &Value, route: Route) -> Result<(), String> {
+    let (stop_field, messages) = match route {
+        Route::Chat => ("stop", false),
+        Route::Messages => ("stop_sequences", true),
+        _ => unreachable!("only generation routes validate generation controls"),
+    };
+    let stops = &req[stop_field];
+    if !stops.is_null() && !stops.as_array().is_some_and(Vec::is_empty) {
+        return Err(format!("{stop_field} is unsupported. Omit it to use the model's own stop tokens"));
+    }
+    if !messages && !matches!(req.get("parallel_tool_calls"), None | Some(Value::Null | Value::Bool(true))) {
+        return Err("parallel_tool_calls must be true or omitted".into());
+    }
+    let choice = &req["tool_choice"];
+    if choice.is_null() { return Ok(()); }
+    let auto = if messages {
+        choice["type"] == "auto" && matches!(choice.get("disable_parallel_tool_use"), None | Some(Value::Null | Value::Bool(false)))
+    } else { choice == "auto" };
+    if !auto { return Err("tool_choice supports only automatic tool selection".into()); }
+    Ok(())
+}
+
 fn route(method: &str, path: &str) -> Route {
     match (method, path) {
         ("GET", "/v1/models") => Route::Models,
@@ -2097,6 +2125,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
         respond(s, 400, &json!({"error": {"message": m}}).to_string())
     };
+    if let Err(message) = check_generation_controls(req, Route::Chat) { return bad(message); }
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -2255,7 +2284,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
                 record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, prompt, ng, Some(&timing), finish, 200);
-                let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{seq}_{i}"), "type": "function",
+                let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{}_{seq}_{i}", cx.nonce), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
                 eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
@@ -2321,6 +2350,10 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
     };
     // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+    if let Err(message) = check_generation_controls(req, Route::Messages) {
+        record_err(first_tok, 400, "invalid_request_error", 0);
+        return anthropic_error(s, 400, "invalid_request_error", &message);
+    }
     let max = match req["max_tokens"].as_u64() {
         Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
@@ -3107,6 +3140,78 @@ mod tests {
         // an image-only user message renders the placeholder too
         let only = anthropic_to_openai(&json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]})).unwrap();
         assert_eq!(only["messages"][0]["content"][0], json!({"type": "text", "text": "[image]"}));
+    }
+
+    #[test]
+    fn unsupported_generation_controls_return_400_before_scheduling() {
+        for stream in [false, true] {
+            for (route, field, value) in [
+                (Route::Chat, "tool_choice", json!("none")),
+                (Route::Messages, "tool_choice", json!({"type": "none"})),
+                (Route::Chat, "tool_choice", json!("required")),
+                (Route::Chat, "parallel_tool_calls", json!(false)),
+                (Route::Messages, "tool_choice", json!({"type": "tool", "name": "get_weather"})),
+                (Route::Messages, "tool_choice", json!({"type": "auto", "disable_parallel_tool_use": true})),
+                (Route::Chat, "stop", json!("ell")),
+                (Route::Chat, "stop", json!(["ell"])),
+                (Route::Messages, "stop_sequences", json!(["ell"])),
+            ] {
+                let (cx, jobs) = admission_test_ctx(1);
+                let mut req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": stream});
+                req[field] = value;
+                // Dropping the channel lets an accidentally accepted request fail immediately.
+                drop(jobs);
+                let mut out = Vec::new();
+                if route == Route::Messages { messages(&cx, &req, &mut out).unwrap(); }
+                else { chat(&cx, &req, &mut out).unwrap(); }
+                let response = String::from_utf8(out).unwrap();
+                assert!(response.starts_with("HTTP/1.1 400") && response.contains(field), "{response}");
+                assert!(!response.contains("text/event-stream"), "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn openai_tool_ids_include_the_process_nonce_in_both_response_modes() {
+        for stream in [false, true] {
+            for nonce in ["firstprocess", "secondprocess"] {
+                let (mut cx, jobs) = admission_test_ctx(1);
+                cx.nonce = nonce.into();
+                let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8,
+                                 "tool_choice": "auto", "stop": [], "stream": stream});
+                let tokens = reply_stream(&cx.tk, &cx.sp);
+                let worker = std::thread::spawn(move || {
+                    let job = jobs.recv().unwrap();
+                    for &t in &tokens { job.out.send(Ev::Tok(t)).unwrap(); }
+                    job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
+                });
+                let mut out = Vec::new();
+                chat(&cx, &req, &mut out).unwrap();
+                assert!(String::from_utf8(out).unwrap().contains(&format!("call_{nonce}_1_0")));
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn historical_tool_names_resolve_against_preceding_assistant_calls() {
+        let (cx, _) = admission_test_ctx(1);
+        let req = json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "call_1_0", "function": {"name": "first", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1_0", "content": "earlier result"},
+            {"role": "assistant", "tool_calls": [{"id": "call_1_0", "function": {"name": "second", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1_0", "content": "later result"}
+        ]});
+        let toks = render(&cx.tk, &cx.sp, &req, "low").unwrap();
+        let mut names = Vec::new();
+        for (i, &t) in toks.iter().enumerate() {
+            if t == cx.sp.msg_tool {
+                let bytes = toks[i + 1..].iter().take_while(|&&id| id != cx.sp.c_text)
+                    .flat_map(|&id| cx.tk.decode_bytes(id)).collect();
+                names.push(String::from_utf8(bytes).unwrap());
+            }
+        }
+        assert_eq!(names, ["first", "second"]);
     }
 
     #[test] fn a_generated_reply_parses_to_anthropic_blocks() {
