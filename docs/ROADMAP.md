@@ -226,8 +226,8 @@ TLA+ models, trace checks and layout models that do not yet reach the code `inky
 
 | feature | done |
 |---|:---:|
-| StartTails is bound by trace to the start-point, window-hold and prune rules in ServeBlockCache | ❌ |
-| PrefixTreeTrace and its mutants drive the EntryTree path inky serve uses, including handle refresh and pruning | ❌ |
+| Replay ServeBlockCache start-point retention, window holds and pruning against the StartTails rules | ✅ |
+| Replay and mutate the EntryTree path used by serve, including handle refresh and pruning | ✅ |
 | The trace-gate mutants are planted in code inky serve computes with, and each turns its gate red | ❌ |
 | The models keep the window rule the server prunes by, and the WindowOffByOne witness reports a real off-by-one | ❌ |
 | CacheScheduler models spans that cross block boundaries, as every production prefill chunk does | ❌ |
@@ -241,7 +241,7 @@ TLA+ models, trace checks and layout models that do not yet reach the code `inky
 | The kv-disk tier, the sliding-window ring and prefill scratch, rollback_verify and VecAlloc each have a state or layout model | ❌ |
 | BlockedSlab slot reuse, stride growth and the packed block-table upload have a layout model run at capacity 3 or 4 | ❌ |
 | The slab-packed GPU block-table word has a layout model and a multi-slab test of packing, shader decode and bind order | ❌ |
-| complete | 0% |
+| complete | 13% |
 
 [Source data](roadmap.sexp)
 

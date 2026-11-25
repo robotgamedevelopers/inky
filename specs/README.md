@@ -199,6 +199,26 @@ one-line mutations of `src/blockbook.rs` must each be rejected by TLC:
 `unheld-window` and `pruned-under-start` (a), `overread` (b), `no-zero` (c),
 `kept-tail` and `every-off`.
 
+## Serve cache traces
+
+The PR trace tier runs `scripts/check-serve-cache-traces.sh`. Its CPU harness
+calls `ServeBlockCache` with the actual `EntryTree`, host-backed `BlockPools`
+and lane tables. `ServeCacheTrace` checks the StartTails and PrefixTree
+contracts at serving operation boundaries: prompt and periodic retention,
+the live window in each start and lane, pool reference ownership, exact
+deepest-prefix matching with a seed token left over, refreshed window handles,
+and pruning after the last lane or start releases a path.
+
+The deterministic trace includes concurrent bindings, a fork that differs at
+the last token of a block, an expired window handle that needs replacement,
+and eviction while a lane still pins a path. The checker requires TLC
+counterexamples when source mutations drop a required window block, skip decode
+window pruning, skip handle refresh, leave the released path unpruned, match an entire prompt, or choose a shallower
+checkpoint in the presence of a deeper match. The standalone BlockBook and
+LiveTree gates still cover their own smaller operation models. The serving
+trace observes bookkeeping and synthetic recurrent-state bytes at operation
+boundaries. GPU byte contents and disk spill are outside its scope.
+
 ## Serve scheduler traces
 
 On a Mac with the Rust toolchain, write one deterministic trace from the serve

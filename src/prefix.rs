@@ -228,6 +228,11 @@ impl<B: Copy> PrefixTree<B> {
             .collect()
     }
 
+    #[cfg(standalone_blocks)]
+    pub(crate) fn trace_block(&self, id: SealedId) -> Option<(Option<SealedId>, &[u32])> {
+        self.node(id).map(|node| (node.parent, node.tokens.as_ref()))
+    }
+
     /// Keep the end of this block as a start point for one more holder.
     /// Start points are counted: two holders are normal (a lane head and
     /// a prompt end), and the point survives until the last release.

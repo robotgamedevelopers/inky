@@ -19,10 +19,10 @@
 set -eu
 
 parts='memmode blocks grouped layout-nightly scheduler traces'
-# The trace-conformance scripts, scripts/check-<name>-traces.sh: memmode, blockbook, cache and scheduler
+# The trace-conformance scripts, scripts/check-<name>-traces.sh: memmode, blockbook, cache, scheduler and serve-cache
 # all live on main and run in parallel. A check-*-traces.sh that is not named here fails the traces part
 # and the tier check.
-trace_scripts='memmode blockbook cache scheduler'
+trace_scripts='memmode blockbook cache scheduler serve-cache'
 grouped_modules=GroupedLayout,PoisonGate,ScratchTail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
