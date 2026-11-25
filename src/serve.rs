@@ -730,6 +730,18 @@ struct Active {
 }
 
 impl Active {
+    fn step_input(&self, runnable: bool) -> crate::scheduler::ServeLaneInput {
+        let mut prefill_target = effective_pf_target(self.n_past, self.pf_end);
+        let mut decode = self.pending.is_some() && self.n_past < self.pf_end + self.gen;
+        if self.job.loopcd_omega > 0.0 {
+            // The final prompt token produces the first guided distribution. Its decode-written
+            // KV stays private; only ordinary prefill rows can enter a shared checkpoint.
+            let last = self.pf_end - 1;
+            prefill_target = prefill_target.min(last);
+            decode |= self.n_past == last;
+        }
+        crate::scheduler::ServeLaneInput { runnable, n_past: self.n_past, pf_end: prefill_target, has_pending_decode: decode }
+    }
     fn log_cancellation(&self, lane: usize) {
         if self.n_past < self.pf_end {
             eprintln!("[serve] lane {lane}: client gone during prefill ({} of {} prompt tokens); lane freed #{} {}", self.n_past, self.pf_end, self.job.seq, self.timing);
@@ -1109,12 +1121,7 @@ fn scheduler(
             }
         }
         let mut step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
-            Some(a) => crate::scheduler::ServeLaneInput {
-                runnable: runnable(i, a) && !deferred_by_singleflight[i],
-                n_past: a.n_past,
-                pf_end: effective_pf_target(a.n_past, a.pf_end),
-                has_pending_decode: a.pending.is_some() && a.n_past < a.pf_end + a.gen,
-            },
+            Some(a) => a.step_input(runnable(i, a) && !deferred_by_singleflight[i]),
             None => crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
         }).collect();
         for input in &mut step_inputs {
@@ -1237,20 +1244,17 @@ fn scheduler(
                         continue;
                     }
                     if a.n_past == a.pf_end {
-                        if a.sampler.uses_gpu_gumbel() {
-                            let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                            a.pending = Some(tok);
+                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                            eng.on(&l.lane).sampled_token_at(a.n_past)
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                            match a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
-                                Ok(tok) => {
-                                    let tok = a.think.observe(tok, &sp);
-                                    a.pending = Some(tok);
-                                }
-                                Err(e) => {
-                                    l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
-                                    planner.on_finish(i);
-                                }
+                            a.sampler.sample_next_with_ban_and_softcap(lg, a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                        };
+                        match sampled {
+                            Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
+                            Err(e) => {
+                                l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
+                                planner.on_finish(i);
                             }
                         }
                     } else if a.job.out.send(Ev::Alive).is_err() {
@@ -1302,10 +1306,13 @@ fn scheduler(
                     }
                     continue;
                 }
-                // feed each lane's pending token at its position
+                // Admission already installed the last prompt token for a first guided draw.
+                // Subsequent decode steps feed the sampled token back into their own lane.
                 for &i in &live_dec {
                     let a = lanes[i].job.as_ref().unwrap();
-                    eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
+                    if a.n_past >= a.pf_end {
+                        eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
+                    }
                 }
                 let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
                 let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().job.loopcd_omega).collect();
@@ -1355,15 +1362,22 @@ fn scheduler(
                 for (k, &i) in live_dec.iter().enumerate() {
                     let l = &mut lanes[i];
                     let a = l.job.as_mut().unwrap();
-                    a.timing.generation.add(1, elapsed);
+                    if a.n_past < a.pf_end {
+                        a.timing.prefill.add(1, elapsed);
+                        metrics.lock().unwrap_or_else(|e| e.into_inner()).input += 1;
+                    } else {
+                        a.timing.generation.add(1, elapsed);
+                    }
                     a.n_past += 1;
                     if a.job.out.cancelled() {
                         let _ = planner.request_cancel(i);
-                    } else if a.sampler.uses_gpu_gumbel() {
-                        let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                        a.pending = Some(tok);
                     } else {
-                        match a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap()) {
+                        let sampled = if a.sampler.uses_gpu_gumbel() {
+                            eng.on(&l.lane).sampled_token_at(a.n_past)
+                        } else {
+                            a.sampler.sample_next_with_ban_and_softcap(eng.span_logits(k), a.think.ban_token(&sp), eng.effective_sampler_softcap(k))
+                        };
+                        match sampled {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
                             Err(e) => {
                                 l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
@@ -3602,8 +3616,8 @@ mod tests {
         for (is_msg, req, want) in [
             (false, json!({"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}), 0.25f32),
             (true, json!({"max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}), 0.25f32),
-            (false, json!({"max_tokens": 8, "loopcd_omega": 0.6, "messages": [{"role": "user", "content": "hi"}]}), 0.6f32),
-            (true, json!({"max_tokens": 8, "loopcd_omega": 0.0, "messages": [{"role": "user", "content": "hi"}]}), 0.0f32),
+            (false, json!({"max_tokens": 1, "loopcd_omega": 0.6, "messages": [{"role": "user", "content": "hi"}]}), 0.6f32),
+            (true, json!({"max_tokens": 1, "loopcd_omega": 0.0, "messages": [{"role": "user", "content": "hi"}]}), 0.0f32),
         ] {
             let cx2 = cx.clone();
             let req2 = req.clone();
@@ -3613,7 +3627,19 @@ mod tests {
             });
             let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
             assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
-            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+            // Reaching length - 1 can follow either a prefill step or a checkpoint hit.
+            // A one-token reply must enter guided decode before any generated token is pending.
+            let pf_end = job.toks.len();
+            let timing = Counters::new(Instant::now()).admit(Instant::now(), job.queued_at);
+            let sampler = Sampler::new(job.temp, job.top_k, job.top_p, 30.0, job.seed);
+            let draft_sampler = Sampler::draft(job.temp, job.top_k, job.top_p, 30.0, job.seed);
+            let mut a = Active { job, n_past: pf_end - 1, pf_end, cached: 0, gen: 0,
+                timing, sampler, draft_sampler, think: ThinkBudget::new(0), pending: None };
+            assert_eq!(a.step_input(true).needs_decode(), want > 0.0);
+            assert_eq!(a.step_input(true).needs_prefill(), want == 0.0);
+            a.n_past = pf_end;
+            assert!(!a.step_input(true).needs_decode(), "first token has not yet been emitted");
+            a.job.out.send(Ev::Done { prompt: pf_end, cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
             worker.join().unwrap();
         }
     }

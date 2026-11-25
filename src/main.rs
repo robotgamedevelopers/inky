@@ -611,7 +611,7 @@ fn check(o: &Opts) -> Result<(), String> {
         }
         for x in raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
         if pos < first_ref { continue; }
-        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap())).collect();
+        let lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
         let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
             .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
@@ -1137,7 +1137,7 @@ fn temp1(o: &Opts) {
                     eng.encode_gumbel_solo(&gcb, &l, pos, req_seed, pos, 1.0, None);
                     gcb.commit();
                     gcb.waitUntilCompleted();
-                    r.token_at(pos)
+                    r.sampled_token_at(pos).expect("valid GPU sample")
                 } else {
                     sampler.sample_next(eng.logits()).expect("solo prefill sample")
                 };
@@ -1156,7 +1156,7 @@ fn temp1(o: &Opts) {
                         eng.encode_gumbel_span(&gcb, 0, &l, next_pos, req_seed, next_pos, 1.0, None);
                         gcb.commit();
                         gcb.waitUntilCompleted();
-                        r.token_at(next_pos)
+                        r.sampled_token_at(next_pos).expect("valid GPU sample")
                     } else {
                         sampler.sample_next(eng.span_logits(0)).expect("solo decode sample")
                     };
@@ -1279,7 +1279,7 @@ fn temp1(o: &Opts) {
                             gcb.waitUntilCompleted();
                             for &(_, i) in &gpu_pf {
                                 let p = reqs[i].n_past;
-                                let tok = eng.on(&reqs[i].lane).token_at(p);
+                                let tok = eng.on(&reqs[i].lane).sampled_token_at(p).expect("valid GPU sample");
                                 reqs[i].toks.push(tok);
                             }
                         }
@@ -1316,7 +1316,7 @@ fn temp1(o: &Opts) {
                         for (k, &i) in dec_lanes.iter().enumerate() {
                             reqs[i].n_past += 1;
                             let tok = if reqs[i].sampler.uses_gpu_gumbel() {
-                                eng.on(&reqs[i].lane).token_at(reqs[i].n_past)
+                                eng.on(&reqs[i].lane).sampled_token_at(reqs[i].n_past).expect("valid GPU sample")
                             } else {
                                 reqs[i].sampler.sample_next(eng.span_logits(k)).expect("batched dec sample")
                             };
@@ -2023,3 +2023,6 @@ fn main() {
         _ => println!("{USAGE}"),
     }
 }
+
+#[cfg(test)]
+mod loopcd_tests;

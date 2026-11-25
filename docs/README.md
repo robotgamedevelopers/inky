@@ -82,6 +82,7 @@ nova-secrets exec --only INKY_SERVE_KEY -- \
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
+| `--loopcd OMEGA` | 0 | Maximum adaptive contrast weight (0 to 4). Both generation APIs accept a per-request `loopcd_omega` override. |
 | `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
 An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.
@@ -96,7 +97,7 @@ The server accepts at most `--lanes` plus `--queue` generation jobs at a time, u
 
 Generation prompt rendering stops early once the applicable token limit is exceeded. A prompt token count reported for an early rejection is a lower bound. To get the exact rendered count for a Messages request, use `count_tokens`, which can count past the lane context. A full output buffer pauses its own lane, and a socket write that stalls for five seconds closes the connection and cancels any remaining generation.
 
-Each completed request logs its queue wait (`queue_ms`) and the number of occupied lanes at admission, including its own (`lanes_busy_start`). Prefill and generation times sum the wall time of the engine batches that served the lane. Each participating lane receives the full batch duration. Prefill tokens/s counts newly evaluated prompt tokens. Generation tokens/s counts decode steps; the first output token comes from prefill, so a one-token response has zero decode time and rate.
+Each completed request logs its queue wait (`queue_ms`) and the number of occupied lanes at admission, including its own (`lanes_busy_start`). Prefill and generation times sum the wall time of the engine batches that served the lane. Each participating lane receives the full batch duration. Prefill tokens/s counts newly evaluated prompt tokens. Generation tokens/s counts steps after the first output token. With LoopCD enabled, the final prompt token runs through guided decode and counts toward prefill time. Its KV stays private to the current request. A one-token response has zero generation time and rate.
 
 Once a minute, including idle periods, the summary reports the time-weighted mean occupied lanes, newly prefilled and sampled output tokens per second over the whole interval, and the number of requests currently waiting for a lane. Use these interval-wide rates to distinguish slow inference from idle time between tool turns.
 
@@ -160,7 +161,8 @@ cargo build --release
 ./target/release/inky bench -f prompt.txt -n 256  # prefill + decode throughput
 ```
 Options: `--effort none|minimal|low|medium|high|xhigh`, `--temp/--top-p/--top-k/--seed`, `--system`, `-c CTX`,
-`--hide-thinking`, `--raw`, `--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
+`--hide-thinking`, `--raw`, `--loopcd OMEGA` (0 to 4, starting with the first output token and incompatible with `--kv-disk`),
+`--kv-disk` (half of the exact K/V cache in memory, the rest streamed from SSD: slower
 generation, bit-identical output), `--kv8` (half-size 8-bit K/V cache, not exact - both in the limits section),
 `-m model.gguf` (default: LM Studio's Inkling-2-Mini Q4_K_M). Requires macOS with Metal 4
 (M5 neural accelerators are used for prefill GEMMs and prefill attention).

@@ -61,6 +61,22 @@ impl Sampler {
         ban: Option<u32>,
         softcap: f32,
     ) -> Result<u32, &'static str> {
+        let total = self.prepare_row(logits, ban, softcap)?;
+        if self.temp < 1e-5 { return Ok(self.cand[0].1); }
+        let mut r = self.next_f32() * total;
+        let mut last = self.cand[0].1;
+        for &(mass, token) in &self.cand {
+            if mass == 0.0 { continue; }
+            last = token;
+            r -= mass;
+            if r <= 0.0 { return Ok(token); }
+        }
+        Ok(last)
+    }
+
+    /// Fill `cand` with the masses used for a draw and return their total after the top-p cut.
+    /// Both ordinary draws and speculative rejection need the exact same token support.
+    fn prepare_row(&mut self, logits: &[f32], ban: Option<u32>, softcap: f32) -> Result<f32, &'static str> {
         if logits.is_empty() { return Err("model returned no logits"); }
         if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
         let mut best: Option<(f32, u32)> = None;
@@ -70,8 +86,10 @@ impl Sampler {
             if best.is_none_or(|(b, _)| x > b) { best = Some((x, i as u32)); }
         }
         let Some((best_val, best_tok)) = best else { return Err("no sampling candidates") };
-        if self.greedy() || self.temp < 1e-5 {
-            return Ok(best_tok);
+        self.cand.clear();
+        if self.temp < 1e-5 {
+            self.cand.push((1.0, best_tok));
+            return Ok(1.0);
         }
         if !softcap.is_finite() || !self.top_p.is_finite() {
             return Err("invalid sampling parameters");
@@ -95,7 +113,6 @@ impl Sampler {
         } else {
             f32::NEG_INFINITY
         };
-        self.cand.clear();
         for (i, &x) in logits.iter().enumerate() {
             if Some(i as u32) != ban && x >= raw_cut {
                 self.cand.push((x, i as u32));
@@ -108,28 +125,26 @@ impl Sampler {
         if self.top_k > 0 && self.cand.len() > self.top_k {
             self.cand.truncate(self.top_k);
         }
-        let mut p: Vec<f32> = self.cand.iter().map(|&(x, _)| {
-            let x = capped(x);
+        let mut sum = 0.0;
+        for (mass, _) in &mut self.cand {
+            let x = capped(*mass);
             let centered = if scaled_max.is_finite() { x / t - scaled_max } else { (x - max_cap) / t };
-            centered.exp()
-        }).collect();
-        let sum: f32 = p.iter().sum();
-        if !sum.is_finite() || sum <= 0.0 { return Err("model returned invalid sampling probabilities"); }
-        for v in p.iter_mut() { *v /= sum; }
-        // top-p cut
-        let mut cum = 0.0;
-        let mut n = p.len();
-        for (i, &v) in p.iter().enumerate() { cum += v; if cum >= self.top_p { n = i + 1; break; } }
-        let total: f32 = p[..n].iter().sum();
-        let mut r = self.next_f32() * total;
-        let mut last = 0;
-        for (i, &mass) in p[..n].iter().enumerate() {
-            if mass == 0.0 { continue; }
-            last = i;
-            r -= mass;
-            if r <= 0.0 { return Ok(self.cand[i].1); }
+            *mass = centered.exp();
+            sum += *mass;
         }
-        Ok(self.cand[last].1)
+        if !sum.is_finite() || sum <= 0.0 { return Err("model returned invalid sampling probabilities"); }
+        let mut total = 0.0;
+        let mut keep = self.cand.len();
+        for (i, (mass, _)) in self.cand.iter_mut().enumerate() {
+            *mass /= sum;
+            total += *mass;
+            if total >= self.top_p {
+                keep = i + 1;
+                break;
+            }
+        }
+        self.cand.truncate(keep);
+        Ok(total)
     }
 
     /// One drafted position. Given the actual drafted token `draft_tok` drawn from `q`, accept with
@@ -191,34 +206,22 @@ impl Sampler {
         dist[dist.len() - 1].0
     }
 
-    /// p and q on the union of the two top-k sets, after softcap-after-top-k, `/temp`, and top-p.
-    /// A token the other side alone kept is present with a zero. Neither side is renormalized for that zero.
-    fn masses(&self, target: &[f32], draft: &[f32]) -> Vec<Mass> {
-        let k = if self.top_k == 0 { target.len().max(draft.len()) } else { self.top_k };
-        let mut target_kept = Vec::new();
-        let mut draft_kept = Vec::new();
-        select_top_k(target, k.min(target.len()), &mut target_kept).expect("invalid target sampling row");
-        select_top_k(draft, k.min(draft.len()), &mut draft_kept).expect("invalid draft sampling row");
-        let draft_ids: Vec<u32> = draft_kept.iter().map(|c| c.1).collect();
-        let target_ids: Vec<u32> = target_kept.iter().map(|c| c.1).collect();
-        // zeros of the other side sit on the support, after this side's own top-k, and do not enter its softmax
-        let p_rows = side_probs(&mut target_kept, &draft_ids, self.softcap, self.temp, self.top_p);
-        let q_rows = side_probs(&mut draft_kept, &target_ids, self.softcap, self.temp, self.top_p);
-        let mut by_token: Vec<Mass> = Vec::new();
-        for (tok, pr) in p_rows {
-            match by_token.iter_mut().find(|m| m.token == tok) {
-                Some(m) => m.p = pr,
-                None => by_token.push(Mass { token: tok, p: pr, q: 0.0 }),
+    /// p and q on the union of the surviving target and draft candidates, ordered by token ID.
+    fn masses(&mut self, target: &[f32], draft: &[f32]) -> Vec<Mass> {
+        let mut by_token = std::collections::BTreeMap::new();
+        let target_total = self.prepare_row(target, None, self.softcap).expect("invalid target sampling row");
+        for &(weight, token) in &self.cand {
+            if weight > 0.0 {
+                by_token.insert(token, Mass { token, p: weight / target_total, q: 0.0 });
             }
         }
-        for (tok, pr) in q_rows {
-            match by_token.iter_mut().find(|m| m.token == tok) {
-                Some(m) => m.q = pr,
-                None => by_token.push(Mass { token: tok, p: 0.0, q: pr }),
+        let draft_total = self.prepare_row(draft, None, self.softcap).expect("invalid draft sampling row");
+        for &(weight, token) in &self.cand {
+            if weight > 0.0 {
+                by_token.entry(token).or_insert(Mass { token, p: 0.0, q: 0.0 }).q = weight / draft_total;
             }
         }
-        by_token.sort_by_key(|m| m.token);
-        by_token
+        by_token.into_values().collect()
     }
 }
 
@@ -226,66 +229,6 @@ impl Sampler {
 pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
 struct Mass { token: u32, p: f32, q: f32 }
-
-fn select_top_k(logits: &[f32], k: usize, cand: &mut Vec<(f32, u32)>) -> Result<(), &'static str> {
-    if k == 0 { return Err("no sampling candidates"); }
-    cand.clear();
-    let mut floor = 0;
-    for (i, &x) in logits.iter().enumerate() {
-        if !x.is_finite() { return Err("model returned non-finite logits"); }
-        if cand.len() < k {
-            let j = cand.len();
-            cand.push((x, i as u32));
-            if x < cand[floor].0 { floor = j; }
-        } else if x > cand[floor].0 {
-            cand[floor] = (x, i as u32);
-            floor = 0;
-            for j in 1..k {
-                if cand[j].0 < cand[floor].0 { floor = j; }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Softcap after the top-k cut, then `/temp`, then the same top-p. `zeros` are the other side's
-/// top-k tokens: they extend the support with probability 0 and are not in the softmax.
-fn side_probs(cand: &mut Vec<(f32, u32)>, zeros: &[u32], softcap: f32, temp: f32, top_p: f32) -> Vec<(u32, f32)> {
-    if cand.is_empty() { return Vec::new(); }
-    cand.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let capped = |x: f32| if softcap > 0.0 { softcap * (x / softcap).tanh() } else { x };
-    let max = capped(cand[0].0);
-    let scaled_max = max / temp;
-    let mut pr: Vec<f32> = cand.iter().map(|&(x, _)| {
-        let x = capped(x);
-        if temp < 1e-5 {
-            if x == max { 1.0 } else { 0.0 }
-        } else {
-            let centered = if scaled_max.is_finite() { x / temp - scaled_max } else { (x - max) / temp };
-            centered.exp()
-        }
-    }).collect();
-    let sum: f32 = pr.iter().sum();
-    for v in pr.iter_mut() { *v /= sum; }
-    let mut rows: Vec<(u32, f32)> = cand.iter().zip(pr).map(|(&(_, tok), p)| (tok, p)).collect();
-    for &tok in zeros {
-        if !rows.iter().any(|r| r.0 == tok) { rows.push((tok, 0.0)); }
-    }
-    let mut cum = 0.0;
-    let mut n = rows.len();
-    for (i, &(_, v)) in rows.iter().enumerate() {
-        cum += v;
-        if cum >= top_p { n = i + 1; break; }
-    }
-    let total: f32 = rows[..n].iter().map(|r| r.1).sum();
-    let mut out = Vec::with_capacity(n);
-    if total > 0.0 {
-        for (tok, p) in rows.into_iter().take(n) {
-            if p > 0.0 { out.push((tok, p / total)); }
-        }
-    }
-    out
-}
 
 fn prob_of(masses: &[Mass], token: u32, target_side: bool) -> f32 {
     match masses.iter().find(|m| m.token == token) {
@@ -377,7 +320,7 @@ mod tests {
         assert!(!target_order[..K].contains(&0), "token 0 is outside the target top-64");
         assert!(!target_order[..K].contains(&150) && !draft_order[..K].contains(&150), "150 is in neither top-64");
 
-        let sampler = Sampler::new(TEMP, K, TOP_P, SOFTCAP, 1);
+        let mut sampler = Sampler::new(TEMP, K, TOP_P, SOFTCAP, 1);
         let masses = sampler.masses(&target, &draft);
         let exp_p = expected_side(&target, K, SOFTCAP, TEMP, TOP_P);
         let exp_q = expected_side(&draft, K, SOFTCAP, TEMP, TOP_P);
@@ -438,6 +381,39 @@ mod tests {
         let out2 = s2.verify_round(&[10, 11], &[&target, &target, &target], &[&target, &target]);
         assert_eq!(out2.len(), 3);
         assert_eq!(&out2[..2], &[10, 11], "accepted tokens must be the exact supplied draft_tokens");
+    }
+
+    #[test]
+    fn reject_one_respects_the_same_tied_top_k_cutoff_as_the_draft_sampler() {
+        let target = [0.0, 0.0, 1.0];
+        let draft = [1.0, 1.0, 1.0];
+        let mut draw = Sampler::draft(1.0, 2, 1.0, 0.0, 23);
+        let mut verify = Sampler::new(1.0, 2, 1.0, 0.0, 43);
+        let mut direct = Sampler::new(1.0, 2, 1.0, 0.0, 43);
+        let mut seen_verified = [false; 3];
+        let mut seen_direct = [false; 3];
+        for _ in 0..256 {
+            let token = draw.sample(&draft);
+            seen_verified[verify.reject_one(token, &target, &draft) as usize] = true;
+            seen_direct[direct.sample(&target) as usize] = true;
+        }
+        assert_eq!(seen_direct, [true, false, true]);
+        assert_eq!(seen_verified, seen_direct);
+    }
+
+    #[test]
+    fn reject_one_uses_first_raw_argmax_at_near_zero_temperature() {
+        // All three target logits saturate after softcap. The raw maximum is tied at 0 and 2.
+        let target = [61.0, 60.0, 61.0];
+        let draft = [0.0, 2.0, 1.0];
+        let mut draw = Sampler::draft(1e-6, 3, 1.0, 1.0, 23);
+        let mut verify = Sampler::new(1e-6, 3, 1.0, 1.0, 43);
+        assert_eq!(draw.sample(&target), 0);
+        for _ in 0..64 {
+            let token = draw.sample(&draft);
+            assert_eq!(token, 1);
+            assert_eq!(verify.reject_one(token, &target, &draft), 0);
+        }
     }
 
     #[test]
