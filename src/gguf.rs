@@ -804,4 +804,111 @@ mod tests {
         dup_tensor.resize(off + 1024, 0);
         assert!(Gguf::open_bytes(&dup_tensor).err().unwrap().to_string().contains("duplicate GGUF tensor name"));
     }
+
+    #[test]
+    fn multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8() {
+        // Build an Inkling-2-Mini-shaped 24-layer native expert GGUF header + aligned tensor payload:
+        // layers 0..20 use T_NV4 + .gscale (T_F32), layers 20..24 use T_MX8.
+        const N_LAYERS: usize = 24;
+        const N_EXP: usize = 64;
+        const E: usize = 2304;
+        const FF: usize = 1152;
+        const W13_ROWS: usize = 2 * FF;
+        const W2_ROWS: usize = E;
+
+        let mut hdr = b"GGUF".to_vec();
+        hdr.extend(3u32.to_le_bytes()); // version 3
+        let mut specs: Vec<(String, Vec<u64>, u32, usize)> = Vec::new();
+        for l in 0..N_LAYERS {
+            let nv4 = l < 20;
+            let ty = if nv4 { T_NV4 } else { T_MX8 };
+            let (bb, be) = type_block(ty).unwrap();
+            let w13_rb = (E / be) * bb;
+            let w2_rb = (FF / be) * bb;
+            specs.push((
+                format!("blk.{l}.ffn_gate_up_exps.weight"),
+                vec![E as u64, W13_ROWS as u64, N_EXP as u64],
+                ty,
+                w13_rb * W13_ROWS * N_EXP,
+            ));
+            if nv4 {
+                specs.push((
+                    format!("blk.{l}.ffn_gate_up_exps.gscale"),
+                    vec![N_EXP as u64],
+                    T_F32,
+                    N_EXP * 4,
+                ));
+            }
+            specs.push((
+                format!("blk.{l}.ffn_down_exps.weight"),
+                vec![FF as u64, W2_ROWS as u64, N_EXP as u64],
+                ty,
+                w2_rb * W2_ROWS * N_EXP,
+            ));
+            if nv4 {
+                specs.push((
+                    format!("blk.{l}.ffn_down_exps.gscale"),
+                    vec![N_EXP as u64],
+                    T_F32,
+                    N_EXP * 4,
+                ));
+            }
+        }
+        hdr.extend((specs.len() as u64).to_le_bytes());
+        hdr.extend(1u64.to_le_bytes()); // 1 metadata KV
+
+        // inkserve.experts = "native"
+        let k = b"inkserve.experts";
+        hdr.extend((k.len() as u64).to_le_bytes());
+        hdr.extend(k);
+        hdr.extend(8u32.to_le_bytes());
+        let v = b"native";
+        hdr.extend((v.len() as u64).to_le_bytes());
+        hdr.extend(v);
+
+        let mut off = 0u64;
+        for (name, dims, ty, bytes) in &specs {
+            let nb = name.as_bytes();
+            hdr.extend((nb.len() as u64).to_le_bytes());
+            hdr.extend(nb);
+            hdr.extend((dims.len() as u32).to_le_bytes());
+            for d in dims {
+                hdr.extend(d.to_le_bytes());
+            }
+            hdr.extend(ty.to_le_bytes());
+            hdr.extend(off.to_le_bytes());
+            off = (off + *bytes as u64).next_multiple_of(32);
+        }
+        let data_off = hdr.len().next_multiple_of(32);
+        let mut buf = hdr;
+        buf.resize(data_off + off as usize, 0);
+
+        let g = Gguf::open_bytes(&buf).unwrap();
+        match g.kv.get("inkserve.experts") {
+            Some(Value::S(s)) => assert_eq!(s, "native"),
+            other => panic!("expected inkserve.experts=native, got {other:?}"),
+        }
+        for l in 0..N_LAYERS {
+            let w13 = g
+                .tensor(&format!("blk.{l}.ffn_gate_up_exps.weight"), &[E, W13_ROWS, N_EXP], &[T_NV4, T_MX8])
+                .unwrap();
+            let w2 = g
+                .tensor(&format!("blk.{l}.ffn_down_exps.weight"), &[FF, W2_ROWS, N_EXP], &[T_NV4, T_MX8])
+                .unwrap();
+            if l < 20 {
+                assert_eq!(w13.ty, T_NV4);
+                assert_eq!(w2.ty, T_NV4);
+                assert_eq!(w13.row_bytes, E / 32 * 18);
+                assert_eq!(w2.row_bytes, FF / 32 * 18);
+                g.tensor(&format!("blk.{l}.ffn_gate_up_exps.gscale"), &[N_EXP], &[T_F32]).unwrap();
+                g.tensor(&format!("blk.{l}.ffn_down_exps.gscale"), &[N_EXP], &[T_F32]).unwrap();
+            } else {
+                assert_eq!(w13.ty, T_MX8);
+                assert_eq!(w2.ty, T_MX8);
+                assert_eq!(w13.row_bytes, E / 32 * 34);
+                assert_eq!(w2.row_bytes, FF / 32 * 34);
+                assert!(g.opt(&format!("blk.{l}.ffn_gate_up_exps.gscale")).is_none());
+            }
+        }
+    }
 }

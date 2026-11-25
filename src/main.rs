@@ -62,6 +62,7 @@ options:
                     temporary file and is read back for every token (slower generation)
   --kv8             8-bit K/V cache: half the cache memory, NOT exact (the default fp16 cache is)
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
+  --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   --raw             do not apply the chat template; print special tokens";
 
 const SERVE_USAGE: &str = "usage: inky serve [options]
@@ -90,6 +91,7 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --hide-cached-tokens
                     report 0 cached prompt tokens in API usage fields while keeping server cache reuse
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
+  --no-mpp          disable Metal 4 MPP tensor kernels and use Metal 3 simdgroup kernels
   --dspark PATH     opt-in DSpark drafter GGUF for speculative decoding (default: off)
   --draft-k N       draft tokens per speculative verify step in 1..=4 (default 3)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
@@ -303,6 +305,7 @@ fn parse_serve(
         isolate_cache: false,
         hide_cached_tokens: false,
         kv8: false,
+        no_mpp: false,
         dspark: None,
         draft_k: scheduler::DEFAULT_DRAFT_K,
     };
@@ -349,6 +352,7 @@ fn parse_serve(
             "--isolate-cache" => o.isolate_cache = true,
             "--hide-cached-tokens" => o.hide_cached_tokens = true,
             "--kv8" => o.kv8 = true,
+            "--no-mpp" => o.no_mpp = true,
             "--dspark" => o.dspark = Some(std::path::PathBuf::from(value()?)),
             "--draft-k" => o.draft_k = parse_draft_k(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
@@ -622,6 +626,16 @@ mod cli_tests {
         assert!(check_prompt_fits_ctx(63, 64).is_ok());
         assert!(check_prompt_fits_ctx(64, 64).is_err());
         assert!(check_prompt_fits_ctx(120, 64).is_err());
+
+        // --no-mpp is accepted by both inference CLI and serve
+        assert!(!cli(&["run", "-p", "hi"]).unwrap().1.no_mpp);
+        assert!(cli(&["run", "--no-mpp", "-p", "hi"]).unwrap().1.no_mpp);
+        assert!(cli(&["check", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["dbatch", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["sharedkv", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(cli(&["bench", "--no-mpp"]).unwrap().1.no_mpp);
+        assert!(!serve_args(&[]).unwrap().no_mpp);
+        assert!(serve_args(&["--no-mpp"]).unwrap().no_mpp);
     }
 }
 
@@ -645,6 +659,7 @@ struct Opts {
     loopcd_omega: f32,
     kv8: bool,
     kv_disk: bool,
+    no_mpp: bool,
     allow_mismatch: bool,
 }
 
@@ -675,6 +690,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
         loopcd_omega: 0.0,
         kv8: false,
         kv_disk: false,
+        no_mpp: false,
         allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0"),
     };
     while let Some(a) = args.next() {
@@ -694,6 +710,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--raw" => o.raw = true,
             "--kv8" => o.kv8 = true,
             "--kv-disk" => o.kv_disk = true,
+            "--no-mpp" => o.no_mpp = true,
             "--allow-mismatch" => o.allow_mismatch = true,
             "--effort" => o.effort = parse_effort(a, v()?)?,
             "--system" => o.system = v()?.into(),
@@ -729,6 +746,9 @@ fn parse() -> (String, Opts) {
         }
         if o.kv_disk {
             engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if o.no_mpp {
+            engine::DISABLE_MPP.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         o.seed = Some(resolve_seed(o.seed));
     }

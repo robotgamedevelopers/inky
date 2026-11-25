@@ -1,0 +1,16 @@
+# Apple M3 Ultra Mac Studio with 192 GB (80 GPU cores, 819 GB/s, Metal 3 simdgroup kernels, no MPP tensor_ops).
+name = m3-ultra-192gb
+chip = Apple M3 Ultra
+memory_gb = 192
+# GPU wired-memory limit in inky mode (MB): 192 GiB less 16 GiB for macOS (196608 - 16384).
+wired_limit_mb = 180224
+# kept free of lane caches inside Metal's working set (GiB): 4 GiB OS headroom
+lane_margin_gib = 4
+# 819 GB/s memory bandwidth with 192 GiB RAM: 64 concurrent lanes on non-tensor decode
+default_lanes = 64
+# Metal 3 simdgroup decode/prefill path (no M5 Neural Accelerators / MPP tensor_ops)
+use_mpp = false
+# Full/Window KV pool split: 20% Window (~31 GiB for 64+ lanes + prefix starts) / 80% Full (~124 GiB)
+kv_window_pct = 20
+# 80 GPU cores: 16-way split-K target for non-tensor decode attention
+decode_splits = 16

@@ -1148,11 +1148,30 @@ fn metal_shader_declarations_and_compiler_validation() {
         };
         run_shader_compiler_validation(
             |src, check_all| compile_in_mem(MTLLanguageVersion::Version4_0, src, check_all),
-            |src| compile_in_mem(MTLLanguageVersion::Version3_1, src, false),
+            |src| compile_in_mem(MTLLanguageVersion::Version3_2, src, false),
             &full_src,
             &dec_src,
         )
         .unwrap_or_else(|e| panic!("{e}"));
+
+        // Verify the non-MPP Metal 3.2 shader path (`#define NO_MPP 1`, used on Apple M3 Ultra and `--no-mpp`)
+        // compiles cleanly and exposes every kernel in `KERNELS_NON_MPP`.
+        let non_mpp_src = format!("#define NO_MPP 1\n{full_src}");
+        let non_mpp_kv8_src = format!("#define KV8 1\n#define NO_MPP 1\n{full_src}");
+        for (variant, src) in [("fp16", non_mpp_src.as_str()), ("kv8", non_mpp_kv8_src.as_str())] {
+            let opts = MTLCompileOptions::new();
+            opts.setMathMode(MTLMathMode::Fast);
+            opts.setLanguageVersion(MTLLanguageVersion::Version3_2);
+            let lib = dev
+                .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
+                .unwrap_or_else(|e| panic!("Metal 3.2 NO_MPP {variant} compile failed:\n{}", e.localizedDescription()));
+            for &name in KERNELS_NON_MPP {
+                assert!(
+                    lib.newFunctionWithName(&NSString::from_str(name)).is_some(),
+                    "Metal 3.2 NO_MPP {variant} missing kernel `{name}`"
+                );
+            }
+        }
     } else {
         // Headless fallback when no `MTLDevice` exists: stay strictly inside `./target/shader-check`.
         let work_dir = std::path::Path::new("target").join(format!("shader-check-{}", std::process::id()));
@@ -1184,6 +1203,9 @@ fn metal_shader_declarations_and_compiler_validation() {
             &full_src,
             &dec_src,
         );
+        let non_mpp_src = format!("#define NO_MPP 1\n{full_src}");
+        compile_xcrun("-std=metal3.1", &non_mpp_src)
+            .unwrap_or_else(|e| panic!("Metal 3.1 NO_MPP compile failed:\n{e}"));
         let _ = std::fs::remove_dir_all(&work_dir);
         res.unwrap_or_else(|e| panic!("{e}"));
     }
@@ -2396,8 +2418,221 @@ fn dspark_gpu_guards_and_rejection_sampling_gate() {
     let emp_tvd: f64 =
         0.5 * counts.iter().zip(&p_t).map(|(&c, &pt)| ((c as f64) / (total_trials as f64) - pt).abs()).sum::<f64>();
     eprintln!("[dspark temp=1.0 gate] trials={total_trials} draft_tvd={draft_tvd:.4} empirical_tvd={emp_tvd:.4}");
-    assert!(
-        emp_tvd < 0.025,
+    assert!(emp_tvd < 0.025,
         "GPU rejection sampling empirical TVD ({emp_tvd:.4}) must match p_target closely (draft TVD was {draft_tvd:.4})"
     );
+}
+
+#[test]
+fn m3_ultra_block_pool_window_split_and_decode_splits() {
+    let m3_192 = crate::tuning::select("Apple M3 Ultra", 192u64 << 30);
+    assert!(!m3_192.use_mpp);
+    assert_eq!(m3_192.kv_window_pct, 20);
+    assert_eq!(m3_192.decode_splits, 16);
+
+    let m3_512 = crate::tuning::select("Apple M3 Ultra", 512u64 << 30);
+    assert!(!m3_512.use_mpp);
+    assert_eq!(m3_512.kv_window_pct, 15);
+    assert_eq!(m3_512.decode_splits, 16);
+
+    let budget_bytes = 128u64 << 30;
+    let max_slab_bytes = 32u64 << 30;
+    // Compare kv_window_pct = 20% vs 15% with fixed max_lanes = 16 so the target percentage governs (floor < 15%).
+    let (win_192, full_192) = Engine::checked_serve_block_pool_counts_with_window_pct(
+        budget_bytes,
+        2,
+        4096,
+        65536,
+        16,
+        max_slab_bytes,
+        m3_192.kv_window_pct,
+    )
+    .unwrap();
+    let (win_512, full_512) = Engine::checked_serve_block_pool_counts_with_window_pct(
+        budget_bytes,
+        2,
+        4096,
+        65536,
+        16,
+        max_slab_bytes,
+        m3_512.kv_window_pct,
+    )
+    .unwrap();
+    // 20% window allocates strictly more window slots (and fewer full slots) than 15% on the same KV budget.
+    assert!(win_192 > win_512 && full_192 < full_512, "win_192={win_192} win_512={win_512} full_192={full_192} full_512={full_512}");
+    let win_bytes_192 = win_192 as u64 * crate::blocks::WINDOW_STRIDE;
+    let full_bytes_192 = full_192 as u64 * crate::blocks::FULL_STRIDE;
+    assert!(win_bytes_192 + full_bytes_192 <= budget_bytes);
+
+    // Also verify default M3 Ultra lane counts fit cleanly on their respective 192 GiB / 512 GiB KV budgets.
+    let (w192_def, f192_def) = Engine::checked_serve_block_pool_counts_with_window_pct(
+        160u64 << 30,
+        2,
+        4096,
+        65536,
+        m3_192.default_lanes,
+        max_slab_bytes,
+        m3_192.kv_window_pct,
+    )
+    .unwrap();
+    let (w512_def, f512_def) = Engine::checked_serve_block_pool_counts_with_window_pct(
+        470u64 << 30,
+        2,
+        4096,
+        65536,
+        m3_512.default_lanes,
+        max_slab_bytes,
+        m3_512.kv_window_pct,
+    )
+    .unwrap();
+    assert!(w192_def > 0 && f192_def > 0 && w512_def > w192_def && f512_def > f192_def);
+
+    // M3 Ultra default attention split target is 16 unless overridden by INK_SPLITS.
+    assert_eq!(configured_split_target_default(Err(std::env::VarError::NotPresent), m3_192.decode_splits).unwrap(), 16);
+    assert_eq!(configured_split_target_default(Ok("8".into()), m3_192.decode_splits).unwrap(), 8);
+}
+
+#[test]
+fn native_checkpoint_nv4_gscale_and_mx8_metal_kernels() {
+    use crate::gguf::{T_MX8, T_NV4};
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        return;
+    }
+    let src = format!(
+        "#define NO_MPP 1\n{}\n{}\n{}",
+        include_str!("../kernels.metal"),
+        include_str!("../prefill.metal"),
+        include_str!("../bench_kernels.metal")
+    );
+    let gpu = Gpu::new_with_lang(&src, &["k_moe_gu", "k_moe_down"], false);
+
+    // Build 1 synthetic expert per format matching Inkling-2-Mini geometry (E=2304, FF=1152, TOPK=8):
+    // NV4: 18 B/32 elems, scale=0x38 (e4m3 1.0), nibble=0x2 (fp4 1.0 -> 0x22), gscale=0.5
+    // MX8: 34 B/32 elems, scale=0x3C00 (fp16 1.0), elem=0x38 (e4m3 1.0)
+    let gu_nv4_rb = (E / 32) * 18;
+    let dn_nv4_rb = (FF / 32) * 18;
+    let gu_mx8_rb = (E / 32) * 34;
+    let dn_mx8_rb = (FF / 32) * 34;
+
+    let gu_nv4_bytes = 2 * FF * gu_nv4_rb;
+    let dn_nv4_bytes = E * dn_nv4_rb;
+    let gu_mx8_bytes = 2 * FF * gu_mx8_rb;
+    let dn_mx8_bytes = E * dn_mx8_rb;
+
+    let mut w_bytes = Vec::with_capacity(gu_nv4_bytes + dn_nv4_bytes + gu_mx8_bytes + dn_mx8_bytes + 64);
+    let fill_nv4 = |out: &mut Vec<u8>, rows: usize, rb: usize| {
+        for _ in 0..rows {
+            for _ in 0..(rb / 18) {
+                out.extend_from_slice(&[0x38, 0x38]);
+                out.extend(std::iter::repeat_n(0x22u8, 16));
+            }
+        }
+    };
+    let fill_mx8 = |out: &mut Vec<u8>, rows: usize, rb: usize| {
+        for _ in 0..rows {
+            for _ in 0..(rb / 34) {
+                out.extend_from_slice(&0x3C00u16.to_le_bytes());
+                out.extend(std::iter::repeat_n(0x38u8, 32));
+            }
+        }
+    };
+
+    let gu_nv4_off = w_bytes.len();
+    fill_nv4(&mut w_bytes, 2 * FF, gu_nv4_rb);
+    let dn_nv4_off = w_bytes.len();
+    fill_nv4(&mut w_bytes, E, dn_nv4_rb);
+    let gu_mx8_off = w_bytes.len();
+    fill_mx8(&mut w_bytes, 2 * FF, gu_mx8_rb);
+    let dn_mx8_off = w_bytes.len();
+    fill_mx8(&mut w_bytes, E, dn_mx8_rb);
+    let gs_off = w_bytes.len();
+    w_bytes.extend_from_slice(&0.5f32.to_le_bytes());
+    let w_buf = gpu.buffer_with(&w_bytes);
+
+    let pb_buf = gpu.buffer(E * 4 * 4);
+    let cs_buf = gpu.buffer(E * 3 * 4);
+
+    let run_pair = |gu_ty: u32, gu_off: usize, gu_rb: usize, dn_ty: u32, dn_off: usize, dn_rb: usize, gs: usize| -> Vec<f32> {
+        let sel_off = E;
+        let act_off = E + 2 * TOPK;
+        let out_off = act_off + TOPK * FF;
+        let res_off = out_off + E;
+        let total_f32 = res_off + E;
+        let a_buf = gpu.buffer(total_f32 * 4);
+        unsafe {
+            let p = a_buf.contents().as_ptr() as *mut f32;
+            std::ptr::write_bytes(p, 0, total_f32);
+            for i in 0..E {
+                *p.add(i) = 0.01;
+            }
+            for k in 0..TOPK {
+                *p.add(sel_off + k) = 0.0; // expert 0
+                *p.add(sel_off + TOPK + k) = 1.0 / TOPK as f32;
+            }
+        }
+        let args = MoeArgs {
+            logits_off: 0,
+            bias_off: 0,
+            sel_off: sel_off as u32,
+            x_off: 0,
+            norm_off: -1,
+            ss_off: -1,
+            ss_n: 0,
+            eps: 1e-6,
+            gu_lo: gu_off as u32,
+            gu_hi: (gu_off >> 32) as u32,
+            gu_expert_bytes: (2 * FF * gu_rb) as u32,
+            gu_row_bytes: gu_rb as u32,
+            act_off: act_off as u32,
+            wscale: 1.0,
+            beta: 10.0,
+            lbeta: 0.0,
+            dn_lo: dn_off as u32,
+            dn_hi: (dn_off >> 32) as u32,
+            dn_expert_bytes: (E * dn_rb) as u32,
+            dn_row_bytes: dn_rb as u32,
+            dn_type: dn_ty,
+            out_off: out_off as u32,
+            res_off: res_off as i32,
+            cs_off: 0,
+            convw_off: 0,
+            gu_type: gu_ty,
+            gu_gs_lo: gs as u32,
+            gu_gs_hi: (gs >> 32) as u32,
+            dn_gs_lo: gs as u32,
+            dn_gs_hi: (gs >> 32) as u32,
+            no_state_write: 1,
+            pad1: 0,
+        };
+        let cb = gpu.cmd();
+        let e = Enc::new(&cb);
+        e.buf(&w_buf, 0, 0);
+        e.buf(&pb_buf, 0, 1);
+        e.buf(&a_buf, 0, 2);
+        e.buf(&cs_buf, 0, 4);
+        e.pso(&gpu.pso("k_moe_gu"));
+        e.bytes(&args, 5);
+        e.dispatch((FF / 2, TOPK, 1), 64);
+        e.barrier();
+        e.pso(&gpu.pso("k_moe_down"));
+        e.bytes(&args, 5);
+        e.dispatch((E / 4, 1, 1), 64);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let p = a_buf.contents().as_ptr() as *const f32;
+        unsafe { std::slice::from_raw_parts(p.add(out_off), E).to_vec() }
+    };
+
+    let nv4_out = run_pair(T_NV4, gu_nv4_off, gu_nv4_rb, T_NV4, dn_nv4_off, dn_nv4_rb, gs_off);
+    let mx8_out = run_pair(T_MX8, gu_mx8_off, gu_mx8_rb, T_MX8, dn_mx8_off, dn_mx8_rb, 0);
+    assert!(nv4_out.iter().all(|v| v.is_finite() && *v > 0.0));
+    assert!(mx8_out.iter().all(|v| v.is_finite() && *v > 0.0));
+    // All rows share identical constant weights, so every output coordinate must agree closely.
+    let spread_nv4 = nv4_out.iter().map(|&v| (v - nv4_out[0]).abs()).fold(0.0f32, f32::max);
+    let spread_mx8 = mx8_out.iter().map(|&v| (v - mx8_out[0]).abs()).fold(0.0f32, f32::max);
+    assert!(spread_nv4 < 1e-4, "nv4 spread {spread_nv4}");
+    assert!(spread_mx8 < 1e-4, "mx8 spread {spread_mx8}");
 }

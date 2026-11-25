@@ -81,6 +81,8 @@ pub struct ServeOpts {
     pub hide_cached_tokens: bool,
     /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
     pub kv8: bool,
+    /// Force non-MPP Metal 3 simdgroup kernels (`--no-mpp` / `INKY_DISABLE_MPP=1`)
+    pub no_mpp: bool,
     /// opt-in DSpark drafter GGUF path (`--dspark`; `None` keeps standard 1-token decode)
     pub dspark: Option<std::path::PathBuf>,
     /// draft tokens per speculative verify step in `1..=4` (`--draft-k`, default 3)
@@ -5278,6 +5280,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
     let max_conns = crate::memd::raise_and_clamp_max_conns(MAX_CONNS, 64);
     let _mode_guard = enter_mode();
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
+    crate::engine::DISABLE_MPP.store(o.no_mpp, Ordering::Relaxed);
     let eng = match prepared.into_engine(o.kv8, chunk) {
         Ok(eng) => eng,
         Err(err) => {
@@ -5285,6 +5288,9 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
             std::process::exit(1);
         }
     };
+    if !eng.use_mpp {
+        eprintln!("[serve] non-MPP Metal 3 simdgroup path active (use_mpp=false)");
+    }
     eng.set_loopcd_omega(o.loopcd_omega);
     eng.reserve_loopcd_weak(o.lanes);
     eng.ensure_batch(eng.chunk);
@@ -11236,6 +11242,7 @@ mod tests {
             isolate_cache: false,
             hide_cached_tokens: false,
             kv8: false,
+            no_mpp: false,
             dspark: None,
             draft_k: crate::scheduler::DEFAULT_DRAFT_K,
         };

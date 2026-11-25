@@ -102,6 +102,9 @@ jobs:
       - name: replay sweep tests
         working-directory: tools/replay
         run: go vet ./... && go test -race ./...
+      - name: quality replay tests
+        working-directory: tools/quality
+        run: go vet ./... && go test -race -count=1 ./...
   # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel.
   tla:
     runs-on: macos-latest
