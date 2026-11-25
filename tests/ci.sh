@@ -15,6 +15,7 @@ cd "${0:A:h}/.."
 B=./target/release/inky
 REF=${INKY_REF:-$HOME/inky-ci/ref}
 fail=0
+tests/golden-status.sh || { echo "FAIL: golden producer status"; fail=1; }
 agree() {  # name, ref, expected positions, env...
     local name=$1 ref=$2 expected=$3
     shift 3
