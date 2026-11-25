@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -98,7 +97,7 @@ func codingTools() []toolDef {
 			Type: "function",
 			Function: toolFnDescr{
 				Name:        "edit_file",
-				Description: "Replace an exact substring old_text with new_text in a workspace file.",
+				Description: "Replace an exact substring old_text with new_text in mathutil.go. Submit just the Clamp function. The acceptance tests are read-only.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -175,6 +174,9 @@ func execTool(workdir, name, argsJSON string) (string, bool) {
 		if err != nil {
 			return err.Error(), false
 		}
+		if filepath.Clean(p) != "mathutil.go" {
+			return "only mathutil.go is editable", false
+		}
 		b, err := os.ReadFile(full)
 		if err != nil {
 			return fmt.Sprintf("edit_file read error: %v", err), false
@@ -196,13 +198,11 @@ func execTool(workdir, name, argsJSON string) (string, bool) {
 		if cmdStr != "go test ./..." && cmdStr != "go test -v ./..." {
 			return fmt.Sprintf("unsupported test command %q (allowed: go test -v ./...)", cmdStr), false
 		}
-		cmd := exec.Command("go", "test", "-v", "./...")
-		cmd.Dir = workdir
-		out, err := cmd.CombinedOutput()
+		out, err := runCardTests(workdir)
 		if err != nil {
-			return fmt.Sprintf("exit error: %v\n%s", err, string(out)), false
+			return fmt.Sprintf("exit error: %v\n%s", err, out), false
 		}
-		return string(out), true
+		return out, true
 	default:
 		return fmt.Sprintf("unknown tool %q", name), false
 	}
@@ -400,31 +400,26 @@ func sendChat(client *http.Client, baseURL, apiKey, cardID string, reqBody chatR
 }
 
 func runFleetCard(client *http.Client, baseURL, apiKey, cardID, workBase string) error {
-	var dir string
-	var cleanup bool
 	if workBase != "" {
-		dir = workBase
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(workBase, 0o700); err != nil {
 			return err
 		}
-	} else {
-		var err error
-		dir, err = os.MkdirTemp("", "inky-fleet-card-*")
-		if err != nil {
-			return err
-		}
-		cleanup = true
 	}
-	if cleanup {
+	dir, err := os.MkdirTemp(workBase, "inky-fleet-card-")
+	if err != nil {
+		return err
+	}
+	if workBase == "" {
 		defer os.RemoveAll(dir)
+	} else {
+		fmt.Printf("fleet card workspace: %s\n", dir)
 	}
 	if err := setupFleetWorkspace(dir); err != nil {
 		return err
 	}
-	preCmd := exec.Command("go", "test", "./...")
-	preCmd.Dir = dir
-	if out, err := preCmd.CombinedOutput(); err == nil {
-		return fmt.Errorf("expected initial go test to fail, but it passed:\n%s", out)
+	pre, err := runCardTests(dir)
+	if err == nil || !strings.Contains(pre, "Clamp(25, 0, 10) = 0, want 10") || !strings.Contains(pre, "--- FAIL: TestClamp") {
+		return fmt.Errorf("expected the initial Clamp assertion to fail: %v\n%s", err, pre)
 	}
 
 	messages := []chatMessage{
@@ -475,8 +470,13 @@ func runFleetCard(client *http.Client, baseURL, apiKey, cardID, workBase string)
 			break
 		}
 		for _, tc := range msg.ToolCalls {
-			seenTools[tc.Function.Name] = true
 			out, ok := execTool(dir, tc.Function.Name, tc.Function.Arguments)
+			if ok || tc.Function.Name == "run_test" {
+				seenTools[tc.Function.Name] = ok
+				if tc.Function.Name == "edit_file" {
+					delete(seenTools, "run_test") // Verify the latest edit.
+				}
+			}
 			fmt.Printf("turn=%d tool=%s ok=%v args=%s\n", turn, tc.Function.Name, ok, tc.Function.Arguments)
 			messages = append(messages, chatMessage{
 				Role:       "tool",
@@ -487,17 +487,15 @@ func runFleetCard(client *http.Client, baseURL, apiKey, cardID, workBase string)
 		}
 	}
 
-	postCmd := exec.Command("go", "test", "-v", "./...")
-	postCmd.Dir = dir
-	postOut, err := postCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("post-card go test failed: %v\n%s", err, string(postOut))
-	}
 	if !seenTools["read_file"] || !seenTools["edit_file"] || !seenTools["run_test"] {
-		return fmt.Errorf("expected read_file, edit_file, and run_test tool calls, saw: %v", seenTools)
+		return fmt.Errorf("expected successful read_file, edit_file and run_test after the last edit, saw: %v", seenTools)
+	}
+	postOut, err := runCardTests(dir)
+	if err != nil {
+		return fmt.Errorf("post-card go test failed: %w\n%s", err, postOut)
 	}
 	fmt.Printf("FLEET_CARD_PASS card_id=%s turns=%d tools=read_file,edit_file,run_test prompt_tokens=%d cached_tokens=%d completion_tokens=%d\n%s",
-		cardID, turns, totalPrompt, totalCached, totalCompletion, string(postOut))
+		cardID, turns, totalPrompt, totalCached, totalCompletion, postOut)
 	return nil
 }
 
@@ -657,7 +655,7 @@ func main() {
 	url := flag.String("url", "http://127.0.0.1:18096", "base URL of inky serve")
 	keyEnv := flag.String("key-env", "INKY_SERVE_KEY", "environment variable holding bearer key (empty for unauthenticated)")
 	cardID := flag.String("card-id", "fleet-card-live-1", "X-Inky-Card-Id header value")
-	workdir := flag.String("workdir", "", "optional workspace dir for fleet-card")
+	workdir := flag.String("workdir", "", "parent directory in which to retain a fresh fleet-card workspace")
 	flag.Parse()
 
 	var apiKey string

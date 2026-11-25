@@ -50,6 +50,14 @@ jobs:
       - name: inkconvert tests
         working-directory: tools/inkconvert
         run: go test -race ./...
+      - name: install fleetcheck sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor-profiles
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          if [ -f "$profile" ] && [ ! -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -r "$profile"
+          fi
       - name: fleetcheck tests
         working-directory: tests
         run: go vet ./fleetcheck/... && go test -race ./fleetcheck/...

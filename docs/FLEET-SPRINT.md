@@ -70,12 +70,14 @@ If routing `claude` harness workers via Anthropic Messages (`/v1/messages`), reg
 
 ## 3. Remote Harness Gate (`tests/fleet_gate.sh` & `tests/fleetcheck`)
 
-[`tests/fleet_gate.sh`](../tests/fleet_gate.sh) verifies Go `-race` tool-execution tests offline (`--offline`) and, given `INKY_URL`, executes a live multi-turn coding-agent card (`read_file` -> `edit_file` -> `run_test`) in an isolated Go module and asserts `go test -v ./...` passes after the model's fix:
+[`tests/fleet_gate.sh`](../tests/fleet_gate.sh) verifies Go `-race` tool-execution tests offline (`--offline`) and, given `INKY_URL`, executes a live multi-turn coding-agent card (`read_file` -> `edit_file` -> `run_test`) on a Linux worker and asserts `go test -v ./...` passes after the model's fix:
 
 ```sh
 # From Linux bench (e.g. amd-3) over Tailscale:
 INKY_URL=http://100.65.89.96:18096 INKY_SERVE_KEY="$KEY" ./tests/fleet_gate.sh
 ```
+
+Each fleet card gets a fresh private fixture directory. Pass `fleetcheck -workdir DIR` to keep it under DIR. The model can read the acceptance tests and edit the standalone `Clamp` function in `mathutil.go`. Each verification runs the Go distribution and read-only fixture in a fresh Bubblewrap sandbox with a private network namespace, empty initial environment, disposable scratch space and a 90-second deadline. The Linux worker needs `bwrap` with user namespaces and a local Go toolchain. A sandbox startup error fails the card.
 
 ### Live Cross-Machine Proof Receipt (2026-11-24, `amd-3` -> `mini-m5`)
 
