@@ -7,7 +7,6 @@ mod blocks;
 mod blockbook;
 #[path = "cache_trace.rs"]
 mod cache_trace;
-#[path = "cache_scheduler.rs"]
 mod cache_scheduler;
 
 use std::fs;

@@ -1,6 +1,6 @@
 # Layer 6: Candidate Machine Measurements, Replay Sweep & Default Knee
 
-Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using real multi-turn coding-agent card traffic recorded through `inky serve --record-dir` into [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
+Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using the scripted multi-turn replay fixture [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
 
 ## 1. Candidate Machine Measurements
 
@@ -23,9 +23,11 @@ Single-stream prefill & decode (`./target/release/inky bench ... -n 128`, greedy
 
 The M5 Max (`574.0 GB/s` peak weight read) runs ~1.98× the memory bandwidth of M5 Pro (`290.4 GB/s`), giving ~1.46× single-stream decode (`96.02` vs `61.62 tok/s` at 2.5K) and ~1.98× prefill (`4196.2` vs `2122.8 tok/s` at 2.5K).
 
-## 2. Recorded Multi-Turn Replay Set
+## 2. Scripted Multi-Turn Replay Set
 
-[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) was captured from live `inky serve --record-dir` (`cards-20261124.jsonl`) across **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
+[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) contains scripted requests and canned tool results representing **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
+
+> **Qualification:** This fixture is not verified real fleet traffic. The historical replay mixed streamed and buffered latency, and the reported memory values were admission estimates rather than sampled footprint. These results do not establish a fleet-derived lane knee or the latency and memory limits. Repeat the sweep using authorized real fleet traffic and the corrected replay measurements before setting regression thresholds.
 
 ## 3. Lane-Count Sweep (`8..128` Lanes on `macbook`, M5 Max 128 GB)
 
@@ -61,7 +63,9 @@ The November 24 runner combined the time to first visible streamed output with t
 | 96 | 368.61 | 3.84 | 5858.4 | 20689.1 | 87,798,524,928 (81.77 GiB) | 96 | 4848.9 | 0 | 0 |
 | 128 | 401.96 | 3.14 | 7020.8 | 25447.6 | 110,613,778,432 (103.02 GiB) | 128 | 5283.9 | 0 | 0 |
 
-## 4. Knee Selection & Default Lane Count
+## 4. Historical Selection & Default Lane Count
+
+The following selection describes the historical fixture run and is not a verified operational knee.
 
 **64 lanes was the highest tested concurrency above the 4.0 tok/s per-lane floor.** The M5 Max delivered 322.66 tok/s in aggregate, 5.04 tok/s per lane, and 4,259 cards/hour at that setting. Aggregate throughput continued rising to 401.96 tok/s at 128 lanes, while per-lane throughput fell to 3.84 tok/s at 96 lanes and 3.14 tok/s at 128.
 

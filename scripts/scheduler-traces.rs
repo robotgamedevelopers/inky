@@ -2,7 +2,6 @@
 // CPU-only trace generator for `src/scheduler.rs` against `specs/CacheScheduler.tla`.
 // Compiled directly via `rustc --edition=2021` by `scripts/check-scheduler-traces.sh`.
 
-#[path = "scheduler.rs"]
 mod scheduler;
 
 use std::fs;
