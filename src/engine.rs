@@ -139,6 +139,12 @@ const KV_CAP0: usize = 64;
 /// MoE tile classes of the fp16 prefill path: (kernel, max tokens per tile, threads per threadgroup)
 pub const NTC: usize = 2;
 const MOE_CLS: [(&str, usize, usize); NTC] = [("k_moe_sg8", 128, 256), ("k_moe_sg4", 64, 128)];
+/// Software-pipelined single-read SLC-localized MoE decode classes: `(kernel, max_tokens, threads_per_tg)`.
+pub const NTC_DEC: usize = 2;
+const MOE_DEC_CLS: [(&str, usize, usize); NTC_DEC] = [
+    ("k_moe_dec_sg8", 128, 256),
+    ("k_moe_dec_sg4", 64, 128),
+];
 pub const MAX_SPLIT: usize = 256;
 /// Maximum decode lanes grouped onto one shared-KV tile read in `k_attn_grp_dec`.
 pub const DEC_GRP_MAX: usize = 8;
@@ -196,6 +202,7 @@ const C_ARGMAX: u32 = 14;
 pub const KERNELS_NON_MPP: &[&str] = &[
     "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_apply",
     "k_attn", "k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec", "k_attn_combine", "k_attn_combine_dec",
+    "k_attn_fixed_b", "k_attn_fixed_b_blk", "k_attn_fixed_combine",
     "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend", "k_dspark_reject", "k_topk",
     "k_gemm", "k_moe_gemm", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b",
     "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk",
@@ -220,6 +227,9 @@ pub const KERNELS: &[&str] = &[
     "k_attn_grp_dec",
     "k_attn_combine",
     "k_attn_combine_dec",
+    "k_attn_fixed_b",
+    "k_attn_fixed_b_blk",
+    "k_attn_fixed_combine",
     "k_moe_gu",
     "k_moe_down",
     "k_argmax1",
@@ -249,11 +259,17 @@ pub const KERNELS: &[&str] = &[
     "k_tohalf",
     "k_gemm_sg8",
     "k_gemm_sg4",
+    "k_gemm_dec_sg8",
+    "k_gemm_dec_sg4",
+    "k_gemm_bf16_dec",
     "k_moe_sg8",
     "k_moe_sg4",
+    "k_moe_dec_sg8",
+    "k_moe_dec_sg4",
     "k_ctrl_gf",
     "k_moe_route3",
     "k_moe_topk_route3",
+    "k_moe_topk_route_dec",
     "k_moe_comb_h",
     "k_attn_h",
     "k_attn_h_blk",
@@ -364,8 +380,8 @@ struct KvPrepDecArgs {
     vconv_w: u32,
     qclip_w: u32,
     relclip_w: u32,
-    pad0: u32,
-    pad1: u32,
+    log_alpha: f32,
+    log_floor: f32,
     pad2: u32,
 }
 #[repr(C)]
@@ -512,6 +528,31 @@ struct AttnArgs {
     istr: u32,
     idx0: u32,
     lastbias: f32,
+    log_alpha: f32,
+    log_floor: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PreparedAttnArgs {
+    pos0: u32,
+    window: u32,
+    cap: u32,
+    idx0: i32,
+    k_base: u32,
+    v_base: u32,
+    q_off: u32,
+    r_off: u32,
+    sink_off: u32,
+    gate_off: u32,
+    out_off: u32,
+    relbias_w: u32,
+    part_off: u32,
+    kps: u32,
+    nsplit: u32,
+    half_io: u32,
+    ring: u32,
+    full_budget: u32,
+    pad: [u32; 2],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -790,6 +831,24 @@ struct TopkRoute3Args {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct TopkRouteDecArgs {
+    logits_off: u32,
+    bias_off: u32,
+    sel_off: u32,
+    t: u32,
+    wscale: f32,
+    perm_off: u32,
+    inv_off: u32,
+    aw_off: u32,
+    ind_off: u32,
+    gu_y: u32,
+    dn_y: u32,
+    no_grp: u32,
+    tiles_off: [u32; NTC_DEC],
+    pad: [u32; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct MoeCombArgs {
     yd_off: u32,
     inv_off: u32,
@@ -858,6 +917,7 @@ struct KvPrepArgs {
     is_full: u32,
     kpos0: i32,
 }
+#[cfg_attr(not(test), allow(dead_code))]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct AttnBArgs {
@@ -1376,6 +1436,8 @@ pub struct Engine {
     lg_weak: RefCell<Option<Buf>>,
     /// Force `count = 1` groups in Layer 3 `k_attn_grp_dec` (`INK_NO_GRP_DEC=1` for A/B parity testing).
     no_grp_dec: Cell<bool>,
+    /// Disable right-sized single-read grouped MoE/GEMM decode kernels (`INK_NO_GRP_MOE=1` for A/B parity & timing).
+    no_grp_moe: Cell<bool>,
     /// Opt-in far-key pruning budget on full-attention passes (`None` = exact unpruned default).
     full_attn_budget: Cell<Option<usize>>,
     // Last fields so Metal device/pipelines and the mmapped GGUF outlive every Metal buffer on Engine.
@@ -1954,7 +2016,6 @@ impl Engine {
     }
     /// Pure worst-case per-lane GPU memory formula at `max_ctx`: full KV + sliding-window KV +
     /// convolution/recurrent state + per-lane token buffer + per-lane decode-batch arena slice.
-    #[cfg(test)]
     pub fn lane_worst_case_bytes_for(
         n_swa: usize,
         n_full: usize,
@@ -2001,7 +2062,7 @@ impl Engine {
     ) -> u64 {
         let n = lanes.max(1);
         let dbatch_bytes =
-            n.saturating_mul(arena_floats).saturating_add(decode_batch_extra_floats(n)).saturating_mul(4) as u64;
+            n.saturating_mul(arena_floats).saturating_add(decode_batch_extra_floats(n, max_ctx)).saturating_mul(4) as u64;
         let blocks = max_ctx.div_ceil(crate::blocks::BLOCK).max(1);
         let slab_cs = (n as u64).saturating_mul(Self::cs_image_bytes() as u64);
         let slab_bt = (n as u64).saturating_mul(blocks as u64).saturating_mul(16);
@@ -2485,6 +2546,14 @@ impl Engine {
     pub fn no_grp_dec(&self) -> bool {
         self.no_grp_dec.get()
     }
+    /// Toggle right-sized single-read grouped MoE/GEMM decode kernels (`true` falls back to `cnt = 1` tiles, matching `INK_NO_GRP_MOE=1`).
+    pub fn set_no_grp_moe(&self, no_grp: bool) {
+        self.no_grp_moe.set(no_grp);
+    }
+    /// Whether right-sized single-read grouped MoE/GEMM decode kernels are disabled.
+    pub fn no_grp_moe(&self) -> bool {
+        self.no_grp_moe.get()
+    }
 
     /// Room for a decode batch of `n` lanes: a copy of the decode arena per lane, followed by Layer 3
     /// batched-decode scratch (`DecodeSpanDesc`, `kv_cur`, and `DecAttnGroup` lists), after everything else
@@ -2492,7 +2561,7 @@ impl Engine {
     /// be in flight on the GPU.
     pub fn ensure_dbatch(&self, n: usize) {
         let start = (self.ar.total).max(self.ba.get().end);
-        let need = (start as usize + n * self.ar.total as usize + decode_batch_extra_floats(n)) * 4;
+        let need = (start as usize + n * self.ar.total as usize + decode_batch_extra_floats(n, self.max_ctx)) * 4;
         self.dstart.set(start);
         if self.act.borrow().length() < need {
             let nb = self.gpu.buffer(need);
@@ -2595,6 +2664,24 @@ impl Engine {
                 b.tl[c] as usize,
                 n.checked_mul(4).expect("moe_tiles overflow"),
                 "Engine::moe_tiles(tl)",
+            );
+            (0..n).map(|i| tiles[i * 4 + 2]).collect::<Vec<u32>>()
+        };
+        [cls(0), cls(1)]
+    }
+    /// Decode-batch MoE tiles of the last layer (`65..=128` and `1..=64`).
+    pub fn moe_dec_tiles(&self) -> [Vec<u32>; NTC_DEC] {
+        let b = self.ba.get();
+        assert!(b.cap > 0, "Engine::moe_dec_tiles requires an allocated batch arena");
+        let tl_offs = if self.no_grp_moe.get() { [b.tl[0], b.sk] } else { b.tl };
+        let cls = |c: usize| {
+            let ind = self.borrow_act_slice::<u32>(b.ind as usize + c * 4, 1, "Engine::moe_dec_tiles(ind)");
+            let n = ind[0] as usize;
+            drop(ind);
+            let tiles = self.borrow_act_slice::<u32>(
+                tl_offs[c] as usize,
+                n.checked_mul(4).expect("moe_dec_tiles overflow"),
+                "Engine::moe_dec_tiles(tl)",
             );
             (0..n).map(|i| tiles[i * 4 + 2]).collect::<Vec<u32>>()
         };
@@ -3460,7 +3547,7 @@ impl Engine {
     /// jobs: (controller index c, loop weights, u_off, m_off, out_off, norm weight)
     /// fp16 path: the mix kernels already wrote [u^ | m^] as half into cath; `hout[i]` receives job i's output as half
     /// (`nof32[i]`: only as half)
-    fn ctrl_b(&self, e: &Enc, lw: &LoopW, jobs: &[(usize, u32, u32, u32, u32)], t: usize, hout: &[(u32, bool)]) {
+    fn ctrl_b(&self, e: &Enc, lw: &LoopW, jobs: &[(usize, u32, u32, u32, u32)], t: usize, hout: &[(u32, bool)], dec: bool) {
         let b = self.ba.get();
         let pb = |off: u32, rows: u32, k: u32, in_off: u32, in2: u32, out: u32| GSeg {
             w_lo: off,
@@ -3492,7 +3579,7 @@ impl Engine {
                     sg
                 })
                 .collect();
-            self.gemm_h(e, C_CTRLD, &down, t);
+            self.gemm_h_dec(e, C_CTRLD, &down, t, dec);
             if !fuse_down_half {
                 for &(c, _, _, _, _) in jobs {
                     self.tohalf(e, C_CTRLA, b.ctrlg[c], 64, b.gh[c], 64, 64, t, None);
@@ -3617,6 +3704,24 @@ impl Engine {
             self.go(e, cls, "k_gemm_sg8", &a, (t.div_ceil(128), tiles as usize, 1), 256);
         } else {
             self.go(e, cls, "k_gemm_sg4", &a, (1, tiles as usize, 1), 128);
+        }
+    }
+    fn gemm_h_dec(&self, e: &Enc, cls: u32, segs: &[HSeg], t: usize, dec: bool) {
+        if !dec || t > MAX_SPANS || std::env::var_os("INK_OLD_MOE_DEC").is_some() {
+            self.gemm_h(e, cls, segs, t);
+            return;
+        }
+        let mut a = GemmHArgs { nseg: segs.len() as u32, t: t as u32, ..Default::default() };
+        let mut tiles = 0u32;
+        for (i, sg) in segs.iter().enumerate() {
+            a.seg[i] = *sg;
+            a.seg[i].tile_start = tiles;
+            tiles += sg.nrows.div_ceil(16);
+        }
+        if t > 64 {
+            self.go(e, cls, "k_gemm_dec_sg8", &a, (t.div_ceil(128), tiles as usize, 1), 256);
+        } else {
+            self.go(e, cls, "k_gemm_dec_sg4", &a, (1, tiles as usize, 1), 128);
         }
     }
     fn hseg(w: &QW, xh: u32, out: u32) -> HSeg {
@@ -3921,7 +4026,7 @@ impl Engine {
             let nsplit = if !l.swa {
                 let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
                 if fp.recent_start > 0 {
-                    let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+                    let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, self.max_ctx, fp);
                     let total_splits = 1 + recent_splits;
                     let a_sink = AttnArgs {
                         nkeys: FULL_ATTN_SINK as u32,
@@ -4851,7 +4956,7 @@ impl Engine {
         }
         assert!(!spans.is_empty(), "encode_spans_x requires at least one span");
         assert!(!dec || spans.len() <= self.decode_span_limit(), "decode step spans exceed decode batch capacity");
-        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize + decode_batch_extra_floats(spans.len())) * 4),
+        assert!(!dec || (self.dstart.get() >= self.ba.get().end && self.act.borrow().length() >= (self.dstart.get() as usize + spans.len() * self.ar.total as usize + decode_batch_extra_floats(spans.len(), self.max_ctx)) * 4),
                 "a decode step keeps each lane's split partials and descriptors in the decode-batch region: call ensure_dbatch(n) after ensure_batch()");
         assert!(t <= self.chunk && t <= self.ba.get().cap, "batch arena: call ensure_batch() first");
         if let Some(k) = verify_k {
@@ -4990,7 +5095,7 @@ impl Engine {
                     .map(|e| (e.slot().get(), e.generation()))
             });
             debug_assert!(swa_groups.len() <= n * MAX_SWA_SPLIT);
-            debug_assert!(full_groups.len() <= n * MAX_SPLIT);
+            debug_assert!(full_groups.len() <= n * split_scratch_slots(self.max_ctx));
             let partition_copy = |groups: &[DecAttnGroup], base_off: u32| -> (u32, usize, u32, usize) {
                 let mut n_solo = 0usize;
                 for g in groups {
@@ -5231,8 +5336,7 @@ impl Engine {
                         &[self.output_norm as i32],
                         0,
                     );
-                    self.mix(&e, C_OMIX, &[j]);
-                    self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                    self.span_row_logits(&e, j, lg);
                 }
             }
         } else if logits && dec {
@@ -5286,8 +5390,7 @@ impl Engine {
                 st.push(b.vec(cur) + last);
                 let j =
                     self.mix_job_off(&st, self.output_res_query as i32, 1, &[ar.fout], &[self.output_norm as i32], 0);
-                self.mix(&e, C_OMIX, &[j]);
-                self.mv(&e, C_LMHEAD, &[Engine::seg(&self.output, ar.fout, lg)]);
+                self.span_row_logits(&e, j, lg);
                 if argmax {
                     let nparts = 128u32;
                     let am = ArgmaxArgs {
@@ -5306,6 +5409,21 @@ impl Engine {
             }
         }
         e.end();
+    }
+
+    fn span_row_logits(&self, e: &Enc, mut job: MixJob, logits: u32) {
+        if self.hgemm {
+            let half = self.ba.get().xh[0];
+            job.hout[0] = half as i32;
+            job.nof32 = 1;
+            self.mix_t(e, C_OMIX, &[job], 1);
+            let mut hs = Engine::hseg(&self.output, half, logits);
+            hs.ldo = self.vocab_pad() as u32;
+            self.gemm_h(e, C_LMHEAD, &[hs], 1);
+        } else {
+            self.mix(e, C_OMIX, &[job]);
+            self.mv(e, C_LMHEAD, &[Engine::seg(&self.output, self.ar.fout, logits)]);
+        }
     }
 
     /// Output depth-mix + LM-head projection for `n` decode lanes into `lg_off` (`ldo = vocab_pad`).
@@ -5401,7 +5519,7 @@ impl Engine {
                 .map(|j| (j, if l.swa { b.inp[0] } else { b.inp[j] }, b.msg[j], b.cin[j], norms[j] as u32))
                 .collect();
             let ho: Vec<(u32, bool)> = if self.hgemm { (0..3).map(|j| (b.xh[j], true)).collect() } else { vec![] };
-            self.ctrl_b(e, lw, &jobs, t, &ho);
+            self.ctrl_b(e, lw, &jobs, t, &ho, dec);
             xin = b.cin;
         } else {
             let nn: Vec<i32> = if l.swa { vec![l.attn_norm] } else { norms.to_vec() };
@@ -5439,10 +5557,11 @@ impl Engine {
                 Engine::hseg(&l.wsink, b.xh[xi[0]], b.sink),
             ];
             // q and the output gate are only read once more (K/V prep, attention epilogue): write them as half
-            if hatt && qgh && !dec {
+            // on both prefill and decode spans so the tensor paths share one identical arithmetic.
+            if hatt && qgh {
                 hq[0].hout = 1;
                 hq[1].hout = 1;
-            } // a decode step keeps them f32 for k_attn
+            }
             let mut hs = vec![Engine::hseg(&l.wk, b.xh[xi[1]], b.k), Engine::hseg(&l.wv, b.xh[xi[2]], b.v)];
             if let (Some(kp), Some(vp)) = (&l.kconvp, &l.vconvp) {
                 hs.push(Engine::hseg(kp, b.xh[xi[1]], b.kdyn));
@@ -5450,15 +5569,15 @@ impl Engine {
             }
             if ts == 0 {
                 hq.extend_from_slice(&hs);
-                self.gemm_h(e, C_QKV, &hq, t);
+                self.gemm_h_dec(e, C_QKV, &hq, t, dec);
             } else {
                 // query-side projections for the tail rows only (the two GEMMs are independent)
                 for sg in hq.iter_mut() {
                     sg.xh_off = sh(sg.xh_off, E / 2);
                     sg.out_off = sh(sg.out_off, sg.nrows as usize / (1 + sg.hout as usize));
                 }
-                self.gemm_h(e, C_QKV, &hs, t);
-                self.gemm_h(e, C_QKV, &hq, n);
+                self.gemm_h_dec(e, C_QKV, &hs, t, dec);
+                self.gemm_h_dec(e, C_QKV, &hq, n, dec);
             }
         } else {
             self.gemm(e, C_QKV, &segs, t);
@@ -5473,17 +5592,18 @@ impl Engine {
         if let Some(dm) = dec_meta {
             // Layer 3 blocked multi-query shared-KV grouped decode:
             //   1. `k_kvprep_dec` once per (kv_head g, span si)
-            //   2. `k_attn_grp_dec` once per (DecAttnGroup, kv_head g), staging shared KV tiles once for up to 8 lanes
+            //   2. `k_attn_dec_solo` / `k_attn_grp_dec` once per (DecAttnGroup, kv_head g), staging shared KV tiles once for up to 8 lanes
             //   3. `k_attn_combine_dec` once per (head h, span si)
             // Shared `CS` (buffer 4) stays bound; rebind `BT` (buffer 8) after `mix_t`'s inline buffer(8) constants.
             assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
             self.bind_pool_slabs(e, l.swa);
             e.buf(self.blocked_slab.borrow().bt_buf.as_ref().expect("blocked slab missing bt_buf"), 0, 8);
+            let swa_flags = (l.swa as u32) | ((dry_state as u32) << 1) | ((hatt as u32) << 2);
             let ka = KvPrepDecArgs {
                 desc_off: dm.desc_off,
                 pass_idx,
                 cs_slot,
-                swa: (l.swa as u32) | ((dry_state as u32) << 1),
+                swa: swa_flags,
                 q_off: b.q,
                 k_off: b.k,
                 v_off: b.v,
@@ -5497,8 +5617,8 @@ impl Engine {
                 vconv_w: l.v_conv,
                 qclip_w: l.q_clip,
                 relclip_w: l.rel_clip,
-                pad0: 0,
-                pad1: 0,
+                log_alpha: self.log_alpha,
+                log_floor: self.log_floor,
                 pad2: 0,
             };
             self.go(e, C_KVPREP, "k_kvprep_dec", &ka, (NKV, spans.len(), 1), 128);
@@ -5518,7 +5638,7 @@ impl Engine {
                     relbias_w: l.rel_bias,
                     pass_idx,
                     kps,
-                    swa: l.swa as u32,
+                    swa: swa_flags,
                     pad0: 0,
                     pad1: 0,
                 };
@@ -5535,7 +5655,7 @@ impl Engine {
                     relbias_w: l.rel_bias,
                     pass_idx,
                     kps,
-                    swa: l.swa as u32,
+                    swa: swa_flags,
                     pad0: 0,
                     pad1: 0,
                 };
@@ -5548,7 +5668,7 @@ impl Engine {
                 gate_off: b.gate,
                 out_off: if direct_half { b.agh } else if self.hgemm { b.qp } else { b.attn_g },
                 swa: l.swa as u32,
-                hout: direct_half as u32,
+                hout: (direct_half as u32) | ((hatt as u32) << 1),
                 pad: [0; 3],
             };
             self.go(e, C_COMB, "k_attn_combine_dec", &ca, (NH, spans.len(), 1), 128);
@@ -5559,8 +5679,11 @@ impl Engine {
                 e.barrier();
             }
         } else if dec {
-            // Layer 2 decode step: each lane's token through the decode path's fused attention.
+            // Layer 2 decode step: each lane's token through cache-fixed split-K attention with the
+            // exact same half q/gate/KV precision as prefill spans (`pad & 8` when `hatt`).
             let direct_half = decode_combine_direct_half(self.hgemm, self.skip.get());
+            let qstride = if hatt { NH * HD / 2 } else { NH * HD };
+            let half_flag = (hatt as u32) << 3;
             let mut combs: Vec<CombineArgs> = Vec::with_capacity(spans.len());
             for (si, sp) in spans.iter().enumerate() {
                 let run = self.on(sp.lane);
@@ -5580,7 +5703,7 @@ impl Engine {
                     k_base: kb,
                     v_base: vb,
                     cs_off: cs_slot,
-                    q_off: b.q + (r0 * NH * HD) as u32,
+                    q_off: b.q + (r0 * qstride) as u32,
                     k_off: b.k + (r0 * NKV * HD) as u32,
                     v_off: b.v + (r0 * NKV * HD) as u32,
                     r_off: b.rel + (r0 * NH * NREL) as u32,
@@ -5595,16 +5718,18 @@ impl Engine {
                     relbias_w: l.rel_bias,
                     tau,
                     ctr: 0,
-                    gate_off: b.gate + (r0 * NH * HD) as u32,
+                    gate_off: b.gate + (r0 * qstride) as u32,
                     out_off: b.qp + (r0 * NH * HD) as u32,
                     gstr: kcap * HD as u32,
                     istr: HD as u32,
+                    log_alpha: self.log_alpha,
+                    log_floor: self.log_floor,
                     ..Default::default()
                 };
                 let nsplit = if !l.swa {
                     let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
                     if fp.recent_start > 0 {
-                        let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+                        let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, self.max_ctx, fp);
                         let total_splits = 1 + recent_splits;
                         let a_sink = AttnArgs {
                             nkeys: FULL_ATTN_SINK as u32,
@@ -5614,7 +5739,7 @@ impl Engine {
                             nsplit: total_splits as u32,
                             sp0: 0,
                             noown: 1,
-                            pad: 1 | 4 | ((dry_state as u32) << 1),
+                            pad: 1 | 4 | ((dry_state as u32) << 1) | half_flag,
                             ..base
                         };
                         self.go_nb(e, C_ATTN, "k_attn", &a_sink, (1, NKV, 1), 128);
@@ -5626,7 +5751,7 @@ impl Engine {
                             nsplit: total_splits as u32,
                             sp0: 1,
                             noown: 0,
-                            pad: 1 | rel_flag | ((dry_state as u32) << 1),
+                            pad: 1 | rel_flag | ((dry_state as u32) << 1) | half_flag,
                             ..base
                         };
                         self.go_nb(e, C_ATTN, "k_attn", &a_rec, (recent_splits, NKV, 1), 128);
@@ -5640,7 +5765,7 @@ impl Engine {
                             ring: 0,
                             kps: kps as u32,
                             nsplit: nsplit as u32,
-                            pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                            pad: (self.sep_comb as u32) | ((dry_state as u32) << 1) | half_flag,
                             ..base
                         };
                         self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
@@ -5655,7 +5780,7 @@ impl Engine {
                         ring: 1,
                         kps: kps as u32,
                         nsplit: nsplit as u32,
-                        pad: (self.sep_comb as u32) | ((dry_state as u32) << 1),
+                        pad: (self.sep_comb as u32) | ((dry_state as u32) << 1) | half_flag,
                         ..base
                     };
                     self.go_nb(e, C_ATTN, "k_attn", &aa, (nsplit, NKV, 1), 128);
@@ -5674,7 +5799,7 @@ impl Engine {
                     nsplit: nsplit as u32,
                     gate_off: base.gate_off,
                     out_off: comb_out,
-                    hout: direct_half as u32,
+                    hout: (direct_half as u32) | ((hatt as u32) << 1),
                     pad: [0; 3],
                 });
             }
@@ -5702,11 +5827,13 @@ impl Engine {
             let tt = t as u32;
             // a row-major region shifted to this span's first row
             let rs = |off: u32, dim: usize| off + (r0 * dim) as u32;
-            let (n, nn_) = (t - ts, (t - ts) as u32);
-            let shs = |off: u32, dim: usize| off + ((r0 + ts) * dim) as u32;
             sp.lane.with_cs_buf(|buf, off, _| e.buf(buf, off, 4));
             let (qd, gd) = (if hatt && qgh { NH * HD / 2 } else { NH * HD }, if qgh { NH * HD / 2 } else { NH * HD });
             let qpd = if hatt { NH * HD / 2 } else { NH * HD };
+            let kps = decode_split_kps(l.swa, self.max_ctx);
+            let (nsplit, batch_rows) = fixed_attn_batch(l.swa, p0 + t, self.max_ctx);
+            let attn_out = if hatt { b.agh } else { b.attn_g };
+            let full_budget_arg = if l.swa { 0u32 } else { self.full_attn_budget().unwrap_or(0) as u32 };
             if blocked {
                 Self::bind_lane_bt(e, sp.lane, l.swa);
                 let ka = KvPrepArgs {
@@ -5779,42 +5906,32 @@ impl Engine {
                 };
                 self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
                 self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-                let full_budget_arg = if l.swa { 0u32 } else { self.full_attn_budget().unwrap_or(0) as u32 };
-                let aa = AttnBArgs {
-                    t: tt,
-                    p0: p0 as u32,
-                    ring: 0,
-                    cap: 0,
-                    k_base: pass_idx,
-                    v_base: 0,
-                    window: if l.swa { EXT as u32 } else { 0 },
-                    qp_off: rs(b.qp, qpd),
-                    rp_off: rs(b.rp, NH * NREL),
-                    sink_off: rs(b.sink, NH),
-                    gate_off: rs(b.gate, gd),
-                    out_off: rs(b.attn_g, NH * HD),
-                    relbias_w: l.rel_bias,
-                    ghalf: 0,
-                    kpos0: 0,
-                    pad: full_budget_arg,
-                };
-                if hatt {
-                    let ah = AttnBArgs {
-                        t: nn_,
-                        p0: (p0 + ts) as u32,
-                        qp_off: shs(b.qp, NH * HD / 2),
-                        rp_off: shs(b.rp, NH * NREL),
-                        sink_off: shs(b.sink, NH),
-                        gate_off: shs(b.gate, gd),
-                        out_off: shs(b.agh, NH * HD / 2),
-                        ghalf: qgh as u32,
-                        ..aa
+                for start in (ts..t).step_by(batch_rows) {
+                    let bn = (t - start).min(batch_rows);
+                    let off = |base: u32, stride: usize| base + ((r0 + start) * stride) as u32;
+                    let args = PreparedAttnArgs {
+                        pos0: (p0 + start) as u32,
+                        window: if l.swa { EXT as u32 } else { 0 },
+                        cap: 0,
+                        idx0: 0,
+                        k_base: pass_idx,
+                        v_base: 0,
+                        q_off: off(b.qp, qpd),
+                        r_off: off(b.rp, NH * NREL),
+                        sink_off: off(b.sink, NH),
+                        gate_off: off(b.gate, gd),
+                        out_off: off(attn_out, qpd),
+                        relbias_w: l.rel_bias,
+                        part_off: self.ar.part,
+                        kps: kps as u32,
+                        nsplit: nsplit as u32,
+                        half_io: hatt as u32,
+                        ring: 0,
+                        full_budget: full_budget_arg,
+                        pad: [0; 2],
                     };
-                    self.go(e, C_ATTN, "k_attn_h_blk", &ah, (n.div_ceil(32), NH, 1), 256);
-                } else if self.tensor {
-                    self.go(e, C_ATTN, "k_attn_bt_blk", &aa, (t.div_ceil(32), NH, 1), 256);
-                } else {
-                    self.go(e, C_ATTN, "k_attn_b_blk", &aa, (t.div_ceil(8), NKV, 1), 128);
+                    self.go(e, C_ATTN, "k_attn_fixed_b_blk", &args, (nsplit, NKV, bn), 128);
+                    self.go(e, C_COMB, "k_attn_fixed_combine", &args, (NH, bn, 1), 128);
                 }
                 continue;
             }
@@ -5903,11 +6020,8 @@ impl Engine {
             if l.swa {
                 kcopy(t.min(EXT), p0 + t - t.min(EXT), 1);
             }
-            // k_attn_h reads keys in whole tiles of ATT_AK positions, so the span's last tile runs past its last key to the
-            // next multiple of ATT_AK. Those scratch rows are masked with a zero weight, which does not cancel a NaN or an
-            // infinity, and k_zero cleared them only at the start of the step: an earlier span of this layer (or a longer span of the
-            // layer before) may have written another lane's keys there since. Zero them for this span.
-            // (specs/ScratchTail.tla; one span alone never leaves them dirty)
+            // Keep the masked tail of the last ATT_AK scratch tile zeroed between private spans
+            // (verified by `specs/ScratchTail.tla` and `private_prefill_clears_the_last_window_tile_between_lanes`).
             if l.swa && spans.len() > 1 {
                 let (end, tail) = (p0 + t, (p0 + t).next_multiple_of(ATT_AK) - (p0 + t));
                 if tail > 0 {
@@ -5934,43 +6048,33 @@ impl Engine {
             };
             self.keep_state(e, si, &su, C_KVPREP, (NKV * HD / 256, 1, 1));
             self.go(e, C_KVPREP, "k_state_upd", &su, (NKV * HD / 256, 1, 1), 256);
-            // ---- attention (causal, query-tiled)
-            let full_budget_arg = if l.swa { 0u32 } else { self.full_attn_budget().unwrap_or(0) as u32 };
-            let aa = AttnBArgs {
-                t: tt,
-                p0: p0 as u32,
-                ring: 0,
-                cap,
-                k_base: pk,
-                v_base: pv,
-                window: if l.swa { EXT as u32 } else { 0 },
-                qp_off: rs(b.qp, qpd),
-                rp_off: rs(b.rp, NH * NREL),
-                sink_off: rs(b.sink, NH),
-                gate_off: rs(b.gate, gd),
-                out_off: rs(b.attn_g, NH * HD),
-                relbias_w: l.rel_bias,
-                ghalf: 0,
-                kpos0,
-                pad: full_budget_arg,
-            };
-            if hatt {
-                let ah = AttnBArgs {
-                    t: nn_,
-                    p0: (p0 + ts) as u32,
-                    qp_off: shs(b.qp, NH * HD / 2),
-                    rp_off: shs(b.rp, NH * NREL),
-                    sink_off: shs(b.sink, NH),
-                    gate_off: shs(b.gate, gd),
-                    out_off: shs(b.agh, NH * HD / 2),
-                    ghalf: qgh as u32,
-                    ..aa
+            // ---- cache-fixed-split attention (bit-identical across prefill and decode)
+            for start in (ts..t).step_by(batch_rows) {
+                let bn = (t - start).min(batch_rows);
+                let off = |base: u32, stride: usize| base + ((r0 + start) * stride) as u32;
+                let args = PreparedAttnArgs {
+                    pos0: (p0 + start) as u32,
+                    window: if l.swa { EXT as u32 } else { 0 },
+                    cap,
+                    idx0: kpos0,
+                    k_base: pk,
+                    v_base: pv,
+                    q_off: off(b.qp, qpd),
+                    r_off: off(b.rp, NH * NREL),
+                    sink_off: off(b.sink, NH),
+                    gate_off: off(b.gate, gd),
+                    out_off: off(attn_out, qpd),
+                    relbias_w: l.rel_bias,
+                    part_off: self.ar.part,
+                    kps: kps as u32,
+                    nsplit: nsplit as u32,
+                    half_io: hatt as u32,
+                    ring: 0,
+                    full_budget: full_budget_arg,
+                    pad: [0; 2],
                 };
-                self.go(e, C_ATTN, "k_attn_h", &ah, (n.div_ceil(32), NH, 1), 256);
-            } else if self.tensor {
-                self.go(e, C_ATTN, "k_attn_bt", &aa, (t.div_ceil(32), NH, 1), 256);
-            } else {
-                self.go(e, C_ATTN, "k_attn_b", &aa, (t.div_ceil(8), NKV, 1), 128);
+                self.go(e, C_ATTN, "k_attn_fixed_b", &args, (nsplit, NKV, bn), 128);
+                self.go(e, C_COMB, "k_attn_fixed_combine", &args, (NH, bn, 1), 128);
             }
         }
         // ---- output projection + post-conv (+ residual)
@@ -5979,7 +6083,7 @@ impl Engine {
                 self.tohalf(e, C_WO, b.attn_g, NH * HD, b.agh, NH * HD, NH * HD, t, None);
                 e.barrier();
             }
-            self.gemm_h(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n);
+            self.gemm_h_dec(e, C_WO, &[Engine::hseg(&l.wo, sh(b.agh, NH * HD / 2), sh(b.wo_y, E))], n, dec);
         } else {
             self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
         }
@@ -6052,7 +6156,7 @@ impl Engine {
             }
             self.mix_t(e, C_MIXF, &[jf], t);
             let ho: Vec<(u32, bool)> = if self.hgemm { vec![(b.fh, rth)] } else { vec![] };
-            self.ctrl_b(e, lw, &[(3, b.fin, b.msg[3], b.finc, l.ffn_norm)], t, &ho);
+            self.ctrl_b(e, lw, &[(3, b.fin, b.msg[3], b.finc, l.ffn_norm)], t, &ho, dec);
             b.finc
         } else {
             let mut jf = self.mix_job_off(&st, l.ffn_res_query as i32, 1, &[sh(b.fin, E)], &[l.ffn_norm as i32], es);
@@ -6078,12 +6182,34 @@ impl Engine {
             ..Default::default()
         };
         if rth {
-            self.gemm_h(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n);
+            self.gemm_h_dec(e, C_ROUTER, &[Engine::hseg_pb(l.router, NEXP as u32, es, sh(b.fh, E / 2), b.rlog)], n, dec);
         } else {
             self.gemm(e, C_ROUTER, &[rs], n);
         }
         let tile = 32usize;
-        if use_fused_topk_route3(self.hgemm, n) {
+        let old_moe_dec = std::env::var_os("INK_OLD_MOE_DEC").is_some();
+        let grp_moe_dec = dec && self.hgemm && n <= MAX_SPANS && !old_moe_dec;
+        let dec_tl_offs = if self.no_grp_moe.get() { [b.tl[0], b.sk] } else { b.tl };
+        if grp_moe_dec {
+            let no_grp = self.no_grp_moe.get();
+            let tra = TopkRouteDecArgs {
+                logits_off: b.rlog,
+                bias_off: l.exp_bias,
+                sel_off: b.sel,
+                t: nn_,
+                wscale: self.wscale,
+                perm_off: b.perm,
+                inv_off: b.inv,
+                aw_off: b.aw,
+                ind_off: b.ind,
+                gu_y: (FF / 8) as u32,
+                dn_y: (E / 16) as u32,
+                no_grp: no_grp as u32,
+                tiles_off: dec_tl_offs,
+                pad: [0; 2],
+            };
+            self.go(e, C_TOPK, "k_moe_topk_route_dec", &tra, (1, 1, 1), 1024);
+        } else if use_fused_topk_route3(self.hgemm, n) {
             let tra = TopkRoute3Args {
                 logits_off: b.rlog,
                 bias_off: l.exp_bias,
@@ -6166,68 +6292,132 @@ impl Engine {
             // gather the FFN input rows of every (token, expert) assignment into contiguous half rows
             self.tohalf_x(e, C_GATHER, sh(b.fh, E / 2), E, b.xgh, E, E, n * TOPK, Some(b.perm), true);
             e.barrier();
-            // tiles in two width classes, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently.
-            // Each token picks TOPK distinct experts, so when n <= 64 every expert receives <= 64 tokens and class 0 (65..128) is empty.
-            let cls_start = moe_class_start(n);
-            if self.skip.get() & (1 << C_GU) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
-                    let g = MoeGemmHArgs {
-                        w_lo: l.gu.off as u32,
-                        w_hi: (l.gu.off >> 32) as u32,
-                        expert_bytes: l.gu.expert_bytes as u32,
-                        row_bytes: l.gu.row_bytes,
-                        wtype: l.gu.ty,
-                        nrows: (2 * FF) as u32,
-                        k: es,
-                        xh_off: b.xgh,
-                        tiles_off: b.tl[c],
-                        ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.acth,
-                        ldo: FF as u32,
-                        situ: 1,
-                        aw_off: b.aw,
-                        beta: self.situ_beta,
-                        lbeta: self.situ_lbeta,
-                        gs_lo: l.gu.gs as u32,
-                        gs_hi: (l.gu.gs >> 32) as u32,
-                        pad0: 0,
-                        pad1: 0,
-                    };
-                    e.pso(&self.gpu.pso(name));
-                    e.bytes(&g, 5);
-                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
+            if grp_moe_dec {
+                let cls_start = if self.no_grp_moe.get() || n <= 64 { 1 } else { 0 };
+                if self.skip.get() & (1 << C_GU) == 0 {
+                    for (c, (name, _, tg)) in MOE_DEC_CLS.iter().enumerate().skip(cls_start) {
+                        let g = MoeGemmHArgs {
+                            w_lo: l.gu.off as u32,
+                            w_hi: (l.gu.off >> 32) as u32,
+                            expert_bytes: l.gu.expert_bytes as u32,
+                            row_bytes: l.gu.row_bytes,
+                            wtype: l.gu.ty,
+                            nrows: (2 * FF) as u32,
+                            k: es,
+                            xh_off: b.xgh,
+                            tiles_off: dec_tl_offs[c],
+                            ntiles_off: b.ind + (c * 4) as u32,
+                            out_off: b.acth,
+                            ldo: FF as u32,
+                            situ: 1,
+                            aw_off: b.aw,
+                            beta: self.situ_beta,
+                            lbeta: self.situ_lbeta,
+                            gs_lo: l.gu.gs as u32,
+                            gs_hi: (l.gu.gs >> 32) as u32,
+                            pad0: 0,
+                            pad1: 0,
+                        };
+                        e.pso(&self.gpu.pso(name));
+                        e.bytes(&g, 5);
+                        e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
+                    }
+                    e.barrier();
                 }
-                e.barrier();
-            }
-            if self.skip.get() & (1 << C_DOWN) == 0 {
-                for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
-                    let d = MoeGemmHArgs {
-                        w_lo: l.dn.off as u32,
-                        w_hi: (l.dn.off >> 32) as u32,
-                        expert_bytes: l.dn.expert_bytes as u32,
-                        row_bytes: l.dn.row_bytes,
-                        wtype: l.dn.ty,
-                        nrows: es,
-                        k: FF as u32,
-                        xh_off: b.acth,
-                        tiles_off: b.tl[c],
-                        ntiles_off: b.ind + (c * 4) as u32,
-                        out_off: b.yd,
-                        ldo: es,
-                        situ: 0,
-                        aw_off: 0,
-                        beta: 0.0,
-                        lbeta: 0.0,
-                        gs_lo: l.dn.gs as u32,
-                        gs_hi: (l.dn.gs >> 32) as u32,
-                        pad0: 0,
-                        pad1: 0,
-                    };
-                    e.pso(&self.gpu.pso(name));
-                    e.bytes(&d, 5);
-                    e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
+                if self.skip.get() & (1 << C_DOWN) == 0 {
+                    for (c, (name, _, tg)) in MOE_DEC_CLS.iter().enumerate().skip(cls_start) {
+                        let d = MoeGemmHArgs {
+                            w_lo: l.dn.off as u32,
+                            w_hi: (l.dn.off >> 32) as u32,
+                            expert_bytes: l.dn.expert_bytes as u32,
+                            row_bytes: l.dn.row_bytes,
+                            wtype: l.dn.ty,
+                            nrows: es,
+                            k: FF as u32,
+                            xh_off: b.acth,
+                            tiles_off: dec_tl_offs[c],
+                            ntiles_off: b.ind + (c * 4) as u32,
+                            out_off: b.yd,
+                            ldo: es,
+                            situ: 0,
+                            aw_off: 0,
+                            beta: 0.0,
+                            lbeta: 0.0,
+                            gs_lo: l.dn.gs as u32,
+                            gs_hi: (l.dn.gs >> 32) as u32,
+                            pad0: 0,
+                            pad1: 0,
+                        };
+                        e.pso(&self.gpu.pso(name));
+                        e.bytes(&d, 5);
+                        e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC_DEC + c * 4) * 4, *tg);
+                    }
+                    e.barrier();
                 }
-                e.barrier();
+            } else {
+                // tiles in two width classes, sized on the GPU by the routing kernel (indirect dispatch); classes run concurrently.
+                // Each token picks TOPK distinct experts, so when n <= 64 every expert receives <= 64 tokens and class 0 (65..128) is empty.
+                let cls_start = moe_class_start(n);
+                if self.skip.get() & (1 << C_GU) == 0 {
+                    for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
+                        let g = MoeGemmHArgs {
+                            w_lo: l.gu.off as u32,
+                            w_hi: (l.gu.off >> 32) as u32,
+                            expert_bytes: l.gu.expert_bytes as u32,
+                            row_bytes: l.gu.row_bytes,
+                            wtype: l.gu.ty,
+                            nrows: (2 * FF) as u32,
+                            k: es,
+                            xh_off: b.xgh,
+                            tiles_off: b.tl[c],
+                            ntiles_off: b.ind + (c * 4) as u32,
+                            out_off: b.acth,
+                            ldo: FF as u32,
+                            situ: 1,
+                            aw_off: b.aw,
+                            beta: self.situ_beta,
+                            lbeta: self.situ_lbeta,
+                            gs_lo: l.gu.gs as u32,
+                            gs_hi: (l.gu.gs >> 32) as u32,
+                            pad0: 0,
+                            pad1: 0,
+                        };
+                        e.pso(&self.gpu.pso(name));
+                        e.bytes(&g, 5);
+                        e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + c * 4) * 4, *tg);
+                    }
+                    e.barrier();
+                }
+                if self.skip.get() & (1 << C_DOWN) == 0 {
+                    for (c, (name, _, tg)) in MOE_CLS.iter().enumerate().skip(cls_start) {
+                        let d = MoeGemmHArgs {
+                            w_lo: l.dn.off as u32,
+                            w_hi: (l.dn.off >> 32) as u32,
+                            expert_bytes: l.dn.expert_bytes as u32,
+                            row_bytes: l.dn.row_bytes,
+                            wtype: l.dn.ty,
+                            nrows: es,
+                            k: FF as u32,
+                            xh_off: b.acth,
+                            tiles_off: b.tl[c],
+                            ntiles_off: b.ind + (c * 4) as u32,
+                            out_off: b.yd,
+                            ldo: es,
+                            situ: 0,
+                            aw_off: 0,
+                            beta: 0.0,
+                            lbeta: 0.0,
+                            gs_lo: l.dn.gs as u32,
+                            gs_hi: (l.dn.gs >> 32) as u32,
+                            pad0: 0,
+                            pad1: 0,
+                        };
+                        e.pso(&self.gpu.pso(name));
+                        e.bytes(&d, 5);
+                        e.dispatch_indirect(&self.act.borrow(), (b.ind as usize + 4 * NTC + c * 4) * 4, *tg);
+                    }
+                    e.barrier();
+                }
             }
         } else {
             self.go(e, C_GU, mg, &gu, (FF / 32, max_tiles, 1), 128);
@@ -6894,7 +7084,7 @@ impl<'a> Run<'a> {
                     room -= n;
                 }
                 let (kps, ns) = spl(pos + 1 - lo);
-                assert!(sp + ns <= MAX_SPLIT, "too many K/V file chunks for one layer");
+                assert!(sp + ns <= split_scratch_slots(self.max_ctx), "too many K/V file chunks for one layer");
                 execs.push(ExecPlan { b: lo, kps, nsplit: sp + ns, sp0: sp, ns, rel_split: true });
             }
         }
@@ -7704,7 +7894,7 @@ impl<'a> Run<'a> {
         } else if !l.swa && self.full_attn_budget().is_some_and(|b| pos + 1 > b) {
             self.bind_kv(e, false);
             let fp = full_attn_decode_plan(pos, self.max_ctx, self.full_attn_budget());
-            let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, fp);
+            let (recent_kps, recent_splits, rel_flag) = full_attn_layer2_recent_splits(pos, self.max_ctx, fp);
             let total_splits = 1 + recent_splits;
             let a_sink = AttnArgs {
                 nkeys: FULL_ATTN_SINK as u32, first_pos: 0, ring: 0, kps: FULL_ATTN_SINK as u32,
@@ -8011,16 +8201,16 @@ fn decode_combine_direct_half(hgemm: bool, skip: u32) -> bool {
     hgemm && (skip & ((1 << C_COMB) | (1 << C_WO)) == 0)
 }
 
-/// Cache-fixed absolute split width for decode attention (independent of `pos` and batch membership):
-/// - Sliding-window (`EXT = 1024`): always 64 tokens (1 block), giving at most `17 <= MAX_SPLIT` splits.
-/// - Full attention: `512 * ceil(max_ctx / 131_072).max(1)` (`512` = 8 blocks for all contexts `<= 131,072`),
-///   fitting in `MAX_SPLIT = 256` without enlarging `Arena`.
+/// Cache-fixed absolute split width for prefill and decode attention (independent of `pos`,
+/// configured context limit `max_ctx`, and batch membership):
+/// - Sliding-window (`EXT = 1024`): always 64 tokens (1 block), giving at most `17` splits.
+/// - Full attention: always 256 tokens (4 blocks), anchored at absolute position 0 (`specs/SplitArena.tla`).
 #[inline]
-pub fn decode_split_kps(swa: bool, max_ctx: usize) -> usize {
+pub const fn decode_split_kps(swa: bool, _max_ctx: usize) -> usize {
     if swa {
         crate::blocks::BLOCK
     } else {
-        512 * max_ctx.div_ceil(131_072).max(1)
+        256
     }
 }
 
@@ -8034,28 +8224,24 @@ pub fn decode_split_grid(swa: bool, pos: usize, max_ctx: usize) -> (usize, usize
     let sp_lo = first_pos / kps;
     let sp_hi = pos / kps;
     let nsplit = sp_hi - sp_lo + 1;
-    debug_assert!(nsplit <= MAX_SPLIT);
+    debug_assert!(nsplit <= split_scratch_slots(max_ctx));
     (first_pos, kps, sp_lo, nsplit)
 }
 
 /// Extra `f32` scratch slots appended after `n * ar.total` in `ensure_dbatch(n)` for Layer 3
 /// batched decode (`DecodeSpanDesc`, `kv_cur`, SWA `DecAttnGroup`, Full `DecAttnGroup`).
 #[inline]
-pub fn decode_batch_extra_floats(n: usize) -> usize {
+pub fn decode_batch_extra_floats(n: usize, max_ctx: usize) -> usize {
     let align64 = |x: usize| x.div_ceil(64) * 64;
     let desc = align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4));
     let kv_cur = align64(n * 2 * NKV * HD);
     let grp_floats = std::mem::size_of::<DecAttnGroup>() / 4;
     let swa_grps = align64(n * MAX_SWA_SPLIT * grp_floats);
-    let full_grps = align64(n * MAX_SPLIT * grp_floats);
+    let full_grps = align64(n * split_scratch_slots(max_ctx) * grp_floats);
     desc + kv_cur + swa_grps + full_grps
 }
 
-/// Build `DecAttnGroup` descriptors for one attention kind (`swa` or `full`) across a decode batch.
-///
-/// Invariants (matching `specs/GroupedLayout.tla`):
 /// Number of fixed-width `kps` splits touched by `[first, end)` (`specs/SplitArena.tla` `SplitCount`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {
     if first >= end {
         0
@@ -8064,8 +8250,9 @@ pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {
     }
 }
 
-/// Split-partials scratch slots per query head for `max_ctx` (`specs/SplitArena.tla` `Slots`).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Split-partials scratch slots per query head for `max_ctx` (`specs/SplitArena.tla` `Slots`):
+/// `max(MAX_SPLIT, ceil(max_ctx / 256) + 1)`. The extra slot accommodates clipped boundaries
+/// in the experimental pruning path.
 pub const fn split_scratch_slots(max_ctx: usize) -> usize {
     let need = max_ctx.div_ceil(256) + 1;
     if need > MAX_SPLIT {
@@ -8077,9 +8264,8 @@ pub const fn split_scratch_slots(max_ctx: usize) -> usize {
 
 /// `(nsplit_stride, max_rows_per_batch)` for a span ending at `span_end = p0 + t` (`specs/SplitArena.tla`
 /// `NSplit` & `Rows`), reserving the extra sliding-window edge split whenever `swa && span_end > EXT`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const fn fixed_attn_batch(swa: bool, span_end: usize, max_ctx: usize) -> (usize, usize) {
-    let kps = if swa { 64 } else { 256 };
+    let kps = decode_split_kps(swa, max_ctx);
     let nsplit = if swa && span_end > EXT {
         (EXT - 1).div_ceil(kps) + 1
     } else if span_end == 0 {
@@ -8273,7 +8459,7 @@ pub fn full_attn_decode_plan(pos: usize, max_ctx: usize, budget: Option<usize>) 
     let sp_hi = pos / kps;
     let recent_splits = sp_hi - recent_sp_lo + 1;
     let nsplit = if recent_sp_lo == 0 { sp_hi + 1 } else { 1 + recent_splits };
-    debug_assert!(nsplit <= MAX_SPLIT);
+    debug_assert!(nsplit <= split_scratch_slots(max_ctx));
     FullAttnDecodePlan {
         nkeys: b,
         kps,
@@ -8285,14 +8471,15 @@ pub fn full_attn_decode_plan(pos: usize, max_ctx: usize, budget: Option<usize>) 
 }
 
 /// Split sizing for the Layer 2 `k_attn` recent-range dispatch when `fp.recent_start > 0`,
-/// guaranteeing `1 + recent_splits <= MAX_SPLIT` even at maximum context.
+/// guaranteeing `1 + recent_splits <= split_scratch_slots(max_ctx)` even at maximum context.
 #[inline]
-fn full_attn_layer2_recent_splits(pos: usize, fp: FullAttnDecodePlan) -> (usize, usize, u32) {
-    if fp.recent_splits < MAX_SPLIT {
+fn full_attn_layer2_recent_splits(pos: usize, max_ctx: usize, fp: FullAttnDecodePlan) -> (usize, usize, u32) {
+    let slots = split_scratch_slots(max_ctx);
+    if fp.recent_splits < slots {
         (fp.kps, fp.recent_splits, 0)
     } else {
         let recent_len = pos + 1 - fp.recent_start;
-        let kps = recent_len.div_ceil(MAX_SPLIT - 1).next_multiple_of(32);
+        let kps = recent_len.div_ceil(slots - 1).next_multiple_of(32);
         let splits = recent_len.div_ceil(kps);
         (kps, splits, 4)
     }

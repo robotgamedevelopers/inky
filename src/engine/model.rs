@@ -157,7 +157,7 @@ impl PreparedModel {
         self.pb.data.extend(std::iter::repeat_n(0u8, 128 * NREL * 4)); // k_attn_h reads up to 95 rows past a relative-bias table
         let pbuf = gpu.buffer_with(&self.pb.data);
 
-        let max_split = MAX_SPLIT;
+        let max_split = super::split_scratch_slots(self.max_ctx);
         let ar = Arena::new(max_split, N_VOCAB_PAD);
         // the batch arena is allocated when a prefill needs it and released when generation starts
         let act = gpu.buffer(ar.total as usize * 4);
@@ -198,6 +198,7 @@ impl PreparedModel {
             guided_logit_rows: Cell::new(0),
             lg_weak: RefCell::new(None),
             no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
+            no_grp_moe: Cell::new(std::env::var("INK_NO_GRP_MOE").is_ok_and(|v| !v.is_empty() && v != "0")),
             full_attn_budget: Cell::new(match FULL_ATTN_BUDGET.load(std::sync::atomic::Ordering::Relaxed) {
                 0 => None,
                 b => Some(b),

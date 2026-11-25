@@ -454,6 +454,7 @@ pub fn parse_metal_kv_layout(kernels_src: &str, prefill_src: &str) -> Result<Met
         "k_kvprep_dec",
         "k_attn_dec_solo",
         "k_attn_grp_dec",
+        "k_attn_fixed_b_blk",
     ] {
         check_kernel(kernels_src, kname)?;
     }

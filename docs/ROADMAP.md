@@ -133,7 +133,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 
 | feature | done |
 |---|:---:|
-| PR #37 — Port fixed-split attention to current main ([#88](https://github.com/robotgamedevelopers/inky/pull/88)) | ❌ |
+| PR #37 — Port fixed-split attention to current main ([#88](https://github.com/robotgamedevelopers/inky/pull/88)) | ✅ |
 | PR #60 — Qualify chip goldens on integrated arithmetic | ❌ |
 | PR #42 — Port speculative scheduler verification ([#80](https://github.com/robotgamedevelopers/inky/pull/80)) | ✅ |
 | PR #51 — Port CI scheduling while retaining main gates | ✅ |
@@ -141,7 +141,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | PR #53 — Extract and qualify fold changes | ✅ |
 | PR #76 — Review and qualify GPU completion checks ([#76](https://github.com/robotgamedevelopers/inky/pull/76)) | ✅ |
 | PR #59 — Port private sliding-window scratch isolation ([#81](https://github.com/robotgamedevelopers/inky/pull/81)) | ✅ |
-| complete | 75% |
+| complete | 87% |
 
 [Source data](roadmap.sexp)
 
@@ -489,8 +489,8 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 | Per-lane sampling with one step in flight, seeded by the request | ✅ |
 | Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |
 | Gate: agreement with llama.cpp as CI checks it | ✅ |
-| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ❌ |
-| complete | 87% |
+| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ✅ |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -634,8 +634,8 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 |---|:---:|
 | The M3 Ultra tuning: decode steps on the non-tensor kernels (later) | ✅ |
 | Speculative decoding with Inkling's own DSpark drafter, exact verification: more tokens per cache read at long context (later) | ✅ |
-| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ❌ |
-| A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ❌ |
+| One attention kernel for every span, split over keys at positions fixed by the cache: decode spans near bus speed, bit-identical to prefill; gate on reference agreement, one reviewed golden rebaseline and bit-identical batch paths (later) | ✅ |
+| A kernel for decode-size batches that reads each touched expert once at full bandwidth: up to 2x at 16 to 32 lanes (later) | ✅ |
 | Shared-prefix design and measured overlap on four concurrent cards (later) | ✅ |
 | Gate: TLC exhausts BlockLayout grouping and CacheScheduler ownership; each reversed witness fails (later) | ✅ |
 | Gate for layer-3 blocks and tables: poisoned-slot forks reproduce private K/V bytes and CI validates ownership traces before storage locks (later) | ✅ |
@@ -668,7 +668,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) (later) | ✅ |
-| complete | 80% |
+| complete | 86% |
 
 [Source data](roadmap.sexp)
 
