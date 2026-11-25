@@ -709,6 +709,50 @@ impl<'a> Layer3Pool<'a> {
     }
 
     /// Release every remaining lane and retained start point so all pool slots return to `refs == 0`.
+    /// Execute one Layer 3 batched decode step and return GPU execution time in milliseconds.
+    pub fn decode_timed(&self, spans: &[(LaneId, usize)]) -> f64 {
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, pos) in spans {
+                self.ensure_span_blocks(v[l].as_mut().expect("live lane"), pos, 1);
+            }
+        }
+        let gpu_ms = {
+            let v = self.lanes.borrow();
+            let sp: Vec<Span> = spans.iter().map(|&(l, p0)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t: 1 }).collect();
+            let cb = self.eng.gpu.cmd();
+            self.eng.encode_decode(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
+        };
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, pos) in spans {
+                self.finish_decode_span(v[l].as_mut().expect("live lane"), pos);
+            }
+        }
+        self.rows.set((spans.len(), true));
+        gpu_ms
+    }
+
+    /// Ensure blocks for `spans` exist and run one timed `encode_decode` without advancing/pruning window state (benchmark only).
+    pub fn bench_decode_ms(&self, spans: &[(LaneId, usize)]) -> f64 {
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, pos) in spans {
+                self.ensure_span_blocks(v[l].as_mut().expect("live lane"), pos, 1);
+            }
+        }
+        let v = self.lanes.borrow();
+        let sp: Vec<Span> = spans.iter().map(|&(l, p0)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t: 1 }).collect();
+        let cb = self.eng.gpu.cmd();
+        self.eng.encode_decode(&cb, &sp, true, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+        (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
+    }
+
     pub fn shutdown(&self) {
         let n = self.lanes.borrow().len();
         for i in 0..n {
