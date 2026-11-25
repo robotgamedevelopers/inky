@@ -36,6 +36,11 @@ fn wait_for(log: &Path, condition: impl Fn(&str) -> bool) {
     }
 }
 
+fn fake_limits(log: &str) -> Vec<u64> {
+    log.lines().filter_map(|line| line.strip_prefix("[inky memd] (fake) limit = "))
+        .map(|value| value.parse().unwrap()).collect()
+}
+
 #[test]
 fn surviving_mode_client_reacquires_lease_after_fake_helper_restart() {
     let uid = unsafe { libc::geteuid() };
@@ -46,26 +51,25 @@ fn surviving_mode_client_reacquires_lease_after_fake_helper_restart() {
     let (socket, saved) = (dir.join("memd.sock"), dir.join("memd.sock.saved"));
     let (first_log, second_log, client_log) = (dir.join("first"), dir.join("second"), dir.join("client"));
     let uid = uid.to_string();
-    let daemon = ["memd", "--fake", "--owner", &uid, "--socket", socket.to_str().unwrap()];
+    let daemon = ["memd", "--fake", "--owner", &uid, "--socket", socket.to_str().unwrap(), "--fake-target-mb", "8192"];
 
     let first = spawn_inky(&daemon, &socket, &first_log);
     wait_for(&first_log, |s| s.contains("listening on"));
     let client = spawn_inky(&["mode", "120"], &socket, &client_log);
     wait_for(&client_log, |s| s.contains("[inky] inky mode:") && saved.is_file());
+    let first_log = fs::read_to_string(&first_log).unwrap();
+    assert_eq!(fake_limits(&first_log), [8192], "{first_log}");
 
     drop(first); // SIGKILL leaves the recovery record for the replacement daemon.
     assert!(saved.is_file());
     let _second = spawn_inky(&daemon, &socket, &second_log);
-    wait_for(&second_log, |s| s.matches("[inky memd] (fake) limit = ").count() >= 2);
+    wait_for(&client_log, |s| s.contains("memory-helper connection restored"));
     let replacement = fs::read_to_string(&second_log).unwrap();
-    let changes: Vec<_> = replacement.lines().filter_map(|line|
-        line.strip_prefix("[inky memd] (fake) limit = ")
-    ).collect();
-    assert_eq!(changes.len(), 2, "{replacement}");
-    assert_eq!(changes[0], "0", "{replacement}");
-    assert!(changes[1].parse::<u64>().unwrap() > 0, "{replacement}");
+    assert_eq!(fake_limits(&replacement), [0, 8192], "{replacement}");
     assert!(saved.is_file(), "replacement must keep the new lease's recovery record");
 
     drop(client);
-    wait_for(&second_log, |s| s.matches("[inky memd] (fake) limit = 0\n").count() == 2 && !saved.exists());
+    wait_for(&second_log, |_| !saved.exists());
+    let final_log = fs::read_to_string(&second_log).unwrap();
+    assert_eq!(fake_limits(&final_log), [0, 8192, 0], "{final_log}");
 }
