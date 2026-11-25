@@ -10,6 +10,8 @@ The November 24, 2026 audit covers v0.2.2 at `be82ef3` and the six pull requests
 
 Johnny Grok's read of that release, written up on 2026-11-25 against main at `d6778fe`, added the rows that were still open after those tables: the 4096 decode reserve, the pool-deferred stall, the agreement and dispatch sentences, the dirty-range test, the shared `count_tokens` pool, and the `ci.sh` sabotage pipelines. The LoopCD lane row already on this page now also records the two tanh paths.
 
+Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on two models, and separate skeptics checked every finding; 336 findings held. Re-checked on 2026-11-25 against main at `21966b0`, 13 of them were already fixed there and 80 were already tracked by the tables in this section. The six tables under "Rowan's audit" below add the rest, and 8 layer rows that the audit found unproven are set back to not done.
+
 ### Cache, admission and scheduler models
 
 <!-- nova-work:audit-cache:start -->
@@ -190,6 +192,203 @@ Johnny Grok's read of that release, written up on 2026-11-25 against main at `d6
 
 <!-- nova-work:audit-checks:end -->
 
+### Rowan's audit: serving defects
+
+Defects in the server, the root helper, the CLI and the tools that are still open on main.
+
+<!-- nova-work:audit-serve:start -->
+
+| feature | done |
+|---|:---:|
+| Every connection has a deadline for the whole request and each peer a connection cap, so slow or idle clients cannot hold every slot | ❌ |
+| count_tokens bounds its input in tokens and memory, and never starves generation of preprocess permits | ❌ |
+| Admission checks shared prefixes in time linear in the prefilling lanes, with no all-pairs rescans while the GPU waits | ❌ |
+| inky serve refuses a bind address that is neither loopback nor private, so the binding rule the server and fleet rows state holds | ❌ |
+| The recorder queue is bounded in bytes and holds no copy of refused requests | ❌ |
+| The fleet script records card traffic only when asked, into a directory git ignores | ❌ |
+| inky serve refuses to start when its K/V budget cannot hold one request at the pool's hard floor | ❌ |
+| The saved-limit record survives a clock step, so a helper restart always restores the limit it found | ❌ |
+| An unkeyed loopback server checks Host, Origin and Content-Type, so a web page in a local browser cannot drive it | ❌ |
+| A streaming client that reads too slowly is cut off by a total write deadline and frees its lane | ❌ |
+| The accept loop backs off and logs on errors, and the connection cap sits below the descriptor limit | ❌ |
+| An allocation that eviction cannot satisfy fails without emptying the cache, and a rolled-back span leaves the cache as it was | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-serve:end -->
+
+### Rowan's audit: models and trace checks
+
+TLA+ models, trace checks and layout models that do not yet reach the code `inky serve` runs, or that cannot fail as written.
+
+<!-- nova-work:audit-models:start -->
+
+| feature | done |
+|---|:---:|
+| StartTails is bound by trace to the start-point, window-hold and prune rules in ServeBlockCache | ❌ |
+| PrefixTreeTrace and its mutants drive the EntryTree path inky serve uses, including handle refresh and pruning | ❌ |
+| The trace-gate mutants are planted in code inky serve computes with, and each turns its gate red | ❌ |
+| The models keep the window rule the server prunes by, and the WindowOffByOne witness reports a real off-by-one | ❌ |
+| CacheScheduler models spans that cross block boundaries, as every production prefill chunk does | ❌ |
+| CacheScheduler models a start point's recurrent state with its own tier and budget, so StartPointsKept can fail | ❌ |
+| The model and the scheduler twin never seal decode-written blocks or keep start points on them, as decision 4 says | ❌ |
+| BypassBoundHolds counts pass-overs with an independent ghost counter and is checked at a bypass bound above 1 | ❌ |
+| BuildStep waits for an in-flight cold writeback in the model as in the code, so the block keeps its I/O protection | ❌ |
+| ColdBlocksSpillable states a spillability condition that a model which never spills would fail | ❌ |
+| The in-block address arithmetic the Metal kernels run is bound to the InBlock model by trace or test | ❌ |
+| Trace replay checks each step's named action and arguments, so a step that changes nothing is refused | ❌ |
+| The kv-disk tier, the sliding-window ring and prefill scratch, rollback_verify and VecAlloc each have a state or layout model | ❌ |
+| BlockedSlab slot reuse, stride growth and the packed block-table upload have a layout model run at capacity 3 or 4 | ❌ |
+| The slab-packed GPU block-table word has a layout model and a multi-slab test of packing, shader decode and bind order | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-models:end -->
+
+### Rowan's audit: gates and tests
+
+Gates that do not run, that test a different path from the one served, or that pass without checking what they claim.
+
+<!-- nova-work:audit-gates:start -->
+
+| feature | done |
+|---|:---:|
+| Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ❌ |
+| A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
+| The replay set is real fleet card traffic, and the lane-count knee is derived from it | ❌ |
+| Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans | ❌ |
+| servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug | ❌ |
+| The poisoned-slot gate checks poisoned and saved slots after each step, catching stray writes as well as reads | ❌ |
+| Tests drive the serve connection handler with chunked, oversized, unauthenticated, slow and over-cap requests | ❌ |
+| Admission and handler unit tests run on an injected clock, with no sleeps or wall-clock assertions | ❌ |
+| The full-disk and kill steps read the record files back and fail on a torn line | ❌ |
+| The soak and fault gates run in a blocking nightly, and the soak fails on 429s under capacity and on a wired limit that never moved | ❌ |
+| Every GPU gate in ci.sh has a planted-bug control that CI requires to fail | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-gates:end -->
+
+### Rowan's audit: CI, release and repository
+
+The self-hosted runner, branch protection, per-pull-request CI time and the nightly gates.
+
+<!-- nova-work:audit-ci:start -->
+
+| feature | done |
+|---|:---:|
+| The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user | ❌ |
+| main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main | ❌ |
+| Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ❌ |
+| The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget | ❌ |
+| The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-ci:end -->
+
+### Rowan's audit: docs that disagree with the code
+
+One row per document, or per section of a large one, covering every finding about it.
+
+<!-- nova-work:audit-docs:start -->
+
+| feature | done |
+|---|:---:|
+| DESIGN.md and the roadmap state the start-point stride and step building the server runs, one policy the model and gates share | ❌ |
+| DESIGN.md's status line and layer table agree with the roadmap, and DSPARK.md cites current line numbers | ❌ |
+| tests/ci.sh and DESIGN.md describe what the long-prompt agreement check compares | ❌ |
+| DESIGN.md, memd.rs and MemMode.tla say what the code does when the machine sleeps | ❌ |
+| docs/README.md documents the engine environment variables that change serving | ❌ |
+| Roadmap evidence names files and functions that exist on the path serve runs, and row states match the code | ❌ |
+| Release notes and the serve.rs header describe the cross-card reuse and lane states the code has | ❌ |
+| LoopCD has a roadmap row, a design section and serve documentation ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ❌ |
+| specs/README.md, RESULTS.md and CACHE_SCHEDULER.md describe the models and runs CI has, PrefixTree and the 429 rule included | ❌ |
+| Code comments in blocks.rs, prefix.rs, engine.rs, main.rs, poolgate.rs and serve.rs describe what is wired today | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-docs:end -->
+
+### Rowan's audit: smaller defects
+
+The remaining low findings, grouped so that one small change set can close each row.
+
+<!-- nova-work:audit-small:start -->
+
+| feature | done |
+|---|:---:|
+| Release tags are protected, the crates.io publish fails loudly without its token, and the token is scoped to release tags | ❌ |
+| Merged branches are deleted, open fix branches land or close, and no run on main is cancelled without a verdict | ❌ |
+| Every workflow pins actions by SHA and the Rust toolchain by version, and builds with --locked | ❌ |
+| CI test steps fail on zero matched tests, and every ignored test runs in a tier or is ledgered | ❌ |
+| A job with no M5 runner online fails with a message instead of waiting in the queue | ❌ |
+| The fleet script's lane, effort and queue defaults are the ones the lane sweep measured ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| The public repository holds no host inventory, network addresses, firewall state, account paths or secret-store layout | ❌ |
+| The default tuning budget cannot underflow on a small or unreadable memory size ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ❌ |
+| PoisonGate.tla is bound by trace to poolgate, with take, share and release inside the poisoned phase | ❌ |
+| The scheduler twin's walks assert drain, reach the disk tier and check invariants, and cancel during restore is modelled | ❌ |
+| Trace checkers pin each mutant to the property it names and require every action, spill and restore to appear | ❌ |
+| BlockLayout and SpanPins invariants can fail in a healthy run, and each has a witness | ❌ |
+| Model bounds hold two blocks, two window slots and two live start points, so the rules they check are exercised | ❌ |
+| Every checked property, MemMode liveness included, has a reversed witness that reports that property | ❌ |
+| CacheScheduler bounds, invariants and action properties can each fail, and least-recently-used order is visible to the trace | ❌ |
+| PrefixTree's bounds tell Full from Window and deepest from shallowest, and its trace cannot pass by its seed alone | ❌ |
+| The cache trace walk and parser fail on any error or missing field | ❌ |
+| Layer 2 prefill zeroes only its scratch and runs the output-matrix pass only for spans whose logits are read | ❌ |
+| Model loading checks tokenizer fields, tensors and UTF-8 before GPU setup, and a changed file cannot alter a running server | ❌ |
+| --kv-disk is refused with --kv8, opens its file exclusively, checks snapshot fit, and has a bit-identical gate | ❌ |
+| Engine GPU-buffer accessors are bounds-checked or marked unsafe, and no slice outlives its borrow | ❌ |
+| LoopCD's weak-logits buffer is allocated up front and counted in the memory budget | ❌ |
+| Engine tests check encode_spans_x, the shaders and the Metal argument structs themselves, not copies written in the tests | ❌ |
+| A step refuses spans that name the same lane twice, and INK_SPLITS=0 is refused | ❌ |
+| Shaders compile in a math mode that keeps the infinities and rounding the exactness claims rely on | ❌ |
+| Per-step host work in the block cache stays flat: no path copies at each start point and no CPU zero-fill of every slot | ❌ |
+| OpenAI streaming writes each event through a buffer in one send | ❌ |
+| Metal kernels use a device-scope acquire in last_tg, dead kernels are gone, and k_attn_b is split-invariant on window layers | ❌ |
+| The shader compile test fails when it compiles nothing, compiles every variant, and stays in its working directory | ❌ |
+| Dead serve and engine code is gone: kept-prompt lane choice, cross-lane copy and its xcopy gate, stale dead_code marks | ❌ |
+| Dead mirrors in blocks.rs, poolgate.rs and cache_scheduler.rs are gone or use the layouts the GPU uses | ❌ |
+| The CPU sampler truncates to top_k without sorting the whole candidate set | ❌ |
+| CLI flags are validated, --seed 0 is a seed, long prompts are refused, unknown subcommands fail, and the renderer keeps text after bad UTF-8 | ❌ |
+| inky serve reports a bad model file or bind address as an error before entering inky mode, and binds every resolved address | ❌ |
+| Chat and Messages refuse wrongly typed fields and unrenderable content alike, and their errors state the real limits | ❌ |
+| Error tool results tokenize whole, a generated role marker ends the reply, and streaming and non-streaming parse agree | ❌ |
+| Chunked bodies under the cap are accepted, and framing errors get a response sent after the body is drained | ❌ |
+| Disconnect detection handles half-close and bytes sent after the body | ❌ |
+| The admission gate is tested with many waiters and probes sockets outside its lock | ❌ |
+| Chat and Messages streams send keep-alives during prefill, hidden thinking and buffered tool calls | ❌ |
+| Scheduler-thread waits on the GPU and on spill writes have deadlines, and /health reports a stuck scheduler | ❌ |
+| Cached-token counts and restore timing tell a client nothing about other clients' prompt prefixes | ❌ |
+| Lane memory is counted once, retained host copies are budgeted, deferrals are counted, and only lanes that cannot progress fail | ❌ |
+| A failed rebind leaves the lane consistent, and a start being spilled owns the disk blocks it reuses from the start | ❌ |
+| The production scheduler test runs in CI, the stream-poll assertion can fail, and the thinking budget is tested through the scheduler | ❌ |
+| memd and spill unit tests use no real sockets, wall-clock time or child processes | ❌ |
+| The memd helper and its clients read with timeouts, the accept loop backs off on errors, and the client cap sits below the descriptor limit | ❌ |
+| The helper never lowers a higher limit, survives an unparsable saved file, passes its refusal reason, and the model covers that path | ❌ |
+| Recorder files are private, never opened through symlinks, and written a whole line at a time | ❌ |
+| Recorder turn indexes survive tracker eviction, and the test-only recorder helpers are gone | ❌ |
+| tools/replay and tools/load unit tests use no sockets or real time | ❌ |
+| tools/inkconvert checks counts and dimensions, refuses a converted base, reports unmatched -q6-tensors, and never wraps a Q8_0 block | ❌ |
+| The research scripts and the reference oracle refuse edge inputs instead of crashing | ❌ |
+| poolgate requires sharing, reuse and pruning, crosses the 1024 window, and its start-point half has a witness and never skips | ❌ |
+| Soak verdicts fail on 429s under capacity, measure leaks net of the model, and require disconnects to stop generation | ❌ |
+| serve.sh's one-test check is anchored, and the concurrent tool-call probe checks that its four requests overlapped | ❌ |
+| The agreement gate checks the out-of-repo reference against the committed tokens | ❌ |
+| The production tokenizer's pre-splitter and Unicode tables have tests against known pieces | ❌ |
+| A cleared GPU block-table entry is distinct from slot 1, and release builds validate every block of a span | ❌ |
+| Each evaluation measurement row names the job or recorded run that produced it | ❌ |
+| complete | 0% |
+
+[Source data](roadmap.sexp)
+
+<!-- nova-work:audit-small:end -->
+
 ## Evaluation
 
 What was measured and tried before any design, and the design itself.
@@ -272,10 +471,10 @@ Many lanes advance in one step, and each expert is read once for all of them. Th
 | Attention per span in two arithmetics — prefill rows and decode steps — each batch-invariant, so prefill chunking never changes a token's numbers | ✅ |
 | Each lane's convolution state and cache written by its own span only | ✅ |
 | Per-lane sampling with one step in flight, seeded by the request | ✅ |
-| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ✅ |
+| Gate: bit-identical cache, state and multi-step logits for a lane alone and in batches of 1, 2, 64, 65 and 129, with prime-sized prefill splits | ❌ |
 | Gate: agreement with llama.cpp as CI checks it | ✅ |
-| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ✅ |
-| complete | 100% |
+| Gate: measured step time and GPU memory at 2K, 20K and 42K context for 1 to 64 lanes, against the lane table | ❌ |
+| complete | 75% |
 
 [Source data](roadmap.sexp)
 
@@ -295,10 +494,10 @@ The cache becomes a prefix tree of append-only blocks, so identical prefixes are
 | Attention reads keys through a per-lane block table of 64-bit offsets | ✅ |
 | A request matches the deepest start point in a prefix tree of sealed blocks | ✅ |
 | Start points: state, full blocks and the window blocks before them, kept at prompt ends, every 16 blocks and lane heads | ✅ |
-| Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ✅ |
+| Unsealed tails private, zero past their length, dropped at the end; pool slots zeroed on reuse | ❌ |
 | Gate: the engine's traces are behaviours of both models, checked in CI | ❌ |
-| Gate: outputs identical to layer 2 with poisoned pool slots | ✅ |
-| complete | 88% |
+| Gate: outputs identical to layer 2 with poisoned pool slots | ❌ |
+| complete | 66% |
 
 [Source data](roadmap.sexp)
 
@@ -322,10 +521,10 @@ Which lanes share each step, which requests are let in, and which cold blocks le
 | Unreferenced blocks spilled to the SSD lazily under memory pressure, least recently used first | ✅ |
 | Restoring reserves the whole working set atomically before reading | ❌ |
 | Gate: scheduler traces are behaviours of the model, checked in CI | ❌ |
-| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ✅ |
-| Gate: kill -9 in mid-write loses cache and never correctness | ✅ |
-| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ✅ |
-| complete | 53% |
+| Gate: a bimodal workload of 2K and 64K requests under a tight budget; disconnects in mid-step | ❌ |
+| Gate: kill -9 in mid-write loses cache and never correctness | ❌ |
+| Gate: temperature 1 with fixed seeds gives the same outputs with and without the cache | ❌ |
+| complete | 30% |
 
 [Source data](roadmap.sexp)
 
@@ -347,8 +546,8 @@ The endpoint a coding-agent harness talks to.
 | A health endpoint, and binding to loopback or a private network only | ✅ |
 | Gate: the tracer card and a recorded replay set land through it | ✅ |
 | Gate: concurrent cards issuing identical tool calls; disconnects in mid-thinking stop generation | ✅ |
-| Gate: memd traces are behaviours of MemMode.tla, checked in CI | ✅ |
-| complete | 77% |
+| Gate: memd traces are behaviours of MemMode.tla, checked in CI | ❌ |
+| complete | 66% |
 
 [Source data](roadmap.sexp)
 
