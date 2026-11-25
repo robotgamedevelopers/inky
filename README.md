@@ -15,4 +15,8 @@ This is a fork of [erisinky](https://github.com/Eriskii/erisinky) by Eris.
 
 Built by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)), Rowan Claude and Eris.
 
-For more information, please ask your AI to [read the docs](docs/README.md).
+For more information, please ask your AI to [read the docs](docs/README.md), or see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for building and running the validation suite with or without an M5 Mac.
+
+## Licensing (`GPL-3.0-or-later`)
+
+`inky` (and the `inky-engine` crate) is free software distributed under the [GNU General Public License v3.0 or later](LICENSE), inherited from upstream `erisinky`. Linking, embedding, or redistributing `inky` or `inky-engine` in a binary or library requires distributing the combined work's complete corresponding source code under `GPL-3.0-or-later`-compatible terms. Calling `inky serve` as a separate process over its HTTP APIs (`/v1/chat/completions`, `/v1/messages`, `/health`) sends prompts and receives generated tokens over standard network protocols without linking `inky` into the client program, though any redistributed copy or modified version of `inky` itself remains covered by `GPL-3.0-or-later`.

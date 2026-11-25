@@ -79,6 +79,22 @@ INKY_URL=http://<server-tailnet-ip>:18096 INKY_SERVE_KEY="$KEY" ./tests/fleet_ga
 
 Each fleet card gets a fresh private fixture directory. Pass `fleetcheck -workdir DIR` to keep it under DIR. The model can read the acceptance tests and edit the standalone `Clamp` function in `mathutil.go`. Each verification runs the Go distribution and read-only fixture in a fresh Bubblewrap sandbox with a private network namespace, empty initial environment, disposable scratch space and a 90-second deadline. The Linux worker needs `bwrap` with user namespaces and a local Go toolchain. A sandbox startup error fails the card.
 
+### Live Bubblewrap-Isolated Fleet Card Receipt (2026-11-25, Linux bench -> M5 Max `v0.2.3` host)
+
+Re-verified with the Bubblewrap-sandboxed `tests/fleetcheck` verifier (`#82`: private network namespace `--unshare-net`, empty initial environment `--clearenv`, read-only acceptance test mount, disposable scratch workspace, 90-second deadline) against live `inky serve v0.2.3` over Tailscale:
+
+- **Client**: a Linux fleet bench (`x86_64`, `bwrap` + Go `1.26.10`)
+- **Server**: an M5 Max 128 GB host (`http://<server-tailnet-host>:8096`, `inky v0.2.3`, `max_admitted_lanes: 32`, `kv8: false`)
+- **Result**:
+  - `GET http://<server-tailnet-host>:8096/health` -> `200 OK` (`{"active_lanes":0,"inflight":0,"kv8":false,"kv_bytes_per_elem":2,"max_admitted_lanes":32,"model_bytes":19365347328,"ok":true,"per_lane_worst_case_bytes":1250339104,"queued_requests":0,"recommended_working_set_bytes":115448725504,...}`)
+  - 4-turn Bubblewrap-isolated coding-agent card (`fleet-card-v023-bwrap`):
+    - Turn 0: `read_file({"path":"mathutil.go"})` (`ok=true`), `read_file({"path":"mathutil_test.go"})` (`ok=true`)
+    - Turn 1: `edit_file({"path":"mathutil.go","old_text":"\tif v > hi {\n\t\treturn lo\n\t}","new_text":"\tif v > hi {\n\t\treturn hi\n\t}"})` (`ok=true`)
+    - Turn 2: `run_test({"command":"go test -v ./..."})` inside Bubblewrap sandbox (`ok=true`)
+    - Turn 3: final summary (`finish_reason: stop`)
+  - `FLEET_CARD_PASS card_id=fleet-card-v023-bwrap turns=4 tools=read_file,edit_file,run_test prompt_tokens=3391 cached_tokens=2304 completion_tokens=302`
+  - Final isolated Bubblewrap `go test -v ./...` verification: `--- PASS: TestClamp (0.00s)`, `PASS`, `ok fleetcard 0.003s`
+
 ### Live Cross-Machine Proof Receipt (2026-11-24, Linux bench -> M5 Pro host)
 
 - **Client**: a Linux bench (Linux x86_64)

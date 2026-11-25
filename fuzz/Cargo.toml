@@ -1,0 +1,22 @@
+[package]
+name = "inky-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so root `cargo test --locked` and `cargo publish --locked` stay isolated.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "gguf_load"
+path = "fuzz_targets/gguf_load.rs"
+test = false
+doc = false
+bench = false
