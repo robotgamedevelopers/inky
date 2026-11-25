@@ -852,6 +852,130 @@ fn binv(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// Compare the same target row through tensor prefill and tensor decode. Every checked end gets its own
+/// span of CROSSPATH_SPAN rows ending at that end (fewer only when the end is shorter), started from one
+/// base lane that never takes part in a comparison: the prefill lane runs the whole span as one multi-row
+/// prefill, the decode lane prefills all but its last row and decodes that row. A one-row prefill would take
+/// the decode path's ring write (`ring = l.swa && t == 1` in engine.rs) and compare decode with itself, so
+/// every span has at least two rows, and a span ending just past a split boundary crosses it.
+const CROSSPATH_SPAN: usize = 17;
+const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
+
+fn crosspath_start(end: usize) -> usize { end.saturating_sub(CROSSPATH_SPAN) }
+
+fn crosspath_completed(status: objc2_metal::MTLCommandBufferStatus) -> bool { status == objc2_metal::MTLCommandBufferStatus::Completed }
+
+fn wait_crosspath(cb: &metal::CmdBuf) {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if !crosspath_completed(status) {
+        let error = cb.error().map(|e| e.localizedDescription().to_string());
+        panic!("crosspath Metal command failed (status {status:?}): {}", error.as_deref().unwrap_or("no driver error provided"));
+    }
+}
+
+#[cfg(test)]
+mod crosspath_tests {
+    use super::*;
+
+    #[test]
+    fn only_successful_gpu_completion_is_accepted() {
+        assert!(crosspath_completed(objc2_metal::MTLCommandBufferStatus::Completed));
+        assert!(!crosspath_completed(objc2_metal::MTLCommandBufferStatus::Error));
+        assert!(!crosspath_completed(objc2_metal::MTLCommandBufferStatus::Scheduled));
+    }
+
+    #[test]
+    fn every_default_boundary_uses_an_independent_17_row_span() {
+        let ends: Vec<usize> = CROSSPATH_ENDS.split(',').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ends.len(), 12);
+        let mut cursor = 0;
+        for end in ends {
+            let start = crosspath_start(end);
+            assert!(start >= cursor);
+            assert_eq!(end - start, 17);
+            cursor = start;
+        }
+    }
+}
+
+fn crosspath(o: &Opts) {
+    use engine::Span;
+
+    let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens")
+        .lines().map(|line| line.trim().parse().unwrap()).collect();
+    let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS").unwrap_or_else(|_| {
+        CROSSPATH_ENDS.into()
+    }).split(',').map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts")).collect();
+    let len = *ends.last().unwrap();
+    assert!(ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
+            "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)");
+    assert!(len <= toks.len() && len <= o.ctx, "crosspath fixture or context is too short");
+
+    let eng = Engine::load(&o.model, o.ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(1);
+    assert!(CROSSPATH_SPAN <= eng.chunk, "a crosspath span must fit one prefill chunk");
+    let base = Lane::new(&eng);
+    let prefill = Lane::new(&eng);
+    let decode = Lane::new(&eng);
+    for lane in [&base, &prefill, &decode] {
+        let run = eng.on(lane);
+        run.reserve(len, false);
+        run.set_tokens(0, &toks[..len]);
+    }
+
+    let run_prefill = |lane: &Lane, p0, t, logits| {
+        let cb = eng.gpu.cmd();
+        eng.on(lane).encode_prefill(&cb, p0, t, logits, false);
+        cb.commit();
+        wait_crosspath(&cb);
+    };
+    // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
+    let mut cursor = 0;
+    let mut ok = true;
+    for end in ends {
+        let start = crosspath_start(end);
+        let target = end - 1;
+        assert!(start >= cursor && target - start >= 1, "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows");
+        while cursor < start {
+            let count = (start - cursor).min(eng.chunk);
+            run_prefill(&base, cursor, count, false);
+            cursor += count;
+        }
+        eng.copy_lane(&base, &prefill);
+        eng.copy_lane(&base, &decode);
+        run_prefill(&decode, start, target - start, false);
+        run_prefill(&prefill, start, end - start, true);
+        let expected = eng.logits().to_vec();
+        let cb = eng.gpu.cmd();
+        eng.encode_decode(&cb, &[Span { lane: &decode, p0: target, t: 1 }], true, false);
+        cb.commit();
+        wait_crosspath(&cb);
+        let actual = eng.span_logits(0);
+        let first_bad = expected.iter().zip(actual).position(|(&a, &b)| {
+            !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
+        });
+        let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&decode);
+        if let Some(i) = first_bad {
+            println!("after {end} tokens: logit {i} differs (prefill {:08x}, decode {:08x}), prefill span [{start}, {end})",
+                     expected[i].to_bits(), actual[i].to_bits());
+        }
+        if !state_equal {
+            println!("after {end} tokens: cache or convolution state differs, prefill span [{start}, {end})");
+        }
+        if first_bad.is_none() && state_equal {
+            println!("after {end} tokens: exact, prefill span [{start}, {end}) of {} rows", end - start);
+        }
+        ok &= first_bad.is_none() && state_equal;
+    }
+    if !ok {
+        println!("CROSSPATH MISMATCH");
+        std::process::exit(1);
+    }
+    println!("crosspath exact: tensor prefill and decode agree");
+}
+
 /// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
 /// each lane exactly the logits it gives alone. Lane A is the --ref tokens, lane B the same tokens rotated by a third (a
 /// different stream of the same length). Each lane prefills its first INK_PF tokens in chunks of INK_LANE_CHUNK, then
@@ -1956,6 +2080,7 @@ fn main() {
         "rows" => rows(&o),
         "rollback" => rollback(&o),
         "binv" => report_cli_result(&cmd, binv(&o)),
+        "crosspath" => crosspath(&o),
         "lanes" => lanes(&o),
         "spans" => spans(&o),
         "xcopy" => xcopy(&o),
