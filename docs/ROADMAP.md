@@ -223,6 +223,8 @@ Run it for days.
 
 Improvements that wait for the layers above. Those that change the model's numbers also wait for the quality replay.
 
+Hardening from a comprehensive audit (Aurora Muse, 2026-11-24, at be82ef3 v0.2.2; the full report was shared on the fleet bus): the last eight rows below. The audit's top finding stands behind them — inky is a genuinely impressive, unusually well-verified niche engine, narrowly locked to M5 and Metal 4, with very large core files and a heavy unsafe and panic surface — so the rows favour reviewability, supply-chain hygiene, and safe serving defaults over new capability.
+
 Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in parallel lanes and lands the first whose check passes; the N attempts share their prompt through cross-lane prompt-prefix reuse (pull request 22). Its gate is the tier test from the flash+ provider goal (pull request 17): land rate per tier, 1 attempt against best-of-4, on mas-bandwidth/sprint-corpus. Aggregation and critic start only if pro still misses the flash+ bar after best-of-N.
 
 <!-- nova-work:later:start -->
@@ -250,7 +252,15 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
 | Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
 | Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
-| complete | 4% |
+| Split the largest core files (engine.rs, serve.rs, scheduler.rs, cache_scheduler.rs, spill.rs) behind the TLA trace checks, so each change stays reviewable (later) | ❌ |
+| Dependency hygiene in CI: cargo audit and Dependabot, so a vulnerable crate is caught without a human noticing (later) | ❌ |
+| Unauthenticated serving is loopback-only: warn loudly or refuse a non-loopback bind with no API key set (later) | ❌ |
+| Fuzz the GGUF loader, so a malformed model file cannot panic or corrupt the engine (later) | ❌ |
+| Request paths return errors instead of unwrapping, so bad input cannot abort the server (about 1546 unwrap and expect sites at the audit) (later) | ❌ |
+| A contributor path for machines without an M5: what can be built and validated where, so outside changes are testable (later) | ❌ |
+| Checked rustfmt and clippy configuration in CI, so style survives team growth (later) | ❌ |
+| One paragraph in the README on what GPL-3.0 means for embedding inky downstream (later) | ❌ |
+| complete | 3% |
 
 [Source data](roadmap.sexp)
 
