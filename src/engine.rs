@@ -675,10 +675,67 @@ impl Engine {
         swa_kv.saturating_add(full_kv).saturating_add(cs).saturating_add(toks).saturating_add(dbatch_arena) as u64
     }
     /// Worst-case GPU memory required by a single lane at `self.max_ctx`.
+    #[allow(dead_code)]
     pub fn per_lane_worst_case_bytes(&self) -> u64 {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         let n_full = N_SLOT - n_swa;
         Self::lane_worst_case_bytes_for(n_swa, n_full, self.max_ctx, self.kvb, self.ar.total as usize)
+    }
+    /// Realistic paged per-lane working reserve for Layer 3 `serve`: KV blocks are paged from
+    /// shared `BlockPools` rather than pre-allocated to `max_ctx`, so admission sizes lanes using
+    /// `min(max_ctx, 32768)` KV tokens plus full `max_ctx` token/block-table metadata.
+    pub fn per_lane_paged_reserve_bytes(&self) -> u64 {
+        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
+        let n_full = N_SLOT - n_swa;
+        let working_ctx = self.max_ctx.min(32768);
+        let base = Self::lane_worst_case_bytes_for(n_swa, n_full, working_ctx, self.kvb, self.ar.total as usize);
+        let extra_toks = self.max_ctx.saturating_sub(working_ctx).saturating_mul(4) as u64;
+        let bt_bytes = self.max_ctx.div_ceil(crate::blocks::BLOCK).saturating_mul(16) as u64;
+        base.saturating_add(extra_toks).saturating_add(bt_bytes)
+    }
+    /// Pure Layer 3 block-pool sizing from `kv_budget_bytes`: allocates ~15% to `Window` slots
+    /// and ~85% to `Full` slots while ensuring at least `max_lanes * span_bound(chunk) + 256`
+    /// window slots when budget permits (capped to 45% of `kv_budget_bytes` so `Full` is never starved,
+    /// with a hard floor of `span_bound(chunk)`), bounded by `MAX_SLABS` per kind.
+    pub fn serve_block_pool_counts(
+        kv_budget_bytes: u64,
+        kvb: u32,
+        chunk: usize,
+        max_lanes: usize,
+        max_slab_bytes: u64,
+    ) -> (usize, usize) {
+        use crate::blocks::{span_bound, stride_at, BlockKind, MAX_SLABS};
+        let win_stride = stride_at(BlockKind::Window, kvb).expect("valid kvb");
+        let full_stride = stride_at(BlockKind::Full, kvb).expect("valid kvb");
+        let max_win_slab = MAX_SLABS.saturating_mul((max_slab_bytes / win_stride) as usize).max(1);
+        let max_full_slab = MAX_SLABS.saturating_mul((max_slab_bytes / full_stride) as usize).max(1);
+        let total_win_cap = ((kv_budget_bytes / win_stride) as usize).max(1);
+        let lanes = max_lanes.max(1);
+        let target_win = ((kv_budget_bytes.saturating_mul(15) / 100) / win_stride) as usize;
+        let desired_min_win = lanes.saturating_mul(span_bound(chunk)).saturating_add(256);
+        let hard_min_win = span_bound(chunk).max(32);
+        let budget_win_cap = ((kv_budget_bytes.saturating_mul(45) / 100) / win_stride) as usize;
+        let floor_win = desired_min_win.min(budget_win_cap.max(hard_min_win));
+        let n_window = target_win.max(floor_win).clamp(1, total_win_cap.min(max_win_slab));
+        let win_bytes = (n_window as u64).saturating_mul(win_stride);
+        let rem_bytes = kv_budget_bytes.saturating_sub(win_bytes);
+        let n_full = ((rem_bytes / full_stride) as usize).clamp(1, max_full_slab);
+        (n_window, n_full)
+    }
+    /// Size and allocate GPU Layer 3 `BlockPools` for `serve` from `kv_budget_bytes` and `max_lanes`.
+    /// Returns `(n_window, n_full)`.
+    pub fn init_serve_block_pools(&self, kv_budget_bytes: u64, max_lanes: usize) -> (usize, usize) {
+        let max_slab = self.gpu.dev.maxBufferLength() as u64;
+        let (n_window, n_full) = Self::serve_block_pool_counts(
+            kv_budget_bytes,
+            self.kvb as u32,
+            self.chunk,
+            max_lanes,
+            max_slab,
+        );
+        let pools = crate::blocks::BlockPools::gpu(&self.gpu.dev, n_window, n_full, self.kvb as u32);
+        *self.block_pool.borrow_mut() = pools;
+        (n_window, n_full)
     }
     /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
     /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
@@ -2466,6 +2523,7 @@ impl<'a> Run<'a> {
     /// full-attention rows); `headroom` adds slack for the tokens about to be generated so growth stays rare.
     pub fn reserve(&self, n: usize, headroom: bool) {
         assert!(n <= self.max_ctx, "context full ({} tokens)", self.max_ctx);
+        if self.lane.use_blocks.get() { return; }
         let grow = |buf: &std::cell::RefCell<Buf>, capc: &std::cell::Cell<usize>, need: usize, limit: usize, nslots: usize| {
             let old = capc.get();
             if need <= old { return; }
