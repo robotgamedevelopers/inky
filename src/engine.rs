@@ -87,7 +87,16 @@ struct Chunk { exec: usize, kind: usize, i: usize, c0: usize, c1: usize, round: 
 struct ExecPlan { b: usize, kps: usize, nsplit: usize, sp0: usize, ns: usize }
 
 /// the encoder a decode step is being written to; with the disk tier a step spans several command buffers
-pub struct Cx { e: Enc, cb: Option<CmdBuf> }
+pub struct Cx { e: Enc, cb: Option<CmdBuf>, prior: Vec<CmdBuf> }
+
+/// All submitted command buffers for a single decode step.
+pub struct DecodeStep { prior: Vec<CmdBuf>, last: CmdBuf }
+
+impl DecodeStep {
+    pub fn wait(&self, pos: usize) -> Result<(), String> {
+        wait_all(self.prior.iter().chain([&self.last]), |cb| wait_completed(cb, "decode", pos))
+    }
+}
 
 /// process-wide default for `Engine::load`: the opt-in 8-bit K/V cache (`--kv8`)
 pub static KV8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2096,7 +2105,7 @@ impl Engine {
                 "decode batch arenas: call ensure_dbatch() after ensure_batch()");
         for (l, pos) in lanes { assert!(l.tier.is_none() && l.prune.borrow().is_none() && *pos < self.on(l).kv_capacity(), "K/V capacity: call reserve() first"); }
         let base = |j: usize| start + j as u32 * tot;
-        let mut cx = Cx { e: Enc::new(cb), cb: None };
+        let mut cx = Cx { e: Enc::new(cb), cb: None, prior: Vec::new() };
         self.bind_eng(&cx.e);
         for (j, (l, pos)) in lanes.iter().enumerate() {
             self.abase.set(base(j));
@@ -3431,10 +3440,14 @@ impl<'a> Run<'a> {
         if s > t.stg.borrow().length() { *t.stg.borrow_mut() = self.gpu.buffer(s); t.half.set(0); }
         t.next.set(pos + 64);
     }
-    /// One decode step, committed: returns the command buffer whose completion means the step is done.
-    pub fn step(&self, pos: usize, logits: bool, argmax: bool) -> CmdBuf {
+    /// Commit one decode step. Tiered decoding can submit several command buffers per step.
+    pub fn step(&self, pos: usize, logits: bool, argmax: bool) -> DecodeStep {
         let cb = self.gpu.cmd();
-        if !self.tier_on() { self.encode_step(&cb, pos, logits, argmax); cb.commit(); return cb; }
+        if !self.tier_on() {
+            self.encode_step(&cb, pos, logits, argmax);
+            cb.commit();
+            return DecodeStep { prior: Vec::new(), last: cb };
+        }
         let t = self.lane.tier.as_ref().unwrap();
         // Rows this step overwrites go to the file first - in fact one split earlier than that (and in batches of 16), so the
         // keys around the hot ring's start are in both places. Rows older than 32 steps are final (2 steps are in flight).
@@ -3502,9 +3515,9 @@ impl<'a> Run<'a> {
         *t.execs.borrow_mut() = execs;
         *t.plan.borrow_mut() = plan;
         t.loaded.set(usize::MAX);
-        let mut cx = Cx { e: Enc::new(&cb), cb: Some(cb) };
+        let mut cx = Cx { e: Enc::new(&cb), cb: Some(cb), prior: Vec::new() };
         self.encode_step_cx(&mut cx, pos, logits, argmax);
-        let Cx { e, cb } = cx;
+        let Cx { e, cb, prior } = cx;
         e.end();
         let cb = cb.unwrap();
         cb.commit();
@@ -3512,7 +3525,7 @@ impl<'a> Run<'a> {
         let h = t.half.get();
         t.pending.borrow_mut()[h] = Some(cb.clone());
         t.half.set(h ^ 1);
-        cb
+        DecodeStep { prior, last: cb }
     }
     /// make the staging round of chunk `k` of the plan available: switch halves if it is a new one and read it from the file
     fn tier_load(&self, cx: &mut Cx, k: usize) {
@@ -3528,7 +3541,8 @@ impl<'a> Run<'a> {
             let ocb = cx.cb.replace(ncb).unwrap();
             ocb.commit();
             let h = t.half.get();
-            t.pending.borrow_mut()[h] = Some(ocb);
+            t.pending.borrow_mut()[h] = Some(ocb.clone());
+            cx.prior.push(ocb);
             t.half.set(h ^ 1);
             self.bind(&cx.e);
         }
@@ -3772,7 +3786,7 @@ impl<'a> Run<'a> {
     pub fn encode_step(&self, cb: &CmdBuf, pos: usize, logits: bool, argmax: bool) {
         assert!(!self.tier_on(), "with the disk tier a step spans several command buffers: use step()");
         assert!(pos < self.kv_capacity(), "K/V capacity: call reserve() first");
-        let mut cx = Cx { e: Enc::new(cb), cb: None };
+        let mut cx = Cx { e: Enc::new(cb), cb: None, prior: Vec::new() };
         self.encode_step_cx(&mut cx, pos, logits, argmax);
         cx.e.end();
     }

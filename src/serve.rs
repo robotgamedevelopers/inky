@@ -469,25 +469,9 @@ fn streaming_delta_usage(prompt: usize, cached: usize, gen: usize) -> Value { an
 
 fn sse_text(event: &str, data: &Value) -> String { format!("event: {event}\ndata: {data}\n\n") }
 
-/// Decode complete UTF-8 sequences and replace malformed bytes, retaining only an
-/// incomplete trailing sequence until more bytes arrive or the segment ends.
 fn take_stream_text(pend: &mut Vec<u8>, end: bool) -> String {
-    let mut consumed = 0;
-    while consumed < pend.len() {
-        match std::str::from_utf8(&pend[consumed..]) {
-            Ok(_) => { consumed = pend.len(); break; }
-            Err(e) => {
-                consumed += e.valid_up_to();
-                match e.error_len() {
-                    Some(n) => consumed += n,
-                    None if end => { consumed = pend.len(); break; }
-                    None => break,
-                }
-            }
-        }
-    }
-    let text = String::from_utf8_lossy(&pend[..consumed]).into_owned();
-    pend.drain(..consumed);
+    let mut text = String::new();
+    crate::stream_text::stream_text(pend, end, |s| text.push_str(s));
     text
 }
 

@@ -12,6 +12,41 @@ pub type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pso = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
+/// Check every submitted command before returning the first failure. Buffers
+/// use unretained references, so callers must finish draining before releasing resources.
+pub fn wait_all<T>(
+    commands: impl IntoIterator<Item = T>,
+    mut wait: impl FnMut(T) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut result = Ok(());
+    for command in commands {
+        result = result.and(wait(command));
+    }
+    result
+}
+
+/// Expose the oldest command's result only after it completes. On failure,
+/// finish the commands already queued after it before returning the error.
+pub fn wait_or_drain<T>(
+    first: T,
+    pending: impl IntoIterator<Item = T>,
+    mut wait: impl FnMut(T) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Err(error) = wait(first) {
+        let _ = wait_all(pending, wait);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn wait_completed(cb: &CmdBuf, stage: &str, pos: usize) -> Result<(), String> {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
+    let detail = cb.error().map(|err| format!(": {}", err.localizedDescription())).unwrap_or_default();
+    Err(format!("Metal {stage} at token {pos} failed ({status:?}){detail}"))
+}
+
 pub struct Gpu {
     pub dev: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
