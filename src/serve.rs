@@ -2069,46 +2069,61 @@ fn enqueue(cx: &Ctx, job: Job) -> Result<(), ()> {
     })
 }
 
-fn record_turn_outcome(
-    cx: &Ctx,
-    turn: Option<(String, u64)>,
-    endpoint: &str,
-    req: &Value,
-    req_start: Instant,
-    first_tok: Option<Instant>,
+/// The scheduler's outcome is provisional until the handler has flushed the response.
+struct TurnDelivery {
+    start: Instant,
+    first_token: Option<Instant>,
     prompt_tokens: usize,
     completion_tokens: usize,
-    timing: Option<&TimingSnapshot>,
-    finish_reason: &str,
+    phase_ms: (u64, u64, u64),
+    finish_reason: &'static str,
     status_code: u16,
-) {
-    let (Some(rec), Some((card_id, turn_index))) = (&cx.recorder, turn) else { return };
-    let total_ms = req_start.elapsed().as_millis() as u64;
-    let ttft_ms = first_tok
-        .map(|t| t.saturating_duration_since(req_start).as_millis() as u64)
-        .unwrap_or(total_ms);
-    let (queue_ms, prefill_ms, decode_ms) = timing
-        .map(|t| (t.queue_ms, t.prefill_ms, t.decode_ms))
-        .unwrap_or((0, 0, 0));
-    rec.record(crate::record::RecordEntry {
-        schema_version: crate::record::SCHEMA_VERSION,
-        recorded_at_ms: crate::record::now_ms(),
-        card_id,
-        turn_index,
-        endpoint: endpoint.to_string(),
-        request: req.clone(),
-        response: crate::record::ResponseMetrics {
-            prompt_tokens,
-            completion_tokens,
-            ttft_ms,
-            total_ms,
-            queue_ms,
-            prefill_ms,
-            decode_ms,
-            finish_reason: finish_reason.to_string(),
-            status_code,
-        },
-    });
+}
+
+impl TurnDelivery {
+    fn status(&mut self, code: u16, reason: &'static str) {
+        self.status_code = code;
+        self.finish_reason = reason;
+    }
+
+    fn token(&mut self) {
+        self.first_token.get_or_insert_with(Instant::now);
+        self.completion_tokens += 1;
+    }
+
+    fn completed(&mut self, prompt: usize, generated: usize, timing: &TimingSnapshot, reason: &'static str) {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = generated;
+        self.phase_ms = (timing.queue_ms, timing.prefill_ms, timing.decode_ms);
+        self.status(200, reason);
+    }
+}
+
+fn record_delivery(
+    cx: &Ctx, req: &Value, card_id: Option<&str>, endpoint: &str,
+    respond: impl FnOnce(&mut TurnDelivery) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut turn = TurnDelivery {
+        start: Instant::now(), first_token: None, prompt_tokens: 0, completion_tokens: 0,
+        phase_ms: (0, 0, 0), finish_reason: "cancelled", status_code: 499,
+    };
+    let recording = cx.recorder.as_ref().map(|rec| (rec, rec.allocate_turn(card_id)));
+    let result = respond(&mut turn);
+    if let Some((rec, (card_id, turn_index))) = recording {
+        if result.is_err() { turn.status(499, "cancelled"); }
+        let total_ms = turn.start.elapsed().as_millis() as u64;
+        let ttft_ms = turn.first_token.map(|t| t.duration_since(turn.start).as_millis() as u64).unwrap_or(total_ms);
+        let (queue_ms, prefill_ms, decode_ms) = turn.phase_ms;
+        rec.record(crate::record::RecordEntry {
+            schema_version: crate::record::SCHEMA_VERSION, recorded_at_ms: crate::record::now_ms(),
+            card_id, turn_index, endpoint: endpoint.to_string(), request: req.clone(),
+            response: crate::record::ResponseMetrics {
+                prompt_tokens: turn.prompt_tokens, completion_tokens: turn.completion_tokens, ttft_ms, total_ms,
+                queue_ms, prefill_ms, decode_ms, finish_reason: turn.finish_reason.into(), status_code: turn.status_code,
+            },
+        });
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2117,12 +2132,13 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
 }
 
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
-    let mut first_tok: Option<Instant> = None;
+    record_delivery(cx, req, card_id, "/v1/chat/completions", |turn| chat_response(cx, req, s, turn))
+}
+
+fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
     // every client-controlled number is checked here, never in the scheduler
     let mut bad = |m: String| {
-        record_turn_outcome(cx, turn.clone(), "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+        turn.status(400, "invalid_request");
         respond(s, 400, &json!({"error": {"message": m}}).to_string())
     };
     if let Err(message) = check_generation_controls(req, Route::Chat) { return bad(message); }
@@ -2173,11 +2189,11 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "overloaded", 429);
+            turn.status(429, "overloaded");
             return openai_overloaded(s, cx.admission.retry_after_secs(), e);
         }
         Err(AdmitError::ClientGone) => {
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "cancelled", 499);
+            turn.status(499, "cancelled");
             return Ok(());
         }
     };
@@ -2192,7 +2208,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
                 RenderError::Invalid(message) => message,
                 RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
             };
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2200,7 +2216,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         Ok(m) => m,
         Err(message) => {
             drop(permit);
-            record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "invalid_request", 400);
+            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -2212,9 +2228,10 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         h
     });
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    turn.prompt_tokens = toks.len();
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
-        record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, 0, None, "unavailable", 503);
+        turn.status(503, "unavailable");
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
     let stream = req["stream"].as_bool().unwrap_or(false);
@@ -2235,7 +2252,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
                 continue;
@@ -2245,15 +2262,15 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
         match ev {
             Ev::Alive => {
                 if s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
             }
             Ev::Tok(t) => {
-                if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                turn.token();
                 gen.push(t);
                 if gen.len() % 16 == 0 && s.client_gone() {
-                    record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, "cancelled", 499);
+                    turn.status(499, "cancelled");
                     return Ok(());
                 }
                 if !stream { continue; }
@@ -2283,7 +2300,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let finish = if !p.calls.is_empty() { "tool_calls" } else if reason == "length" { "length" } else { "stop" };
-                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, prompt, ng, Some(&timing), finish, 200);
+                turn.completed(prompt, ng, &timing, finish);
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{}_{seq}_{i}", cx.nonce), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
                 let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
@@ -2312,7 +2329,7 @@ fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Optio
             }
             Ev::Err(ref message) | Ev::Failed(ref message) => {
                 let (code, kind) = if matches!(ev, Ev::Err(_)) { (400, "invalid_request_error") } else { (500, "server_error") };
-                record_turn_outcome(cx, turn, "/v1/chat/completions", req, req_start, first_tok, 0, gen.len(), None, kind, code);
+                turn.status(code, kind);
                 let error = json!({"error": {"type": kind, "message": message}});
                 if stream {
                     write!(s, "data: {error}\n\n")?;
@@ -2343,21 +2360,19 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
 }
 
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    let req_start = Instant::now();
-    let turn = cx.recorder.as_ref().map(|r| r.allocate_turn(card_id));
-    let mut first_tok: Option<Instant> = None;
-    let record_err = |first_tok: Option<Instant>, code: u16, reason: &str, gen_len: usize| {
-        record_turn_outcome(cx, turn.clone(), "/v1/messages", req, req_start, first_tok, 0, gen_len, None, reason, code);
-    };
+    record_delivery(cx, req, card_id, "/v1/messages", |turn| messages_response(cx, req, s, turn))
+}
+
+fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
     // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
     if let Err(message) = check_generation_controls(req, Route::Messages) {
-        record_err(first_tok, 400, "invalid_request_error", 0);
+        turn.status(400, "invalid_request_error");
         return anthropic_error(s, 400, "invalid_request_error", &message);
     }
     let max = match req["max_tokens"].as_u64() {
-        Some(0) => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
+        Some(0) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
+        None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
@@ -2365,7 +2380,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         None | Some(Value::Null) => 64,
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
             Some(k) => k,
-            None => { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
         },
     };
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
@@ -2379,17 +2394,17 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         Some(v) => match v.as_f64() {
             Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
             _ => {
-                record_err(first_tok, 400, "invalid_request_error", 0);
+                turn.status(400, "invalid_request_error");
                 return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4");
             }
         },
     };
-    if !(0.0..=2.0).contains(&temp) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { record_err(first_tok, 400, "invalid_request_error", 0); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if !(0.0..=2.0).contains(&temp) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(AdmitError::Overloaded(e)) => { record_err(first_tok, 429, "rate_limit_error", 0); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
-        Err(AdmitError::ClientGone) => { record_err(first_tok, 499, "cancelled", 0); return Ok(()); }
+        Err(AdmitError::Overloaded(e)) => { turn.status(429, "rate_limit_error"); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
+        Err(AdmitError::ClientGone) => { turn.status(499, "cancelled"); return Ok(()); }
     };
     let rendered = render_messages(cx, req, cx.ctx);
     drop(preprocess);
@@ -2402,7 +2417,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                 // Retain the numeric error format used by clients for reactive compaction.
                 RenderError::TooLong => format!("prompt is too long: {} tokens > {} maximum", cx.ctx.saturating_add(1), cx.ctx),
             };
-            record_err(first_tok, 400, "invalid_request_error", 0);
+            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &message);
         }
     };
@@ -2411,7 +2426,7 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         Ok(m) => m,
         Err(e) => {
             drop(permit);
-            record_err(first_tok, 400, "invalid_request_error", 0);
+            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &e);
         }
     };
@@ -2423,8 +2438,9 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
         h
     };
     let (tx, rx) = job_events();
-    let job = Job { seq, queued_at: req_start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
-    if enqueue(cx, job).is_err() { record_err(first_tok, 503, "api_error", 0); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    turn.prompt_tokens = toks.len();
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    if enqueue(cx, job).is_err() { turn.status(503, "api_error"); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -2441,27 +2457,27 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
             let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
                     write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    record_err(first_tok, 500, "api_error", received);
+                    turn.status(500, "api_error");
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
                     return s.flush();
                 }
             };
             match ev {
-                Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
                 Ev::Tok(t) => {
-                    if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                    turn.token();
                     received += 1;
-                    if received % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", received); return Ok(()); }
+                    if received % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
                     for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
                 }
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
-                    for text in bs.close_all() { write!(s, "{text}")?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
-                    record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
+                    turn.completed(prompt, ng, &timing, stop);
+                    for text in bs.close_all() { write!(s, "{text}")?; }
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {}", timing.summary, calls = bs.calls);
                     write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
@@ -2470,13 +2486,13 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
                     return s.flush();
                 }
                 Ev::Err(e) => {
-                    record_err(first_tok, 400, "invalid_request_error", received);
+                    turn.status(400, "invalid_request_error");
                     for text in bs.close_all() { write!(s, "{text}")?; }
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
                     return s.flush();
                 }
                 Ev::Failed(message) => {
-                    record_err(first_tok, 500, "api_error", received);
+                    turn.status(500, "api_error");
                     write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
                     return s.flush();
                 }
@@ -2487,27 +2503,27 @@ fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: O
     loop {
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } continue; }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } continue; }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
         };
         match ev {
-            Ev::Alive => { if s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); } }
+            Ev::Alive => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } }
             Ev::Tok(t) => {
-                if first_tok.is_none() { first_tok = Some(Instant::now()); }
+                turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() { record_err(first_tok, 499, "cancelled", gen.len()); return Ok(()); }
+                if gen.len() % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let p = parse(&cx.tk, &sp, &gen);
                 let stop = anthropic_stop_reason(!p.calls.is_empty(), reason);
-                record_turn_outcome(cx, turn, "/v1/messages", req, req_start, first_tok, prompt, ng, Some(&timing), stop, 200);
+                turn.completed(prompt, ng, &timing, stop);
                 eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
                 return respond_with_timing(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
                     "content": anthropic_content(&p, &cx.nonce, seq), "stop_reason": stop, "stop_sequence": null,
                     "usage": anthropic_usage(prompt, cached, ng)}).to_string(), &timing);
             }
-            Ev::Err(e) => { record_err(first_tok, 400, "invalid_request_error", gen.len()); return anthropic_error(s, 400, "invalid_request_error", &e); }
-            Ev::Failed(message) => { record_err(first_tok, 500, "api_error", gen.len()); return anthropic_error(s, 500, "api_error", &message); }
+            Ev::Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+            Ev::Failed(message) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", &message); }
         }
     }
 }
@@ -4405,6 +4421,88 @@ mod tests {
         assert_eq!(delta.1["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(delta.1["usage"]["input_tokens"], prompt_len - 40);
         assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    #[test]
+    fn recorder_tracks_delivery_failures_and_completed_responses() {
+        struct Writer {
+            bytes: Vec<u8>,
+            fail_on_write: Option<&'static [u8]>,
+            fail_on_flush: Option<&'static [u8]>,
+        }
+        impl Writer {
+            fn contains(&self, marker: Option<&[u8]>) -> bool {
+                marker.is_some_and(|m| self.bytes.windows(m.len()).any(|bytes| bytes == m))
+            }
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                if self.contains(self.fail_on_write) { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.contains(self.fail_on_flush) { return Err(std::io::ErrorKind::TimedOut.into()); }
+                Ok(())
+            }
+        }
+        impl ClientWrite for Writer { fn client_gone(&self) -> bool { false } }
+
+        let dir = std::env::temp_dir().join(format!("inky-record-delivery-{}-{}", std::process::id(), startup_nonce()));
+        let (mut cx, jobs) = admission_test_ctx(1);
+        cx.recorder = Some(Arc::new(crate::record::Recorder::new(dir.clone())));
+        let mut expected = Vec::new();
+        for is_messages in [false, true] {
+            let endpoint = if is_messages { "/v1/messages" } else { "/v1/chat/completions" };
+            for stream in [false, true] {
+                let terminal: &[u8] = if !stream { b"200 OK" } else if is_messages { b"event: message_stop" } else { b"[DONE]" };
+                let mut failures = vec![(None, None, true), (Some(terminal), None, true), (None, Some(terminal), true)];
+                if stream {
+                    // The first visible character follows the two model/text markers.
+                    let first_text: &[u8] = if is_messages { br#""text":"H""# } else { br#""content":"H""# };
+                    failures.push((Some(first_text), None, false));
+                }
+                for (write, flush, finished) in failures {
+                    let mut w = Writer { bytes: vec![], fail_on_write: write, fail_on_flush: flush };
+                    let req = json!({"max_tokens": 12, "stream": stream, "messages": [{"role": "user", "content": "Hi"}]});
+                    let mut generated = vec![cx.sp.msg_model, cx.sp.c_text];
+                    generated.extend(cx.tk.encode("Hello", false));
+                    generated.push(cx.sp.end);
+                    let (result, rprompt) = std::thread::scope(|scope| {
+                        let handler = scope.spawn(|| {
+                            if is_messages { messages_with_card(&cx, &req, Some("test-card"), &mut w) }
+                            else { chat_with_card(&cx, &req, Some("test-card"), &mut w) }
+                        });
+                        let job = jobs.recv_timeout(Duration::from_secs(2)).unwrap();
+                        let prompt = job.toks.len();
+                        for &t in &generated { let _ = job.out.send(Ev::Tok(t)); }
+                        let _ = job.out.send(Ev::Done { prompt, cached: 0, gen: generated.len(), reason: "stop",
+                            timing: TimingSnapshot { queue_ms: 1, prefill_ms: 2, decode_ms: 3, ..Default::default() } });
+                        (handler.join().unwrap(), prompt)
+                    });
+                    let failed = write.is_some() || flush.is_some();
+                    assert_eq!(result.is_err(), failed, "{endpoint} streaming={stream}");
+                    expected.push((endpoint, failed, rprompt, if finished { generated.len() } else { 3 }, finished));
+                }
+            }
+        }
+        drop(cx); // Join the recorder before inspecting the written entries.
+        let mut entries = Vec::new();
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let file = std::fs::read_to_string(f.unwrap().path()).unwrap();
+            entries.extend(crate::record::parse_jsonl(&file).unwrap());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        entries.sort_by_key(|e| e.turn_index);
+        assert_eq!(entries.len(), expected.len());
+        for (i, (entry, (endpoint, failed, prompt, generated, finished))) in entries.iter().zip(expected).enumerate() {
+            assert_eq!((entry.card_id.as_str(), entry.turn_index, entry.endpoint.as_str()), ("test-card", i as u64, endpoint));
+            let m = &entry.response;
+            assert_eq!((m.prompt_tokens, m.completion_tokens), (prompt, generated));
+            let reason = if failed { "cancelled" } else if endpoint == "/v1/messages" { "end_turn" } else { "stop" };
+            assert_eq!((m.status_code, m.finish_reason.as_str()), (if failed { 499 } else { 200 }, reason));
+            assert_eq!((m.queue_ms, m.prefill_ms, m.decode_ms), if finished { (1, 2, 3) } else { (0, 0, 0) });
+        }
     }
 
     #[test] fn health_body_reports_recorder_telemetry_when_enabled() {
