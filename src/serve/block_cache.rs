@@ -316,7 +316,6 @@ pub struct ServeBlockCache {
     entry_spill_keys: HashMap<(u8, u32, u32), SpillKey>,
     spill_key_to_entry: HashMap<SpillKey, (u8, u32, u32)>,
     next_spill_id: u64,
-    next_spill_block_id: u64,
     max_spilled_starts: usize,
 }
 
@@ -342,7 +341,6 @@ impl ServeBlockCache {
             entry_spill_keys: HashMap::new(),
             spill_key_to_entry: HashMap::new(),
             next_spill_id: 1,
-            next_spill_block_id: 1,
             max_spilled_starts: DEFAULT_MAX_SPILLED_STARTS,
         }
     }
@@ -616,8 +614,7 @@ impl ServeBlockCache {
     }
 
     fn alloc_spill_key(&mut self, kind: BlockKind) -> SpillKey {
-        self.next_spill_block_id = self.next_spill_block_id.wrapping_add(1).max(1);
-        SpillKey::new(to_spill_kind(kind), self.next_spill_block_id)
+        self.spill_store.as_mut().expect("spill keys require an open store").fresh_key(to_spill_kind(kind))
     }
 
     fn remove_spilled_start(&mut self, spill_id: u64, delete_from_disk: bool) {
@@ -710,7 +707,7 @@ impl ServeBlockCache {
                 .spill_store
                 .as_ref()
                 .is_some_and(|store| store.contains(sk));
-            if already_on_disk {
+            if !is_new_key && already_on_disk {
                 protected.insert(sk);
                 spilled_entries.push((kind, bi, sk));
                 continue;
