@@ -1451,6 +1451,8 @@ impl ServeBlockCache {
 mod tests {
     use super::*;
 
+    mod spill_model;
+
     fn fake_cs(tag: u8) -> Vec<u8> {
         vec![tag; 16]
     }
