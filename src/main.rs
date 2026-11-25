@@ -1,24 +1,25 @@
+#[allow(dead_code)]
+mod blockbook;
 mod blocks;
 mod cache_scheduler;
 mod cache_trace;
-#[allow(dead_code)]
-mod blockbook;
+mod dspark;
 mod engine;
 mod gguf;
 mod json_grammar;
-mod prefix;
+mod memd;
 mod metal;
+mod poolgate;
+mod prefix;
+mod record;
 mod sampler;
 mod scheduler;
-mod session;
-mod memd;
-mod poolgate;
-mod record;
 mod serve;
+mod session;
 mod spill;
 mod stream_text;
-mod tuning;
 mod tokenizer;
+mod tuning;
 mod unicode_tables;
 mod verify;
 
@@ -63,7 +64,6 @@ options:
   --loopcd OMEGA    adaptive LoopCD-Logits contrast weight in [0, 4] (default 0 = disabled)
   --raw             do not apply the chat template; print special tokens";
 
-
 const SERVE_USAGE: &str = "usage: inky serve [options]
 
   -m, --model PATH  GGUF file (default: LM Studio's Inkling-2-Mini Q4_K_M)
@@ -90,6 +90,8 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --hide-cached-tokens
                     report 0 cached prompt tokens in API usage fields while keeping server cache reuse
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
+  --dspark PATH     opt-in DSpark drafter GGUF for speculative decoding (default: off)
+  --draft-k N       draft tokens per speculative verify step in 1..=4 (default 3)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
 fn cli_error(error: String) -> ! {
@@ -136,19 +138,29 @@ fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
 }
 
 fn parse_loopcd_omega(flag: &str, value: &str) -> Result<f32, String> {
-    let omega: f32 = value
-        .parse()
-        .map_err(|_| format!("{flag} must be a finite number between 0 and 4"))?;
+    let omega: f32 = value.parse().map_err(|_| format!("{flag} must be a finite number between 0 and 4"))?;
     if !omega.is_finite() || !(0.0..=4.0).contains(&omega) {
         return Err(format!("{flag} must be a finite number between 0 and 4"));
     }
     Ok(omega)
 }
 
+fn parse_draft_k(flag: &str, value: &str) -> Result<usize, String> {
+    let k: usize = value.parse().map_err(|_| {
+        format!("{flag} must be an integer between {} and {}", scheduler::MIN_DRAFT_K, scheduler::MAX_DRAFT_K)
+    })?;
+    if !(scheduler::MIN_DRAFT_K..=scheduler::MAX_DRAFT_K).contains(&k) {
+        return Err(format!(
+            "{flag} must be an integer between {} and {}",
+            scheduler::MIN_DRAFT_K,
+            scheduler::MAX_DRAFT_K
+        ));
+    }
+    Ok(k)
+}
+
 fn parse_temp(flag: &str, value: &str) -> Result<f32, String> {
-    let temp: f32 = value
-        .parse()
-        .map_err(|_| format!("{flag} must be a finite nonnegative number"))?;
+    let temp: f32 = value.parse().map_err(|_| format!("{flag} must be a finite nonnegative number"))?;
     if !temp.is_finite() || temp < 0.0 {
         return Err(format!("{flag} must be a finite nonnegative number"));
     }
@@ -156,9 +168,7 @@ fn parse_temp(flag: &str, value: &str) -> Result<f32, String> {
 }
 
 fn parse_top_p(flag: &str, value: &str) -> Result<f32, String> {
-    let top_p: f32 = value
-        .parse()
-        .map_err(|_| format!("{flag} must be a finite number in (0, 1]"))?;
+    let top_p: f32 = value.parse().map_err(|_| format!("{flag} must be a finite number in (0, 1]"))?;
     if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
         return Err(format!("{flag} must be a finite number in (0, 1]"));
     }
@@ -176,10 +186,14 @@ fn effort_value(e: &str) -> Result<f64, String> {
         "xhigh" | "max" => Ok(0.99),
         _ => {
             let v: f64 = trimmed.parse().map_err(|_| {
-                format!("--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}")
+                format!(
+                    "--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}"
+                )
             })?;
             if !v.is_finite() || !(0.0..=1.0).contains(&v) {
-                return Err(format!("--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}"));
+                return Err(format!(
+                    "--effort must be none|minimal|low|medium|high|xhigh|max or a finite number in [0, 1], got {e:?}"
+                ));
             }
             Ok(v.clamp(0.0, 0.99))
         }
@@ -194,12 +208,48 @@ fn parse_effort(flag: &str, value: &str) -> Result<String, String> {
 fn is_known_cli_command(cmd: &str) -> bool {
     matches!(
         cmd,
-        "help" | "-h" | "--help"
-            | "check" | "rows" | "rollback" | "verify" | "binv" | "crosspath" | "lanes" | "spans" | "xcopy" | "poolgate"
-            | "loopcdgate" | "blockedinv" | "temp1" | "prefixbench"
-            | "lanebench" | "dbatch" | "sharedkv" | "maxctx" | "debug" | "prof" | "routes" | "vcost" | "prof_pf"
-            | "kmoe" | "kgemm" | "kmoepf" | "ksg" | "qclip" | "lazytest" | "kvprune" | "kvscreen" | "kvdump"
-            | "kpeak" | "kmode" | "bw" | "kbench" | "run" | "chat" | "bench"
+        "help"
+            | "-h"
+            | "--help"
+            | "check"
+            | "rows"
+            | "rollback"
+            | "verify"
+            | "binv"
+            | "crosspath"
+            | "lanes"
+            | "spans"
+            | "xcopy"
+            | "poolgate"
+            | "loopcdgate"
+            | "blockedinv"
+            | "temp1"
+            | "prefixbench"
+            | "lanebench"
+            | "dbatch"
+            | "sharedkv"
+            | "maxctx"
+            | "debug"
+            | "prof"
+            | "routes"
+            | "vcost"
+            | "prof_pf"
+            | "kmoe"
+            | "kgemm"
+            | "kmoepf"
+            | "ksg"
+            | "qclip"
+            | "lazytest"
+            | "kvprune"
+            | "kvscreen"
+            | "kvdump"
+            | "kpeak"
+            | "kmode"
+            | "bw"
+            | "kbench"
+            | "run"
+            | "chat"
+            | "bench"
     )
 }
 
@@ -217,10 +267,8 @@ fn check_prompt_fits_ctx(prompt_tokens: usize, ctx: usize) -> Result<(), String>
 }
 
 fn entropy_seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     nanos ^ (std::process::id() as u64).rotate_left(32)
 }
 
@@ -232,21 +280,43 @@ fn default_model() -> String {
     DEFAULT_MODEL.replace('~', &std::env::var("HOME").unwrap_or_default())
 }
 
-fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<serve::ServeOpts, String> {
+fn parse_serve(
+    args: &[String],
+    default_lanes: usize,
+    read_key: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<serve::ServeOpts, String> {
     let mut o = serve::ServeOpts {
-        model: default_model(), ctx: 65536, bind: Vec::new(), lanes: default_lanes, effort: "medium".into(),
-        max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
+        model: default_model(),
+        ctx: 65536,
+        bind: Vec::new(),
+        lanes: default_lanes,
+        effort: "medium".into(),
+        max_tokens: 16384,
+        key: None,
+        queue: 64,
+        thinking_budget: 0,
+        loopcd_omega: 0.0,
+        record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
-        spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
-        isolate_cache: false, hide_cached_tokens: false,
+        spill_dir: None,
+        max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
+        isolate_cache: false,
+        hide_cached_tokens: false,
         kv8: false,
+        dspark: None,
+        draft_k: scheduler::DEFAULT_DRAFT_K,
     };
     let mut bind = "127.0.0.1:8090";
     let mut allow_unauthenticated = false;
     let mut args = args.iter().map(String::as_str);
     while let Some(flag) = args.next() {
-        let mut value = || args.next().filter(|value| !value.is_empty() && !value.starts_with("--") && !matches!(*value, "-m" | "-c" | "-n" | "-h"))
-            .ok_or_else(|| format!("missing value for {flag}"));
+        let mut value = || {
+            args.next()
+                .filter(|value| {
+                    !value.is_empty() && !value.starts_with("--") && !matches!(*value, "-m" | "-c" | "-n" | "-h")
+                })
+                .ok_or_else(|| format!("missing value for {flag}"))
+        };
         match flag {
             "-m" | "--model" => o.model = value()?.into(),
             "-c" | "--ctx" => o.ctx = parse_context(flag, value()?)?,
@@ -279,6 +349,8 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "--isolate-cache" => o.isolate_cache = true,
             "--hide-cached-tokens" => o.hide_cached_tokens = true,
             "--kv8" => o.kv8 = true,
+            "--dspark" => o.dspark = Some(std::path::PathBuf::from(value()?)),
+            "--draft-k" => o.draft_k = parse_draft_k(flag, value()?)?,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
         }
@@ -366,6 +438,11 @@ mod cli_tests {
             (&["--loopcd", "abc"], "--loopcd must be a finite number between 0 and 4"),
             (&["--effort", "bogus"], "unknown effort level"),
             (&["--effort", "2.0"], "unknown effort level"),
+            (&["--dspark"], "missing value for --dspark"),
+            (&["--draft-k"], "missing value for --draft-k"),
+            (&["--draft-k", "0"], "--draft-k must be an integer between 1 and 4"),
+            (&["--draft-k", "5"], "--draft-k must be an integer between 1 and 4"),
+            (&["--draft-k", "abc"], "--draft-k must be an integer between 1 and 4"),
             (&["--typo"], "unknown serve option --typo"),
         ] {
             let err = serve_args(args).err().unwrap();
@@ -379,12 +456,21 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().lanes, 64);
         assert_eq!(serve_args(&[]).unwrap().record_dir, None);
         assert_eq!(serve_args(&[]).unwrap().record_max_bytes, record::DEFAULT_MAX_FILE_BYTES);
-        assert_eq!(serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir, Some(std::path::PathBuf::from("cards-out")));
+        assert_eq!(
+            serve_args(&["--record-dir", "cards-out"]).unwrap().record_dir,
+            Some(std::path::PathBuf::from("cards-out"))
+        );
         assert_eq!(serve_args(&["--record-max-bytes", "4096"]).unwrap().record_max_bytes, 4096);
         assert_eq!(serve_args(&[]).unwrap().spill_dir, None);
         assert_eq!(serve_args(&[]).unwrap().max_spill_bytes, spill::DEFAULT_MAX_SPILL_BYTES);
         assert!(!serve_args(&[]).unwrap().kv8);
         assert!(serve_args(&["--kv8"]).unwrap().kv8);
+        assert_eq!(serve_args(&[]).unwrap().dspark, None);
+        assert_eq!(serve_args(&[]).unwrap().draft_k, 3);
+        let dspark = serve_args(&["--dspark", "mtp.gguf", "--draft-k", "4"]).unwrap();
+        assert_eq!(dspark.dspark, Some(std::path::PathBuf::from("mtp.gguf")));
+        assert_eq!(dspark.draft_k, 4);
+        assert_eq!(serve_args(&["--draft-k", "1"]).unwrap().draft_k, 1);
         let spilled = serve_args(&["--spill-dir", "spill-out", "--max-spill-bytes", "1048576", "--kv8"]).unwrap();
         assert_eq!(spilled.spill_dir, Some(std::path::PathBuf::from("spill-out")));
         assert_eq!(spilled.max_spill_bytes, 1_048_576);
@@ -392,7 +478,10 @@ mod cli_tests {
         assert_eq!(serve_args(&[]).unwrap().effort, "medium");
         assert_eq!(serve_args(&["--effort", "high"]).unwrap().effort, "high");
         assert_eq!(serve_args(&[]).unwrap().bind, ["127.0.0.1:8090".parse::<std::net::SocketAddr>().unwrap()]);
-        assert_eq!(serve_args(&["--bind", "[::1]:0"]).unwrap().bind, ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]);
+        assert_eq!(
+            serve_args(&["--bind", "[::1]:0"]).unwrap().bind,
+            ["[::1]:0".parse::<std::net::SocketAddr>().unwrap()]
+        );
         assert!(serve_args(&["--bind", "[::ffff:127.0.0.1]:0"]).is_ok());
         for bind in [
             "10.0.0.1:0",
@@ -448,9 +537,7 @@ mod cli_tests {
         assert!(serve_args(&["--isolate-cache"]).unwrap().isolate_cache);
         assert!(serve_args(&["--hide-cached-tokens"]).unwrap().hide_cached_tokens);
 
-        let cli = |args: &[&str]| {
-            parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
-        };
+        let cli = |args: &[&str]| parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         assert_eq!(cli(&["run", "-p", "hi"]).unwrap().1.loopcd_omega, 0.0);
         assert_eq!(cli(&["run", "--loopcd", "0"]).unwrap().1.loopcd_omega, 0.0);
         assert_eq!(cli(&["run", "--loopcd", "0.3"]).unwrap().1.loopcd_omega, 0.3);
@@ -466,9 +553,7 @@ mod cli_tests {
 
     #[test]
     fn cli_validates_sampling_effort_seed_zero_kv_disk_and_subcommands() {
-        let cli = |args: &[&str]| {
-            parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
-        };
+        let cli = |args: &[&str]| parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
 
         // --temp and --top-p bounds + NaN/Inf rejection before loading weights
         assert_eq!(cli(&["run", "--temp", "0"]).unwrap().1.temp, 0.0);
@@ -518,7 +603,10 @@ mod cli_tests {
 
         // --kv-disk + --kv8 refused cleanly at CLI parse
         assert!(cli(&["run", "--kv-disk", "--kv8"]).err().unwrap().contains("--kv-disk cannot be combined with --kv8"));
-        assert!(cli(&["check", "--kv8", "--kv-disk"]).err().unwrap().contains("--kv-disk cannot be combined with --kv8"));
+        assert!(cli(&["check", "--kv8", "--kv-disk"])
+            .err()
+            .unwrap()
+            .contains("--kv-disk cannot be combined with --kv8"));
 
         // Unknown subcommands fail with error instead of printing usage with exit 0
         for unknown in ["bogus", "sever", "runs", "--unknown-first"] {
@@ -538,9 +626,26 @@ mod cli_tests {
 }
 
 struct Opts {
-    model: String, prompt: String, n: usize, ctx: usize, raw: bool, effort: String, reference: String, quiet: bool, stop: usize,
-    system: String, temp: f32, top_p: f32, top_k: usize, seed: Option<u64>, hide_thinking: bool, n_set: bool,
-    loopcd_omega: f32, kv8: bool, kv_disk: bool, allow_mismatch: bool,
+    model: String,
+    prompt: String,
+    n: usize,
+    ctx: usize,
+    raw: bool,
+    effort: String,
+    reference: String,
+    quiet: bool,
+    stop: usize,
+    system: String,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    seed: Option<u64>,
+    hide_thinking: bool,
+    n_set: bool,
+    loopcd_omega: f32,
+    kv8: bool,
+    kv_disk: bool,
+    allow_mismatch: bool,
 }
 
 fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
@@ -550,11 +655,28 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
         return Err(format!("unknown command {raw_cmd}\n\n{USAGE}"));
     }
     let cmd = if matches!(raw_cmd, "help" | "-h" | "--help") { "help".to_string() } else { raw_cmd.to_string() };
-    let mut o = Opts { model: default_model(), prompt: "Write a haiku about the ocean.".into(), n: 2048, ctx: 16384,
-                       raw: false, effort: "high".into(), reference: String::new(), quiet: false, stop: 1, system: String::new(),
-                       temp: 1.0, top_p: 0.95, top_k: 64, seed: None, hide_thinking: false, n_set: false,
-                       loopcd_omega: 0.0, kv8: false, kv_disk: false,
-                       allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0") };
+    let mut o = Opts {
+        model: default_model(),
+        prompt: "Write a haiku about the ocean.".into(),
+        n: 2048,
+        ctx: 16384,
+        raw: false,
+        effort: "high".into(),
+        reference: String::new(),
+        quiet: false,
+        stop: 1,
+        system: String::new(),
+        temp: 1.0,
+        top_p: 0.95,
+        top_k: 64,
+        seed: None,
+        hide_thinking: false,
+        n_set: false,
+        loopcd_omega: 0.0,
+        kv8: false,
+        kv_disk: false,
+        allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0"),
+    };
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| format!("missing value for {a}"));
         match a {
@@ -564,7 +686,10 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
                 let path = v()?;
                 o.prompt = std::fs::read_to_string(path).map_err(|e| format!("read prompt file {path}: {e}"))?;
             }
-            "-n" => { o.n = parse_usize(a, v()?)?; o.n_set = true; }
+            "-n" => {
+                o.n = parse_usize(a, v()?)?;
+                o.n_set = true;
+            }
             "-c" | "--ctx" => o.ctx = parse_context(a, v()?)?,
             "--raw" => o.raw = true,
             "--kv8" => o.kv8 = true,
@@ -599,8 +724,12 @@ fn parse() -> (String, Opts) {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, mut o) = parse_cli_args(&raw).unwrap_or_else(|e| cli_error(e));
     if cmd != "help" {
-        if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
-        if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
+        if o.kv8 {
+            engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if o.kv_disk {
+            engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         o.seed = Some(resolve_seed(o.seed));
     }
     (cmd, o)
@@ -609,21 +738,37 @@ fn parse() -> (String, Opts) {
 /// reasoning effort as rendered by the GGUF chat template
 fn effort_str(e: &str) -> String {
     let v = effort_value(e).expect("validated --effort");
-    if v == 0.0 { "0".into() } else { format!("{v}") }
+    if v == 0.0 {
+        "0".into()
+    } else {
+        format!("{v}")
+    }
 }
 
 fn first_turn(o: &Opts, user: &str) -> String {
     let mut s = String::new();
-    if !o.system.is_empty() { s += &format!("<|message_system|><|content_text|>{}<|end_message|>", o.system); }
+    if !o.system.is_empty() {
+        s += &format!("<|message_system|><|content_text|>{}<|end_message|>", o.system);
+    }
     s += &format!("<|message_system|><|content_text|>Thinking effort level: {}<|end_message|>", effort_str(&o.effort));
     s += &format!("<|message_user|><|content_text|>{user}<|end_message|>");
     s
 }
 
-fn softcap(x: f32, c: f32) -> f32 { if c > 0.0 { c * (x / c).tanh() } else { x } }
+fn softcap(x: f32, c: f32) -> f32 {
+    if c > 0.0 {
+        c * (x / c).tanh()
+    } else {
+        x
+    }
+}
 
 fn token_rate(tokens: usize, elapsed: std::time::Duration) -> f64 {
-    if elapsed.is_zero() { 0.0 } else { tokens as f64 / elapsed.as_secs_f64() }
+    if elapsed.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / elapsed.as_secs_f64()
+    }
 }
 
 fn run(o: &Opts) -> Result<(), String> {
@@ -634,19 +779,33 @@ fn run(o: &Opts) -> Result<(), String> {
     let toks = tk.encode(&text, true);
     check_prompt_fits_ctx(toks.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
     let mut sess = Session::new(&eng, &tk);
-    if std::env::var("INK_KV_PREALLOC").is_ok() { sess.run().reserve(o.ctx, false); }     // dev: no cache growth (to compare against)
+    if std::env::var("INK_KV_PREALLOC").is_ok() {
+        sess.run().reserve(o.ctx, false);
+    } // dev: no cache growth (to compare against)
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, resolve_seed(o.seed));
-    sess.run().prepare(toks.len(), toks.len());       // working memory for this prompt, mapped before the prefill starts
+    sess.run().prepare(toks.len(), toks.len()); // working memory for this prompt, mapped before the prefill starts
     let first = sess.prefill(&toks)?;
     let mut out = std::io::stdout();
     let mut r = Renderer::new(!o.hide_thinking, o.raw);
-    let generated = sess.generate(first, o.n, &mut sampler, |t| { if !o.quiet { r.push(&tk, t, &mut out); } true });
+    let generated = sess.generate(first, o.n, &mut sampler, |t| {
+        if !o.quiet {
+            r.push(&tk, t, &mut out);
+        }
+        true
+    });
     r.end(&mut out);
     generated?;
     let s = sess.stats;
-    eprintln!("\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
-              s.prompt_tokens, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(), s.gen_tokens, token_rate(s.gen_tokens, s.gen_time),
-              if sampler.greedy() { " (greedy)" } else { "" }, kv_note(sess.run(), sess.n_past), sess.n_past);
+    eprintln!(
+        "\n[inky] prompt {} tok @ {:.1} tok/s | generated {} tok @ {:.2} tok/s{} | {} at {} tokens",
+        s.prompt_tokens,
+        s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
+        s.gen_tokens,
+        token_rate(s.gen_tokens, s.gen_time),
+        if sampler.greedy() { " (greedy)" } else { "" },
+        kv_note(sess.run(), sess.n_past),
+        sess.n_past
+    );
     Ok(())
 }
 
@@ -658,20 +817,40 @@ fn chat(o: &Opts) -> Result<(), String> {
     let mut sampler = Sampler::new(o.temp, o.top_k, o.top_p, eng.softcap, resolve_seed(o.seed));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
-    eprintln!("[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
-              o.effort, if sampler.greedy() { "greedy".to_string() } else { format!("temp {}", o.temp) });
+    eprintln!(
+        "[inky] chat ready (effort {}, {}). empty line or Ctrl-D to quit, /reset to clear the context.",
+        o.effort,
+        if sampler.greedy() { "greedy".to_string() } else { format!("temp {}", o.temp) }
+    );
     let mut has_turn = false;
     loop {
-        print!("\n\x1b[1m> \x1b[0m"); out.flush().ok();
+        print!("\n\x1b[1m> \x1b[0m");
+        out.flush().ok();
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
         let line = line.trim_end_matches(['\n', '\r']).to_string();
-        if line.trim().is_empty() { break; }
-        if line.trim() == "/reset" { sess = Session::with_lane(&eng, &tk, sess.into_lane()); has_turn = false; eprintln!("[context cleared]"); continue; }
-        let text = if has_turn { format!("<|message_user|><|content_text|>{line}<|end_message|>") } else { first_turn(o, &line) };
+        if line.trim().is_empty() {
+            break;
+        }
+        if line.trim() == "/reset" {
+            sess = Session::with_lane(&eng, &tk, sess.into_lane());
+            has_turn = false;
+            eprintln!("[context cleared]");
+            continue;
+        }
+        let text = if has_turn {
+            format!("<|message_user|><|content_text|>{line}<|end_message|>")
+        } else {
+            first_turn(o, &line)
+        };
         let before = sess.stats;
         let toks = tk.encode(&text, true);
-        if sess.ctx_left() < toks.len() + 64 { eprintln!("[context full: /reset]"); continue; }
+        if sess.ctx_left() < toks.len() + 64 {
+            eprintln!("[context full: /reset]");
+            continue;
+        }
         match sess.run_chat_turn(&toks, o.n, !o.hide_thinking, o.raw, &mut sampler, &mut out) {
             Ok(_) => {
                 has_turn = true;
@@ -683,9 +862,14 @@ fn chat(o: &Opts) -> Result<(), String> {
         }
         let s = sess.stats;
         let (pt, gt) = (s.prompt_tokens - before.prompt_tokens, s.gen_tokens - before.gen_tokens);
-        eprintln!("\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
-                  pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(), token_rate(gt, s.gen_time - before.gen_time),
-                  sess.n_past, eng.max_ctx, kv_note(sess.run(), sess.n_past));
+        eprintln!(
+            "\n\x1b[2m[{pt} prompt tok @ {:.0} tok/s · {gt} tok @ {:.1} tok/s · context {}/{} · {}]\x1b[0m",
+            pt as f64 / (s.prompt_time - before.prompt_time).as_secs_f64(),
+            token_rate(gt, s.gen_time - before.gen_time),
+            sess.n_past,
+            eng.max_ctx,
+            kv_note(sess.run(), sess.n_past)
+        );
     }
     Ok(())
 }
@@ -693,7 +877,9 @@ fn chat(o: &Opts) -> Result<(), String> {
 fn bench(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
-    if let Ok(v) = std::env::var("INK_SKIP") { eng.skip.set(v.parse().unwrap()); }
+    if let Ok(v) = std::env::var("INK_SKIP") {
+        eng.skip.set(v.parse().unwrap());
+    }
     let tk = Tokenizer::load(&eng.g);
     let n = if o.n_set { o.n } else { 128 };
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
@@ -704,23 +890,36 @@ fn bench(o: &Opts) -> Result<(), String> {
     let warm = {
         let mut s = Session::new(&eng, &tk);
         let f = s.prefill(&toks[..toks.len().min(64)])?;
-        if n > 0 { s.generate(f, 8, &mut sampler, |_| true)?; }
+        if n > 0 {
+            s.generate(f, 8, &mut sampler, |_| true)?;
+        }
         s.into_lane()
     };
-    let mut sess = Session::with_lane(&eng, &tk, warm);     // the warm-up's buffers, already mapped
-    sess.run().prepare(toks.len(), toks.len());       // as `run` does: working memory allocated and mapped before the clock starts
+    let mut sess = Session::with_lane(&eng, &tk, warm); // the warm-up's buffers, already mapped
+    sess.run().prepare(toks.len(), toks.len()); // as `run` does: working memory allocated and mapped before the clock starts
     let first = sess.prefill(&toks)?;
     sess.generate(first, n, &mut sampler, |_| true)?;
     let s = sess.stats;
-    println!("prompt {:5} tok: {:8.1} ms  {:7.1} tok/s | decode {:4} tok: {:8.1} ms  {:6.2} tok/s",
-             s.prompt_tokens, s.prompt_time.as_secs_f64() * 1e3, s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
-             s.gen_tokens, s.gen_time.as_secs_f64() * 1e3, token_rate(s.gen_tokens, s.gen_time));
+    println!(
+        "prompt {:5} tok: {:8.1} ms  {:7.1} tok/s | decode {:4} tok: {:8.1} ms  {:6.2} tok/s",
+        s.prompt_tokens,
+        s.prompt_time.as_secs_f64() * 1e3,
+        s.prompt_tokens as f64 / s.prompt_time.as_secs_f64(),
+        s.gen_tokens,
+        s.gen_time.as_secs_f64() * 1e3,
+        token_rate(s.gen_tokens, s.gen_time)
+    );
     println!("memory besides the weights: {} at {} tokens | prefill scratch {:.0} MiB while prefilling, {:.1} MiB while generating",
              kv_note(sess.run(), sess.n_past), sess.n_past, s.peak_scratch as f64 / 1048576.0, sess.run().mem().1 as f64 / 1048576.0);
     if s.gen_tokens > 0 && sess.run().tier_on() {
         let (rb, rt) = sess.run().tier_io();
-        println!("K/V file: {:.0} MiB read per token, {:.1} GiB/s, {:.1} ms of each token's {:.1} ms", rb as f64 / 1048576.0 / s.gen_tokens as f64,
-                 rb as f64 / 1073741824.0 / rt.as_secs_f64(), rt.as_secs_f64() * 1e3 / s.gen_tokens as f64, s.gen_time.as_secs_f64() * 1e3 / s.gen_tokens as f64);
+        println!(
+            "K/V file: {:.0} MiB read per token, {:.1} GiB/s, {:.1} ms of each token's {:.1} ms",
+            rb as f64 / 1048576.0 / s.gen_tokens as f64,
+            rb as f64 / 1073741824.0 / rt.as_secs_f64(),
+            rt.as_secs_f64() * 1e3 / s.gen_tokens as f64,
+            s.gen_time.as_secs_f64() * 1e3 / s.gen_tokens as f64
+        );
     }
     Ok(())
 }
@@ -728,8 +927,16 @@ fn bench(o: &Opts) -> Result<(), String> {
 /// the K/V cache as it is held right now (with --kv-disk: the part in memory and the part that is only in the file)
 fn kv_note(eng: engine::Run, n: usize) -> String {
     let mib = |b: usize| b as f64 / 1048576.0;
-    if eng.tier_on() { format!("K/V cache {:.0} MiB in memory + {:.0} MiB on disk (all in memory: {:.0} MiB)", mib(eng.mem().0), mib(eng.kv_disk_bytes(n)), mib(eng.kv_exact_bytes(n))) }
-    else { format!("K/V cache {:.0} MiB", mib(eng.mem().0)) }
+    if eng.tier_on() {
+        format!(
+            "K/V cache {:.0} MiB in memory + {:.0} MiB on disk (all in memory: {:.0} MiB)",
+            mib(eng.mem().0),
+            mib(eng.kv_disk_bytes(n)),
+            mib(eng.kv_exact_bytes(n))
+        )
+    } else {
+        format!("K/V cache {:.0} MiB", mib(eng.mem().0))
+    }
 }
 
 fn reference_tokens(text: &str, context: usize) -> Result<Vec<u32>, String> {
@@ -749,18 +956,26 @@ fn reference_tokens(text: &str, context: usize) -> Result<Vec<u32>, String> {
 fn reference_logits(raw: &[u8], tokens: usize, vocab: usize) -> Result<Vec<f32>, String> {
     let row_bytes = vocab * size_of::<f32>();
     if raw.is_empty() || row_bytes == 0 || !raw.len().is_multiple_of(row_bytes) || raw.len() / row_bytes > tokens {
-        return Err(format!("expected 1 to {tokens} complete reference logit rows of width {vocab}, got {} bytes", raw.len()));
+        return Err(format!(
+            "expected 1 to {tokens} complete reference logit rows of width {vocab}, got {} bytes",
+            raw.len()
+        ));
     }
     // Trimmed dumps cover the last positions of the token list.
     let first_pos = tokens - raw.len() / row_bytes;
-    raw.as_chunks::<{ size_of::<f32>() }>().0.iter().enumerate().map(|(i, &bytes)| {
-        let logit = f32::from_le_bytes(bytes);
-        if logit.is_finite() {
-            Ok(logit)
-        } else {
-            Err(format!("non-finite reference logit at position {}, token {}", first_pos + i / vocab, i % vocab))
-        }
-    }).collect()
+    raw.as_chunks::<{ size_of::<f32>() }>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, &bytes)| {
+            let logit = f32::from_le_bytes(bytes);
+            if logit.is_finite() {
+                Ok(logit)
+            } else {
+                Err(format!("non-finite reference logit at position {}, token {}", first_pos + i / vocab, i % vocab))
+            }
+        })
+        .collect()
 }
 
 fn compare_logits(lg: &[f32], r: &[f32]) -> Option<(usize, usize, f32, f32)> {
@@ -770,9 +985,19 @@ fn compare_logits(lg: &[f32], r: &[f32]) -> Option<(usize, usize, f32, f32)> {
     let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
     let maxdiff = lg.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     // KL(ref || ours)
-    let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+    let lse = |v: &[f32]| {
+        let m = v.iter().cloned().fold(f32::MIN, f32::max);
+        m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln()
+    };
     let (l1, l2) = (lse(lg), lse(r));
-    let kl: f32 = r.iter().zip(lg).map(|(b, a)| { let pb = (b - l2).exp(); pb * ((b - l2) - (a - l1)) }).sum();
+    let kl: f32 = r
+        .iter()
+        .zip(lg)
+        .map(|(b, a)| {
+            let pb = (b - l2).exp();
+            pb * ((b - l2) - (a - l1))
+        })
+        .sum();
     if maxdiff.is_finite() && kl.is_finite() {
         Some((am(lg), am(r), maxdiff, kl))
     } else {
@@ -818,20 +1043,25 @@ fn check(o: &Opts) -> Result<(), String> {
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
     eng.try_set_tokens(0, &toks).map_err(|err| format!("{token_path}: {err}"))?;
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     eng.reset();
     // INK_DEC=1: decode positions through decode steps (encode_decode) instead of the single-stream decode path
     let dec_steps = std::env::var("INK_DEC").is_ok();
-    if dec_steps { eng.ensure_dbatch(1); }
+    if dec_steps {
+        eng.ensure_dbatch(1);
+    }
     let sabotage = std::env::var("INK_CHECK_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
     let mut sabotaged = false;
     let mut agree = 0;
     let mut compared = 0;
     let mut worst = 0f32;
     let kv_disk = engine::KV_DISK.load(std::sync::atomic::Ordering::Relaxed);
-    let mut bits_hash = 0xcbf29ce484222325u64;       // over the raw bits of every logit of every checked step
+    let mut bits_hash = 0xcbf29ce484222325u64; // over the raw bits of every logit of every checked step
     for pos in 0..toks.len() {
-        if pf > 0 && pos + 1 < pf { continue; }
+        if pf > 0 && pos + 1 < pf {
+            continue;
+        }
         if pf > 0 && pos + 1 == pf {
             let mut p0 = 0;
             while p0 < pf {
@@ -858,27 +1088,43 @@ fn check(o: &Opts) -> Result<(), String> {
         // dev: INK_KVQ=kbits,vbits rounds the cache as it is written, to measure what a coarser cache would cost
         if let Ok(v) = std::env::var("INK_KVQ") {
             let (kb, vb) = v.split_once(',').map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap())).unwrap();
-            if pf > 0 && pos + 1 == pf { eng.kv_quant_sim(0, pf, kb, vb); } else { eng.kv_quant_sim(pos, pos + 1, kb, vb); }
+            if pf > 0 && pos + 1 == pf {
+                eng.kv_quant_sim(0, pf, kb, vb);
+            } else {
+                eng.kv_quant_sim(pos, pos + 1, kb, vb);
+            }
         }
         let raw = if dec_steps && !(pf > 0 && pos + 1 == pf) { eng.span_logits(0) } else { eng.logits() };
         if let Some(token) = raw.iter().position(|x| !x.is_finite()) {
             return Err(format!("non-finite engine logit at position {pos}, token {token}"));
         }
-        for &x in &*raw { bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
-        if pos < first_ref { continue; }
+        for &x in &*raw {
+            bits_hash = (bits_hash ^ x.to_bits() as u64).wrapping_mul(0x100000001b3);
+        }
+        if pos < first_ref {
+            continue;
+        }
         let mut lg: Vec<f32> = raw.iter().map(|&x| softcap(x, eng.effective_sampler_softcap(0))).collect();
         if sabotage && !sabotaged {
-            for x in &mut lg { *x = -*x; }
+            for x in &mut lg {
+                *x = -*x;
+            }
             println!("INK_CHECK_SABOTAGE: negated engine logits at position {pos}");
             sabotaged = true;
         }
         let r = &reflog[(pos - first_ref) * nv..(pos - first_ref + 1) * nv];
-        let (a1, a2, maxdiff, kl) = compare_logits(&lg, r)
-            .ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
+        let (a1, a2, maxdiff, kl) =
+            compare_logits(&lg, r).ok_or_else(|| format!("non-finite comparison at position {pos}"))?;
         compared += 1;
-        if a1 == a2 { agree += 1; }
+        if a1 == a2 {
+            agree += 1;
+        }
         worst = worst.max(kl);
-        println!("pos {pos:3} tok {:6} argmax ours {a1:6} ref {a2:6} {} maxdiff {maxdiff:.4} KL {kl:.6}", toks[pos], if a1 == a2 { "OK " } else { "XX " });
+        println!(
+            "pos {pos:3} tok {:6} argmax ours {a1:6} ref {a2:6} {} maxdiff {maxdiff:.4} KL {kl:.6}",
+            toks[pos],
+            if a1 == a2 { "OK " } else { "XX " }
+        );
     }
     println!("argmax agreement {agree}/{compared} worst KL {worst:.9}");
     eprintln!("logit bits hash {bits_hash:016x}");
@@ -909,7 +1155,8 @@ mod reference_tests {
         assert!(check_agreement_gate(0, 0, true).is_err());
         let (_, opts_default) = parse_cli_args(&["check".into(), "--ref".into(), "p".into()]).unwrap();
         assert!(!opts_default.allow_mismatch);
-        let (_, opts_override) = parse_cli_args(&["check".into(), "--ref".into(), "p".into(), "--allow-mismatch".into()]).unwrap();
+        let (_, opts_override) =
+            parse_cli_args(&["check".into(), "--ref".into(), "p".into(), "--allow-mismatch".into()]).unwrap();
         assert!(opts_override.allow_mismatch);
     }
 
@@ -975,11 +1222,15 @@ fn rows(o: &Opts) {
     let mut expect: Vec<Vec<f32>> = Vec::with_capacity(1 + k);
     for pos in 0..ntok {
         step1(&lane_r, pos, true);
-        if pos + 1 >= p { expect.push(eng.logits().to_vec()); }
+        if pos + 1 >= p {
+            expect.push(eng.logits().to_vec());
+        }
     }
     let lane = fresh();
     let run = eng.on(&lane);
-    for pos in 0..p - 1 { step1(&lane, pos, false); }
+    for pos in 0..p - 1 {
+        step1(&lane, pos, false);
+    }
     let cs = run.get_cs();
     step1(&lane, p - 1, false);
     run.set_cs(&cs);
@@ -995,7 +1246,9 @@ fn rows(o: &Opts) {
         println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
     }
     println!("{}", if ok { "per-row logits match encode_spans of t=1" } else { "PER-ROW LOGITS DIFFER" });
-    if !ok { std::process::exit(1); }
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev, rollback gate. One lane, synthetic draft tokens, no drafter. Two forced rejects of a verify span:
@@ -1012,8 +1265,17 @@ fn rollback(o: &Opts) {
     let t = 1 + k;
     let ntok = p0 + t;
     let one = engine::Engine::cs_image_bytes();
-    println!("cs image {one} bytes ({:.2} MiB). The span holds 1+k of these, transient, not one per context token.", one as f64 / 1048576.0);
-    println!("k=3: {} bytes ({:.2} MiB per lane). k=7: {} bytes ({:.2} MiB per lane).", one * 4, (one * 4) as f64 / 1048576.0, one * 8, (one * 8) as f64 / 1048576.0);
+    println!(
+        "cs image {one} bytes ({:.2} MiB). The span holds 1+k of these, transient, not one per context token.",
+        one as f64 / 1048576.0
+    );
+    println!(
+        "k=3: {} bytes ({:.2} MiB per lane). k=7: {} bytes ({:.2} MiB per lane).",
+        one * 4,
+        (one * 4) as f64 / 1048576.0,
+        one * 8,
+        (one * 8) as f64 / 1048576.0
+    );
     let eng = Engine::load(&o.model, o.ctx.max((ntok + 1).div_ceil(64) * 64));
     eng.ensure_batch(eng.chunk);
     let true_tok = |i: usize| ((i * 17 + 3) % 1000) as u32;
@@ -1050,7 +1312,9 @@ fn rollback(o: &Opts) {
         let lane = fresh();
         let run = eng.on(&lane);
         run.set_tokens(0, &(0..ntok).map(draft_tok).collect::<Vec<_>>());
-        for pos in 0..p0 { step1(&lane, pos, false); }
+        for pos in 0..p0 {
+            step1(&lane, pos, false);
+        }
         let cs = run.get_cs();
         step1(&lane, p0, false);
         run.set_cs(&cs);
@@ -1065,16 +1329,20 @@ fn rollback(o: &Opts) {
         step1(&lane, reject_at, false);
         let corr_ok = eng.lane_hash(&lane) == hash_ref;
         ok &= pref_ok && corr_ok;
-        println!("case {name} n_keep {n_keep} reject-row logits {} prefix lane_hash {} correction lane_hash {}",
+        println!(
+            "case {name} n_keep {n_keep} reject-row logits {} prefix lane_hash {} correction lane_hash {}",
             if logits_same { "same" } else { "DIFFERENT" },
             if pref_ok { "same" } else { "DIFFERENT" },
-            if corr_ok { "same" } else { "DIFFERENT" });
+            if corr_ok { "same" } else { "DIFFERENT" }
+        );
         if logits_same && !(pref_ok && corr_ok) {
             println!("case {name}: reject-row logits match and lane_hash does not; logits alone do not pass");
         }
     }
     println!("{}", if ok { "rollback lane_hash matches encode_spans of t=1" } else { "ROLLBACK LANE_HASH DIFFERS" });
-    if !ok { std::process::exit(1); }
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// Speculative scheduler verification & rollback gate (`PR #42` / `PR #80` / `t-audit-pr42-port`):
@@ -1092,8 +1360,7 @@ fn verify(o: &Opts) {
     use sampler::checked_argmax;
     use scheduler::logit_hash;
     use verify::{
-        run_speculative_loop, verify_step, verify_step_sampled, NgramDraftProducer,
-        PagedVerifyLane, VerifyIn,
+        run_speculative_loop, verify_step, verify_step_sampled, NgramDraftProducer, PagedVerifyLane, VerifyIn,
     };
 
     let sabotage = std::env::var("INK_VERIFY_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
@@ -1149,15 +1416,11 @@ fn verify(o: &Opts) {
     {
         let (lane, cs) = prep(&prompt);
         let drafts = gen_toks[..k].to_vec();
-        let kept = verify_step(
-            &eng,
-            &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
-            &[],
-        )
-        .pop()
-        .unwrap()
-        .transpose()
-        .expect("verify step");
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[])
+            .pop()
+            .unwrap()
+            .transpose()
+            .expect("verify step");
         if let Some(mut kept) = kept {
             if sabotage {
                 println!("INK_VERIFY_SABOTAGE: perturbing verified logit hash");
@@ -1204,14 +1467,13 @@ fn verify(o: &Opts) {
             VerifyIn { lane: &right, p0, cs_before: &right_cs, drafts: &right_toks[..k] },
         ];
         let kept = verify_step(&eng, &input, &[]);
-        let same = kept
-            .into_iter()
-            .zip([(&gen_toks, &gen_hash), (&right_toks, &right_hashes)])
-            .all(|(kept, (toks, hashes))| {
+        let same = kept.into_iter().zip([(&gen_toks, &gen_hash), (&right_toks, &right_hashes)]).all(
+            |(kept, (toks, hashes))| {
                 kept.transpose()
                     .expect("batched verify step")
                     .is_some_and(|kept| &kept.emitted == toks && &kept.hashes == hashes)
-            });
+            },
+        );
         ok &= same;
         println!("two-lane verify tokens and logit hashes {}", if same { "same" } else { "DIFFERENT" });
     }
@@ -1232,10 +1494,7 @@ fn verify(o: &Opts) {
             wait_gate(&cb, "verify abort probe", p0);
             eng.rollback_verify(&lane, 0, 0);
             let same = eng.lane_hash(&lane) == before
-                && saved_tokens
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &tok)| run.token_at(p0 + 1 + i) == tok);
+                && saved_tokens.iter().enumerate().all(|(i, &tok)| run.token_at(p0 + 1 + i) == tok);
             ok &= same;
             println!(
                 "full verify rollback {}",
@@ -1247,16 +1506,12 @@ fn verify(o: &Opts) {
             let (lane, cs) = prep(&prompt);
             let mut drafts = gen_toks[..k].to_vec();
             drafts[at] = (drafts[at] + 1) % eng.n_vocab as u32;
-            let kept = verify_step(
-                &eng,
-                &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
-                &[],
-            )
-            .pop()
-            .unwrap()
-            .transpose()
-            .expect("verify reject")
-            .expect("verify ran");
+            let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[])
+                .pop()
+                .unwrap()
+                .transpose()
+                .expect("verify reject")
+                .expect("verify ran");
             let next_ok = kept.bonus == Some(gen_toks[at]);
             let pos = kept.p0 + kept.n_keep;
             eng.on(&lane).set_tokens(pos, &[gen_toks[at]]);
@@ -1274,16 +1529,12 @@ fn verify(o: &Opts) {
             let stop_tok = gen_toks[1];
             let (lane, cs) = prep(&prompt);
             let drafts = gen_toks[..k].to_vec();
-            let kept = verify_step(
-                &eng,
-                &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }],
-                &[stop_tok],
-            )
-            .pop()
-            .unwrap()
-            .transpose()
-            .expect("verify stop")
-            .expect("verify ran");
+            let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[stop_tok])
+                .pop()
+                .unwrap()
+                .transpose()
+                .expect("verify stop")
+                .expect("verify ran");
             let expect: Vec<u32> = drafts
                 .iter()
                 .copied()
@@ -1325,16 +1576,12 @@ fn verify(o: &Opts) {
             let p0b = n - 1;
             let want = 7usize;
             let drafts = vec![1u32; want];
-            let kept = verify_step(
-                &eng,
-                &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }],
-                &[],
-            )
-            .pop()
-            .unwrap()
-            .transpose()
-            .expect("boundary verify")
-            .expect("boundary ran");
+            let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }], &[])
+                .pop()
+                .unwrap()
+                .transpose()
+                .expect("boundary verify")
+                .expect("boundary ran");
             let clamped = kept.k < want && p0b + 1 + kept.k <= cap;
             ok &= clamped;
             println!(
@@ -1440,8 +1687,7 @@ fn verify(o: &Opts) {
         {
             let mut drafter = NgramDraftProducer::new(3, gen_toks[0]);
             let (spec_out, reason) =
-                run_speculative_loop(&eng, &prompt, k + 1, 128, 3, &[], &mut drafter)
-                    .expect("ngram speculative loop");
+                run_speculative_loop(&eng, &prompt, k + 1, 128, 3, &[], &mut drafter).expect("ngram speculative loop");
             let loop_same = spec_out == gen_toks[..=k] && reason == "length";
             ok &= loop_same;
             println!(
@@ -1476,14 +1722,7 @@ fn verify(o: &Opts) {
         }
     }
 
-    println!(
-        "{}",
-        if ok {
-            "verify gate matches encode_spans of t=1"
-        } else {
-            "VERIFY GATE FAILED"
-        }
-    );
+    println!("{}", if ok { "verify gate matches encode_spans of t=1" } else { "VERIFY GATE FAILED" });
     if !ok {
         std::process::exit(1);
     }
@@ -1496,7 +1735,11 @@ fn binv(o: &Opts) -> Result<(), String> {
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
     let tk = Tokenizer::load(&eng.g);
-    let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let toks: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
     // each entry is one way to split the prompt: boundaries joined by '+' ("37+190": three prefills); an entry may repeat,
     // which tests that the same split gives the same bits run after run. At least two schedules are required (refusing e.g. `INK_SPLITS=0` alone).
     let raw_splits = std::env::var("INK_SPLITS").unwrap_or_else(|_| "0,1,5,16,23,100,1001".into());
@@ -1536,31 +1779,56 @@ fn binv(o: &Opts) -> Result<(), String> {
             sabotaged = true;
         }
         let mut p = 0;
-        for &b in k.iter().chain(std::iter::once(&run_toks.len())) { if b > p { sess.prefill(&run_toks[p..b])?; p = b; } }
+        for &b in k.iter().chain(std::iter::once(&run_toks.len())) {
+            if b > p {
+                sess.prefill(&run_toks[p..b])?;
+                p = b;
+            }
+        }
         let k = k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("+");
         let k = if k.is_empty() { "0".to_string() } else { k };
         let lg = eng.logits();
         let mut h = 0xcbf29ce484222325u64;
-        for &x in &*lg { h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        for &x in &*lg {
+            h = (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3);
+        }
         let same = *first.get_or_insert(h) == h;
-        if base.is_empty() { base = lg.to_vec(); }
+        if base.is_empty() {
+            base = lg.to_vec();
+        }
         let maxdiff = lg.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
         ok &= same;
         // KL(first || this) over the soft-capped logits, as sampling sees them
         let cap = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| softcap(x, eng.softcap)).collect() };
         let (pa, pb) = (cap(&base), cap(&lg));
-        let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+        let lse = |v: &[f32]| {
+            let m = v.iter().cloned().fold(f32::MIN, f32::max);
+            m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln()
+        };
         let (l1, l2) = (lse(&pa), lse(&pb));
-        let kl: f32 = pa.iter().zip(&pb).map(|(x, y)| { let p = (x - l1).exp(); p * ((x - l1) - (y - l2)) }).sum();
-        println!("split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})", if same { "same" } else { "DIFFERENT" }, am(&lg));
+        let kl: f32 = pa
+            .iter()
+            .zip(&pb)
+            .map(|(x, y)| {
+                let p = (x - l1).exp();
+                p * ((x - l1) - (y - l2))
+            })
+            .sum();
+        println!(
+            "split at {k:>9}: logit bits hash {h:016x} {} (max logit diff {maxdiff:.6}, KL {kl:.6}, argmax {})",
+            if same { "same" } else { "DIFFERENT" },
+            am(&lg)
+        );
     }
     if sabotage && !sabotaged {
         eprintln!("INK_BINV_SABOTAGE: need at least two splits in INK_SPLITS");
         std::process::exit(2);
     }
     println!("{}", if ok { "batch invariant: every split gives identical logits" } else { "NOT batch invariant" });
-    if !ok { std::process::exit(1); }
+    if !ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -1572,16 +1840,23 @@ fn binv(o: &Opts) -> Result<(), String> {
 const CROSSPATH_SPAN: usize = 17;
 const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
 
-fn crosspath_start(end: usize) -> usize { end.saturating_sub(CROSSPATH_SPAN) }
+fn crosspath_start(end: usize) -> usize {
+    end.saturating_sub(CROSSPATH_SPAN)
+}
 
-fn crosspath_completed(status: objc2_metal::MTLCommandBufferStatus) -> bool { status == objc2_metal::MTLCommandBufferStatus::Completed }
+fn crosspath_completed(status: objc2_metal::MTLCommandBufferStatus) -> bool {
+    status == objc2_metal::MTLCommandBufferStatus::Completed
+}
 
 fn wait_crosspath(cb: &metal::CmdBuf) {
     cb.waitUntilCompleted();
     let status = cb.status();
     if !crosspath_completed(status) {
         let error = cb.error().map(|e| e.localizedDescription().to_string());
-        panic!("crosspath Metal command failed (status {status:?}): {}", error.as_deref().unwrap_or("no driver error provided"));
+        panic!(
+            "crosspath Metal command failed (status {status:?}): {}",
+            error.as_deref().unwrap_or("no driver error provided")
+        );
     }
 }
 
@@ -1611,14 +1886,21 @@ mod crosspath_tests {
 }
 
 fn crosspath(o: &Opts) {
-    let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens")
-        .lines().map(|line| line.trim().parse().unwrap()).collect();
-    let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS").unwrap_or_else(|_| {
-        CROSSPATH_ENDS.into()
-    }).split(',').map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts")).collect();
+    let toks: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect();
+    let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS")
+        .unwrap_or_else(|_| CROSSPATH_ENDS.into())
+        .split(',')
+        .map(|n| n.parse().expect("INK_COMPARE_ENDS lists token counts"))
+        .collect();
     let len = *ends.last().unwrap();
-    assert!(ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
-            "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)");
+    assert!(
+        ends[0] >= 2 && ends.windows(2).all(|p| p[0] < p[1]),
+        "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)"
+    );
     assert!(len <= toks.len() && len <= o.ctx, "crosspath fixture or context is too short");
 
     let eng = Engine::load(&o.model, o.ctx);
@@ -1645,7 +1927,10 @@ fn crosspath(o: &Opts) {
     for end in ends {
         let start = crosspath_start(end);
         let target = end - 1;
-        assert!(start >= cursor && target - start >= 1, "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows");
+        assert!(
+            start >= cursor && target - start >= 1,
+            "crosspath span [{start}, {end}) must start at or after the base lane ({cursor}) and hold two rows"
+        );
         while cursor < start {
             let count = (start - cursor).min(eng.chunk);
             run_prefill(&base, cursor, count, false);
@@ -1662,13 +1947,17 @@ fn crosspath(o: &Opts) {
         }
         run_prefill(&split, target, 1, true);
         let actual = eng.logits();
-        let first_bad = expected.iter().zip(actual.iter()).position(|(&a, &b)| {
-            !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
-        });
+        let first_bad = expected
+            .iter()
+            .zip(actual.iter())
+            .position(|(&a, &b)| !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits());
         let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&split);
         if let Some(i) = first_bad {
-            println!("after {end} tokens: logit {i} differs (prefill {:08x}, split {:08x}), prefill span [{start}, {end})",
-                     expected[i].to_bits(), actual[i].to_bits());
+            println!(
+                "after {end} tokens: logit {i} differs (prefill {:08x}, split {:08x}), prefill span [{start}, {end})",
+                expected[i].to_bits(),
+                actual[i].to_bits()
+            );
         }
         if !state_equal {
             println!("after {end} tokens: cache or convolution state differs, prefill span [{start}, {end})");
@@ -1692,43 +1981,79 @@ fn crosspath(o: &Opts) {
 fn lanes(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
-    let a: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
-    let mut b = a.clone(); b.rotate_left(a.len() / 3);
+    let a: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    let mut b = a.clone();
+    b.rotate_left(a.len() / 3);
     let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000).min(a.len() - 1);
     let ch: usize = std::env::var("INK_LANE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     // the work of one lane as a list of (p0, t): prefill chunks, then single decode steps
     let mut work: Vec<(usize, usize)> = Vec::new();
-    let mut p = 0; while p < pf { let t = (pf - p).min(ch); work.push((p, t)); p += t; }
-    for p in pf..a.len() { work.push((p, 1)); }
+    let mut p = 0;
+    while p < pf {
+        let t = (pf - p).min(ch);
+        work.push((p, t));
+        p += t;
+    }
+    for p in pf..a.len() {
+        work.push((p, 1));
+    }
     let poison = std::env::var("INK_NO_POISON").is_err();
     let hash_step = |run: &engine::Run, (p0, t): (usize, usize), h: &mut u64| {
-        if poison { run.poison_scratch(); }
+        if poison {
+            run.poison_scratch();
+        }
         let cb = run.gpu.cmd();
-        if t == 1 { run.encode_step(&cb, p0, true, false); } else { run.encode_prefill(&cb, p0, t, true, false); }
-        cb.commit(); wait_gate(&cb, "lanes step", p0);
-        for &x in &*run.logits() { *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3); }
+        if t == 1 {
+            run.encode_step(&cb, p0, true, false);
+        } else {
+            run.encode_prefill(&cb, p0, t, true, false);
+        }
+        cb.commit();
+        wait_gate(&cb, "lanes step", p0);
+        for &x in &*run.logits() {
+            *h = (*h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3);
+        }
     };
     // per-step hashes, to name the first step where two runs part
     let trace = |run: &engine::Run, toks: &[u32], other: Option<&engine::Run>| -> Vec<u64> {
         let mut v = Vec::new();
         for &w in &work {
-            if let Some(o) = other { let mut x = 0u64; hash_step(o, w, &mut x); }
-            let mut h = 0xcbf29ce484222325u64; hash_step(run, w, &mut h); v.push(h);
+            if let Some(o) = other {
+                let mut x = 0u64;
+                hash_step(o, w, &mut x);
+            }
+            let mut h = 0xcbf29ce484222325u64;
+            hash_step(run, w, &mut h);
+            v.push(h);
         }
-        let _ = toks; v
+        let _ = toks;
+        v
     };
     let alone = |toks: &[u32]| -> u64 {
-        let lane = Lane::new(&eng); let run = eng.on(&lane);
-        run.reserve(toks.len() + 1, false); run.set_tokens(0, toks);
+        let lane = Lane::new(&eng);
+        let run = eng.on(&lane);
+        run.reserve(toks.len() + 1, false);
+        run.set_tokens(0, toks);
         let mut h = 0xcbf29ce484222325u64;
-        for &w in &work { hash_step(&run, w, &mut h); }
+        for &w in &work {
+            hash_step(&run, w, &mut h);
+        }
         h
     };
-    if std::env::var("INK_ARENA_MAP").is_ok() { println!("{}", eng.arena_map()); }
+    if std::env::var("INK_ARENA_MAP").is_ok() {
+        println!("{}", eng.arena_map());
+    }
     let (ha, hb) = (alone(&a), alone(&b));
     let (la, lb) = (Lane::new(&eng), Lane::new(&eng));
     let (ra, rb) = (eng.on(&la), eng.on(&lb));
-    for (r, t) in [(&ra, &a), (&rb, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+    for (r, t) in [(&ra, &a), (&rb, &b)] {
+        r.reserve(t.len() + 1, false);
+        r.set_tokens(0, t);
+    }
     if std::env::var("INK_LANES_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0") {
         let pos = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
         let leaked = if a[pos] != b[pos] { b[pos] } else { (a[pos] + 1) % (eng.n_vocab as u32) };
@@ -1736,11 +2061,17 @@ fn lanes(o: &Opts) {
         println!("INK_LANES_SABOTAGE: bled lane B token into lane A at position {pos}");
     }
     let (mut ia, mut ib) = (0xcbf29ce484222325u64, 0xcbf29ce484222325u64);
-    for &w in &work { hash_step(&ra, w, &mut ia); hash_step(&rb, w, &mut ib); }
+    for &w in &work {
+        hash_step(&ra, w, &mut ia);
+        hash_step(&rb, w, &mut ib);
+    }
     if std::env::var("INK_LANE_TRACE").is_ok() {
         let (l1, l2, l3) = (Lane::new(&eng), Lane::new(&eng), Lane::new(&eng));
         let (r1, r2, r3) = (eng.on(&l1), eng.on(&l2), eng.on(&l3));
-        for (r, t) in [(&r1, &a), (&r2, &a), (&r3, &b)] { r.reserve(t.len() + 1, false); r.set_tokens(0, t); }
+        for (r, t) in [(&r1, &a), (&r2, &a), (&r3, &b)] {
+            r.reserve(t.len() + 1, false);
+            r.set_tokens(0, t);
+        }
         let solo = trace(&r1, &a, None);
         let mixed = trace(&r2, &a, Some(&r3));
         match solo.iter().zip(&mixed).position(|(x, y)| x != y) {
@@ -1751,8 +2082,17 @@ fn lanes(o: &Opts) {
     println!("lane A alone {ha:016x} interleaved {ia:016x} {}", if ha == ia { "same" } else { "DIFFERENT" });
     println!("lane B alone {hb:016x} interleaved {ib:016x} {}", if hb == ib { "same" } else { "DIFFERENT" });
     let ok = ha == ia && hb == ib && ha != hb;
-    println!("{}", if ok { "lanes independent: interleaved and poisoned, each lane gives exactly its own logits" } else { "LANES NOT INDEPENDENT" });
-    if !ok { std::process::exit(1); }
+    println!(
+        "{}",
+        if ok {
+            "lanes independent: interleaved and poisoned, each lane gives exactly its own logits"
+        } else {
+            "LANES NOT INDEPENDENT"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev, layer 2's gate: N lanes advanced together in steps of several spans must each give exactly what they give alone:
@@ -1767,16 +2107,47 @@ fn spans(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
-    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
     let chunks = [31usize, 1, 23, 7, 17, 1, 29];
     let ndec: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
     let plen: usize = chunks.iter().sum();
     let len = plen + ndec;
-    let work: Vec<(usize, usize)> = { let mut w = Vec::new(); let mut p = 0; for &c in &chunks { w.push((p, c)); p += c; } for q in plen..len { w.push((q, 1)); } w };
-    let stream = |i: usize| -> Vec<u32> { let mut v = base.clone(); v.rotate_left((17 * i) % base.len()); v.truncate(len + 1); v };
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
-    let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128,129".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let work: Vec<(usize, usize)> = {
+        let mut w = Vec::new();
+        let mut p = 0;
+        for &c in &chunks {
+            w.push((p, c));
+            p += c;
+        }
+        for q in plen..len {
+            w.push((q, 1));
+        }
+        w
+    };
+    let stream = |i: usize| -> Vec<u32> {
+        let mut v = base.clone();
+        v.rotate_left((17 * i) % base.len());
+        v.truncate(len + 1);
+        v
+    };
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let fresh = |i: usize| {
+        let l = Lane::new(&eng);
+        let r = eng.on(&l);
+        r.reserve(len + 1, false);
+        r.set_tokens(0, &stream(i));
+        l
+    };
+    let counts: Vec<usize> = std::env::var("INK_LANES")
+        .unwrap_or("1,2,3,17,64,65,128,129".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
     let sabotage = std::env::var("INK_SPANS_SABOTAGE").is_ok();
     let nmax = *counts.iter().max().unwrap();
     // each lane alone: one span per step
@@ -1785,7 +2156,10 @@ fn spans(o: &Opts) {
         let l = fresh(i);
         let mut hs = Vec::new();
         for &(p0, t) in &work {
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false); cb.commit(); wait_gate(&cb, "spans alone", p0);
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &l, p0, t }], true, false);
+            cb.commit();
+            wait_gate(&cb, "spans alone", p0);
             hs.push(fnv(&eng.logits()));
         }
         alone.push((hs, eng.lane_hash(&l)));
@@ -1794,14 +2168,23 @@ fn spans(o: &Opts) {
     for &n in &counts {
         let mut sabotaged = false;
         let lanes: Vec<Lane> = (0..n).map(fresh).collect();
-        let delay = |i: usize| i % 3;                       // lane i starts i % 3 steps late
+        let delay = |i: usize| i % 3; // lane i starts i % 3 steps late
         let mut hs: Vec<Vec<u64>> = vec![Vec::new(); n];
         let steps = work.len() + 2;
         let (mut nsteps, mut mixed) = (0, 0);
         for s in 0..steps {
-            let mut sp = Vec::new(); let mut who = Vec::new();
-            for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
-            if sp.is_empty() { continue; }
+            let mut sp = Vec::new();
+            let mut who = Vec::new();
+            for i in 0..n {
+                if s >= delay(i) && s - delay(i) < work.len() {
+                    let (p0, t) = work[s - delay(i)];
+                    sp.push(Span { lane: &lanes[i], p0, t });
+                    who.push(i);
+                }
+            }
+            if sp.is_empty() {
+                continue;
+            }
             for (w_sp_slice, w_who) in sp.chunks_mut(engine::MAX_SPANS).zip(who.chunks(engine::MAX_SPANS)) {
                 if sabotage && !sabotaged && w_sp_slice.len() >= 2 {
                     // negative control: swap the first two spans' lanes so every span still names a distinct lane,
@@ -1812,23 +2195,52 @@ fn spans(o: &Opts) {
                     w_sp_slice[1].lane = lane0;
                     sabotaged = true;
                 }
-                if w_sp_slice.iter().any(|x| x.t > 1) && w_sp_slice.iter().any(|x| x.t == 1) { mixed += 1; }
+                if w_sp_slice.iter().any(|x| x.t > 1) && w_sp_slice.iter().any(|x| x.t == 1) {
+                    mixed += 1;
+                }
                 nsteps += 1;
-                let cb = eng.gpu.cmd(); eng.encode_spans(&cb, w_sp_slice, true, false); cb.commit(); wait_gate(&cb, "spans batch", w_sp_slice[0].p0);
-                for (k, &i) in w_who.iter().enumerate() { hs[i].push(fnv(&(if w_sp_slice.len() == 1 { eng.logits() } else { eng.span_logits(k) }))); }
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, w_sp_slice, true, false);
+                cb.commit();
+                wait_gate(&cb, "spans batch", w_sp_slice[0].p0);
+                for (k, &i) in w_who.iter().enumerate() {
+                    hs[i].push(fnv(&(if w_sp_slice.len() == 1 { eng.logits() } else { eng.span_logits(k) })));
+                }
             }
         }
         let mut bad = Vec::new();
         for i in 0..n {
             let step = hs[i].iter().zip(&alone[i].0).position(|(a, b)| a != b);
             let cache = eng.lane_hash(&lanes[i]) != alone[i].1;
-            if step.is_some() || cache { bad.push(format!("lane {i}: {}{}", step.map_or(String::new(), |s| format!("logits differ from step {s} ({:?}) ", work[s])), if cache { "cache or state differs" } else { "" })); }
+            if step.is_some() || cache {
+                bad.push(format!(
+                    "lane {i}: {}{}",
+                    step.map_or(String::new(), |s| format!("logits differ from step {s} ({:?}) ", work[s])),
+                    if cache { "cache or state differs" } else { "" }
+                ));
+            }
         }
-        println!("{n:4} lanes, {nsteps} steps ({mixed} mixing prefill and decode spans): {}", if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER, first: {}", bad.len(), bad[0]) });
+        println!(
+            "{n:4} lanes, {nsteps} steps ({mixed} mixing prefill and decode spans): {}",
+            if bad.is_empty() {
+                "every lane identical to alone".to_string()
+            } else {
+                format!("{} lanes DIFFER, first: {}", bad.len(), bad[0])
+            }
+        );
         ok &= bad.is_empty();
     }
-    println!("{}", if ok { "spans invariant: every lane, in every batch, gives exactly what it gives alone" } else { "SPANS NOT INVARIANT" });
-    if !ok { std::process::exit(1); }
+    println!(
+        "{}",
+        if ok {
+            "spans invariant: every lane, in every batch, gives exactly what it gives alone"
+        } else {
+            "SPANS NOT INVARIANT"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev, layer 3's output gate (src/poolgate.rs): lanes run together over production `ServeBlockCache` with every pool
@@ -1841,12 +2253,17 @@ fn spans(o: &Opts) {
 fn poolgate(o: &Opts) {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
-    let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
+    let chunks: Vec<usize> =
+        env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
     let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
     let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
     let start_sabotage = std::env::var("INK_POOLGATE_START_SABOTAGE").is_ok();
     let cache_sabotage = std::env::var("INK_POOLGATE_CACHE_SABOTAGE").is_ok();
-    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
     let plen: usize = chunks.iter().sum();
     let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
     let eng = Engine::load(&o.model, o.ctx);
@@ -1859,17 +2276,25 @@ fn poolgate(o: &Opts) {
     let st = cand.stats();
     let cache_sab_hit = cand.cache_sabotage_triggered();
     cand.shutdown();
-    if sabotage && got.sabotaged.is_none() { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
+    if sabotage && got.sabotaged.is_none() {
+        println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged");
+        std::process::exit(2);
+    }
     // the poisoned lane must differ and no other lane may: lanes share no unpoisoned cache with a sabotaged lane,
     // so a second lane that differs read the poison through state the engine shares across lanes
     if let Some(s) = got.sabotaged {
         let leak = poolgate::leaked(&want, &got, s);
-        if leak.is_empty() { println!("INK_POOLGATE_SABOTAGE: no other lane differs from layer 2's outputs"); }
-        else { println!("LANE LEAK: lanes {leak:?} differ though only lane {s}'s slots were poisoned"); }
+        if leak.is_empty() {
+            println!("INK_POOLGATE_SABOTAGE: no other lane differs from layer 2's outputs");
+        } else {
+            println!("LANE LEAK: lanes {leak:?} differ though only lane {s}'s slots were poisoned");
+        }
     }
     match poolgate::compare(&want, &got) {
         Ok(lines) => {
-            for l in lines { println!("{l}"); }
+            for l in lines {
+                println!("{l}");
+            }
             println!("serve block cache stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, starts_saved={}, starts_matched={}",
                 st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.start_points_saved, st.start_matches);
             if !sabotage && n >= 2 && plen >= 64 && st.shared_dedups == 0 {
@@ -1884,7 +2309,9 @@ fn poolgate(o: &Opts) {
                 match poolgate::verify_serve_cache_start_points(&eng, &base, o.ctx, cache_sabotage) {
                     Ok(msg) => {
                         if cache_sabotage {
-                            println!("INK_POOLGATE_CACHE_SABOTAGE: sabotage did not cause divergence (hit={cache_sab_hit})");
+                            println!(
+                                "INK_POOLGATE_CACHE_SABOTAGE: sabotage did not cause divergence (hit={cache_sab_hit})"
+                            );
                             std::process::exit(2);
                         }
                         println!("{msg}");
@@ -1897,12 +2324,22 @@ fn poolgate(o: &Opts) {
                 }
                 match poolgate::verify_prefix_start_points(&eng, &base, o.ctx, start_sabotage) {
                     Ok(msg) => println!("{msg}"),
-                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
+                    Err(err) => {
+                        println!("PREFIX START-POINT GATE DIFFERS: {err}");
+                        println!("POOL GATE DIFFERS [{label}]");
+                        std::process::exit(1);
+                    }
                 }
             }
             println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs");
         }
-        Err(lines) => { for l in lines { println!("{l}"); } println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
+        Err(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+            println!("POOL GATE DIFFERS [{label}]");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1919,52 +2356,111 @@ fn xcopy(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(2);
-    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
     let (head, tail, ndec) = (384usize, 256usize, 8usize);
     assert!(base.len() > head + tail + ndec + 1024, "need a longer --ref token list");
-    let mut rot = base.clone(); rot.rotate_left(997);
-    let stream = |which: usize| -> Vec<u32> { let mut v: Vec<u32> = base[..head].to_vec(); v.extend_from_slice(if which == 0 { &base[head..head + tail + ndec] } else { &rot[head..head + tail + ndec] }); v };
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let mut rot = base.clone();
+    rot.rotate_left(997);
+    let stream = |which: usize| -> Vec<u32> {
+        let mut v: Vec<u32> = base[..head].to_vec();
+        v.extend_from_slice(if which == 0 { &base[head..head + tail + ndec] } else { &rot[head..head + tail + ndec] });
+        v
+    };
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let sabotage = std::env::var("INK_XCOPY_SABOTAGE").is_ok();
     let step = |lane: &Lane, p0: usize, t: usize, dec: bool| -> u64 {
         eng.poison_scratch();
         let cb = eng.gpu.cmd();
-        if dec { eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false); } else { eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false); }
-        cb.commit(); wait_gate(&cb, "xcopy step", p0);
+        if dec {
+            eng.encode_decode(&cb, &[Span { lane, p0, t }], true, false);
+        } else {
+            eng.encode_spans(&cb, &[Span { lane, p0, t }], true, false);
+        }
+        cb.commit();
+        wait_gate(&cb, "xcopy step", p0);
         fnv(&(if dec { eng.span_logits(0) } else { eng.logits() }))
     };
     let run_stream = |lane: &Lane, chunks: &[usize], from: usize, decode: bool| -> (Vec<(usize, u64)>, Vec<u64>) {
-        let mut hs = Vec::new(); let mut p = from;
-        for &t in chunks { hs.push((p + t, step(lane, p, t, false))); p += t; }
+        let mut hs = Vec::new();
+        let mut p = from;
+        for &t in chunks {
+            hs.push((p + t, step(lane, p, t, false)));
+            p += t;
+        }
         let mut ds = Vec::new();
-        if decode { for q in 0..ndec { ds.push(step(lane, head + tail + q, 1, true)); } }
+        if decode {
+            for q in 0..ndec {
+                ds.push(step(lane, head + tail + q, 1, true));
+            }
+        }
         (hs, ds)
     };
     // cold: head and tail prefilled on one lane, split at 101, 384 and 640
-    let cold = |which: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(which));
-                                let out = run_stream(&l, &[101, 283, 256], 0, true); (l, out) };
+    let cold = |which: usize| {
+        let l = Lane::new(&eng);
+        let r = eng.on(&l);
+        r.reserve(head + tail + ndec + 1, false);
+        r.set_tokens(0, &stream(which));
+        let out = run_stream(&l, &[101, 283, 256], 0, true);
+        (l, out)
+    };
     // the source: the shared head alone, split at 101 and 384; its state at the head's end is kept
     let src = Lane::new(&eng);
-    { let r = eng.on(&src); r.reserve(head + tail + ndec + 1, false); r.set_tokens(0, &stream(0)[..head]); run_stream(&src, &[101, 283], 0, false); }
+    {
+        let r = eng.on(&src);
+        r.reserve(head + tail + ndec + 1, false);
+        r.set_tokens(0, &stream(0)[..head]);
+        run_stream(&src, &[101, 283], 0, false);
+    }
     let cs_head = eng.on(&src).get_cs();
     let src_before = eng.lane_hash(&src);
     let mut ok = true;
     for which in 0..2 {
         let (cl, (chs, cds)) = cold(which);
-        let l = Lane::new(&eng); let r = eng.on(&l);
-        r.reset(); r.reserve(head + tail + ndec + 1, false);
+        let l = Lane::new(&eng);
+        let r = eng.on(&l);
+        r.reset();
+        r.reserve(head + tail + ndec + 1, false);
         eng.copy_lane_prefix(&src, &l, if sabotage { head - 1 } else { head });
-        r.set_cs(&cs_head); r.set_tokens(0, &stream(which));
+        r.set_cs(&cs_head);
+        r.set_tokens(0, &stream(which));
         let (hs, ds) = run_stream(&l, &[63, 193], head, true);
         let at = |v: &[(usize, u64)], p: usize| v.iter().find(|(q, _)| *q == p).map(|(_, h)| *h);
-        let same = at(&hs, head + tail) == at(&chs, head + tail) && ds == cds && eng.lane_hash(&l) == eng.lane_hash(&cl);
-        println!("tail {}: copied head {} + tail {} {} cold (logits at {}, decode steps, final state)", which, head, tail, if same { "matches" } else { "DIFFERS from" }, head + tail);
+        let same =
+            at(&hs, head + tail) == at(&chs, head + tail) && ds == cds && eng.lane_hash(&l) == eng.lane_hash(&cl);
+        println!(
+            "tail {}: copied head {} + tail {} {} cold (logits at {}, decode steps, final state)",
+            which,
+            head,
+            tail,
+            if same { "matches" } else { "DIFFERS from" },
+            head + tail
+        );
         ok &= same;
     }
-    if eng.lane_hash(&src) != src_before { println!("the copy moved the source lane"); ok = false; }
-    if sabotage { println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head); }
-    println!("{}", if ok { "xcopy lossless: two tails from one copied head match cold prefill bit for bit" } else { "XCOPY NOT LOSSLESS" });
-    if !ok { std::process::exit(1); }
+    if eng.lane_hash(&src) != src_before {
+        println!("the copy moved the source lane");
+        ok = false;
+    }
+    if sabotage {
+        println!("INK_XCOPY_SABOTAGE: copied {} of {} head tokens, the tail still starts at {}", head - 1, head, head);
+    }
+    println!(
+        "{}",
+        if ok {
+            "xcopy lossless: two tails from one copied head match cold prefill bit for bit"
+        } else {
+            "XCOPY NOT LOSSLESS"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// dev, Layer 4 gate (`docs/ROADMAP.md:141`): temperature = 1.0 with fixed seeds gives bit-identical
@@ -2006,7 +2502,8 @@ fn temp1(o: &Opts) {
         rot2[..head + tail].to_vec(),
     ];
     let seeds = [0x1111_2222_3333_4444u64, 0xCAFE_BABE_DEAD_BEEFu64];
-    let modes: [(&str, f32); 2] = [("gpu-gumbel (temp=1.0, top_p=1.0)", 1.0), ("cpu-sampler (temp=1.0, top_p=0.95)", 0.95)];
+    let modes: [(&str, f32); 2] =
+        [("gpu-gumbel (temp=1.0, top_p=1.0)", 1.0), ("cpu-sampler (temp=1.0, top_p=0.95)", 0.95)];
     let mut ok = true;
 
     for &(mode_name, top_p) in &modes {
@@ -2135,19 +2632,13 @@ fn temp1(o: &Opts) {
                         has_pending_decode: !r.toks.is_empty() && r.n_past < r.pf_end + r.toks.len(),
                     })
                     .collect();
-                let plan = planner
-                    .plan_and_begin_step(&inputs, 256, 64)
-                    .expect("temp1 scheduler must make progress");
+                let plan = planner.plan_and_begin_step(&inputs, 256, 64).expect("temp1 scheduler must make progress");
                 match plan {
                     ServeStepPlan::Prefill(sp_list) => {
-                        let spans: Vec<Span> = sp_list
-                            .iter()
-                            .map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t })
-                            .collect();
-                        let want_logits: Vec<bool> = sp_list
-                            .iter()
-                            .map(|&(i, p0, t)| p0 + t == reqs[i].pf_end)
-                            .collect();
+                        let spans: Vec<Span> =
+                            sp_list.iter().map(|&(i, p0, t)| Span { lane: &reqs[i].lane, p0, t }).collect();
+                        let want_logits: Vec<bool> =
+                            sp_list.iter().map(|&(i, p0, t)| p0 + t == reqs[i].pf_end).collect();
                         let many = spans.len() > 1;
                         eng.poison_scratch();
                         let cb = eng.gpu.cmd();
@@ -2191,10 +2682,8 @@ fn temp1(o: &Opts) {
                             let tok = *reqs[i].toks.last().unwrap();
                             eng.on(&reqs[i].lane).set_tokens(reqs[i].n_past, &[tok]);
                         }
-                        let spans: Vec<Span> = dec_lanes
-                            .iter()
-                            .map(|&i| Span { lane: &reqs[i].lane, p0: reqs[i].n_past, t: 1 })
-                            .collect();
+                        let spans: Vec<Span> =
+                            dec_lanes.iter().map(|&i| Span { lane: &reqs[i].lane, p0: reqs[i].n_past, t: 1 }).collect();
                         eng.poison_scratch();
                         let cb = eng.gpu.cmd();
                         eng.encode_decode(&cb, &spans, true, false);
@@ -2210,7 +2699,16 @@ fn temp1(o: &Opts) {
                             let gcb = eng.gpu.cmd();
                             for &(k, i) in &gpu_dec {
                                 let next_pos = reqs[i].n_past + 1;
-                                eng.encode_gumbel_span(&gcb, k, &reqs[i].lane, next_pos, reqs[i].seed, next_pos, 1.0, None);
+                                eng.encode_gumbel_span(
+                                    &gcb,
+                                    k,
+                                    &reqs[i].lane,
+                                    next_pos,
+                                    reqs[i].seed,
+                                    next_pos,
+                                    1.0,
+                                    None,
+                                );
                             }
                             gcb.commit();
                             gcb.waitUntilCompleted();
@@ -2369,17 +2867,14 @@ fn temp1(o: &Opts) {
                             let mut pools = eng.block_pool().borrow_mut();
                             for &(i, p0, t) in &sp_list {
                                 let mut tbl = breqs[i].lane.block_table().borrow_mut();
-                                sbc.ensure_span_blocks(&mut pools, &mut tbl, p0, t).expect("blocked pf ensure_span_blocks");
+                                sbc.ensure_span_blocks(&mut pools, &mut tbl, p0, t)
+                                    .expect("blocked pf ensure_span_blocks");
                             }
                         }
-                        let spans: Vec<Span> = sp_list
-                            .iter()
-                            .map(|&(i, p0, t)| Span { lane: &breqs[i].lane, p0, t })
-                            .collect();
-                        let want_logits: Vec<bool> = sp_list
-                            .iter()
-                            .map(|&(i, p0, t)| p0 + t == breqs[i].pf_end)
-                            .collect();
+                        let spans: Vec<Span> =
+                            sp_list.iter().map(|&(i, p0, t)| Span { lane: &breqs[i].lane, p0, t }).collect();
+                        let want_logits: Vec<bool> =
+                            sp_list.iter().map(|&(i, p0, t)| p0 + t == breqs[i].pf_end).collect();
                         let many = spans.len() > 1;
                         eng.poison_scratch();
                         let cb = eng.gpu.cmd();
@@ -2391,15 +2886,9 @@ fn temp1(o: &Opts) {
                             for &(i, p0, t) in &sp_list {
                                 let r = &mut breqs[i];
                                 let mut tbl = r.lane.block_table().borrow_mut();
-                                sbc.finish_prefill_span(
-                                    &mut pools,
-                                    &mut tbl,
-                                    &mut r.blocks,
-                                    &r.prompt,
-                                    p0,
-                                    t,
-                                    || eng.on(&r.lane).get_cs(),
-                                );
+                                sbc.finish_prefill_span(&mut pools, &mut tbl, &mut r.blocks, &r.prompt, p0, t, || {
+                                    eng.on(&r.lane).get_cs()
+                                });
                             }
                         }
                         let mut gpu_pf = Vec::new();
@@ -2440,7 +2929,8 @@ fn temp1(o: &Opts) {
                             for &i in &dec_lanes {
                                 let pos = breqs[i].n_past;
                                 let mut tbl = breqs[i].lane.block_table().borrow_mut();
-                                sbc.ensure_span_blocks(&mut pools, &mut tbl, pos, 1).expect("blocked dec ensure_span_blocks");
+                                sbc.ensure_span_blocks(&mut pools, &mut tbl, pos, 1)
+                                    .expect("blocked dec ensure_span_blocks");
                             }
                         }
                         for &i in &dec_lanes {
@@ -2475,7 +2965,16 @@ fn temp1(o: &Opts) {
                             let gcb = eng.gpu.cmd();
                             for &(k, i) in &gpu_dec {
                                 let next_pos = breqs[i].n_past + 1;
-                                eng.encode_gumbel_span(&gcb, k, &breqs[i].lane, next_pos, breqs[i].seed, next_pos, 1.0, None);
+                                eng.encode_gumbel_span(
+                                    &gcb,
+                                    k,
+                                    &breqs[i].lane,
+                                    next_pos,
+                                    breqs[i].seed,
+                                    next_pos,
+                                    1.0,
+                                    None,
+                                );
                             }
                             gcb.commit();
                             gcb.waitUntilCompleted();
@@ -2546,9 +3045,15 @@ fn lanebench(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
-    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
-    let ctxs: Vec<usize> = std::env::var("INK_CTXS").unwrap_or("2048,20480".into()).split(',').map(|v| v.parse().unwrap()).collect();
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,8,16,32,64".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    let ctxs: Vec<usize> =
+        std::env::var("INK_CTXS").unwrap_or("2048,20480".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> =
+        std::env::var("INK_LANES").unwrap_or("1,8,16,32,64".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let steps: usize = std::env::var("INK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
     println!("{:>6} {:>5} {:>9} {:>10} {:>9} {:>10}", "ctx", "lanes", "ms/step", "total t/s", "per lane", "GPU GiB");
@@ -2556,36 +3061,85 @@ fn lanebench(o: &Opts) {
         let len = c + steps + 1;
         let toks: Vec<u32> = (0..len).map(|i| base[i % base.len()]).collect();
         let src = Lane::new(&eng);
-        { let r = eng.on(&src); r.reserve(len, false); r.set_tokens(0, &toks);
-          let mut p = 0; while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; } }
+        {
+            let r = eng.on(&src);
+            r.reserve(len, false);
+            r.set_tokens(0, &toks);
+            let mut p = 0;
+            while p < c {
+                let t = (c - p).min(eng.chunk);
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false);
+                cb.commit();
+                cb.waitUntilCompleted();
+                p += t;
+            }
+        }
         // the baseline: one stream on the single-stream decode path at this context
         {
             let r = eng.on(&src);
-            let tok = |q: usize| { let cb = eng.gpu.cmd(); r.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+            let tok = |q: usize| {
+                let cb = eng.gpu.cmd();
+                r.encode_step(&cb, c + q, true, false);
+                cb.commit();
+                cb.waitUntilCompleted();
+            };
             tok(0);
             let t0 = std::time::Instant::now();
-            for q in 0..steps { tok(q); }
+            for q in 0..steps {
+                tok(q);
+            }
             let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
-            println!("{c:>6} {:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}  (one stream, decode path)", 1, 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+            println!(
+                "{c:>6} {:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}  (one stream, decode path)",
+                1,
+                1e3 / ms,
+                1e3 / ms,
+                gib(eng.gpu_mem().0)
+            );
             // (the decode path advanced src's state by `steps` tokens: harmless here, this measures time only)
         }
         let nmax = *counts.iter().max().unwrap();
-        let lanes: Vec<Lane> = (0..nmax).map(|i| {
-            let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false);
-            let mut t = toks.clone();
-            for q in 0..=steps { t[c + q] = base[(97 * i + q) % base.len()]; }
-            r.set_tokens(0, &t); eng.copy_lane(&src, &l); l
-        }).collect();
+        let lanes: Vec<Lane> = (0..nmax)
+            .map(|i| {
+                let l = Lane::new(&eng);
+                let r = eng.on(&l);
+                r.reserve(len, false);
+                let mut t = toks.clone();
+                for q in 0..=steps {
+                    t[c + q] = base[(97 * i + q) % base.len()];
+                }
+                r.set_tokens(0, &t);
+                eng.copy_lane(&src, &l);
+                l
+            })
+            .collect();
         eng.ensure_dbatch(nmax);
         for &n in &counts {
             // a warm-up step, then the timed steps: lanes decode positions c, c + 1, ... (the context grows by `steps` at most)
-            let step = |q: usize| { let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
-                                    let cb = eng.gpu.cmd(); if std::env::var("INK_SPANS_DEC").is_ok() { eng.encode_spans(&cb, &sp, true, false) } else { eng.encode_decode(&cb, &sp, true, false) }; cb.commit(); cb.waitUntilCompleted(); };
+            let step = |q: usize| {
+                let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                let cb = eng.gpu.cmd();
+                if std::env::var("INK_SPANS_DEC").is_ok() {
+                    eng.encode_spans(&cb, &sp, true, false)
+                } else {
+                    eng.encode_decode(&cb, &sp, true, false)
+                };
+                cb.commit();
+                cb.waitUntilCompleted();
+            };
             step(0);
             let t0 = std::time::Instant::now();
-            for q in 0..steps { step(q); }
+            for q in 0..steps {
+                step(q);
+            }
             let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
-            println!("{c:>6} {n:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}", n as f64 * 1e3 / ms, 1e3 / ms, gib(eng.gpu_mem().0));
+            println!(
+                "{c:>6} {n:>5} {ms:>9.1} {:>10.0} {:>9.1} {:>10.1}",
+                n as f64 * 1e3 / ms,
+                1e3 / ms,
+                gib(eng.gpu_mem().0)
+            );
         }
     }
     let (_, ws) = eng.gpu_mem();
@@ -2603,16 +3157,33 @@ fn dbatch(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(MAX_SPANS_DB);
-    let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let base: Vec<u32> = std::fs::read_to_string(&o.reference)
+        .expect("--ref FILE.tokens")
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
     let pf: usize = std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
     let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,8".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> =
+        std::env::var("INK_LANES").unwrap_or("1,2,8".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let len = pf + nd + 1;
     let stream = |i: usize| -> Vec<u32> { (0..len).map(|q| base[(97 * i + q) % base.len()]).collect() };
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let prefilled = |i: usize| -> Lane {
-        let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len, false); r.set_tokens(0, &stream(i));
-        let mut p = 0; while p < pf { let t = (pf - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &l, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
+        let l = Lane::new(&eng);
+        let r = eng.on(&l);
+        r.reserve(len, false);
+        r.set_tokens(0, &stream(i));
+        let mut p = 0;
+        while p < pf {
+            let t = (pf - p).min(eng.chunk);
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &l, p0: p, t }], false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            p += t;
+        }
         l
     };
     let nmax = *counts.iter().max().unwrap();
@@ -2626,11 +3197,31 @@ fn dbatch(o: &Opts) {
             eng.ensure_dbatch(n);
             let b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf)).collect();
             let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect();
-            let time = |skip: u32| { eng.skip.set(skip); let mut best = f64::MAX; for _ in 0..3 { let cb = eng.gpu.cmd(); if old { eng.encode_dbatch(&cb, &b, true); } else { eng.encode_decode(&cb, &sp, true, false); } cb.commit(); cb.waitUntilCompleted();
-                best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3); } eng.skip.set(0); best };
+            let time = |skip: u32| {
+                eng.skip.set(skip);
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let cb = eng.gpu.cmd();
+                    if old {
+                        eng.encode_dbatch(&cb, &b, true);
+                    } else {
+                        eng.encode_decode(&cb, &sp, true, false);
+                    }
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3);
+                }
+                eng.skip.set(0);
+                best
+            };
             let full = time(0);
             println!("{n} lanes: {full:.1} ms GPU per step");
-            for (c, name) in engine::CLS_NAMES.iter().enumerate() { let d = full - time(1 << c); if d > 0.5 { println!("  {name:>11}: {d:7.1} ms ({:4.1}%)", d / full * 100.0); } }
+            for (c, name) in engine::CLS_NAMES.iter().enumerate() {
+                let d = full - time(1 << c);
+                if d > 0.5 {
+                    println!("  {name:>11}: {d:7.1} ms ({:4.1}%)", d / full * 100.0);
+                }
+            }
         }
         return;
     }
@@ -2638,19 +3229,30 @@ fn dbatch(o: &Opts) {
     let mut alone = Vec::new();
     let mut t_alone = 0.0;
     for i in 0..nmax {
-        let l = prefilled(i); let r = eng.on(&l);
+        let l = prefilled(i);
+        let r = eng.on(&l);
         let mut hs = Vec::new();
         let t0 = std::time::Instant::now();
         for q in 0..nd {
             let cb = eng.gpu.cmd();
-            if old { r.encode_step(&cb, pf + q, true, false); } else { eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false); }
-            cb.commit(); cb.waitUntilCompleted(); hs.push(fnv(&(if old { eng.logits() } else { eng.span_logits(0) })));
+            if old {
+                r.encode_step(&cb, pf + q, true, false);
+            } else {
+                eng.encode_decode(&cb, &[Span { lane: &l, p0: pf + q, t: 1 }], true, false);
+            }
+            cb.commit();
+            cb.waitUntilCompleted();
+            hs.push(fnv(&(if old { eng.logits() } else { eng.span_logits(0) })));
         }
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
     }
     let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
-    println!("alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s", if old { "decode path" } else { "decode steps of one lane" }, 1e3 / ms_alone);
+    println!(
+        "alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s",
+        if old { "decode path" } else { "decode steps of one lane" },
+        1e3 / ms_alone
+    );
     let sabotage = std::env::var("INK_DBATCH_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
     let mut sabotaged = false;
     let mut ok = true;
@@ -2667,22 +3269,48 @@ fn dbatch(o: &Opts) {
                 sabotaged = true;
             }
             let cb = eng.gpu.cmd();
-            if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
-            cb.commit(); cb.waitUntilCompleted();
-            for (j, h) in hs.iter_mut().enumerate().take(n) { h.push(fnv(&(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) }))); }
+            if old {
+                eng.encode_dbatch(&cb, &b, true);
+            } else {
+                let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect();
+                eng.encode_decode(&cb, &sp, true, false);
+            }
+            cb.commit();
+            cb.waitUntilCompleted();
+            for (j, h) in hs.iter_mut().enumerate().take(n) {
+                h.push(fnv(&(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })));
+            }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
-        let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
-        println!("{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}", n as f64 * 1e3 / ms, 1e3 / ms,
-                 if bad.is_empty() { "every lane identical to alone".to_string() } else { format!("{} lanes DIFFER (first {})", bad.len(), bad[0]) });
+        let bad: Vec<usize> =
+            (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
+        println!(
+            "{n:4} lanes: {ms:7.1} ms/step, {:6.0} tok/s total, {:5.1} per lane: {}",
+            n as f64 * 1e3 / ms,
+            1e3 / ms,
+            if bad.is_empty() {
+                "every lane identical to alone".to_string()
+            } else {
+                format!("{} lanes DIFFER (first {})", bad.len(), bad[0])
+            }
+        );
         ok &= bad.is_empty();
     }
     if sabotage && !sabotaged {
         eprintln!("INK_DBATCH_SABOTAGE: need a lane count >= 2 in INK_LANES");
         std::process::exit(2);
     }
-    println!("{}", if ok { "dbatch exact: every lane in the batch gives exactly what it gives decoding alone" } else { "DBATCH NOT EXACT" });
-    if !ok { std::process::exit(1); }
+    println!(
+        "{}",
+        if ok {
+            "dbatch exact: every lane in the batch gives exactly what it gives decoding alone"
+        } else {
+            "DBATCH NOT EXACT"
+        }
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 /// Layer 3 shared-KV grouped decode parity + speedup benchmark (`k_attn_grp_dec` G_MAX=8 vs `INK_NO_GRP_DEC=1`).
@@ -2694,7 +3322,8 @@ fn sharedkv(o: &Opts) {
     let prefix_len: usize = std::env::var("INK_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     assert!(prefix_len >= 64 && prefix_len.is_multiple_of(64), "INK_PREFIX must be a non-zero multiple of 64");
     let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> =
+        std::env::var("INK_LANES").unwrap_or("16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let max_suffix = 256usize;
     let ctx = o.ctx.max((prefix_len + max_suffix + nd + 64).div_ceil(64) * 64);
     let eng = Engine::load(&o.model, ctx);
@@ -2704,7 +3333,8 @@ fn sharedkv(o: &Opts) {
         .map(|l| l.trim().parse().unwrap())
         .collect();
     let prefix: Vec<u32> = (0..prefix_len).map(|i| base[i % base.len()]).collect();
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let argmax = |v: &[f32]| -> u32 {
         v.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i as u32).unwrap_or(0)
     };
@@ -2780,7 +3410,9 @@ fn sharedkv(o: &Opts) {
         for i in 0..n {
             let sfx_len = 16 + (i * 19) % 192;
             let mut toks = prefix.clone();
-            for k in 0..sfx_len { toks.push(base[(97 * (i + 1) + k) % base.len()]); }
+            for k in 0..sfx_len {
+                toks.push(base[(97 * (i + 1) + k) % base.len()]);
+            }
             let (lid, matched) = pool.new_lane_matched(&toks, ctx);
             pool.prefill(&[(lid, matched, sfx_len)]);
             pool.set_token(lid, toks.len(), base[(i + 7) % base.len()]);
@@ -2790,8 +3422,10 @@ fn sharedkv(o: &Opts) {
         pool.end_lane(donor);
         let sp: Vec<(usize, usize)> = child_ids.iter().copied().zip(child_pos.iter().copied()).collect();
         // Warmup 2 steps
-        eng.set_no_grp_dec(false); let _ = pool.bench_decode_ms(&sp);
-        eng.set_no_grp_dec(true);  let _ = pool.bench_decode_ms(&sp);
+        eng.set_no_grp_dec(false);
+        let _ = pool.bench_decode_ms(&sp);
+        eng.set_no_grp_dec(true);
+        let _ = pool.bench_decode_ms(&sp);
         let (mut best_nogrp, mut best_grp, mut best_noattn) = (f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..5 {
             eng.skip.set(0);
@@ -2877,7 +3511,9 @@ fn sharedkv(o: &Opts) {
                 pool.shutdown();
             }
         }
-        println!("boundary ends {boundary_ends:?}: grouped and solo Layer 3 match private Layer 2 fixed-split bit-for-bit");
+        println!(
+            "boundary ends {boundary_ends:?}: grouped and solo Layer 3 match private Layer 2 fixed-split bit-for-bit"
+        );
     }
     for &n in &counts {
         let (h_nogrp, _, _) = run_mode(n, true);
@@ -2922,8 +3558,10 @@ fn prefixbench(o: &Opts) {
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(16);
     let base = load_gate_tokens(&eng, o);
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
-    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i as u32).unwrap_or(0);
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let argmax =
+        |v: &[f32]| v.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i as u32).unwrap_or(0);
     let mib = |b: usize| b as f64 / 1048576.0;
 
     #[derive(Clone)]
@@ -2949,9 +3587,7 @@ fn prefixbench(o: &Opts) {
         },
         Case {
             name: "unrelated-4x2k",
-            prompts: (0..4)
-                .map(|i| (0..2176).map(|k| base[(199 * (i + 1) + k) % base.len()]).collect())
-                .collect(),
+            prompts: (0..4).map(|i| (0..2176).map(|k| base[(199 * (i + 1) + k) % base.len()]).collect()).collect(),
             shared_prefix_toks: 0,
         },
         Case {
@@ -2988,7 +3624,16 @@ fn prefixbench(o: &Opts) {
 
     println!(
         "{:<20} {:>5} {:>11} {:>11} {:>10} {:>11} {:>11} {:>11} {:>10} {:>8}",
-        "case", "lanes", "priv KV MiB", "shrd KV MiB", "peak MiB", "e2e priv ms", "e2e shrd ms", "dec ms(p->s)", "dec tok/s", "parity"
+        "case",
+        "lanes",
+        "priv KV MiB",
+        "shrd KV MiB",
+        "peak MiB",
+        "e2e priv ms",
+        "e2e shrd ms",
+        "dec ms(p->s)",
+        "dec tok/s",
+        "parity"
     );
 
     let mut all_ok = true;
@@ -3154,7 +3799,11 @@ fn cpu_loopcd_reference(z3_raw: &[f32], z1_raw: &[f32], softcap: f32, omega_max:
     let c = softcap as f64;
     let cap = |x: f32| -> f64 {
         let xd = x as f64;
-        if c > 0.0 { c * (xd / c).tanh() } else { xd }
+        if c > 0.0 {
+            c * (xd / c).tanh()
+        } else {
+            xd
+        }
     };
     let mut max1 = f64::NEG_INFINITY;
     let mut max2 = f64::NEG_INFINITY;
@@ -3219,9 +3868,7 @@ fn loopcdgate(o: &Opts) {
     let eng = Engine::load(&o.model, ctx);
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(n_lanes);
-    let sabotage = std::env::var("INK_LOOPCDGATE_SABOTAGE")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "0");
+    let sabotage = std::env::var("INK_LOOPCDGATE_SABOTAGE").ok().filter(|v| !v.is_empty() && v != "0");
 
     let base = load_gate_tokens(&eng, o);
     // Build 4 token streams: lanes 0 & 1 share block 0 (`[0..64)`) + identical `[64..need_toks)` at different omegas;
@@ -3264,12 +3911,18 @@ fn loopcdgate(o: &Opts) {
                     }
                     let (sf, _) = match pools.full.lowest_free() {
                         Some(s) => (s, pools.full.take(s).unwrap()),
-                        None => { let s = pools.full.grow().unwrap(); (s, pools.full.take(s).unwrap()) }
+                        None => {
+                            let s = pools.full.grow().unwrap();
+                            (s, pools.full.take(s).unwrap())
+                        }
                     };
                     let gf = pools.full.record(sf).unwrap().generation();
                     let (sw, _) = match pools.window.lowest_free() {
                         Some(s) => (s, pools.window.take(s).unwrap()),
-                        None => { let s = pools.window.grow().unwrap(); (s, pools.window.take(s).unwrap()) }
+                        None => {
+                            let s = pools.window.grow().unwrap();
+                            (s, pools.window.take(s).unwrap())
+                        }
                     };
                     let gw = pools.window.record(sw).unwrap().generation();
                     tbl.fill(&mut pools.full, bi, sf, gf).unwrap();
@@ -3346,7 +3999,8 @@ fn loopcdgate(o: &Opts) {
     // 1. Isolated dry weak pass check (`encode_decode_one_pass(..., true)`):
     //    `CS[18..24]` and `KV[18..24]` must mutate ZERO bytes during the dry weak pass itself!
     let dry_probe_lanes = setup_blocked_lanes(true);
-    let pre_coda_cs: Vec<Vec<u8>> = dry_probe_lanes.iter().map(|l| eng.on(l).get_cs()[coda_cs_range.clone()].to_vec()).collect();
+    let pre_coda_cs: Vec<Vec<u8>> =
+        dry_probe_lanes.iter().map(|l| eng.on(l).get_cs()[coda_cs_range.clone()].to_vec()).collect();
     let pre_coda_kv: Vec<Vec<u8>> = dry_probe_lanes.iter().map(snapshot_coda_kv).collect();
     {
         let sp: Vec<Span> = dry_probe_lanes.iter().map(|l| Span { lane: l, p0: prefill_len, t: 1 }).collect();
@@ -3432,37 +4086,52 @@ fn loopcdgate(o: &Opts) {
         }
         // Verify captured `lg_weak` matches both isolated dry probe and standalone 1-pass reference.
         if let Some(wd) = weak_loopcd_mismatch(&cand_weak_logits[i], &dry_weak_probe_logits[i], &z1_ref[i]) {
-            bad.push(format!("lane {i}: captured weak logits fail the dry-probe or standalone comparison (max_diff={wd:.6e})"));
+            bad.push(format!(
+                "lane {i}: captured weak logits fail the dry-probe or standalone comparison (max_diff={wd:.6e})"
+            ));
         }
 
         if omegas[i] == 0.0 {
             // (c) Disabled lane in mixed batch must leave raw logits untouched and report `span_loopcd == false`.
             if eng.span_loopcd(i) || eng.span_effective_sampler_softcap(i) != eng.softcap {
-                bad.push(format!("lane {i} (omega=0): span_loopcd={} softcap={}", eng.span_loopcd(i), eng.span_effective_sampler_softcap(i)));
+                bad.push(format!(
+                    "lane {i} (omega=0): span_loopcd={} softcap={}",
+                    eng.span_loopcd(i),
+                    eng.span_effective_sampler_softcap(i)
+                ));
             }
-            let same_bits = cand_logits[i]
-                .iter()
-                .zip(&z3_solo[i])
-                .all(|(a, b)| a.is_finite() && a.to_bits() == b.to_bits());
+            let same_bits =
+                cand_logits[i].iter().zip(&z3_solo[i]).all(|(a, b)| a.is_finite() && a.to_bits() == b.to_bits());
             if !same_bits {
                 let d = cand_logits[i].iter().zip(&z3_solo[i]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                 bad.push(format!("lane {i} (omega=0): logits differ from standalone omega=0 step (max_diff={d:.6e})"));
             }
-            println!("lane {i} (omega={:.2}): raw logits bit-identical to standalone omega=0, CS/KV bit-identical", omegas[i]);
+            println!(
+                "lane {i} (omega={:.2}): raw logits bit-identical to standalone omega=0, CS/KV bit-identical",
+                omegas[i]
+            );
         } else {
             // (d) Guided lane must match independent `f64` CPU LoopCD formula within `< 1e-4`.
             if !eng.span_loopcd(i) || eng.span_effective_sampler_softcap(i) != 0.0 {
-                bad.push(format!("lane {i} (omega={}): span_loopcd={} softcap={}", omegas[i], eng.span_loopcd(i), eng.span_effective_sampler_softcap(i)));
+                bad.push(format!(
+                    "lane {i} (omega={}): span_loopcd={} softcap={}",
+                    omegas[i],
+                    eng.span_loopcd(i),
+                    eng.span_effective_sampler_softcap(i)
+                ));
             }
             let (want_blended, omega_t) = cpu_loopcd_reference(&z3_solo[i], &z1_ref[i], eng.softcap, omegas[i]);
-            let (worst_tok, worst_diff) = cand_logits[i]
-                .iter()
-                .zip(&want_blended)
-                .enumerate()
-                .fold((0usize, 0.0f32), |(bi, bd), (v, (&a, &b))| {
+            let (worst_tok, worst_diff) = cand_logits[i].iter().zip(&want_blended).enumerate().fold(
+                (0usize, 0.0f32),
+                |(bi, bd), (v, (&a, &b))| {
                     let d = if a.is_finite() && b.is_finite() { (a - b).abs() } else { f32::INFINITY };
-                    if d > bd { (v, d) } else { (bi, bd) }
-                });
+                    if d > bd {
+                        (v, d)
+                    } else {
+                        (bi, bd)
+                    }
+                },
+            );
             max_guided_err = max_guided_err.max(worst_diff);
             let shift_vs_plain = cand_logits[i]
                 .iter()
@@ -3516,35 +4185,25 @@ fn blockedinv(o: &Opts) {
     use poolgate::{Layer3Pool, StepPath};
 
     let sabotage = std::env::var("INK_BLOCKEDINV_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
-    let n_lanes: usize = std::env::var("INK_LANES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if sabotage { 4 } else { 20 });
-    let pf_len: usize = std::env::var("INK_PF")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if sabotage { 192 } else { 1120 });
-    let ndec: usize = std::env::var("INK_DECODE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if sabotage { 2 } else { 6 });
-    let full_span_req: usize = std::env::var("INK_FULL_SPAN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if sabotage { 0 } else { 4096 });
+    let n_lanes: usize =
+        std::env::var("INK_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(if sabotage { 4 } else { 20 });
+    let pf_len: usize =
+        std::env::var("INK_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(if sabotage { 192 } else { 1120 });
+    let ndec: usize =
+        std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(if sabotage { 2 } else { 6 });
+    let full_span_req: usize =
+        std::env::var("INK_FULL_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(if sabotage { 0 } else { 4096 });
 
-    let needed_ctx = full_span_req
-        .max(pf_len + ndec + 16)
-        .max(192)
-        .div_ceil(64)
-        * 64
-        + 64;
+    let needed_ctx = full_span_req.max(pf_len + ndec + 16).max(192).div_ceil(64) * 64 + 64;
     let eng = Engine::load(&o.model, o.ctx.max(needed_ctx));
     eng.ensure_batch(eng.chunk);
     eng.ensure_dbatch(n_lanes.max(4));
     let base = load_gate_tokens(&eng, o);
-    let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
-    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32;
+    let fnv =
+        |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+    let argmax = |v: &[f32]| {
+        v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32
+    };
 
     let mut bad: Vec<String> = Vec::new();
 
@@ -3834,49 +4493,110 @@ fn maxctx(o: &Opts) {
     let tk = Tokenizer::load(&eng.g);
     let mut toks = tk.encode(&o.prompt, false);
     let steps = 8usize;
-    let ckpts: Vec<usize> = std::env::var("INK_CKPTS").unwrap_or("16384,65536,131072,262000".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let ckpts: Vec<usize> = std::env::var("INK_CKPTS")
+        .unwrap_or("16384,65536,131072,262000".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
     let last = *ckpts.iter().max().unwrap();
-    assert!(last + steps < eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
+    assert!(
+        last + steps < eng.max_ctx && toks.len() > last + steps,
+        "need -c > {} and more text ({} tokens)",
+        last + steps,
+        toks.len()
+    );
     toks.truncate(last + steps + 1);
     // lane memory: what Metal's working set leaves after everything allocated so far, less the tuning's margin
-    let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64).unwrap_or_else(|| {
-        let (alloc, ws) = eng.gpu_mem();
-        let (chip, mem) = tuning::this_machine();
-        let margin = tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64;
-        (ws as f64 - alloc as f64 - margin - 9.0 * (1u64 << 30) as f64).max(1.0)      // (9 GiB: the source lane at the longest context)
-    });
+    let budget = std::env::var("INK_LANE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|g| g * (1u64 << 30) as f64)
+        .unwrap_or_else(|| {
+            let (alloc, ws) = eng.gpu_mem();
+            let (chip, mem) = tuning::this_machine();
+            let margin = tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64;
+            (ws as f64 - alloc as f64 - margin - 9.0 * (1u64 << 30) as f64).max(1.0)
+            // (9 GiB: the source lane at the longest context)
+        });
     println!("lane budget {:.1} GiB", budget / (1u64 << 30) as f64);
     let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
     let src = Lane::new(&eng);
     let rs = eng.on(&src);
     rs.reserve(last + steps + 1, false);
     rs.set_tokens(0, &toks);
-    println!("{} tokens of text; KV per lane at {}: {:.1} GiB", toks.len(), last, gib(rs.kv_exact_bytes(last + steps + 1)));
-    println!("{:>7} {:>13} {:>11} {:>14} {:>6} {:>11} {:>9} {:>8}", "ctx", "prefill t/s", "TTFT s", "1 stream t/s", "lanes", "lanes t/s", "gain", "GPU GiB");
+    println!(
+        "{} tokens of text; KV per lane at {}: {:.1} GiB",
+        toks.len(),
+        last,
+        gib(rs.kv_exact_bytes(last + steps + 1))
+    );
+    println!(
+        "{:>7} {:>13} {:>11} {:>14} {:>6} {:>11} {:>9} {:>8}",
+        "ctx", "prefill t/s", "TTFT s", "1 stream t/s", "lanes", "lanes t/s", "gain", "GPU GiB"
+    );
     let (mut p, mut tpf) = (0usize, 0.0f64);
     for &c in &ckpts {
         let t0 = std::time::Instant::now();
         let p_start = p;
-        while p < c { let t = (c - p).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false); cb.commit(); cb.waitUntilCompleted(); p += t; }
-        let dt = t0.elapsed().as_secs_f64(); tpf += dt;
+        while p < c {
+            let t = (c - p).min(eng.chunk);
+            let cb = eng.gpu.cmd();
+            eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            p += t;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        tpf += dt;
         let pf_rate = (c - p_start) as f64 / dt;
         // one stream, decode path (timing only: it advances src's state; the prefill above already finished)
-        let tok = |q: usize| { let cb = eng.gpu.cmd(); rs.encode_step(&cb, c + q, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        let tok = |q: usize| {
+            let cb = eng.gpu.cmd();
+            rs.encode_step(&cb, c + q, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        };
         tok(0);
-        let t1 = std::time::Instant::now(); for q in 0..steps { tok(q); }
+        let t1 = std::time::Instant::now();
+        for q in 0..steps {
+            tok(q);
+        }
         let one = steps as f64 / t1.elapsed().as_secs_f64();
         // lanes: as many as fit the budget at this context
         let per = rs.kv_exact_bytes(c + steps + 1) as f64;
         let n = ((budget / per) as usize).clamp(1, 64);
-        let lanes: Vec<Lane> = (0..n).map(|i| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(c + steps + 1, false);
-            let mut t: Vec<u32> = toks[..=c + steps].to_vec(); for q in 0..=steps { t[c + q] = toks[(c + 7919 * (i + 1) + q) % c]; }
-            r.set_tokens(0, &t); eng.copy_lane_prefix(&src, &l, c); l }).collect();
-        let step = |q: usize| { let sp: Vec<Span> = lanes.iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
-                                let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted(); };
+        let lanes: Vec<Lane> = (0..n)
+            .map(|i| {
+                let l = Lane::new(&eng);
+                let r = eng.on(&l);
+                r.reserve(c + steps + 1, false);
+                let mut t: Vec<u32> = toks[..=c + steps].to_vec();
+                for q in 0..=steps {
+                    t[c + q] = toks[(c + 7919 * (i + 1) + q) % c];
+                }
+                r.set_tokens(0, &t);
+                eng.copy_lane_prefix(&src, &l, c);
+                l
+            })
+            .collect();
+        let step = |q: usize| {
+            let sp: Vec<Span> = lanes.iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+            let cb = eng.gpu.cmd();
+            eng.encode_decode(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        };
         step(0);
-        let t2 = std::time::Instant::now(); for q in 0..steps { step(q); }
+        let t2 = std::time::Instant::now();
+        for q in 0..steps {
+            step(q);
+        }
         let lt = (n * steps) as f64 / t2.elapsed().as_secs_f64();
-        println!("{c:>7} {pf_rate:>13.0} {tpf:>11.1} {one:>14.1} {n:>6} {lt:>11.1} {:>8.2}x {:>8.1}", lt / one, gib(eng.gpu_mem().0));
+        println!(
+            "{c:>7} {pf_rate:>13.0} {tpf:>11.1} {one:>14.1} {n:>6} {lt:>11.1} {:>8.2}x {:>8.1}",
+            lt / one,
+            gib(eng.gpu_mem().0)
+        );
         drop(lanes);
     }
 }
@@ -3884,14 +4604,23 @@ fn maxctx(o: &Opts) {
 fn stats(name: &str, v: &[f32]) {
     let n = v.len();
     let s: f64 = v.iter().map(|&x| x as f64).sum();
-    println!("{name:>12} [{:9.4} {:9.4} {:9.4} ... {:9.4} {:9.4} {:9.4}] sum = {s:.6}", v[0], v[1], v[2], v[n - 3], v[n - 2], v[n - 1]);
+    println!(
+        "{name:>12} [{:9.4} {:9.4} {:9.4} ... {:9.4} {:9.4} {:9.4}] sum = {s:.6}",
+        v[0],
+        v[1],
+        v[2],
+        v[n - 3],
+        v[n - 2],
+        v[n - 1]
+    );
 }
 
 fn debug(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
     let toks = tk.encode(&o.prompt, true);
     check_prompt_fits_ctx(toks.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
@@ -3925,17 +4654,30 @@ fn prof(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     eng.reset();
     let vary = std::env::var("INK_VARY").is_ok();
-    let toks: Vec<u32> = (0..o.ctx.min(4096)).map(|i| if vary { ((i as u64 * 2654435761u64) % 150000) as u32 + 1000 } else { 1000 }).collect();
+    let toks: Vec<u32> = (0..o.ctx.min(4096))
+        .map(|i| if vary { ((i as u64 * 2654435761u64) % 150000) as u32 + 1000 } else { 1000 })
+        .collect();
     eng.set_tokens(0, &toks);
-    let pos = o.n.min(o.ctx - 64);   // profile at this context position
+    let pos = o.n.min(o.ctx - 64); // profile at this context position
     let time = |skip: u32, reps: usize| -> f64 {
         eng.skip.set(skip);
         let mut ts = Vec::new();
-        let cbs: Vec<_> = (0..reps).map(|r| { let cb = eng.gpu.cmd(); eng.encode_step(&cb, if vary { pos + r } else { pos }, true, false); cb.commit(); cb }).collect();
-        for cb in &cbs { cb.waitUntilCompleted(); ts.push(cb.GPUEndTime() - cb.GPUStartTime()); }
+        let cbs: Vec<_> = (0..reps)
+            .map(|r| {
+                let cb = eng.gpu.cmd();
+                eng.encode_step(&cb, if vary { pos + r } else { pos }, true, false);
+                cb.commit();
+                cb
+            })
+            .collect();
+        for cb in &cbs {
+            cb.waitUntilCompleted();
+            ts.push(cb.GPUEndTime() - cb.GPUStartTime());
+        }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ts[reps / 2] * 1e3
     };
@@ -3956,7 +4698,8 @@ fn prof_pf(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     eng.reset();
     eng.set_tokens(0, &(0..8192).map(|i| 1000 + (i * 7) % 5000).collect::<Vec<u32>>());
     if o.prompt.len() > 500 {
@@ -3965,26 +4708,45 @@ fn prof_pf(o: &Opts) {
         println!("using prompt ({} tokens)", pt.len());
         eng.set_tokens(0, &pt);
     }
-    eng.tail.set(false);      // profile full layers (the MoE classes re-use the routing of the last layer)
+    eng.tail.set(false); // profile full layers (the MoE classes re-use the routing of the last layer)
     let t = eng.chunk;
     let p0 = o.n.min(o.ctx - t);
     // fill the cache up to p0 so attention sees a realistic context
     let mut q = 0;
-    while q < p0 { let n = (p0 - q).min(t); let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, q, n, false, false); cb.commit(); cb.waitUntilCompleted(); q += n; }
+    while q < p0 {
+        let n = (p0 - q).min(t);
+        let cb = eng.gpu.cmd();
+        eng.encode_prefill(&cb, q, n, false, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+        q += n;
+    }
     let once = |skip: u32| -> f64 {
         eng.skip.set(skip);
         let cb = eng.gpu.cmd();
         eng.encode_prefill(&cb, p0, t, true, true);
-        cb.commit(); cb.waitUntilCompleted();
+        cb.commit();
+        cb.waitUntilCompleted();
         (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3
     };
-    once(0); once(0);
-    let med = |mut v: Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    once(0);
+    once(0);
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
     let base = med((0..5).map(|_| once(0)).collect());
     println!("prefill chunk of {t} tokens at p0={p0}: {base:.1} ms ({:.0} tok/s)", t as f64 / base * 1e3);
-    { let tl = eng.moe_tiles(); let s: u32 = tl.iter().flatten().sum();
-      println!("  last-layer MoE tiles: {} of 8 simdgroups, {} of 4; assignments {s}, 16-token slots used {}", tl[0].len(), tl[1].len(),
-               tl.iter().flatten().map(|&c| c.div_ceil(16)).sum::<u32>() * 16); }
+    {
+        let tl = eng.moe_tiles();
+        let s: u32 = tl.iter().flatten().sum();
+        println!(
+            "  last-layer MoE tiles: {} of 8 simdgroups, {} of 4; assignments {s}, 16-token slots used {}",
+            tl[0].len(),
+            tl[1].len(),
+            tl.iter().flatten().map(|&c| c.div_ceil(16)).sum::<u32>() * 16
+        );
+    }
     // isolation: run only one class (buffers keep realistic contents, incl. MoE routing, from the full pass)
     let mut tot = 0.0;
     for (c, name) in engine::CLS_NAMES.iter().enumerate() {
@@ -3993,7 +4755,9 @@ fn prof_pf(o: &Opts) {
         let empty = med((0..3).map(|_| once(u32::MAX)).collect());
         let d = d - empty;
         tot += d;
-        if d > 0.3 { println!("  {name:>11}: {d:8.2} ms ({:5.1}%)", d / base * 100.0); }
+        if d > 0.3 {
+            println!("  {name:>11}: {d:8.2} ms ({:5.1}%)", d / base * 100.0);
+        }
     }
     println!("  sum of isolated classes: {tot:.1} ms");
 }
@@ -4003,7 +4767,8 @@ fn routes(o: &Opts) -> Result<(), String> {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     let tk = Tokenizer::load(&eng.g);
     let text = if o.raw { o.prompt.clone() } else { first_turn(o, &o.prompt) };
     let prompt = tk.encode(&text, true);
@@ -4011,9 +4776,13 @@ fn routes(o: &Opts) -> Result<(), String> {
     let mut sess = Session::new(&eng, &tk);
     let mut tok = sess.prefill(&prompt)?;
     let mut out = String::new();
-    for t in &prompt { out += &format!("P {t}\n"); }
+    for t in &prompt {
+        out += &format!("P {t}\n");
+    }
     for _ in 0..o.n {
-        if sess.n_past + 1 >= eng.max_ctx { break; }
+        if sess.n_past + 1 >= eng.max_ctx {
+            break;
+        }
         let pos = sess.n_past;
         eng.set_tokens(pos, &[tok]);
         let cb = eng.gpu.cmd();
@@ -4022,9 +4791,17 @@ fn routes(o: &Opts) -> Result<(), String> {
         metal::wait_completed(&cb, "routes decode", pos)?;
         sess.n_past += 1;
         let r = eng.routes();
-        out += &format!("G {tok} {}\n", r.iter().map(|x| x.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join(";"));
+        out += &format!(
+            "G {tok} {}\n",
+            r.iter()
+                .map(|x| x.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","))
+                .collect::<Vec<_>>()
+                .join(";")
+        );
         tok = eng.token_at(pos + 1);
-        if tok == tk.eos { break; }
+        if tok == tk.eos {
+            break;
+        }
     }
     std::fs::write(&o.reference, out).unwrap();
     Ok(())
@@ -4035,14 +4812,22 @@ fn vcost(o: &Opts) {
     let eng = Engine::load(&o.model, o.ctx);
     let lane = Lane::new(&eng);
     let eng = eng.on(&lane);
-    eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+    eng.reserve(o.ctx, false);
+    eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
     eng.reset();
     eng.set_tokens(0, &(0..4096).map(|i| 1000 + (i * 7) % 5000).collect::<Vec<u32>>());
     let pos = 300usize;
     let time = |f: &dyn Fn(&metal::CmdBuf)| -> f64 {
         let mut ts = Vec::new();
-        for _ in 0..12 { let cb = eng.gpu.cmd(); f(&cb); cb.commit(); cb.waitUntilCompleted(); ts.push(cb.GPUEndTime() - cb.GPUStartTime()); }
-        ts.sort_by(|a, b| a.partial_cmp(b).unwrap()); ts[6] * 1e3
+        for _ in 0..12 {
+            let cb = eng.gpu.cmd();
+            f(&cb);
+            cb.commit();
+            cb.waitUntilCompleted();
+            ts.push(cb.GPUEndTime() - cb.GPUStartTime());
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts[6] * 1e3
     };
     let step = time(&|cb| eng.encode_step(cb, pos, true, true));
     println!("decode step: {step:.2} ms");
@@ -4055,7 +4840,7 @@ fn vcost(o: &Opts) {
 fn enter_inky_mode_with(persistent: bool) -> Option<memd::Lease> {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
-    let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
+    let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into()); // tests point it elsewhere
     if persistent {
         let lease = memd::enter_persistent(&sock);
         match lease.as_ref().and_then(|l| l.initial_limit) {
@@ -4067,7 +4852,10 @@ fn enter_inky_mode_with(persistent: bool) -> Option<memd::Lease> {
         match memd::enter_lease(&sock) {
             memd::LeaseOutcome::Entered(lease) => {
                 let limit = lease.initial_limit.unwrap_or(0);
-                eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, limit);
+                eprintln!(
+                    "[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected",
+                    t.name, t.default_lanes, limit
+                );
                 Some(lease)
             }
             memd::LeaseOutcome::NotInstalled => {
@@ -4091,7 +4879,9 @@ fn process_footprint_bytes() -> Option<u64> {
     unsafe {
         let mut usage: libc::rusage_info_v4 = std::mem::zeroed();
         let result = libc::proc_pid_rusage(
-            libc::getpid(), libc::RUSAGE_INFO_V4, &mut usage as *mut _ as *mut libc::rusage_info_t,
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            &mut usage as *mut _ as *mut libc::rusage_info_t,
         );
         (result == 0).then_some(usage.ri_phys_footprint)
     }
@@ -4100,7 +4890,10 @@ fn process_footprint_bytes() -> Option<u64> {
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     match raw.get(1).map(|s| s.as_str()) {
-        Some("memd") => { memd::daemon(&raw[2..]); return; }
+        Some("memd") => {
+            memd::daemon(&raw[2..]);
+            return;
+        }
         Some("inblock-trace") => {
             let path = raw.get(2).map(|s| s.as_str()).unwrap_or("specs/InBlockTraceData.tla");
             if let Err(e) = blocks::write_inblock_trace(path) {
@@ -4109,7 +4902,10 @@ fn main() {
             }
             return;
         }
-        Some("tune-memory") => { memd::install(&raw[2..]); return; }
+        Some("tune-memory") => {
+            memd::install(&raw[2..]);
+            return;
+        }
         Some("serve") => {
             let args = &raw[2..];
             if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
@@ -4117,7 +4913,8 @@ fn main() {
                 return;
             }
             let (chip, memory) = tuning::this_machine();
-            let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
+            let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name))
+                .unwrap_or_else(|e| cli_error(e));
             serve::serve_with_mode(options, || enter_inky_mode_with(true));
             return;
         }
@@ -4125,11 +4922,8 @@ fn main() {
             // Hold inky mode for the requested interval, then leave by exiting.
             let args = &raw[2..];
             let persistent = args.iter().any(|a| a == "--persistent");
-            let secs: u64 = args
-                .iter()
-                .find(|a| a.as_str() != "--persistent")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let secs: u64 =
+                args.iter().find(|a| a.as_str() != "--persistent").and_then(|v| v.parse().ok()).unwrap_or(0);
             let _lease = enter_inky_mode_with(persistent);
             std::thread::sleep(std::time::Duration::from_secs(secs));
             return;
@@ -4175,7 +4969,19 @@ fn main() {
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
             let t: usize = std::env::var("INK_T").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
-            for (n, bm, bn) in [("kgs_64_128_8", 64, 128), ("kgs_64_64_4", 64, 64), ("kgs_64_32_4", 64, 32), ("kgs_64_96_6", 64, 96), ("kgs_64_112_7", 64, 112), ("kgs_64_192_12", 64, 192), ("kgs_64_256_16", 64, 256), ("kgb_64_128_8", 64, 128), ("kgb_64_64_4", 64, 64), ("kg_iso0_3", 64, 64), ("kg_iso2_3", 64, 64)] {
+            for (n, bm, bn) in [
+                ("kgs_64_128_8", 64, 128),
+                ("kgs_64_64_4", 64, 64),
+                ("kgs_64_32_4", 64, 32),
+                ("kgs_64_96_6", 64, 96),
+                ("kgs_64_112_7", 64, 112),
+                ("kgs_64_192_12", 64, 192),
+                ("kgs_64_256_16", 64, 256),
+                ("kgb_64_128_8", 64, 128),
+                ("kgb_64_64_4", 64, 64),
+                ("kg_iso0_3", 64, 64),
+                ("kg_iso2_3", 64, 64),
+            ] {
                 println!("{n:>16}: {:5.1} TFLOPs", eng.kbench_gemm(n, bm, bn, t));
             }
         }
@@ -4184,7 +4990,8 @@ fn main() {
             let eng = Engine::load(&o.model, o.ctx);
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
-            eng.reserve(o.ctx, false); eng.ensure_batch(eng.chunk);      // dev tool: everything pre-allocated
+            eng.reserve(o.ctx, false);
+            eng.ensure_batch(eng.chunk); // dev tool: everything pre-allocated
             eng.tail.set(false);
             let tk = Tokenizer::load(&eng.g);
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
@@ -4192,20 +4999,41 @@ fn main() {
             let t = pt.len().min(eng.chunk);
             eng.reset();
             eng.set_tokens(0, &pt);
-            let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, 0, t, false, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd();
+            eng.encode_prefill(&cb, 0, t, false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
             let tl = eng.moe_tiles();
             let (gu, dn) = eng.kbench_moe_pf(t);
-            println!("T={t}: tiles {} x8sg {} x4sg | gate/up {gu:.1} TFLOPs, down {dn:.1} TFLOPs (real flops)", tl[0].len(), tl[1].len());
+            println!(
+                "T={t}: tiles {} x8sg {} x4sg | gate/up {gu:.1} TFLOPs, down {dn:.1} TFLOPs (real flops)",
+                tl[0].len(),
+                tl[1].len()
+            );
         }
         "ksg" => {
             // per-simdgroup tile ops: cost of a tile vs threadgroup size and number of simdgroups that have tokens
             let eng = Engine::load(&o.model, 4096);
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
-            for (name, nsg, nact) in [("kgsg_8", 8, 8), ("kgsgf0_8", 8, 8), ("kgsgf0_8", 8, 6), ("kgsgf0_8", 8, 4), ("kgsgf0_8", 8, 2), ("kgsg_4", 4, 4),
-                                      ("kgsgf0_4", 4, 4), ("kgsgf0_4", 4, 2), ("kgsgf0_4", 4, 1), ("kgsg_16", 16, 16), ("kgsgf0_16", 16, 16)] {
+            for (name, nsg, nact) in [
+                ("kgsg_8", 8, 8),
+                ("kgsgf0_8", 8, 8),
+                ("kgsgf0_8", 8, 6),
+                ("kgsgf0_8", 8, 4),
+                ("kgsgf0_8", 8, 2),
+                ("kgsg_4", 4, 4),
+                ("kgsgf0_4", 4, 4),
+                ("kgsgf0_4", 4, 2),
+                ("kgsgf0_4", 4, 1),
+                ("kgsg_16", 16, 16),
+                ("kgsgf0_16", 16, 16),
+            ] {
                 let tf = eng.kbench_sgn(name, nsg, nact, 3840);
-                println!("{name:>10} {nsg:2} simdgroups, {nact:2} with tokens: {tf:5.1} TFLOPs -> tile cost {:.2}", (16 * nact) as f64 / tf);
+                println!(
+                    "{name:>10} {nsg:2} simdgroups, {nact:2} with tokens: {tf:5.1} TFLOPs -> tile cost {:.2}",
+                    (16 * nact) as f64 / tf
+                );
             }
         }
         "qclip" => {
@@ -4213,10 +5041,16 @@ fn main() {
             let eng = Engine::load(&o.model, 64);
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
-            let pb = unsafe { std::slice::from_raw_parts(eng.pb.contents().as_ptr() as *const f32, eng.pb.length() / 4) };
+            let pb =
+                unsafe { std::slice::from_raw_parts(eng.pb.contents().as_ptr() as *const f32, eng.pb.length() / 4) };
             for (i, l) in eng.layers.iter().enumerate() {
                 let w = &pb[l.q_clip as usize / 4..l.q_clip as usize / 4 + 24 * 128];
-                let mut eff: Vec<f32> = (0..8 * 128).map(|c| { let (g, d) = (c / 128, c % 128); (0..3).map(|h| w[(g * 3 + h) * 128 + d].abs()).fold(0f32, f32::max) }).collect();
+                let mut eff: Vec<f32> = (0..8 * 128)
+                    .map(|c| {
+                        let (g, d) = (c / 128, c % 128);
+                        (0..3).map(|h| w[(g * 3 + h) * 128 + d].abs()).fold(0f32, f32::max)
+                    })
+                    .collect();
                 eff.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let zeros = eff.iter().filter(|&&x| x == 0.0).count();
                 println!("layer {i:2} swa {}: max|qclip| over the 3 heads, per key dim: min {:.4} p5 {:.4} p25 {:.4} median {:.4} max {:.4}  exact zeros {zeros}",
@@ -4231,22 +5065,49 @@ fn main() {
             let foot = || process_footprint_bytes().expect("read process physical footprint") as f64 / 1048576.0;
             let len = 1usize << 30;
             let f0 = foot();
-            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) } as *mut u8;
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            } as *mut u8;
             let buf = gpu.buffer_nocopy(ptr, len);
             println!("footprint: start {f0:.1} MiB, after wrapping 1 GiB of untouched memory {:.1} MiB", foot());
             let run = |first: u32, stride: u32, n: usize| {
-                let cb = gpu.cmd(); let e = metal::Enc::new(&cb);
-                e.pso(&gpu.pso("k_w")); e.buf(&buf, 0, 0); e.bytes(&[first, stride], 1);
-                e.dispatch((n.div_ceil(64), 1, 1), 64); e.end();
-                let t = std::time::Instant::now(); cb.commit(); cb.waitUntilCompleted(); t.elapsed().as_secs_f64() * 1e3
+                let cb = gpu.cmd();
+                let e = metal::Enc::new(&cb);
+                e.pso(&gpu.pso("k_w"));
+                e.buf(&buf, 0, 0);
+                e.bytes(&[first, stride], 1);
+                e.dispatch((n.div_ceil(64), 1, 1), 64);
+                e.end();
+                let t = std::time::Instant::now();
+                cb.commit();
+                cb.waitUntilCompleted();
+                t.elapsed().as_secs_f64() * 1e3
             };
-            let mib = |m: usize| (m << 18) as u32;      // MiB -> uint index
+            let mib = |m: usize| (m << 18) as u32; // MiB -> uint index
             let rd = |m: usize| unsafe { *(ptr.add(m << 20) as *const u32) };
             let mut last = foot();
             // pages of the mapping that physically exist (the footprint ledger does not see pages only the GPU has touched)
-            let resident = || { let mut v = vec![0i8; len / 16384]; unsafe { libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr()); } v.iter().filter(|&&x| x & 1 != 0).count() as f64 * 16384.0 / 1048576.0 };
+            let resident = || {
+                let mut v = vec![0i8; len / 16384];
+                unsafe {
+                    libc::mincore(ptr as *mut libc::c_void, len, v.as_mut_ptr());
+                }
+                v.iter().filter(|&&x| x & 1 != 0).count() as f64 * 16384.0 / 1048576.0
+            };
             let mut lastr = resident();
-            let mut step = |what: &str, ms: f64| { let (f, r) = (foot(), resident()); println!("{what}: {ms:.2} ms, footprint {:+.2} MiB (now {f:.1}), resident in the mapping {:+.2} MiB (now {r:.1})", f - last, r - lastr); last = f; lastr = r; };
+            let mut step = |what: &str, ms: f64| {
+                let (f, r) = (foot(), resident());
+                println!("{what}: {ms:.2} ms, footprint {:+.2} MiB (now {f:.1}), resident in the mapping {:+.2} MiB (now {r:.1})", f - last, r - lastr);
+                last = f;
+                lastr = r;
+            };
             step("GPU writes one word at 0", run(0, 1, 1));
             step("GPU writes one word at 0 again", run(0, 1, 1));
             step("GPU writes one word at 1 MiB", run(mib(1), 1, 1));
@@ -4258,15 +5119,24 @@ fn main() {
             step("GPU writes 4 MiB dense at 200 MiB again", run(mib(200), 1, 1 << 20));
             step("GPU writes 32 MiB dense at 300 MiB", run(mib(300), 1, 8 << 20));
             step("GPU writes 32 MiB dense at 300 MiB again", run(mib(300), 1, 8 << 20));
-            for i in 0..2048usize { unsafe { *ptr.add((400 << 20) + i * 16384) = 1; } }
+            for i in 0..2048usize {
+                unsafe {
+                    *ptr.add((400 << 20) + i * 16384) = 1;
+                }
+            }
             step("CPU touches 32 MiB at 400 MiB", 0.0);
             step("GPU writes 32 MiB dense at 400 MiB (CPU-touched)", run(mib(400), 1, 8 << 20));
             step("GPU writes 32 MiB dense at 400 MiB again", run(mib(400), 1, 8 << 20));
             println!("readback: {} {} {} {} (expect 2 1 1 2)", rd(0), rd(1), rd(100), rd(200));
             // one fresh page per dispatch
-            let mut tf = 0.0; let mut tw = 0.0;
-            for i in 0..200u32 { tf += run(mib(600) + i * 4096, 1, 64); }
-            for i in 0..200u32 { tw += run(mib(600) + i * 4096, 1, 64); }
+            let mut tf = 0.0;
+            let mut tw = 0.0;
+            for i in 0..200u32 {
+                tf += run(mib(600) + i * 4096, 1, 64);
+            }
+            for i in 0..200u32 {
+                tw += run(mib(600) + i * 4096, 1, 64);
+            }
             step("200 dispatches, one fresh page each", tf);
             println!("per dispatch: fresh page {:.1} us, touched page {:.1} us", tf * 5.0, tw * 5.0);
         }
@@ -4284,11 +5154,22 @@ fn main() {
                 cli_error(format!("kvprune requires a prompt longer than {} tokens (got {n})", engine::EXT));
             }
             check_prompt_fits_ctx(n + d, eng.max_ctx).unwrap_or_else(|e| cli_error(e));
-            eng.reset(); eng.reserve(n + d + 1, false); eng.ensure_batch(n.min(eng.chunk)); eng.qcap_alloc(n);
+            eng.reset();
+            eng.reserve(n + d + 1, false);
+            eng.ensure_batch(n.min(eng.chunk));
+            eng.qcap_alloc(n);
             eng.set_tokens(0, &pt);
             let mut p0 = 0;
-            while p0 < n { let t = (n - p0).min(eng.chunk); let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, p0, t, p0 + t == n, false); cb.commit(); cb.waitUntilCompleted(); p0 += t; }
-            let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
+            while p0 < n {
+                let t = (n - p0).min(eng.chunk);
+                let cb = eng.gpu.cmd();
+                eng.encode_prefill(&cb, p0, t, p0 + t == n, false);
+                cb.commit();
+                cb.waitUntilCompleted();
+                p0 += t;
+            }
+            let am =
+                |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
             let first = am(&eng.logits()) as u32;
             let snap = eng.snapshot();
             let run = |toks: Option<&[u32]>| -> (Vec<u32>, Vec<Vec<f32>>, f64) {
@@ -4296,11 +5177,18 @@ fn main() {
                 let (mut tok, mut ts, mut lgs) = (first, Vec::new(), Vec::new());
                 let t0 = std::time::Instant::now();
                 for i in 0..d {
-                    if let Some(tt) = toks { tok = tt[i]; }
+                    if let Some(tt) = toks {
+                        tok = tt[i];
+                    }
                     eng.set_tokens(n + i, &[tok]);
-                    let cb = eng.gpu.cmd(); eng.encode_step(&cb, n + i, true, false); cb.commit(); cb.waitUntilCompleted();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_step(&cb, n + i, true, false);
+                    cb.commit();
+                    cb.waitUntilCompleted();
                     let lg: Vec<f32> = eng.logits().iter().map(|&x| softcap(x, eng.softcap)).collect();
-                    ts.push(tok); tok = am(&lg) as u32; lgs.push(lg);
+                    ts.push(tok);
+                    tok = am(&lg) as u32;
+                    lgs.push(lg);
                 }
                 (ts, lgs, t0.elapsed().as_secs_f64() * 1e3 / d as f64)
             };
@@ -4309,24 +5197,41 @@ fn main() {
             let same = refl.iter().zip(&again).all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
             println!("{n} prompt tokens, {d} decode steps, {ms0:.2} ms per step with the whole cache (rerun bit-identical: {same})");
             let full_mib = |keys: usize| (8 * keys * 4096) as f64 / 1048576.0;
-            let lse = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln() };
+            let lse = |v: &[f32]| {
+                let m = v.iter().cloned().fold(f32::MIN, f32::max);
+                m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln()
+            };
             let nq: usize = std::env::var("INK_NQ").ok().and_then(|v| v.parse().ok()).unwrap_or(192);
             let keeps = std::env::var("INK_KEEP").unwrap_or("1.0,0.5,0.25,0.125,0.0".into());
-            for mode in std::env::var("INK_MODE").unwrap_or("sum".into()).split(',') { for sum in [false, true] { for keep in keeps.split(',').map(|k| k.parse::<f64>().unwrap()) {
-                let t0 = std::time::Instant::now();
-                let (far, kept) = eng.prune_build(n, keep, sum, nq, mode);
-                let tb = t0.elapsed().as_secs_f64();
-                let (_, lg, ms) = run(Some(&toks));
-                let (mut agree, mut worst, mut mean) = (0, 0f32, 0f32);
-                for (a, r) in lg.iter().zip(&refl) {
-                    let (l1, l2) = (lse(a), lse(r));
-                    let kl: f32 = r.iter().zip(a).map(|(b, a)| { let pb = (b - l2).exp(); pb * ((b - l2) - (a - l1)) }).sum();
-                    if am(a) == am(r) { agree += 1; }
-                    worst = worst.max(kl); mean += kl / d as f32;
-                }
-                println!("score {mode:3} keep {:5.1}% of {far} far keys{}: full-attention cache {:.0} -> {:.0} MiB | argmax {agree}/{d}  KL mean {mean:.5} worst {worst:.5} | {ms:.2} ms/step (selection {tb:.1} s)",
+            for mode in std::env::var("INK_MODE").unwrap_or("sum".into()).split(',') {
+                for sum in [false, true] {
+                    for keep in keeps.split(',').map(|k| k.parse::<f64>().unwrap()) {
+                        let t0 = std::time::Instant::now();
+                        let (far, kept) = eng.prune_build(n, keep, sum, nq, mode);
+                        let tb = t0.elapsed().as_secs_f64();
+                        let (_, lg, ms) = run(Some(&toks));
+                        let (mut agree, mut worst, mut mean) = (0, 0f32, 0f32);
+                        for (a, r) in lg.iter().zip(&refl) {
+                            let (l1, l2) = (lse(a), lse(r));
+                            let kl: f32 = r
+                                .iter()
+                                .zip(a)
+                                .map(|(b, a)| {
+                                    let pb = (b - l2).exp();
+                                    pb * ((b - l2) - (a - l1))
+                                })
+                                .sum();
+                            if am(a) == am(r) {
+                                agree += 1;
+                            }
+                            worst = worst.max(kl);
+                            mean += kl / d as f32;
+                        }
+                        println!("score {mode:3} keep {:5.1}% of {far} far keys{}: full-attention cache {:.0} -> {:.0} MiB | argmax {agree}/{d}  KL mean {mean:.5} worst {worst:.5} | {ms:.2} ms/step (selection {tb:.1} s)",
                          keep * 100.0, if sum { " + summary key" } else { "              " }, full_mib(n + d), full_mib(kept + sum as usize + 1024 + d));
-            } } }
+                    }
+                }
+            }
             *eng.lane.prune.borrow_mut() = None;
         }
         "kvscreen" => {
@@ -4338,12 +5243,23 @@ fn main() {
             let pt = tk.encode(&first_turn(&o, &o.prompt), true);
             check_prompt_fits_ctx(pt.len(), eng.max_ctx).unwrap_or_else(|e| cli_error(e));
             let n = pt.len().min(eng.chunk);
-            eng.reset(); eng.reserve(n + 1, false); eng.ensure_batch(n);
+            eng.reset();
+            eng.reserve(n + 1, false);
+            eng.ensure_batch(n);
             eng.set_tokens(0, &pt[..n]);
-            let cb = eng.gpu.cmd(); eng.encode_prefill(&cb, 0, n, false, false); cb.commit(); cb.waitUntilCompleted();
-            println!("last layer, {n} keys, last 48 queries x 24 heads: share of keys within a margin of the best score");
+            let cb = eng.gpu.cmd();
+            eng.encode_prefill(&cb, 0, n, false, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+            println!(
+                "last layer, {n} keys, last 48 queries x 24 heads: share of keys within a margin of the best score"
+            );
             for (m, mean, worst) in eng.kv_screen(n, 48, &[8.0, 12.0, 17.0, 25.0]) {
-                println!("  within {m:4.0} logits (weight > e^-{m:.0}): mean {:6.2}% of keys, worst head {:6.2}%", mean * 100.0, worst * 100.0);
+                println!(
+                    "  within {m:4.0} logits (weight > e^-{m:.0}): mean {:6.2}% of keys, worst head {:6.2}%",
+                    mean * 100.0,
+                    worst * 100.0
+                );
             }
         }
         "kvdump" => {
@@ -4359,13 +5275,25 @@ fn main() {
             let (swa, full) = eng.kv_dump(pt.len());
             std::fs::write(format!("{}.swa", o.reference), &swa).unwrap();
             std::fs::write(format!("{}.full", o.reference), &full).unwrap();
-            println!("{} tokens: sliding-window payload {:.1} MiB, full-attention payload {:.1} MiB", pt.len(), swa.len() as f64 / 1048576.0, full.len() as f64 / 1048576.0);
+            println!(
+                "{} tokens: sliding-window payload {:.1} MiB, full-attention payload {:.1} MiB",
+                pt.len(),
+                swa.len() as f64 / 1048576.0,
+                full.len() as f64 / 1048576.0
+            );
         }
         "kpeak" => {
             let eng = Engine::load(&o.model, 4096);
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
-            for (n, nsg) in [("kgpeak_8_0", 8), ("kgpeak_8_576", 8), ("kgpeak_8_128", 8), ("kgpeak_8_32", 8), ("kgpeak_4_0", 4), ("kgpeak_1_0", 1)] {
+            for (n, nsg) in [
+                ("kgpeak_8_0", 8),
+                ("kgpeak_8_576", 8),
+                ("kgpeak_8_128", 8),
+                ("kgpeak_8_32", 8),
+                ("kgpeak_4_0", 4),
+                ("kgpeak_1_0", 1),
+            ] {
                 println!("{n:>13}: {:5.1} TFLOPs", eng.kbench_peak(n, nsg, 1024));
             }
         }
@@ -4378,22 +5306,49 @@ fn main() {
                 println!("{n}: {tf:5.1} TFLOPs   relative RMS error {rel:.2e}   max error / output RMS {mx:.2e}");
             }
         }
-        "bw" => { let eng = Engine::load(&o.model, 4096);
- let lane = Lane::new(&eng);
- let eng = eng.on(&lane); eng.bw_weights(); }
+        "bw" => {
+            let eng = Engine::load(&o.model, 4096);
+            let lane = Lane::new(&eng);
+            let eng = eng.on(&lane);
+            eng.bw_weights();
+        }
         "kbench" => {
             let eng = Engine::load(&o.model, 4096);
             let lane = Lane::new(&eng);
             let eng = eng.on(&lane);
-            if std::env::var("INK_KB_Q4").is_ok() { for (n, nr, nsg) in [("kb_dev_2_2", 2, 2), ("kb_dev_2_4", 2, 4), ("kb_dev_4_2", 4, 2),
-                                 ("kb_dev_4_4", 4, 4), ("kb_dev_8_2", 8, 2), ("kb_dev_1_4", 1, 4), ("kb_blk_2_4", 2, 4), ("kb_blk_4_4", 4, 4),
-                                 ("kb_blk_8_2", 8, 2), ("kb_blk_4_8", 4, 8)] {
-                println!("{n:>14}: {:6.1} GB/s", eng.kbench(n, nr, nsg));
-            } }
-            for (n, nr, nsg) in [("k_moe_down", 2, 2), ("kd_dev_1_2", 1, 2), ("kd_dev_1_4", 1, 4), ("kd_dev_1_8", 1, 8), ("kd_dev_2_2", 2, 2),
-                                 ("kd_dev_2_4", 2, 4), ("kd_dev_2_8", 2, 8), ("kd_dev_4_4", 4, 4), ("kd_tg_2_8", 2, 8)] {
-                println!("{n:>14}: all {:6.1} GB/s | Q8_0 {:6.1} | Q5_0 {:6.1}", eng.kbench_down(n, nr * nsg, 32 * nsg, 0),
-                         eng.kbench_down(n, nr * nsg, 32 * nsg, 8), eng.kbench_down(n, nr * nsg, 32 * nsg, 6));
+            if std::env::var("INK_KB_Q4").is_ok() {
+                for (n, nr, nsg) in [
+                    ("kb_dev_2_2", 2, 2),
+                    ("kb_dev_2_4", 2, 4),
+                    ("kb_dev_4_2", 4, 2),
+                    ("kb_dev_4_4", 4, 4),
+                    ("kb_dev_8_2", 8, 2),
+                    ("kb_dev_1_4", 1, 4),
+                    ("kb_blk_2_4", 2, 4),
+                    ("kb_blk_4_4", 4, 4),
+                    ("kb_blk_8_2", 8, 2),
+                    ("kb_blk_4_8", 4, 8),
+                ] {
+                    println!("{n:>14}: {:6.1} GB/s", eng.kbench(n, nr, nsg));
+                }
+            }
+            for (n, nr, nsg) in [
+                ("k_moe_down", 2, 2),
+                ("kd_dev_1_2", 1, 2),
+                ("kd_dev_1_4", 1, 4),
+                ("kd_dev_1_8", 1, 8),
+                ("kd_dev_2_2", 2, 2),
+                ("kd_dev_2_4", 2, 4),
+                ("kd_dev_2_8", 2, 8),
+                ("kd_dev_4_4", 4, 4),
+                ("kd_tg_2_8", 2, 8),
+            ] {
+                println!(
+                    "{n:>14}: all {:6.1} GB/s | Q8_0 {:6.1} | Q5_0 {:6.1}",
+                    eng.kbench_down(n, nr * nsg, 32 * nsg, 0),
+                    eng.kbench_down(n, nr * nsg, 32 * nsg, 8),
+                    eng.kbench_down(n, nr * nsg, 32 * nsg, 6)
+                );
             }
         }
         "run" => report_cli_result(&cmd, run(&o)),

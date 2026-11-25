@@ -1782,25 +1782,26 @@ kernel void k_attn_grp_dec(device const uchar * PB [[buffer(1)]], device float *
         }
     }
 }
-// ---------------------------------------------------------------------------------------------
-// DSpark speculative verification & exact GPU rejection sampling (`k_dspark_reject`).
-// Grid: (1, n_spans, 1), 1024 threads/TG (32 simdgroups x 32 lanes).
-// - When `temp <= 0.0f`: exact greedy verification against target argmax (lowest-token-ID tie break).
-// - When `temp > 0.0f`: exact Leviathan/Chen rejection sampling (`u < min(1, p_target[x] / p_draft[x])`),
+#pragma clang fp contract(off) reassociate(off)
+// DSpark speculative rejection sampling (`k_dspark_reject`):
+// Grid: (1, n_spans, 1), 1024 threads (32 simdgroups).
+// - When `eff_temp < 1e-5f`: exact greedy verification against raw target argmax (lowest-token-ID tie break).
+// - When `eff_temp >= 1e-5f`: exact Leviathan/Chen rejection sampling (`u < min(1, p_target[x] / p_draft[x])`),
 //   exact Gumbel-max residual resampling over `[p_target - p_draft]_+` on rejection, and exact Gumbel-max
 //   bonus token draw from `p_target` at row `k` when all `k` draft tokens are accepted.
 
 struct DSparkSpanDesc {
-    uint target_off;
-    uint draft_lg_off;
-    uint draft_tok_off;
-    uint out_off;
-    uint k;
-    uint seed_lo;
-    uint seed_hi;
-    uint base_pos;
-    uint ban_tok;
-    uint pad0, pad1, pad2;
+    uint  target_off;
+    uint  draft_lg_off;
+    uint  draft_tok_off;
+    uint  out_off;
+    uint  k;
+    uint  seed_lo;
+    uint  seed_hi;
+    uint  base_pos;
+    uint  ban_tok;
+    float temp;
+    uint  pad1, pad2;
 };
 
 struct DSparkRejectArgs {
@@ -1880,8 +1881,10 @@ kernel void k_dspark_reject(
         return;
     }
 
-    // ---- Greedy verification (`temp <= 0`): exact target argmax match step-by-step ----
-    if (a.temp <= 0.0f) {
+    const float eff_temp = (desc.temp >= 0.0f) ? desc.temp : a.temp;
+
+    // ---- Greedy verification (`eff_temp < 1e-5f`): exact raw-logit target argmax match ----
+    if (eff_temp < 1e-5f) {
         for (uint d = 0u; d <= desc.k; d++) {
             device const float * ZT = A + ulong(desc.target_off) + ulong(d) * ulong(a.target_stride);
             float best = -INFINITY;
@@ -1891,8 +1894,7 @@ kernel void k_dspark_reject(
                 const float raw = ZT[v];
                 if (isnan(raw) || isinf(raw)) { bad = 1u; continue; }
                 if (v == desc.ban_tok) continue;
-                const float s = dspark_softcap(raw, a.target_softcap);
-                if (s > best || (s == best && int(v) < best_i)) { best = s; best_i = int(v); }
+                if (raw > best || (raw == best && int(v) < best_i)) { best = raw; best_i = int(v); }
             }
             const uint sg_bad = simd_or(bad);
             if (lane == 0) bu[sg] = sg_bad;
@@ -1936,8 +1938,8 @@ kernel void k_dspark_reject(
         return;
     }
 
-    // ---- Stochastic exact speculative rejection sampling (`temp > 0`) ----
-    const float inv_temp = 1.0f / a.temp;
+    // ---- Stochastic exact speculative rejection sampling (`eff_temp >= 1e-5f`) ----
+    const float inv_temp = 1.0f / eff_temp;
     for (uint d = 0u; d < desc.k; d++) {
         const uint dx = DRAFT_TOKS[desc.draft_tok_off + d];
         if (dx >= n) {

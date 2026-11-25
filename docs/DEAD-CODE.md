@@ -21,23 +21,19 @@ Every `allow(dead_code)` attribute in `src/` is audited against two independent 
 | `src/main.rs` | `mod blockbook;` | `trace-reference` | `BlockBook` reference model consumed by `scripts/blockbook-traces.rs` and `scripts/cache-traces.rs` (`EVERY` and `PROMPT` are live in `serve::block_cache`). |
 | `src/gguf.rs` | `AF(Vec<f64>),` | `kept-spec` | GGUF v3 binary metadata array variant populated by `read_val` (`ty == 12`). |
 | `src/gguf.rs` | `pub fn open_bytes(bytes: &[u8]) -> io::Result<Gguf> {` | `kept-api` | Anonymous-mapping in-memory GGUF parser entrypoint consumed by `fuzz/fuzz_targets/gguf_load.rs` and unit tests. |
-| `src/engine.rs` | `pub fn no_grp_dec(&self) -> bool { self.no_grp_dec.get() }` | `kept-api` | Symmetric accessor paired with `Engine::set_no_grp_dec`. |
+| `src/engine.rs` | `pub fn no_grp_dec(&self) -> bool {` | `kept-api` | Symmetric accessor paired with `Engine::set_no_grp_dec`. |
 | `src/engine.rs` | `pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `SplitCount`, exercised by unit tests and `fixed_attn_batch`. |
 | `src/engine.rs` | `pub const fn split_scratch_slots(max_ctx: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `Slots`, exercised by unit tests and `fixed_attn_batch`. |
 | `src/engine.rs` | `pub const fn fixed_attn_batch(swa: bool, span_end: usize, max_ctx: usize) -> (usize, usize) {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `NSplit` & `Rows`, exercised by unit tests across sliding-window edge splits. |
 | `src/poolgate.rs` | `pub fn borrow_lane_ptrs(&self, ids: &[LaneId]) -> Vec<*const Lane> {` | `kept-api` | Raw lane pointer borrow helper on `Layer3Pool` exercised by unit tests. |
 | `src/verify.rs` | `pub struct FixedDraftProducer {` | `held-open-pr` | Deterministic `DraftProducer` implementation exercised by unit tests and held for speculative serving (`#42`, `#80`). |
 | `src/verify.rs` | `pub struct SamplerDraftProducer<'a> {` | `held-open-pr` | Stochastic `Sampler::draft` `DraftProducer` implementation held for speculative serving (`#42`, `#80`). |
-| `src/engine.rs` | `struct DSparkSpanDesc {` | `held-open-pr` | GPU descriptor for `k_dspark_reject`, exercised by `dspark_gpu_guards_and_rejection_sampling_gate` and held for DSpark speculative serving (`#42`, `#86`). |
-| `src/engine.rs` | `struct DSparkRejectArgs {` | `held-open-pr` | Uniform argument block for `k_dspark_reject`, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `pub struct SpeculativeVerifySpan<'a> {` | `held-open-pr` | Per-span input to `Engine::verify_speculative_gpu`, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
-| `src/engine.rs` | `pub struct SpeculativeVerifyOut {` | `held-open-pr` | Accepted/resampled output of `Engine::verify_speculative_gpu`, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `pub fn reject_sample_gpu(` | `held-open-pr` | GPU `k_dspark_reject` dispatch primitive, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `pub fn verify_speculative_gpu(` | `held-open-pr` | Fallible end-to-end GPU speculative verification and rollback entry point, exercised by GPU tests and held for DSpark speculative serving (`#42`, `#86`). |
 | `src/engine.rs` | `pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32) -> f32 {` | `held-open-pr` | Pure-Rust reference mirror of `k_loopcd_blend` (`#[cfg_attr(not(test), allow(dead_code))]`), exercised by unit tests and LoopCD GPU gates. |
 | `src/sampler.rs` | `pub fn reject_one(&mut self, draft_tok: u32, target: &[f32], draft: &[f32]) -> u32 {` | `held-open-pr` | Speculative verification primitive (`#[cfg_attr(not(test), allow(dead_code))]`) held for open PRs `#42` and `#86`. |
 | `src/sampler.rs` | `pub fn verify_round(&mut self, draft_tokens: &[u32], target_rows: &[&[f32]], draft_rows: &[&[f32]]) -> Vec<u32> {` | `held-open-pr` | Speculative round verification primitive (`#[cfg_attr(not(test), allow(dead_code))]`) held for open PRs `#42` and `#86`. |
-| `src/serve.rs` | `draft_sampler: Sampler,` | `held-open-pr` | Per-request independent speculative draft RNG stream initialized once at admission, held for open PRs `#42` and `#86`. |
 | `src/serve/block_cache.rs` | `fn evict_start(&mut self, pools: &mut BlockPools, sid: SealedId) -> bool {` | `held-open-pr` | Direct checkpoint eviction entry point exercised by unit tests and open PR `#103` (`src/serve/block_cache/trace.rs`). |
 <!-- DEAD_CODE_LEDGER_END -->
 

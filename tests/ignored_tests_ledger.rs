@@ -25,11 +25,7 @@ fn extract_ignored_tests(root: &Path) -> BTreeMap<(String, String), String> {
     files.sort();
     let mut found = BTreeMap::new();
     for file in files {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = file.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
         let content = fs::read_to_string(&file).expect("read rust source");
         let lines: Vec<&str> = content.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
@@ -39,19 +35,16 @@ fn extract_ignored_tests(root: &Path) -> BTreeMap<(String, String), String> {
                 for next in lines.iter().skip(idx + 1).take(8) {
                     let nt = next.trim();
                     if let Some(rest) = nt.strip_prefix("fn ") {
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                            .collect();
+                        let name: String =
+                            rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
                         if !name.is_empty() {
                             fn_name = Some(name);
                             break;
                         }
                     }
                 }
-                let name = fn_name.unwrap_or_else(|| {
-                    panic!("could not find `fn` following #[ignore] at {rel}:{}", idx + 1)
-                });
+                let name =
+                    fn_name.unwrap_or_else(|| panic!("could not find `fn` following #[ignore] at {rel}:{}", idx + 1));
                 found.insert((rel.clone(), name), trimmed.to_string());
             }
         }
@@ -162,12 +155,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             ".github/workflows/ci.yml",
             "memd::tests:: -- --ignored",
         ),
-        (
-            "src/prefix.rs",
-            "prefix_trace_dump",
-            "specs/run_tlc.zsh",
-            "prefix::tests::prefix_trace_dump",
-        ),
+        ("src/prefix.rs", "prefix_trace_dump", "specs/run_tlc.zsh", "prefix::tests::prefix_trace_dump"),
         (
             "src/serve.rs",
             "gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
@@ -186,12 +174,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "tests/nightly.sh",
             "serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits",
         ),
-        (
-            "src/serve/step_trace.rs",
-            "dump",
-            ".github/workflows/ci.yml",
-            "serve::scheduler_trace::dump",
-        ),
+        ("src/serve/step_trace.rs", "dump", ".github/workflows/ci.yml", "serve::scheduler_trace::dump"),
         (
             "src/session.rs",
             "cli_session_recovers_from_injected_prefill_and_decode_failures",
@@ -204,12 +187,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             ".github/workflows/ci.yml",
             "spill::tests::kill9_mid_write_loses_cache_never_correctness",
         ),
-        (
-            "src/spill/tests.rs",
-            "kill9_writer_helper",
-            "src/spill/tests.rs",
-            "spill::tests::kill9_writer_helper",
-        ),
+        ("src/spill/tests.rs", "kill9_writer_helper", "src/spill/tests.rs", "spill::tests::kill9_writer_helper"),
         (
             "src/tokenizer.rs",
             "real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism",
@@ -218,10 +196,8 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
     ];
 
-    let expected_keys: BTreeSet<(String, String)> = ledger
-        .iter()
-        .map(|(f, n, _, _)| ((*f).to_string(), (*n).to_string()))
-        .collect();
+    let expected_keys: BTreeSet<(String, String)> =
+        ledger.iter().map(|(f, n, _, _)| ((*f).to_string(), (*n).to_string())).collect();
     let actual_keys: BTreeSet<(String, String)> = found.keys().cloned().collect();
     assert_eq!(
         actual_keys, expected_keys,

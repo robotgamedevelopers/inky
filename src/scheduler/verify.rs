@@ -9,6 +9,92 @@
 
 use std::collections::VecDeque;
 
+/// Supported `--draft-k` bounds for opt-in DSpark speculative decoding in `inky serve`.
+pub const MIN_DRAFT_K: usize = 1;
+pub const MAX_DRAFT_K: usize = 4;
+pub const DEFAULT_DRAFT_K: usize = 3;
+
+/// Reason a candidate speculative verify batch fell back cleanly to standard 1-token decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyFallbackReason {
+    CapacityExceeded { spans: usize, k: usize, needed_rows: usize, lg_rows: usize },
+    IneligibleLane,
+    ZeroDraftBudget,
+    MultiSpanRequiresHgemm,
+}
+
+/// Per-lane eligibility snapshot for speculative verification on a planned decode batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyLaneEligibility {
+    pub lane: usize,
+    pub p0: usize,
+    pub max_k: usize,
+    pub kv_cap: usize,
+    pub eligible: bool,
+}
+
+/// Scheduler dispatch decision for a planned decode batch when `--dspark` is enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeStepDispatch {
+    /// Execute a GPU speculative verify step with shared draft length `k` (`1..=MAX_DRAFT_K`).
+    Verify { lanes: Vec<usize>, k: usize },
+    /// Fall back cleanly to standard 1-token `encode_decode` for every lane in the batch without failing lanes.
+    FallbackDecode { lanes: Vec<usize>, reason: VerifyFallbackReason },
+}
+
+/// Check the `spans * (1 + k) <= lg_rows` batch logits arena invariant before encoding a verify step.
+pub fn check_verify_rows_fit(spans: usize, k: usize, lg_rows: usize) -> Result<usize, VerifyFallbackReason> {
+    let step_len = 1usize.saturating_add(k);
+    let needed_rows = spans.saturating_mul(step_len);
+    if spans == 0 || needed_rows > lg_rows {
+        return Err(VerifyFallbackReason::CapacityExceeded { spans, k, needed_rows, lg_rows });
+    }
+    Ok(needed_rows)
+}
+
+/// Decide whether a planned `ServeStepPlan::Decode` batch runs as a speculative verify step or
+/// falls back cleanly to standard 1-token decode:
+/// - Every lane in `dec_lanes` must be eligible (`eligible == true`, `clamp_k >= 1`).
+/// - Shared `k` is the minimum clamped `k` across the batch (`1..=requested_k`).
+/// - Enforces `dec_lanes.len() * (1 + k) <= lg_rows` (128): if exceeded, falls back to standard
+///   1-token decode for that step without failing or dropping any lane.
+/// - Requires `hgemm` whenever `dec_lanes.len() > 1`.
+pub fn select_verify_or_decode_fallback(
+    dec_lanes: &[usize],
+    elig: &[VerifyLaneEligibility],
+    requested_k: usize,
+    lg_rows: usize,
+    hgemm: bool,
+) -> DecodeStepDispatch {
+    let lanes = dec_lanes.to_vec();
+    if lanes.is_empty() || requested_k == 0 {
+        return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::ZeroDraftBudget };
+    }
+    if lanes.len() > 1 && !hgemm {
+        return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::MultiSpanRequiresHgemm };
+    }
+    if elig.len() != lanes.len() {
+        return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::IneligibleLane };
+    }
+    let mut shared_k = requested_k;
+    for (idx, c) in elig.iter().enumerate() {
+        if c.lane != lanes[idx] || !c.eligible {
+            return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::IneligibleLane };
+        }
+        let Some(clamped) = clamp_k(c.p0, c.max_k.min(requested_k), c.kv_cap) else {
+            return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::ZeroDraftBudget };
+        };
+        if clamped == 0 {
+            return DecodeStepDispatch::FallbackDecode { lanes, reason: VerifyFallbackReason::ZeroDraftBudget };
+        }
+        shared_k = shared_k.min(clamped);
+    }
+    if let Err(reason) = check_verify_rows_fit(lanes.len(), shared_k, lg_rows) {
+        return DecodeStepDispatch::FallbackDecode { lanes, reason };
+    }
+    DecodeStepDispatch::Verify { lanes, k: shared_k }
+}
+
 /// FNV-1a over the raw IEEE-754 bits of one vocabulary row.
 pub fn logit_hash(row: &[f32]) -> u64 {
     let mut h = 0u64;
@@ -48,8 +134,7 @@ pub fn clamp_k(p0: usize, k: usize, kv_cap: usize) -> Option<usize> {
 /// Remaining tokens a lane may still emit before hitting either `max` generated tokens or
 /// `ctx - 1` (`prompt + gen + 1 <= ctx`).
 pub fn reply_budget(prompt: usize, gen: usize, max: usize, ctx: usize) -> usize {
-    max.saturating_sub(gen)
-        .min(ctx.saturating_sub(prompt.saturating_add(gen).saturating_add(1)))
+    max.saturating_sub(gen).min(ctx.saturating_sub(prompt.saturating_add(gen).saturating_add(1)))
 }
 
 /// Pack verify spans into one GPU verify step bounded by `rows` (`Engine::verify_row_capacity()`,
@@ -83,11 +168,7 @@ pub fn plan_verify(cands: &[VerifyCand], rows: usize, multi: bool) -> Vec<Verify
             break;
         }
         budget -= t;
-        out.push(VerifySpanPlan {
-            lane: c.lane,
-            p0: c.p0,
-            k,
-        });
+        out.push(VerifySpanPlan { lane: c.lane, p0: c.p0, k });
     }
     out
 }
@@ -108,11 +189,7 @@ pub struct GreedyKeep {
 /// On mismatch, emits the target's correction token `rows[n_acc]` and stops.
 /// If an accepted draft is in `stop`, emits only through that stop token with `bonus = None`.
 pub fn accept_greedy(drafts: &[u32], rows: &[u32], stop: &[u32]) -> GreedyKeep {
-    assert_eq!(
-        rows.len(),
-        drafts.len() + 1,
-        "one argmax per draft, plus the bonus row"
-    );
+    assert_eq!(rows.len(), drafts.len() + 1, "one argmax per draft, plus the bonus row");
     let mut emitted = Vec::new();
     let mut used = Vec::new();
     let mut n_acc = 0usize;
@@ -124,25 +201,13 @@ pub fn accept_greedy(drafts: &[u32], rows: &[u32], stop: &[u32]) -> GreedyKeep {
         used.push(i);
         n_acc += 1;
         if stop.contains(&drafts[i]) {
-            return GreedyKeep {
-                emitted,
-                n_keep: 1 + n_acc,
-                finished: true,
-                rows: used,
-                bonus: None,
-            };
+            return GreedyKeep { emitted, n_keep: 1 + n_acc, finished: true, rows: used, bonus: None };
         }
     }
     let bonus = rows[n_acc];
     emitted.push(bonus);
     used.push(n_acc);
-    GreedyKeep {
-        emitted,
-        n_keep: 1 + n_acc,
-        finished: stop.contains(&bonus),
-        rows: used,
-        bonus: Some(bonus),
-    }
+    GreedyKeep { emitted, n_keep: 1 + n_acc, finished: stop.contains(&bonus), rows: used, bonus: Some(bonus) }
 }
 
 /// Multi-token emission accounting for a verified lane (`emit_q` + `reply_budget`).
@@ -159,13 +224,7 @@ pub struct SpecEmitState {
 
 impl SpecEmitState {
     pub fn new(pf_end: usize, max_tokens: usize, ctx: usize) -> Self {
-        Self {
-            pf_end,
-            gen: 0,
-            max_tokens,
-            ctx,
-            emit_q: VecDeque::new(),
-        }
+        Self { pf_end, gen: 0, max_tokens, ctx, emit_q: VecDeque::new() }
     }
 
     /// Remaining reply budget at the current `(pf_end, gen)` cursor.
@@ -203,11 +262,7 @@ impl SpecEmitState {
 
     /// Drain all queued tokens in `emit_q`, stopping immediately on disconnect, stop token,
     /// or exhausted `reply_budget`.
-    pub fn drain_queue(
-        &mut self,
-        stop: &[u32],
-        mut send_tok: impl FnMut(u32) -> bool,
-    ) -> Option<&'static str> {
+    pub fn drain_queue(&mut self, stop: &[u32], mut send_tok: impl FnMut(u32) -> bool) -> Option<&'static str> {
         while let Some(tok) = self.emit_q.pop_front() {
             if let Some(reason) = self.emit_token(tok, stop, &mut send_tok) {
                 self.emit_q.clear();
@@ -250,14 +305,7 @@ mod verify_planner_tests {
 
     #[test]
     fn verify_logit_arena_bounds_256_requested_rows_to_128() {
-        let cands: Vec<_> = (0..64)
-            .map(|lane| VerifyCand {
-                lane,
-                p0: 10,
-                k: 3,
-                kv_cap: 64,
-            })
-            .collect();
+        let cands: Vec<_> = (0..64).map(|lane| VerifyCand { lane, p0: 10, k: 3, kv_cap: 64 }).collect();
         // 64 lanes * (1 + 3) = 256 requested rows; 128-row arena packs 32 spans (128 rows).
         let plans = plan_verify(&cands, 128, true);
         assert_eq!(plans.len(), 32);
@@ -266,23 +314,14 @@ mod verify_planner_tests {
         assert_eq!(waiting.len(), 32);
         assert_eq!(waiting.first().unwrap().lane, 32);
         assert_eq!(waiting.last().unwrap().lane, 63);
-        assert_eq!(
-            plan_verify(&cands, 2, true),
-            vec![VerifySpanPlan {
-                lane: 0,
-                p0: 10,
-                k: 1
-            }]
-        );
+        assert_eq!(plan_verify(&cands, 2, true), vec![VerifySpanPlan { lane: 0, p0: 10, k: 1 }]);
     }
 
     #[test]
     fn final_verify_block_emits_full_two_token_reply_budget() {
-        for (max_tokens, ctx, stop, want_reason) in [
-            (2usize, 64usize, vec![], "length"),
-            (10, 63, vec![], "length"),
-            (2, 64, vec![8u32], "stop"),
-        ] {
+        for (max_tokens, ctx, stop, want_reason) in
+            [(2usize, 64usize, vec![], "length"), (10, 63, vec![], "length"), (2, 64, vec![8u32], "stop")]
+        {
             let mut st = SpecEmitState::new(60, max_tokens, ctx);
             assert_eq!(st.remaining_budget(), 2);
             assert_eq!(st.clamp_draft_count(4), 1);
@@ -364,18 +403,82 @@ mod verify_planner_tests {
         // Generation burst runs lanes 0 & 1 without mixing lane 2's prefill into the step;
         // verify planner packs both spans within the 128-row arena.
         assert_eq!(p2, ServeStepPlan::Decode(vec![0, 1]));
-        let cands = [
-            VerifyCand { lane: 0, p0: 15, k: 3, kv_cap: 64 },
-            VerifyCand { lane: 1, p0: 15, k: 3, kv_cap: 64 },
-        ];
+        let cands =
+            [VerifyCand { lane: 0, p0: 15, k: 3, kv_cap: 64 }, VerifyCand { lane: 1, p0: 15, k: 3, kv_cap: 64 }];
         let vplans = plan_verify(&cands, 128, true);
-        assert_eq!(
-            vplans,
-            vec![
-                VerifySpanPlan { lane: 0, p0: 15, k: 3 },
-                VerifySpanPlan { lane: 1, p0: 15, k: 3 },
-            ]
-        );
+        assert_eq!(vplans, vec![VerifySpanPlan { lane: 0, p0: 15, k: 3 }, VerifySpanPlan { lane: 1, p0: 15, k: 3 },]);
         assert!(planner.complete_step().is_empty());
+    }
+
+    #[test]
+    fn serve_verify_capacity_guard_falls_back_cleanly_to_one_token_decode() {
+        let make_elig =
+            |n: usize, p0: usize, max_k: usize, kv_cap: usize| -> (Vec<usize>, Vec<VerifyLaneEligibility>) {
+                let lanes: Vec<usize> = (0..n).collect();
+                let elig = lanes
+                    .iter()
+                    .map(|&lane| VerifyLaneEligibility { lane, p0, max_k, kv_cap, eligible: true })
+                    .collect();
+                (lanes, elig)
+            };
+
+        // 32 lanes * (1 + 3) = 128 <= lg_rows(128): runs verify with k = 3.
+        let (l32, e32) = make_elig(32, 64, 3, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l32, &e32, 3, 128, true),
+            DecodeStepDispatch::Verify { lanes: l32, k: 3 }
+        );
+
+        // 33 lanes * (1 + 3) = 132 > lg_rows(128): cleanly falls back to 1-token decode without failing lanes.
+        let (l33, e33) = make_elig(33, 64, 3, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l33, &e33, 3, 128, true),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l33,
+                reason: VerifyFallbackReason::CapacityExceeded { spans: 33, k: 3, needed_rows: 132, lg_rows: 128 },
+            }
+        );
+
+        // k = 4: 25 * 5 = 125 fits; 26 * 5 = 130 falls back cleanly.
+        let (l25, e25) = make_elig(25, 64, 4, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l25, &e25, 4, 128, true),
+            DecodeStepDispatch::Verify { lanes: l25, k: 4 }
+        );
+        let (l26, e26) = make_elig(26, 64, 4, 4096);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l26, &e26, 4, 128, true),
+            DecodeStepDispatch::FallbackDecode {
+                lanes: l26,
+                reason: VerifyFallbackReason::CapacityExceeded { spans: 26, k: 4, needed_rows: 130, lg_rows: 128 },
+            }
+        );
+
+        // Near KV boundary clamps shared k across the batch (p0=61, kv_cap=64 -> k=2).
+        let (l2, mut e2) = make_elig(2, 10, 4, 64);
+        e2[1].p0 = 61;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 4, 128, true),
+            DecodeStepDispatch::Verify { lanes: l2.clone(), k: 2 }
+        );
+
+        // Ineligible lane (e.g., active LoopCD or JSON grammar) falls back cleanly.
+        e2[1].eligible = false;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 3, 128, true),
+            DecodeStepDispatch::FallbackDecode { lanes: l2.clone(), reason: VerifyFallbackReason::IneligibleLane }
+        );
+
+        // Multi-span without hgemm falls back cleanly; single-span without hgemm verifies.
+        e2[1].eligible = true;
+        assert_eq!(
+            select_verify_or_decode_fallback(&l2, &e2, 3, 128, false),
+            DecodeStepDispatch::FallbackDecode { lanes: l2, reason: VerifyFallbackReason::MultiSpanRequiresHgemm }
+        );
+        let (l1, e1) = make_elig(1, 10, 3, 64);
+        assert_eq!(
+            select_verify_or_decode_fallback(&l1, &e1, 3, 128, false),
+            DecodeStepDispatch::Verify { lanes: l1, k: 3 }
+        );
     }
 }
