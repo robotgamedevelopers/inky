@@ -144,3 +144,28 @@ jobs:
         env:
           INKY_SERVE_PROBES_ONLY: '1'
         run: tests/serve-negative.sh tests/serve.sh ./target/ci/inky
+
+  # GitHub satisfies a required job that is skipped. Require a real M5 result for main PRs.
+  m5-pr-result:
+    if: always() && github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    needs: [m5-gpu, m5-serve]
+    steps:
+      - name: require both M5 jobs to have passed
+        env:
+          SAME_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          GPU: ${{ needs.m5-gpu.result }}
+          SERVE: ${{ needs.m5-serve.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$SAME_REPOSITORY" != true ]]; then
+            echo 'M5 checks are unavailable on fork branches. A maintainer can stage the reviewed change in this repository.' >&2
+            exit 1
+          fi
+          if [[ "$GPU" != success || "$SERVE" != success ]]; then
+            echo "Both M5 jobs must have passed (GPU: $GPU, serving: $SERVE)." >&2
+            exit 1
+          fi
