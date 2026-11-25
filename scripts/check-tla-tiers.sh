@@ -107,6 +107,9 @@ if [ "${1:-}" = --self-test ]; then
         sub_line scripts/check-memmode-traces.sh 's/ skip-keep\)/)/'
     plant 'a declared matrix with no runner' 'TIER GAP: memmode:MemMode runs in no CI tier' "$root" \
         sub_line .github/workflows/ci.yml 's|^        run: TLA_JAR_CACHE=.*check-tla.sh.*$|        run: echo skipped|'
+    plant 'a disabled TLA job' 'TLA tier coverage requires an unconditional, required runner' "$root" \
+        sub_line .github/workflows/ci.yml 's/^  tla:$/  tla:\
+    if: false/'
     plant 'a part no workflow runs' 'TIER GAP: memmode:MemMode runs in no CI tier' "$root" \
         sub_line .github/workflows/ci.yml 's/part: \[memmode, /part: [/'
     plant 'a part in both tiers' 'TIER DUP: memmode:MemMode runs 2 times: ci (memmode), nightly (memmode)' "$root" \
