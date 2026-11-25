@@ -260,7 +260,14 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | A contributor path for machines without an M5: what can be built and validated where, so outside changes are testable (later) | ❌ |
 | Checked rustfmt and clippy configuration in CI, so style survives team growth (later) | ❌ |
 | One paragraph in the README on what GPL-3.0 means for embedding inky downstream (later) | ❌ |
-| complete | 3% |
+| Dedicated isolated macOS user and sandbox for self-hosted M5 CI runners, separate from the owner login (later) | ❌ |
+| Pin every GitHub Action in CI workflows by full 40-hex commit SHA rather than mutable major tag (later) | ❌ |
+| Short pre-authentication socket header deadline and separate unauthenticated connection budget on non-loopback binds (later) | ❌ |
+| Detect memd helper restart or reinstall in running serve processes and re-establish the wired-limit lease (later) | ❌ |
+| Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check (later) | ❌ |
+| Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model (later) | ❌ |
+| Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve (later) | ❌ |
+| complete | 2% |
 
 [Source data](roadmap.sexp)
 
