@@ -274,6 +274,19 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
 mod cli_tests {
     use super::*;
 
+    #[test]
+    fn loopcd_weak_logits_require_both_finite_references() {
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.25, 2.0], &[1.0, 2.0]), Some(0.25));
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 2.25]), Some(0.25));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[f32::NAN], &[1.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[1.0], &[f32::NAN]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[], &[], &[]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[f32::NAN], &[1.0], &[1.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[f32::INFINITY], &[f32::INFINITY], &[f32::INFINITY]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0, 2.0], &[1.0], &[1.0, 2.0]), Some(f32::INFINITY));
+        assert_eq!(weak_loopcd_mismatch(&[1.0], &[1.0000001], &[0.9999999]), None);
+    }
+
     fn serve_args(args: &[&str]) -> Result<serve::ServeOpts, String> {
         parse_serve(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), 64, |name| match name {
             "PRESENT" => Ok("configured-key".into()),
@@ -2137,6 +2150,20 @@ fn cpu_loopcd_reference(z3_raw: &[f32], z1_raw: &[f32], softcap: f32, omega_max:
     (out, omega_t as f32)
 }
 
+fn weak_loopcd_mismatch(candidate: &[f32], dry: &[f32], stateful: &[f32]) -> Option<f32> {
+    if candidate.len() != dry.len() || candidate.len() != stateful.len() || candidate.is_empty() {
+        return Some(f32::INFINITY);
+    }
+    let mut max_delta = 0.0f32;
+    for ((&actual, &dry_ref), &stateful_ref) in candidate.iter().zip(dry).zip(stateful) {
+        if !(actual.is_finite() && dry_ref.is_finite() && stateful_ref.is_finite()) {
+            return Some(f32::INFINITY);
+        }
+        max_delta = max_delta.max((actual - dry_ref).abs()).max((actual - stateful_ref).abs());
+    }
+    (max_delta > 1e-6).then_some(max_delta)
+}
+
 /// GPU gate for Adaptive `LoopCD-Logits` (`t-au-loopcd-gpu-gate` / `U19`):
 /// 1. Runs `encode_decode_with_omegas` on a 4-lane Layer 3 blocked batch with mixed omegas `[0.0, 0.35, 0.0, 0.5]`
 ///    (lanes 0 & 1 sharing a sealed 64-token prefix block for `k_attn_grp_dec`, lanes 2 & 3 private for `k_attn_dec_solo`).
@@ -2371,15 +2398,8 @@ fn loopcdgate(o: &Opts) {
             bad.push(format!("lane {i}: post-step KV blocks differ from standalone omega=0 decode"));
         }
         // Verify captured `lg_weak` matches both isolated dry probe and standalone 1-pass reference.
-        if cand_weak_logits[i] != dry_weak_probe_logits[i] || cand_weak_logits[i] != z1_ref[i] {
-            let wd = cand_weak_logits[i]
-                .iter()
-                .zip(&z1_ref[i])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            if wd > 1e-6 {
-                bad.push(format!("lane {i}: dry weak logits differ from standalone 1-pass reference (max_diff={wd:.6e})"));
-            }
+        if let Some(wd) = weak_loopcd_mismatch(&cand_weak_logits[i], &dry_weak_probe_logits[i], &z1_ref[i]) {
+            bad.push(format!("lane {i}: captured weak logits fail the dry-probe or standalone comparison (max_diff={wd:.6e})"));
         }
 
         if omegas[i] == 0.0 {
