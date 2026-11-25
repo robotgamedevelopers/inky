@@ -11,9 +11,10 @@
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
 use crate::engine::{Engine, Lane, Span};
-use crate::sampler::Sampler;
+use crate::metal::CmdBuf;
+use crate::sampler::{checked_argmax, Sampler};
 use crate::tokenizer::Tokenizer;
-use objc2_metal::MTLCommandBuffer;
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -417,6 +418,19 @@ struct Active {
     emit_q: VecDeque<u32>,
 }
 
+impl Active {
+    fn emit_token(&mut self, tok: u32, stop: &[u32], ctx: usize) -> bool {
+        let gone = self.job.out.send(Ev::Tok(tok)).is_err();
+        self.gen += 1;
+        let budget = reply_budget(self.pf_end, self.gen, self.job.max, ctx);
+        let reason = if gone { "cancelled" } else if stop.contains(&tok) { "stop" }
+                     else if budget == 0 { "length" } else { return false };
+        if gone { eprintln!("[serve] client gone after {} generated tokens; lane freed", self.gen); }
+        let _ = self.job.out.send(Ev::Done { prompt: self.pf_end, cached: self.cached, gen: self.gen, reason });
+        true
+    }
+}
+
 /// Tokens two token lists share at their start.
 fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
 
@@ -465,7 +479,6 @@ fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usi
     eng.copy_lane_prefix(&s.lane, &d.lane, n);
 }
 
-pub(crate) fn argmax(v: &[f32]) -> u32 { v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32 }
 
 /// FNV-1a over the raw logit bits of one vocabulary row.
 pub(crate) fn logit_hash(row: &[f32]) -> u64 {
@@ -490,17 +503,18 @@ pub(crate) fn clamp_k(p0: usize, k: usize, kv_cap: usize) -> Option<usize> {
     Some(k.min(room - 1))
 }
 
-/// Pack verify spans into one step. The budget is the prefill's: the sum of `1 + k` stays `<= chunk`.
+/// Pack verify spans into one step. Each position consumes one activation and one logit row.
 /// A span that does not fit the remaining budget stops the pack; that lane and every lane behind it
 /// wait for a later step. Spans are not split, and a span is not handed to the prefill call.
 /// Lanes in one step share one `k`, because `encode_verify` takes a single `k`. Without `multi`
 /// (no hgemm) only one span runs. A lane whose committed token does not fit the cache is skipped.
-pub(crate) fn plan_verify(cands: &[VerifyCand], chunk: usize, multi: bool) -> Vec<VerifySpanPlan> {
-    let mut budget = chunk;
+pub(crate) fn plan_verify(cands: &[VerifyCand], rows: usize, multi: bool) -> Vec<VerifySpanPlan> {
+    let mut budget = rows;
     let mut out = Vec::new();
+    if rows == 0 { return out; }
     for c in cands {
         if !multi && !out.is_empty() { break; }
-        let Some(k) = clamp_k(c.p0, c.k, c.kv_cap) else { continue; };
+        let Some(k) = clamp_k(c.p0, c.k.min(rows - 1), c.kv_cap) else { continue; };
         let t = 1 + k;
         if t > budget { break; }
         if out.first().is_some_and(|p: &VerifySpanPlan| p.k != k) { break; }
@@ -572,48 +586,68 @@ pub(crate) struct VerifyKept {
 /// The bonus token is not encoded here: its K and V land on the next step, which is
 /// `encode_spans` of `t = 1` for the gate and `encode_decode` only when the lane has no
 /// further drafts. Rollback leaves the lane at the accepted prefix.
-pub(crate) fn verify_step(eng: &Engine, lanes: &[VerifyIn<'_>], stop: &[u32]) -> Vec<Option<VerifyKept>> {
+pub(crate) fn verify_step(eng: &Engine, lanes: &[VerifyIn<'_>], stop: &[u32]) -> Vec<Option<Result<VerifyKept, String>>> {
     let cands: Vec<VerifyCand> = lanes.iter().enumerate().map(|(i, v)| VerifyCand {
         lane: i, p0: v.p0, k: v.drafts.len(), kv_cap: eng.on(v.lane).kv_capacity(),
     }).collect();
-    let plans = plan_verify(&cands, eng.chunk, eng.hgemm);
+    let plans = plan_verify(&cands, eng.verify_row_capacity(), eng.hgemm);
     let mut out = vec![None; lanes.len()];
     if plans.is_empty() { return out; }
     let k = plans[0].k;
-    for p in &plans {
-        let v = &lanes[p.lane];
-        debug_assert_eq!(p.k, k);
-        eng.on(v.lane).set_cs(v.cs_before);
-        if k > 0 { eng.on(v.lane).set_tokens(p.p0 + 1, &v.drafts[..k]); }
-    }
     let spans: Vec<Span> = plans.iter().map(|p| Span { lane: lanes[p.lane].lane, p0: p.p0, t: 1 + k }).collect();
     let cb = eng.gpu.cmd();
+    // Encoding snapshots the lane before the host stages inputs in the shared buffers.
     eng.encode_verify(&cb, &spans, k);
-    cb.commit();
-    cb.waitUntilCompleted();
-    struct Staged { si: usize, lane: usize, p0: usize, keep: GreedyKeep, hashes: Vec<u64> }
-    let mut staged = Vec::new();
-    for (si, p) in plans.iter().enumerate() {
-        let base = si * (1 + k);
-        let mut argmaxes = Vec::with_capacity(1 + k);
-        let mut every = Vec::with_capacity(1 + k);
-        for r in 0..=k {
-            let lg = eng.span_logits(base + r);
-            every.push(logit_hash(lg));
-            argmaxes.push(argmax(lg));
-        }
-        let keep = accept_greedy(&lanes[p.lane].drafts[..k], &argmaxes, stop);
-        let hashes = keep.rows.iter().map(|&r| every[r]).collect();
-        staged.push(Staged { si, lane: p.lane, p0: p.p0, keep, hashes });
+    for p in &plans {
+        let v = &lanes[p.lane];
+        let run = eng.on(v.lane);
+        run.set_cs(v.cs_before);
+        run.set_tokens(p.p0 + 1, &v.drafts[..k]);
     }
-    for s in &staged { eng.rollback_verify(lanes[s.lane].lane, s.si, s.keep.n_keep); }
-    for s in staged {
-        out[s.lane] = Some(VerifyKept {
-            p0: s.p0, k, emitted: s.keep.emitted, n_keep: s.keep.n_keep, finished: s.keep.finished,
-            hashes: s.hashes, bonus: s.keep.bonus,
+    cb.commit();
+    let gpu = wait_committed_step(&cb, "verify");
+    for (si, p) in plans.iter().enumerate() {
+        let result = gpu.clone().and_then(|()| {
+            let base = si * (1 + k);
+            let logits: Vec<_> = (0..=k).map(|r| eng.span_logits(base + r)).collect();
+            let argmaxes: Result<Vec<_>, _> = logits.iter().map(|row| checked_argmax(row)).collect();
+            let keep = accept_greedy(&lanes[p.lane].drafts[..k], &argmaxes?, stop);
+            let hashes = keep.rows.iter().map(|&r| logit_hash(logits[r])).collect();
+            Ok(VerifyKept {
+                p0: p.p0, k, emitted: keep.emitted, n_keep: keep.n_keep, finished: keep.finished,
+                hashes, bonus: keep.bonus,
+            })
         });
+        eng.rollback_verify(lanes[p.lane].lane, si, result.as_ref().map_or(0, |kept| kept.n_keep));
+        out[p.lane] = Some(result);
     }
     out
+}
+
+pub(crate) fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
+    if let Some(error) = cb.error() {
+        eprintln!("[serve] Metal {stage} failed ({status:?}): {}", error.localizedDescription());
+    } else {
+        eprintln!("[serve] Metal {stage} failed ({status:?})");
+    }
+    Err(format!("Metal {stage} failed"))
+}
+
+fn reply_budget(prompt: usize, gen: usize, max: usize, ctx: usize) -> usize {
+    max.saturating_sub(gen).min(ctx.saturating_sub(prompt.saturating_add(gen).saturating_add(1)))
+}
+
+fn fail_lane(eng: &Engine, lane: &mut LaneS, error: String, tick: &mut u64) {
+    let a = lane.job.take().unwrap();
+    let _ = a.job.out.send(Ev::Err(error));
+    lane.prompt.clear();
+    lane.cs_at_prompt = None;
+    eng.on(&lane.lane).reset();
+    lane.tick = *tick;
+    *tick += 1;
 }
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>) {
@@ -697,7 +731,11 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             }
             for (i, cs) in snap_last { lanes[i].job.as_mut().unwrap().cs_before = Some(cs); }
             let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &spans, true, false); cb.commit();
+            if let Err(error) = wait_committed_step(&cb, "prefill") {
+                for &(i, _, _) in &sp_list { fail_lane(eng, &mut lanes[i], error.clone(), &mut tick_seq); }
+                continue;
+            }
             let many = spans.len() > 1;
             for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
                 let l = &mut lanes[i];
@@ -710,8 +748,10 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     l.prompt = a.job.toks.clone();
                     if a.drafts.is_none() || a.cs_before.is_none() {
                         let lg = if many { eng.span_logits(k) } else { eng.logits() };
-                        let tok = if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) };
-                        a.pending = Some(tok);
+                        match a.sampler.sample_next(lg) {
+                            Ok(tok) => a.pending = Some(tok),
+                            Err(error) => fail_lane(eng, l, error.into(), &mut tick_seq),
+                        }
                     }
                 } else if a.job.out.send(Ev::Alive).is_err() {
                     // the client went away during its prefill: free the lane now
@@ -721,23 +761,24 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             }
         } else if !need_ver.is_empty() {
             last_was_prefill = false;
-            let mut runnable: Vec<usize> = Vec::new();
+            let mut owned = Vec::new();
+            let rows = eng.verify_row_capacity();
             for &i in &need_ver {
-                let cap = eng.on(&lanes[i].lane).kv_capacity();
-                let (p0, fit) = {
-                    let a = lanes[i].job.as_ref().unwrap();
-                    let p0 = a.n_past - 1;
-                    let nk = a.drafts.as_ref().unwrap().len();
-                    (p0, clamp_k(p0, nk, cap).is_some_and(|k| 1 + k <= eng.chunk))
-                };
-                if fit { runnable.push(i); continue; }
-                let _ = lanes[i].job.as_ref().unwrap().job.out.send(Ev::Err(format!("verify span at {p0} does not fit the K/V cache ({cap}) or the chunk ({})", eng.chunk)));
-                lanes[i].job = None; lanes[i].tick = tick_seq; tick_seq += 1;
+                let l = &mut lanes[i];
+                let cap = eng.on(&l.lane).kv_capacity();
+                let a = l.job.as_ref().unwrap();
+                let p0 = a.n_past - 1;
+                let budget = reply_budget(a.pf_end, a.gen, a.job.max, eng.max_ctx);
+                let drafts = a.drafts.as_ref().unwrap();
+                let k = drafts.len().min(budget.saturating_sub(1));
+                if !a.sampler.greedy() {
+                    fail_lane(eng, l, "synthetic verification requires greedy sampling".into(), &mut tick_seq);
+                } else if budget == 0 || rows == 0 || p0 >= cap {
+                    fail_lane(eng, l, format!("verify span at {p0} exceeds the reply budget, K/V capacity ({cap}), or logit arena ({rows})"), &mut tick_seq);
+                } else {
+                    owned.push((i, a.cs_before.clone().unwrap(), drafts[..k].to_vec(), p0));
+                }
             }
-            let owned: Vec<(usize, Vec<u8>, Vec<u32>, usize)> = runnable.iter().map(|&i| {
-                let a = lanes[i].job.as_ref().unwrap();
-                (i, a.cs_before.clone().unwrap(), a.drafts.clone().unwrap(), a.n_past - 1)
-            }).collect();
             let kept = {
                 let input: Vec<VerifyIn> = owned.iter().map(|(i, cs, drafts, p0)| VerifyIn {
                     lane: &lanes[*i].lane, p0: *p0, cs_before: cs, drafts,
@@ -745,9 +786,15 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 verify_step(eng, &input, &stop)
             };
             for (slot, kopt) in kept.into_iter().enumerate() {
-                let Some(kpt) = kopt else { continue };
-                let i = owned[slot].0;
-                let l = &mut lanes[i];
+                let Some(result) = kopt else { continue };
+                let l = &mut lanes[owned[slot].0];
+                let kpt = match result {
+                    Ok(kept) => kept,
+                    Err(error) => {
+                        fail_lane(eng, l, error, &mut tick_seq);
+                        continue;
+                    }
+                };
                 let a = l.job.as_mut().unwrap();
                 a.emit_q.extend(kpt.emitted);
                 // the bonus is emitted now and encoded on the next step. With no further drafts that
@@ -762,12 +809,19 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // feed each lane's pending token at its position
             for &i in &need_dec { let a = lanes[i].job.as_ref().unwrap(); eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]); }
             let spans: Vec<Span> = need_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-            let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &spans, true, false); cb.commit(); cb.waitUntilCompleted();
+            let cb = eng.gpu.cmd(); eng.encode_decode(&cb, &spans, true, false); cb.commit();
+            if let Err(error) = wait_committed_step(&cb, "decode") {
+                for &i in &need_dec { fail_lane(eng, &mut lanes[i], error.clone(), &mut tick_seq); }
+                continue;
+            }
             for (k, &i) in need_dec.iter().enumerate() {
-                let a = lanes[i].job.as_mut().unwrap();
+                let l = &mut lanes[i];
+                let a = l.job.as_mut().unwrap();
                 a.n_past += 1;
-                let lg = eng.span_logits(k);
-                a.pending = Some(if a.sampler.greedy() { argmax(lg) } else { a.sampler.sample(lg) });
+                match a.sampler.sample_next(eng.span_logits(k)) {
+                    Ok(tok) => a.pending = Some(tok),
+                    Err(error) => fail_lane(eng, l, error.into(), &mut tick_seq),
+                }
             }
         }
         // emit the tokens just sampled; finish lanes that stopped or whose client went away
@@ -776,13 +830,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // a verify step emits 1 to k+1 tokens. The no-drafter path leaves this queue empty and emits one.
             if !a.emit_q.is_empty() {
                 while let Some(tok) = a.emit_q.pop_front() {
-                    let gone = a.job.out.send(Ev::Tok(tok)).is_err();
-                    a.gen += 1;
-                    let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
-                                 else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
-                    if let Some(r) = reason {
-                        if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
-                        let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+                    if a.emit_token(tok, &stop, eng.max_ctx) {
                         l.job = None; l.tick = tick_seq; tick_seq += 1;
                         break;
                     }
@@ -794,13 +842,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
             // a token is emitted once, right after it is sampled: then n_past - pf_end == gen
             let fresh = a.n_past == a.pf_end + a.gen;
             if !fresh { continue; }
-            let gone = a.job.out.send(Ev::Tok(tok)).is_err();
-            a.gen += 1;
-            let reason = if gone { Some("cancelled") } else if stop.contains(&tok) { Some("stop") }
-                         else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx { Some("length") } else { None };
-            if let Some(r) = reason {
-                if r == "cancelled" { eprintln!("[serve] client gone after {} generated tokens; lane freed", a.gen); }
-                let _ = a.job.out.send(Ev::Done { prompt: a.pf_end, cached: a.cached, gen: a.gen, reason: r });
+            if a.emit_token(tok, &stop, eng.max_ctx) {
                 l.job = None; l.tick = tick_seq; tick_seq += 1;
             }
         }
@@ -1747,6 +1789,37 @@ mod tests {
         let p = plan_verify(&[c(0, 10, 3, 100), c(1, 10, 1, 100)], 100, true);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].k, 3);
+    }
+
+    #[test] fn verify_logit_arena_can_be_smaller_than_the_prefill_chunk() {
+        let cands: Vec<_> = (0..64).map(|lane| VerifyCand { lane, p0: 10, k: 3, kv_cap: 64 }).collect();
+        let plans = plan_verify(&cands, crate::engine::MAX_SPANS, true);
+        assert_eq!(plans.len(), 32);
+        assert_eq!(plans.iter().map(|p| p.k + 1).sum::<usize>(), 128);
+        let waiting = plan_verify(&cands[32..], crate::engine::MAX_SPANS, true);
+        assert_eq!(waiting.first().unwrap().lane, 32);
+        assert_eq!(waiting.last().unwrap().lane, 63);
+        assert_eq!(plan_verify(&cands, 2, true), vec![VerifySpanPlan { lane: 0, p0: 10, k: 1 }]);
+    }
+
+    #[test] fn final_verify_block_emits_the_full_reply_budget() {
+        for (max, ctx, stop, reason) in [(2, 64, vec![], "length"), (10, 63, vec![], "length"), (2, 64, vec![8], "stop")] {
+            let (out, events) = channel();
+            let job = Job { toks: vec![0; 60], max, temp: 0.0, top_p: 1.0, seed: 0, out };
+            let mut a = Active {
+                job, n_past: 62, pf_end: 60, cached: 0, gen: 0,
+                sampler: Sampler::new(0.0, 64, 1.0, 0.0, 0),
+                draft_sampler: Sampler::draft(0.0, 64, 1.0, 0.0, 0),
+                pending: Some(8), drafts: None, cs_before: None, emit_q: VecDeque::new(),
+            };
+            assert_eq!(reply_budget(a.pf_end, a.gen, a.job.max, ctx), 2);
+            assert!(!a.emit_token(7, &stop, ctx));
+            assert!(a.emit_token(8, &stop, ctx));
+            assert!(matches!(events.try_recv(), Ok(Ev::Tok(7))));
+            assert!(matches!(events.try_recv(), Ok(Ev::Tok(8))));
+            assert!(matches!(events.try_recv(), Ok(Ev::Done { gen: 2, reason: r, .. }) if r == reason));
+            assert!(events.try_recv().is_err());
+        }
     }
 
     #[test] fn verify_stop_in_the_middle_emits_only_the_prefix() {

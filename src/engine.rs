@@ -423,12 +423,13 @@ impl std::ops::Deref for Run<'_> { type Target = Engine; fn deref(&self) -> &Eng
 pub struct Span<'a> { pub lane: &'a Lane, pub p0: usize, pub t: usize }
 
 /// K/V rows one verify position overwrote, copied before the span ran.
-#[derive(Clone)]
 struct KvUndo { pos: usize, rows: Vec<u8> }
 struct VerifySpan {
     lane: *const Lane,
     p0: usize,
     kv: Vec<KvUndo>,
+    cs_before: Vec<u8>,
+    tokens_before: Vec<u32>,
     /// `p0 + n_keep` after rollback. Absent until then. Not a seal of the span's end, and not `cs_at_prompt`.
     accepted_end: Option<usize>,
 }
@@ -510,6 +511,10 @@ impl Engine {
     pub fn gpu_mem(&self) -> (usize, usize) {
         use objc2_metal::MTLDevice;
         (self.gpu.dev.currentAllocatedSize(), self.gpu.dev.recommendedMaxWorkingSetSize() as usize)
+    }
+    pub fn verify_row_capacity(&self) -> usize {
+        let b = self.ba.get();
+        self.chunk.min(b.cap).min(b.lg_rows as usize)
     }
     /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
     /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
@@ -1525,43 +1530,47 @@ impl Engine {
             lane: sp.lane as *const Lane,
             p0: sp.p0,
             kv: self.snapshot_kv_positions(sp.lane, sp.p0, sp.t),
+            cs_before: self.on(sp.lane).get_cs(),
+            tokens_before: (sp.p0..sp.p0 + sp.t).map(|i| self.on(sp.lane).token_at(i)).collect(),
             accepted_end: None,
         }).collect();
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
         self.encode_spans_x(cb, spans, true, false, false, Some(k));
     }
-    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
+    /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (0..=1+k).
+    /// Zero aborts the whole span and restores the pre-step convolution state.
     /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
     /// the span, so a rejected draft and anything after it do not stay. The recorded length is `p0 + n_keep`, never
     /// a seal of the span's end. The images live on `verify_keep`, not in serve's `cs_at_prompt`. Nothing may be in
     /// flight on the GPU. The correction token is not written here: its K and V land when that token is encoded.
     pub fn rollback_verify(&self, lane: &Lane, si: usize, n_keep: usize) {
         assert!(lane.tier.is_none(), "verify does not run on a --kv-disk lane");
-        let tail = {
-            let mut slot = self.verify_keep.borrow_mut();
-            let g = slot.as_mut().expect("rollback_verify without encode_verify");
-            assert!(si < g.spans.len(), "verify span {si} is out of range");
-            let t = g.t;
-            let stride = g.stride;
-            let cs = g.cs.clone();
-            assert!(n_keep >= 1 && n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
-            let rec = &mut g.spans[si];
-            assert!(std::ptr::eq(rec.lane, lane), "rollback lane is not the lane encode_verify ran");
-            let end = rec.p0 + n_keep;
-            // Layer 2 has no block table. The only length this step records is the accepted prefix.
-            rec.accepted_end = Some(end);
-            assert!(end <= rec.p0 + t);
-            if n_keep < t { assert!(end < rec.p0 + t, "a rejected tail is not sealed"); }
-            let bytes = stride * 4;
-            assert_eq!(bytes, lane.cs.length());
+        let mut slot = self.verify_keep.borrow_mut();
+        let g = slot.as_mut().expect("rollback_verify without encode_verify");
+        assert!(si < g.spans.len(), "verify span {si} is out of range");
+        let t = g.t;
+        assert!(n_keep <= t, "n_keep {n_keep} is outside the verify span of {t}");
+        let rec = &mut g.spans[si];
+        assert!(std::ptr::eq(rec.lane, lane), "rollback lane is not the lane encode_verify ran");
+        assert!(rec.accepted_end.is_none(), "verify span already finalized");
+        let end = rec.p0 + n_keep;
+        let bytes = g.stride * 4;
+        assert_eq!(bytes, lane.cs.length());
+        let run = self.on(lane);
+        if n_keep == 0 {
+            run.set_cs(&rec.cs_before);
+        } else {
             unsafe {
-                let src = (cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
+                let src = (g.cs.contents().as_ptr() as *const u8).add((si * t + (n_keep - 1)) * bytes);
                 std::ptr::copy_nonoverlapping(src, lane.cs.contents().as_ptr() as *mut u8, bytes);
             }
-            rec.kv.iter().skip(n_keep).cloned().collect::<Vec<_>>()
-        };
-        for undo in &tail { self.restore_kv_pos(lane, undo); }
+        }
+        run.set_tokens(end, &rec.tokens_before[n_keep..]);
+        for undo in &rec.kv[n_keep..] { self.restore_kv_pos(lane, undo); }
+        rec.accepted_end = Some(end);
+        if g.spans.iter().all(|span| span.accepted_end.is_some()) { *slot = None; }
     }
+
     /// Bytes of every slot's K and V row at positions [p0, p0+t), before the span writes them.
     fn snapshot_kv_positions(&self, lane: &Lane, p0: usize, t: usize) -> Vec<KvUndo> {
         let eb = self.kvb;

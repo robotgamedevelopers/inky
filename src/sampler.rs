@@ -1,5 +1,15 @@
 //! CPU sampler over the GPU logits: softcap -> top-k -> temperature -> top-p -> draw.
 
+pub(crate) fn checked_argmax(logits: &[f32]) -> Result<u32, &'static str> {
+    if logits.is_empty() { return Err("model returned no logits"); }
+    let mut best = (0, f32::NEG_INFINITY);
+    for (i, &x) in logits.iter().enumerate() {
+        if !x.is_finite() { return Err("model returned non-finite logits"); }
+        if x > best.1 { best = (i as u32, x); }
+    }
+    Ok(best.0)
+}
+
 pub struct Sampler {
     pub temp: f32,
     pub top_k: usize,
@@ -32,6 +42,16 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        self.sample_next(logits).expect("model sampling failed")
+    }
+
+    pub fn sample_next(&mut self, logits: &[f32]) -> Result<u32, &'static str> {
+        let best = checked_argmax(logits)?;
+        if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
+        if self.greedy() { return Ok(best); }
+        if !self.softcap.is_finite() || !self.top_p.is_finite() {
+            return Err("invalid sampling parameters");
+        }
         // top-k on raw logits (softcap is monotonic, so the order is the same)
         let k = self.top_k.min(logits.len());
         select_top_k(logits, k, &mut self.cand);
@@ -42,6 +62,7 @@ impl Sampler {
         let m = scaled[0];
         let mut p: Vec<f32> = scaled.iter().map(|&x| (x - m).exp()).collect();
         let sum: f32 = p.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 { return Err("model returned invalid sampling probabilities"); }
         for v in p.iter_mut() { *v /= sum; }
         // top-p cut
         let mut cum = 0.0;
@@ -49,8 +70,8 @@ impl Sampler {
         for (i, &v) in p.iter().enumerate() { cum += v; if cum >= self.top_p { n = i + 1; break; } }
         let total: f32 = p[..n].iter().sum();
         let mut r = self.next_f32() * total;
-        for i in 0..n { r -= p[i]; if r <= 0.0 { return self.cand[i].1; } }
-        self.cand[n - 1].1
+        for i in 0..n { r -= p[i]; if r <= 0.0 { return Ok(self.cand[i].1); } }
+        Ok(self.cand[n - 1].1)
     }
 
     /// One drafted position. Draw from q, accept with min(1, p/q), else draw `norm(max(0, p-q))`.
@@ -200,6 +221,18 @@ fn prob_of(masses: &[Mass], token: u32, target_side: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test] fn checked_sampling_rejects_invalid_rows_without_advancing_rng() {
+        let mut sampler = Sampler::new(0.5, 64, 1.0, 0.0, 7);
+        let before = sampler.state;
+        for row in [&[][..], &[1.0, f32::NAN], &[f32::INFINITY, 2.0], &[2.0, f32::NEG_INFINITY]] {
+            assert!(checked_argmax(row).is_err());
+            assert!(sampler.sample_next(row).is_err());
+            assert_eq!(sampler.state, before);
+        }
+        assert_eq!(checked_argmax(&[0.0, 2.0, 2.0]), Ok(1));
+        assert!(sampler.sample_next(&[1.0, 2.0]).is_ok());
+    }
+
     use super::*;
 
     const SOFTCAP: f32 = 20.0;

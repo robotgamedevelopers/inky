@@ -401,7 +401,7 @@ fn rollback(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
-/// dev, scheduler verify gate. One lane, synthetic drafts, no drafter, temperature 0.
+/// dev, scheduler verify gate with synthetic drafts at temperature 0.
 /// Kept tokens and the logit hash at each kept position match `encode_spans` of t=1, one position
 /// at a time. A forced reject leaves the correction and `lane_hash` the same as that run. A stop
 /// token in the middle of the drafts emits only the prefix. A verify at the K/V boundary clamps k
@@ -409,10 +409,11 @@ fn rollback(o: &Opts) {
 /// Not this run: temperature, more than one lane, sealing a tail, tok/s.
 fn verify(o: &Opts) {
     use engine::Span;
-    use serve::{logit_hash, verify_step, VerifyIn};
+    use sampler::checked_argmax;
+    use serve::{logit_hash, verify_step, wait_committed_step, VerifyIn};
     let k = 3usize;
     let ctx = 128usize;
-    println!("verify gate: one lane, synthetic drafts, no drafter, temp 0, ctx {ctx}");
+    println!("verify gate: synthetic drafts, temp 0, ctx {ctx}");
     let eng = Engine::load(&o.model, ctx);
     eng.ensure_batch(eng.chunk);
     let prompt: Vec<u32> = (0..8).map(|i| ((i * 17 + 3) % 1000) as u32).collect();
@@ -421,7 +422,7 @@ fn verify(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_spans(&cb, &[Span { lane, p0: pos, t: 1 }], logits, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_committed_step(&cb, "verify reference").expect("reference Metal step");
     };
     // baseline: the same prompt, encode_spans of t=1, one position at a time. No encode_decode.
     let base = Lane::new(&eng);
@@ -436,7 +437,7 @@ fn verify(o: &Opts) {
         step1(&base, pos, true);
         let lg = eng.logits().to_vec();
         gen_hash.push(logit_hash(&lg));
-        gen_toks.push(serve::argmax(&lg));
+        gen_toks.push(checked_argmax(&lg).expect("reference logits"));
         hash_after.push(eng.lane_hash(&base));
     }
     println!("fixed prompt {prompt:?}");
@@ -448,7 +449,6 @@ fn verify(o: &Opts) {
         for pos in 0..toks.len() - 1 { step1(&lane, pos, false); }
         let cs = run.get_cs();
         step1(&lane, toks.len() - 1, false);
-        run.set_cs(&cs);
         (lane, cs)
     };
     let mut ok = true;
@@ -456,7 +456,7 @@ fn verify(o: &Opts) {
     {
         let (lane, cs) = prep(&prompt);
         let drafts = gen_toks[..k].to_vec();
-        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap().transpose().expect("synthetic verify step");
         if let Some(kept) = kept {
             let same_tok = kept.emitted == gen_toks[..=k];
             let same_hash = kept.hashes == gen_hash[..=k];
@@ -468,14 +468,62 @@ fn verify(o: &Opts) {
             ok = false;
         }
     }
+    if eng.hgemm {
+        let (left, left_cs) = prep(&prompt);
+        let mut other = prompt.clone();
+        other[p0] += 1;
+        let (right, right_cs) = prep(&other);
+        let reference = Lane::new(&eng);
+        eng.on(&reference).set_tokens(0, &other);
+        for pos in 0..p0 { step1(&reference, pos, false); }
+        let mut right_toks = Vec::new();
+        let mut right_hashes = Vec::new();
+        for i in 0..=k {
+            let pos = p0 + i;
+            if i > 0 { eng.on(&reference).set_tokens(pos, &[right_toks[i - 1]]); }
+            step1(&reference, pos, true);
+            let row = eng.logits();
+            right_toks.push(checked_argmax(row).expect("reference logits"));
+            right_hashes.push(logit_hash(row));
+        }
+        let input = [
+            VerifyIn { lane: &left, p0, cs_before: &left_cs, drafts: &gen_toks[..k] },
+            VerifyIn { lane: &right, p0, cs_before: &right_cs, drafts: &right_toks[..k] },
+        ];
+        let kept = verify_step(&eng, &input, &[]);
+        let same = kept.into_iter().zip([(&gen_toks, &gen_hash), (&right_toks, &right_hashes)])
+            .all(|(kept, (toks, hashes))| kept.transpose().expect("batched verify step")
+                .is_some_and(|kept| &kept.emitted == toks && &kept.hashes == hashes));
+        ok &= same;
+        println!("two-lane verify tokens and logit hashes {}", if same { "same" } else { "DIFFERENT" });
+    }
+    // A discarded span restores even the committed row and the pre-step convolution state.
+    {
+        let (lane, cs_before_anchor) = prep(&prompt);
+        let run = eng.on(&lane);
+        let saved_tokens = [41, 42, 43];
+        run.set_tokens(p0 + 1, &saved_tokens);
+        let before = eng.lane_hash(&lane);
+        let cb = eng.gpu.cmd();
+        eng.encode_verify(&cb, &[Span { lane: &lane, p0, t: 1 + k }], k);
+        run.set_cs(&cs_before_anchor);
+        run.set_tokens(p0 + 1, &gen_toks[..k]);
+        cb.commit();
+        wait_committed_step(&cb, "verify abort probe").expect("abort probe Metal step");
+        eng.rollback_verify(&lane, 0, 0);
+        let same = eng.lane_hash(&lane) == before
+            && saved_tokens.iter().enumerate().all(|(i, &tok)| run.token_at(p0 + 1 + i) == tok);
+        ok &= same;
+        println!("full verify rollback {}", if same { "restored cache, convolution state and tokens" } else { "DIFFERENT" });
+    }
     // forced rejects, as in the rollback gate: middle draft, and the last draft.
     for (name, at) in [("middle", 1usize), ("last", k - 1)] {
         let (lane, cs) = prep(&prompt);
         let mut drafts = gen_toks[..k].to_vec();
         let right = drafts[at];
-        drafts[at] = right.wrapping_add(1);
+        drafts[at] = (right + 1) % eng.n_vocab as u32;
         assert_ne!(drafts[at], right);
-        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap().transpose().expect("synthetic verify step");
         let Some(kept) = kept else { println!("reject {name}: verify waited"); ok = false; continue; };
         let next = kept.bonus;
         let next_ok = next == Some(gen_toks[at]);
@@ -491,7 +539,7 @@ fn verify(o: &Opts) {
         let stop_tok = gen_toks[1];
         let (lane, cs) = prep(&prompt);
         let drafts = gen_toks[..k].to_vec();
-        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[stop_tok]).pop().unwrap();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0, cs_before: &cs, drafts: &drafts }], &[stop_tok]).pop().unwrap().transpose().expect("synthetic verify step");
         if let Some(kept) = kept {
             let mut expect = Vec::new();
             for &t in &drafts {
@@ -517,15 +565,14 @@ fn verify(o: &Opts) {
         let cb = eng.gpu.cmd();
         eng.encode_spans(&cb, &[Span { lane: &lane, p0: 0, t: n - 1 }], false, false);
         cb.commit();
-        cb.waitUntilCompleted();
+        wait_committed_step(&cb, "verify reference").expect("reference Metal step");
         let cs = run.get_cs();
         step1(&lane, n - 1, false);
-        run.set_cs(&cs);
         let p0b = n - 1;
         let want = 7usize;
         assert!(p0b + 1 + want > cap, "the unclamped span has to be past the cache");
         let drafts = vec![1u32; want];
-        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap();
+        let kept = verify_step(&eng, &[VerifyIn { lane: &lane, p0: p0b, cs_before: &cs, drafts: &drafts }], &[]).pop().unwrap().transpose().expect("synthetic verify step");
         if let Some(kept) = kept {
             let clamped = kept.k < want && p0b + 1 + kept.k <= cap;
             ok &= clamped;

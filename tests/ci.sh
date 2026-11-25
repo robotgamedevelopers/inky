@@ -45,6 +45,13 @@ $B xcopy --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -
 # negative control: a copy one token short of the head it claims must report XCOPY NOT LOSSLESS (src/main.rs); a crash or any other failure does not count
 if INK_XCOPY_SABOTAGE=1 $B xcopy --ref ref/long.tokens -c 4096 2>&1 | grep -q 'XCOPY NOT LOSSLESS'; then echo "xcopy sabotage: detected, as required"; else echo "FAIL: xcopy sabotage not detected"; fail=1; fi
 INK_LANES=1,8,33 INK_DECODE=8 $B dbatch --ref ref/long.tokens -c 4096 2>&1 | tail -1 | tee /dev/stderr | grep -q '^dbatch exact' || { echo "FAIL: dbatch"; fail=1; }
+if verify_out=$($B verify 2>&1) && print -r -- "$verify_out" | grep -Fxq 'verify gate matches encode_spans of t=1'; then
+    print -r -- "$verify_out"
+else
+    print -r -- "$verify_out"
+    echo "FAIL: verify"
+    fail=1
+fi
 chip=$(sysctl -n machdep.cpu.brand_string | sed 's/Apple //; s/ /-/g' | tr A-Z a-z)
 if [ -f tests/golden-$chip.txt ]; then
     tests/golden.sh $B > /tmp/inky-golden.$$ 2>&1
