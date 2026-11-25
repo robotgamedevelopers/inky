@@ -159,3 +159,80 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
     );
     assert!(!cache.can_admit(&pools, &active, 1, &prompt, 1, 2048));
 }
+
+#[test]
+fn small_window_pool_keeps_enough_history_for_each_planned_prefill_and_decode() {
+    use crate::scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+    use crate::serve::{pooled_context, window_span_end};
+
+    for (windows, prompt_len, generated) in
+        [(1, 60, 5), (16, 1024, 1), (17, 2311, 138), (20, 3073, 81)]
+    {
+        assert!(pooled_context(8192, 128, windows) >= prompt_len + generated + 2);
+        for guided in [false, true] {
+            let mut pools = BlockPools::with_capacities(128, windows, 1).unwrap();
+            let mut cache = ServeBlockCache::new();
+            let mut table = BlockTable::new(128).unwrap();
+            let mut state = LaneBlockState::default();
+            let prompt = vec![1; prompt_len];
+            cache.match_and_bind(&mut pools, &mut table, &mut state, &prompt);
+            let mut planner = ServeStepPlanner::new(1, 16);
+            planner.on_admit(0);
+            let final_prefill = prompt_len - usize::from(guided);
+            let mut pos = 0;
+            while pos < prompt_len + generated - 1 {
+                let input = ServeLaneInput {
+                    runnable: true,
+                    n_past: pos,
+                    pf_end: effective_pf_target(pos, prompt_len)
+                        .min(final_prefill)
+                        .min(window_span_end(pos, windows)),
+                    has_pending_decode: pos >= final_prefill,
+                };
+                match planner
+                    .plan_and_begin_step(&[input], 4096, BLOCK)
+                    .expect("single lane can progress")
+                {
+                    ServeStepPlan::Prefill(spans) => {
+                        let (_, start, count) = spans[0];
+                        assert_eq!(start, pos);
+                        cache
+                            .ensure_span_blocks(&mut pools, &mut table, pos, count)
+                            .unwrap();
+                        cache.finish_prefill_span(
+                            &mut pools,
+                            &mut table,
+                            &mut state,
+                            &prompt,
+                            pos,
+                            count,
+                            || vec![0; 16],
+                        );
+                        pos += count;
+                    }
+                    ServeStepPlan::Decode(_) => {
+                        cache
+                            .ensure_span_blocks(&mut pools, &mut table, pos, 1)
+                            .unwrap();
+                        cache.finish_decode_span(&mut pools, &mut table, &mut state, pos);
+                        pos += 1;
+                    }
+                }
+                planner.complete_step();
+            }
+            cache.release_lane(&mut pools, &mut table, &mut state);
+            cache.shutdown(&mut pools);
+        }
+    }
+}
+
+#[test]
+fn long_reply_maintains_a_rolling_decode_reservation_after_4096_tokens() {
+    let prompt = [42];
+    let generated = 8192;
+    let active = InflightLaneReserve {
+        gen: generated,
+        ..lane(0, &prompt, generated, generated + 2 * BLOCK)
+    };
+    assert_eq!(reserved_inflight_full_slots(&[active]), 2);
+}

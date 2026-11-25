@@ -245,7 +245,9 @@ pub struct InflightLaneReserve<'a> {
 impl InflightLaneReserve<'_> {
     fn reserved_end(&self) -> usize {
         let prompt_end = self.n_past.max(self.pf_end);
-        prompt_end + self.max_gen.min(MAX_ADMIT_DECODE_RESERVE).saturating_sub(self.gen)
+        // The first generated token comes from the final prompt row. For longer
+        // replies, keep reserving the next bounded tranche after earlier tokens were emitted.
+        prompt_end + self.max_gen.saturating_sub(self.gen.max(1)).min(MAX_ADMIT_DECODE_RESERVE)
     }
 }
 
@@ -444,8 +446,8 @@ impl ServeBlockCache {
         max_gen: usize,
         chunk: usize,
     ) -> bool {
-        // The scheduler rejects prompts larger than the physical Full pool before reaching here.
-        // An otherwise idle server must try a single job even if its requested decode reserve is large.
+        // The handler and scheduler backstop enforce each single-lane physical context bound.
+        // With no competing jobs, retained-only slots are reclaimable on demand.
         if active.is_empty() {
             return true;
         }
@@ -483,7 +485,7 @@ impl ServeBlockCache {
             let mut window_growth = newly_pinned[kind_idx(BlockKind::Window)];
             let mut steady_window = 0;
             for lane in &cohort {
-                let end = (lane.pf_end + lane.max_gen).div_ceil(BLOCK);
+                let end = (lane.pf_end + lane.max_gen.saturating_sub(1)).div_ceil(BLOCK);
                 window_growth += end - lane.written.div_ceil(BLOCK);
                 steady_window += end.min(WINDOW / BLOCK + 1);
             }
