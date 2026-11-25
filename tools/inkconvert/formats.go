@@ -53,6 +53,11 @@ func f16(h uint16) float32 {
 	var v float64
 	if e == 0 {
 		v = m / 1024 * math.Ldexp(1, -14)
+	} else if e == 31 {
+		v = math.Inf(1)
+		if m != 0 {
+			v = math.NaN()
+		}
 	} else {
 		v = (1 + m/1024) * math.Ldexp(1, e-15)
 	}
@@ -174,7 +179,10 @@ func dequantRow(typ uint32, row []byte, k int, gscale float32) ([]float32, error
 }
 
 // relErr returns ||a-b|| / ||b|| and the best least-squares scale s minimizing ||s*a - b||.
-func relErr(a, b []float32) (rel, scale float64) {
+func relErr(a, b []float32) (rel, scale float64, err error) {
+	if len(a) != len(b) {
+		return 0, 0, fmt.Errorf("row widths differ: %d and %d", len(a), len(b))
+	}
 	var ab, aa, bb, dd float64
 	for i := range a {
 		x, y := float64(a[i]), float64(b[i])
@@ -183,11 +191,19 @@ func relErr(a, b []float32) (rel, scale float64) {
 		bb += y * y
 		dd += (x - y) * (x - y)
 	}
+	// A finite float32 row cannot overflow these float64 sums. Any nonfinite
+	// component produces an infinite or NaN squared difference, including Inf - Inf.
+	if math.IsNaN(dd) || math.IsInf(dd, 0) {
+		return 0, 0, fmt.Errorf("row contains a nonfinite weight")
+	}
 	if bb == 0 {
-		return math.Inf(1), 0
+		if dd == 0 {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("nonzero row differs from all-zero reference")
 	}
 	if aa > 0 {
 		scale = ab / aa
 	}
-	return math.Sqrt(dd / bb), scale
+	return math.Sqrt(dd / bb), scale, nil
 }
