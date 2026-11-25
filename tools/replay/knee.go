@@ -19,6 +19,11 @@ type RungMetrics struct {
 	TTFTSamples             int     `json:"ttft_samples"`
 	PeakBudgetEstimateBytes uint64  `json:"peak_budget_estimate_bytes"`
 	PeakMemoryBytes         uint64  `json:"peak_memory_bytes"`
+	PeakRSSBytes            uint64  `json:"peak_rss_bytes"`
+	RSSSamples              int     `json:"rss_samples"`
+	MinHeadroomBytes        uint64  `json:"min_headroom_bytes"`
+	HostMemoryBytes         uint64  `json:"host_memory_bytes"`
+	HeadroomSamples         int     `json:"headroom_samples"`
 	CardsCompleted          int     `json:"cards_completed"`
 	CardsPerHour            float64 `json:"cards_per_hour"`
 	Errors                  int     `json:"errors"`
@@ -137,9 +142,9 @@ func PickKnee(rungs []RungMetrics, cfg KneeConfig) (KneeResult, error) {
 func summaryRows(rungs []RungMetrics) [][]string {
 	sorted := append([]RungMetrics(nil), rungs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Lanes < sorted[j].Lanes })
-	rows := [][]string{{"lanes", "total_tok_s", "per_lane_tok_s", "ttft_p50_ms", "ttft_p95_ms", "peak_memory_bytes", "cards_completed", "cards_per_hour", "errors", "retries_429", "ttft_samples", "peak_budget_estimate_bytes"}}
+	rows := [][]string{{"lanes", "total_tok_s", "per_lane_tok_s", "ttft_p50_ms", "ttft_p95_ms", "peak_memory_bytes", "cards_completed", "cards_per_hour", "errors", "retries_429", "ttft_samples", "peak_budget_estimate_bytes", "peak_rss_bytes", "min_headroom_bytes", "host_memory_bytes"}}
 	for _, r := range sorted {
-		p50, p95, memory, budget := "n/a", "n/a", "n/a", "n/a"
+		p50, p95, memory, budget, rss, headroom, hostMem := "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"
 		if r.TTFTSamples > 0 {
 			p50, p95 = fmt.Sprintf("%.1f", r.TTFTP50Ms), fmt.Sprintf("%.1f", r.TTFTP95Ms)
 		}
@@ -149,10 +154,18 @@ func summaryRows(rungs []RungMetrics) [][]string {
 		if r.PeakBudgetEstimateBytes > 0 {
 			budget = strconv.FormatUint(r.PeakBudgetEstimateBytes, 10)
 		}
+		if r.RSSSamples > 0 {
+			rss = strconv.FormatUint(r.PeakRSSBytes, 10)
+		}
+		if r.HeadroomSamples > 0 {
+			headroom = strconv.FormatUint(r.MinHeadroomBytes, 10)
+			hostMem = strconv.FormatUint(r.HostMemoryBytes, 10)
+		}
 		rows = append(rows, []string{
 			strconv.Itoa(r.Lanes), fmt.Sprintf("%.2f", r.TotalTokS), fmt.Sprintf("%.2f", r.PerLaneTokS),
 			p50, p95, memory, strconv.Itoa(r.CardsCompleted), fmt.Sprintf("%.1f", r.CardsPerHour),
 			strconv.Itoa(r.Errors), strconv.Itoa(r.Retries429), strconv.Itoa(r.TTFTSamples), budget,
+			rss, headroom, hostMem,
 		})
 	}
 	return rows

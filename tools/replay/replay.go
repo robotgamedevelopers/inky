@@ -63,16 +63,21 @@ func (realClock) Sleep(d time.Duration) { time.Sleep(d) }
 
 // SweepConfig configures a replay lane-count sweep.
 type SweepConfig struct {
-	BaseURL        string
-	APIKey         string
-	LaneCounts     []int
-	CardsPerRung   int           // 0 = max(len(cards), lanes)
-	Duration       time.Duration // 0 = fixed card count mode
-	MaxRetries     int
-	HealthInterval time.Duration
-	Knee           KneeConfig
-	Client         *http.Client
-	Clock          Clock
+	BaseURL         string
+	APIKey          string
+	LaneCounts      []int
+	CardsPerRung    int           // 0 = max(len(cards), lanes)
+	Duration        time.Duration // 0 = fixed card count mode
+	MaxRetries      int
+	HealthInterval  time.Duration
+	ServerPID       int
+	MeasureHeadroom bool
+	ForceStream     bool
+	RSSSampler      func(pid int) (uint64, error)
+	HeadroomSampler func() (SystemMemorySample, error)
+	Knee            KneeConfig
+	Client          *http.Client
+	Clock           Clock
 }
 
 // LoadReplaySet loads one .jsonl file or a directory of .jsonl files and their .jsonl.1 backups, groups turns
@@ -249,9 +254,14 @@ type healthTelemetry struct {
 }
 
 type memorySamples struct {
-	mu       sync.Mutex
-	observed uint64
-	budget   uint64
+	mu              sync.Mutex
+	observed        uint64
+	budget          uint64
+	peakRSS         uint64
+	rssSamples      int
+	minHeadroom     uint64
+	hostMemory      uint64
+	headroomSamples int
 }
 
 func (m *memorySamples) observe(h healthTelemetry) {
@@ -262,13 +272,54 @@ func (m *memorySamples) observe(h healthTelemetry) {
 	m.budget = max(m.budget, estimate)
 }
 
-func (m *memorySamples) peaks() (uint64, uint64) {
+func (m *memorySamples) observeRSS(rssBytes uint64) {
+	if rssBytes == 0 {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.observed, m.budget
+	m.peakRSS = max(m.peakRSS, rssBytes)
+	m.rssSamples++
 }
 
-func pollHealthOnce(ctx context.Context, client *http.Client, baseURL, apiKey string, memory *memorySamples) {
+func (m *memorySamples) observeSystem(sys SystemMemorySample) {
+	if sys.TotalBytes == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hostMemory = max(m.hostMemory, sys.TotalBytes)
+	if m.headroomSamples == 0 || sys.AvailableBytes < m.minHeadroom {
+		m.minHeadroom = sys.AvailableBytes
+	}
+	m.headroomSamples++
+}
+
+func (m *memorySamples) peaks() (observed, budget, peakRSS uint64, rssSamples int, minHeadroom, hostMemory uint64, headroomSamples int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.observed, m.budget, m.peakRSS, m.rssSamples, m.minHeadroom, m.hostMemory, m.headroomSamples
+}
+
+func pollTelemetryOnce(
+	ctx context.Context,
+	client *http.Client,
+	baseURL, apiKey string,
+	serverPID int,
+	rssSampler func(int) (uint64, error),
+	headroomSampler func() (SystemMemorySample, error),
+	memory *memorySamples,
+) {
+	if rssSampler != nil && serverPID > 0 {
+		if rss, err := rssSampler(serverPID); err == nil && rss > 0 {
+			memory.observeRSS(rss)
+		}
+	}
+	if headroomSampler != nil {
+		if sys, err := headroomSampler(); err == nil && sys.TotalBytes > 0 {
+			memory.observeSystem(sys)
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/health", nil)
 	if err != nil {
 		return
@@ -362,8 +413,17 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 		healthInterval = 250 * time.Millisecond
 	}
 
+	rssSampler := cfg.RSSSampler
+	if rssSampler == nil && cfg.ServerPID > 0 {
+		rssSampler = SampleProcessRSS
+	}
+	headroomSampler := cfg.HeadroomSampler
+	if headroomSampler == nil && cfg.MeasureHeadroom {
+		headroomSampler = SampleSystemMemory
+	}
+
 	var memory memorySamples
-	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
+	pollTelemetryOnce(ctx, client, baseURL, cfg.APIKey, cfg.ServerPID, rssSampler, headroomSampler, &memory)
 
 	start := clk.Now()
 	_, useRealTimers := clk.(realClock)
@@ -382,7 +442,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 				case <-healthCtx.Done():
 					return
 				case <-timer.C:
-					pollHealthOnce(healthCtx, client, baseURL, cfg.APIKey, &memory)
+					pollTelemetryOnce(healthCtx, client, baseURL, cfg.APIKey, cfg.ServerPID, rssSampler, headroomSampler, &memory)
 					timer.Reset(healthInterval)
 				}
 			}
@@ -431,13 +491,13 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 				replayCardID := fmt.Sprintf("%s-r%d-c%d", template.ID, lanes, idx)
 				cardOK := true
 				for _, turn := range template.Turns {
-					toks, ttftMs, retries, err := executeTurn(ctx, client, clk, baseURL, cfg.APIKey, replayCardID, turn, maxRetries)
+					toks, ttftMs, retries, err := executeTurnWithOptions(ctx, client, clk, baseURL, cfg.APIKey, replayCardID, turn, maxRetries, cfg.ForceStream)
 					retry429Count.Add(int64(retries))
 					if !useRealTimers {
 						nowNs := clk.Now().UnixNano()
 						targetNs := nextHealthPollNs.Load()
 						if nowNs >= targetNs && nextHealthPollNs.CompareAndSwap(targetNs, nowNs+healthInterval.Nanoseconds()) {
-							pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
+							pollTelemetryOnce(ctx, client, baseURL, cfg.APIKey, cfg.ServerPID, rssSampler, headroomSampler, &memory)
 						}
 					}
 					if err != nil {
@@ -463,7 +523,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	cancelHealth()
 	healthWG.Wait()
 	// Capture final post-rung memory snapshot if not yet sampled.
-	pollHealthOnce(ctx, client, baseURL, cfg.APIKey, &memory)
+	pollTelemetryOnce(ctx, client, baseURL, cfg.APIKey, cfg.ServerPID, rssSampler, headroomSampler, &memory)
 
 	wall := clk.Now().Sub(start).Seconds()
 	if wall <= 0 {
@@ -476,7 +536,7 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 	totalTokS := totTok / wall
 	perLaneTokS := totalTokS / float64(lanes)
 
-	obsPeak, budPeak := memory.peaks()
+	obsPeak, budPeak, rssPeak, rssCount, minHeadroom, hostMem, headroomCount := memory.peaks()
 	return RungMetrics{
 		Lanes:                   lanes,
 		TotalTokS:               totalTokS,
@@ -486,11 +546,25 @@ func RunRung(ctx context.Context, cfg SweepConfig, lanes int, cards []Card) Rung
 		TTFTSamples:             len(ttftsMs),
 		PeakMemoryBytes:         obsPeak,
 		PeakBudgetEstimateBytes: budPeak,
+		PeakRSSBytes:            rssPeak,
+		RSSSamples:              rssCount,
+		MinHeadroomBytes:        minHeadroom,
+		HostMemoryBytes:         hostMem,
+		HeadroomSamples:         headroomCount,
 		CardsCompleted:          doneCards,
 		CardsPerHour:            float64(doneCards) / wall * 3600.0,
 		Errors:                  int(errCount.Load()),
 		Retries429:              int(retry429Count.Load()),
 	}
+}
+
+func forceStreamingRequest(raw json.RawMessage) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	obj["stream"] = json.RawMessage("true")
+	return json.Marshal(obj)
 }
 
 func executeTurn(
@@ -501,26 +575,47 @@ func executeTurn(
 	turn RecordedEntry,
 	maxRetries int,
 ) (completionTokens int, ttftMs float64, retries429 int, err error) {
+	return executeTurnWithOptions(ctx, client, clk, baseURL, apiKey, cardID, turn, maxRetries, false)
+}
+
+func executeTurnWithOptions(
+	ctx context.Context,
+	client *http.Client,
+	clk Clock,
+	baseURL, apiKey, cardID string,
+	turn RecordedEntry,
+	maxRetries int,
+	forceStream bool,
+) (completionTokens int, ttftMs float64, retries429 int, err error) {
 	endpoint := turn.Endpoint
 	if !strings.HasPrefix(endpoint, "/") {
 		endpoint = "/" + endpoint
 	}
 	targetURL := baseURL + endpoint
+	reqBody := turn.Request
 	var options struct {
 		Stream        bool `json:"stream"`
 		StreamOptions struct {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options"`
 	}
-	if err := json.Unmarshal(turn.Request, &options); err != nil {
+	if err := json.Unmarshal(reqBody, &options); err != nil {
 		return 0, -1, 0, fmt.Errorf("invalid recorded request: %w", err)
+	}
+	if forceStream && !options.Stream {
+		patched, err := forceStreamingRequest(reqBody)
+		if err != nil {
+			return 0, -1, 0, fmt.Errorf("invalid recorded request: %w", err)
+		}
+		reqBody = patched
+		options.Stream = true
 	}
 
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return 0, 0, retries429, ctx.Err()
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(turn.Request))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(reqBody))
 		if err != nil {
 			return 0, 0, retries429, err
 		}

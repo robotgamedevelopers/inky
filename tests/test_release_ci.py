@@ -234,7 +234,7 @@ class ReleaseCiTests(unittest.TestCase):
         import re
         sha_pin = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
         workflows = ROOT / ".github/workflows"
-        for wf_name in ("ci.yml", "nightly.yml", "release.yml"):
+        for wf_name in ("ci.yml", "nightly.yml", "dependency-audit.yml", "release.yml"):
             doc = workflow(workflows / wf_name)
             for job_name, job in doc["jobs"].items():
                 steps = job.get("steps", [])
@@ -401,6 +401,83 @@ class ReleaseCiTests(unittest.TestCase):
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode == 0, passes, result.stderr)
+
+    def test_workflows_never_cancel_main_runs(self):
+        workflows_dir = ROOT / ".github/workflows"
+        wf_paths = sorted(
+            p for p in workflows_dir.iterdir() if p.suffix in (".yml", ".yaml")
+        )
+        self.assertGreaterEqual(len(wf_paths), 4)
+        for path in wf_paths:
+            with self.subTest(workflow=path.name):
+                doc = workflow(path)
+                release_ci.validate_no_main_cancellation(doc, path.name)
+
+    def test_planted_main_cancellation_bugs_fail(self):
+        ci_doc = workflow(ROOT / ".github/workflows/ci.yml")
+        nightly_doc = workflow(ROOT / ".github/workflows/nightly.yml")
+        dep_doc = workflow(ROOT / ".github/workflows/dependency-audit.yml")
+        release_doc = workflow(ROOT / ".github/workflows/release.yml")
+
+        cases = [
+            (
+                "ci.yml cancel-in-progress true on main",
+                dict(ci_doc, concurrency={"group": "ci-main", "cancel-in-progress": True}),
+            ),
+            (
+                "ci.yml missing concurrency block",
+                {k: v for k, v in ci_doc.items() if k != "concurrency"},
+            ),
+            (
+                "ci.yml string 'true' cancel-in-progress",
+                dict(ci_doc, concurrency={"group": "ci-${{ github.ref }}", "cancel-in-progress": "true"}),
+            ),
+            (
+                "ci.yml PR cancel expression without run_id fallback group",
+                dict(
+                    ci_doc,
+                    concurrency={
+                        "group": "ci-${{ github.ref }}",
+                        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+                    },
+                ),
+            ),
+            (
+                "nightly.yml cancel-in-progress true",
+                dict(nightly_doc, concurrency={"group": "nightly-${{ github.ref }}", "cancel-in-progress": True}),
+            ),
+            (
+                "dependency-audit.yml non-PR-restricted expression",
+                dict(
+                    dep_doc,
+                    concurrency={
+                        "group": "audit-${{ github.ref }}",
+                        "cancel-in-progress": "${{ github.ref == 'refs/heads/main' }}",
+                    },
+                ),
+            ),
+            (
+                "release.yml cancel-in-progress true",
+                dict(release_doc, concurrency={"group": "release-${{ github.ref }}", "cancel-in-progress": True}),
+            ),
+            (
+                "job-level cancel-in-progress true on main",
+                dict(
+                    ci_doc,
+                    jobs={
+                        **ci_doc["jobs"],
+                        "unit": {
+                            **ci_doc["jobs"]["unit"],
+                            "concurrency": {"group": "unit-main", "cancel-in-progress": True},
+                        },
+                    },
+                ),
+            ),
+        ]
+        for label, bad_doc in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    release_ci.validate_no_main_cancellation(bad_doc, label)
 
 
 if __name__ == "__main__":

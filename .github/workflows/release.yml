@@ -13,6 +13,10 @@ on:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 permissions:
   contents: read
+# Release runs on pushed version tags must never cancel in progress.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   main-ci:
     runs-on: ubuntu-latest

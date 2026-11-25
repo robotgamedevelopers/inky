@@ -1,6 +1,6 @@
 # Layer 6: Candidate Machine Measurements, Replay Sweep & Default Knee
 
-Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using the scripted multi-turn replay fixture [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
+Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using the synthetic scripted multi-turn benchmark fixture [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
 
 ## 1. Candidate Machine Measurements
 
@@ -23,11 +23,11 @@ Single-stream prefill & decode (`./target/release/inky bench ... -n 128`, greedy
 
 The M5 Max (`574.0 GB/s` peak weight read) runs ~1.98× the memory bandwidth of M5 Pro (`290.4 GB/s`), giving ~1.46× single-stream decode (`96.02` vs `61.62 tok/s` at 2.5K) and ~1.98× prefill (`4196.2` vs `2122.8 tok/s` at 2.5K).
 
-## 2. Scripted Multi-Turn Replay Set
+## 2. Synthetic Scripted Benchmark Fixture (Not Fleet Traffic)
 
-[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) contains scripted requests and canned tool results representing **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
+[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) is a **synthetic scripted benchmark fixture** containing handcrafted prompts and canned tool results representing **7 multi-turn coding-agent cards** (**22 synthetic turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens in fixture metadata). It is **not** recorded production fleet traffic; real fleet traffic requires authorized captures from `inky serve --record-dir` / [`cardproxy`](../tools/replay/cmd/cardproxy/main.go).
 
-> **Qualification:** This fixture is not verified real fleet traffic. The historical replay mixed streamed and buffered latency, and the reported memory values were admission estimates rather than sampled footprint. These results do not establish a fleet-derived lane knee or the latency and memory limits. Repeat the sweep using authorized real fleet traffic and the corrected replay measurements before setting regression thresholds.
+> **Qualification:** This fixture is synthetic benchmark traffic, not verified real fleet card traffic. The November 24 historical replay mixed streamed and buffered latency, and the reported memory values were static admission estimates rather than sampled footprint/RSS or measured OS headroom. Those historical numbers do not establish a fleet-derived lane knee or verified latency and memory limits. Repeat the M5 Max 64-lane sweep using authorized real fleet traffic and corrected measurements in a dedicated offline M5 Max window before locking fleet regression thresholds.
 
 ## 3. Lane-Count Sweep (`8..128` Lanes on M5 Max 128 GB)
 
@@ -51,7 +51,7 @@ go run . --url http://127.0.0.1:18096 --input ../../tests/replay/recorded_cards.
   --lanes 8,16,32,48,64,96,128 --duration 20s --key-env INKY_SERVE_KEY
 ```
 
-The November 24 runner combined the time to first visible streamed output with the time to receive a complete buffered response. Seven of the fixture's 22 turns were buffered. For example, the original recording of turn 2 of `card-slice-bounds` shows 168 ms to first token and 5,979 ms to completion. The mixed latency percentiles below preserve what the runner reported. The memory column projects the admission budget from `model_bytes + active_lanes × per_lane_worst_case_bytes`.
+The November 24 runner combined the time to first visible streamed output with the time to receive a complete buffered response. Seven of the fixture's 22 turns were buffered. For example, the fixture metadata on turn 2 of `card-slice-bounds` lists 168 ms TTFT and 5,979 ms total. The mixed latency percentiles below preserve what the historical runner reported. The memory column projects the admission budget from `model_bytes + active_lanes × per_lane_worst_case_bytes`.
 
 | lanes | total_tok_s | per_lane_tok_s | mixed_latency_p50_ms | mixed_latency_p95_ms | peak_budget_estimate_bytes | cards_completed | cards_per_hour | errors | retries_429 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -63,7 +63,20 @@ The November 24 runner combined the time to first visible streamed output with t
 | 96 | 368.61 | 3.84 | 5858.4 | 20689.1 | 87,798,524,928 (81.77 GiB) | 96 | 4848.9 | 0 | 0 |
 | 128 | 401.96 | 3.14 | 7020.8 | 25447.6 | 110,613,778,432 (103.02 GiB) | 128 | 5283.9 | 0 | 0 |
 
-## 4. Historical Selection & Default Lane Count
+## 4. Streamed Qualification on M5 Pro 64 GB (`1..16` Lanes, Synthetic Fixture)
+
+Measured on **2026-11-25** on an Apple M5 Pro 64 GB host (`hw.memsize = 68,719,476,736`, Metal working set `51.84 GiB`) against `Inkling-2-Mini-Q4_K_M.gguf` (`--lanes 16 -c 16384 -n 2048 --queue 64 --effort low`, `/health` `model_bytes = 19,378,225,152`, `per_lane_worst_case_bytes = 712,995,904`), replaying [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) with `--force-stream --duration 15s --server-pid <pid> --measure-headroom`:
+
+| lanes | total_tok_s | per_lane_tok_s | ttft_p50_ms | ttft_p95_ms | ttft_samples | peak_memory_bytes (footprint) | peak_rss_bytes (`ps`) | min_headroom_bytes (`vm_stat`) | peak_budget_estimate_bytes | cards_completed | cards_per_hour | errors | retries_429 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 22.75 | 22.75 | 363.3 | 1031.4 | 6 | 26,813,632,256 (24.97 GiB) | 2,139,488,256 (1.99 GiB) | 16,100,753,408 (14.99 GiB) | 20,091,221,056 (18.71 GiB) | 2 | 331.6 | 0 | 0 |
+| 4 | 41.48 | 10.37 | 1331.8 | 2219.0 | 15 | 26,839,158,552 (25.00 GiB) | 2,167,046,144 (2.02 GiB) | 15,915,466,752 (14.82 GiB) | 22,230,208,768 (20.70 GiB) | 5 | 550.6 | 0 | 0 |
+| 8 | 64.99 | 8.12 | 1608.1 | 3249.8 | 25 | 26,869,436,256 (25.02 GiB) | 2,198,274,048 (2.05 GiB) | 10,472,865,792 (9.75 GiB) | 25,082,192,384 (23.36 GiB) | 8 | 877.5 | 0 | 0 |
+| 16 | 126.40 | 7.90 | 1645.2 | 2177.5 | 50 | 26,885,181,328 (25.04 GiB) | 2,210,332,672 (2.06 GiB) | 10,412,605,440 (9.70 GiB) | 30,786,159,616 (28.67 GiB) | 16 | 1650.9 | 0 | 0 |
+
+Across `1..16` lanes on M5 Pro 64 GB, all `6 / 15 / 25 / 50` streamed TTFT samples stayed well below the 20 s ceiling (`2,177.5 ms` p95 at 16 lanes), `errors = 0`, `retries_429 = 0`, sampled `process_footprint_bytes` peaked at `25.04 GiB` (`peak_rss_bytes` at `2.06 GiB`), and independently measured `vm_stat` + `sysctl` headroom stayed at least `9.70 GiB` out of `64.00 GiB`. Because this run uses the synthetic `recorded_cards.jsonl` fixture up to 16 lanes on M5 Pro, the 64-lane M5 Max rerun (`t-audit-replay-capacity-rerun`) and a fleet-derived knee from authorized recorded fleet traffic (`t-au-replay-real`) still require a dedicated offline M5 Max window with real fleet captures.
+
+## 5. Historical Selection & Default Lane Count
 
 The following selection describes the historical fixture run and is not a verified operational knee.
 
@@ -71,7 +84,12 @@ The following selection describes the historical fixture run and is not a verifi
 
 The historical aggregates leave the 20-second p95 TTFT target unverified. On a new sweep, `ttft_samples` counts successful streaming turns with observable output. Only these turns contribute to `ttft_p50_ms` and `ttft_p95_ms`. Buffered turns still count toward completed cards and throughput.
 
-At 64 lanes the budget projection was 60.52 GiB. Actual process footprint and available system memory were unmeasured in this run. With a server exposing `process_footprint_bytes` through `/health`, replay reports the largest sampled process footprint in `peak_memory_bytes` and the largest admission-budget estimate in `peak_budget_estimate_bytes`. Sampling can miss peaks between polls.
+At 64 lanes the budget projection was 60.52 GiB. Actual process footprint, OS RSS, and available system memory were unmeasured in that November 24 run. `tools/replay` now separately reports:
+- `ttft_p50_ms`, `ttft_p95_ms`, and `ttft_samples` from streamed turns with observable output only (with `--force-stream` available when every turn in a mixed fixture should be measured as a stream),
+- `peak_memory_bytes` from `/health` (`process_footprint_bytes`),
+- `peak_rss_bytes` from sampled OS process RSS (`--server-pid` / `ps -o rss= -p <pid>`),
+- `min_headroom_bytes` and `host_memory_bytes` from independently sampled OS memory telemetry (`--measure-headroom` via `vm_stat` + `sysctl hw.memsize` on macOS, or `/proc/meminfo` on Linux), and
+- `peak_budget_estimate_bytes` as the admission-budget upper bound. Sampling can miss peaks between polls.
 
 When `inky serve` starts without `--lanes`, it uses the machine profile. M5 Max 128 GB requests 64 lanes, M5 Pro 64 GB requests 32, and unmatched machines request 64. An explicit `--lanes` overrides the profile. The memory budget can reduce the effective lane count. [Machine profiles](../src/tuning.rs)
 
