@@ -161,17 +161,17 @@
   (:id "t-audit-engine-assistant-parts" :type :task :title "Keep assistant text parts separate in the model prompt" :state :doing
    :evidence ("src/serve.rs" "src/tokenizer.rs" "https://github.com/robotgamedevelopers/inky/pull/90")
    :note "Two text parts in assistant history became one segment. The embedded GGUF Jinja and actual tokenizer produced different prompts. Check the fix against independently rendered token IDs with two parts, empty parts and a following user turn.")
-  (:id "t-audit-engine-convert-complete" :type :task :title "Require complete source and destination tensors" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-convert-complete" :type :task :title "Require complete source and destination tensors" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/main.go")
    :note "PR #74 checks tensor extents at open, exact copying if the source shrinks, and declared output bytes before publication. Linux regression fixtures cover short tensors and a successful conversion with known weights.")
-  (:id "t-audit-engine-convert-publish" :type :task :title "Preserve the previous model if conversion fails" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/mtp.go")
+  (:id "t-audit-engine-convert-publish" :type :task :title "Preserve the previous model if conversion fails" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/gguf.go" "tools/inkconvert/mtp.go")
    :note "PR #74 rejects output aliases of opened inputs and renames a completed sibling file into place. Linux tests cover direct, hard-link and symlink aliases and failure after staging begins for MTP.")
-  (:id "t-audit-engine-convert-row-check" :type :task :title "Reject nonfinite weights and handle zero reference rows" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/formats.go" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-convert-row-check" :type :task :title "Reject nonfinite weights and handle zero reference rows" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/formats.go" "tools/inkconvert/main.go")
    :note "PR #74 makes a nonfinite coordinate fail verification, accepts two zero rows and rejects a nonzero row against a zero reference. The compiled Linux CLI passed all three controls on synthetic native and Q8 GGUF files.")
-  (:id "t-audit-engine-w13-layout" :type :task :title "Reject unrecognized expert row layouts" :state :doing
-   :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/main.go")
+  (:id "t-audit-engine-w13-layout" :type :task :title "Reject unrecognized expert row layouts" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "https://github.com/robotgamedevelopers/inky/pull/74" "tools/inkconvert/main.go")
    :note "A misspelled W13 layout selected stacked rows for the interleaved official checkpoint. PR #74 checks both accepted names, rejects other values before opening model files and tests the gate and up row mappings.")
   (:id "t-audit-engine-native-checkpoint" :type :task :title "Qualify a converted official native checkpoint on M5" :state :todo
    :evidence ("https://github.com/robotgamedevelopers/inky/pull/74" "docs/releases/v0.2.2.md" "tools/inkconvert/main.go" "src/engine.rs")
@@ -194,8 +194,8 @@
   (:id "t-audit-engine-cli-step-status" :type :task :title "Check every CLI Metal step before accepting its result" :state :doing
    :evidence ("src/session.rs" "src/main.rs" "src/metal.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "CLI prefill waited only on the final chunk and decode consumed unchecked results. Exercise failed early and final prefill chunks and both sampled and greedy decode. An error must leave output and chat state consistent for the next turn. The original audit traced this path without injecting a device failure.")
-  (:id "t-audit-engine-cli-utf8" :type :task :title "Preserve valid CLI output after malformed bytes" :state :doing
-   :evidence ("src/session.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
+  (:id "t-audit-engine-cli-utf8" :type :task :title "Preserve valid CLI output after malformed bytes" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "src/session.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/83")
    :note "A malformed leading byte caused the CLI to discard valid following text. Share incremental decoding with serve and flush incomplete sequences at content boundaries and end of stream. Check valid split code points, a malformed prefix followed by valid text, and an incomplete final code point.")
   (:id "t-audit-engine-spec-topk-ties" :type :task :title "Use identical top-k tie handling in direct and draft sampling" :state :doing
    :evidence ("src/sampler.rs" "https://github.com/robotgamedevelopers/inky/pull/86")
@@ -342,11 +342,11 @@
   (:id "t-audit-record-row-cap" :type :task :title "Enforce recording byte limits on individual rows" :state :doing
    :evidence ("src/record.rs" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Check serialized size including the newline before rotating. Count an oversized row as dropped, preserve the active segment, and accept a row exactly at the limit.")
-  (:id "t-audit-replay-knee" :type :task :title "Stop lane recommendations at a failing measured rung" :state :doing
-   :evidence ("tools/replay/knee.go" "tools/replay/main.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-knee" :type :task :title "Stop lane recommendations at a failing measured rung" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/knee.go" "tools/replay/main.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Retain zero-completion rungs during selection. Return no recommendation if the initial rung fails or requested TTFT has no observations. Preserve measurements from a failed sweep.")
-  (:id "t-audit-replay-duration" :type :task :title "Reject negative replay durations before sending traffic" :state :doing
-   :evidence ("tools/replay/main.go" "tools/replay/replay.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-duration" :type :task :title "Reject negative replay durations before sending traffic" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/main.go" "tools/replay/replay.go" "tools/replay/replay_test.go" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "Validate the command-line flag and sweep configuration. Cover a negative duration with a positive card count and verify no requests were issued.")
   (:id "t-audit-replay-completion" :type :task :title "Validate actual replies and terminal usage before crediting a turn" :state :doing
    :evidence ("tools/replay/replay.go" "tools/replay/replay_test.go" "src/serve.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
@@ -405,8 +405,8 @@
   (:id "t-audit-ci-integration-tests" :type :task :title "Include Rust integration tests in hosted debug CI" :state :done
    :evidence ("https://github.com/robotgamedevelopers/inky/commit/062913a5112a04737c89642b66ed4230d05faa72" ".github/workflows/ci.yml" "https://github.com/robotgamedevelopers/inky/pull/75")
    :note "PR #75 adds integration targets to the debug suite so new subprocess or helper-lifecycle tests under tests/ are scheduled alongside binary tests.")
-  (:id "t-audit-replay-line-size" :type :task :title "Read the full range of recorder-supported JSONL rows" :state :doing
-   :evidence ("tools/replay/replay.go" "src/serve.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
+  (:id "t-audit-replay-line-size" :type :task :title "Read the full range of recorder-supported JSONL rows" :state :done
+   :evidence ("https://github.com/robotgamedevelopers/inky/pull/94" "tools/replay/replay.go" "src/serve.rs" "src/record.rs" "https://github.com/robotgamedevelopers/inky/pull/91")
    :note "The loader aborts a replay set at a 16 MiB line, while the server accepts 32 MiB bodies and the recorder defaults to 100 MiB per segment. Read a valid recorded line above 16 MiB and its following turn without silent loss.")
   (:id "t-audit-record-generation-delivery" :type :task :title "Represent generation and delivery outcomes independently" :state :doing
    :evidence ("src/serve.rs" "src/record.rs" "tools/replay/replay.go" "https://github.com/robotgamedevelopers/inky/pull/90")
