@@ -11,8 +11,8 @@
 #   INKY_BIND          Listen address (default: 127.0.0.1:8096)
 #   INKY_LANES         Requested lane count (default: 64, the M5 Max profile default)
 #   INKY_CTX           Context per lane (default: 16384)
-#   INKY_QUEUE         Bounded admission queue depth (default: 64)
-#   INKY_EFFORT        Default reasoning effort (default: medium)
+#   INKY_QUEUE         Bounded admission queue depth (default: 128, matching docs/LANE-SWEEP.md)
+#   INKY_EFFORT        Default reasoning effort (default: low, matching docs/LANE-SWEEP.md)
 #   INKY_MAX_TOKENS    Default reply token budget (default: 8192, must be < INKY_CTX)
 #   INKY_RECORD_CARDS  Set to 1 to record card traffic into <repo>/logs/cards (default: 0, disabled)
 #   INKY_RECORD_DIR    Explicit directory for cards-YYYYMMDD.jsonl (enables recording when non-empty)
@@ -26,8 +26,8 @@ INKY_MODEL=${INKY_MODEL:-$HOME/.lmstudio/models/lmstudio-community/Inkling-2-Min
 INKY_BIND=${INKY_BIND:-127.0.0.1:8096}
 INKY_LANES=${INKY_LANES:-64}
 INKY_CTX=${INKY_CTX:-16384}
-INKY_QUEUE=${INKY_QUEUE:-64}
-INKY_EFFORT=${INKY_EFFORT:-medium}
+INKY_QUEUE=${INKY_QUEUE:-128}
+INKY_EFFORT=${INKY_EFFORT:-low}
 INKY_MAX_TOKENS=${INKY_MAX_TOKENS:-8192}
 INKY_KEY_ENV=${INKY_KEY_ENV:-INKY_SERVE_KEY}
 

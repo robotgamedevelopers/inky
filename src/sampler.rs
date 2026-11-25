@@ -61,7 +61,21 @@ impl Sampler {
         ban: Option<u32>,
         softcap: f32,
     ) -> Result<u32, &'static str> {
-        let total = self.prepare_row(logits, ban, softcap)?;
+        self.sample_next_filtered(logits, ban, softcap, |_| true)
+    }
+
+    /// Sample one model row while masking out both `ban` and any token rejected by `allow(token_id)`
+    /// (for example, byte-level JSON pushdown grammar constraints during active tool-call spans).
+    /// Checks finiteness of all logits first and evaluates `allow` lazily only on record-highs and
+    /// candidates within the 30-nat raw-logit cutoff.
+    pub fn sample_next_filtered<F: FnMut(u32) -> bool>(
+        &mut self,
+        logits: &[f32],
+        ban: Option<u32>,
+        softcap: f32,
+        allow: F,
+    ) -> Result<u32, &'static str> {
+        let total = self.prepare_row_filtered(logits, ban, softcap, allow)?;
         if self.temp < 1e-5 { return Ok(self.cand[0].1); }
         let mut r = self.next_f32() * total;
         let mut last = self.cand[0].1;
@@ -77,13 +91,26 @@ impl Sampler {
     /// Fill `cand` with the masses used for a draw and return their total after the top-p cut.
     /// Both ordinary draws and speculative rejection need the exact same token support.
     fn prepare_row(&mut self, logits: &[f32], ban: Option<u32>, softcap: f32) -> Result<f32, &'static str> {
+        self.prepare_row_filtered(logits, ban, softcap, |_| true)
+    }
+
+    fn prepare_row_filtered<F: FnMut(u32) -> bool>(
+        &mut self,
+        logits: &[f32],
+        ban: Option<u32>,
+        softcap: f32,
+        mut allow: F,
+    ) -> Result<f32, &'static str> {
         if logits.is_empty() { return Err("model returned no logits"); }
         if !self.temp.is_finite() { return Err("invalid sampling temperature"); }
         let mut best: Option<(f32, u32)> = None;
         for (i, &x) in logits.iter().enumerate() {
             if !x.is_finite() { return Err("model returned non-finite logits"); }
-            if Some(i as u32) == ban { continue; }
-            if best.is_none_or(|(b, _)| x > b) { best = Some((x, i as u32)); }
+            let tok = i as u32;
+            if Some(tok) == ban { continue; }
+            if best.is_none_or(|(b, _)| x > b) && allow(tok) {
+                best = Some((x, tok));
+            }
         }
         let Some((best_val, best_tok)) = best else { return Err("no sampling candidates") };
         self.cand.clear();
@@ -114,8 +141,9 @@ impl Sampler {
             f32::NEG_INFINITY
         };
         for (i, &x) in logits.iter().enumerate() {
-            if Some(i as u32) != ban && x >= raw_cut {
-                self.cand.push((x, i as u32));
+            let tok = i as u32;
+            if Some(tok) != ban && x >= raw_cut && (tok == best_tok || allow(tok)) {
+                self.cand.push((x, tok));
             }
         }
         if self.cand.is_empty() {

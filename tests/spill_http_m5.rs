@@ -30,6 +30,16 @@ struct RunningServer {
 
 impl RunningServer {
     fn spawn(bin: &Path, model: &Path, spill_dir: Option<&Path>, pool_slots: &str) -> Self {
+        Self::spawn_with_env(bin, model, spill_dir, pool_slots, &[])
+    }
+
+    fn spawn_with_env(
+        bin: &Path,
+        model: &Path,
+        spill_dir: Option<&Path>,
+        pool_slots: &str,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         let mut cmd = Command::new(bin);
         cmd.arg("serve")
             .arg("--bind")
@@ -48,6 +58,9 @@ impl RunningServer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
         if let Some(dir) = spill_dir {
             cmd.arg("--spill-dir").arg(dir);
         }
@@ -467,5 +480,196 @@ fn m5_http_spill_eviction_restart_branching_and_corrupt_fallback_match_cold() {
     );
 
     spill_srv2.stop();
+    let _ = std::fs::remove_dir_all(&spill_dir);
+}
+
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF model and Apple M5 GPU"]
+fn m5_http_spill_sigkill_mid_write_restart_preserves_exact_outputs() {
+    let bin = std::env::var_os("INKY_BIN")
+        .or_else(|| std::env::var_os("INKY_TEST_BIN"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_inky")));
+    let model = std::env::var_os("INKY_TEST_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf",
+            )
+        });
+    assert!(bin.exists(), "inky binary not found at {}", bin.display());
+    assert!(model.exists(), "model not found at {}", model.display());
+
+    let spill_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("m5-http-spill-sigkill-{}", std::process::id()));
+    let marker_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("m5-http-spill-midwrite-{}.marker", std::process::id()));
+    let _ = std::fs::remove_dir_all(&spill_dir);
+    let _ = std::fs::remove_file(&marker_path);
+    std::fs::create_dir_all(&spill_dir).unwrap();
+
+    let mk_long_doc = |topic: &str| -> String {
+        format!(
+            " Technical subsystem {topic}: each block spans 64 positions; Window blocks hold 40 sliding-window passes over the trailing 1024 tokens while Full blocks hold 8 global attention passes across the full prompt history; start points retain exact recurrent state bytes at periodic and prompt boundaries."
+        )
+        .repeat(22)
+    };
+    let shared_doc_a = mk_long_doc("alpha");
+    let shared_doc_b = mk_long_doc("bravo");
+    let pool_slots = "24,30";
+    let flush_seq = std::sync::atomic::AtomicU64::new(100);
+    let flush_ram = |srv: &RunningServer| {
+        for pass in 0..3 {
+            let id = flush_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ev_msgs = json!([
+                {"role": "system", "content": format!("Unrelated flush workload #{id}-{pass}: orbital catalog indexing.")},
+                {"role": "user", "content": format!("Epoch {id} pass {pass}:{}", " Keplerian elements inclination eccentricity ascending node periapsis anomaly.".repeat(48))}
+            ]);
+            let _ = send_chat_greedy(srv, ev_msgs, 4);
+        }
+        let _ = srv.wait_drained(Duration::from_secs(15));
+    };
+
+    let turn1_a = json!([
+        {"role": "system", "content": "Answer concisely and deterministically."},
+        {"role": "user", "content": format!("{shared_doc_a}\n\nState section alpha-149's checksum.")}
+    ]);
+    let turn2_a = json!([
+        {"role": "system", "content": "Answer concisely and deterministically."},
+        {"role": "user", "content": format!("{shared_doc_a}\n\nState section alpha-149's checksum.")},
+        {"role": "assistant", "content": "Section alpha-149 checksum is 1057."},
+        {"role": "user", "content": "Now compute 1057 + 100 and state only the sum."}
+    ]);
+    let turn1_b = json!([
+        {"role": "system", "content": "Answer concisely and deterministically."},
+        {"role": "user", "content": format!("{shared_doc_b}\n\nState section bravo-149's checksum.")}
+    ]);
+    let turn2_b = json!([
+        {"role": "system", "content": "Answer concisely and deterministically."},
+        {"role": "user", "content": format!("{shared_doc_b}\n\nState section bravo-149's checksum.")},
+        {"role": "assistant", "content": "Section bravo-149 checksum is 1057."},
+        {"role": "user", "content": "Now multiply 1057 by 2 and state only the product."}
+    ]);
+
+    // 1. Cold `--spill-dir`-less reference server.
+    let cold_srv = RunningServer::spawn(&bin, &model, None, pool_slots);
+    let cold_a2 = send_chat_greedy(&cold_srv, turn2_a.clone(), 48);
+    let cold_b2 = send_chat_greedy(&cold_srv, turn2_b.clone(), 48);
+    cold_srv.stop();
+
+    // 2. Server #1: seal and cleanly spill `turn1_a` to SSD so an existing committed checkpoint lives on disk.
+    let srv1 = RunningServer::spawn(&bin, &model, Some(&spill_dir), pool_slots);
+    let _ = send_chat_greedy(&srv1, turn1_a.clone(), 16);
+    flush_ram(&srv1);
+    let h1 = srv1.wait_drained(Duration::from_secs(15));
+    assert!(h1["spill_starts_spilled"].as_u64().unwrap_or(0) >= 1, "expected committed spill on srv1: {h1}");
+    assert!(h1["spill_spilled_starts_indexed"].as_u64().unwrap_or(0) >= 1, "expected indexed spill on srv1: {h1}");
+    srv1.stop();
+
+    // 3. Server #2: pause mid-spill-write while spilling `turn1_b` and deliver `SIGKILL` (`kill -9`)!
+    let mut srv2 = RunningServer::spawn_with_env(
+        &bin,
+        &model,
+        Some(&spill_dir),
+        pool_slots,
+        &[
+            ("INKY_SERVE_ALLOW_FAULT_INJECTION", std::ffi::OsStr::new("1")),
+            ("INKY_TEST_SPILL_PAUSE_MID_WRITE", marker_path.as_os_str()),
+        ],
+    );
+    let _ = send_chat_greedy(&srv2, turn1_b.clone(), 16);
+    let addr2 = srv2.addr;
+    let trigger_thread = std::thread::spawn(move || {
+        for pass in 0..3 {
+            if let Ok(mut stream) = TcpStream::connect_timeout(&addr2, Duration::from_secs(10)) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let body = json!({
+                    "model": "inkling-2-mini",
+                    "messages": [
+                        {"role": "system", "content": format!("Mid-write eviction trigger pass {pass}.")},
+                        {"role": "user", "content": format!("Trigger {pass}:{}", " Bathymetry Rossby waves Ekman transport meridional overturning pycnocline.".repeat(48))}
+                    ],
+                    "temperature": 0.0,
+                    "seed": 42,
+                    "reasoning_effort": "none",
+                    "thinking_budget": 2,
+                    "max_tokens": 4,
+                    "stream": false
+                })
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr2}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.flush();
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+            }
+        }
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
+    while !marker_path.exists() {
+        assert!(Instant::now() < wait_deadline, "timed out waiting for mid-spill-write marker {}", marker_path.display());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Deliver hard SIGKILL (`kill -9`) while the `.tmp` spill block write is mid-flight!
+    srv2.child.kill().expect("SIGKILL inky serve mid-spill-write");
+    let exit_status = srv2.child.wait().expect("wait SIGKILLed inky serve");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_status.signal(), Some(libc::SIGKILL), "expected SIGKILL termination, got {exit_status:?}");
+    }
+    let _ = trigger_thread.join();
+
+    // Verify a partial `.tmp.` file was genuinely stranded in `--spill-dir` by `SIGKILL`.
+    let stranded_tmps: Vec<String> = std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(!stranded_tmps.is_empty(), "expected stranded .tmp file(s) after mid-write SIGKILL in {}", spill_dir.display());
+
+    // 4. Server #3: restart cleanly on `--spill-dir`; verify orphan `.tmp` sweep, surviving `turn2_a`
+    // SSD cache hit, clean cold prefill for unsealed `turn2_b`, and 100% bit-identical outputs!
+    let srv3 = RunningServer::spawn(&bin, &model, Some(&spill_dir), pool_slots);
+    let remaining_tmps: Vec<String> = std::fs::read_dir(&spill_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(remaining_tmps.is_empty(), "startup sweep must remove all stranded .tmp files, found {remaining_tmps:?}");
+    {
+        let stderr_dump = srv3.stderr_lines.lock().unwrap().join("\n");
+        assert!(
+            stderr_dump.contains("swept ") && !stderr_dump.contains("swept 0 orphan"),
+            "expected non-zero orphan sweep log in stderr:\n{stderr_dump}"
+        );
+    }
+
+    let post_kill_a2 = send_chat_greedy(&srv3, turn2_a, 48);
+    assert!(
+        post_kill_a2.cached_tokens >= 1_088,
+        "previously committed checkpoint A must survive mid-write SIGKILL of B (cached={})",
+        post_kill_a2.cached_tokens
+    );
+    assert_eq!(
+        post_kill_a2,
+        ChatResult { cached_tokens: post_kill_a2.cached_tokens, ..cold_a2 },
+        "surviving SSD-restored reply after SIGKILL must match cold reference bit-for-bit"
+    );
+
+    let post_kill_b2 = send_chat_greedy(&srv3, turn2_b, 48);
+    assert_eq!(post_kill_b2.cached_tokens, 0, "interrupted mid-write spill B must lose only cache, never serve partial data");
+    assert_eq!(post_kill_b2, cold_b2, "unsealed prompt B after mid-write SIGKILL must match cold reference bit-for-bit");
+
+    srv3.stop();
+    let _ = std::fs::remove_file(&marker_path);
     let _ = std::fs::remove_dir_all(&spill_dir);
 }

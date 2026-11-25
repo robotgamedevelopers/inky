@@ -152,6 +152,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/serve.rs",
+            "gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
+            ".github/workflows/ci.yml",
+            "serve::tests::gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
+        ),
+        (
+            "src/serve.rs",
             "serve_layer3_three_turn_10k_cached_matches_cold_solo",
             "tests/nightly.sh",
             "serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo",

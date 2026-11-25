@@ -301,6 +301,7 @@ func execute() error {
 	}
 	if err = g.server(ctx, bin, model, dir, 4, 2, func(g *gate) {
 		g.run("concurrent identical tool calls", (*gate).concurrentToolCalls)
+		g.run("JSON grammar constrained high-temperature tool calls", (*gate).toolGrammarConstrainedSampling)
 	}); err != nil {
 		return err
 	}

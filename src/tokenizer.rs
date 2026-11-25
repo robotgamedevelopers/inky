@@ -139,6 +139,8 @@ impl Tokenizer {
         })
     }
 
+    pub fn vocab_len(&self) -> usize { self.id_to_tok.len() }
+
     pub fn is_special(&self, id: u32) -> bool { self.tok_type.get(id as usize) == Some(&3) }
 
     /// Raw bytes of one token (special tokens rendered literally; out-of-range IDs return empty).

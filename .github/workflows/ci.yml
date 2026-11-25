@@ -200,6 +200,11 @@ jobs:
           out=$(cargo test --locked --profile ci --bin inky tokenizer::tests::real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: GGUF embedded chat_template parity with serve prompt renderer
+        run: |
+          out=$(cargo test --locked --profile ci --bin inky serve::tests::gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token: expected 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (pull request set)
         env:
           INKY_BIN: ./target/ci/inky

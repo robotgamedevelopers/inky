@@ -18,6 +18,9 @@ if [[ $mode != list ]]; then
     mkdir -p "$output"
     output=$(cd -- "$output" && pwd)
     [[ -r "$jar" ]] || { echo >&2 "Missing TLC jar: $jar"; exit 1; }
+    if [[ $mode = run ]] && command -v rustc >/dev/null 2>&1; then
+        (cd "$root/.." && rustc --version >/dev/null)
+    fi
 fi
 
 # TLC_ONLY=<modules> runs only the checks of those modules; TLC_EXCEPT=<modules> runs every other check (comma lists).

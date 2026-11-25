@@ -408,6 +408,16 @@ impl SpillStore {
             }
             enable_nocache(&file);
             file.write_all(&header)?;
+            if std::env::var("INKY_SERVE_ALLOW_FAULT_INJECTION").as_deref() == Ok("1") {
+                if let Some(marker) = std::env::var_os("INKY_TEST_SPILL_PAUSE_MID_WRITE") {
+                    let marker_path = Path::new(&marker);
+                    if !marker_path.exists() {
+                        let _ = file.flush();
+                        let _ = fs::write(marker_path, tmp_path.to_string_lossy().as_bytes());
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                }
+            }
             file.write_all(kv_bytes)?;
             if !state_slice.is_empty() {
                 file.write_all(state_slice)?;
