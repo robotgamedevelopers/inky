@@ -269,6 +269,7 @@ fi
 # check-*-traces.sh that trace_scripts does not name fails here rather than going unrun.
 if want traces; then
     [ -f "$root/scripts/check-memmode-traces.sh" ] || { echo 'memmode trace checker missing' >&2; exit 1; }
+    (cd "$root" && rustc --version >/dev/null)
     for f in "$root"/scripts/check-*-traces.sh; do
         t=${f##*/check-}; t=${t%-traces.sh}
         case " $trace_scripts " in
