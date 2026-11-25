@@ -1104,16 +1104,33 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_spans(&cb, &spans, true, false);
-                for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
+                if many {
+                    let gumbels: Vec<crate::engine::GumbelSpan<'_>> = live_sp
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, &(i, p0, t))| {
+                            let l = &lanes[i];
+                            let a = l.job.as_ref().unwrap();
+                            let next_pos = p0 + t;
+                            (next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel())
+                                .then(|| crate::engine::GumbelSpan {
+                                    span_idx: k,
+                                    lane: &l.lane,
+                                    out_index: next_pos,
+                                    seed: a.job.seed,
+                                    pos: next_pos,
+                                    temp: a.job.temp,
+                                    ban_tok: a.think.ban_token(&sp),
+                                })
+                        })
+                        .collect();
+                    eng.encode_gumbel_spans(&cb, &gumbels);
+                } else if let Some(&(i, p0, t)) = live_sp.first() {
                     let l = &lanes[i];
                     let a = l.job.as_ref().unwrap();
                     let next_pos = p0 + t;
                     if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
-                        if many {
-                            eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
-                        } else {
-                            eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
-                        }
+                        eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
                     }
                 }
                 cb.commit();
@@ -1218,14 +1235,27 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode(&cb, &spans, true, false);
-                for (k, &i) in live_dec.iter().enumerate() {
-                    let l = &lanes[i];
-                    let a = l.job.as_ref().unwrap();
-                    if !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
-                        let next_pos = a.n_past + 1;
-                        eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
-                    }
-                }
+                let gumbels: Vec<crate::engine::GumbelSpan<'_>> = live_dec
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &i)| {
+                        let l = &lanes[i];
+                        let a = l.job.as_ref().unwrap();
+                        (!a.job.out.cancelled() && a.sampler.uses_gpu_gumbel()).then(|| {
+                            let next_pos = a.n_past + 1;
+                            crate::engine::GumbelSpan {
+                                span_idx: k,
+                                lane: &l.lane,
+                                out_index: next_pos,
+                                seed: a.job.seed,
+                                pos: next_pos,
+                                temp: a.job.temp,
+                                ban_tok: a.think.ban_token(&sp),
+                            }
+                        })
+                    })
+                    .collect();
+                eng.encode_gumbel_spans(&cb, &gumbels);
                 cb.commit();
                 let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &planner, metrics);
                 if let Err(e) = wait_committed_step(&cb, "decode") {
