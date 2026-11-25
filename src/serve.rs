@@ -23,7 +23,9 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender,
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod block_cache;
 mod timing;
+use block_cache::{effective_pf_target, LaneBlockState, ServeBlockCache};
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
 pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAddr>, pub lanes: usize, pub effort: String, pub max_tokens: usize,
@@ -682,26 +684,41 @@ fn discard_cancelled_jobs(queue: &mut VecDeque<Job>) -> usize {
     before - queue.len()
 }
 
-/// A lane: its stream state on the GPU, the last prompt it prefilled and its convolution state at that prompt's end.
+/// A Layer 3 paged lane: reusable blocked `Lane` on GPU plus its `EntryTree` pin state.
 /// `tick` is the scheduler's logical clock (not wall time): a smaller tick was freed longer ago.
-struct LaneS { lane: Lane, prompt: Vec<u32>, cs_at_prompt: Option<Vec<u8>>, tick: u64, job: Option<Active> }
+struct LaneS { lane: Lane, blocks: LaneBlockState, tick: u64, job: Option<Active> }
 impl LaneS {
-    fn invalidate_prompt(&mut self) {
-        self.prompt.clear();
-        self.cs_at_prompt = None;
-    }
-
-    fn release_job(&mut self, metrics: &Mutex<Counters>, tick_seq: &mut u64) -> Option<Active> {
+    fn release_job(
+        &mut self,
+        eng: &Engine,
+        cache: &mut ServeBlockCache,
+        metrics: &Mutex<Counters>,
+        tick_seq: &mut u64,
+    ) -> Option<Active> {
         let active = self.job.take()?;
+        {
+            let mut pools = eng.block_pool().borrow_mut();
+            let mut tbl = self.lane.block_table().borrow_mut();
+            cache.release_lane(&mut pools, &mut tbl, &mut self.blocks);
+        }
+        eng.on(&self.lane).reset();
         metrics.lock().unwrap_or_else(|e| e.into_inner()).release(Instant::now());
         self.tick = *tick_seq;
         *tick_seq += 1;
         Some(active)
     }
 
-    fn fail(&mut self, message: String, metrics: &Mutex<Counters>, tick_seq: &mut u64) {
-        self.invalidate_prompt();
-        let active = self.release_job(metrics, tick_seq).expect("failed lane must have an active job");
+    fn fail(
+        &mut self,
+        eng: &Engine,
+        cache: &mut ServeBlockCache,
+        message: String,
+        metrics: &Mutex<Counters>,
+        tick_seq: &mut u64,
+    ) {
+        let active = self
+            .release_job(eng, cache, metrics, tick_seq)
+            .expect("failed lane must have an active job");
         let _ = active.job.out.send(Ev::Failed(message));
     }
 }
@@ -728,31 +745,24 @@ impl Active {
     }
 }
 
-/// Tokens two token lists share at their start.
+#[allow(dead_code)]
 fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
 
-/// How much of `request` a lane's kept prompt can supply: the prompt's whole length when the lane holds the
-/// convolution state at that prompt's end and the prompt is a strict prefix of the request, else nothing. A
-/// partial overlap supplies nothing (the state exists only at the prompt's end), and an equal prompt supplies
-/// nothing either, so the suffix to prefill is never empty — the own-lane rule, unchanged.
+#[allow(dead_code)]
 fn reusable_prefix(prompt: &[u32], has_state: bool, request: &[u32]) -> usize {
     let n = shared_prefix(prompt, request);
     if has_state && n == prompt.len() && n < request.len() { n } else { 0 }
 }
 
-/// One lane as admission sees it, in logical time (the unit tests drive this with synthetic ticks: no wall
-/// clock, no sockets, no GPU).
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct LaneCand { prefix: usize, free: bool, copyable: bool, tick: u64 }
 
-/// Where a request starts: lane `dst` runs it, starting from `prefix` tokens supplied by lane `src`.
-/// `src == dst` is the lane's own kept prompt (or a cold start when `prefix` is 0); `src != dst` is a copy.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Admission { dst: usize, src: usize, prefix: usize }
 
-/// Pick the lane for a request and where its prefix comes from. A free lane's own kept prompt comes first
-/// (longest, then least recently freed, as before); only a strictly longer prompt held by a busy but copyable
-/// lane is copied, into the least recently freed lane. A busy lane is never the destination.
+#[allow(dead_code)]
 fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
     let own = cands.iter().enumerate().filter(|(_, c)| c.free)
         .max_by_key(|(_, c)| (c.prefix, std::cmp::Reverse(c.tick)));
@@ -768,17 +778,7 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
     }
 }
 
-/// Copy `src`'s first `n` prefill-written positions into `dst` (the two lanes of one `lanes` slice).
-fn copy_prefix(eng: &Engine, lanes: &mut [LaneS], src: usize, dst: usize, n: usize) {
-    assert!(src != dst && n > 0);
-    let (s, d) = if src < dst { let (a, b) = lanes.split_at_mut(dst); (&a[src], &mut b[0]) }
-                 else { let (a, b) = lanes.split_at_mut(src); (&b[0], &mut a[dst]) };
-    eng.copy_lane_prefix(&s.lane, &d.lane, n);
-}
-
-/// Prefill loads the saved prompt's last `EXT` rows (or its whole history if shorter).
-/// The first decode row that overlaps this range in the ring is `oldest + EXT`.
-/// Serve reserves the full request budget up front, so a ring smaller than `EXT` cannot wrap.
+#[allow(dead_code)]
 fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
 
 fn commit_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
@@ -794,14 +794,43 @@ fn commit_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
     Err(format!("Metal {stage} failed"))
 }
 
-fn fail_step(lanes: &mut [LaneS], affected: impl IntoIterator<Item = usize>, error: String, metrics: &Mutex<Counters>, tick_seq: &mut u64) {
-    for i in affected { lanes[i].fail(error.clone(), metrics, tick_seq); }
+fn fail_step(
+    eng: &Engine,
+    cache: &mut ServeBlockCache,
+    lanes: &mut [LaneS],
+    affected: impl IntoIterator<Item = usize>,
+    error: String,
+    metrics: &Mutex<Counters>,
+    tick_seq: &mut u64,
+) {
+    for i in affected {
+        lanes[i].fail(eng, cache, error.clone(), metrics, tick_seq);
+    }
 }
 
-const SERVE_STEP_MAX_BYPASS: u32 = 4;
+fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCache) {
+    let mut pools = eng.block_pool().borrow_mut();
+    for l in lanes.iter_mut() {
+        l.job = None;
+        let mut tbl = l.lane.block_table().borrow_mut();
+        cache.release_lane(&mut pools, &mut tbl, &mut l.blocks);
+    }
+    cache.shutdown(&mut pools);
+}
+
+const SERVE_STEP_MAX_BYPASS: u32 = 16;
 
 fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Receiver<Job>, active_lanes: Arc<AtomicUsize>, metrics: &Mutex<Counters>) {
-    let mut lanes: Vec<LaneS> = (0..nlanes).enumerate().map(|(i, _)| LaneS { lane: Lane::new(eng), prompt: vec![], cs_at_prompt: None, tick: i as u64, job: None }).collect();
+    let mut lanes: Vec<LaneS> = (0..nlanes)
+        .enumerate()
+        .map(|(i, _)| LaneS {
+            lane: Lane::new_blocked(eng, eng.max_ctx),
+            blocks: LaneBlockState::default(),
+            tick: i as u64,
+            job: None,
+        })
+        .collect();
+    let mut cache = ServeBlockCache::new();
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<Job> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
@@ -811,8 +840,25 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         active_lanes.store(busy_count, Ordering::Relaxed);
         // take new requests: block only when there is nothing to do
         let busy = busy_count > 0;
-        if !busy && queue.is_empty() { match rx.recv() { Ok(j) => queue.push_back(j), Err(_) => return } }
-        loop { match rx.try_recv() { Ok(j) => queue.push_back(j), Err(TryRecvError::Empty) => break, Err(TryRecvError::Disconnected) => return } }
+        if !busy && queue.is_empty() {
+            match rx.recv() {
+                Ok(j) => queue.push_back(j),
+                Err(_) => {
+                    cleanup_scheduler(eng, &mut lanes, &mut cache);
+                    return;
+                }
+            }
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(j) => queue.push_back(j),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    cleanup_scheduler(eng, &mut lanes, &mut cache);
+                    return;
+                }
+            }
+        }
         let dropped = discard_cancelled_jobs(&mut queue);
         if dropped > 0 {
             let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
@@ -820,74 +866,91 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         }
         for (i, lane) in lanes.iter_mut().enumerate() {
             if lane.job.as_ref().is_some_and(|a| a.job.out.cancelled()) && planner.request_cancel(i) {
-                if let Some(a) = lane.release_job(metrics, &mut tick_seq) {
+                if let Some(a) = lane.release_job(eng, &mut cache, metrics, &mut tick_seq) {
                     a.log_cancellation(i);
                 }
             }
         }
-        // admit: a free lane whose kept prompt is the longest prefix of the request, else the least recently freed
-        // lane — started, when a busy lane holds a strictly longer prompt it may still copy, from that lane's
-        // prefill-written prefix and its kept convolution state. Busy lanes may supply a copy at prefill completion
-        // while their cache is in memory. A free lane can restore its saved state until enough decode rows were
-        // written to overwrite the prompt's sliding-window history.
+        // Admit queued jobs onto free Layer 3 lanes with zero-copy prefix matching via EntryTree
+        // + BlockPools, guarded by pool-pressure headroom (always allowing >= 1 active lane).
         while let Some(j) = queue.front() {
-            let cands: Vec<LaneCand> = lanes.iter().map(|l| LaneCand {
-                prefix: reusable_prefix(&l.prompt, l.cs_at_prompt.is_some(), &j.toks),
-                free: l.job.is_none(),
-                copyable: match &l.job { Some(a) => a.n_past == a.pf_end && !eng.on(&l.lane).tier_on(), None => false },
-                tick: l.tick,
-            }).collect();
-            let Some(adm) = choose_lane(&cands) else { break };
-            let j = queue.pop_front().unwrap();
+            let Some(i) = lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.job.is_none())
+                .min_by_key(|(_, l)| l.tick)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
             if j.out.cancelled() {
+                let _ = queue.pop_front();
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 continue;
             }
             if context_over(j.toks.len(), j.max, eng.max_ctx) {
+                let j = queue.pop_front().unwrap();
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, eng.max_ctx)));
                 continue;
             }
-            let timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
-            let i = adm.dst;
-            let start = adm.prefix;
-            if start > 0 && adm.src == i {
-                eng.on(&lanes[i].lane).set_cs(lanes[i].cs_at_prompt.as_ref().unwrap());
-            } else if start > 0 {
-                // cross-lane: forget the destination, make room, copy the source's prefill-written prefix,
-                // then put back the source's kept convolution state (its own state at that prompt's end)
-                let cs = lanes[adm.src].cs_at_prompt.clone().unwrap();
-                let run = eng.on(&lanes[i].lane);
-                run.reset();
-                run.reserve(j.toks.len() + j.max + 2, true);
-                copy_prefix(eng, &mut lanes, adm.src, i, start);
-                eng.on(&lanes[i].lane).set_cs(&cs);
-            } else {
-                eng.on(&lanes[i].lane).reset();
+            let active_now = lanes.iter().filter(|l| l.job.is_some()).count();
+            {
+                let pools = eng.block_pool().borrow();
+                if !cache.can_admit(&pools, active_now, &j.toks, j.max, eng.chunk) {
+                    break;
+                }
             }
-            let run = eng.on(&lanes[i].lane);
-            run.reserve(j.toks.len() + j.max + 2, true);
-            run.set_tokens(0, &j.toks);
+            let j = queue.pop_front().unwrap();
+            let timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
+            let start = {
+                let l = &mut lanes[i];
+                let mut pools = eng.block_pool().borrow_mut();
+                let matched = {
+                    let mut tbl = l.lane.block_table().borrow_mut();
+                    cache.match_and_bind(&mut pools, &mut tbl, &mut l.blocks, &j.toks)
+                };
+                match matched {
+                    Some((matched_at, cs)) => {
+                        eng.on(&l.lane).set_cs(&cs);
+                        matched_at
+                    }
+                    None => {
+                        eng.on(&l.lane).reset();
+                        0
+                    }
+                }
+            };
+            eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
             let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
             // once per request, not per round and not per emitted token
             let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
             let think = ThinkBudget::new(j.thinking_budget);
-            let l = &mut lanes[i];
-            l.invalidate_prompt();
-            l.job = Some(Active { pf_end: j.toks.len(), n_past: start, cached: start, gen: 0, timing, sampler, draft_sampler, think, pending: None, job: j });
+            lanes[i].job = Some(Active {
+                pf_end: j.toks.len(),
+                n_past: start,
+                cached: start,
+                gen: 0,
+                timing,
+                sampler,
+                draft_sampler,
+                think,
+                pending: None,
+                job: j,
+            });
             planner.on_admit(i);
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
         // Starvation-bounded Layer 4 step selection: ceiling >= W, longest-waiting first,
-        // active 1-token decoding lanes, then 64-aligned prefill spans up to eng.chunk.
+        // active 1-token decoding lanes, then 64-aligned prefill spans capped at checkpoint boundaries.
         let runnable = |a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured();
         let step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().map(|l| match &l.job {
             Some(a) => crate::scheduler::ServeLaneInput {
                 runnable: runnable(a),
                 n_past: a.n_past,
-                pf_end: a.pf_end,
+                pf_end: effective_pf_target(a.n_past, a.pf_end),
                 has_pending_decode: a.pending.is_some() && a.n_past < a.pf_end + a.gen,
             },
             None => crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
@@ -895,21 +958,70 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
         let step_plan = planner.plan_and_begin_step(&step_inputs, eng.chunk, 64);
         match step_plan {
             Some(crate::scheduler::ServeStepPlan::Prefill(sp_list)) => {
-                let spans: Vec<Span> = sp_list.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
+                let mut live_sp: Vec<(usize, usize, usize)> = Vec::with_capacity(sp_list.len());
+                let mut exhausted: Vec<(usize, String)> = Vec::new();
+                {
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for &(i, p0, t) in &sp_list {
+                        let mut tbl = lanes[i].lane.block_table().borrow_mut();
+                        match cache.ensure_span_blocks(&mut pools, &mut tbl, p0, t) {
+                            Ok(()) => live_sp.push((i, p0, t)),
+                            Err(err) => exhausted.push((i, err.to_string())),
+                        }
+                    }
+                }
+                for (i, msg) in exhausted {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
+                if live_sp.is_empty() {
+                    let _ = planner.complete_step();
+                    continue;
+                }
+                let spans: Vec<Span> = live_sp.iter().map(|&(i, p0, t)| Span { lane: &lanes[i].lane, p0, t }).collect();
+                let many = spans.len() > 1;
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_spans(&cb, &spans, true, false);
-                let many = spans.len() > 1;
+                for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
+                    let l = &lanes[i];
+                    let a = l.job.as_ref().unwrap();
+                    let next_pos = p0 + t;
+                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                        if many {
+                            eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        } else {
+                            eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        }
+                    }
+                }
                 if let Err(e) = commit_step(&cb, "prefill") {
-                    fail_step(&mut lanes, sp_list.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
+                    fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
-                    for &(i, _, _) in &sp_list { planner.on_finish(i); }
+                    for &(i, _, _) in &live_sp { planner.on_finish(i); }
                     continue;
                 }
                 let elapsed = began.elapsed();
-                metrics.lock().unwrap_or_else(|e| e.into_inner()).input += sp_list.iter().map(|&(_, _, t)| t).sum::<usize>();
-                let mut gpu_pf: Vec<(usize, usize)> = Vec::new();
-                for (k, &(i, p0, t)) in sp_list.iter().enumerate() {
+                {
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for &(i, p0, t) in &live_sp {
+                        let l = &mut lanes[i];
+                        let a = l.job.as_ref().unwrap();
+                        let mut tbl = l.lane.block_table().borrow_mut();
+                        cache.finish_prefill_span(
+                            &mut pools,
+                            &mut tbl,
+                            &mut l.blocks,
+                            &a.job.toks,
+                            p0,
+                            t,
+                            || eng.on(&l.lane).get_cs(),
+                        );
+                    }
+                }
+                metrics.lock().unwrap_or_else(|e| e.into_inner()).input += live_sp.iter().map(|&(_, _, t)| t).sum::<usize>();
+                for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
+
                     let l = &mut lanes[i];
                     let a = l.job.as_mut().unwrap();
                     a.timing.prefill.add(t, elapsed);
@@ -921,18 +1033,17 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     }
                     if a.n_past == a.pf_end {
                         if a.sampler.uses_gpu_gumbel() {
-                            gpu_pf.push((k, i));
+                            let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
+                            a.pending = Some(tok);
                         } else {
                             let lg = if many { eng.span_logits(k) } else { eng.logits() };
                             match a.sampler.sample_next_with_ban(lg, a.think.ban_token(&sp)) {
                                 Ok(tok) => {
                                     let tok = a.think.observe(tok, &sp);
                                     a.pending = Some(tok);
-                                    l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
-                                    l.prompt = a.job.toks.clone();
                                 }
                                 Err(e) => {
-                                    l.fail(e.into(), metrics, &mut tick_seq);
+                                    l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
                                     planner.on_finish(i);
                                 }
                             }
@@ -941,79 +1052,71 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         let _ = planner.request_cancel(i);
                     }
                 }
-                if !gpu_pf.is_empty() {
-                    let gumbel_began = Instant::now();
-                    let gcb = eng.gpu.cmd();
-                    for &(k, i) in &gpu_pf {
-                        let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
-                        if many {
-                            eng.encode_gumbel_span(&gcb, k, &l.lane, a.n_past, a.job.seed, a.n_past, a.job.temp, a.think.ban_token(&sp));
-                        } else {
-                            eng.encode_gumbel_solo(&gcb, &l.lane, a.n_past, a.job.seed, a.n_past, a.job.temp, a.think.ban_token(&sp));
-                        }
-                    }
-                    if let Err(e) = commit_step(&gcb, "gumbel") {
-                        fail_step(&mut lanes, gpu_pf.iter().map(|&(_, i)| i), e, metrics, &mut tick_seq);
-                        let _ = planner.complete_step();
-                        for &(_, i) in &gpu_pf { planner.on_finish(i); }
-                        continue;
-                    }
-                    let gumbel_elapsed = gumbel_began.elapsed();
-                    for &(_, i) in &gpu_pf {
-                        let l = &mut lanes[i];
-                        let a = l.job.as_mut().unwrap();
-                        a.timing.prefill.add(0, gumbel_elapsed);
-                        let tok = a.think.observe(eng.on(&l.lane).token_at(a.n_past), &sp);
-                        a.pending = Some(tok);
-                        l.cs_at_prompt = Some(eng.on(&l.lane).get_cs());
-                        l.prompt = a.job.toks.clone();
-                    }
-                }
                 for cancelled_i in planner.complete_step() {
-                    if let Some(a) = lanes[cancelled_i].release_job(metrics, &mut tick_seq) {
+                    if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                         a.log_cancellation(cancelled_i);
                     }
                 }
             }
             Some(crate::scheduler::ServeStepPlan::Decode(need_dec)) => {
+                let mut live_dec: Vec<usize> = Vec::with_capacity(need_dec.len());
+                let mut exhausted: Vec<(usize, String)> = Vec::new();
+                {
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for &i in &need_dec {
+                        let pos = lanes[i].job.as_ref().unwrap().n_past;
+                        let mut tbl = lanes[i].lane.block_table().borrow_mut();
+                        match cache.ensure_span_blocks(&mut pools, &mut tbl, pos, 1) {
+                            Ok(()) => live_dec.push(i),
+                            Err(err) => exhausted.push((i, err.to_string())),
+                        }
+                    }
+                }
+                for (i, msg) in exhausted {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
+                if live_dec.is_empty() {
+                    let _ = planner.complete_step();
+                    continue;
+                }
                 // feed each lane's pending token at its position
-                for &i in &need_dec { let a = lanes[i].job.as_ref().unwrap(); eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]); }
-                let spans: Vec<Span> = need_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
+                for &i in &live_dec {
+                    let a = lanes[i].job.as_ref().unwrap();
+                    eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
+                }
+                let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode(&cb, &spans, true, false);
+                for (k, &i) in live_dec.iter().enumerate() {
+                    let l = &lanes[i];
+                    let a = l.job.as_ref().unwrap();
+                    if !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                        let next_pos = a.n_past + 1;
+                        eng.encode_gumbel_span(&cb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                    }
+                }
                 if let Err(e) = commit_step(&cb, "decode") {
-                    fail_step(&mut lanes, need_dec.iter().copied(), e, metrics, &mut tick_seq);
+                    fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
-                    for i in need_dec { planner.on_finish(i); }
+                    for i in live_dec { planner.on_finish(i); }
                     continue;
                 }
-                let gpu_dec: Vec<(usize, usize)> = need_dec.iter().enumerate()
-                    .filter(|&(_, &i)| lanes[i].job.as_ref().unwrap().sampler.uses_gpu_gumbel())
-                    .map(|(k, &i)| (k, i))
-                    .collect();
-                if !gpu_dec.is_empty() {
-                    let gcb = eng.gpu.cmd();
-                    for &(k, i) in &gpu_dec {
-                        let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
-                        let next_pos = a.n_past + 1;
-                        eng.encode_gumbel_span(&gcb, k, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
-                    }
-                    if let Err(e) = commit_step(&gcb, "gumbel") {
-                        fail_step(&mut lanes, need_dec.iter().copied(), e, metrics, &mut tick_seq);
-                        let _ = planner.complete_step();
-                        for i in need_dec { planner.on_finish(i); }
-                        continue;
+                {
+                    let mut pools = eng.block_pool().borrow_mut();
+                    for &i in &live_dec {
+                        let l = &mut lanes[i];
+                        let pos = l.job.as_ref().unwrap().n_past;
+                        let mut tbl = l.lane.block_table().borrow_mut();
+                        cache.finish_decode_span(&mut pools, &mut tbl, &mut l.blocks, pos);
                     }
                 }
                 let elapsed = began.elapsed();
-                for (k, &i) in need_dec.iter().enumerate() {
+                for (k, &i) in live_dec.iter().enumerate() {
                     let l = &mut lanes[i];
                     let a = l.job.as_mut().unwrap();
                     a.timing.generation.add(1, elapsed);
-                    let overwritten = decode_overwrites_prompt(a.n_past, a.pf_end);
                     a.n_past += 1;
                     if a.job.out.cancelled() {
                         let _ = planner.request_cancel(i);
@@ -1024,15 +1127,14 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                         match a.sampler.sample_next_with_ban(eng.span_logits(k), a.think.ban_token(&sp)) {
                             Ok(tok) => a.pending = Some(a.think.observe(tok, &sp)),
                             Err(e) => {
-                                l.fail(e.into(), metrics, &mut tick_seq);
+                                l.fail(eng, &mut cache, e.into(), metrics, &mut tick_seq);
                                 planner.on_finish(i);
                             }
                         }
                     }
-                    if overwritten { l.invalidate_prompt(); }
                 }
                 for cancelled_i in planner.complete_step() {
-                    if let Some(a) = lanes[cancelled_i].release_job(metrics, &mut tick_seq) {
+                    if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                         a.log_cancellation(cancelled_i);
                     }
                 }
@@ -1044,7 +1146,10 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                     match rx.recv_timeout(Duration::from_millis(2)) {
                         Ok(job) => queue.push_back(job),
                         Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            cleanup_scheduler(eng, &mut lanes, &mut cache);
+                            return;
+                        }
                     }
                 }
             }
@@ -1068,7 +1173,7 @@ fn scheduler(eng: &Engine, tk: &Tokenizer, sp: Specials, nlanes: usize, rx: Rece
                 else { None }
             };
             if let Some(r) = reason {
-                if let Some(a) = l.release_job(metrics, &mut tick_seq) {
+                if let Some(a) = l.release_job(eng, &mut cache, metrics, &mut tick_seq) {
                     if r == "cancelled" {
                         a.log_cancellation(i);
                         let _ = planner.request_cancel(i);
@@ -2125,12 +2230,13 @@ pub fn serve(o: ServeOpts) {
         eng.gpu.recommended_max_working_set_size(),
         eng.model_and_scratch_bytes(),
         safety_headroom_bytes,
-        eng.per_lane_worst_case_bytes(),
+        eng.per_lane_paged_reserve_bytes(),
         o.lanes,
     );
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
         msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
@@ -2196,6 +2302,12 @@ pub fn serve(o: ServeOpts) {
             gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
             gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
         );
+    }
+    {
+        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
+        let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap()));
+        let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap()));
+        eprintln!("[serve] Layer 3 paged KV pool: {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)");
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, o.ctx, o.effort, effective_queue);
     std::thread::spawn(move || {
@@ -3906,5 +4018,210 @@ mod tests {
             let ip: std::net::IpAddr = addr.parse().unwrap();
             assert!(!is_private_ip(ip), "{addr} should not be classified as private");
         }
+    }
+    #[test] fn paged_lane_budget_and_pool_sizing_for_m5_max_and_m5_pro() {
+        let gib = 1u64 << 30;
+        // Realistic paged per-lane working reserve at -c 131072 uses min(131072, 32768) KV tokens (~1.22 GiB).
+        let per_lane_128k = Engine::lane_worst_case_bytes_for(40, 8, 32768, 2, 16_000_000)
+            + ((131072 - 32768) * 4) as u64
+            + (131072usize.div_ceil(64) * 16) as u64;
+        // M5 Max 128GB: ~100 GiB working set, ~17 GiB model+scratch, ~4 GiB margin -> ~79 GiB KV budget.
+        let m5_max = MemoryBudget::compute(100 * gib, 17 * gib, 4 * gib, per_lane_128k, 32);
+        assert_eq!(m5_max.max_admitted_lanes, 32, "M5 Max 128GB must admit all 32 lanes at -c 131072");
+        let (max_win, max_full) = Engine::serve_block_pool_counts(m5_max.available_kv_budget_bytes, 2, 4096, 32, 64 * gib);
+        assert!(max_win >= 32 * crate::blocks::span_bound(4096) + 256, "M5 Max window pool must cover 32 lanes + 256 retained starts");
+        assert!(max_full >= 20_000, "M5 Max full pool must retain >1.2M tokens of full KV");
+
+        // M5 Pro 64GB: ~48 GiB working set, ~17 GiB model+scratch, ~4 GiB margin -> ~27 GiB KV budget.
+        let m5_pro = MemoryBudget::compute(48 * gib, 17 * gib, 4 * gib, per_lane_128k, 16);
+        assert_eq!(m5_pro.max_admitted_lanes, 16, "M5 Pro 64GB must admit all 16 lanes at -c 131072");
+        let (pro_win, pro_full) = Engine::serve_block_pool_counts(m5_pro.available_kv_budget_bytes, 2, 4096, 16, 32 * gib);
+        assert!(pro_win >= 1000 && pro_full >= 6000, "M5 Pro pools must stay balanced: win={pro_win}, full={pro_full}");
+        let pro_total = (pro_win as u64) * crate::blocks::stride_at(crate::blocks::BlockKind::Window, 2).unwrap()
+            + (pro_full as u64) * crate::blocks::stride_at(crate::blocks::BlockKind::Full, 2).unwrap();
+        assert!(pro_total <= m5_pro.available_kv_budget_bytes, "pool allocation must never exceed available KV budget");
+    }
+
+    /// End-to-end Metal GPU integration test: 3-turn 10,000+-token conversation (>= EXT = 1024)
+    /// through `serve::scheduler` verifies `cached >= 9,900` on Turn 2 & Turn 3 AND exact
+    /// token-for-token greedy parity with cold uncached Layer 2 solo execution.
+    #[test]
+    #[ignore = "requires local Inkling-2-Mini GGUF model on Metal GPU"]
+    fn serve_layer3_three_turn_10k_cached_matches_cold_solo() {
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
+            "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf".to_string()
+        });
+        assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
+
+        let ctx = 16384usize;
+        let n_gen = 16usize;
+        let eng = Engine::load(&model, ctx);
+        eng.ensure_batch(eng.chunk);
+        eng.ensure_dbatch(4);
+        // 4 GiB pool is plenty for 10k-token 3-turn test while launching instantaneously.
+        let (w_slots, f_slots) = eng.init_serve_block_pools(4u64 << 30, 4);
+        assert!(w_slots >= 64 && f_slots >= 512, "unexpected pool sizing: win={w_slots} full={f_slots}");
+
+        let tk = Tokenizer::load(&eng.g);
+        let sp = Specials {
+            msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"),
+            msg_system: special(&tk, "<|message_system|>"), msg_tool: special(&tk, "<|message_tool|>"),
+            c_text: special(&tk, "<|content_text|>"), c_think: special(&tk, "<|content_thinking|>"),
+            c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"),
+            end: special(&tk, "<|end_message|>"), end_sampling: special(&tk, "<|content_model_end_sampling|>"),
+        };
+
+        // Build a deterministic 10,050-token Turn 1 prompt (> 9x EXT = 1024) from valid token IDs.
+        let base_text = "You are a helpful software engineering assistant. Analyze the following repository architecture, invariants, and performance constraints carefully. ";
+        let base_toks = tk.encode(base_text, false);
+        let mut turn1: Vec<u32> = vec![sp.msg_system, sp.c_text];
+        while turn1.len() < 10_040 {
+            turn1.extend_from_slice(&base_toks);
+        }
+        turn1.truncate(10_040);
+        turn1.extend_from_slice(&[sp.end, sp.msg_user, sp.c_text]);
+        turn1.extend_from_slice(&tk.encode("Summarize step one in one sentence.", false));
+        turn1.extend_from_slice(&[sp.end, sp.msg_model, sp.c_text]);
+        assert!(turn1.len() >= 10_045, "turn1 len={}", turn1.len());
+
+        // Helper: run one prompt cold on Layer 2 solo (`Lane::new(&eng)`) with greedy argmax.
+        let run_cold_l2 = |toks: &[u32]| -> Vec<u32> {
+            let lane = Lane::new(&eng);
+            let run = eng.on(&lane);
+            run.reserve(toks.len() + n_gen + 2, true);
+            run.set_tokens(0, toks);
+            let mut p = 0;
+            while p < toks.len() {
+                let c = eng.chunk.min(toks.len() - p);
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, &[Span { lane: &lane, p0: p, t: c }], true, false);
+                cb.commit();
+                cb.waitUntilCompleted();
+                p += c;
+            }
+            let mut sampler = Sampler::new(0.0, 0, 1.0, eng.softcap, 1);
+            let stop = [tk.eos, sp.end_sampling];
+            let mut out = Vec::new();
+            let mut tok = sampler.sample_next_with_ban(eng.logits(), None).unwrap();
+            out.push(tok);
+            let mut n_past = toks.len();
+            while out.len() < n_gen && !stop.contains(&tok) {
+                run.set_tokens(n_past, &[tok]);
+                let cb = eng.gpu.cmd();
+                eng.encode_decode(&cb, &[Span { lane: &lane, p0: n_past, t: 1 }], true, false);
+                cb.commit();
+                cb.waitUntilCompleted();
+                n_past += 1;
+                tok = sampler.sample_next_with_ban(eng.span_logits(0), None).unwrap();
+                out.push(tok);
+            }
+            out
+        };
+
+        // Run 3 turns through the real Layer 3 `serve::scheduler`!
+        let (jtx, jrx) = channel::<Job>();
+        let active_lanes = Arc::new(AtomicUsize::new(0));
+        let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
+        let turn2_suffix = tk.encode("Now give step two concisely, covering block table indexing, sliding-window expiration across 1024 tokens, recurrent convolution state restoration, and exact LRU start-point eviction under pool pressure so that this turn crosses at least one full 64-token block boundary.", false);
+        let turn3_suffix = tk.encode("Finally summarize step three.", false);
+        let turn1_for_client = turn1.clone();
+        let client = std::thread::spawn(move || {
+            let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
+            let send_turn = |seq: u64, prompt: Vec<u32>| -> (Vec<u32>, usize, usize) {
+                let (out, events) = job_events();
+                let job = Job {
+                    seq,
+                    toks: prompt,
+                    max: n_gen,
+                    temp: 0.0,
+                    top_k: 0,
+                    top_p: 1.0,
+                    seed: 1,
+                    thinking_budget: 0,
+                    queued_at: Instant::now(),
+                    out,
+                    _permit: admission.try_acquire().unwrap(),
+                };
+                jtx.send(job).unwrap();
+                let mut toks = Vec::new();
+                loop {
+                    match events.recv_timeout(Duration::from_secs(120)).unwrap() {
+                        Ev::Tok(t) => toks.push(t),
+                        Ev::Alive => {}
+                        Ev::Done { prompt, cached, .. } => return (toks, prompt, cached),
+                        Ev::Err(e) | Ev::Failed(e) => panic!("turn {seq} failed: {e}"),
+                    }
+                }
+            };
+
+            let (t1_out, t1_pf, t1_cached) = send_turn(1, turn1_for_client.clone());
+            assert_eq!(t1_cached, 0, "Turn 1 cold prompt should have cached == 0");
+
+            let mut turn2 = turn1_for_client.clone();
+            turn2.extend_from_slice(&t1_out);
+            turn2.extend_from_slice(&[sp.end, sp.msg_user, sp.c_text]);
+            turn2.extend_from_slice(&turn2_suffix);
+            turn2.extend_from_slice(&[sp.end, sp.msg_model, sp.c_text]);
+            let (t2_out, t2_pf, t2_cached) = send_turn(2, turn2.clone());
+
+            let mut turn3 = turn2.clone();
+            turn3.extend_from_slice(&t2_out);
+            turn3.extend_from_slice(&[sp.end, sp.msg_user, sp.c_text]);
+            turn3.extend_from_slice(&turn3_suffix);
+            turn3.extend_from_slice(&[sp.end, sp.msg_model, sp.c_text]);
+            let (t3_out, t3_pf, t3_cached) = send_turn(3, turn3.clone());
+
+            drop(jtx);
+
+            eprintln!(
+                "[test 3-turn 10k] T1 prompt={t1_pf} cached={t1_cached} gen={}; T2 prompt={t2_pf} cached={t2_cached} gen={}; T3 prompt={t3_pf} cached={t3_cached} gen={}",
+                t1_out.len(), t2_out.len(), t3_out.len()
+            );
+            assert!(t2_cached >= 9_900, "Turn 2 cached {} < 9900 (prompt={t2_pf})", t2_cached);
+            assert!(t3_cached >= 9_900, "Turn 3 cached {} < 9900 (prompt={t3_pf})", t3_cached);
+            assert!(t3_cached > t2_cached, "Turn 3 cached {t3_cached} should advance past Turn 2 cached {t2_cached}");
+
+            (turn2, turn3, t1_out, t2_out, t3_out)
+        });
+
+        scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics);
+        let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
+
+        // Compare all 3 turns token-for-token against cold uncached Layer 2 solo!
+        let cold1 = run_cold_l2(&turn1);
+        let cold2 = run_cold_l2(&turn2);
+        let cold3 = run_cold_l2(&turn3);
+        assert_eq!(t1_out, cold1, "Turn 1 greedy tokens must match cold uncached solo token-for-token");
+        assert_eq!(t2_out, cold2, "Turn 2 cached greedy tokens must match cold uncached solo token-for-token");
+        assert_eq!(t3_out, cold3, "Turn 3 cached greedy tokens must match cold uncached solo token-for-token");
+    }
+
+
+    #[test] fn serve_step_max_bypass_bursts_sixteen_decodes_before_prefill() {
+        assert_eq!(SERVE_STEP_MAX_BYPASS, 16);
+        let mut planner = crate::scheduler::ServeStepPlanner::new(2, SERVE_STEP_MAX_BYPASS);
+        planner.on_admit(0);
+        planner.on_admit(1);
+        let mut dec_pos = 64usize;
+        for step in 1..=SERVE_STEP_MAX_BYPASS {
+            let inputs = [
+                crate::scheduler::ServeLaneInput { runnable: true, n_past: dec_pos, pf_end: 64, has_pending_decode: true },
+                crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: 4096, has_pending_decode: false },
+            ];
+            let plan = planner.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+            assert_eq!(plan, crate::scheduler::ServeStepPlan::Decode(vec![0]));
+            assert_eq!(planner.wait_ticks(1), step);
+            dec_pos += 1;
+            assert!(planner.complete_step().is_empty());
+        }
+        let inputs = [
+            crate::scheduler::ServeLaneInput { runnable: true, n_past: dec_pos, pf_end: 64, has_pending_decode: true },
+            crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: 4096, has_pending_decode: false },
+        ];
+        let plan = planner.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, crate::scheduler::ServeStepPlan::Prefill(vec![(1, 0, 4096)]));
+        assert_eq!(planner.wait_ticks(1), 0);
+        assert_eq!(planner.wait_ticks(0), 1);
+        assert!(planner.complete_step().is_empty());
     }
 }

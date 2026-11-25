@@ -233,6 +233,33 @@ impl<B: Copy> PrefixTree<B> {
         self.node(id).map(|n| n.handle)
     }
 
+    /// Replace a live block's stored handle in place (e.g. refreshing a stale window entry
+    /// without removing descendants or breaking active start points).
+    pub fn set_handle(&mut self, id: SealedId, handle: B) -> bool {
+        match self.node_mut(id) {
+            Some(n) => { n.handle = handle; true }
+            None => false,
+        }
+    }
+
+    /// Remove `id` and any ancestors that have no children, no start holders, and no active pins.
+    pub fn prune_unreferenced(&mut self, mut id: SealedId) -> usize {
+        let mut removed = 0usize;
+        while let Some(n) = self.node(id) {
+            if !n.children.is_empty() || n.starts > 0 || n.pins > 0 {
+                break;
+            }
+            let parent = n.parent;
+            self.remove(id);
+            removed += 1;
+            match parent {
+                Some(p) => id = p,
+                None => break,
+            }
+        }
+        removed
+    }
+
     /// Drop one holder of a start point. Returns false when the id names
     /// no block here or the point had no holder left; an evicted block
     /// and a drained point are the same `false`, so a caller that must
