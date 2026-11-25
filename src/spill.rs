@@ -15,7 +15,7 @@
 //!    `ReserveError::WouldBlock` with zero mutations and zero partial reads.
 //! 3. **Crash-safe checksummed format (`kill -9` gate)**: every spilled block
 //!    (K/V bytes + optional start-point recurrent state) carries a fixed 80-byte
-//!    header (`magic`, `version`, `block_kind`, `block_id`, `generation`,
+//!    header (`magic`, `version`, `block_kind`, `kvb`, `block_id`, `generation`,
 //!    `kv_len`, `state_len`, and SHA-256 over `header[0..48] || kv || state`).
 //!    Writes go to `<name>.tmp.<pid>.<nonce>` (`0600`, `O_NOFOLLOW`), `fsync`,
 //!    atomic `rename` to `<name>.blk`, and directory `fsync`. Startup sweeps
@@ -56,9 +56,9 @@ pub const MAX_KV_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// Fixed 8-byte file magic for spilled block files.
 pub const SPILL_MAGIC: [u8; 8] = *b"INKYSPIL";
 /// Binary on-disk format version.
-pub const SPILL_FORMAT_VERSION: u32 = 1;
+pub const SPILL_FORMAT_VERSION: u32 = 2;
 /// Fixed header length in bytes:
-/// magic(8) + version(4) + kind(4) + block_id(8) + generation(8) + kv_len(8) + state_len(8) + sha256(32).
+/// magic(8) + version(4) + kind(2) + kvb(2) + block_id(8) + generation(8) + kv_len(8) + state_len(8) + sha256(32).
 pub const SPILL_HEADER_LEN: usize = 80;
 const HEADER_PREFIX_LEN: usize = 48;
 
@@ -318,6 +318,7 @@ pub struct ResidentSlot {
 pub enum SpillError {
     Io(io::Error),
     InvalidDir(String),
+    InvalidKvb(u32),
     Pool(String),
     InvalidLength { expected: usize, got: usize },
     PayloadTooLarge(usize),
@@ -328,6 +329,7 @@ impl fmt::Display for SpillError {
         match self {
             Self::Io(e) => write!(f, "spill I/O error: {e}"),
             Self::InvalidDir(s) => write!(f, "invalid spill directory: {s}"),
+            Self::InvalidKvb(kvb) => write!(f, "invalid kvb {kvb}: expected 1 (--kv8) or 2 (fp16)"),
             Self::Pool(s) => write!(f, "pool error: {s}"),
             Self::InvalidLength { expected, got } => {
                 write!(f, "payload length mismatch: expected {expected}, got {got}")
@@ -352,6 +354,7 @@ pub enum MissReason {
     BadMagic,
     UnsupportedVersion,
     BadBlockKind,
+    KvbMismatch,
     MetadataMismatch,
     LengthMismatch,
     SizeMismatch,
@@ -667,6 +670,7 @@ pub struct SpillStore {
     max_bytes: u64,
     used_bytes: u64,
     lru_clock: u64,
+    kvb: u32,
     entries: HashMap<SpillKey, DiskEntry>,
     stats: SpillStoreStats,
 }
@@ -716,6 +720,7 @@ fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<(
 
 fn encode_header(
     key: SpillKey,
+    kvb: u32,
     generation: u64,
     kv_bytes: &[u8],
     recurrent_state: Option<&[u8]>,
@@ -724,7 +729,8 @@ fn encode_header(
     let mut header = [0u8; SPILL_HEADER_LEN];
     header[0..8].copy_from_slice(&SPILL_MAGIC);
     header[8..12].copy_from_slice(&SPILL_FORMAT_VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&(key.kind as u32).to_le_bytes());
+    header[12..14].copy_from_slice(&(key.kind as u16).to_le_bytes());
+    header[14..16].copy_from_slice(&(kvb as u16).to_le_bytes());
     header[16..24].copy_from_slice(&key.id.to_le_bytes());
     header[24..32].copy_from_slice(&generation.to_le_bytes());
     header[32..40].copy_from_slice(&(kv_bytes.len() as u64).to_le_bytes());
@@ -743,8 +749,16 @@ fn encode_header(
 
 impl SpillStore {
     /// Prepare `--spill-dir` (mode `0700` on Unix), sweep orphan `.tmp.*` files,
-    /// index surviving `.blk` files, and enforce `max_bytes` via LRU disk GC.
+    /// index surviving `.blk` files, and enforce `max_bytes` via LRU disk GC (default fp16 `kvb = 2`).
     pub fn open(dir: impl AsRef<Path>, max_bytes: u64) -> Result<Self, SpillError> {
+        Self::open_with_kvb(dir, max_bytes, 2)
+    }
+
+    /// Prepare `--spill-dir` with an explicit KV element width `kvb` (`1` for `--kv8`, `2` for fp16).
+    pub fn open_with_kvb(dir: impl AsRef<Path>, max_bytes: u64, kvb: u32) -> Result<Self, SpillError> {
+        if kvb != 1 && kvb != 2 {
+            return Err(SpillError::InvalidKvb(kvb));
+        }
         let dir = dir.as_ref().to_path_buf();
         prepare_spill_dir(&dir)?;
 
@@ -753,11 +767,16 @@ impl SpillStore {
             max_bytes,
             used_bytes: 0,
             lru_clock: 0,
+            kvb,
             entries: HashMap::new(),
             stats: SpillStoreStats::default(),
         };
         store.scan_and_sweep()?;
         Ok(store)
+    }
+
+    pub fn kvb(&self) -> u32 {
+        self.kvb
     }
 
     pub fn dir(&self) -> &Path {
@@ -925,7 +944,7 @@ impl SpillStore {
             return Ok((WriteOutcome::OverBudget, evicted));
         }
 
-        let header = encode_header(key, generation, kv_bytes, recurrent_state);
+        let header = encode_header(key, self.kvb, generation, kv_bytes, recurrent_state);
         let pid = std::process::id();
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let tmp_path = self.dir.join(key.tmp_filename(pid, nonce));
@@ -1042,11 +1061,16 @@ impl SpillStore {
             self.drop_corrupt(key);
             return ReadOutcome::Miss(MissReason::UnsupportedVersion);
         }
-        let raw_kind = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let raw_kind = u32::from(u16::from_le_bytes(header[12..14].try_into().unwrap()));
         let Some(kind) = SpillBlockKind::from_u32(raw_kind) else {
             self.drop_corrupt(key);
             return ReadOutcome::Miss(MissReason::BadBlockKind);
         };
+        let file_kvb = u32::from(u16::from_le_bytes(header[14..16].try_into().unwrap()));
+        if file_kvb != self.kvb {
+            self.drop_corrupt(key);
+            return ReadOutcome::Miss(MissReason::KvbMismatch);
+        }
         let block_id = u64::from_le_bytes(header[16..24].try_into().unwrap());
         if kind != key.kind || block_id != key.id {
             self.drop_corrupt(key);
@@ -2517,6 +2541,7 @@ mod tests {
             (0usize, MissReason::BadMagic),
             (8, MissReason::UnsupportedVersion),
             (12, MissReason::BadBlockKind),
+            (14, MissReason::KvbMismatch),
             (16, MissReason::MetadataMismatch),
             (24, MissReason::ChecksumMismatch), // generation bit-flip
             (48, MissReason::ChecksumMismatch), // sha256 byte flip
@@ -2929,5 +2954,56 @@ mod tests {
             }
             ReadOutcome::Miss(r) => panic!("expected full-scale hit, got {r:?}"),
         }
+    }
+
+    #[test]
+    fn kvb_mismatch_between_kv8_and_fp16_is_rejected_without_exposing_bytes() {
+        let scratch = ScratchTestDir::new("kvb-mismatch");
+        let dir = scratch.path().join("spill");
+
+        // Reject invalid kvb widths at open time.
+        assert!(matches!(SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 0), Err(SpillError::InvalidKvb(0))));
+        assert!(matches!(SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 3), Err(SpillError::InvalidKvb(3))));
+
+        let kv_len = 4096usize;
+        let cs_len = 256usize;
+        let k_kv8 = SpillKey::full(77);
+        let k_cs_kv8 = SpillKey::full(78);
+
+        // 1. Write K/V and recurrent-state-only blocks from a --kv8 (kvb=1) server.
+        {
+            let mut kv8_store = SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 1).unwrap();
+            assert_eq!(kv8_store.kvb(), 1);
+            kv8_store
+                .write_block(k_kv8, 1, &deterministic_kv(k_kv8, kv_len), None, &HashSet::new())
+                .unwrap();
+            kv8_store
+                .write_block(k_cs_kv8, 1, &[], Some(&deterministic_state(k_cs_kv8, cs_len)), &HashSet::new())
+                .unwrap();
+            assert!(matches!(kv8_store.read_block(k_kv8, Some(kv_len)), ReadOutcome::Hit(_)));
+            assert!(matches!(kv8_store.read_block(k_cs_kv8, Some(0)), ReadOutcome::Hit(_)));
+        }
+
+        // 2. Reopen as fp16 (kvb=2): must reject BOTH K/V and state-only blocks even if expected_kv_len is None/0!
+        {
+            let mut fp16_store = SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 2).unwrap();
+            assert_eq!(fp16_store.kvb(), 2);
+            assert_eq!(fp16_store.read_block(k_kv8, None), ReadOutcome::Miss(MissReason::KvbMismatch));
+            assert!(!fp16_store.block_path(k_kv8).exists());
+            assert_eq!(fp16_store.read_block(k_cs_kv8, Some(0)), ReadOutcome::Miss(MissReason::KvbMismatch));
+            assert!(!fp16_store.block_path(k_cs_kv8).exists());
+
+            // Write an fp16 block (kvb=2) now.
+            let k_fp16 = SpillKey::window(88);
+            fp16_store
+                .write_block(k_fp16, 2, &deterministic_kv(k_fp16, kv_len), None, &HashSet::new())
+                .unwrap();
+        }
+
+        // 3. Reopen as --kv8 (kvb=1): must reject the fp16 block!
+        let mut kv8_store = SpillStore::open_with_kvb(&dir, 64 * 1024 * 1024, 1).unwrap();
+        let k_fp16 = SpillKey::window(88);
+        assert_eq!(kv8_store.read_block(k_fp16, Some(kv_len)), ReadOutcome::Miss(MissReason::KvbMismatch));
+        assert!(!kv8_store.block_path(k_fp16).exists());
     }
 }
