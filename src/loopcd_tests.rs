@@ -108,18 +108,18 @@ fn loopcd_model_first_token_and_mixed_lanes() {
     final_row(&[&solo], &[0.0]);
     let solo_row = eng.span_logits(0).to_vec();
     final_row(&[&disabled, &enabled], &[0.0, OMEGA]);
-    assert!(same_row(eng.span_logits(0), &solo_row), "neighbor changed disabled logits");
-    assert!(differs_from_plain(eng.span_logits(1), &solo_row, eng.softcap));
-    assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
-    assert_eq!(eng.effective_sampler_softcap(1), 0.0);
+    assert!(same_row(eng.span_logits(0), &solo_row), "LoopCD paged weak pass changed strong logits or state: disabled row");
     let pools = eng.block_pool().borrow();
     for lane in [&disabled, &enabled] {
-        assert!(eng.on(lane).get_cs() == eng.on(&solo).get_cs(), "recurrent state changed");
+        assert!(eng.on(lane).get_cs() == eng.on(&solo).get_cs(), "LoopCD paged weak pass changed strong logits or state: recurrent state");
         for kind in [BlockKind::Full, BlockKind::Window] {
             let slot_at = |l: &Lane| l.block_table().borrow().get(kind, BlockIndex::new(0)).unwrap().unwrap().slot();
             let pool = pools.of(kind);
             assert!(pool.slot_bytes(slot_at(lane)).unwrap() == pool.slot_bytes(slot_at(&solo)).unwrap(),
-                    "{kind:?} cache changed");
+                    "LoopCD paged weak pass changed strong logits or state: {kind:?} cache");
         }
     }
+    assert!(differs_from_plain(eng.span_logits(1), &solo_row, eng.softcap));
+    assert_eq!(eng.effective_sampler_softcap(0), eng.softcap);
+    assert_eq!(eng.effective_sampler_softcap(1), 0.0);
 }

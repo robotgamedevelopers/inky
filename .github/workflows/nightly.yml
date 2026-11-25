@@ -88,7 +88,7 @@ jobs:
         run: cargo test --locked --release router_handles_nonfinite_scores -- --ignored
       - name: LoopCD model and mixed-lane regressions
         if: ${{ !cancelled() }}
-        run: cargo test --locked --release loopcd_ -- --ignored --test-threads=1
+        run: tests/loopcd-gate.sh
       - name: GPU gates (full set)
         if: ${{ !cancelled() }}
         run: tests/ci.sh full

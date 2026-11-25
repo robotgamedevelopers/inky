@@ -2691,6 +2691,8 @@ impl Engine {
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
         let mut lg_weak_buf: Option<Buf> = None;
+        // The test binary can plant a weak-pass state write to verify the model gate.
+        let dry_weak_state = !cfg!(test) || std::env::var_os("INKY_TEST_LOOPCD_WRITE_WEAK_STATE").is_none();
         for pass in 0..N_PASS {
             if pass > 0 { cur = prelude; blocks = prelude_blocks.clone(); }
             let msg = if pass > 0 { Some(bank) } else { None };
@@ -2704,7 +2706,7 @@ impl Engine {
                 let mut blocks_w = blocks.clone();
                 let pinned_w = [prelude, bank.0, bank.1];
                 for ip in LOOP_END..N_PHYS {
-                    cur_w = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, 0, true);
+                    cur_w = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur_w, &mut blocks_w, None, &mut va, &pinned_w, 0, dry_weak_state);
                 }
                 let n = spans.len();
                 let st_w: Vec<u32> = blocks_w.iter().map(|&v| b.vec(v)).chain(std::iter::once(b.vec(cur_w))).collect();
