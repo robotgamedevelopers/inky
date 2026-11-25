@@ -11,10 +11,14 @@ verify the selected source of each. [GitHub ruleset options](https://docs.github
 | --- | --- | --- |
 | `unit` | GitHub Actions | CPU tests on a hosted Mac |
 | `go` | GitHub Actions | Go tests on hosted Linux |
+| `tla (memmode)` | GitHub Actions | Memory-mode models |
+| `tla (blocks)` | GitHub Actions | Block models |
+| `tla (grouped)` | GitHub Actions | Grouped models |
+| `tla (traces)` | GitHub Actions | Trace checks |
 | `m5-reviewed` | Dedicated Inky M5 App | Both the GPU and serving gates on M5 |
 
-During the [M5 migration](CI-TRUST.md), set up the ruleset with `unit` and
-`go` first. Add the last required context only after smoke-testing a genuine
+During the [M5 migration](CI-TRUST.md), switch the required contexts to
+the hosted jobs for the cutover. Add the last required context only after smoke-testing a genuine
 passing `m5-reviewed` on a ready, current PR. GitHub treats skipped native
 jobs as successful required checks. The individual main-push `m5-gpu`
 and `m5-serve` jobs therefore remain release checks, and the App receipt
