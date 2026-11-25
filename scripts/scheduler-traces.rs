@@ -120,6 +120,7 @@ fn targeted_edge_trace(cfg: SchedulerConfig) -> SchedulerTrace {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let out_dir = Path::new(args.get(1).map(String::as_str).unwrap_or("."));
+    let mode = args.get(2).map(String::as_str).unwrap_or("all");
     let cfg = trace_cfg();
 
     let mut traces = Vec::new();
@@ -132,17 +133,19 @@ fn main() {
     let mut total_refuse = 0usize;
     let mut total_finished = 0usize;
 
-    for seed in 0..12u64 {
-        let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 140)
-            .unwrap_or_else(|e| panic!("walk seed {seed} failed: {e}"));
-        total_steps += trace.steps.len();
-        total_cancel += stats.cancel_in_step;
-        total_step_bypass += stats.step_bypasses;
-        total_admit_bypass += stats.admit_bypasses;
-        total_refuse += stats.refused_429;
-        total_finished += stats.finished;
-        if trace.steps.len() >= 2 {
-            traces.push(trace);
+    if mode != "mutant" {
+        for seed in 0..12u64 {
+            let (trace, stats) = walk_scheduler_trace(cfg.clone(), seed, 140)
+                .unwrap_or_else(|e| panic!("walk seed {seed} failed: {e}"));
+            total_steps += trace.steps.len();
+            total_cancel += stats.cancel_in_step;
+            total_step_bypass += stats.step_bypasses;
+            total_admit_bypass += stats.admit_bypasses;
+            total_refuse += stats.refused_429;
+            total_finished += stats.finished;
+            if trace.steps.len() >= 2 {
+                traces.push(trace);
+            }
         }
     }
 

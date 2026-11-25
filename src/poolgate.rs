@@ -9,15 +9,15 @@
 //! out. Every step's logits and every greedy token must be bit-identical to the reference.
 //!
 //! What plugs in where (src/blocks.rs types):
-//!  - `StepPath`: create a lane, step prefill spans, step decode spans, read logits, end a lane. `Layer2` is today's
-//!    per-lane caches; the block cache implements it as the candidate, over `Engine::block_pool` and
-//!    `Lane::block_table`.
+//!  - `StepPath`: create a lane, step prefill spans, step decode spans, read logits, end a lane. `Layer2` is the
+//!    per-lane contiguous reference path; `Layer3Pool` is the paged candidate over `Engine::block_pool`,
+//!    `Lane::block_table`, and `EntryTree`.
 //!  - `PoisonPool`: each kind's pool as the gate sees it. `slot_count(kind)` is `BlockPools::{window,full}.len()`;
 //!    `lane_slots` is `table_slots(&lane.block_table().borrow())`; `slot_bytes(kind, slot)` is
-//!    `slot_region(base, len, pool, slot)` over that kind's GPU buffer, at the pool's width. `Layer2` implements it with lane k's window
+//!    `BlockPool::slot_raw_region(slot)` over that kind's owning slab, at the pool's width. `Layer2` implements it with lane k's window
 //!    cache as window slot k + 1 and its full cache as full slot k + 1, so the gate runs today with the other lanes'
 //!    caches poisoned.
-//!  - main.rs `poolgate` builds the reference and the candidate; the candidate line is where the block cache goes.
+//!  - main.rs `poolgate` builds the `Layer2` reference and `ServePoolCandidate` (`ServeBlockCache`) and compares every step and token.
 //!
 //! The slot arithmetic (`poison_plan`, once per kind) is modelled in specs/PoisonGate.tla.
 use crate::blockbook::{EVERY, HEAD, PROMPT};
@@ -65,6 +65,10 @@ pub trait PoisonPool {
     /// this so the intentionally poisoned lane never publishes corrupted blocks into its shared prefix tree for other
     /// lanes to adopt; any remaining divergence on another lane proves a genuine cross-lane leak in the engine.
     fn note_sabotaged(&self, _lane: LaneId) {}
+    /// Slots held by retained cache checkpoints (not necessarily in any currently-stepping lane's `BlockTable`):
+    /// still poisoned during every step that does not read them, and saved/restored around the step so subsequent
+    /// waves can match retained start points while unreferenced (`refs == 0`) free slots remain poisoned.
+    fn retained_slots(&self) -> Vec<(BlockKind, Slot)> { Vec::new() }
 }
 
 /// The candidate is a path with a pool.
@@ -72,7 +76,6 @@ pub trait Candidate: StepPath + PoisonPool {}
 impl<T: StepPath + PoisonPool> Candidate for T {}
 
 /// Every (kind, slot) a block table holds an entry for. Walks each kind's rows until the table says out of range.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no table
 pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
     let mut v = Vec::new();
     for kind in KINDS {
@@ -83,17 +86,6 @@ pub fn table_slots(t: &BlockTable) -> Vec<(BlockKind, Slot)> {
         }
     }
     v
-}
-
-/// The bytes of `slot` in `pool`'s buffer at `base` of `len` bytes, at the pool's element width.
-/// None when the slot does not fit in the buffer.
-#[allow(dead_code)] // for the block cache's PoisonPool; Layer2 has no pool buffer
-pub fn slot_region(base: *mut u8, len: usize, pool: &crate::blocks::BlockPool, slot: Slot) -> Option<(*mut u8, usize)> {
-    let stride = pool.kind().stride_bytes(pool.kvb()).ok()?;
-    let off = pool.offset(slot).ok()?;
-    let end = off.checked_add(stride)?;
-    if end > len as u64 { return None; }
-    Some((unsafe { base.add(off as usize) }, stride as usize))
 }
 
 /// What to do to one kind's pool before one step, by 0-based pool index (`Slot::pool_index`).
@@ -130,17 +122,24 @@ pub fn poison_plan(n_slots: usize, tables: &[Vec<usize>], stepping: &[usize], gu
 pub const POISON: [u32; 2] = [0x7fc0_7fc0, 0x7bff_7bff];
 
 pub fn poison_bytes(b: &mut [u8]) {
-    for (i, w) in b.chunks_exact_mut(4).enumerate() { w.copy_from_slice(&POISON[i & 1].to_ne_bytes()); }
-    let tail = b.len() & !3;
-    for x in &mut b[tail..] { *x = 0x7f; }
+    let (chunks, rem) = b.as_chunks_mut::<4>();
+    for (i, w) in chunks.iter_mut().enumerate() { *w = POISON[i & 1].to_ne_bytes(); }
+    rem.fill(0x7f);
 }
 
 fn slot_at(i: usize) -> Slot { Slot::new(u32::try_from(i + 1).expect("pool index fits a slot")).unwrap() }
 
 /// Both kinds' plans for one step. `tables[i]` is live lane i's (kind, slot) list.
 pub fn plans(pool: &dyn PoisonPool, tables: &[Vec<(BlockKind, Slot)>], stepping: &[usize], guard: bool) -> Vec<(BlockKind, Plan)> {
+    let retained = pool.retained_slots();
     KINDS.iter().map(|&kind| {
-        let per: Vec<Vec<usize>> = tables.iter().map(|t| t.iter().filter(|(k, _)| *k == kind).map(|(_, s)| s.pool_index().get() as usize).collect()).collect();
+        let mut per: Vec<Vec<usize>> = tables.iter().map(|t| t.iter().filter(|(k, _)| *k == kind).map(|(_, s)| s.pool_index().get() as usize).collect()).collect();
+        if !retained.is_empty() {
+            let r: Vec<usize> = retained.iter().filter(|(k, _)| *k == kind).map(|(_, s)| s.pool_index().get() as usize).collect();
+            if !r.is_empty() {
+                per.push(r);
+            }
+        }
         (kind, poison_plan(pool.slot_count(kind), &per, stepping, guard))
     }).collect()
 }
@@ -313,10 +312,6 @@ impl<'a> Layer2<'a> {
         eng.ensure_dbatch(max_lanes);
         Layer2 { eng, lanes: RefCell::new(Vec::new()), rows: std::cell::Cell::new((0, false)) }
     }
-    #[allow(dead_code)]
-    pub fn candidate_label(&self) -> &'static str {
-        "Layer2 self-check (BlockPools candidate not yet wired)"
-    }
     fn run<R>(&self, f: impl FnOnce(&[Option<Lane>]) -> R) -> R { f(&self.lanes.borrow()) }
 }
 
@@ -406,6 +401,7 @@ pub struct Layer3Pool<'a> {
 impl<'a> Layer3Pool<'a> {
     /// Candidate for `poolgate::poisoned`: every slot not referenced by a live lane is poisoned
     /// before each step, so finished lanes release all their refs back to the pool for reuse + zeroing.
+    #[cfg(test)]
     pub fn new(eng: &'a Engine, max_lanes: usize) -> Layer3Pool<'a> {
         Self::create(eng, max_lanes, false)
     }
@@ -439,11 +435,6 @@ impl<'a> Layer3Pool<'a> {
         };
         p.poison_free_slots();
         p
-    }
-
-    #[allow(dead_code)]
-    pub fn candidate_label(&self) -> &'static str {
-        "Layer3 BlockPool + BlockTable + PrefixTree"
     }
 
     pub fn stats(&self) -> L3Stats { *self.stats.borrow() }
@@ -667,11 +658,11 @@ impl<'a> Layer3Pool<'a> {
             }
         }
         // Keep start points at prompt end, every 16th block, and lane head (when persistent starts enabled).
-        if self.keep_persistent_starts && end % BLOCK == 0 && l3.sealed.len() == end / BLOCK {
+        if self.keep_persistent_starts && end.is_multiple_of(BLOCK) && l3.sealed.len() == end / BLOCK {
             let tip = *l3.sealed.last().unwrap();
             let mut reasons = HEAD;
             if end == l3.prompt_len { reasons |= PROMPT; }
-            if (end / BLOCK) % 16 == 0 { reasons |= EVERY; }
+            if (end / BLOCK).is_multiple_of(16) { reasons |= EVERY; }
             if let Some(old_head) = l3.head_start.take() {
                 if old_head != tip { self.drop_start_reason(old_head, HEAD); }
             }
@@ -902,6 +893,507 @@ impl PoisonPool for Layer3Pool<'_> {
             l3.sabotaged = true;
         }
     }
+}
+
+struct ServeCandidateLane {
+    lane: Lane,
+    tokens: Vec<u32>,
+    blocks: crate::serve::block_cache::LaneBlockState,
+    sabotaged: bool,
+}
+
+/// Production `ServeBlockCache` candidate for `inky poolgate`: exercises the exact `src/serve/block_cache.rs`
+/// `EntryTree` deduplication, `RetainedStart` (`PROMPT` + `EVERY`) matching, `take_zeroed_slot` reuse, and
+/// sliding-window pruning under full `PoisonPool` NaN/fp16-max slot poisoning.
+pub struct ServePoolCandidate<'a> {
+    eng: &'a Engine,
+    cache: RefCell<crate::serve::block_cache::ServeBlockCache>,
+    lanes: RefCell<Vec<Option<ServeCandidateLane>>>,
+    rows: Cell<(usize, bool)>,
+    cache_sabotage: bool,
+    cache_sabotage_triggered: Cell<bool>,
+}
+
+impl<'a> ServePoolCandidate<'a> {
+    pub fn new(eng: &'a Engine, max_lanes: usize, max_pos: usize, cache_sabotage: bool) -> ServePoolCandidate<'a> {
+        eng.ensure_batch(eng.chunk);
+        eng.ensure_dbatch(max_lanes.max(1));
+        let blocks_per_lane = max_pos.div_ceil(BLOCK).max(2);
+        let win_per_lane = blocks_per_lane.min(WINDOW / BLOCK + 4);
+        let n_window = ((max_lanes + 2) * win_per_lane + 4).max(8);
+        let n_full = ((max_lanes + 2) * blocks_per_lane + 4).max(8);
+        eng.init_block_pools_exact(n_window, n_full);
+        let cand = ServePoolCandidate {
+            eng,
+            cache: RefCell::new(crate::serve::block_cache::ServeBlockCache::new()),
+            lanes: RefCell::new(Vec::new()),
+            rows: Cell::new((0, false)),
+            cache_sabotage,
+            cache_sabotage_triggered: Cell::new(false),
+        };
+        cand.poison_free_slots();
+        cand
+    }
+
+    pub fn candidate_label(&self) -> &'static str {
+        "ServeBlockCache + BlockPools + BlockTable + EntryTree"
+    }
+
+    pub fn stats(&self) -> crate::serve::block_cache::CacheStats {
+        self.cache.borrow().stats()
+    }
+
+    pub fn cache_sabotage_triggered(&self) -> bool {
+        self.cache_sabotage_triggered.get()
+    }
+
+    pub fn poison_free_slots(&self) -> usize {
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let mut count = 0usize;
+        for kind in KINDS {
+            let pool = pools.of_mut(kind);
+            for i in 0..pool.len() {
+                let slot = slot_at(i);
+                if pool.record(slot).unwrap().refs() == 0 {
+                    poison_bytes(pool.slot_bytes_mut(slot).unwrap());
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn new_lane_matched(&self, toks: &[u32], cap: usize) -> (LaneId, usize) {
+        assert!(!toks.is_empty(), "prompt cannot be empty");
+        let lane = Lane::new_blocked(self.eng, cap.max(toks.len() + 1));
+        self.eng.on(&lane).set_tokens(0, toks);
+        let mut blocks = crate::serve::block_cache::LaneBlockState::default();
+        let matched_at = {
+            let mut pools = self.eng.block_pool().borrow_mut();
+            let mut tbl = lane.block_table().borrow_mut();
+            let mut cache = self.cache.borrow_mut();
+            match cache.match_and_bind(&mut pools, &mut tbl, &mut blocks, toks) {
+                Some((at, mut cs)) => {
+                    if self.cache_sabotage && !self.cache_sabotage_triggered.get() {
+                        // Planted ServeBlockCache bug: corrupt restored recurrent state at start point.
+                        for b in &mut cs {
+                            *b ^= 0xFF;
+                        }
+                        self.cache_sabotage_triggered.set(true);
+                        println!("INK_POOLGATE_CACHE_SABOTAGE: corrupted ServeBlockCache start-point CS at pos {at}");
+                    }
+                    self.eng.on(&lane).set_cs(&cs);
+                    at
+                }
+                None => 0,
+            }
+        };
+        let mut v = self.lanes.borrow_mut();
+        v.push(Some(ServeCandidateLane {
+            lane,
+            tokens: toks.to_vec(),
+            blocks,
+            sabotaged: false,
+        }));
+        (v.len() - 1, matched_at)
+    }
+
+    pub fn shutdown(&self) {
+        let mut v = self.lanes.borrow_mut();
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let mut cache = self.cache.borrow_mut();
+        for slot in v.iter_mut() {
+            if let Some(mut sl) = slot.take() {
+                let mut tbl = sl.lane.block_table().borrow_mut();
+                cache.release_lane(&mut pools, &mut tbl, &mut sl.blocks);
+            }
+        }
+        cache.shutdown(&mut pools);
+    }
+}
+
+impl StepPath for ServePoolCandidate<'_> {
+    fn new_lane(&self, toks: &[u32], cap: usize) -> LaneId {
+        let lane = Lane::new_blocked(self.eng, cap.max(toks.len() + 1));
+        self.eng.on(&lane).set_tokens(0, toks);
+        let blocks = crate::serve::block_cache::LaneBlockState {
+            prompt_len: toks.len(),
+            ..Default::default()
+        };
+        let mut v = self.lanes.borrow_mut();
+        v.push(Some(ServeCandidateLane {
+            lane,
+            tokens: toks.to_vec(),
+            blocks,
+            sabotaged: false,
+        }));
+        v.len() - 1
+    }
+
+    fn set_token(&self, lane: LaneId, pos: usize, tok: u32) {
+        let mut v = self.lanes.borrow_mut();
+        let sl = v[lane].as_mut().expect("live ServePoolCandidate lane");
+        if pos >= sl.tokens.len() {
+            sl.tokens.resize(pos + 1, 0);
+        }
+        sl.tokens[pos] = tok;
+        self.eng.on(&sl.lane).set_tokens(pos, &[tok]);
+    }
+
+    fn prefill(&self, spans: &[(LaneId, usize, usize)]) {
+        {
+            let mut v = self.lanes.borrow_mut();
+            let mut pools = self.eng.block_pool().borrow_mut();
+            let mut cache = self.cache.borrow_mut();
+            for &(l, p0, t) in spans {
+                let sl = v[l].as_mut().expect("live lane");
+                let mut tbl = sl.lane.block_table().borrow_mut();
+                cache.ensure_span_blocks(&mut pools, &mut tbl, p0, t).expect("ServePoolCandidate ensure_span_blocks");
+            }
+        }
+        {
+            let v = self.lanes.borrow();
+            let sp: Vec<Span> = spans
+                .iter()
+                .map(|&(l, p0, t)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t })
+                .collect();
+            let cb = self.eng.gpu.cmd();
+            self.eng.encode_spans(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        {
+            let mut v = self.lanes.borrow_mut();
+            for &(l, p0, t) in spans {
+                let sl = v[l].as_mut().expect("live lane");
+                if sl.sabotaged {
+                    // Intentionally poisoned lane under INK_POOLGATE_SABOTAGE: update its own block lengths
+                    // and sliding window without publishing poisoned KV into ServeBlockCache's shared EntryTree.
+                    let end = p0 + t;
+                    sl.blocks.written = end;
+                    let mut pools = self.eng.block_pool().borrow_mut();
+                    let mut tbl = sl.lane.block_table().borrow_mut();
+                    for b in (p0 / BLOCK)..=((end - 1) / BLOCK) {
+                        let bi = BlockIndex::new(b as u32);
+                        let block_len = (end - b * BLOCK).min(BLOCK) as u32;
+                        for kind in KINDS {
+                            let e = tbl.get(kind, bi).unwrap().expect("sabotaged span block");
+                            let rec = pools.of_mut(kind).record_mut(e.slot()).unwrap();
+                            rec.set_length(block_len).expect("set sabotaged length");
+                            if block_len == BLOCK as u32 {
+                                rec.seal();
+                            }
+                        }
+                    }
+                    let min_win_blk = end.saturating_sub(EXT - 1) / BLOCK;
+                    for b in 0..min_win_blk {
+                        let bi = BlockIndex::new(b as u32);
+                        if tbl.get(BlockKind::Window, bi).unwrap().is_some() {
+                            tbl.clear_kind_entry(&mut pools.window, bi).unwrap();
+                        }
+                    }
+                } else {
+                    let cs_fn = || self.eng.on(&sl.lane).get_cs();
+                    let dedups_before = self.cache.borrow().stats().shared_dedups;
+                    {
+                        let mut pools = self.eng.block_pool().borrow_mut();
+                        let mut tbl = sl.lane.block_table().borrow_mut();
+                        self.cache.borrow_mut().finish_prefill_span(
+                            &mut pools,
+                            &mut tbl,
+                            &mut sl.blocks,
+                            &sl.tokens,
+                            p0,
+                            t,
+                            cs_fn,
+                        );
+                    }
+                    let dedups_after = self.cache.borrow().stats().shared_dedups;
+                    if self.cache_sabotage && !self.cache_sabotage_triggered.get() && dedups_after > dedups_before {
+                        // Planted ServeBlockCache bug on shared-prefix block deduplication: zero the deduplicated
+                        // lane's shared block 0 entry in its GPU block table / KV or corrupt its recurrent CS!
+                        let mut bad_cs = self.eng.on(&sl.lane).get_cs();
+                        bad_cs.fill(0x7f);
+                        self.eng.on(&sl.lane).set_cs(&bad_cs);
+                        self.cache_sabotage_triggered.set(true);
+                        println!("INK_POOLGATE_CACHE_SABOTAGE: corrupted lane {l} state after ServeBlockCache shared-prefix dedup");
+                    }
+                }
+            }
+        }
+        self.rows.set((spans.len(), false));
+    }
+
+    fn decode(&self, spans: &[(LaneId, usize)]) {
+        {
+            let mut v = self.lanes.borrow_mut();
+            let mut pools = self.eng.block_pool().borrow_mut();
+            let mut cache = self.cache.borrow_mut();
+            for &(l, pos) in spans {
+                let sl = v[l].as_mut().expect("live lane");
+                let mut tbl = sl.lane.block_table().borrow_mut();
+                cache.ensure_span_blocks(&mut pools, &mut tbl, pos, 1).expect("ServePoolCandidate decode ensure_span_blocks");
+            }
+        }
+        {
+            let v = self.lanes.borrow();
+            let sp: Vec<Span> = spans
+                .iter()
+                .map(|&(l, p0)| Span { lane: &v[l].as_ref().unwrap().lane, p0, t: 1 })
+                .collect();
+            let cb = self.eng.gpu.cmd();
+            self.eng.encode_decode(&cb, &sp, true, false);
+            cb.commit();
+            cb.waitUntilCompleted();
+        }
+        {
+            let mut v = self.lanes.borrow_mut();
+            let mut pools = self.eng.block_pool().borrow_mut();
+            let mut cache = self.cache.borrow_mut();
+            for &(l, pos) in spans {
+                let sl = v[l].as_mut().expect("live lane");
+                let mut tbl = sl.lane.block_table().borrow_mut();
+                cache.finish_decode_span(&mut pools, &mut tbl, &mut sl.blocks, pos);
+            }
+        }
+        self.rows.set((spans.len(), true));
+    }
+
+    fn logits(&self, row: usize) -> Vec<f32> {
+        let (n, dec) = self.rows.get();
+        assert!(row < n, "logits row {row} of a step of {n} spans");
+        (if n == 1 && !dec { self.eng.logits() } else { self.eng.span_logits(row) }).to_vec()
+    }
+
+    fn end_lane(&self, lane: LaneId) {
+        let Some(mut sl) = self.lanes.borrow_mut()[lane].take() else { return };
+        let mut pools = self.eng.block_pool().borrow_mut();
+        let mut tbl = sl.lane.block_table().borrow_mut();
+        self.cache.borrow_mut().release_lane(&mut pools, &mut tbl, &mut sl.blocks);
+    }
+}
+
+impl PoisonPool for ServePoolCandidate<'_> {
+    fn slot_count(&self, kind: BlockKind) -> usize {
+        self.eng.block_pool().borrow().of(kind).len()
+    }
+    fn lane_slots(&self, lane: LaneId) -> Vec<(BlockKind, Slot)> {
+        let v = self.lanes.borrow();
+        let sl = v[lane].as_ref().expect("live lane");
+        let slots = table_slots(&sl.lane.block_table().borrow());
+        slots
+    }
+    fn slot_bytes(&self, kind: BlockKind, slot: Slot) -> Option<(*mut u8, usize)> {
+        self.eng.block_pool().borrow().of(kind).slot_raw_region(slot)
+    }
+    fn note_sabotaged(&self, lane: LaneId) {
+        if let Some(sl) = self.lanes.borrow_mut()[lane].as_mut() {
+            sl.sabotaged = true;
+        }
+    }
+    fn retained_slots(&self) -> Vec<(BlockKind, Slot)> {
+        let pools = self.eng.block_pool().borrow();
+        let mut out = Vec::new();
+        for kind in KINDS {
+            let pool = pools.of(kind);
+            for i in 0..pool.len() {
+                let s = slot_at(i);
+                if pool.record(s).unwrap().refs() > 0 {
+                    out.push((kind, s));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Exercise `ServeBlockCache` start-point matching (`PROMPT` @ 192, window-pruned `PROMPT` @ 1152 past
+/// `EXT = 1024`, and `EVERY` @ 2048 when `ctx >= 2304`), slot reuse, and diverging multi-lane forks
+/// with every free pool slot poisoned, asserting non-zero sharing, reuse, and window pruning.
+pub fn verify_serve_cache_start_points(eng: &Engine, base: &[u32], ctx: usize, cache_sabotage: bool) -> Result<String, String> {
+    if ctx < 1408 || base.len() < 1408 {
+        return Err(format!("verify_serve_cache_start_points requires ctx >= 1408 and base.len() >= 1408 (got ctx={ctx}, base={})", base.len()));
+    }
+    let run_cold_l2 = |toks: &[u32], ndec: usize| -> Record {
+        let l2 = Layer2::new(eng, 1);
+        let lid = l2.new_lane(toks, toks.len() + ndec + 1);
+        let mut rec = Record::default();
+        let mut p = 0;
+        while p < toks.len() {
+            let c = eng.chunk.min(toks.len() - p);
+            l2.prefill(&[(lid, p, c)]);
+            p += c;
+        }
+        let lg = l2.logits(0);
+        rec.steps.push(fnv(&lg));
+        let mut tok = argmax(&lg);
+        rec.tokens.push(tok);
+        l2.set_token(lid, toks.len(), tok);
+        for d in 0..ndec {
+            let pos = toks.len() + d;
+            l2.decode(&[(lid, pos)]);
+            let lg = l2.logits(0);
+            rec.steps.push(fnv(&lg));
+            tok = argmax(&lg);
+            rec.tokens.push(tok);
+            l2.set_token(lid, pos + 1, tok);
+        }
+        l2.end_lane(lid);
+        rec
+    };
+
+    let rot = |k: usize, len: usize| -> Vec<u32> {
+        let mut v = base.to_vec();
+        v.rotate_left(k % base.len());
+        v.truncate(len);
+        v
+    };
+
+    let max_pos = if ctx >= 2304 && base.len() >= 2304 { 2240 } else { 1280 };
+    // Tight pool sizing guarantees freed unsealed/window-pruned slots are reused across turns (`slots_reused > 0`).
+    let sc = ServePoolCandidate::new(eng, 2, max_pos, cache_sabotage);
+
+    let run_matched = |toks: &[u32], expected_match: usize, ndec: usize| -> Result<Record, String> {
+        sc.poison_free_slots();
+        let (lid, matched) = sc.new_lane_matched(toks, toks.len() + ndec + 2);
+        if matched != expected_match {
+            sc.end_lane(lid);
+            return Err(format!("ServeBlockCache expected match at {expected_match}, got {matched}"));
+        }
+        let mut p = matched;
+        while p < toks.len() {
+            let target = crate::serve::block_cache::effective_pf_target(p, toks.len());
+            let c = eng.chunk.min(target - p);
+            sc.poison_free_slots();
+            sc.prefill(&[(lid, p, c)]);
+            p += c;
+        }
+        let mut rec = Record::default();
+        let lg = sc.logits(0);
+        rec.steps.push(fnv(&lg));
+        let mut tok = argmax(&lg);
+        rec.tokens.push(tok);
+        sc.set_token(lid, toks.len(), tok);
+        for d in 0..ndec {
+            let pos = toks.len() + d;
+            sc.poison_free_slots();
+            sc.decode(&[(lid, pos)]);
+            let lg = sc.logits(0);
+            rec.steps.push(fnv(&lg));
+            tok = argmax(&lg);
+            rec.tokens.push(tok);
+            sc.set_token(lid, pos + 1, tok);
+        }
+        sc.end_lane(lid);
+        Ok(rec)
+    };
+
+    // 1. Seed PROMPT checkpoint at 192 tokens (prompt length 195 -> prompt_ckpt = 192) and decode 4 tokens
+    //    into block 3 so releasing this lane returns unsealed tail blocks to the pool for `slots_reused`.
+    let mut seed195 = base[..192].to_vec();
+    seed195.extend_from_slice(&rot(41, 3));
+    let _ = run_matched(&seed195, 0, 4)?;
+
+    // Two diverging continuations sharing the 192-token PROMPT start point run concurrently under PoisonPool!
+    let mut fork_a = base[..192].to_vec();
+    fork_a.extend_from_slice(&rot(173, 37));
+    let mut fork_b = base[..192].to_vec();
+    fork_b.extend_from_slice(&rot(311, 37));
+    let want_a = run_cold_l2(&fork_a, 4);
+    let want_b = run_cold_l2(&fork_b, 4);
+    sc.poison_free_slots();
+    let (la, ma) = sc.new_lane_matched(&fork_a, fork_a.len() + 6);
+    let (lb, mb) = sc.new_lane_matched(&fork_b, fork_b.len() + 6);
+    if ma != 192 || mb != 192 {
+        sc.shutdown();
+        return Err(format!("expected concurrent forks to match 192, got ({ma}, {mb})"));
+    }
+    sc.poison_free_slots();
+    sc.prefill(&[(la, 192, 37), (lb, 192, 37)]);
+    let (mut rec_a, mut rec_b) = (Record::default(), Record::default());
+    for (k, (lid, prompt, rec)) in [(la, &fork_a, &mut rec_a), (lb, &fork_b, &mut rec_b)].into_iter().enumerate() {
+        let lg = sc.logits(k);
+        rec.steps.push(fnv(&lg));
+        let tok = argmax(&lg);
+        rec.tokens.push(tok);
+        sc.set_token(lid, prompt.len(), tok);
+    }
+    for d in 0..4 {
+        let pos = fork_a.len() + d;
+        sc.poison_free_slots();
+        sc.decode(&[(la, pos), (lb, pos)]);
+        for (k, (lid, rec)) in [(la, &mut rec_a), (lb, &mut rec_b)].into_iter().enumerate() {
+            let lg = sc.logits(k);
+            rec.steps.push(fnv(&lg));
+            let tok = argmax(&lg);
+            rec.tokens.push(tok);
+            sc.set_token(lid, pos + 1, tok);
+        }
+    }
+    sc.end_lane(la);
+    sc.end_lane(lb);
+    if rec_a != want_a || rec_b != want_b {
+        sc.shutdown();
+        return Err("ServeBlockCache concurrent shared-prefix forks differed from cold Layer 2".into());
+    }
+
+    // 2. Cross the 1024-token sliding window (`PROMPT` @ 1152, pruning window blocks 0..2), then match & fork!
+    let mut seed1155 = base[..1152].to_vec();
+    seed1155.extend_from_slice(&rot(601, 3));
+    let _ = run_matched(&seed1155, 192, 2)?;
+
+    let mut prompt_1152_fork = base[..1152].to_vec();
+    prompt_1152_fork.extend_from_slice(&rot(733, 45));
+    let want_1152 = run_cold_l2(&prompt_1152_fork, 4);
+    let got_1152 = run_matched(&prompt_1152_fork, 1152, 4)?;
+    if got_1152 != want_1152 {
+        sc.shutdown();
+        return Err("ServeBlockCache window-pruned PROMPT@1152 fork differed from cold Layer 2".into());
+    }
+
+    // 3. Also exercise periodic `EVERY` @ 2048 checkpoint when ctx >= 2304.
+    let mut tested_every_2048 = false;
+    if ctx >= 2304 && base.len() >= 2304 {
+        tested_every_2048 = true;
+        let mut seed2115 = base[..2112].to_vec();
+        seed2115.extend_from_slice(&rot(857, 3));
+        let _ = run_matched(&seed2115, 1152, 2)?;
+
+        let mut fork_2048 = base[..2048].to_vec();
+        fork_2048.extend_from_slice(&rot(911, 37));
+        let want_2048 = run_cold_l2(&fork_2048, 3);
+        let got_2048 = run_matched(&fork_2048, 2048, 3)?;
+        if got_2048 != want_2048 {
+            sc.shutdown();
+            return Err("ServeBlockCache periodic EVERY@2048 fork differed from cold Layer 2".into());
+        }
+    }
+
+    let st = sc.stats();
+    sc.shutdown();
+    {
+        let pools = eng.block_pool().borrow();
+        for kind in KINDS {
+            let pool = pools.of(kind);
+            for i in 0..pool.len() {
+                let r = pool.record(slot_at(i)).unwrap().refs();
+                if r != 0 {
+                    return Err(format!("ServeBlockCache refcount leak on {kind:?} slot {}: refs={r}", i + 1));
+                }
+            }
+        }
+    }
+    if st.start_matches == 0 || st.slots_reused == 0 || st.window_pruned == 0 {
+        return Err(format!(
+            "ServeBlockCache gate failed non-vacuity check: matches={}, reused={}, window_pruned={}",
+            st.start_matches, st.slots_reused, st.window_pruned
+        ));
+    }
+    Ok(format!(
+        "ServeBlockCache start-point & window-pruning gate identical to Layer 2 (192, PROMPT@1152{}: matches={}, saved={}, reused={}, window_pruned={})",
+        if tested_every_2048 { ", EVERY@2048" } else { "" },
+        st.start_matches, st.start_points_saved, st.slots_reused, st.window_pruned
+    ))
 }
 
 /// Verify deepest start-point prefix matching (`PrefixTree`) + recurrent state & window restoration
@@ -1191,23 +1683,6 @@ mod tests {
     fn table_slots_reads_every_entry_of_both_kinds() {
         assert_eq!(table_slots(&BlockTable::new(4).unwrap()), vec![]);
         assert_eq!(table_slots(&BlockTable::empty()), vec![]);
-    }
-
-    #[test]
-    fn slot_region_is_the_stride_at_the_offset_and_refuses_past_the_buffer() {
-        use crate::blocks::BlockPool;
-        let base = 0x1000 as *mut u8;
-        let len = 2 * crate::blocks::FULL_STRIDE as usize;
-        let full = BlockPool::new(BlockKind::Full, 4);
-        let narrow = BlockPool::with_kvb(BlockKind::Full, 4, 1).unwrap();
-        let window = BlockPool::new(BlockKind::Window, 4);
-        assert_eq!(slot_region(base, len, &full, sl(1)), Some((base, crate::blocks::FULL_STRIDE as usize)));
-        assert_eq!(slot_region(base, len, &full, sl(2)).map(|r| r.0 as usize - 0x1000), Some(crate::blocks::FULL_STRIDE as usize));
-        assert_eq!(slot_region(base, len, &full, sl(3)), None);
-        assert_eq!(slot_region(base, len, &window, sl(1)), None);
-        let half = crate::blocks::FULL_STRIDE as usize / 2;
-        assert_eq!(slot_region(base, 4 * half, &narrow, sl(2)).map(|r| r.1), Some(half));
-        assert!(half < crate::blocks::FULL_STRIDE as usize);
     }
 
     #[test]

@@ -46,8 +46,12 @@ impl<'a> Session<'a> {
     pub fn prefill(&mut self, toks: &[u32]) -> Result<u32, String> {
         let mut all: Vec<u32> = self.pending.take().into_iter().collect();
         all.extend_from_slice(toks);
-        assert!(!all.is_empty());
-        assert!(self.n_past + all.len() < self.eng.max_ctx, "context full ({} tokens)", self.eng.max_ctx);
+        if all.is_empty() {
+            return Err("cannot prefill an empty token sequence".into());
+        }
+        if self.n_past.saturating_add(all.len()) >= self.eng.max_ctx {
+            return Err(format!("context full ({} tokens)", self.eng.max_ctx));
+        }
         let t0 = Instant::now();
         self.run().tier_leave(self.n_past);       // (--kv-disk) a prefill attends through the whole cache in memory
         self.run().set_tokens(self.n_past, &all);
@@ -69,8 +73,9 @@ impl<'a> Session<'a> {
             }
             p0 += t;
         }
-        let (pos, cb) = last.unwrap();
-        wait_completed(&cb, "prefill", pos)?;
+        if let Some((pos, cb)) = last {
+            wait_completed(&cb, "prefill", pos)?;
+        }
         self.n_past = end;
         self.stats.prompt_tokens += all.len();
         self.stats.prompt_time += t0.elapsed();
@@ -108,15 +113,17 @@ impl<'a> Session<'a> {
                 inflight.push_back(step(self.n_past));
                 loop {
                     if inflight.len() < 2 {
-                        let pos = inflight.back().unwrap().0 + 1;
-                        if pos >= eng.gen_capacity() {
-                            // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
-                            wait_all(&inflight, |(pos, cmd)| cmd.wait(*pos))?;
-                            eng.gen_reserve(pos);
+                        if let Some(&(last_pos, _)) = inflight.back() {
+                            let pos = last_pos + 1;
+                            if pos >= eng.gen_capacity() {
+                                // the K/V buffers must grow (or, with --kv-disk, be re-sized): nothing may be in flight meanwhile
+                                wait_all(&inflight, |(pos, cmd)| cmd.wait(*pos))?;
+                                eng.gen_reserve(pos);
+                            }
+                            inflight.push_back(step(pos));
                         }
-                        inflight.push_back(step(pos));
                     }
-                    let (pos, cmd) = inflight.pop_front().unwrap();
+                    let Some((pos, cmd)) = inflight.pop_front() else { break };
                     wait_or_drain(&(pos, cmd), &inflight, |(pos, cmd)| cmd.wait(*pos))?;
                     self.n_past = pos + 1;
                     tok = eng.token_at(pos + 1);

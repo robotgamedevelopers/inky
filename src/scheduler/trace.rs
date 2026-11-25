@@ -235,7 +235,8 @@ pub fn render_cache_scheduler_tla_bundle(
          VARIABLES traceIdx, stepIdx\n\
          \n\
          LaneSeq == <<{lane_seq_lit}>>\n\
-         LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l\n\
+         LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]\n\
+         LaneIdx(l) == LaneIdxMap[l]\n\
          \n\
          HydrateBlocks(bs) ==\n\
              [b \\in BlockIds |->\n\
@@ -299,16 +300,27 @@ pub fn render_cache_scheduler_tla_bundle(
          ReplayInit ==\n\
              /\\ traceIdx \\in 1..Len(Traces)\n\
              /\\ stepIdx = 1\n\
-             /\\ ApplyStep(Traces[traceIdx][1])\n\
+             /\\ LET initStep == Traces[traceIdx][1] IN ApplyStep(initStep)\n\
          \n\
          ReplayNext ==\n\
              /\\ stepIdx < Len(Traces[traceIdx])\n\
              /\\ traceIdx' = traceIdx\n\
              /\\ stepIdx' = stepIdx + 1\n\
-             /\\ ApplyNext(Traces[traceIdx][stepIdx + 1])\n\
+             /\\ LET nextStep == Traces[traceIdx][stepIdx + 1] IN ApplyNext(nextStep)\n\
          \n\
          ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>\n\
-         Conforms == Init /\\ [][Next]_vars\n\
+         TraceAnyBuildStep ==\n\
+             /\\ stepActive' = TRUE\n\
+             /\\ stepLanes' \\in ((SUBSET Lanes) \\ {{}})\n\
+             /\\ stepSpan' \\in [Lanes -> 0..MaxSpan]\n\
+             /\\ BuildStep(stepLanes', stepSpan')\n\
+         TraceNext ==\n\
+             \\/ (\\E l \\in Lanes : AdvanceLane(l))\n\
+             \\/ MemReclaim\n\
+             \\/ TraceAnyBuildStep\n\
+             \\/ StepProgress\n\
+             \\/ UnfairEnvActions\n\
+         Conforms == Init /\\ [][TraceNext]_vars\n\
          =============================================================================\n"
     );
 

@@ -107,6 +107,8 @@ fn live_starts(book: &BlockBook) -> Vec<usize> { (0..STARTS).filter(|&i| book.st
 fn main() {
     // resumed, reused slot, window pruned under a live point, partial tail read,
     // retired, finished with a tail, prompt point, every point, pool full
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let is_mutant = !mode.is_empty() && mode != "prod";
     let mut seen = [0u64; 9];
     let mut traces = Vec::new();
     for seed in 1..=SEEDS {
@@ -180,6 +182,19 @@ fn main() {
             }
         }
         traces.push(states);
+        if is_mutant {
+            let hit = match mode.as_str() {
+                "unheld-window" | "pruned-under-start" => seen[2] > 0 && seen[0] > 0,
+                "overread" => seen[3] > 0,
+                "no-zero" => seen[1] > 0,
+                "kept-tail" => seen[5] > 0,
+                "every-off" => seen[7] > 0,
+                _ => seen.iter().all(|&c| c > 0),
+            };
+            if hit {
+                break;
+            }
+        }
     }
     println!("---- MODULE StartTailsTraceData ----\nEXTENDS Integers\nTraces == <<");
     let body: Vec<String> = traces.iter().map(|t| format!("<<\n{}\n>>", t.join(",\n"))).collect();

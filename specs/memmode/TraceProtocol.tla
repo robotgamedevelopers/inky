@@ -32,6 +32,7 @@ ConnectCalls(p,s,cs,target) ==
     ELSE IF p.saved # -1 THEN Raise(p,s,cs,1,p.saved,target)
     ELSE /\ Call(cs,1,"get",-1)
          /\ IF At(cs,1).result = -1 THEN End(s,cs,1,p.saved,p.owed,0)
+            ELSE IF At(cs,1).result >= target THEN End(s,cs,1,-1,FALSE,1)
             ELSE /\ Call(cs,2,"keep",At(cs,1).result)
                  /\ IF At(cs,2).result # 0 THEN End(s,cs,2,p.saved,p.owed,0)
                     ELSE Raise(p,s,cs,3,At(cs,1).result,target)

@@ -67,6 +67,7 @@ impl ResponseMetrics {
         response
     }
 
+    #[cfg(test)]
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let obj = v.as_object().ok_or("response must be a JSON object")?;
         let prompt_tokens = obj
@@ -149,6 +150,7 @@ impl RecordEntry {
         })
     }
 
+    #[cfg(test)]
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let obj = v.as_object().ok_or("record entry must be a JSON object")?;
         let schema_version = obj
@@ -230,19 +232,6 @@ pub fn sanitize_card_id(raw: Option<&str>) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Extracts only `X-Inky-Card-Id` from HTTP headers while strictly ignoring auth/cookie headers.
-#[allow(dead_code)]
-pub fn card_id_from_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("x-inky-card-id") {
-            if let Some(id) = sanitize_card_id(Some(value)) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 fn is_sensitive_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -267,7 +256,7 @@ pub fn sanitize_request_body(req: &Value) -> Value {
 }
 
 /// Parses newline-delimited JSON records, ignoring blank lines.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn parse_jsonl(input: &str) -> Result<Vec<RecordEntry>, String> {
     let mut out = Vec::new();
     for (idx, line) in input.lines().enumerate() {
@@ -286,7 +275,7 @@ pub fn parse_jsonl(input: &str) -> Result<Vec<RecordEntry>, String> {
 
 /// Groups recorded turns by `card_id`, ordering each card's turns by `(turn_index, recorded_at_ms)`
 /// and ordering cards by their earliest `(recorded_at_ms, card_id)`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn group_by_card(entries: &[RecordEntry]) -> Vec<Vec<RecordEntry>> {
     let mut grouped: HashMap<&str, Vec<RecordEntry>> = HashMap::new();
     for e in entries {
@@ -307,27 +296,83 @@ pub fn group_by_card(entries: &[RecordEntry]) -> Vec<Vec<RecordEntry>> {
     cards
 }
 
-#[derive(Default)]
+const EVICTED_FLOOR_BUCKETS: usize = 4096;
+
+fn card_floor_slot(card_id: &str) -> usize {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in card_id.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as usize) & (EVICTED_FLOOR_BUCKETS - 1)
+}
+
 struct TurnTracker {
-    next_turn: HashMap<String, u64>,
-    order: VecDeque<String>,
+    /// `card_id -> (next_turn, last_touch_stamp)`
+    entries: HashMap<String, (u64, u64)>,
+    lru: VecDeque<(u64, String)>,
+    tick: u64,
+    max_cards: usize,
+    /// Fixed-size high-water floor across evicted cards so an evicted `card_id` never resets to `0`
+    /// or collides with any previously issued `turn_index` for that `card_id`.
+    evicted_floor: Box<[u64; EVICTED_FLOOR_BUCKETS]>,
+}
+
+impl Default for TurnTracker {
+    fn default() -> Self {
+        Self::with_max_cards(MAX_TRACKED_CARDS)
+    }
 }
 
 impl TurnTracker {
-    fn next_for(&mut self, card_id: &str) -> u64 {
-        if let Some(turn) = self.next_turn.get_mut(card_id) {
-            let cur = *turn;
-            *turn = cur.saturating_add(1);
-            return cur;
+    fn with_max_cards(max_cards: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            tick: 0,
+            max_cards: max_cards.max(1),
+            evicted_floor: Box::new([0u64; EVICTED_FLOOR_BUCKETS]),
         }
-        if self.next_turn.len() >= MAX_TRACKED_CARDS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.next_turn.remove(&oldest);
+    }
+
+    fn compact_lru(&mut self) {
+        self.lru.retain(|(stamp, id)| {
+            self.entries.get(id).is_some_and(|&(_, cur_stamp)| cur_stamp == *stamp)
+        });
+    }
+
+    fn evict_one(&mut self) {
+        while let Some((stamp, oldest_id)) = self.lru.pop_front() {
+            if self.entries.get(&oldest_id).is_some_and(|&(_, cur_stamp)| cur_stamp == stamp) {
+                if let Some((evicted_next, _)) = self.entries.remove(&oldest_id) {
+                    let slot = card_floor_slot(&oldest_id);
+                    self.evicted_floor[slot] = self.evicted_floor[slot].max(evicted_next);
+                }
+                return;
             }
         }
-        self.order.push_back(card_id.to_string());
-        self.next_turn.insert(card_id.to_string(), 1);
-        0
+    }
+
+    fn next_for(&mut self, card_id: &str) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        let stamp = self.tick;
+        if let Some((turn, cur_stamp)) = self.entries.get_mut(card_id) {
+            let cur = *turn;
+            *turn = cur.saturating_add(1);
+            *cur_stamp = stamp;
+            self.lru.push_back((stamp, card_id.to_string()));
+            if self.lru.len() > self.max_cards.saturating_mul(4).max(64) {
+                self.compact_lru();
+            }
+            return cur;
+        }
+        if self.entries.len() >= self.max_cards {
+            self.evict_one();
+        }
+        let initial = self.evicted_floor[card_floor_slot(card_id)];
+        self.lru.push_back((stamp, card_id.to_string()));
+        self.entries.insert(card_id.to_string(), (initial.saturating_add(1), stamp));
+        initial
     }
 }
 
@@ -359,14 +404,9 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(dir: PathBuf) -> Self {
         Self::with_options(dir, DEFAULT_QUEUE_CAPACITY, DEFAULT_MAX_FILE_BYTES)
-    }
-
-    #[allow(dead_code)]
-    pub fn with_capacity(dir: PathBuf, capacity: usize) -> Self {
-        Self::with_options(dir, capacity, DEFAULT_MAX_FILE_BYTES)
     }
 
     pub fn with_options(dir: PathBuf, capacity: usize, max_file_bytes: u64) -> Self {
@@ -377,7 +417,7 @@ impl Recorder {
             let mut dir_ready = false;
             while let Ok(entry) = rx.recv() {
                 if !dir_ready {
-                    match fs::create_dir_all(&dir) {
+                    match ensure_private_record_dir(&dir) {
                         Ok(()) => dir_ready = true,
                         Err(e) => {
                             let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
@@ -463,6 +503,39 @@ fn is_card_record_file(name: &str) -> bool {
     name.starts_with("cards-") && (name.ends_with(".jsonl") || name.ends_with(".jsonl.1"))
 }
 
+fn ensure_private_record_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let existed = fs::symlink_metadata(dir).is_ok();
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("record directory {} must be a real directory, not a symlink", dir.display()),
+            ));
+        }
+        if !existed {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        } else if meta.mode() & 0o077 != 0 {
+            // Strip any group/other permissions without adding write bits to a read-only directory.
+            fs::set_permissions(dir, fs::Permissions::from_mode(meta.mode() & 0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
 fn rotate_and_prune(
     dir: &Path,
     filename: &str,
@@ -474,14 +547,31 @@ fn rotate_and_prune(
     if max_file_bytes == 0 {
         return Ok(());
     }
-    let existing_len = match fs::metadata(path) {
-        Ok(m) => m.len(),
+    let existing_len = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => m.len(),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("record file {} must be a regular file, not a symlink", path.display()),
+            ));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
     };
     let backup_name = format!("{filename}.1");
     if existing_len > 0 && existing_len.saturating_add(needed_bytes) > max_file_bytes {
         let backup = dir.join(&backup_name);
+        match fs::symlink_metadata(&backup) {
+            Ok(m) if !m.file_type().is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("backup record file {} is not a regular file", backup.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         fs::rename(path, &backup)?;
         stats.rotations.fetch_add(1, Ordering::Relaxed);
     }
@@ -495,11 +585,15 @@ fn rotate_and_prune(
         if !is_card_record_file(&name) {
             continue;
         }
-        let meta = item.metadata()?;
+        let item_path = item.path();
+        let meta = fs::symlink_metadata(&item_path)?;
+        if !meta.file_type().is_file() {
+            continue;
+        }
         let len = meta.len();
         total = total.saturating_add(len);
         if name != filename && name != backup_name {
-            older.push((name, item.path(), len));
+            older.push((name, item_path, len));
         }
     }
     // Older dated files sort chronologically by name (`cards-YYYYMMDD.jsonl*`),
@@ -521,15 +615,26 @@ fn rotate_and_prune(
     Ok(())
 }
 
+fn format_jsonl_line(entry: &RecordEntry) -> std::io::Result<Vec<u8>> {
+    let mut buf = serde_json::to_vec(&entry.to_json())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    buf.push(b'\n');
+    Ok(buf)
+}
+
+fn write_whole_line<W: Write>(writer: &mut W, line_with_nl: &[u8]) -> std::io::Result<()> {
+    debug_assert!(line_with_nl.ends_with(b"\n"));
+    writer.write_all(line_with_nl)
+}
+
 fn append_entry(
     dir: &Path,
     entry: &RecordEntry,
     max_file_bytes: u64,
     stats: &Stats,
 ) -> std::io::Result<()> {
-    let line = serde_json::to_string(&entry.to_json())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let needed_bytes = (line.len() as u64).saturating_add(1);
+    let line = format_jsonl_line(entry)?;
+    let needed_bytes = line.len() as u64;
     if max_file_bytes != 0 && needed_bytes > max_file_bytes {
         let n = stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n.is_power_of_two() {
@@ -545,15 +650,24 @@ fn append_entry(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(&path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("record file {} is not a regular file", path.display()),
+        ));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
     }
-    writeln!(file, "{line}")?;
+    write_whole_line(&mut file, &line)?;
     file.flush()?;
     stats.written.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -580,6 +694,109 @@ mod tests {
         assert_eq!(yyyymmdd_utc(1_709_208_000_000), "20240229");
         // 2026-11-24 18:00:00 UTC
         assert_eq!(yyyymmdd_utc(1_795_543_200_000), "20261124");
+    }
+
+    #[test]
+    fn private_dir_rejects_symlinks_and_writes_whole_lines_at_once() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let base = temp_dir("security");
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("records");
+        ensure_private_record_dir(&dir).unwrap();
+        assert_eq!(fs::symlink_metadata(&dir).unwrap().mode() & 0o777, 0o700);
+
+        // Symlinked --record-dir is refused.
+        let symlink_dir = base.join("records-link");
+        symlink(&dir, &symlink_dir).unwrap();
+        assert!(ensure_private_record_dir(&symlink_dir).is_err());
+
+        let sample = RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: 1_795_543_200_000, // 20261124
+            card_id: "card-sec".into(),
+            turn_index: 0,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"messages": [{"role": "user", "content": "hi"}]}),
+            response: ResponseMetrics {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                ttft_ms: 10,
+                total_ms: 20,
+                queue_ms: 1,
+                prefill_ms: 9,
+                decode_ms: 10,
+                finish_reason: "stop".into(),
+                status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
+            },
+        };
+
+        // Planted symlink at cards-20261124.jsonl must be refused without touching victim.
+        let victim = base.join("victim.txt");
+        fs::write(&victim, b"untouched").unwrap();
+        let planted = dir.join("cards-20261124.jsonl");
+        symlink(&victim, &planted).unwrap();
+        let stats = Stats::new();
+        assert!(append_entry(&dir, &sample, DEFAULT_MAX_FILE_BYTES, &stats).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        fs::remove_file(&planted).unwrap();
+
+        // Real regular file is created with mode 0o600 and written in one whole-line write call.
+        append_entry(&dir, &sample, DEFAULT_MAX_FILE_BYTES, &stats).unwrap();
+        assert_eq!(fs::symlink_metadata(&planted).unwrap().mode() & 0o777, 0o600);
+
+        struct CountingWriter {
+            writes: usize,
+            buf: Vec<u8>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let formatted = format_jsonl_line(&sample).unwrap();
+        let mut cw = CountingWriter { writes: 0, buf: Vec::new() };
+        write_whole_line(&mut cw, &formatted).unwrap();
+        assert_eq!(cw.writes, 1, "JSONL line + newline must be written in a single write call");
+        assert!(cw.buf.ends_with(b"\n"));
+        assert_eq!(parse_jsonl(std::str::from_utf8(&cw.buf).unwrap()).unwrap(), vec![sample]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn turn_tracker_preserves_monotonic_turns_across_lru_and_eviction() {
+        let mut tracker = TurnTracker::with_max_cards(4);
+        assert_eq!(tracker.next_for("active-card"), 0);
+        assert_eq!(tracker.next_for("one-shot-1"), 0);
+        assert_eq!(tracker.next_for("one-shot-2"), 0);
+        assert_eq!(tracker.next_for("one-shot-3"), 0);
+        // Touching active-card promotes it in LRU so incoming cards evict one-shot-1..3 instead.
+        assert_eq!(tracker.next_for("active-card"), 1);
+        for i in 4..=6 {
+            assert_eq!(tracker.next_for(&format!("one-shot-{i}")), 0);
+            assert_eq!(tracker.next_for("active-card"), (i - 2) as u64);
+        }
+
+        // Now force eviction of active-card itself by flooding > max_cards distinct cards.
+        let last_before_evict = tracker.next_for("active-card");
+        for i in 100..120 {
+            let _ = tracker.next_for(&format!("flood-{i}"));
+        }
+        assert!(!tracker.entries.contains_key("active-card"), "active-card was evicted under flood");
+        let resumed = tracker.next_for("active-card");
+        assert!(
+            resumed > last_before_evict,
+            "evicted card turn_index ({resumed}) must remain strictly greater than prior turn ({last_before_evict})"
+        );
+        assert_eq!(tracker.next_for("active-card"), resumed + 1);
     }
 
     #[test]
@@ -774,24 +991,12 @@ mod tests {
 
     #[test]
     fn auth_headers_and_keys_are_never_recorded() {
-        let headers = [
-            ("Authorization", "Bearer super-secret-token-xyz"),
-            ("Cookie", "session=top-secret-cookie"),
-            ("X-Api-Key", "sk-secret-api-key-999"),
-            ("X-Inky-Card-Id", "card-safe-1"),
-        ];
-        assert_eq!(card_id_from_headers(headers), Some("card-safe-1".to_string()));
-        assert_eq!(
-            card_id_from_headers([("Authorization", "Bearer secret"), ("Cookie", "a=b")]),
-            None
-        );
-
         let dir = temp_dir("auth");
         let _ = fs::remove_dir_all(&dir);
         let ts = 1_795_543_200_000u64;
         {
             let rec = Recorder::new(dir.clone());
-            let (cid, turn) = rec.allocate_turn(card_id_from_headers(headers).as_deref());
+            let (cid, turn) = rec.allocate_turn(sanitize_card_id(Some("card-safe-1")).as_deref());
             rec.record(RecordEntry {
                 schema_version: SCHEMA_VERSION,
                 recorded_at_ms: ts,
@@ -801,6 +1006,7 @@ mod tests {
                 request: json!({
                     "Authorization": "Bearer leaked-in-body",
                     "Cookie": "secret=cookie",
+                    "X-Api-Key": "sk-secret-api-key-999",
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": false
                 }),
@@ -820,8 +1026,6 @@ mod tests {
             });
         }
         let content = fs::read_to_string(dir.join("cards-20261124.jsonl")).unwrap();
-        assert!(!content.contains("super-secret-token-xyz"));
-        assert!(!content.contains("top-secret-cookie"));
         assert!(!content.contains("sk-secret-api-key-999"));
         assert!(!content.contains("leaked-in-body"));
         assert!(!content.contains("secret=cookie"));

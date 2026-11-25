@@ -68,7 +68,7 @@ func (s *jobStream) read(firstDelta bool) error {
 	tokens := 0
 	for s.lines.Scan() {
 		line := s.lines.Text()
-		if strings.TrimSpace(line) == "" {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
 		data, ok := strings.CutPrefix(line, "data: ")

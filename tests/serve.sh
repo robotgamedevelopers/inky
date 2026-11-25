@@ -14,12 +14,18 @@ model=${2:-$HOME/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling
 bin_abs=${bin:A}
 model_abs=${model:A}
 # Exercise header rejection order on parsed metadata, entirely in-process.
-# INKY_SERVE_PROBES_ONLY=1 (the pull-request m5-serve job) leaves this to the unit job's cargo test --bins.
+# INKY_SERVE_PROBES_ONLY=1 (the pull-request m5-serve job) runs serve_header_policy in unit and
+# serve_layer3_three_turn_10k_cached_matches_cold_solo in an explicit --profile ci step.
 if [[ "${INKY_SERVE_PROBES_ONLY:-}" == 1 ]]; then
     print -r -- "serve_header_policy: runs in the unit job (cargo test --bins), not here"
 else
-    out=$(cargo test --locked --offline serve_header_policy) || { print -ru2 -- "$out"; exit 1; }
-    [[ "$out" == *'1 passed; 0 failed;'* ]] || { print -ru2 -- "$out"; exit 1; }
+    out=$(cargo test --locked --offline serve_header_policy 2>&1) || { print -ru2 -- "$out"; exit 1; }
+    print -r -- "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { print -ru2 -- "$out"; exit 1; }
+    if [[ -z "${SERVECHECK_SABOTAGE:-}" ]]; then
+        sched_out=$(INKY_TEST_MODEL="$model_abs" cargo test --locked --release --bin inky serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo -- --ignored --exact 2>&1) || { print -ru2 -- "$sched_out"; exit 1; }
+        print -r -- "$sched_out"
+        print -r -- "$sched_out" | grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' || { print -ru2 -- "$sched_out"; exit 1; }
+    fi
 fi
 cd tests
 exec go run ./servecheck "$bin_abs" "$model_abs"

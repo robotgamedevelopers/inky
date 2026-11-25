@@ -84,7 +84,7 @@ pub struct LoopW { pub msg_query: u32, pub down: [u32; 4], pub gain: [u32; 4], p
 
 struct Pb { data: Vec<u8> }
 impl Pb {
-    fn align(&mut self) { while self.data.len() % 256 != 0 { self.data.push(0); } }
+    fn align(&mut self) { while !self.data.len().is_multiple_of(256) { self.data.push(0); } }
     fn f32(&mut self, g: &Gguf, name: &str, shape: &[usize]) -> io::Result<u32> {
         let t = g.tensor(name, shape, &[T_F32])?;
         self.align();
@@ -97,8 +97,8 @@ impl Pb {
         let t = g.tensor(name, shape, &[T_F32])?;
         self.align();
         let off = self.data.len() as u32;
-        for c in g.bytes(t).chunks_exact(4) {
-            let u = u32::from_le_bytes(c.try_into().unwrap());
+        for &c in g.bytes(t).as_chunks::<4>().0 {
+            let u = u32::from_le_bytes(c);
             let r = u.wrapping_add(0x7FFF + ((u >> 16) & 1)) >> 16;
             self.data.extend_from_slice(&(r as u16).to_le_bytes());
         }
@@ -106,20 +106,109 @@ impl Pb {
     }
 }
 
-impl Engine {
-    pub fn load(path: &str, max_ctx: usize) -> Engine {
-        let chunk = configured_prefill_chunk(std::env::var("INK_CHUNK"), max_ctx).unwrap_or_else(|err| {
-            eprintln!("[inky] {err}");
-            std::process::exit(2);
-        });
-        Self::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), chunk)
-            .unwrap_or_else(|err| {
-                eprintln!("[inky] could not load {path}: {err}");
-                std::process::exit(1);
-            })
+/// CPU-validated GGUF model image ready to bind onto Metal after `enter_inky_mode()`.
+pub struct PreparedModel {
+    path: String,
+    max_ctx: usize,
+    t0: std::time::Instant,
+    pub g: Gguf,
+    pb: Pb,
+    layers: Vec<Layer>,
+    loops: Vec<LoopW>,
+    tok_embd: QW,
+    tok_norm: u32,
+    output: QW,
+    output_norm: u32,
+    output_res_query: u32,
+    n_vocab: usize,
+    eps: f32,
+    log_alpha: f32,
+    log_floor: f32,
+    situ_beta: f32,
+    situ_lbeta: f32,
+    wscale: f32,
+    softcap: f32,
+    slot_kind: Vec<(bool, usize)>,
+}
+
+impl PreparedModel {
+    pub fn into_engine(mut self, kv8: bool, chunk: usize) -> io::Result<Engine> {
+        let src = format!(
+            "{}{}\n{}\n{}",
+            if kv8 { "#define KV8 1\n" } else { "" },
+            include_str!("../kernels.metal"),
+            include_str!("../prefill.metal"),
+            include_str!("../bench_kernels.metal")
+        );
+        let kvb = if kv8 { 1 } else { 2 };
+        let gpu = Gpu::new(&src, KERNELS);
+        if self.g.map_len() > gpu.dev.maxBufferLength() {
+            return Err(invalid_model("GGUF exceeds the Metal buffer size limit"));
+        }
+        let w = gpu.buffer_nocopy(self.g.ptr(), self.g.map_len());
+        self.pb.data.extend(std::iter::repeat_n(0u8, 128 * NREL * 4)); // k_attn_h reads up to 95 rows past a relative-bias table
+        let pbuf = gpu.buffer_with(&self.pb.data);
+
+        let max_split = MAX_SPLIT;
+        let ar = Arena::new(max_split, N_VOCAB_PAD);
+        // the batch arena is allocated when a prefill needs it and released when generation starts
+        let act = gpu.buffer(ar.total as usize * 4);
+        let ctr = gpu.buffer(4096 * 4);
+        eprintln!(
+            "[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
+            self.path.rsplit('/').next().unwrap_or(&self.path),
+            self.g.file_len() as f64 / (1u64 << 30) as f64,
+            self.pb.data.len() as f64 / (1 << 20) as f64,
+            self.t0.elapsed()
+        );
+        // KV_CAP0 positions is one block. Further slots come from `BlockPool::grow`.
+        let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
+        let blocked_slab = Rc::new(RefCell::new(BlockedSlab::new(self.max_ctx.div_ceil(crate::blocks::BLOCK))));
+        let mut eng = Engine {
+            eps: self.eps, log_alpha: self.log_alpha, log_floor: self.log_floor,
+            situ_beta: self.situ_beta, situ_lbeta: self.situ_lbeta, wscale: self.wscale, softcap: self.softcap,
+            g: self.g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
+            slot_kind: self.slot_kind, qcap: RefCell::new(None), ctr, layers: self.layers, loops: self.loops,
+            tok_embd: self.tok_embd, tok_norm: self.tok_norm, output: self.output,
+            output_norm: self.output_norm, output_res_query: self.output_res_query,
+            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk,
+            tensor: std::env::var("INK_NO_TENSOR").is_err(),
+            hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
+            sep_comb: std::env::var("INK_FUSE_COMB").is_err(),
+            sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
+            tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
+            skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
+            last_out: Default::default(), last_mid: Default::default(),
+            max_ctx: self.max_ctx, n_vocab: self.n_vocab,
+            verify_keep: RefCell::new(None), verify_record: Cell::new(false),
+            block_pool,
+            blocked_slab,
+            loopcd_omega: Cell::new(0.0),
+            guided_logit_rows: Cell::new(0),
+            lg_weak: RefCell::new(None),
+            no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
+        };
+        eng.ensure_batch(64);
+        let ok = !eng.hgemm || eng.layout_ok();
+        eng.release_batch();
+        if !ok {
+            eprintln!("[inky] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
+            eng.hgemm = false;
+        }
+        if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
+        Ok(eng)
     }
-    /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
-    fn load_with(path: &str, max_ctx: usize, kv8: bool, chunk: usize) -> io::Result<Engine> {
+}
+
+impl Engine {
+    pub fn prefill_chunk_for(max_ctx: usize) -> Result<usize, String> {
+        configured_prefill_chunk(std::env::var("INK_CHUNK"), max_ctx).map_err(str::to_owned)
+    }
+
+    pub fn prepare_model(path: &str, max_ctx: usize) -> io::Result<PreparedModel> {
+        if max_ctx == 0 || !max_ctx.is_multiple_of(64) {
+            return Err(invalid_model("context size must be a positive multiple of 64"));
+        }
         let t0 = std::time::Instant::now();
         let g = Gguf::open(path)?;
         if !matches!(g.kv.get("general.architecture"), Some(Value::S(s)) if s == "inkling2_loop") {
@@ -139,7 +228,7 @@ impl Engine {
         }
         let swa_pat = match g.kv.get(&a("attention.sliding_window_pattern")) {
             Some(Value::AB(v)) if v.len() == N_PHYS
-                && v.iter().copied().eq((0..N_PHYS).map(|i| (i + 1) % BLOCK != 0)) => v,
+                && v.iter().copied().eq((0..N_PHYS).map(|i| !(i + 1).is_multiple_of(BLOCK))) => v,
             _ => return Err(invalid_model("unexpected sliding-window attention pattern")),
         };
 
@@ -227,64 +316,36 @@ impl Engine {
         let output_norm = pb.f32(&g, "output_norm.weight", &[E])?;
         let output_res_query = pb.f32(&g, "output_res_query.weight", &[E])?;
 
-        let src = format!("{}{}\n{}\n{}", if kv8 { "#define KV8 1\n" } else { "" }, include_str!("../kernels.metal"), include_str!("../prefill.metal"), include_str!("../bench_kernels.metal"));
-        let kvb = if kv8 { 1 } else { 2 };
-        let gpu = Gpu::new(&src, KERNELS);
-        if g.map_len() > gpu.dev.maxBufferLength() {
-            return Err(invalid_model("GGUF exceeds the Metal buffer size limit"));
-        }
-        let w = gpu.buffer_nocopy(g.ptr(), g.map_len());
-        pb.data.extend(std::iter::repeat(0u8).take(128 * NREL * 4));   // k_attn_h reads up to 95 rows past a relative-bias table
-        let pbuf = gpu.buffer_with(&pb.data);
-
-        let max_split = MAX_SPLIT;
-        let ar = Arena::new(max_split, N_VOCAB_PAD);
-        assert!(max_ctx % 64 == 0, "context size must be a multiple of 64");
-        // the batch arena is allocated when a prefill needs it and released when generation starts
-        let act = gpu.buffer(ar.total as usize * 4);
-        // K/V cache layout: per slot [K: NKV x cap x HD][V: NKV x cap x HD] halfs, sliding-window and full slots in separate
-        // buffers that both grow with the context (Metal commits a buffer when it is created, so capacity is real memory)
         let mut slot_kind = Vec::new();
         let (mut n_swa, mut n_full) = (0usize, 0usize);
         for s in 0..N_SLOT {
             let phys = if s < N_PHYS { s } else { LOOP_START + (s - N_PHYS) % (LOOP_END - LOOP_START) };
             if layers[phys].swa { slot_kind.push((true, n_swa)); n_swa += 1; } else { slot_kind.push((false, n_full)); n_full += 1; }
         }
-        assert!(n_full * 2 * NKV * max_ctx * HD < u32::MAX as usize, "KV cache too large for 32-bit offsets");
-        let ctr = gpu.buffer(4096 * 4);
-        eprintln!("[inky] loaded {} ({:.1} GiB mapped, {:.1} MiB params) in {:.2?}",
-            path.rsplit('/').next().unwrap_or(path), g.file_len() as f64 / (1u64 << 30) as f64, pb.data.len() as f64 / (1 << 20) as f64, t0.elapsed());
-        // KV_CAP0 positions is one block. Further slots come from `BlockPool::grow`.
-        let block_pool = std::cell::RefCell::new(crate::blocks::BlockPools::gpu(&gpu.dev, 1, 1, kvb as u32));
-        let blocked_slab = Rc::new(RefCell::new(BlockedSlab::new(max_ctx.div_ceil(crate::blocks::BLOCK))));
-        let eng = Engine {
-            eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap,
-            g, gpu, w, pb: pbuf, act: std::cell::RefCell::new(act),
-            slot_kind, qcap: RefCell::new(None), ctr, layers, loops, tok_embd, tok_norm, output, output_norm, output_res_query,
-            ar, abase: Cell::new(0), dstart: Cell::new(0), kv8, kvb, ba: Default::default(), chunk, tensor: std::env::var("INK_NO_TENSOR").is_err(),
-            hgemm: std::env::var("INK_NO_HGEMM").is_err() && std::env::var("INK_NO_TENSOR").is_err(),
-            sep_comb: std::env::var("INK_FUSE_COMB").is_err(), sep_topk: std::env::var("INK_SEP_TOPK").is_ok(),
-            tail: std::cell::Cell::new(std::env::var("INK_NO_TAIL").is_err()),
-            skip: Default::default(), stop: std::cell::Cell::new(usize::MAX), done: std::cell::Cell::new(0),
-            last_out: Default::default(), last_mid: Default::default(),
-            max_ctx, n_vocab,
-            verify_keep: RefCell::new(None), verify_record: Cell::new(false),
-            block_pool,
-            blocked_slab,
-            loopcd_omega: Cell::new(0.0),
-            guided_logit_rows: Cell::new(0),
-            lg_weak: RefCell::new(None),
-            no_grp_dec: Cell::new(std::env::var("INK_NO_GRP_DEC").is_ok_and(|v| !v.is_empty() && v != "0")),
-        };
-        let mut eng = eng;
-        eng.ensure_batch(64);
-        let ok = !eng.hgemm || eng.layout_ok();
-        eng.release_batch();
-        if !ok {
-            eprintln!("[inky] unexpected tensor accumulator layout on this GPU/OS: using the slower prefill path");
-            eng.hgemm = false;
+        if n_full.saturating_mul(2).saturating_mul(NKV).saturating_mul(max_ctx).saturating_mul(HD) >= u32::MAX as usize {
+            return Err(invalid_model("KV cache too large for 32-bit offsets"));
         }
-        if std::env::var("INK_NO_WARM").is_err() { eng.warm(); }
-        Ok(eng)
+        Ok(PreparedModel {
+            path: path.to_owned(), max_ctx, t0, g, pb, layers, loops, tok_embd, tok_norm, output, output_norm,
+            output_res_query, n_vocab, eps, log_alpha, log_floor, situ_beta, situ_lbeta, wscale, softcap, slot_kind,
+        })
+    }
+}
+
+impl Engine {
+    pub fn load(path: &str, max_ctx: usize) -> Engine {
+        let chunk = configured_prefill_chunk(std::env::var("INK_CHUNK"), max_ctx).unwrap_or_else(|err| {
+            eprintln!("[inky] {err}");
+            std::process::exit(2);
+        });
+        Self::load_with(path, max_ctx, KV8.load(std::sync::atomic::Ordering::Relaxed), chunk)
+            .unwrap_or_else(|err| {
+                eprintln!("[inky] could not load {path}: {err}");
+                std::process::exit(1);
+            })
+    }
+    /// `kv8`: keep the K/V cache as 8-bit integers with a per-vector scale (half the memory, not exact) instead of fp16
+    fn load_with(path: &str, max_ctx: usize, kv8: bool, chunk: usize) -> io::Result<Engine> {
+        Self::prepare_model(path, max_ctx)?.into_engine(kv8, chunk)
     }
 }

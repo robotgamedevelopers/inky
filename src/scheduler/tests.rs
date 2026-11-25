@@ -621,6 +621,6 @@ fn walk_scheduler_trace_satisfies_invariants_across_seeds() {
     let (tr, _) = walk_scheduler_trace(cfg, 0, 60).unwrap();
     let (data, check, tlc_cfg) = render_cache_scheduler_tla_bundle(&[tr]).unwrap();
     assert!(data.contains("MODULE TraceData"));
-    assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
+    assert!(check.contains("Conforms == Init /\\ [][TraceNext]_vars"));
     assert!(tlc_cfg.contains("BypassBoundHolds"));
 }

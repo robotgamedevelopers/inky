@@ -315,7 +315,7 @@ impl BlockBook {
         let l = &self.lanes[lane];
         let n = l.pos;
         let last = l.prompt / geo.block * geo.block;
-        if n % geo.block != 0 || n > last { return Ok(None); }
+        if !n.is_multiple_of(geo.block) || n > last { return Ok(None); }
         if l.head.and_then(|h| self.start(h)).is_some_and(|h| h.pos >= n) { return Ok(None); }
         let head_dies = l.head.and_then(|h| self.start(h)).is_some_and(|h| h.reasons == HEAD);
         if !head_dies && self.starts.iter().all(|s| s.is_some()) { return Ok(None); }
@@ -328,7 +328,7 @@ impl BlockBook {
         }
         let mut reasons = HEAD;
         if n == last { reasons |= PROMPT; }
-        if (n / geo.block) % geo.every == 0 { reasons |= EVERY; }
+        if (n / geo.block).is_multiple_of(geo.every) { reasons |= EVERY; }
         if let Some(h) = self.lanes[lane].head.take() { self.drop_reason(h, gpu)?; }
         let id = self.starts.iter().position(|s| s.is_none()).ok_or(BookError::NoStart)?;
         for (_, e) in table.entries() { self.hold(e)?; }

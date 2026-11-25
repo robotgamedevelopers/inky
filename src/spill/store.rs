@@ -181,10 +181,6 @@ impl SpillStore {
         &self.dir
     }
 
-    pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -355,7 +351,7 @@ impl SpillStore {
         let total_bytes = (SPILL_HEADER_LEN as u64)
             .checked_add(kv_bytes.len() as u64)
             .and_then(|v| v.checked_add(state_slice.len() as u64))
-            .ok_or_else(|| SpillError::PayloadTooLarge(usize::MAX))?;
+            .ok_or(SpillError::PayloadTooLarge(usize::MAX))?;
 
         if total_bytes > self.max_bytes {
             self.stats.over_budget_drops += 1;

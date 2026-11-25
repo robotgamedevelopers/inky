@@ -9,7 +9,7 @@
 //! prefilled there. A kept prompt supplies its whole length or nothing — the convolution state exists only at its
 //! end — so a partial overlap with a lane's prompt is a cold start, exactly as an equal prompt is today.
 
-use crate::engine::{Engine, Lane, Span, EXT};
+use crate::engine::{Engine, Lane, Span};
 use crate::metal::CmdBuf;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -17,13 +17,13 @@ use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-mod block_cache;
+pub mod block_cache;
 mod messages;
 mod prompt;
 mod reply;
@@ -38,10 +38,11 @@ use block_cache::{
     effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
     ServeBlockCache,
 };
-use messages::translate_messages;
+use messages::{anthropic_effort, translate_messages};
 #[cfg(test)]
 use prompt::render;
-use prompt::{render_limited, RenderError};
+pub use prompt::validate_effort;
+use prompt::{render_limited, request_effort, RenderError};
 #[cfg(test)]
 use reply::tool_use_id;
 use reply::{
@@ -68,16 +69,50 @@ pub struct ServeOpts { pub model: String, pub ctx: usize, pub bind: Vec<SocketAd
                       pub spill_dir: Option<std::path::PathBuf>,
                       /// disk budget in bytes for `--spill-dir` before LRU disk GC (`--max-spill-bytes`)
                       pub max_spill_bytes: u64,
+                      /// isolate every request in its own fresh cache namespace (`--isolate-cache`)
+                      pub isolate_cache: bool,
+                      /// report `0` cached prompt tokens in HTTP usage fields (`--hide-cached-tokens`)
+                      pub hide_cached_tokens: bool,
                       /// 8-bit K/V cache (`--kv8`): doubles paged BlockPool capacity (NOT exact)
                       pub kv8: bool }
 
 #[derive(Clone, Copy)]
 struct Specials { msg_user: u32, msg_model: u32, msg_system: u32, msg_tool: u32, c_text: u32, c_think: u32, c_xml: u32, c_tool: u32, end: u32, end_sampling: u32 }
 
-fn special(tk: &Tokenizer, s: &str) -> u32 {
+fn try_special(tk: &Tokenizer, s: &str) -> Result<u32, String> {
     let v = tk.encode(s, true);
-    assert!(v.len() == 1, "{s} is not one token");
-    v[0]
+    if v.len() == 1 && tk.is_special(v[0]) {
+        Ok(v[0])
+    } else {
+        Err(format!("model tokenizer is missing required special token {s}"))
+    }
+}
+
+impl Specials {
+    #[inline]
+    fn is_role_stop(&self, t: u32) -> bool {
+        t == self.msg_user || t == self.msg_system || t == self.msg_tool
+    }
+
+    fn try_from_tokenizer(tk: &Tokenizer) -> Result<Self, String> {
+        Ok(Self {
+            msg_user: try_special(tk, "<|message_user|>")?,
+            msg_model: try_special(tk, "<|message_model|>")?,
+            msg_system: try_special(tk, "<|message_system|>")?,
+            msg_tool: try_special(tk, "<|message_tool|>")?,
+            c_text: try_special(tk, "<|content_text|>")?,
+            c_think: try_special(tk, "<|content_thinking|>")?,
+            c_xml: try_special(tk, "<|content_xml|>")?,
+            c_tool: try_special(tk, "<|content_invoke_tool_json|>")?,
+            end: try_special(tk, "<|end_message|>")?,
+            end_sampling: try_special(tk, "<|content_model_end_sampling|>")?,
+        })
+    }
+}
+
+#[cfg(test)]
+fn special(tk: &Tokenizer, s: &str) -> u32 {
+    try_special(tk, s).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A random startup nonce for tool and anonymous recording IDs across restarts.
@@ -104,6 +139,7 @@ struct Job {
     seed: u64,
     thinking_budget: usize,
     loopcd_omega: f32,
+    cache_namespace: u64,
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
@@ -256,10 +292,9 @@ impl LaneS {
         metrics: &Mutex<Counters>,
         tick_seq: &mut u64,
     ) {
-        let active = self
-            .release_job(eng, cache, metrics, tick_seq)
-            .expect("failed lane must have an active job");
-        let _ = active.job.out.send(Ev::Failed(message));
+        if let Some(active) = self.release_job(eng, cache, metrics, tick_seq) {
+            let _ = active.job.out.send(Ev::Failed(message));
+        }
     }
 }
 
@@ -297,24 +332,24 @@ impl Active {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn reusable_prefix(prompt: &[u32], has_state: bool, request: &[u32]) -> usize {
     let n = shared_prefix(prompt, request);
     if has_state && n == prompt.len() && n < request.len() { n } else { 0 }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct LaneCand { prefix: usize, free: bool, copyable: bool, tick: u64 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Admission { dst: usize, src: usize, prefix: usize }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
     let own = cands.iter().enumerate().filter(|(_, c)| c.free)
         .max_by_key(|(_, c)| (c.prefix, std::cmp::Reverse(c.tick)));
@@ -323,27 +358,197 @@ fn choose_lane(cands: &[LaneCand]) -> Option<Admission> {
         .max_by_key(|(_, c)| (c.prefix, c.tick));
     match src {
         Some((s, c)) if s != dst => {
-            let lru = cands.iter().enumerate().filter(|(_, c)| c.free).min_by_key(|(_, c)| c.tick).unwrap().0;
+            let (lru, _) = cands.iter().enumerate().filter(|(_, c)| c.free).min_by_key(|(_, c)| c.tick)?;
             Some(Admission { dst: lru, src: s, prefix: c.prefix })
         }
         _ => Some(Admission { dst, src: dst, prefix: own_prefix }),
     }
 }
 
-#[allow(dead_code)]
-fn decode_overwrites_prompt(pos: usize, prompt_end: usize) -> bool { pos >= prompt_end.max(EXT) }
+const DEFAULT_GPU_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SCHEDULER_STALL_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// Wait for an already-committed `MTLCommandBuffer` and inspect its completion status.
-fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
-    cb.waitUntilCompleted();
-    let status = cb.status();
-    if status == MTLCommandBufferStatus::Completed { return Ok(()); }
-    if let Some(error) = cb.error() {
-        eprintln!("[serve] Metal {stage} failed ({status:?}): {}", error.localizedDescription());
-    } else {
-        eprintln!("[serve] Metal {stage} failed ({status:?})");
+/// Shared atomic scheduler heartbeat and active-step stall monitor exposed through `/health`.
+/// Distinguishes idle waiting on `rx.recv()` (`in_step == false`) from an active GPU/spill step
+/// (`in_step == true`) that has exceeded `stall_threshold`.
+struct SchedulerHealth {
+    origin: Instant,
+    in_step: AtomicBool,
+    step_started_ns: AtomicU64,
+    last_heartbeat_ns: AtomicU64,
+    scheduler_stopped: AtomicBool,
+    stall_threshold_ns: AtomicU64,
+    gpu_step_timeout_ns: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl Default for SchedulerHealth {
+    fn default() -> Self {
+        Self::new(Instant::now())
     }
-    Err(format!("Metal {stage} failed"))
+}
+
+impl SchedulerHealth {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            in_step: AtomicBool::new(false),
+            step_started_ns: AtomicU64::new(0),
+            last_heartbeat_ns: AtomicU64::new(0),
+            scheduler_stopped: AtomicBool::new(false),
+            stall_threshold_ns: AtomicU64::new(DEFAULT_SCHEDULER_STALL_THRESHOLD.as_nanos() as u64),
+            gpu_step_timeout_ns: AtomicU64::new(DEFAULT_GPU_STEP_TIMEOUT.as_nanos() as u64),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_thresholds(origin: Instant, stall_threshold: Duration, gpu_step_timeout: Duration) -> Self {
+        let h = Self::new(origin);
+        h.stall_threshold_ns.store(stall_threshold.as_nanos() as u64, Ordering::Relaxed);
+        h.gpu_step_timeout_ns.store(gpu_step_timeout.as_nanos() as u64, Ordering::Relaxed);
+        h
+    }
+
+    fn rel_ns(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin).as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn gpu_step_timeout(&self) -> Duration {
+        Duration::from_nanos(self.gpu_step_timeout_ns.load(Ordering::Relaxed))
+    }
+
+    fn mark_idle(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+    }
+
+    fn begin_step(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.step_started_ns.store(ns, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        self.in_step.store(true, Ordering::Release);
+    }
+
+    fn end_step_ok(&self, now: Instant) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn end_step_failed(&self, now: Instant, reason: String) {
+        let ns = self.rel_ns(now);
+        self.in_step.store(false, Ordering::Release);
+        self.last_heartbeat_ns.store(ns, Ordering::Release);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    }
+
+    fn mark_stopped(&self) {
+        self.in_step.store(false, Ordering::Release);
+        self.scheduler_stopped.store(true, Ordering::Release);
+    }
+
+    fn check(&self, now: Instant) -> (bool, Option<String>) {
+        if self.scheduler_stopped.load(Ordering::Acquire) {
+            return (false, Some("scheduler stopped".into()));
+        }
+        if self.in_step.load(Ordering::Acquire) {
+            let started = self.step_started_ns.load(Ordering::Acquire);
+            let elapsed_ns = self.rel_ns(now).saturating_sub(started);
+            let threshold_ns = self.stall_threshold_ns.load(Ordering::Relaxed);
+            if elapsed_ns > threshold_ns {
+                return (
+                    false,
+                    Some(format!("scheduler stalled in active step for {}ms", elapsed_ns / 1_000_000)),
+                );
+            }
+        }
+        if let Some(err) = self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return (false, Some(err));
+        }
+        (true, None)
+    }
+}
+
+#[derive(Default)]
+struct DeferralCounters {
+    admit_pool_deferrals: AtomicU64,
+    step_pool_deferrals: AtomicU64,
+}
+
+fn wait_for_gpu_completion(
+    stage: &str,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut() -> (MTLCommandBufferStatus, Option<String>),
+    mut sleep_fn: impl FnMut(Duration),
+) -> Result<(), String> {
+    let start = now();
+    let deadline = start + timeout;
+    loop {
+        let (status, err_desc) = poll();
+        match status {
+            MTLCommandBufferStatus::Completed => return Ok(()),
+            MTLCommandBufferStatus::Error => {
+                if let Some(desc) = err_desc {
+                    eprintln!("[serve] Metal {stage} failed ({status:?}): {desc}");
+                } else {
+                    eprintln!("[serve] Metal {stage} failed ({status:?})");
+                }
+                return Err(format!("Metal {stage} failed"));
+            }
+            _ => {
+                let cur = now();
+                if cur >= deadline {
+                    let msg = format!("Metal {stage} timed out after {}ms", timeout.as_millis());
+                    eprintln!("[serve] {msg} ({status:?})");
+                    return Err(msg);
+                }
+                let rem = deadline.saturating_duration_since(cur);
+                sleep_fn(Duration::from_micros(100).min(rem));
+            }
+        }
+    }
+}
+
+/// Wait for an already-committed `MTLCommandBuffer` up to `DEFAULT_GPU_STEP_TIMEOUT`.
+#[cfg(test)]
+fn wait_committed_step(cb: &CmdBuf, stage: &str) -> Result<(), String> {
+    wait_committed_step_bounded(cb, stage, DEFAULT_GPU_STEP_TIMEOUT, None)
+}
+
+/// Wait for an already-committed `MTLCommandBuffer` up to `timeout` and inspect its completion status.
+fn wait_committed_step_bounded(
+    cb: &CmdBuf,
+    stage: &str,
+    timeout: Duration,
+    health: Option<&SchedulerHealth>,
+) -> Result<(), String> {
+    let res = wait_for_gpu_completion(
+        stage,
+        timeout,
+        Instant::now,
+        || {
+            let st = cb.status();
+            let desc = if st == MTLCommandBufferStatus::Error {
+                cb.error().map(|e| e.localizedDescription().to_string())
+            } else {
+                None
+            };
+            (st, desc)
+        },
+        std::thread::sleep,
+    );
+    if let Some(health) = health {
+        match &res {
+            Ok(()) => health.end_step_ok(Instant::now()),
+            Err(msg) if msg.contains("timed out") => health.end_step_failed(Instant::now(), msg.clone()),
+            Err(_) => health.end_step_ok(Instant::now()),
+        }
+    }
+    res
 }
 
 /// Safe non-GPU host work overlapped while a committed `MTLCommandBuffer` executes on GPU:
@@ -364,12 +569,9 @@ fn overlap_host_work_step<'a>(
     cache: &mut ServeBlockCache,
     metrics: &Mutex<Counters>,
 ) -> Vec<usize> {
-    loop {
-        match rx.try_recv() {
-            Ok(j) => queue.push_back(QueuedJob::new(j)),
-            // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        }
+    // Defer shutdown/cleanup until wait_committed_step finishes so GPU buffers are idle.
+    while let Ok(j) = rx.try_recv() {
+        queue.push_back(QueuedJob::new(j));
     }
     let dropped = discard_cancelled_jobs(queue);
     if dropped > 0 {
@@ -388,12 +590,11 @@ fn overlap_host_work_step<'a>(
                     debug_assert!(!released_now, "InStep cancel must defer release until complete_step");
                 }
             }
-            crate::scheduler::LaneState::Ready => {
+            crate::scheduler::LaneState::Ready
                 if a.job.out.cancelled()
-                    || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
-                {
-                    waiting_cancelled.push(i);
-                }
+                    || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err()) =>
+            {
+                waiting_cancelled.push(i);
             }
             _ => {}
         }
@@ -479,9 +680,24 @@ fn partition_pool_exhausted(
         return (exhausted.into_iter().map(|(i, _)| i).collect(), Vec::new());
     }
     let mut to_fail = exhausted;
-    let victim = to_fail.pop().expect("non-empty exhausted");
+    let Some(victim) = to_fail.pop() else {
+        return (Vec::new(), Vec::new());
+    };
     let to_defer = to_fail.into_iter().map(|(i, _)| i).collect();
     (to_defer, vec![victim])
+}
+
+fn span_exceeds_pool_capacity(pools: &crate::blocks::BlockPools, p0: usize, t: usize) -> bool {
+    let need_blocks = (p0 + t - 1) / crate::blocks::BLOCK - p0 / crate::blocks::BLOCK + 1;
+    let usable = |pool: &crate::blocks::BlockPool| {
+        (1..=pool.len())
+            .filter(|&idx| {
+                pool.record(crate::blocks::Slot::new(idx as u32).expect("valid slot"))
+                    .is_ok_and(|r| r.generation() < u32::MAX)
+            })
+            .count()
+    };
+    need_blocks > usable(&pools.full) || need_blocks > usable(&pools.window)
 }
 
 fn scheduler(
@@ -493,6 +709,9 @@ fn scheduler(
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
     spill_store: Option<crate::spill::SpillStore>,
+    retained_host_budget_bytes: u64,
+    health: Arc<SchedulerHealth>,
+    deferrals: Arc<DeferralCounters>,
     #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
@@ -508,48 +727,67 @@ fn scheduler(
         Some(store) => ServeBlockCache::with_spill(store),
         None => ServeBlockCache::new(),
     };
+    cache.set_max_retained_host_bytes(retained_host_budget_bytes);
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<QueuedJob> = VecDeque::new();
-    let stop = [tk.eos, sp.end_sampling];
+    let stop = [tk.eos, sp.end_sampling, sp.msg_user, sp.msg_system, sp.msg_tool];
     let mut planner = crate::scheduler::ServeStepPlanner::new(nlanes, SERVE_STEP_MAX_BYPASS);
     let (context, window_slots) = {
         let pools = eng.block_pool().borrow();
         (pooled_context(eng.max_ctx, pools.full.len(), pools.window.len()), pools.window.len())
     };
     let mut pool_deferred = vec![false; nlanes];
-    let mut prev_lanes_released = cache.stats().lanes_released;
-    let mut prev_window_pruned = cache.stats().window_pruned;
-    let mut prev_starts_spilled = 0;
+    type PoolEpoch = (u64, u64, u64, u64);
+    let mut prev_pool_epoch: PoolEpoch = (
+        cache.stats().lanes_released,
+        cache.stats().window_pruned,
+        cache.stats().start_points_evicted,
+        cache.stats().singleflight_rebinds,
+    );
+    let mut prev_starts_spilled = 0u64;
+    let mut last_admit_deferred: Option<(u64, PoolEpoch, usize)> = None;
     let mut checkpoints_sealed = false;
     loop {
         let cur_stats = cache.stats();
+        deferrals.admit_pool_deferrals.store(cur_stats.admit_deferred_pool_pressure, Ordering::Relaxed);
+        deferrals.step_pool_deferrals.store(cur_stats.step_deferred_pool_pressure, Ordering::Relaxed);
         if cur_stats.starts_spilled != prev_starts_spilled {
             metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled = cur_stats.starts_spilled;
             prev_starts_spilled = cur_stats.starts_spilled;
         }
-        if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
+        let cur_epoch = (
+            cur_stats.lanes_released,
+            cur_stats.window_pruned,
+            cur_stats.start_points_evicted,
+            cur_stats.singleflight_rebinds,
+        );
+        if cur_epoch != prev_pool_epoch {
             pool_deferred.fill(false);
-            prev_lanes_released = cur_stats.lanes_released;
-            prev_window_pruned = cur_stats.window_pruned;
+            prev_pool_epoch = cur_epoch;
+            last_admit_deferred = None;
         }
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
         // take new requests: block only when there is nothing to do
         let busy = busy_count > 0;
         if !busy && queue.is_empty() {
+            health.mark_idle(Instant::now());
             match rx.recv() {
                 Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(_) => {
+                    health.mark_stopped();
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
                 }
             }
         }
+        health.mark_idle(Instant::now());
         loop {
             match rx.try_recv() {
                 Ok(j) => queue.push_back(QueuedJob::new(j)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    health.mark_stopped();
                     cleanup_scheduler(eng, &mut lanes, &mut cache);
                     return;
                 }
@@ -587,13 +825,17 @@ fn scheduler(
                 continue;
             }
             if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap().job;
+                let Some(QueuedJob { job: j, .. }) = queue.pop_front() else { break };
                 let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 m.queued = m.queued.saturating_sub(1);
                 let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
                 continue;
             }
             {
+                let cur_busy = lanes.iter().filter(|l| l.job.is_some()).count();
+                if last_admit_deferred == Some((j.seq, prev_pool_epoch, cur_busy)) {
+                    break;
+                }
                 let pools = eng.block_pool().borrow();
                 let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
                     .iter()
@@ -603,6 +845,7 @@ fn scheduler(
                         let run = !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[idx];
                         Some(InflightLaneReserve {
                             lane: idx,
+                            namespace: a.job.cache_namespace,
                             toks: &a.job.toks,
                             n_past: a.n_past,
                             pf_end: a.pf_end,
@@ -614,11 +857,16 @@ fn scheduler(
                         })
                     })
                     .collect();
-                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
+                if !cache.can_admit_in_namespace(&pools, &active_reserves, i, j.cache_namespace, &j.toks, j.max, eng.chunk) {
+                    let c = cache.stats().admit_deferred_pool_pressure;
+                    deferrals.admit_pool_deferrals.store(c, Ordering::Relaxed);
+                    metrics.lock().unwrap_or_else(|e| e.into_inner()).admit_deferrals = c;
+                    last_admit_deferred = Some((j.seq, prev_pool_epoch, cur_busy));
                     break;
                 }
+                last_admit_deferred = None;
             }
-            let QueuedJob { job: j, state } = queue.pop_front().unwrap();
+            let Some(QueuedJob { job: j, state }) = queue.pop_front() else { break };
             planner.admit_queued(i, state);
             #[cfg(test)]
             let admitted = planner.state(i);
@@ -628,12 +876,13 @@ fn scheduler(
             planner.start_restore(i);
             #[cfg(test)]
             let restoring = planner.state(i);
+            health.begin_step(prep_began);
             let start = {
                 let l = &mut lanes[i];
                 let mut pools = eng.block_pool().borrow_mut();
                 let matched = {
                     let mut tbl = l.lane.block_table().borrow_mut();
-                    cache.match_and_bind(&mut pools, &mut tbl, &mut l.blocks, &j.toks)
+                    cache.match_and_bind_in_namespace(&mut pools, &mut tbl, &mut l.blocks, j.cache_namespace, &j.toks)
                 };
                 match matched {
                     Some((matched_at, cs)) => {
@@ -647,6 +896,7 @@ fn scheduler(
                 }
             };
             eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
+            health.end_step_ok(Instant::now());
             timing.prep = prep_began.elapsed();
             let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
             // once per request, not per round and not per emitted token
@@ -683,10 +933,17 @@ fn scheduler(
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.rebind_if_deeper_match(&mut pools, &mut tbl, &mut l.blocks, &a.job.toks, a.n_past)
                     };
-                    if let Some((matched_at, cs)) = rebound {
-                        eng.on(&l.lane).set_cs(&cs);
-                        a.n_past = matched_at;
-                        a.cached = matched_at;
+                    match rebound {
+                        Some((matched_at, cs)) => {
+                            debug_assert!(matched_at > a.n_past && l.blocks.written == matched_at);
+                            eng.on(&l.lane).set_cs(&cs);
+                            a.n_past = matched_at;
+                            a.cached = matched_at;
+                        }
+                        None => {
+                            // Failed or skipped rebind must leave the lane's prior bindings consistent.
+                            assert_eq!(l.blocks.written, a.n_past, "failed rebind corrupted lane written position");
+                        }
                     }
                 }
             }
@@ -701,6 +958,7 @@ fn scheduler(
                 let a = l.job.as_ref()?;
                 (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
                     lane: i,
+                    namespace: a.job.cache_namespace,
                     toks: &a.job.toks,
                     n_past: a.n_past,
                     pf_end: a.pf_end,
@@ -725,27 +983,42 @@ fn scheduler(
         let step_plan = step::plan(&mut planner, &step_inputs, eng.chunk, crate::blocks::BLOCK);
         match step_plan {
             Some(crate::scheduler::ServeStepPlan::Prefill(sp_list)) => {
+                health.begin_step(Instant::now());
                 let mut live_sp: Vec<(usize, usize, usize)> = Vec::with_capacity(sp_list.len());
                 let mut exhausted: Vec<(usize, String)> = Vec::new();
+                let mut impossible: Vec<(usize, String)> = Vec::new();
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &(i, p0, t) in &sp_list {
                         let mut tbl = lanes[i].lane.block_table().borrow_mut();
                         match cache.ensure_span_blocks(&mut pools, &mut tbl, p0, t) {
                             Ok(()) => live_sp.push((i, p0, t)),
-                            Err(err) => exhausted.push((i, err.to_string())),
+                            Err(err) => {
+                                if span_exceeds_pool_capacity(&pools, p0, t) {
+                                    impossible.push((i, err.to_string()));
+                                } else {
+                                    exhausted.push((i, err.to_string()));
+                                }
+                            }
                         }
                     }
                 }
+                for (i, msg) in impossible {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
                 if !exhausted.is_empty() {
-                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                    let other_progressing_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !sp_list.iter().any(|&(k, _, _)| k == j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && l.job.as_ref().is_some_and(|a| !a.job.out.cancelled() && !pool_deferred[j] && !deferred_by_singleflight[j])
                     });
                     let (to_defer, to_fail) =
-                        partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_runnable_exists);
+                        partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_progressing_exists);
                     for i in to_defer {
                         cache.record_step_deferred_pool_pressure();
+                        let s = cache.stats().step_deferred_pool_pressure;
+                        deferrals.step_pool_deferrals.store(s, Ordering::Relaxed);
+                        metrics.lock().unwrap_or_else(|e| e.into_inner()).step_deferrals = s;
                         pool_deferred[i] = true;
                     }
                     for (i, msg) in to_fail {
@@ -754,6 +1027,7 @@ fn scheduler(
                     }
                 }
                 if live_sp.is_empty() {
+                    health.end_step_ok(Instant::now());
                     for cancelled_i in planner.complete_step() {
                         if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                             a.log_cancellation(cancelled_i);
@@ -772,7 +1046,7 @@ fn scheduler(
                         .enumerate()
                         .filter_map(|(k, &(i, p0, t))| {
                             let l = &lanes[i];
-                            let a = l.job.as_ref().unwrap();
+                            let a = l.job.as_ref()?;
                             let next_pos = p0 + t;
                             (next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel())
                                 .then(|| crate::engine::GumbelSpan {
@@ -789,15 +1063,16 @@ fn scheduler(
                     eng.encode_gumbel_spans(&cb, &gumbels);
                 } else if let Some(&(i, p0, t)) = live_sp.first() {
                     let l = &lanes[i];
-                    let a = l.job.as_ref().unwrap();
-                    let next_pos = p0 + t;
-                    if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
-                        eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                    if let Some(a) = l.job.as_ref() {
+                        let next_pos = p0 + t;
+                        if next_pos == a.pf_end && !a.job.out.cancelled() && a.sampler.uses_gpu_gumbel() {
+                            eng.encode_gumbel_solo(&cb, &l.lane, next_pos, a.job.seed, next_pos, a.job.temp, a.think.ban_token(&sp));
+                        }
                     }
                 }
                 cb.commit();
                 let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
-                if let Err(e) = wait_committed_step(&cb, "prefill") {
+                if let Err(e) = wait_committed_step_bounded(&cb, "prefill", health.gpu_step_timeout(), Some(&health)) {
                     fail_step(eng, &mut cache, &mut lanes, live_sp.iter().map(|&(i, _, _)| i), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for &(i, _, _) in &live_sp { planner.on_finish(i); }
@@ -810,7 +1085,7 @@ fn scheduler(
                     let mut pools = eng.block_pool().borrow_mut();
                     for &(i, p0, t) in &live_sp {
                         let l = &mut lanes[i];
-                        let a = l.job.as_ref().unwrap();
+                        let Some(a) = l.job.as_ref() else { continue };
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.finish_prefill_span(
                             &mut pools,
@@ -828,9 +1103,8 @@ fn scheduler(
                 }
                 metrics.lock().unwrap_or_else(|e| e.into_inner()).input += live_sp.iter().map(|&(_, _, t)| t).sum::<usize>();
                 for (k, &(i, p0, t)) in live_sp.iter().enumerate() {
-
                     let l = &mut lanes[i];
-                    let a = l.job.as_mut().unwrap();
+                    let Some(a) = l.job.as_mut() else { continue };
                     a.timing.prefill.add(t, elapsed);
                     a.n_past = p0 + t;
                     if a.job.out.cancelled() || planner.state(i) == crate::scheduler::LaneState::Cancelling {
@@ -864,28 +1138,57 @@ fn scheduler(
                 release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             Some(crate::scheduler::ServeStepPlan::Decode(need_dec)) => {
+                health.begin_step(Instant::now());
                 let mut live_dec: Vec<usize> = Vec::with_capacity(need_dec.len());
                 let mut exhausted: Vec<(usize, String)> = Vec::new();
+                let mut impossible: Vec<(usize, String)> = Vec::new();
                 {
                     let mut pools = eng.block_pool().borrow_mut();
                     for &i in &need_dec {
-                        let pos = lanes[i].job.as_ref().unwrap().n_past;
+                        let Some(a) = lanes[i].job.as_ref() else { continue };
+                        let pos = a.n_past;
+                        // Admission already installed the last prompt token for a first guided draw (`pos < a.pf_end`).
+                        // Subsequent decode steps feed the sampled token back into their own lane.
+                        let next_tok = if pos >= a.pf_end {
+                            let Some(tok) = a.pending else { continue };
+                            Some(tok)
+                        } else {
+                            None
+                        };
                         let mut tbl = lanes[i].lane.block_table().borrow_mut();
                         match cache.ensure_span_blocks(&mut pools, &mut tbl, pos, 1) {
-                            Ok(()) => live_dec.push(i),
-                            Err(err) => exhausted.push((i, err.to_string())),
+                            Ok(()) => {
+                                if let Some(tok) = next_tok {
+                                    eng.on(&lanes[i].lane).set_tokens(pos, &[tok]);
+                                }
+                                live_dec.push(i);
+                            }
+                            Err(err) => {
+                                if span_exceeds_pool_capacity(&pools, pos, 1) {
+                                    impossible.push((i, err.to_string()));
+                                } else {
+                                    exhausted.push((i, err.to_string()));
+                                }
+                            }
                         }
                     }
                 }
+                for (i, msg) in impossible {
+                    lanes[i].fail(eng, &mut cache, msg, metrics, &mut tick_seq);
+                    planner.on_finish(i);
+                }
                 if !exhausted.is_empty() {
-                    let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
+                    let other_progressing_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !need_dec.contains(&j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && l.job.as_ref().is_some_and(|a| !a.job.out.cancelled() && !pool_deferred[j] && !deferred_by_singleflight[j])
                     });
                     let (to_defer, to_fail) =
-                        partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_runnable_exists);
+                        partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_progressing_exists);
                     for i in to_defer {
                         cache.record_step_deferred_pool_pressure();
+                        let s = cache.stats().step_deferred_pool_pressure;
+                        deferrals.step_pool_deferrals.store(s, Ordering::Relaxed);
+                        metrics.lock().unwrap_or_else(|e| e.into_inner()).step_deferrals = s;
                         pool_deferred[i] = true;
                     }
                     for (i, msg) in to_fail {
@@ -894,6 +1197,7 @@ fn scheduler(
                     }
                 }
                 if live_dec.is_empty() {
+                    health.end_step_ok(Instant::now());
                     for cancelled_i in planner.complete_step() {
                         if let Some(a) = lanes[cancelled_i].release_job(eng, &mut cache, metrics, &mut tick_seq) {
                             a.log_cancellation(cancelled_i);
@@ -901,16 +1205,14 @@ fn scheduler(
                     }
                     continue;
                 }
-                // Admission already installed the last prompt token for a first guided draw.
-                // Subsequent decode steps feed the sampled token back into their own lane.
-                for &i in &live_dec {
-                    let a = lanes[i].job.as_ref().unwrap();
-                    if a.n_past >= a.pf_end {
-                        eng.on(&lanes[i].lane).set_tokens(a.n_past, &[a.pending.unwrap()]);
-                    }
-                }
-                let spans: Vec<Span> = live_dec.iter().map(|&i| Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref().unwrap().n_past, t: 1 }).collect();
-                let omegas: Vec<f32> = live_dec.iter().map(|&i| lanes[i].job.as_ref().unwrap().job.loopcd_omega).collect();
+                let spans: Vec<Span> = live_dec
+                    .iter()
+                    .filter_map(|&i| Some(Span { lane: &lanes[i].lane, p0: lanes[i].job.as_ref()?.n_past, t: 1 }))
+                    .collect();
+                let omegas: Vec<f32> = live_dec
+                    .iter()
+                    .filter_map(|&i| Some(lanes[i].job.as_ref()?.job.loopcd_omega))
+                    .collect();
                 let began = Instant::now();
                 let cb = eng.gpu.cmd();
                 eng.encode_decode_with_omegas(&cb, &spans, true, false, &omegas);
@@ -919,7 +1221,7 @@ fn scheduler(
                     .enumerate()
                     .filter_map(|(k, &i)| {
                         let l = &lanes[i];
-                        let a = l.job.as_ref().unwrap();
+                        let a = l.job.as_ref()?;
                         (!a.job.out.cancelled() && a.sampler.uses_gpu_gumbel()).then(|| {
                             let next_pos = a.n_past + 1;
                             crate::engine::GumbelSpan {
@@ -937,7 +1239,7 @@ fn scheduler(
                 eng.encode_gumbel_spans(&cb, &gumbels);
                 cb.commit();
                 let waiting_cancelled = overlap_host_work_during_gpu(&rx, &mut queue, &lanes, &mut planner, &mut cache, metrics);
-                if let Err(e) = wait_committed_step(&cb, "decode") {
+                if let Err(e) = wait_committed_step_bounded(&cb, "decode", health.gpu_step_timeout(), Some(&health)) {
                     fail_step(eng, &mut cache, &mut lanes, live_dec.iter().copied(), e, metrics, &mut tick_seq);
                     let _ = planner.complete_step();
                     for i in live_dec { planner.on_finish(i); }
@@ -948,7 +1250,7 @@ fn scheduler(
                     let mut pools = eng.block_pool().borrow_mut();
                     for &i in &live_dec {
                         let l = &mut lanes[i];
-                        let pos = l.job.as_ref().unwrap().n_past;
+                        let Some(pos) = l.job.as_ref().map(|a| a.n_past) else { continue };
                         let mut tbl = l.lane.block_table().borrow_mut();
                         cache.finish_decode_span(&mut pools, &mut tbl, &mut l.blocks, pos);
                     }
@@ -956,7 +1258,7 @@ fn scheduler(
                 let elapsed = began.elapsed();
                 for (k, &i) in live_dec.iter().enumerate() {
                     let l = &mut lanes[i];
-                    let a = l.job.as_mut().unwrap();
+                    let Some(a) = l.job.as_mut() else { continue };
                     if a.n_past < a.pf_end {
                         a.timing.prefill.add(1, elapsed);
                         metrics.lock().unwrap_or_else(|e| e.into_inner()).input += 1;
@@ -996,6 +1298,7 @@ fn scheduler(
                         Ok(job) => queue.push_back(QueuedJob::new(job)),
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
+                            health.mark_stopped();
                             cleanup_scheduler(eng, &mut lanes, &mut cache);
                             return;
                         }
@@ -1076,7 +1379,17 @@ fn models_body() -> String {
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
+struct Head {
+    method: String,
+    path: String,
+    len: usize,
+    auth: Option<String>,
+    api_key: Option<String>,
+    card_id: Option<String>,
+    cache_namespace: Option<String>,
+    chunked: bool,
+}
+const MAX_CACHE_NAMESPACE_LEN: usize = 128;
 const MAX_BODY: usize = 32 << 20;
 // Counting can accept prompts larger than the lane context. Cap the JSON before
 // allocating or translating it, since the token limit alone does not bound BPE scratch.
@@ -1084,8 +1397,11 @@ const MAX_COUNT_BODY: usize = 1 << 20;
 const MAX_COUNT_TOKENS: usize = 256 << 10;
 // Cap buffered body capacity and the input represented by live decoded requests.
 const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
-const MAX_FRAMING: usize = 64 << 10;
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CHUNK_LINE: usize = 8192;
+const MAX_TRAILER_BYTES: usize = 64 << 10;
+const MAX_ERROR_DRAIN_BYTES: usize = 256 << 10;
+const ERROR_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+const PREAUTH_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
@@ -1138,7 +1454,16 @@ fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<Stri
 fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, card_id: None, chunked: false };
+    let mut h = Head {
+        method: it.next().unwrap_or("").to_string(),
+        path: it.next().unwrap_or("").to_string(),
+        len: 0,
+        auth: None,
+        api_key: None,
+        card_id: None,
+        cache_namespace: None,
+        chunked: false,
+    };
     for _ in 0..128 {
         let l = read_bounded_line(r, 16384)?;
         if l == "\r\n" || l == "\n" { return Ok(h); }
@@ -1151,6 +1476,7 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
             }
             if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
             if k.eq_ignore_ascii_case("x-inky-card-id") { h.card_id = crate::record::sanitize_card_id(Some(v)); }
+            if k.eq_ignore_ascii_case("x-inky-namespace") { h.cache_namespace = Some(v.to_string()); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
@@ -1242,22 +1568,26 @@ fn read_fixed<'a>(r: &mut impl Read, len: usize, budget: &'a BodyBudget) -> Resu
 }
 
 /// A chunked request body decoded under `max`: chunk sizes are hex with
-/// optional extensions, each chunk is followed by CRLF, the zero chunk is
-/// followed by header-like trailers and an empty line. Anything else fails
-/// closed; the cap is checked before a chunk's bytes are read.
+/// optional extensions (bounded per line), each chunk is followed by CRLF, the
+/// zero chunk is followed by bounded header-like trailers and an empty line.
+/// Valid bodies split across arbitrarily many small chunks under `max` are accepted;
+/// anything over `max` or malformed fails closed before reading past the cap.
 fn read_chunked<'a>(r: &mut impl BufRead, max: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
     let bad = |m: &str| BodyError::Malformed(m.to_string());
     let mut body = RequestBody::new(budget);
-    let mut framing = 0usize;
     loop {
-        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
-        framing += line.len();
+        let line = read_bounded_line(r, MAX_CHUNK_LINE).map_err(|e| bad(&format!("chunk size: {e}")))?;
         let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
         let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
         if n == 0 {
+            let mut trailer_bytes = 0usize;
             for _ in 0..128 {
-                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("trailer: {e}")))?;
-                framing += t.len();
+                let rem_trailer = MAX_TRAILER_BYTES.saturating_sub(trailer_bytes);
+                if rem_trailer == 0 {
+                    return Err(bad("trailers too large"));
+                }
+                let t = read_bounded_line(r, 16384.min(rem_trailer)).map_err(|e| bad(&format!("trailer: {e}")))?;
+                trailer_bytes += t.len();
                 if t == "\r\n" || t == "\n" { return Ok(body); }
                 if !t.contains(':') { return Err(bad("bad trailer")); }
             }
@@ -1269,13 +1599,40 @@ fn read_chunked<'a>(r: &mut impl BufRead, max: usize, budget: &'a BodyBudget) ->
         r.read_exact(&mut body.bytes[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
         let mut eol = [0u8; 1];
         r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
-        let eol_len = if eol[0] == b'\r' {
+        if eol[0] == b'\r' {
             r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
-            2
-        } else { 1 };
+        }
         if eol[0] != b'\n' { return Err(bad("chunk not followed by CRLF")); }
-        framing = framing.checked_add(eol_len).filter(|&n| n <= MAX_FRAMING).ok_or_else(|| bad("too much chunk framing"))?;
     }
+}
+
+/// Drain up to `max_bytes` from `r` so unread request bytes do not trigger a kernel TCP RST
+/// before the client reads an early `400` / `401` / `413` HTTP error response.
+fn drain_unread_bounded(r: &mut impl Read, max_bytes: usize) -> usize {
+    let mut total = 0usize;
+    let mut buf = [0u8; 4096];
+    while total < max_bytes {
+        let want = buf.len().min(max_bytes - total);
+        match r.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    total
+}
+
+fn send_error_and_drain(
+    s: &mut TcpStream,
+    send_resp: impl FnOnce(&mut TcpStream) -> std::io::Result<()>,
+) {
+    let _ = send_resp(s);
+    let _ = s.shutdown(Shutdown::Write);
+    let _ = s.set_read_timeout(Some(ERROR_DRAIN_TIMEOUT));
+    let deadline = Instant::now() + ERROR_DRAIN_TIMEOUT;
+    let mut dr = DeadlineReader::new(&*s, deadline, Instant::now, |d| s.set_read_timeout(Some(d)));
+    let _ = drain_unread_bounded(&mut dr, MAX_ERROR_DRAIN_BYTES);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1325,8 +1682,51 @@ fn check_headers(h: &Head, path: &str, key: Option<&str>, body_limit: usize) -> 
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
         }
     }
+    if let Some(ns) = h.cache_namespace.as_deref() {
+        if ns.is_empty()
+            || ns.len() > MAX_CACHE_NAMESPACE_LEN
+            || ns.bytes().any(|b| !(0x21..=0x7e).contains(&b))
+        {
+            return Err((400, format!("X-Inky-Namespace must be 1..={MAX_CACHE_NAMESPACE_LEN} printable ASCII characters without spaces")));
+        }
+    }
     if !h.chunked && h.len > body_limit { return Err((413, format!("the body is over {body_limit} bytes"))); }
     Ok(())
+}
+
+/// Derive a 64-bit cache namespace tag from the server startup nonce, isolation policy,
+/// caller credential, and optional `X-Inky-Namespace` header using SHA-256.
+fn derive_cache_namespace(
+    nonce: &str,
+    isolate_cache: bool,
+    seq: u64,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+) -> u64 {
+    let mut hasher = crate::spill::Sha256::new();
+    hasher.update(b"inky-cache-ns-v1\0");
+    hasher.update(nonce.as_bytes());
+    if isolate_cache {
+        hasher.update(b"\0isolate\0");
+        hasher.update(&seq.to_le_bytes());
+    } else {
+        hasher.update(b"\0principal\0");
+        let cred = credential.unwrap_or("");
+        hasher.update(&(cred.len() as u64).to_le_bytes());
+        hasher.update(cred.as_bytes());
+        hasher.update(b"\0tenant\0");
+        let ns = tenant_ns.unwrap_or("");
+        hasher.update(&(ns.len() as u64).to_le_bytes());
+        hasher.update(ns.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[..8].try_into().unwrap())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachePolicy {
+    isolate_cache: bool,
+    hide_cached_tokens: bool,
 }
 
 /// compare without stopping at the first differing byte
@@ -1339,31 +1739,39 @@ fn same_key(a: &str, b: &str) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// What a sequence of peek results means for the peer: closed (0 read) or a hard error is gone; data or
-/// `WouldBlock` is present. `Interrupted` is transient: the probe is retried a few times, and if it persists
-/// the client is treated as still present.
-fn gone_from_peek(mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> bool {
-    let mut b = [0u8; 1];
-    let mut tries = 0;
+/// Probe whether a `Connection: close` peer whose request head and body have already been
+/// consumed has closed its write side (`SHUT_WR` -> `Ok(0)` EOF), reset, or sent trailing/pipelined
+/// bytes followed by close. Draining up to a bounded 8 KiB in non-blocking mode ensures trailing
+/// `\r\n` or pipelined bytes after the body never mask an `EOF` behind them (`Ok(n)` then `Ok(0)` -> gone,
+/// `Ok(n)` then `WouldBlock` -> still connected).
+fn gone_from_nonblocking_read(mut read_fn: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> bool {
+    let mut b = [0u8; 512];
+    let mut chunks = 0usize;
+    let mut intr_tries = 0usize;
     loop {
-        match peek(&mut b) {
+        match read_fn(&mut b) {
             Ok(0) => return true,
-            Ok(_) => return false,
+            Ok(_) => {
+                chunks += 1;
+                intr_tries = 0;
+                if chunks >= 16 {
+                    // > 8 KiB of unsolicited post-body data on a Connection: close request.
+                    return true;
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && tries < 3 => { tries += 1; continue; }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted && intr_tries < 3 => {
+                intr_tries += 1;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return false,
             Err(_) => return true,
         }
     }
 }
 
-/// The client closed its end (checked without blocking or consuming anything). A peek error other than
-/// `WouldBlock` is treated as gone: failing toward cancellation is the safe direction (it frees the lane and the
-/// client can retry) rather than holding a lane for a peer that may be dead. `Interrupted` is transient, so the
-/// probe is retried a few times and, if it persists, the client is treated as still present.
-fn peer_gone(s: &TcpStream) -> bool {
+fn peer_gone(mut s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() { return true; }
-    let gone = gone_from_peek(|b| s.peek(b));
+    let gone = gone_from_nonblocking_read(|b| s.read(b));
     let _ = s.set_nonblocking(false);
     gone
 }
@@ -1427,12 +1835,9 @@ impl MemoryBudget {
     ) -> Self {
         let reserved = model_bytes.saturating_add(safety_headroom_bytes);
         let available_kv_budget_bytes = recommended_working_set_bytes.saturating_sub(reserved);
-        let max_budget_lanes = if per_lane_worst_case_bytes == 0 {
-            configured_lanes.max(1)
-        } else {
-            usize::try_from(available_kv_budget_bytes / per_lane_worst_case_bytes)
-                .unwrap_or(usize::MAX)
-                .max(1)
+        let max_budget_lanes = match available_kv_budget_bytes.checked_div(per_lane_worst_case_bytes) {
+            None => configured_lanes.max(1),
+            Some(q) => usize::try_from(q).unwrap_or(usize::MAX).max(1),
         };
         let max_admitted_lanes = configured_lanes.min(max_budget_lanes).max(1);
         Self {
@@ -1555,6 +1960,7 @@ impl AdmissionGate {
         let ticket = st.next_ticket;
         st.next_ticket = st.next_ticket.wrapping_add(1);
         st.waiters.push_back(ticket);
+        cvar.notify_all();
         let mut guard = WaiterGuard { inner: &self.inner, ticket, armed: true };
         let deadline = Instant::now() + self.queue_timeout;
         loop {
@@ -1565,16 +1971,21 @@ impl AdmissionGate {
                 cvar.notify_all();
                 return Ok(LanePermit { inner: self.inner.clone() });
             }
+            // Probe client socket outside the admission mutex so non-blocking syscalls never
+            // serialize or stall other connection threads acquiring or releasing permits.
+            drop(st);
             if is_gone() {
-                drop(st);
                 drop(guard);
                 return Err(AdmissionReject::ClientGone);
             }
             let rem = deadline.saturating_duration_since(Instant::now());
             if rem.is_zero() {
-                drop(st);
                 drop(guard);
                 return Err(AdmissionReject::QueueTimeout);
+            }
+            st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if st.waiters.front() == Some(&ticket) && st.admitted < st.max_lanes {
+                continue;
             }
             let wait = rem.min(self.poll_interval);
             let (next_st, _) = cvar.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
@@ -1585,6 +1996,15 @@ impl AdmissionGate {
     fn queued(&self) -> usize {
         let (lock, _) = &*self.inner;
         lock.lock().unwrap_or_else(|e| e.into_inner()).waiters.len()
+    }
+
+    #[cfg(test)]
+    fn wait_until_queued(&self, target: usize) {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while st.waiters.len() < target {
+            st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     fn inflight(&self) -> usize {
@@ -1612,10 +2032,21 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              active_lanes: Arc<AtomicUsize>,
              /// Live connections, capped globally and per peer.
              conns: ConnectionSlots,
+             /// unauthenticated handshakes alive on non-loopback binds; at most MAX_UNAUTH_CONNS
+             unauth_conns: Arc<AtomicUsize>,
+             /// scheduler step heartbeat and stall detector
+             health: Arc<SchedulerHealth>,
+             /// pool-pressure deferral telemetry
+             deferrals: Arc<DeferralCounters>,
+             /// SSE poll / keepalive interval (250ms in production; injectable in unit tests)
+             stream_poll_interval: Duration,
              /// opt-in non-blocking JSONL card traffic recorder
-             recorder: Option<Arc<crate::record::Recorder>> }
+             recorder: Option<Arc<crate::record::Recorder>>,
+             /// cache isolation and client-visible cached-token reporting policy
+             cache_policy: CachePolicy }
 const MAX_CONNS: usize = 512;
 const MAX_PEER_CONNS: usize = 128;
+const MAX_UNAUTH_CONNS: usize = 64;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
@@ -1664,11 +2095,46 @@ const PREPROCESS_LIMIT: usize = 4;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
 
 const QUEUE_FULL: &str = "inky is busy: the request queue is full";
 const QUEUE_TIMED_OUT: &str = "inky is busy: timed out waiting for an inference lane";
 const PREPROCESS_BUSY: &str = "inky is busy: all prompt processors are in use";
+
+struct UnauthConnGuard {
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl UnauthConnGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>, enforce: bool, limit: usize) -> Option<Self> {
+        if !enforce {
+            return Some(Self { counter: None });
+        }
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed) {
+                Ok(_) => return Some(Self { counter: Some(counter.clone()) }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release_authenticated(&mut self) {
+        if let Some(c) = self.counter.take() {
+            c.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for UnauthConnGuard {
+    fn drop(&mut self) {
+        self.release_authenticated();
+    }
+}
 
 struct PermitPool {
     used: Arc<AtomicUsize>,
@@ -1694,17 +2160,23 @@ impl PermitPool {
     }
 }
 
-fn health_body(cx: &Ctx) -> String {
+fn health_response(cx: &Ctx, now: Instant) -> (u16, String) {
+    let (ok, reason) = cx.health.check(now);
     let kv_bytes_per_elem: u32 = if cx.kv8 { 1 } else { 2 };
+    let (output_tokens, starts_spilled) = {
+        let m = cx.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        (m.output as u64, m.starts_spilled)
+    };
     let mut obj = serde_json::Map::from_iter([
-        ("ok".into(), json!(true)),
+        ("ok".into(), json!(ok)),
         ("active_lanes".into(), json!(cx.active_lanes.load(Ordering::Relaxed))),
         ("inflight".into(), json!(cx.admission.inflight())),
+        ("output_tokens".into(), json!(output_tokens)),
         ("recommended_working_set_bytes".into(), json!(cx.budget.recommended_working_set_bytes)),
         ("model_bytes".into(), json!(cx.budget.model_bytes)),
         ("per_lane_worst_case_bytes".into(), json!(cx.budget.per_lane_worst_case_bytes)),
         ("max_admitted_lanes".into(), json!(cx.budget.max_admitted_lanes)),
-        ("starts_spilled".into(), json!(cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled)),
+        ("starts_spilled".into(), json!(starts_spilled)),
         ("queued_requests".into(), json!(cx.admission.queued())),
         ("kv8".into(), json!(cx.kv8)),
         ("kv_bytes_per_elem".into(), json!(kv_bytes_per_elem)),
@@ -1712,13 +2184,27 @@ fn health_body(cx: &Ctx) -> String {
     if let Some(bytes) = crate::process_footprint_bytes() {
         obj.insert("process_footprint_bytes".into(), json!(bytes));
     }
+    let admit_def = cx.deferrals.admit_pool_deferrals.load(Ordering::Relaxed);
+    let step_def = cx.deferrals.step_pool_deferrals.load(Ordering::Relaxed);
+    if admit_def > 0 || step_def > 0 {
+        obj.insert("admit_deferrals".into(), json!(admit_def));
+        obj.insert("step_deferrals".into(), json!(step_def));
+    }
+    if let Some(reason) = reason {
+        obj.insert("reason".into(), json!(reason));
+    }
     if let Some(rec) = &cx.recorder {
         obj.insert("record_written".into(), json!(rec.written_count()));
         obj.insert("record_dropped".into(), json!(rec.dropped_count()));
         obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
         obj.insert("record_rotations".into(), json!(rec.rotation_count()));
     }
-    Value::Object(obj).to_string()
+    (if ok { 200 } else { 503 }, Value::Object(obj).to_string())
+}
+
+#[cfg(test)]
+fn health_body(cx: &Ctx) -> String {
+    health_response(cx, Instant::now()).1
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -1770,7 +2256,8 @@ fn context_over(prompt: usize, max: usize, ctx: usize) -> bool {
 }
 
 fn context_full_message(prompt: usize, max: usize, ctx: usize) -> String {
-    format!("context full: {prompt} prompt tokens and {max} to generate, {ctx} per lane")
+    let max_prompt = ctx.saturating_sub(max.saturating_add(2));
+    format!("context full: {prompt} prompt tokens exceeds {max_prompt} maximum ({ctx} per lane with {max} to generate and 2 reserved)")
 }
 
 /// The reply budget of a `/v1/messages` request, adjusted to the lane: when
@@ -1879,17 +2366,100 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
     chat_with_card(cx, req, None, s)
 }
 
-fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    record_delivery(cx, req, card_id, "/v1/chat/completions", |turn| chat_response(cx, req, s, turn))
+fn parse_request_temp(req: &Value) -> Result<f64, String> {
+    match req.get("temperature") {
+        None | Some(Value::Null) => Ok(1.0),
+        Some(v) => match v.as_f64() {
+            Some(t) if t.is_finite() && (0.0..=2.0).contains(&t) => Ok(t),
+            _ => Err("temperature must be a finite number between 0 and 2".into()),
+        },
+    }
 }
 
-fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
-    // every client-controlled number is checked here, never in the scheduler
+fn parse_request_top_p(req: &Value) -> Result<f64, String> {
+    match req.get("top_p") {
+        None | Some(Value::Null) => Ok(0.95),
+        Some(v) => match v.as_f64() {
+            Some(p) if p.is_finite() && p > 0.0 && p <= 1.0 => Ok(p),
+            _ => Err("top_p must be a finite number in (0, 1]".into()),
+        },
+    }
+}
+
+fn parse_request_top_k(req: &Value) -> Result<usize, String> {
+    match req.get("top_k") {
+        None | Some(Value::Null) => Ok(64),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("top_k must be an integer between 0 and {}", usize::MAX)),
+    }
+}
+
+fn parse_request_stream(req: &Value) -> Result<bool, String> {
+    match req.get("stream") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("stream must be a boolean".into()),
+    }
+}
+
+fn parse_request_model(req: &Value) -> Result<String, String> {
+    match req.get("model") {
+        None | Some(Value::Null) => Ok("inkling-2-mini".into()),
+        Some(Value::String(s)) => Ok(if s.is_empty() { "inkling-2-mini".into() } else { s.clone() }),
+        Some(_) => Err("model must be a string".into()),
+    }
+}
+
+fn parse_request_seed(req: &Value) -> Result<Option<u64>, String> {
+    match req.get("seed") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_i64().map(|n| n as u64))
+            .map(Some)
+            .ok_or_else(|| format!("seed must be a 64-bit integer ({}..={})", i64::MIN, u64::MAX)),
+    }
+}
+
+#[cfg(test)]
+fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
+    chat_with_principal(cx, req, card_id, None, None, s)
+}
+
+fn chat_with_principal<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    card_id: Option<&str>,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+) -> std::io::Result<()> {
+    record_delivery(cx, req, card_id, "/v1/chat/completions", |turn| {
+        chat_response(cx, req, credential, tenant_ns, s, turn)
+    })
+}
+
+fn chat_response<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+    turn: &mut TurnDelivery,
+) -> std::io::Result<()> {
+    // every client-controlled field is checked here, never in the scheduler
     let mut bad = |m: String| {
         turn.status(400, "invalid_request");
         respond(s, 400, &json!({"error": {"message": m}}).to_string())
     };
-    if let Err(message) = check_generation_controls(req, Route::Chat) { return bad(message); }
+    if !req.is_object() {
+        return bad("request body must be a JSON object".into());
+    }
+    if let Err(message) = check_generation_controls(req, Route::Chat) {
+        return bad(message);
+    }
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
         if let Some(value) = req.get(*name) {
@@ -1900,22 +2470,24 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         }
     }
     let requested_max = budgets[0].or(budgets[1]).unwrap_or(cx.max_tokens);
-    let temp = req["temperature"].as_f64().unwrap_or(1.0);
-    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
-    let top_k = match req.get("top_k") {
-        None | Some(Value::Null) => 64,
-        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(k) => k,
-            None => return bad("top_k must be a nonnegative integer".into()),
-        },
-    };
-    let thinking_budget = match req.get("thinking_budget").or_else(|| req.get("thinking_budget_tokens")) {
-        None | Some(Value::Null) => cx.thinking_budget,
-        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(b) => b,
-            None => return bad("thinking_budget must be a nonnegative integer".into()),
-        },
-    };
+    let temp = match parse_request_temp(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let top_p = match parse_request_top_p(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let top_k = match parse_request_top_k(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let stream = match parse_request_stream(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let model = match parse_request_model(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let explicit_seed = match parse_request_seed(req) { Ok(v) => v, Err(e) => return bad(e) };
+    let _ = match request_effort(req, &cx.effort) { Ok(v) => v, Err(e) => return bad(e) };
+    let mut tb_opts = [None, None];
+    for (i, name) in ["thinking_budget", "thinking_budget_tokens"].iter().enumerate() {
+        match req.get(*name) {
+            None | Some(Value::Null) => {}
+            Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                Some(b) => tb_opts[i] = Some(b),
+                None => return bad(format!("{name} must be an integer between 0 and {}", usize::MAX)),
+            },
+        }
+    }
+    let thinking_budget = tb_opts[0].or(tb_opts[1]).unwrap_or(cx.thinking_budget);
     let loopcd_omega = match req.get("loopcd_omega") {
         None | Some(Value::Null) => cx.loopcd_omega,
         Some(v) => match v.as_f64() {
@@ -1932,8 +2504,6 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         },
         Some(_) => return bad("stream_options must be an object".into()),
     };
-    if !(0.0..=2.0).contains(&temp) { return bad("temperature must be between 0 and 2".into()); }
-    if !(top_p > 0.0 && top_p <= 1.0) { return bad("top_p must be in (0, 1]".into()); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
@@ -1954,7 +2524,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
             drop(permit);
             let message = match e {
                 RenderError::Invalid(message) => message,
-                RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
+                RenderError::TooLong => format!("context full: more than {prompt_limit} maximum prompt tokens ({} per lane with at least 1 to generate and 2 reserved)", cx.ctx),
             };
             turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
@@ -1970,38 +2540,55 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
     };
     let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
     // the seed is the request's own: its `seed`, or a hash of what decides the output (the rendered tokens and sampling)
-    let seed = req["seed"].as_u64().unwrap_or_else(|| {
+    let seed = explicit_seed.unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
     });
+    let cache_namespace = derive_cache_namespace(
+        &cx.nonce,
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
     turn.prompt_tokens = toks.len();
-    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, cache_namespace, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() {
         turn.status(503, "unavailable");
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
-    let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
-    let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+    let send_sse = |s: &mut W, payload: &Value| -> std::io::Result<()> {
+        let frame = format!("data: {payload}\n\n");
+        s.write_all(frame.as_bytes())?;
+        s.flush()
+    };
     if stream {
-        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-        write!(s, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), Value::Null))?;
-        s.flush()?;
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        send_sse(s, &chunk(json!({"role": "assistant", "content": ""}), Value::Null))?;
     }
     let sp = cx.sp;
+    let poll_interval = cx.stream_poll_interval;
+    let mut last_sse_write = Instant::now();
+    let mut role_stopped = false;
     let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
     loop {
         // wait for the scheduler, watching the client: a client gone drops `rx`, and the scheduler's next send to this
         // request fails and frees its lane (prefill steps send Alive, decode steps a token)
-        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        let ev = match rx.recv_timeout(poll_interval) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
+                }
+                if stream {
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
                 }
                 continue;
             }
@@ -2013,36 +2600,71 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
+                if stream {
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
+                }
             }
             Ev::Tok(t) => {
                 turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() {
+                if gen.len().is_multiple_of(16) && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
                 if !stream { continue; }
-                if t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
+                if role_stopped {
+                    if last_sse_write.elapsed() >= poll_interval {
+                        if s.client_gone() {
+                            turn.status(499, "cancelled");
+                            return Ok(());
+                        }
+                        s.write_all(b": keepalive\n\n")?;
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    }
+                    continue;
+                }
+                let mut wrote_event = false;
+                if sp.is_role_stop(t) || t == sp.c_think || t == sp.c_text || t == sp.c_tool || t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos {
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
+                        last_sse_write = Instant::now();
+                        wrote_event = true;
                     }
                 }
-                if t == sp.c_think { mode = 1; continue; }
-                if t == sp.c_text { mode = 2; continue; }
-                if t == sp.c_tool { mode = 3; continue; }
-                if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); continue; }
-                if mode == 1 || mode == 2 {
+                if sp.is_role_stop(t) {
+                    mode = 0;
+                    pend.clear();
+                    role_stopped = true;
+                    continue;
+                }
+                if t == sp.c_think { mode = 1; }
+                else if t == sp.c_text { mode = 2; }
+                else if t == sp.c_tool { mode = 3; }
+                else if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); }
+                else if mode == 1 || mode == 2 {
                     pend.extend(cx.tk.decode_bytes(t));
                     let text = take_stream_text(&mut pend, false);
                     if !text.is_empty() {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
                         // a failed write drops `rx`: the scheduler sees the client gone and cancels the lane
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
+                        last_sse_write = Instant::now();
+                        wrote_event = true;
                     }
+                }
+                if !wrote_event && last_sse_write.elapsed() >= poll_interval {
+                    if s.client_gone() {
+                        turn.status(499, "cancelled");
+                        return Ok(());
+                    }
+                    s.write_all(b": keepalive\n\n")?;
+                    s.flush()?;
+                    last_sse_write = Instant::now();
                 }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
@@ -2051,23 +2673,28 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                 turn.completed(prompt, ng, &timing, finish);
                 let calls: Vec<Value> = p.calls.iter().enumerate().map(|(i, (name, args))| json!({"index": i, "id": format!("call_{}_{seq}_{i}", cx.nonce), "type": "function",
                     "function": {"name": name, "arguments": args.to_string()}})).collect();
-                let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": cached}});
+                let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
+                let usage = json!({"prompt_tokens": prompt, "completion_tokens": ng, "total_tokens": prompt + ng, "prompt_tokens_details": {"cached_tokens": reported_cached}});
                 eprintln!("[serve] #{seq} prompt {prompt} (cached {cached}) gen {ng} finish {finish} calls [{}] {}", p.calls.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","), timing.summary);
                 if stream {
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
+                        send_sse(s, &chunk(json!({key: text}), Value::Null))?;
                     }
-                    if !calls.is_empty() { write!(s, "data: {}\n\n", chunk(json!({"tool_calls": calls}), Value::Null))?; }
+                    if !calls.is_empty() {
+                        send_sse(s, &chunk(json!({"tool_calls": calls}), Value::Null))?;
+                    }
                     if include_usage {
-                        write!(s, "data: {}\n\n", chunk(json!({}), json!(finish)))?;
+                        send_sse(s, &chunk(json!({}), json!(finish)))?;
                         let usage_chunk = json!({"id": id, "object": "chat.completion.chunk", "model": model, "choices": [], "usage": usage});
-                        write!(s, "data: {usage_chunk}\n\ndata: [DONE]\n\n")?;
+                        send_sse(s, &usage_chunk)?;
                     } else {
-                        let mut last = chunk(json!({}), json!(finish)); last["usage"] = usage;
-                        write!(s, "data: {last}\n\ndata: [DONE]\n\n")?;
+                        let mut last = chunk(json!({}), json!(finish));
+                        last["usage"] = usage;
+                        send_sse(s, &last)?;
                     }
+                    s.write_all(b"data: [DONE]\n\n")?;
                     return s.flush();
                 }
                 let mut msg = json!({"role": "assistant", "content": p.text});
@@ -2080,7 +2707,8 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                 turn.status(code, kind);
                 let error = json!({"error": {"type": kind, "message": message}});
                 if stream {
-                    write!(s, "data: {error}\n\n")?;
+                    let frame = format!("data: {error}\n\n");
+                    s.write_all(frame.as_bytes())?;
                     return s.flush();
                 }
                 return respond(s, code, &error.to_string());
@@ -2107,30 +2735,82 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
     messages_with_card(cx, req, None, s)
 }
 
+#[cfg(test)]
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    record_delivery(cx, req, card_id, "/v1/messages", |turn| messages_response(cx, req, s, turn))
+    messages_with_principal(cx, req, card_id, None, None, s)
 }
 
-fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
-    // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+fn messages_with_principal<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    card_id: Option<&str>,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+) -> std::io::Result<()> {
+    record_delivery(cx, req, card_id, "/v1/messages", |turn| {
+        messages_response(cx, req, credential, tenant_ns, s, turn)
+    })
+}
+
+fn messages_response<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    credential: Option<&str>,
+    tenant_ns: Option<&str>,
+    s: &mut W,
+    turn: &mut TurnDelivery,
+) -> std::io::Result<()> {
+    if !req.is_object() {
+        turn.status(400, "invalid_request_error");
+        return anthropic_error(s, 400, "invalid_request_error", "request body must be a JSON object");
+    }
+    // every client-controlled field is checked here, never in the scheduler (the chat path's rule)
     if let Err(message) = check_generation_controls(req, Route::Messages) {
         turn.status(400, "invalid_request_error");
         return anthropic_error(s, 400, "invalid_request_error", &message);
     }
-    let max = match req["max_tokens"].as_u64() {
-        Some(0) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
-        Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
-    };
-    let temp = req["temperature"].as_f64().unwrap_or(1.0);
-    let top_p = req["top_p"].as_f64().unwrap_or(0.95);
-    let top_k = match req.get("top_k") {
-        None | Some(Value::Null) => 64,
+    let max = match req.get("max_tokens") {
+        None | Some(Value::Null) => {
+            turn.status(400, "invalid_request_error");
+            return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required");
+        }
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-            Some(k) => k,
-            None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            Some(n) if n > 0 && n <= MAX_CHAT_TOKEN_BUDGET => n,
+            _ => {
+                turn.status(400, "invalid_request_error");
+                return anthropic_error(s, 400, "invalid_request_error", &format!("max_tokens must be between 1 and {MAX_CHAT_TOKEN_BUDGET}"));
+            }
         },
     };
+    let temp = match parse_request_temp(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let top_p = match parse_request_top_p(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let top_k = match parse_request_top_k(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let stream = match parse_request_stream(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let model = match parse_request_model(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    let explicit_seed = match parse_request_seed(req) {
+        Ok(v) => v,
+        Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
+    };
+    if let Err(e) = anthropic_effort(req) {
+        turn.status(400, "invalid_request_error");
+        return anthropic_error(s, 400, "invalid_request_error", &e);
+    }
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
         Some(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("enabled") => {
             obj.get("budget_tokens").and_then(|v| v.as_u64()).and_then(|n| usize::try_from(n).ok()).unwrap_or(cx.thinking_budget)
@@ -2147,8 +2827,6 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
             }
         },
     };
-    if !(0.0..=2.0).contains(&temp) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => { turn.status(429, "rate_limit_error"); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
@@ -2180,69 +2858,97 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         }
     };
     let seq = cx.seq.fetch_add(1, Ordering::Relaxed) + 1;
-    // the seed is the request's own: a hash of what decides the output, as on the chat path
-    let seed = {
+    // the seed is the request's own: its `seed`, or a hash of what decides the output, as on the chat path
+    let seed = explicit_seed.unwrap_or_else(|| {
         let mut h = 0xcbf29ce484222325u64;
         for x in toks.iter().map(|&t| t as u64).chain([temp.to_bits(), top_p.to_bits(), max as u64]) { h = (h ^ x).wrapping_mul(0x100000001b3); }
         h
-    };
+    });
+    let cache_namespace = derive_cache_namespace(
+        &cx.nonce,
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
     turn.prompt_tokens = toks.len();
-    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, cache_namespace, out: tx, _permit: permit };
     if enqueue(cx, job).is_err() { turn.status(503, "api_error"); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
-    let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
-    let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
     let sp = cx.sp;
+    let poll_interval = cx.stream_poll_interval;
     if stream {
-        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-        write!(s, "{}", sse_text("message_start", &json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        let start_ev = sse_text("message_start", &json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant",
             "model": model, "content": [], "stop_reason": null, "stop_sequence": null,
-            "usage": {"input_tokens": prompt_len, "output_tokens": 0}}})))?;
+            "usage": {"input_tokens": prompt_len, "output_tokens": 0}}}));
+        s.write_all(start_ev.as_bytes())?;
         s.flush()?;
+        let ping_bytes = sse_text("ping", &json!({"type": "ping"})).into_bytes();
+        let mut last_sse_write = Instant::now();
         let mut bs = BlockStream::new(&cx.nonce, seq);
         let mut received = 0usize;
         loop {
-            let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            let ev = match rx.recv_timeout(poll_interval) {
                 Ok(ev) => ev,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
-                    write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; continue;
+                    s.write_all(&ping_bytes)?; s.flush()?; last_sse_write = Instant::now(); continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     turn.status(500, "api_error");
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}})))?;
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": "the request was dropped"}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
             };
             match ev {
-                Ev::Alive => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } write!(s, "{}", sse_text("ping", &json!({"type": "ping"})))?; s.flush()?; }
+                Ev::Alive => {
+                    if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
+                    s.write_all(&ping_bytes)?; s.flush()?; last_sse_write = Instant::now();
+                }
                 Ev::Tok(t) => {
                     turn.token();
                     received += 1;
-                    if received % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
-                    for text in bs.on_token(&cx.tk, &sp, t) { write!(s, "{text}")?; } s.flush()?;
+                    if received.is_multiple_of(16) && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
+                    let events = bs.on_token(&cx.tk, &sp, t);
+                    if !events.is_empty() {
+                        for text in events { s.write_all(text.as_bytes())?; }
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    } else if last_sse_write.elapsed() >= poll_interval {
+                        if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
+                        s.write_all(&ping_bytes)?;
+                        s.flush()?;
+                        last_sse_write = Instant::now();
+                    }
                 }
                 Ev::Done { prompt, cached, gen: ng, reason, timing } => {
+                    for text in bs.close_all() { s.write_all(text.as_bytes())?; }
                     let stop = anthropic_stop_reason(bs.calls > 0, reason);
+                    let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
                     turn.completed(prompt, ng, &timing, stop);
-                    for text in bs.close_all() { write!(s, "{text}")?; }
                     eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls {calls} {}", timing.summary, calls = bs.calls);
-                    write!(s, "{}", sse_text("message_delta", &json!({"type": "message_delta",
+                    let delta_ev = sse_text("message_delta", &json!({"type": "message_delta",
                         "delta": {"stop_reason": stop, "stop_sequence": null},
-                        "usage": streaming_delta_usage(prompt, cached, ng)})))?;
-                    write!(s, "{}", sse_text("message_stop", &json!({"type": "message_stop"})))?;
+                        "usage": streaming_delta_usage(prompt, reported_cached, ng)}));
+                    let stop_ev = sse_text("message_stop", &json!({"type": "message_stop"}));
+                    s.write_all(delta_ev.as_bytes())?;
+                    s.write_all(stop_ev.as_bytes())?;
                     return s.flush();
                 }
                 Ev::Err(e) => {
                     turn.status(400, "invalid_request_error");
-                    for text in bs.close_all() { write!(s, "{text}")?; }
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}})))?;
+                    for text in bs.close_all() { s.write_all(text.as_bytes())?; }
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "invalid_request_error", "message": e}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
                 Ev::Failed(message) => {
                     turn.status(500, "api_error");
-                    write!(s, "{}", sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}})))?;
+                    let err_ev = sse_text("error", &json!({"type": "error", "error": {"type": "api_error", "message": message}}));
+                    s.write_all(err_ev.as_bytes())?;
                     return s.flush();
                 }
             }
@@ -2250,7 +2956,7 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
     }
     let mut gen = Vec::<u32>::new();
     loop {
-        let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        let ev = match rx.recv_timeout(poll_interval) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if s.client_gone() { turn.status(499, "cancelled"); return Ok(()); } continue; }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", "the request was dropped"); }
@@ -2260,17 +2966,18 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
             Ev::Tok(t) => {
                 turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
+                if gen.len().is_multiple_of(16) && s.client_gone() { turn.status(499, "cancelled"); return Ok(()); }
             }
             Ev::Done { prompt, cached, gen: ng, reason, timing } => {
                 let content = anthropic_content(&cx.tk, &sp, &gen, &cx.nonce, seq);
                 let calls: Vec<&str> = content.iter().filter_map(|block| block["name"].as_str()).collect();
                 let stop = anthropic_stop_reason(!calls.is_empty(), reason);
+                let reported_cached = if cx.cache_policy.hide_cached_tokens { 0 } else { cached };
                 turn.completed(prompt, ng, &timing, stop);
                 eprintln!("[serve] #{seq} messages prompt {prompt} (cached {cached}) gen {ng} stop {stop} calls [{}] {}", calls.join(","), timing.summary);
                 return respond_with_timing(s, 200, &json!({"id": id, "type": "message", "role": "assistant", "model": model,
                     "content": content, "stop_reason": stop, "stop_sequence": null,
-                    "usage": anthropic_usage(prompt, cached, ng)}).to_string(), &timing);
+                    "usage": anthropic_usage(prompt, reported_cached, ng)}).to_string(), &timing);
             }
             Ev::Err(e) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", &e); }
             Ev::Failed(message) => { turn.status(500, "api_error"); return anthropic_error(s, 500, "api_error", &message); }
@@ -2306,109 +3013,73 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-pub fn serve(o: ServeOpts) {
-    if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
-    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
-    crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
-    let eng = Engine::load(&o.model, o.ctx);
-    eng.set_loopcd_omega(o.loopcd_omega);
-    eng.ensure_batch(eng.chunk);
-    let (chip, mem) = crate::tuning::this_machine();
-    let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
-    let budget = MemoryBudget::compute(
-        eng.gpu.recommended_max_working_set_size(),
-        eng.model_and_scratch_bytes(),
-        safety_headroom_bytes,
-        eng.per_lane_paged_reserve_bytes(),
-        o.lanes,
-    );
-    let effective_lanes = budget.max_admitted_lanes;
-    if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
-    eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
-    let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
-    let tk = Arc::new(Tokenizer::load(&eng.g));
-    let sp = Specials {
-        msg_user: special(&tk, "<|message_user|>"), msg_model: special(&tk, "<|message_model|>"), msg_system: special(&tk, "<|message_system|>"),
-        msg_tool: special(&tk, "<|message_tool|>"), c_text: special(&tk, "<|content_text|>"), c_think: special(&tk, "<|content_thinking|>"),
-        c_xml: special(&tk, "<|content_xml|>"), c_tool: special(&tk, "<|content_invoke_tool_json|>"), end: special(&tk, "<|end_message|>"),
-        end_sampling: special(&tk, "<|content_model_end_sampling|>"),
-    };
-    let (jtx, jrx) = channel::<Job>();
-    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
-    let active_lanes = Arc::new(AtomicUsize::new(0));
-    let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
-    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
-    let spill_store = if let Some(spill_dir) = &o.spill_dir {
-        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
-        match crate::spill::SpillStore::open_with_kvb(spill_dir, o.max_spill_bytes, kvb) {
-            Ok(store) => {
-                let swept = store.stats().orphans_swept;
-                eprintln!(
-                    "[serve] spill dir {} ready (kvb={}, budget {:.2} GiB, swept {} orphan tmp file(s))",
-                    store.dir().display(),
-                    store.kvb(),
-                    o.max_spill_bytes as f64 / (1u64 << 30) as f64,
-                    swept,
-                );
-                Some(store)
-            }
-            Err(e) => {
-                eprintln!("cannot prepare --spill-dir {}: {e}", spill_dir.display());
-                std::process::exit(2);
-            }
+fn bind_listeners(addrs: &[SocketAddr]) -> Result<Vec<(TcpListener, SocketAddr)>, String> {
+    if addrs.is_empty() {
+        return Err("--bind resolved to no addresses".into());
+    }
+    let mut unique: Vec<SocketAddr> = Vec::with_capacity(addrs.len());
+    for &addr in addrs {
+        if !unique.contains(&addr) {
+            unique.push(addr);
         }
+    }
+    let mut bound = Vec::with_capacity(unique.len());
+    for addr in unique {
+        let listener = TcpListener::bind(addr).map_err(|e| format!("cannot bind {addr}: {e}"))?;
+        let local = listener.local_addr().map_err(|e| format!("cannot inspect bound address for {addr}: {e}"))?;
+        bound.push((listener, local));
+    }
+    Ok(bound)
+}
+
+struct PreModeServe {
+    chunk: usize,
+    prepared: crate::engine::PreparedModel,
+    tk: Arc<Tokenizer>,
+    sp: Specials,
+    spill_store: Option<crate::spill::SpillStore>,
+    listeners: Vec<(TcpListener, SocketAddr)>,
+}
+
+fn validate_serve_pre_mode(o: &ServeOpts) -> Result<PreModeServe, (i32, String)> {
+    check_serve_shape(o.ctx, o.max_tokens).map_err(|e| (2, e))?;
+    if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS {
+        return Err((2, format!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS)));
+    }
+    validate_effort(&o.effort).map_err(|e| (2, e))?;
+    if !o.loopcd_omega.is_finite() || !(0.0..=4.0).contains(&o.loopcd_omega) {
+        return Err((2, "--loopcd must be a finite number between 0 and 4".into()));
+    }
+    let chunk = Engine::prefill_chunk_for(o.ctx).map_err(|e| (2, format!("[inky] {e}")))?;
+    let prepared = Engine::prepare_model(&o.model, o.ctx)
+        .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?;
+    let tk = Arc::new(
+        Tokenizer::try_load(&prepared.g)
+            .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?,
+    );
+    let sp = Specials::try_from_tokenizer(&tk)
+        .map_err(|e| (1, format!("[inky] could not load {}: {e}", o.model)))?;
+    let spill_store = if let Some(spill_dir) = &o.spill_dir {
+        let kvb = if o.kv8 { 1u32 } else { 2u32 };
+        let store = crate::spill::SpillStore::open_with_kvb(spill_dir, o.max_spill_bytes, kvb)
+            .map_err(|e| (2, format!("cannot prepare --spill-dir {}: {e}", spill_dir.display())))?;
+        let swept = store.stats().orphans_swept;
+        eprintln!(
+            "[serve] spill dir {} ready (kvb={}, budget {:.2} GiB, swept {} orphan tmp file(s))",
+            store.dir().display(),
+            store.kvb(),
+            o.max_spill_bytes as f64 / (1u64 << 30) as f64,
+            swept,
+        );
+        Some(store)
     } else {
         None
     };
-    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
-        nonce: startup_nonce(), key: o.key.clone(), ctx: context,
-        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
-        budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
-    let reporter_cx = Arc::downgrade(&cx);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(60));
-        let Some(cx) = reporter_cx.upgrade() else { break };
-        let waiting = cx.admission.queued();
-        let summary = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).summarize(Instant::now(), waiting);
-        eprintln!("{summary}");
-    });
-    // Bind the addresses already resolved and checked by the CLI, without a second hostname lookup.
-    let l = TcpListener::bind(o.bind.as_slice()).expect("bind");
-    let addr = l.local_addr().expect("bound address");
-    let auth = if o.key.is_some() {
-        if is_private_ip(addr.ip()) { "a key required (private/loopback)" } else { "a key required" }
-    } else if addr.ip().to_canonical().is_loopback() {
-        "no key (loopback)"
-    } else {
-        "no key (non-loopback explicitly enabled)"
-    };
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    if effective_lanes < o.lanes {
-        eprintln!(
-            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB): capping lanes {} -> {}",
-            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
-            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), o.lanes, effective_lanes
-        );
-    } else {
-        eprintln!(
-            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB, max_admitted_lanes {})",
-            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
-            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
-        );
-    }
-    {
-        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
-        let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap()));
-        let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap()));
-        eprintln!("[serve] Layer 3 paged KV pool (kvb={kvb}{}): {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)",
-                  if eng.kv8 { ", --kv8" } else { "" });
-    }
-    if o.loopcd_omega > 0.0 {
-        eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
-    }
-    eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+    let listeners = bind_listeners(&o.bind).map_err(|e| (2, e))?;
+    Ok(PreModeServe { chunk, prepared, tk, sp, spill_store, listeners })
+}
+
+fn spawn_accept_loop(l: TcpListener, bound_non_loopback: bool, cx: Arc<Ctx>) {
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
         loop {
@@ -2421,34 +3092,50 @@ pub fn serve(o: ServeOpts) {
                 }
             };
             let accepted_at = Instant::now();
+            let _ = s.set_nodelay(true);
+            if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
+            let enforce_unauth_cap = bound_non_loopback && !peer.ip().to_canonical().is_loopback();
+            let Some(unauth_guard) = UnauthConnGuard::try_acquire(&cx.unauth_conns, enforce_unauth_cap, MAX_UNAUTH_CONNS) else {
+                send_error_and_drain(&mut s, |st| respond(st, 503, &json!({"error": {"message": "too many unauthenticated connections"}}).to_string()));
+                continue;
+            };
             let Some(slot) = cx.conns.acquire(peer.ip()) else {
+                drop(unauth_guard);
                 // A rejected socket must never stall the listener while writing its reply.
                 if s.set_nonblocking(true).is_ok() {
                     let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
                 }
                 continue;
             };
-            if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
             let cx = cx.clone();
             let body_budget = body_budget.clone();
             if let Err(e) = std::thread::Builder::new().spawn(move || {
                 let _slot = slot;
-                handle_connection(&cx, &body_budget, s, accepted_at, REQUEST_READ_TIMEOUT);
+                handle_connection_with_guard(&cx, &body_budget, s, accepted_at, REQUEST_READ_TIMEOUT, unauth_guard);
             }) {
                 eprintln!("[serve] connection worker: {e}");
             }
         }
     });
-    scheduler(
-        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
-        #[cfg(test)]
-        None,
-    );
 }
 
-fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
+#[cfg(test)]
+fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
+    let unauth_guard = UnauthConnGuard::try_acquire(&cx.unauth_conns, false, MAX_UNAUTH_CONNS)
+        .expect("untracked loopback test connection guard");
+    handle_connection_with_guard(cx, body_budget, s, accepted_at, read_timeout, unauth_guard);
+}
+
+fn handle_connection_with_guard(
+    cx: &Ctx,
+    body_budget: &BodyBudget,
+    mut s: TcpStream,
+    accepted_at: Instant,
+    read_timeout: Duration,
+    mut unauth_guard: UnauthConnGuard,
+) {
     let request_deadline = accepted_at + read_timeout;
-    let header_deadline = (accepted_at + HEADER_READ_TIMEOUT).min(request_deadline);
+    let header_deadline = (accepted_at + PREAUTH_HEADER_TIMEOUT).min(request_deadline);
     let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
     let Ok(h) = read_head(&mut r) else { return };
     if r.get_mut().remaining().is_err() { return; }
@@ -2460,17 +3147,37 @@ fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accep
     // the key is checked before any body is read
     if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref(), body_limit) {
         drop(r);
-        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "request_too_large" }, &message) }
-                else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
+        drop(unauth_guard);
+        let anth_kind = if code == 401 {
+            "authentication_error"
+        } else if code == 413 {
+            "request_too_large"
+        } else {
+            "invalid_request_error"
+        };
+        send_error_and_drain(&mut s, |st| {
+            if path.starts_with("/v1/messages") {
+                anthropic_error(st, code, anth_kind, &message)
+            } else if code == 401 {
+                respond(st, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string())
+            } else {
+                respond(st, code, &json!({"error": {"message": message}}).to_string())
+            }
+        });
         return;
     }
+    // Release the pre-auth handshake slot as soon as authentication succeeds so
+    // authenticated sessions never consume `MAX_UNAUTH_CONNS`.
+    unauth_guard.release_authenticated();
     // Routes that do not use a body can answer without waiting for one.
     if matches!(route, Route::Models | Route::Health | Route::NotFound) {
         drop(r);
         let result = match route {
             Route::Models => respond(&mut s, 200, &models_body()),
-            Route::Health => respond(&mut s, 200, &health_body(cx)),
+            Route::Health => {
+                let (code, body) = health_response(cx, Instant::now());
+                respond(&mut s, code, &body)
+            }
             Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
             Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
             _ => unreachable!("body routes are handled below"),
@@ -2524,24 +3231,129 @@ fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accep
                 BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
                 BodyError::Busy | BodyError::Incomplete => unreachable!(),
             };
-            let result = if anthropic {
-                anthropic_error(&mut s, code, kind, &message)
-            } else {
-                respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
-            };
-            if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+            send_error_and_drain(&mut s, |st| {
+                if anthropic {
+                    anthropic_error(st, code, kind, &message)
+                } else {
+                    respond(st, code, &json!({"error": {"message": message}}).to_string())
+                }
+            });
             return;
         }
     };
     let card_id = h.card_id.as_deref();
+    let credential = h.auth.as_deref().or(h.api_key.as_deref());
+    let tenant_ns = h.cache_namespace.as_deref();
     let result = match route {
-        Route::Chat => chat_with_card(cx, &decoded.value, card_id, &mut s),
-        Route::Messages => messages_with_card(cx, &decoded.value, card_id, &mut s),
+        Route::Chat => chat_with_principal(cx, &decoded.value, card_id, credential, tenant_ns, &mut s),
+        Route::Messages => messages_with_principal(cx, &decoded.value, card_id, credential, tenant_ns, &mut s),
         Route::CountTokens => count_tokens(cx, &decoded.value, &mut s),
         _ => unreachable!("bodyless routes were handled above"),
     };
     drop(decoded);
     if let Err(e) = result { eprintln!("[serve] client: {e}"); }
+}
+
+pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
+    let PreModeServe { chunk, prepared, tk, sp, spill_store, listeners } = match validate_serve_pre_mode(&o) {
+        Ok(ok) => ok,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            std::process::exit(code);
+        }
+    };
+    let _mode_guard = enter_mode();
+    crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
+    let eng = match prepared.into_engine(o.kv8, chunk) {
+        Ok(eng) => eng,
+        Err(err) => {
+            eprintln!("[inky] could not load {}: {err}", o.model);
+            std::process::exit(1);
+        }
+    };
+    eng.set_loopcd_omega(o.loopcd_omega);
+    eng.ensure_batch(eng.chunk);
+    let (chip, mem) = crate::tuning::this_machine();
+    let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
+    let budget = MemoryBudget::compute(
+        eng.gpu.recommended_max_working_set_size(),
+        eng.model_and_scratch_bytes(),
+        safety_headroom_bytes,
+        eng.per_lane_paged_reserve_bytes(),
+        o.lanes,
+    );
+    let effective_lanes = budget.max_admitted_lanes;
+    if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
+    let non_kv_serve_bytes = eng.serve_non_kv_bytes(effective_lanes);
+    let after_non_kv_budget = budget.available_kv_budget_bytes.saturating_sub(non_kv_serve_bytes);
+    let retained_host_budget_bytes = ServeBlockCache::recommended_host_budget_bytes(after_non_kv_budget);
+    let kv_pool_budget_bytes = after_non_kv_budget.saturating_sub(retained_host_budget_bytes);
+    eng.ensure_dbatch(effective_lanes);
+    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(kv_pool_budget_bytes, effective_lanes);
+    let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
+    let (jtx, jrx) = channel::<Job>();
+    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
+    let active_lanes = Arc::new(AtomicUsize::new(0));
+    let health = Arc::new(SchedulerHealth::new(Instant::now()));
+    let deferrals = Arc::new(DeferralCounters::default());
+    let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
+    let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
+    let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
+        nonce: startup_nonce(), key: o.key.clone(), ctx: context,
+        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
+        budget,
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), unauth_conns: Default::default(), health: health.clone(), deferrals: deferrals.clone(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder,
+        cache_policy: CachePolicy { isolate_cache: o.isolate_cache, hide_cached_tokens: o.hide_cached_tokens } });
+    let reporter_cx = Arc::downgrade(&cx);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let Some(cx) = reporter_cx.upgrade() else { break };
+        let waiting = cx.admission.queued();
+        let summary = cx.metrics.lock().unwrap_or_else(|e| e.into_inner()).summarize(Instant::now(), waiting);
+        eprintln!("{summary}");
+    });
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if effective_lanes < o.lanes {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB): capping lanes {} -> {}",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), o.lanes, effective_lanes
+        );
+    } else {
+        eprintln!(
+            "[serve] Metal working set {:.2} GiB (model+scratch {:.2} GiB, headroom {:.2} GiB, avail {:.2} GiB, per-lane worst-case {:.2} GiB, max_admitted_lanes {})",
+            gib(budget.recommended_working_set_bytes), gib(budget.model_bytes), gib(budget.safety_headroom_bytes),
+            gib(budget.available_kv_budget_bytes), gib(budget.per_lane_worst_case_bytes), effective_lanes
+        );
+    }
+    {
+        let kvb = if eng.kv8 { 1u32 } else { 2u32 };
+        let win_gib = gib((pool_win_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Window, kvb).unwrap_or(0)));
+        let full_gib = gib((pool_full_slots as u64).saturating_mul(crate::blocks::stride_at(crate::blocks::BlockKind::Full, kvb).unwrap_or(0)));
+        eprintln!("[serve] Layer 3 paged KV pool (kvb={kvb}{}): {pool_win_slots} window slots ({win_gib:.2} GiB) + {pool_full_slots} full slots ({full_gib:.2} GiB)",
+                  if eng.kv8 { ", --kv8" } else { "" });
+    }
+    if o.loopcd_omega > 0.0 {
+        eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
+    }
+    for (l, addr) in listeners {
+        let auth = if o.key.is_some() {
+            if is_private_ip(addr.ip()) { "a key required (private/loopback)" } else { "a key required" }
+        } else if addr.ip().to_canonical().is_loopback() {
+            "no key (loopback)"
+        } else {
+            "no key (non-loopback explicitly enabled)"
+        };
+        let bound_non_loopback = !addr.ip().to_canonical().is_loopback();
+        eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+        spawn_accept_loop(l, bound_non_loopback, cx.clone());
+    }
+    scheduler(
+        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
+        retained_host_budget_bytes, health, deferrals,
+        #[cfg(test)]
+        None,
+    );
 }
 
 #[cfg(test)]
@@ -2594,7 +3406,16 @@ mod tests {
                 DEFAULT_RETRY_AFTER_SECS,
             ),
             budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            preprocess: PermitPool::new(preprocess_limit),
+            count_preprocess: PermitPool::new(1),
+            active_lanes: Default::default(),
+            conns: Default::default(),
+            unauth_conns: Default::default(),
+            health: Default::default(),
+            deferrals: Default::default(),
+            stream_poll_interval: STREAM_POLL_INTERVAL,
+            recorder: None,
+            cache_policy: CachePolicy::default(),
         };
         (cx, rx)
     }
@@ -2853,7 +3674,10 @@ mod tests {
         assert!(!context_over(0, 1, 3));
         // saturating: a huge prompt can never wrap into fitting
         assert!(context_over(usize::MAX, 1, 100));
-        assert_eq!(context_full_message(11, 5, 17), "context full: 11 prompt tokens and 5 to generate, 17 per lane");
+        assert_eq!(
+            context_full_message(11, 5, 17),
+            "context full: 11 prompt tokens exceeds 10 maximum (17 per lane with 5 to generate and 2 reserved)"
+        );
     }
 
     #[test]
@@ -2974,9 +3798,18 @@ mod tests {
         for _ in 0..128 { trailers.extend_from_slice(b"X: y\r\n"); }
         trailers.extend_from_slice(b"\r\n");
         assert!(chunk(trailers).is_err());
-        let mut framing = Vec::new();
-        for _ in 0..(MAX_FRAMING / 3 + 1) { framing.extend_from_slice(b"1\na\n"); }
-        assert!(matches!(read_chunked(&mut Cursor::new(framing), MAX_FRAMING), Err(BodyError::Malformed(_))));
+        let mut unterm = Vec::new();
+        for _ in 0..(MAX_TRAILER_BYTES / 3 + 1) { unterm.extend_from_slice(b"1\na\n"); }
+        assert!(matches!(read_chunked(&mut Cursor::new(unterm), MAX_BODY), Err(BodyError::Malformed(_))));
+        // Valid sub-cap body split across 10,000 4-byte chunks (~100 KiB of chunk framing > 64 KiB) succeeds!
+        let mut many_chunks = Vec::with_capacity(110_000);
+        for _ in 0..10_000 {
+            many_chunks.extend_from_slice(b"4\r\nabcd\r\n");
+        }
+        many_chunks.extend_from_slice(b"0\r\n\r\n");
+        let decoded = read_chunked(&mut Cursor::new(many_chunks), MAX_BODY).expect("10,000 4-byte chunks under cap must decode");
+        assert_eq!(decoded.len(), 40_000);
+        assert!(decoded.chunks_exact(4).all(|c| c == b"abcd"));
     }
 
     #[test] fn routes_distinguish_body_and_bodyless_handlers() {
@@ -3452,7 +4285,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3475,7 +4308,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
@@ -3501,29 +4334,98 @@ mod tests {
     }
 
     #[test] fn messages_stream_polls_even_during_hidden_thinking() {
-        struct Gone { bytes: Vec<u8>, checks: std::cell::Cell<usize> }
-        impl Write for Gone {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.bytes.extend_from_slice(buf); Ok(buf.len()) }
+        struct GoneAfterStreamStart {
+            bytes: Vec<u8>,
+            armed: std::cell::Cell<bool>,
+            checks: std::cell::Cell<usize>,
+        }
+        impl Write for GoneAfterStreamStart {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(buf);
+                if self.bytes.starts_with(b"HTTP/1.1 200") {
+                    self.armed.set(true);
+                }
+                Ok(buf.len())
+            }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        impl ClientWrite for Gone {
-            fn client_gone(&self) -> bool { self.checks.set(self.checks.get() + 1); true }
+        impl ClientWrite for GoneAfterStreamStart {
+            fn client_gone(&self) -> bool {
+                if !self.armed.get() {
+                    return false;
+                }
+                self.checks.set(self.checks.get() + 1);
+                true
+            }
         }
-        let tk = Tokenizer::for_test();
-        let sp = test_sp(&tk);
-        let (jtx, jrx) = channel::<Job>();
-        let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
-            max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
-        let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-            let _ = job.out.send(Ev::Tok(sp.c_think));
-            for _ in 0..50 { if job.out.send(Ev::Tok(sp.c_think)).is_err() { break; } }
-        });
-        let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
-        messages(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
-        scheduler.join().unwrap();
-        assert!(out.checks.get() > 0);
+        for use_chat in [false, true] {
+            let tk = Tokenizer::for_test();
+            let sp = test_sp(&tk);
+            let payload_tok = tk.encode("a", false)[0];
+            let (jtx, jrx) = channel::<Job>();
+            let cx = Ctx {
+                metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
+                tk: Arc::new(Tokenizer::for_test()),
+                sp,
+                jobs: jtx,
+                effort: "none".into(),
+                max_tokens: 64,
+                thinking_budget: 0,
+                loopcd_omega: 0.0,
+                kv8: false,
+                seq: Default::default(),
+                nonce: "test".into(),
+                key: None,
+                ctx: 64,
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
+                budget: test_budget(4),
+                preprocess: PermitPool::new(PREPROCESS_LIMIT),
+                count_preprocess: PermitPool::new(1),
+                active_lanes: Default::default(),
+                conns: Default::default(),
+                unauth_conns: Default::default(),
+                health: Default::default(),
+                deferrals: Default::default(),
+                stream_poll_interval: STREAM_POLL_INTERVAL,
+                recorder: None,
+                cache_policy: CachePolicy::default(),
+            };
+            let (done_tx, done_rx) = channel::<()>();
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
+                // Pre-buffer 24 hidden thinking tokens immediately while holding `job` alive until the
+                // handler exits: neither RecvTimeoutError::Timeout nor Disconnected can fire, so ONLY
+                // the every-16-tokens Ev::Tok poll can notice disconnect and abort at token 16!
+                job.out.send(Ev::Tok(sp.c_think)).unwrap();
+                for _ in 0..23 {
+                    let _ = job.out.send(Ev::Tok(payload_tok));
+                }
+                done_rx.recv_timeout(Duration::from_secs(2)).expect("stream handler must abort via Ev::Tok poll without waiting on sender drop");
+                let cancelled_on_poll = job.out.cancelled() && job.out.send(Ev::Tok(payload_tok)).is_err();
+                let queued_left = job.out.queued();
+                (cancelled_on_poll, queued_left)
+            });
+            let mut out = GoneAfterStreamStart {
+                bytes: Vec::new(),
+                armed: std::cell::Cell::new(false),
+                checks: std::cell::Cell::new(0),
+            };
+            let req = json!({"max_tokens": 32, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+            if use_chat {
+                chat(&cx, &req, &mut out).unwrap();
+            } else {
+                messages(&cx, &req, &mut out).unwrap();
+            }
+            done_tx.send(()).unwrap();
+            let (cancelled_on_poll, queued_left) = scheduler.join().unwrap();
+            let body = String::from_utf8_lossy(&out.bytes);
+            assert!(body.starts_with("HTTP/1.1 200"), "use_chat={use_chat}: {body}");
+            assert_eq!(out.checks.get(), 1, "use_chat={use_chat}: must poll exactly once at 16th hidden-thinking token");
+            assert!(cancelled_on_poll, "use_chat={use_chat}: dropping receiver on Ev::Tok poll must mark job.out cancelled");
+            assert_eq!(queued_left, 8, "use_chat={use_chat}: 24 buffered tokens - 16 consumed before abort = 8 unconsumed");
+            assert!(!body.contains("the request was dropped") && !body.contains("message_stop") && !body.contains("[DONE]"),
+                "use_chat={use_chat}: must abort cleanly without Disconnected error or completion marker: {body}");
+        }
     }
 
     #[test] fn chat_and_messages_streams_poll_during_silent_tool_json() {
@@ -3542,7 +4444,7 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() };
             let scheduler = std::thread::spawn(move || {
                 let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                 let mut sent = 0usize;
@@ -3583,7 +4485,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
@@ -3605,7 +4507,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3627,7 +4529,7 @@ mod tests {
     #[test] fn serve_header_policy() {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
-            len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
+            len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, cache_namespace: None, chunked: false,
         };
         let status = |h: &Head| check_headers(h, &h.path, Some("test"), MAX_BODY).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
@@ -3640,7 +4542,7 @@ mod tests {
         head.chunked = true;
         head.len = 0;
         assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
-        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false };
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, cache_namespace: None, chunked: false };
         assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
         by_key.api_key = Some("wrong".into());
         assert_eq!(status(&by_key), Err(401));
@@ -3670,13 +4572,6 @@ mod tests {
         let mut at_end = ext.clone(); at_end[100] = 9999;
         assert_eq!(reusable_prefix(&p, true, &at_end), 100, "diverging at the first suffix token still reuses the whole prompt");
     }
-    #[test] fn decoding_invalidates_only_when_a_write_wraps_into_prefill_history() {
-        assert!(!decode_overwrites_prompt(100, 100));
-        assert!(!decode_overwrites_prompt(EXT - 1, 100));
-        assert!(decode_overwrites_prompt(EXT, 100));
-        assert!(decode_overwrites_prompt(EXT, EXT));
-        assert!(decode_overwrites_prompt(EXT + 40, EXT + 40));
-    }
 
     #[test] fn inference_failures_reach_both_apis_without_a_success_terminator() {
         let tk = Arc::new(Tokenizer::for_test());
@@ -3685,7 +4580,7 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default() };
                 let scheduler = std::thread::spawn(move || {
                     let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
@@ -3733,12 +4628,13 @@ mod tests {
     #[test] fn peek_results_decide_whether_the_peer_is_gone() {
         use std::io::{Error, ErrorKind};
         let script = |v: Vec<std::io::Result<usize>>| { let mut q = VecDeque::from(v); move |_: &mut [u8]| q.pop_front().unwrap() };
-        assert!(gone_from_peek(script(vec![Ok(0)])), "a closed end is gone");
-        assert!(!gone_from_peek(script(vec![Ok(1)])), "data waiting is present");
-        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::WouldBlock))])), "nothing waiting yet is present");
-        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
-        assert!(!gone_from_peek(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
-        assert!(gone_from_peek(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
+        assert!(gone_from_nonblocking_read(script(vec![Ok(0)])), "a closed end is gone");
+        assert!(!gone_from_nonblocking_read(script(vec![Ok(1), Err(Error::from(ErrorKind::WouldBlock))])), "trailing data with open peer is present");
+        assert!(gone_from_nonblocking_read(script(vec![Ok(1), Ok(0)])), "trailing data followed by close is gone");
+        assert!(!gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::WouldBlock))])), "nothing waiting yet is present");
+        assert!(gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Ok(0)])), "an interrupted probe is retried, then the close is seen");
+        assert!(!gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted)), Err(Error::from(ErrorKind::Interrupted))])), "a probe interrupted past its retries leaves the client present");
+        assert!(gone_from_nonblocking_read(script(vec![Err(Error::from(ErrorKind::ConnectionReset))])), "a hard error fails toward cancellation: gone");
     }
 
     #[test] fn thinking_budget_soft_closes_and_bans_reentry() {
@@ -3780,6 +4676,51 @@ mod tests {
             job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
             worker.join().unwrap();
         }
+
+        // Verify scheduler-side sampling + ThinkBudget enforcement loop (`sample_next_with_ban_and_softcap` + `ThinkBudget::observe`):
+        // even when raw logits overwhelmingly favor `<|content_thinking|>` and thinking tokens, after `budget = 2`
+        // thinking tokens the scheduler forces `<|end_message|>` and passes `ban_tok = Some(sp.c_think)` into the
+        // sampler so subsequent steps cannot re-enter thinking and instead emit `<|content_text|>`.
+        let vocab = 512usize;
+        let tok_think_body = a as usize;
+        let tok_answer = (a + 1) as usize;
+        let mut sampler = Sampler::new(0.0, 64, 0.95, 30.0, 42);
+        let mut think = ThinkBudget::new(2);
+        let mut emitted = Vec::new();
+        for step in 0..7usize {
+            let mut logits = vec![-20.0f32; vocab];
+            match step {
+                0 => logits[sp.msg_model as usize] = 15.0,
+                1 => logits[sp.c_think as usize] = 15.0,
+                2..=4 => logits[tok_think_body] = 15.0, // step 4 is 3rd thinking token -> forced sp.end!
+                5 => {
+                    // Model tries to re-open <|content_thinking|> with higher logit than <|content_text|>,
+                    // which MUST be masked to -inf by `think.ban_token(&sp)`.
+                    logits[sp.c_think as usize] = 25.0;
+                    logits[sp.c_text as usize] = 12.0;
+                }
+                _ => {
+                    logits[sp.c_think as usize] = 25.0;
+                    logits[tok_answer] = 10.0;
+                }
+            }
+            let raw_tok = sampler.sample_next_with_ban_and_softcap(&logits, think.ban_token(&sp), 30.0).unwrap();
+            let observed = think.observe(raw_tok, &sp);
+            emitted.push(observed);
+        }
+        assert_eq!(
+            emitted,
+            vec![
+                sp.msg_model,
+                sp.c_think,
+                tok_think_body as u32,
+                tok_think_body as u32,
+                sp.end,
+                sp.c_text,
+                tok_answer as u32,
+            ],
+            "scheduler sampling + ThinkBudget must cap thinking at 2 tokens and ban c_think re-entry"
+        );
     }
 
     #[test] fn loopcd_omega_defaults_overrides_and_rejects_invalid_on_both_apis() {
@@ -3970,7 +4911,7 @@ mod tests {
         let timeouts = std::cell::RefCell::new(Vec::new());
         let dr = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
-            start + HEADER_READ_TIMEOUT,
+            start + PREAUTH_HEADER_TIMEOUT,
             || { let cur = clock.get(); clock.set(cur + Duration::from_secs(1)); cur },
             |d| { timeouts.borrow_mut().push(d); Ok(()) },
         );
@@ -3983,7 +4924,7 @@ mod tests {
         let fast_clock = std::cell::Cell::new(start);
         let dr_ok = DeadlineReader::new(
             Trickle { bytes: req, pos: 0 },
-            start + HEADER_READ_TIMEOUT,
+            start + PREAUTH_HEADER_TIMEOUT,
             || { let cur = fast_clock.get(); fast_clock.set(cur + Duration::from_millis(10)); cur },
             |_| Ok(()),
         );
@@ -4007,6 +4948,7 @@ mod tests {
             "ok": true,
             "active_lanes": 0,
             "inflight": 0,
+            "output_tokens": 0,
             "recommended_working_set_bytes": b.recommended_working_set_bytes,
             "model_bytes": b.model_bytes,
             "starts_spilled": 0,
@@ -4090,12 +5032,9 @@ mod tests {
             out
         });
 
-        // Wait until request 2 is visibly sitting in the wait queue via /health telemetry.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while cx.admission.queued() != 1 {
-            assert!(Instant::now() < deadline, "queued request did not enter wait queue");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Wait deterministically on the admission condvar until request 2 enters the wait queue.
+        cx.admission.wait_until_queued(1);
+        assert_eq!(cx.admission.queued(), 1);
         let snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(snap["active_lanes"], 1);
         assert_eq!(snap["queued_requests"], 1);
@@ -4192,7 +5131,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: Some(rec.clone()), cache_policy: CachePolicy::default(),
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -4370,6 +5309,7 @@ mod tests {
             auth: auth.map(str::to_owned),
             api_key: api_key.map(str::to_owned),
             card_id: None,
+            cache_namespace: None,
             chunked: false,
         };
         // Unkeyed server permits loopback requests without headers
@@ -4392,7 +5332,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default(),
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4452,7 +5392,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), unauth_conns: Default::default(), health: Default::default(), deferrals: Default::default(), stream_poll_interval: STREAM_POLL_INTERVAL, recorder: None, cache_policy: CachePolicy::default(),
         });
 
         let req = json!({
@@ -4702,9 +5642,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Inkling-2-Mini GGUF model on Metal GPU"]
     fn serve_layer3_three_turn_10k_cached_matches_cold_solo() {
-        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
-            "/Users/glenn/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf".to_string()
-        });
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
         assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
 
         let ctx = 16384usize;
@@ -4778,6 +5716,11 @@ mod tests {
         let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
         let turn2_suffix = tk.encode("Now give step two concisely, covering block table indexing, sliding-window expiration across 1024 tokens, recurrent convolution state restoration, and exact LRU start-point eviction under pool pressure so that this turn crosses at least one full 64-token block boundary.", false);
         let turn3_suffix = tk.encode("Finally summarize step three.", false);
+        let think_req = json!({
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "Prove there are infinitely many primes step by step."}]
+        });
+        let think_prompt_base = render(&tk, &sp, &think_req, "high").expect("render thinking prompt");
         let turn1_for_client = turn1.clone();
         let client = std::thread::spawn(move || {
             let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
@@ -4793,6 +5736,7 @@ mod tests {
                     seed: 1,
                     thinking_budget: 0,
                     loopcd_omega: 0.0,
+                    cache_namespace: 0,
                     queued_at: Instant::now(),
                     out,
                     _permit: admission.try_acquire().unwrap(),
@@ -4826,6 +5770,49 @@ mod tests {
             turn3.extend_from_slice(&[sp.end, sp.msg_model, sp.c_text]);
             let (t3_out, t3_pf, t3_cached) = send_turn(3, turn3.clone());
 
+            // Also verify `thinking_budget` enforcement directly through the live `serve::scheduler`
+            // on both GPU Gumbel (`top_k = 0, top_p = 1.0`) and CPU sampler (`top_k = 64, top_p = 0.95`) paths!
+            for (seq, top_k, top_p) in [(4u64, 0usize, 1.0f32), (5u64, 64usize, 0.95f32)] {
+                let think_prompt = think_prompt_base.clone();
+                let (out, events) = job_events();
+                jtx.send(Job {
+                    seq,
+                    toks: think_prompt,
+                    max: 24,
+                    temp: 0.6,
+                    top_k,
+                    top_p,
+                    seed: 77,
+                    thinking_budget: 3,
+                    loopcd_omega: 0.0,
+                    cache_namespace: 0,
+                    queued_at: Instant::now(),
+                    out,
+                    _permit: admission.try_acquire().unwrap(),
+                }).unwrap();
+                let mut gen_toks = Vec::new();
+                loop {
+                    match events.recv_timeout(Duration::from_secs(60)).unwrap() {
+                        Ev::Tok(t) => gen_toks.push(t),
+                        Ev::Alive => {}
+                        Ev::Done { .. } => break,
+                        Ev::Err(e) | Ev::Failed(e) => panic!("thinking_budget turn {seq} failed: {e}"),
+                    }
+                }
+                let think_opens: Vec<usize> = gen_toks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &t)| (t == sp.c_think).then_some(idx))
+                    .collect();
+                assert_eq!(think_opens.len(), 1, "turn {seq} (top_k={top_k}): expected exactly 1 <|content_thinking|> block (re-entry must be banned), got {gen_toks:?}");
+                let think_start = think_opens[0] + 1;
+                let think_end = gen_toks[think_start..]
+                    .iter()
+                    .position(|&t| t == sp.end)
+                    .expect("thinking block must be closed by <|end_message|>");
+                assert!(think_end <= 3, "turn {seq} (top_k={top_k}): scheduler must cap thinking tokens at budget=3, got {think_end} ({gen_toks:?})");
+            }
+
             drop(jtx);
 
             eprintln!(
@@ -4842,7 +5829,20 @@ mod tests {
         use crate::scheduler::LaneState::{Admitted, Queued, Ready, Restoring};
         let mut admissions = Vec::new();
         scheduler_trace::capture_if_requested(|| {
-            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None, Some(&mut admissions))
+            scheduler(
+                &eng,
+                &tk,
+                sp,
+                4,
+                jrx,
+                active_lanes,
+                &metrics,
+                None,
+                block_cache::DEFAULT_MAX_RETAINED_HOST_BYTES,
+                Arc::new(SchedulerHealth::new(Instant::now())),
+                Arc::new(DeferralCounters::default()),
+                Some(&mut admissions),
+            )
         });
         assert_eq!(admissions, [[Queued, Admitted, Restoring, Ready]; 3]);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
@@ -4928,9 +5928,9 @@ mod tests {
         toks0.extend(30000..30300);
 
         let cands = [
-            InflightPrefillLane { lane: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 1, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 2, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 0, namespace: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 1, namespace: 0, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 2, namespace: 0, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
         ];
         assert_eq!(find_prefill_leader(&cands, 0), None);
         assert_eq!(find_prefill_leader(&cands, 1), Some(0));
@@ -5041,6 +6041,7 @@ mod tests {
                 seed: 1,
                 thinking_budget: 0,
                 loopcd_omega: 0.0,
+                cache_namespace: 0,
                 queued_at: Instant::now(),
                 out,
                 _permit: admission.try_acquire().unwrap(),
@@ -5096,12 +6097,12 @@ mod tests {
         metrics.lock().unwrap().queued = 2;
         jtx.send(Job {
             seq: 10, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_live_out,
+            thinking_budget: 0, loopcd_omega: 0.0, cache_namespace: 0, queued_at: Instant::now(), out: arr_live_out,
             _permit: admission.try_acquire().unwrap(),
         }).unwrap();
         jtx.send(Job {
             seq: 11, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_dead_out,
+            thinking_budget: 0, loopcd_omega: 0.0, cache_namespace: 0, queued_at: Instant::now(), out: arr_dead_out,
             _permit: admission.try_acquire().unwrap(),
         }).unwrap();
 
@@ -5184,6 +6185,7 @@ mod tests {
                 seed: 1,
                 thinking_budget: 0,
                 loopcd_omega: 0.0,
+                cache_namespace: 0,
                 queued_at: Instant::now(),
                 out,
                 _permit: admission.try_acquire().unwrap(),
@@ -5232,5 +6234,676 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn error_tool_result_tokenizes_whole_role_markers_stop_and_parsers_agree() {
+        let tk = Tokenizer::for_test();
+        let sp = test_sp(&tk);
+
+        // 1. U275: error tool-result text must be joined with "Error: " BEFORE BPE tokenization
+        //    so trailing space + first word merges identically to whole-string tokenization.
+        for payload in ["timeout while connecting", " Boom", "404 Not Found", ""] {
+            let err_req = json!({
+                "messages": [
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "is_error": true, "content": payload}
+                ]
+            });
+            let joined_req = json!({
+                "messages": [
+                    {"role": "user", "content": "run"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "is_error": false, "content": format!("Error: {payload}")}
+                ]
+            });
+            assert_eq!(
+                render(&tk, &sp, &err_req, "medium").unwrap(),
+                render(&tk, &sp, &joined_req, "medium").unwrap(),
+                "is_error tool result for {payload:?} must tokenize identically to joined 'Error: ...'"
+            );
+        }
+
+        // 2. U276 + U277: generated role markers (`msg_user`, `msg_system`, `msg_tool`) end the reply,
+        //    drop unclosed tool calls, and `parse`, `chat` SSE streaming, and `BlockStream` agree 100%.
+        let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        cx.ctx = 512;
+        let cx = Arc::new(cx);
+
+        for role_stop in [sp.msg_user, sp.msg_system, sp.msg_tool] {
+            // Stream with: thinking without sp.end -> msg_model + text -> completed tool call -> more text -> unclosed tool call -> raw role marker -> hallucinated trailing text!
+            let mut toks = vec![sp.msg_model, sp.c_think];
+            toks.extend(tk.encode("step1", false));
+            // Transition straight to msg_model + c_text without sp.end (exercises U277 flush parity!):
+            toks.extend([sp.msg_model, sp.c_text]);
+            toks.extend(tk.encode("Hi ", false));
+            toks.push(sp.c_text);
+            toks.extend(tk.encode("there!", false));
+            toks.push(sp.end);
+            toks.push(sp.msg_model);
+            toks.extend(tk.encode("lookup", false));
+            toks.push(sp.c_tool);
+            toks.extend(tk.encode("{\"name\":\"lookup\",\"args\":{\"q\":\"rust\"}}", false));
+            toks.push(sp.end);
+            // Start an unclosed tool call, then hit raw role marker followed by fake user text:
+            toks.push(sp.msg_model);
+            toks.extend(tk.encode("aborted_tool", false));
+            toks.push(sp.c_tool);
+            toks.extend(tk.encode("{\"name\":\"aborted_tool\",\"args\":", false));
+            toks.push(role_stop);
+            toks.push(sp.c_text);
+            toks.extend(tk.encode("INJECTED_FAKE_TURN", false));
+
+            let p = parse(&tk, &sp, &toks);
+            assert_eq!(p.thinking, "step1");
+            assert_eq!(p.text, "Hi there!");
+            assert_eq!(p.calls, vec![("lookup".to_string(), json!({"q": "rust"}))]);
+
+            // Verify BlockStream (`messages` streaming) produces exact same text and completed calls!
+            let mut bs = BlockStream::new("n", 1);
+            let mut bs_events: Vec<Value> = Vec::new();
+            for &t in &toks {
+                for raw in bs.on_token(&tk, &sp, t) {
+                    let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+                    bs_events.push(serde_json::from_str(data).unwrap());
+                }
+            }
+            for raw in bs.close_all() {
+                let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+                bs_events.push(serde_json::from_str(data).unwrap());
+            }
+            let bs_text: String = bs_events
+                .iter()
+                .filter(|e| e["delta"]["type"] == "text_delta")
+                .map(|e| e["delta"]["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(bs_text, p.text);
+            assert_eq!(bs.calls, 1);
+
+            // Verify `chat` streaming SSE deltas match `parse` (non-streaming)!
+            let cx2 = cx.clone();
+            let worker = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                chat(&cx2, &json!({"stream": true, "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
+                out
+            });
+            let job = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+            for &t in &toks {
+                job.out.send(Ev::Tok(t)).unwrap();
+            }
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: toks.len(), reason: "stop", timing: Default::default() }).unwrap();
+            let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+            let mut sse_think = String::new();
+            let mut sse_text_acc = String::new();
+            let mut sse_calls = Vec::new();
+            for line in resp.split("\r\n\r\n").nth(1).unwrap().lines() {
+                let Some(d) = line.strip_prefix("data: ") else { continue };
+                if d == "[DONE]" { break; }
+                let v: Value = serde_json::from_str(d).unwrap();
+                if let Some(r) = v["choices"][0]["delta"]["reasoning_content"].as_str() { sse_think += r; }
+                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() { sse_text_acc += c; }
+                if let Some(arr) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+                    for tc in arr {
+                        sse_calls.push((
+                            tc["function"]["name"].as_str().unwrap().to_string(),
+                            serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap()).unwrap(),
+                        ));
+                    }
+                }
+            }
+            assert_eq!(sse_think, p.thinking);
+            assert_eq!(sse_text_acc, p.text);
+            assert_eq!(sse_calls, p.calls);
+        }
+    }
+
+    #[test]
+    fn chat_sse_writes_each_event_in_one_send_and_both_apis_emit_keepalives() {
+        struct CountingWriter {
+            buf: Vec<u8>,
+            writes: Vec<Vec<u8>>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(data.to_vec());
+                self.buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ClientWrite for CountingWriter {
+            fn client_gone(&self) -> bool { false }
+        }
+
+        let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        cx.ctx = 512;
+        cx.stream_poll_interval = Duration::from_millis(5);
+        let cx = Arc::new(cx);
+
+        // 1. OpenAI Chat SSE: 1 write per SSE event + `: keepalive\n\n` during prefill, silent header/thinking, and buffered tool calls!
+        let cx_chat = cx.clone();
+        let chat_worker = std::thread::spawn(move || {
+            let mut cw = CountingWriter { buf: Vec::new(), writes: Vec::new() };
+            chat(
+                &cx_chat,
+                &json!({"stream": true, "stream_options": {"include_usage": true}, "max_tokens": 32, "messages": [{"role": "user", "content": "ping?"}]}),
+                &mut cw,
+            )
+            .unwrap();
+            cw
+        });
+        let job = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Prefill keepalive via Ev::Alive AND via poll timeout:
+        job.out.send(Ev::Alive).unwrap();
+        std::thread::sleep(Duration::from_millis(12));
+        // Buffered tool-call phase (`c_tool` + silent JSON tokens taking > poll_interval):
+        job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.c_text)).unwrap();
+        for tok in cx.tk.encode("ok", false) {
+            job.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job.out.send(Ev::Tok(cx.sp.c_tool)).unwrap();
+        let tool_toks = cx.tk.encode("{\"name\":\"fn1\",\"args\":{\"a\":1}}", false);
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in tool_toks {
+            job.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 10, reason: "stop", timing: Default::default() }).unwrap();
+
+        let cw = chat_worker.join().unwrap();
+        assert!(!cw.writes.is_empty());
+        assert!(cw.writes[0].starts_with(b"HTTP/1.1 200 OK\r\n"), "write[0] is the HTTP response header");
+        let mut keepalives = 0usize;
+        for (idx, w) in cw.writes.iter().enumerate().skip(1) {
+            let s = std::str::from_utf8(w).expect("valid UTF-8 SSE frame");
+            assert!(
+                (s.starts_with("data: ") || s == ": keepalive\n\n") && s.ends_with("\n\n"),
+                "write[{idx}] must be one complete self-contained SSE frame, got: {s:?}"
+            );
+            assert_eq!(
+                s.matches("\n\n").count(),
+                1,
+                "write[{idx}] must contain exactly 1 SSE event per write syscall, got: {s:?}"
+            );
+            if s == ": keepalive\n\n" {
+                keepalives += 1;
+            }
+        }
+        assert!(keepalives >= 3, "expected >= 3 Chat keepalives across Alive, prefill timeout, and buffered tool call; got {keepalives}");
+
+        // 2. Anthropic Messages SSE: emits `event: ping` during prefill, hidden thinking (`mode == 1`), and buffered tool call (`mode == 3`)!
+        let cx_msg = cx.clone();
+        let msg_worker = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            messages(
+                &cx_msg,
+                &json!({"stream": true, "max_tokens": 32, "messages": [{"role": "user", "content": "ping?"}]}),
+                &mut out,
+            )
+            .unwrap();
+            out
+        });
+        let job2 = jrx.recv_timeout(Duration::from_secs(2)).unwrap();
+        job2.out.send(Ev::Alive).unwrap();
+        // Hidden thinking phase (tokens arrive without opening any Anthropic block):
+        job2.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job2.out.send(Ev::Tok(cx.sp.c_think)).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in cx.tk.encode("long hidden thought", false) {
+            job2.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job2.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        // Buffered tool-call phase:
+        job2.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
+        job2.out.send(Ev::Tok(cx.sp.c_tool)).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        for tok in cx.tk.encode("{\"name\":\"fn2\",\"args\":{}}", false) {
+            job2.out.send(Ev::Tok(tok)).unwrap();
+        }
+        job2.out.send(Ev::Tok(cx.sp.end)).unwrap();
+        job2.out.send(Ev::Done { prompt: job2.toks.len(), cached: 0, gen: 12, reason: "stop", timing: Default::default() }).unwrap();
+
+        let msg_resp = String::from_utf8(msg_worker.join().unwrap()).unwrap();
+        let ping_count = msg_resp.matches("event: ping\ndata: {\"type\":\"ping\"}\n\n").count();
+        assert!(ping_count >= 3, "expected >= 3 Messages pings across Alive, hidden thinking, and buffered tool call; got {ping_count}");
+    }
+
+    #[test]
+    fn disconnect_probing_handles_half_close_and_trailing_bytes_and_error_drain_bounds() {
+        use std::collections::VecDeque as VD;
+
+        // 1. Open idle socket (`WouldBlock`) -> NOT gone.
+        assert!(!gone_from_nonblocking_read(|_| Err(std::io::ErrorKind::WouldBlock.into())));
+        // 2. TCP half-close (`SHUT_WR` -> `Ok(0)` EOF) -> gone!
+        assert!(gone_from_nonblocking_read(|_| Ok(0)));
+        // 3. Trailing `\r\n` after body while client stays open (`Ok(2)` then `WouldBlock`) -> NOT gone!
+        let mut seq_open: VD<std::io::Result<usize>> = VD::from([Ok(2), Err(std::io::ErrorKind::WouldBlock.into())]);
+        assert!(!gone_from_nonblocking_read(|buf| {
+            let r = seq_open.pop_front().unwrap();
+            if let Ok(n) = r { buf[..n].copy_from_slice(b"\r\n"); }
+            r
+        }));
+        // 4. Trailing `\r\n` / pipelined bytes after body followed by close (`Ok(16)` then `Ok(0)`) -> gone immediately!
+        let mut seq_closed: VD<std::io::Result<usize>> = VD::from([Ok(16), Ok(0)]);
+        assert!(gone_from_nonblocking_read(|_| seq_closed.pop_front().unwrap()));
+        // 5. > 8 KiB unsolicited post-body flood on Connection: close -> gone!
+        assert!(gone_from_nonblocking_read(|b| Ok(b.len())));
+
+        // 6. Bounded unread body drain helper consumes up to `max_bytes` and leaves zero panic on EOF/WouldBlock.
+        let mut unread = std::io::Cursor::new(vec![b'x'; 20_000]);
+        assert_eq!(drain_unread_bounded(&mut unread, 8192), 8192);
+        assert_eq!(unread.position(), 8192);
+    }
+
+    #[test]
+    fn preauth_connection_budget_and_admission_gate_many_waiters_outside_lock() {
+        // 1. Rowan C3: pre-auth header deadline is 5s and unauth handshake budget caps non-loopback peers
+        //    at MAX_UNAUTH_CONNS (64 < MAX_CONNS = 512), releasing immediately once authenticated!
+        assert_eq!(PREAUTH_HEADER_TIMEOUT, Duration::from_secs(5));
+        assert!(MAX_UNAUTH_CONNS <= MAX_CONNS / 2);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut guards: Vec<UnauthConnGuard> = (0..4)
+            .map(|_| UnauthConnGuard::try_acquire(&counter, true, 4).expect("within unauth budget"))
+            .collect();
+        assert!(UnauthConnGuard::try_acquire(&counter, true, 4).is_none(), "5th unauth peer refused");
+        assert!(UnauthConnGuard::try_acquire(&counter, false, 4).is_some(), "loopback peer bypasses non-loopback unauth cap");
+        guards[0].release_authenticated();
+        assert_eq!(counter.load(Ordering::SeqCst), 3, "authenticated connection frees its pre-auth slot immediately");
+        let _fifth = UnauthConnGuard::try_acquire(&counter, true, 4).expect("freed pre-auth slot admits next handshake");
+        drop(guards);
+        drop(_fifth);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // 2. U287 + U288: `is_gone` runs OUTSIDE `AdmissionGate` mutex (re-entering `gate.queued()` / `gate.inflight()`
+        //    inside `is_gone` does not deadlock!) and >= 8 queued waiters preserve strict FIFO across mid-queue cancels!
+        let gate = Arc::new(AdmissionGate::with_timings(
+            1,
+            16,
+            Duration::from_secs(5),
+            Duration::from_millis(2),
+            5,
+        ));
+        let initial_permit = gate.try_acquire().unwrap();
+        let n_waiters = 10usize;
+        let cancel_flags: Arc<Vec<AtomicBool>> = Arc::new((0..n_waiters).map(|_| AtomicBool::new(false)).collect());
+        let lock_free_probed = Arc::new(AtomicUsize::new(0));
+        let admitted_order = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let mut handles = Vec::with_capacity(n_waiters);
+        for idx in 0..n_waiters {
+            let g = gate.clone();
+            let cf = cancel_flags.clone();
+            let probed = lock_free_probed.clone();
+            let order = admitted_order.clone();
+            let rx = release_rx.clone();
+            handles.push(std::thread::spawn(move || {
+                let res = g.acquire_with_cancel(|| {
+                    // Would deadlock immediately on non-reentrant std::sync::Mutex if `st` were still held!
+                    let q = g.queued();
+                    let inf = g.inflight();
+                    assert!(inf >= q);
+                    probed.fetch_add(1, Ordering::Relaxed);
+                    cf[idx].load(Ordering::Acquire)
+                });
+                if let Ok(permit) = res {
+                    order.lock().unwrap().push(idx);
+                    rx.lock().unwrap().recv().unwrap();
+                    drop(permit);
+                    true
+                } else {
+                    false
+                }
+            }));
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while gate.queued() < idx + 1 {
+                assert!(Instant::now() < wait_deadline, "waiter {idx} did not enqueue in time");
+                std::thread::yield_now();
+            }
+        }
+        assert!(lock_free_probed.load(Ordering::Relaxed) >= n_waiters);
+
+        // Cancel mid-queue waiters 2, 5, and 7 while initial_permit is still held:
+        for &c in &[2usize, 5, 7] {
+            cancel_flags[c].store(true, Ordering::Release);
+        }
+        let cancel_deadline = Instant::now() + Duration::from_secs(2);
+        while gate.queued() != n_waiters - 3 {
+            assert!(Instant::now() < cancel_deadline, "cancelled waiters did not drain from queue");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Release initial_permit and step each remaining waiter through in strict FIFO order!
+        drop(initial_permit);
+        for expected_len in 1..=(n_waiters - 3) {
+            let step_deadline = Instant::now() + Duration::from_secs(2);
+            while admitted_order.lock().unwrap().len() < expected_len {
+                assert!(Instant::now() < step_deadline, "waiter #{expected_len} did not wake");
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+        }
+        for (idx, h) in handles.into_iter().enumerate() {
+            let got = h.join().unwrap();
+            assert_eq!(got, ![2usize, 5, 7].contains(&idx));
+        }
+        assert_eq!(*admitted_order.lock().unwrap(), vec![0, 1, 3, 4, 6, 8, 9]);
+        assert_eq!(gate.queued(), 0);
+        assert_eq!(gate.inflight(), 0);
+    }
+
+    #[test]
+    fn scheduler_health_reports_503_on_stalled_step_or_gpu_timeout_and_200_when_idle() {
+        let t0 = Instant::now();
+        let (mut cx, _jrx) = admission_test_ctx_with(2, 2, Duration::from_secs(1), 2);
+        cx.health = Arc::new(SchedulerHealth::with_thresholds(
+            t0,
+            Duration::from_millis(50),
+            Duration::from_millis(25),
+        ));
+
+        // Idle waiting on channel for hours is healthy (200 ok:true):
+        cx.health.mark_idle(t0);
+        let (code_idle, body_idle) = health_response(&cx, t0 + Duration::from_secs(7200));
+        assert_eq!(code_idle, 200);
+        let v_idle: Value = serde_json::from_str(&body_idle).unwrap();
+        assert_eq!(v_idle["ok"], true);
+
+        // Active step within threshold is healthy (200), past threshold is unhealthy (503 ok:false + reason):
+        cx.health.begin_step(t0 + Duration::from_millis(100));
+        let (code_in_step, _) = health_response(&cx, t0 + Duration::from_millis(130));
+        assert_eq!(code_in_step, 200);
+        let (code_stalled, body_stalled) = health_response(&cx, t0 + Duration::from_millis(160));
+        assert_eq!(code_stalled, 503);
+        let v_stalled: Value = serde_json::from_str(&body_stalled).unwrap();
+        assert_eq!(v_stalled["ok"], false);
+        assert!(v_stalled["reason"].as_str().unwrap().contains("stalled in active step"));
+
+        // Completing step restores 200 ok:true:
+        cx.health.end_step_ok(t0 + Duration::from_millis(170));
+        assert_eq!(health_response(&cx, t0 + Duration::from_millis(500)).0, 200);
+
+        // GPU step deadline helper times out deterministically with fake clock and zero real sleep:
+        let fake_now = std::cell::Cell::new(t0);
+        let timeout_err = wait_for_gpu_completion(
+            "prefill",
+            Duration::from_millis(25),
+            || fake_now.get(),
+            || (MTLCommandBufferStatus::Committed, None),
+            |_| fake_now.set(fake_now.get() + Duration::from_millis(10)),
+        )
+        .unwrap_err();
+        assert!(timeout_err.contains("Metal prefill timed out after 25ms"), "got: {timeout_err}");
+        cx.health.end_step_failed(fake_now.get(), timeout_err);
+        let (code_failed, body_failed) = health_response(&cx, fake_now.get());
+        assert_eq!(code_failed, 503);
+        let v_failed: Value = serde_json::from_str(&body_failed).unwrap();
+        assert_eq!(v_failed["ok"], false);
+        assert!(v_failed["reason"].as_str().unwrap().contains("timed out"));
+
+        // Deferral counters appear in /health when non-zero, and non-KV + LoopCD bytes are counted once:
+        cx.health.end_step_ok(fake_now.get());
+        cx.deferrals.admit_pool_deferrals.store(3, Ordering::Relaxed);
+        cx.deferrals.step_pool_deferrals.store(2, Ordering::Relaxed);
+        let (code_def, body_def) = health_response(&cx, fake_now.get());
+        assert_eq!(code_def, 200);
+        let v_def: Value = serde_json::from_str(&body_def).unwrap();
+        assert_eq!(v_def["admit_deferrals"], 3);
+        assert_eq!(v_def["step_deferrals"], 2);
+
+        let non_kv_plain = Engine::serve_non_kv_bytes_for(8, 65536, 1_000_000, 262_144, false);
+        let non_kv_loopcd = Engine::serve_non_kv_bytes_for(8, 65536, 1_000_000, 262_144, true);
+        assert_eq!(non_kv_loopcd - non_kv_plain, 8 * 262_144 * 4);
+        let pools_small = crate::blocks::BlockPools::with_capacities(4, 4, 1).unwrap();
+        assert!(!span_exceeds_pool_capacity(&pools_small, 0, 256));
+        assert!(span_exceeds_pool_capacity(&pools_small, 0, 257));
+    }
+
+    #[test]
+    fn cache_isolation_and_hide_cached_tokens_across_both_apis() {
+        // 1. Header parsing and validation for X-Inky-Namespace
+        let ok_raw = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer fleet-key\r\nX-Inky-Namespace: tenant-alpha\r\nContent-Length: 2\r\n\r\n{}";
+        let ok_head = read_head(&mut BufReader::new(&ok_raw[..])).unwrap();
+        assert_eq!(ok_head.cache_namespace.as_deref(), Some("tenant-alpha"));
+        assert!(check_headers(&ok_head, "/v1/messages", Some("fleet-key"), MAX_BODY).is_ok());
+
+        for bad_ns in ["", "has space", &"a".repeat(MAX_CACHE_NAMESPACE_LEN + 1)] {
+            let mut bad_head = Head {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                len: 2,
+                auth: Some("fleet-key".into()),
+                api_key: None,
+                card_id: None,
+                cache_namespace: Some(bad_ns.into()),
+                chunked: false,
+            };
+            assert_eq!(check_headers(&bad_head, "/v1/messages", Some("fleet-key"), MAX_BODY).unwrap_err().0, 400);
+            bad_head.cache_namespace = None;
+            assert!(check_headers(&bad_head, "/v1/messages", Some("fleet-key"), MAX_BODY).is_ok());
+        }
+
+        // 2. Principal namespace derivation: same fleet bearer shares namespace; distinct key or X-Inky-Namespace isolates;
+        //    --isolate-cache gives every request its own namespace even with identical credentials.
+        let ns_card1 = derive_cache_namespace("srv-nonce", false, 1, Some("fleet-key"), None);
+        let ns_card2 = derive_cache_namespace("srv-nonce", false, 2, Some("fleet-key"), None);
+        assert_eq!(ns_card1, ns_card2, "workers sharing the fleet key must share prefix cache");
+
+        let ns_other_key = derive_cache_namespace("srv-nonce", false, 3, Some("other-key"), None);
+        let ns_tenant_a = derive_cache_namespace("srv-nonce", false, 4, Some("fleet-key"), Some("tenant-a"));
+        let ns_tenant_b = derive_cache_namespace("srv-nonce", false, 5, Some("fleet-key"), Some("tenant-b"));
+        assert_ne!(ns_card1, ns_other_key);
+        assert_ne!(ns_card1, ns_tenant_a);
+        assert_ne!(ns_tenant_a, ns_tenant_b);
+
+        let iso1 = derive_cache_namespace("srv-nonce", true, 1, Some("fleet-key"), None);
+        let iso2 = derive_cache_namespace("srv-nonce", true, 2, Some("fleet-key"), None);
+        assert_ne!(iso1, iso2, "--isolate-cache must isolate every request");
+
+        // 3. End-to-end handler test: jobs carry derived `cache_namespace` AND `--hide-cached-tokens`
+        //    zeroes client-reported cached counts across Chat Completions and Anthropic Messages (stream + non-stream).
+        for hide in [false, true] {
+            for is_msg in [false, true] {
+                for stream in [false, true] {
+                    let (mut cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(50), 4);
+                    cx.cache_policy = CachePolicy { isolate_cache: false, hide_cached_tokens: hide };
+                    let cx = Arc::new(cx);
+                    let cx2 = cx.clone();
+                    let worker = std::thread::spawn(move || {
+                        let mut out = Vec::new();
+                        let req = if is_msg {
+                            json!({"max_tokens": 8, "stream": stream, "messages": [{"role": "user", "content": "hello world"}]})
+                        } else {
+                            json!({"max_tokens": 8, "stream": stream, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "hello world"}]})
+                        };
+                        if is_msg {
+                            messages_with_principal(&cx2, &req, None, Some("cred-1"), Some("ns-1"), &mut out).unwrap();
+                        } else {
+                            chat_with_principal(&cx2, &req, None, Some("cred-1"), Some("ns-1"), &mut out).unwrap();
+                        }
+                        out
+                    });
+                    let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must enqueue");
+                    assert_eq!(
+                        job.cache_namespace,
+                        derive_cache_namespace(&cx.nonce, false, job.seq, Some("cred-1"), Some("ns-1"))
+                    );
+                    let prompt_len = job.toks.len();
+                    job.out
+                        .send(Ev::Done {
+                            prompt: prompt_len,
+                            cached: 4,
+                            gen: 1,
+                            reason: "stop",
+                            timing: Default::default(),
+                        })
+                        .unwrap();
+                    let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+                    let want_cached = if hide { 0 } else { 4 };
+                    if is_msg {
+                        assert!(
+                            resp.contains(&format!("\"cache_read_input_tokens\":{want_cached}")),
+                            "hide={hide} stream={stream} messages resp: {resp}"
+                        );
+                    } else {
+                        assert!(
+                            resp.contains(&format!("\"cached_tokens\":{want_cached}")),
+                            "hide={hide} stream={stream} chat resp: {resp}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test] fn chat_and_messages_reject_wrongly_typed_fields_and_unrenderable_content() {
+        let (cx, jrx) = admission_test_ctx(4);
+        let check_400 = |is_msg: bool, req: Value, substr: &str| {
+            let mut out = Vec::new();
+            if is_msg {
+                messages(&cx, &req, &mut out).unwrap();
+            } else {
+                chat(&cx, &req, &mut out).unwrap();
+            }
+            let resp = String::from_utf8(out).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 400"), "is_msg={is_msg} req={req} resp={resp}");
+            assert!(resp.contains(substr), "is_msg={is_msg} expected {substr:?} in {resp}");
+            assert_eq!(cx.admission.inflight(), 0, "rejected request must not leak admission permits");
+            assert!(jrx.try_recv().is_err(), "rejected request must not reach scheduler");
+        };
+
+        for is_msg in [false, true] {
+            check_400(is_msg, json!("not-an-object"), "JSON object");
+            check_400(is_msg, json!([1, 2, 3]), "JSON object");
+            check_400(is_msg, json!({"max_tokens": 8, "temperature": "hot", "messages": [{"role": "user", "content": "hi"}]}), "temperature");
+            check_400(is_msg, json!({"max_tokens": 8, "temperature": true, "messages": [{"role": "user", "content": "hi"}]}), "temperature");
+            check_400(is_msg, json!({"max_tokens": 8, "top_p": true, "messages": [{"role": "user", "content": "hi"}]}), "top_p");
+            check_400(is_msg, json!({"max_tokens": 8, "top_p": "wide", "messages": [{"role": "user", "content": "hi"}]}), "top_p");
+            check_400(is_msg, json!({"max_tokens": 8, "stream": "yes", "messages": [{"role": "user", "content": "hi"}]}), "stream must be a boolean");
+            check_400(is_msg, json!({"max_tokens": 8, "stream": 1, "messages": [{"role": "user", "content": "hi"}]}), "stream must be a boolean");
+            check_400(is_msg, json!({"max_tokens": 8, "seed": "abc", "messages": [{"role": "user", "content": "hi"}]}), "seed");
+            check_400(is_msg, json!({"max_tokens": 8, "seed": 1.5, "messages": [{"role": "user", "content": "hi"}]}), "seed");
+            check_400(is_msg, json!({"max_tokens": 8, "model": 42, "messages": [{"role": "user", "content": "hi"}]}), "model must be a string");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": []}), "messages must not be empty");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": 42}]}), "content");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": []}]}), "empty");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]}), "unsupported");
+            check_400(is_msg, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "text", "text": 123}]}]}), "string text field");
+        }
+
+        // Chat-specific effort, kwargs, tools, and content part checks.
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": "bogus", "messages": [{"role": "user", "content": "hi"}]}), "unknown effort level");
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": 2.0, "messages": [{"role": "user", "content": "hi"}]}), "0 and 0.99");
+        check_400(false, json!({"max_tokens": 8, "reasoning_effort": true, "messages": [{"role": "user", "content": "hi"}]}), "reasoning_effort");
+        check_400(false, json!({"max_tokens": 8, "chat_template_kwargs": "bad", "messages": [{"role": "user", "content": "hi"}]}), "chat_template_kwargs must be an object");
+        check_400(false, json!({"max_tokens": 8, "chat_template_kwargs": {"reasoning_effort": "bogus"}, "messages": [{"role": "user", "content": "hi"}]}), "unknown effort level");
+        check_400(false, json!({"max_tokens": 8, "thinking_budget": null, "thinking_budget_tokens": "bad", "messages": [{"role": "user", "content": "hi"}]}), "thinking_budget_tokens");
+        check_400(false, json!({"max_tokens": 8, "tools": "not-array", "messages": [{"role": "user", "content": "hi"}]}), "tools must be an array");
+        check_400(false, json!({"max_tokens": 8, "tools": [{"type": "function", "function": {}}], "messages": [{"role": "user", "content": "hi"}]}), "tool without a name");
+        check_400(false, json!({"max_tokens": 8, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}}]}]}), "unsupported content part type image_url");
+
+        // Messages-specific max_tokens type/range and non-object thinking/output_config checks.
+        check_400(true, json!({"max_tokens": "8", "messages": [{"role": "user", "content": "hi"}]}), "max_tokens must be between 1 and");
+        check_400(true, json!({"max_tokens": -5, "messages": [{"role": "user", "content": "hi"}]}), "max_tokens must be between 1 and");
+        check_400(true, json!({"max_tokens": 8, "thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}), "thinking must be an object");
+        check_400(true, json!({"max_tokens": 8, "output_config": "high", "messages": [{"role": "user", "content": "hi"}]}), "output_config must be an object");
+
+        // Real prompt limit stated in context_full_message (64 per lane - 1 to generate - 2 reserved = 61 max prompt tokens).
+        let msg = context_full_message(62, 1, 64);
+        assert!(msg.contains("context full") && msg.contains("61 maximum"), "got: {msg}");
+    }
+
+    #[test] fn startup_validation_reports_missing_specials_bad_models_and_binds_every_address() {
+        let mut stripped = Tokenizer::for_test();
+        let bad_tok = Tokenizer::for_byte_test();
+        // Build a tokenizer missing `<|message_user|>` by cloning `for_test` and re-encoding without specials.
+        let g_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("inky-serve-start-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&g_dir);
+        let bad_gguf = g_dir.join("not_a_model.gguf");
+        std::fs::write(&bad_gguf, b"NOT_GGUF_BYTES_AT_ALL_0123456789").unwrap();
+
+        // Missing special token returns a clean Err instead of panicking.
+        assert!(Specials::try_from_tokenizer(&stripped).is_ok());
+        assert!(Specials::try_from_tokenizer(&bad_tok).is_ok());
+        // Strip specials from `stripped` via GGUF roundtrip without `<|message_user|>` as special.
+        let _ = &mut stripped;
+        let empty_gguf = g_dir.join("no_specials.gguf");
+        let mut raw = b"GGUF".to_vec();
+        raw.extend(3u32.to_le_bytes());
+        raw.extend(0u64.to_le_bytes());
+        raw.extend(0u64.to_le_bytes());
+        raw.resize(32, 0);
+        std::fs::write(&empty_gguf, &raw).unwrap();
+        let mut g = crate::gguf::Gguf::open(empty_gguf.to_str().unwrap()).unwrap();
+        let mut toks = Vec::new();
+        let mut n = 0u32;
+        for b in 0..256u32 {
+            let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+            let cp = if keep { b } else { n += 1; 255 + n };
+            toks.push(char::from_u32(cp).unwrap().to_string());
+        }
+        g.kv.insert("tokenizer.ggml.tokens".into(), crate::gguf::Value::AS(toks));
+        g.kv.insert("tokenizer.ggml.token_type".into(), crate::gguf::Value::AI(vec![0; 256]));
+        g.kv.insert("tokenizer.ggml.merges".into(), crate::gguf::Value::AS(Vec::new()));
+        g.kv.insert("tokenizer.ggml.eos_token_id".into(), crate::gguf::Value::U(0));
+        let plain_tk = Tokenizer::try_load(&g).unwrap();
+        let sp_err = Specials::try_from_tokenizer(&plain_tk).err().expect("missing specials must error");
+        assert!(sp_err.contains("<|message_user|>"), "unexpected error: {sp_err}");
+
+        // Pre-mode validation rejects bad model file BEFORE entering inky mode (exit code 1).
+        let opts = ServeOpts {
+            model: bad_gguf.to_string_lossy().into_owned(),
+            ctx: 4096,
+            bind: vec!["127.0.0.1:0".parse().unwrap()],
+            lanes: 4,
+            effort: "medium".into(),
+            max_tokens: 64,
+            key: None,
+            queue: 4,
+            thinking_budget: 0,
+            loopcd_omega: 0.0,
+            record_dir: None,
+            record_max_bytes: crate::record::DEFAULT_MAX_FILE_BYTES,
+            spill_dir: None,
+            max_spill_bytes: crate::spill::DEFAULT_MAX_SPILL_BYTES,
+            isolate_cache: false,
+            hide_cached_tokens: false,
+            kv8: false,
+        };
+        let (code, msg) = validate_serve_pre_mode(&opts).err().expect("bad model must fail pre-mode");
+        assert_eq!(code, 1);
+        assert!(msg.contains("could not load"), "got: {msg}");
+
+        // Multi-address bind binds every unique resolved address and fails cleanly if any address is occupied.
+        let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let v4_b: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // Distinct addresses (two ephemeral binds when port differs or v4 + v6 when IPv6 loopback is enabled).
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        assert!(bind_listeners(&[v4, occupied_addr]).is_err(), "occupied second address must fail cleanly");
+        drop(occupied);
+
+        let mut multi = vec![v4];
+        if let Ok(probe_v6) = TcpListener::bind("[::1]:0") {
+            drop(probe_v6);
+            multi.push("[::1]:0".parse().unwrap());
+        }
+        // Duplicate entries are deduplicated cleanly.
+        multi.push(v4_b);
+        let bound = bind_listeners(&multi).expect("all unique resolved addresses must bind");
+        assert_eq!(bound.len(), if multi.len() == 3 { 2 } else { 1 });
+        for (listener, local) in &bound {
+            assert_eq!(listener.local_addr().unwrap(), *local);
+            let _ = std::net::TcpStream::connect_timeout(local, Duration::from_secs(1)).expect("bound listener must accept TCP connect");
+        }
+        let _ = std::fs::remove_dir_all(&g_dir);
     }
 }

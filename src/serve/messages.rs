@@ -1,5 +1,6 @@
 //! Translate Anthropic Messages requests into the shared prompt format.
 
+use super::validate_effort;
 use serde_json::{json, Value};
 
 // ------------------------------------------------------------------------------------------------- Anthropic Messages
@@ -17,59 +18,88 @@ use serde_json::{json, Value};
 /// block after a tool starts a new group in the same turn. The caller suppresses the intermediate
 /// end-of-sampling markers at the returned (ascending) group indices.
 pub(super) fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), String> {
-    let msgs_in = req["messages"].as_array().ok_or("messages missing")?;
+    if !req.is_object() {
+        return Err("request body must be a JSON object".into());
+    }
+    let msgs_in = req.get("messages").and_then(Value::as_array).ok_or("messages missing")?;
     if msgs_in.is_empty() { return Err("messages must not be empty".into()); }
     let mut msgs: Vec<Value> = Vec::new();
     let mut continued_assistants = Vec::new();
-    match &req["system"] {
-        Value::Null => {}
-        Value::String(s) => msgs.push(json!({"role": "system", "content": s})),
-        Value::Array(blocks) => {
-            let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+    match req.get("system") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
+        Some(Value::Array(blocks)) => {
+            let parts: Vec<Value> = blocks.iter().map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let txt = b.get("text").and_then(Value::as_str).ok_or("system text block requires a string text field")?;
+                    Ok(json!({"type": "text", "text": txt}))
+                }
                 t => Err(format!("unsupported system block type {}", t.unwrap_or("none"))),
-            }).collect::<Result<_, _>>()?;
+            }).collect::<Result<_, String>>()?;
             if !parts.is_empty() { msgs.push(json!({"role": "system", "content": parts})); }
         }
-        _ => return Err("system must be a string or an array of text blocks".into()),
+        Some(_) => return Err("system must be a string or an array of text blocks".into()),
     }
     for m in msgs_in {
-        let role = m["role"].as_str().ok_or("message without role")?;
-        match (role, &m["content"]) {
+        let m_obj = m.as_object().ok_or("each message must be an object")?;
+        let role = m_obj.get("role").and_then(Value::as_str).ok_or("message without role")?;
+        let content = m_obj.get("content").unwrap_or(&Value::Null);
+        match (role, content) {
             ("system", Value::String(s)) => msgs.push(json!({"role": "system", "content": s})),
             ("system", Value::Array(blocks)) => {
-                let parts: Vec<Value> = blocks.iter().map(|b| match b["type"].as_str() {
-                    Some("text") => Ok(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
+                let parts: Vec<Value> = blocks.iter().map(|b| match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let txt = b.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
+                        Ok(json!({"type": "text", "text": txt}))
+                    }
                     t => Err(format!("unsupported content block type {} in a system message", t.unwrap_or("none"))),
-                }).collect::<Result<_, _>>()?;
+                }).collect::<Result<_, String>>()?;
                 msgs.push(json!({"role": "system", "content": parts}));
             }
             ("user", Value::String(s)) => msgs.push(json!({"role": "user", "content": s})),
             ("assistant", Value::String(s)) => msgs.push(json!({"role": "assistant", "content": s})),
             ("user", Value::Array(blocks)) => {
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
                 let mut texts: Vec<Value> = Vec::new();
                 for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => texts.push(json!({"type": "text", "text": b["text"].as_str().unwrap_or("")})),
+                    let b_obj = b.as_object().ok_or("each content block must be an object")?;
+                    match b_obj.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            let txt = b_obj.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
+                            texts.push(json!({"type": "text", "text": txt}));
+                        }
                         Some("image") => texts.push(json!({"type": "text", "text": "[image]"})),
                         Some("tool_result") => {
                             if !texts.is_empty() { msgs.push(json!({"role": "user", "content": std::mem::take(&mut texts)})); }
-                            let id = b["tool_use_id"].as_str().ok_or("tool_result without tool_use_id")?;
-                            let c = match &b["content"] {
-                                Value::Null => json!(""),
-                                Value::String(s) => json!(s),
-                                Value::Array(parts) => {
-                                    let ps: Vec<Value> = parts.iter().map(|p| match p["type"].as_str() {
-                                        Some("text") => Ok(json!({"type": "text", "text": p["text"].as_str().unwrap_or("")})),
+                            let id = b_obj.get("tool_use_id").and_then(Value::as_str).ok_or("tool_result without tool_use_id")?;
+                            let c = match b_obj.get("content") {
+                                None | Some(Value::Null) => json!(""),
+                                Some(Value::String(s)) => json!(s),
+                                Some(Value::Array(parts)) => {
+                                    let ps: Vec<Value> = parts.iter().map(|p| match p.get("type").and_then(Value::as_str) {
+                                        Some("text") => {
+                                            let txt = p.get("text").and_then(Value::as_str).ok_or("tool_result text block requires a string text field")?;
+                                            Ok(json!({"type": "text", "text": txt}))
+                                        }
                                         Some("image") => Ok(json!({"type": "text", "text": "[image]"})),
                                         t => Err(format!("unsupported tool_result content type {}", t.unwrap_or("none"))),
-                                    }).collect::<Result<_, _>>()?;
+                                    }).collect::<Result<_, String>>()?;
                                     Value::Array(ps)
                                 }
-                                _ => return Err("tool_result content must be a string or an array of text blocks".into()),
+                                Some(_) => return Err("tool_result content must be a string or an array of text blocks".into()),
+                            };
+                            let is_error = match b_obj.get("is_error") {
+                                None | Some(Value::Null) => false,
+                                Some(Value::Bool(err)) => *err,
+                                Some(_) => return Err("tool_result is_error must be a boolean".into()),
                             };
                             let mut tool_msg = json!({"role": "tool", "tool_call_id": id, "content": c});
-                            if b["is_error"].as_bool().unwrap_or(false) { tool_msg["is_error"] = json!(true); }
+                            if is_error { tool_msg["is_error"] = json!(true); }
                             msgs.push(tool_msg);
                         }
                         t => return Err(format!("unsupported content block type {} in a user message", t.unwrap_or("none"))),
@@ -78,21 +108,29 @@ pub(super) fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), Str
                 if !texts.is_empty() { msgs.push(json!({"role": "user", "content": texts})); }
             }
             ("assistant", Value::Array(blocks)) => {
-                let mut texts = Vec::new();
+                if blocks.is_empty() {
+                    return Err("message content blocks must not be empty".into());
+                }
+                let mut texts: Vec<Value> = Vec::new();
                 let mut calls: Vec<Value> = Vec::new();
                 for b in blocks {
-                    match b["type"].as_str() {
+                    let b_obj = b.as_object().ok_or("each content block must be an object")?;
+                    match b_obj.get("type").and_then(Value::as_str) {
                         Some("text") => {
+                            let txt = b_obj.get("text").and_then(Value::as_str).ok_or("text block requires a string text field")?;
                             if !calls.is_empty() {
                                 continued_assistants.push(msgs.len());
                                 msgs.push(json!({"role": "assistant", "content": std::mem::take(&mut texts), "tool_calls": std::mem::take(&mut calls)}));
                             }
-                            texts.push(b["text"].as_str().unwrap_or(""));
+                            texts.push(json!(txt));
                         }
                         Some("tool_use") => {
-                            let id = b["id"].as_str().ok_or("tool_use without id")?;
-                            let name = b["name"].as_str().ok_or("tool_use without a name")?;
-                            let input = if b["input"].is_null() { json!({}) } else { b["input"].clone() };
+                            let id = b_obj.get("id").and_then(Value::as_str).ok_or("tool_use without id")?;
+                            let name = b_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool_use without a name")?;
+                            let input = match b_obj.get("input") {
+                                None | Some(Value::Null) => json!({}),
+                                Some(v) => v.clone(),
+                            };
                             calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": input}}));
                         }
                         Some("thinking") | Some("redacted_thinking") => {}
@@ -113,9 +151,15 @@ pub(super) fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), Str
         let tools = tools.as_array().ok_or("tools must be an array")?;
         if !tools.is_empty() {
             let mapped: Vec<Value> = tools.iter().map(|t| {
-                let name = t["name"].as_str().ok_or("tool without a name")?;
-                Ok(json!({"type": "function", "function": {"name": name, "description": t["description"].as_str().unwrap_or(""),
-                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({}))}}))
+                let t_obj = t.as_object().ok_or("each tool must be an object")?;
+                let name = t_obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("tool without a name")?;
+                let desc = match t_obj.get("description") {
+                    None | Some(Value::Null) => "",
+                    Some(Value::String(d)) => d.as_str(),
+                    Some(_) => return Err("tool description must be a string".into()),
+                };
+                Ok(json!({"type": "function", "function": {"name": name, "description": desc,
+                        "parameters": t_obj.get("input_schema").cloned().unwrap_or_else(|| json!({}))}}))
             }).collect::<Result<_, String>>()?;
             out["tools"] = json!(mapped);
         }
@@ -123,34 +167,27 @@ pub(super) fn translate_messages(req: &Value) -> Result<(Value, Vec<usize>), Str
     Ok((out, continued_assistants))
 }
 
-/// The thinking effort a Messages request asks for, as the `reasoning_effort`
-/// the chat path renders through `effort_num` — or none, when the request
-/// leaves the serve default standing. An explicit effort field wins (top
-/// level, `output_config`, or inside `thinking`); then `thinking` itself:
-/// disabled is none, an enabled budget maps by size (1024–4095 low,
-/// 4096–16383 medium, else high), and adaptive — or no thinking at all —
-/// decides for itself, so it sets nothing. Anything malformed refuses
-/// (the caller answers 400): no silent fallback may turn an unknown
-/// effort into 0.9 or drop a budget on the floor.
-fn anthropic_effort(req: &Value) -> Result<Option<String>, String> {
-    // an effort field that is present must be a known level (or a number in
-    // effort_num's range): an unknown string would otherwise reach effort_num
-    // and silently become 0.9, and a non-string would silently vanish
+pub(super) fn anthropic_effort(req: &Value) -> Result<Option<String>, String> {
     let field = |v: &Value| -> Result<String, String> {
         let s = v.as_str().ok_or("effort must be a string")?.trim();
-        let known = matches!(s, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-            || s.parse::<f64>().is_ok_and(|n| n.is_finite() && (0.0..=0.99).contains(&n));
-        if known { Ok(s.to_string()) } else { Err(format!("unknown effort level {s:?}")) }
+        let _ = validate_effort(s)?;
+        Ok(s.to_string())
     };
-    if let Some(v) = req.get("output_config").and_then(|o| o.get("effort")).filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    if let Some(oc) = req.get("output_config").filter(|v| !v.is_null()) {
+        let oc_obj = oc.as_object().ok_or("output_config must be an object")?;
+        if let Some(v) = oc_obj.get("effort").filter(|v| !v.is_null()) {
+            return Ok(Some(field(v)?));
+        }
+    }
     if let Some(v) = req.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
     let Some(th) = req.get("thinking").filter(|v| !v.is_null()) else { return Ok(None) };
-    if let Some(v) = th.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
-    match th["type"].as_str() {
+    let th_obj = th.as_object().ok_or("thinking must be an object")?;
+    if let Some(v) = th_obj.get("effort").filter(|v| !v.is_null()) { return Ok(Some(field(v)?)); }
+    match th_obj.get("type").and_then(Value::as_str) {
         Some("disabled") => Ok(Some("none".into())),
         Some("adaptive") => Ok(None),
         Some("enabled") => {
-            let b = th.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
+            let b = th_obj.get("budget_tokens").filter(|v| !v.is_null()).ok_or("thinking budget_tokens is required when thinking is enabled")?;
             let b = b.as_u64().ok_or("thinking budget_tokens must be a non-negative integer")?;
             match b {
                 0 => Ok(Some("none".into())),

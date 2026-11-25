@@ -26,6 +26,7 @@ fn lane<'a>(
 ) -> InflightLaneReserve<'a> {
     InflightLaneReserve {
         lane: id,
+        namespace: 0,
         toks: prompt,
         n_past: written,
         pf_end: prompt.len(),
@@ -166,6 +167,7 @@ fn an_ssd_restore_cannot_spend_the_slots_reserved_for_a_cold_producer() {
     cache.spilled_starts.insert(
         spill_id,
         SpilledStart {
+            namespace: 0,
             pos: 8192,
             reasons: EVERY,
             cs_key: SpillKey::new(SpillBlockKind::Full, 1),

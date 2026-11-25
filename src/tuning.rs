@@ -12,7 +12,7 @@ const FILES: &[&str] = &[
 pub fn parse(text: &str) -> Result<Tuning, String> {
     let mut kv = std::collections::HashMap::new();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap().trim();
+        let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() { continue; }
         let (k, v) = line.split_once('=').ok_or(format!("not key = value: {line}"))?;
         kv.insert(k.trim().to_string(), v.trim().to_string());
@@ -31,7 +31,7 @@ pub fn parse(text: &str) -> Result<Tuning, String> {
 pub fn select(chip: &str, memory_bytes: u64) -> Tuning {
     let gb = (memory_bytes as f64 / (1u64 << 30) as f64).round() as u64;
     for f in FILES {
-        let t = parse(f).expect("a tuning in tunings/ does not parse");
+        let Ok(t) = parse(f) else { continue };
         if t.chip == chip && t.memory_gb == gb { return t; }
     }
     // defaults: leave max(8 GB, 10%) for macOS

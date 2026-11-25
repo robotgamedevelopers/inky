@@ -10,6 +10,7 @@ changes = {
     "no-readback": ("Ok(()) if get() == Some(v) =>", "Ok(()) =>"),
     "lost-seed": ("Mode { saved: seed, clients: 0 }", "Mode { saved: None, clients: 0 }"),
     "skip-keep": ('keep(Some(found)).map_err(|e| format!("the saved limit could not be written; not raising it: {e}"))?;', "// omitted persistence"),
+    "lower-higher": ("if found >= target {", "if false && found >= target {"),
 }
 old, new = changes[mutant]
 source = path.read_text()

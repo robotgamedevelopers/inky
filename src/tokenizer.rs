@@ -1,6 +1,6 @@
 //! Byte-level BPE tokenizer for Inkling 2 (GPT-4o / o200k style pre-tokenizer), built from GGUF vocab + merges.
 
-use crate::gguf::{Gguf, Value};
+use crate::gguf::{invalid_model, Gguf, Value};
 use crate::unicode_tables::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -37,15 +37,32 @@ fn uflags(c: u32) -> u8 {
 
 impl Tokenizer {
     pub fn load(g: &Gguf) -> Tokenizer {
-        let id_to_tok = match &g.kv["tokenizer.ggml.tokens"] { Value::AS(v) => v.clone(), _ => panic!("no tokens") };
-        let tok_type = match &g.kv["tokenizer.ggml.token_type"] { Value::AI(v) => v.clone(), _ => panic!("no token types") };
-        let merges_s = match &g.kv["tokenizer.ggml.merges"] { Value::AS(v) => v, _ => panic!("no merges") };
+        Self::try_load(g).unwrap_or_else(|err| {
+            eprintln!("[inky] {err}");
+            std::process::exit(1);
+        })
+    }
+
+    pub fn try_load(g: &Gguf) -> std::io::Result<Tokenizer> {
+        let id_to_tok = match g.kv.get("tokenizer.ggml.tokens") {
+            Some(Value::AS(v)) if !v.is_empty() => v.clone(),
+            _ => return Err(invalid_model("missing or empty tokenizer.ggml.tokens")),
+        };
+        let tok_type = match g.kv.get("tokenizer.ggml.token_type") {
+            Some(Value::AI(v)) if v.len() == id_to_tok.len() => v.clone(),
+            Some(Value::AI(_)) => return Err(invalid_model("tokenizer.ggml.token_type length does not match tokenizer.ggml.tokens")),
+            _ => return Err(invalid_model("missing or invalid tokenizer.ggml.token_type")),
+        };
+        let merges_s = match g.kv.get("tokenizer.ggml.merges") {
+            Some(Value::AS(v)) => v,
+            _ => return Err(invalid_model("missing or invalid tokenizer.ggml.merges")),
+        };
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
         for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
         let mut merges = HashMap::with_capacity(merges_s.len() * 2);
         let mut max_bpe_token_bytes = 1;
         for (rank, m) in merges_s.iter().enumerate() {
-            let (a, b) = m.split_once(' ').expect("bad merge");
+            let (a, b) = m.split_once(' ').ok_or_else(|| invalid_model(format_args!("malformed tokenizer merge at index {rank}")))?;
             if let (Some(&ia), Some(&ib), Some(&im)) = (tok_to_id.get(a), tok_to_id.get(b), tok_to_id.get(&format!("{a}{b}"))) {
                 merges.insert((ia, ib), (rank as u32, im));
                 // Every mapped character represents one original input byte.
@@ -62,19 +79,28 @@ impl Tokenizer {
         for b in 0..256u32 {
             let keep = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
             let cp = if keep { b } else { n += 1; 255 + n };
-            let ch = char::from_u32(cp).unwrap();
-            byte_to_id[b as usize] = *tok_to_id.get(&ch.to_string()).expect("byte token missing");
+            let ch = char::from_u32(cp).ok_or_else(|| invalid_model("invalid byte unicode mapping"))?;
+            byte_to_id[b as usize] = *tok_to_id
+                .get(&ch.to_string())
+                .ok_or_else(|| invalid_model(format_args!("byte token missing for 0x{b:02x}")))?;
             uni_to_byte.insert(ch, b as u8);
         }
-        let eos = g.u("tokenizer.ggml.eos_token_id") as u32;
-        Tokenizer { id_to_tok, tok_type, tok_to_id, merges, max_bpe_token_bytes, specials, byte_to_id, uni_to_byte, eos }
+        let eos_raw = match g.kv.get("tokenizer.ggml.eos_token_id") {
+            Some(Value::B(b)) => u64::from(*b),
+            _ => g.uint("tokenizer.ggml.eos_token_id")?,
+        };
+        let eos = u32::try_from(eos_raw)
+            .ok()
+            .filter(|&id| (id as usize) < id_to_tok.len())
+            .ok_or_else(|| invalid_model("tokenizer.ggml.eos_token_id is out of vocabulary range"))?;
+        Ok(Tokenizer { id_to_tok, tok_type, tok_to_id, merges, max_bpe_token_bytes, specials, byte_to_id, uni_to_byte, eos })
     }
 
     pub fn is_special(&self, id: u32) -> bool { self.tok_type.get(id as usize) == Some(&3) }
 
     /// Raw bytes of one token (special tokens rendered literally).
     pub fn decode_bytes(&self, id: u32) -> Vec<u8> {
-        let t = &self.id_to_tok[id as usize];
+        let Some(t) = self.id_to_tok.get(id as usize) else { return Vec::new() };
         if self.is_special(id) { return t.as_bytes().to_vec(); }
         let mut out = Vec::with_capacity(t.len());
         for ch in t.chars() {
@@ -178,7 +204,7 @@ impl Tokenizer {
             let mut best: Option<(u32, usize, u32)> = None;
             for j in 0..sym.len().saturating_sub(1) {
                 if let Some(&(rank, merged)) = self.merges.get(&(sym[j], sym[j + 1])) {
-                    if best.map_or(true, |b| rank < b.0) { best = Some((rank, j, merged)); }
+                    if best.is_none_or(|b| rank < b.0) { best = Some((rank, j, merged)); }
                 }
             }
             match best {
@@ -403,6 +429,174 @@ mod tests {
         out.truncate(1);
         assert!(t.encode_plain_limited(&text, &mut out, expected.len() + 1));
         assert_eq!(out[1..], expected);
+    }
+
+    fn split_pieces(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let flags: Vec<u8> = chars.iter().map(|&c| uflags(c as u32)).collect();
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = Tokenizer::piece_end(&chars, &flags, i);
+            assert!(end > i && end <= chars.len(), "invalid piece_end({i}) = {end}");
+            pieces.push(chars[i..end].iter().collect());
+            i = end;
+        }
+        pieces
+    }
+
+    #[test]
+    fn uflags_tables_classify_ascii_and_unicode_categories() {
+        for ch in ['A', 'Z', 'Ω', 'Ж'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_ucls(f) && !is_lcls(f) && !is_n(f) && !is_ws(f), "upper {ch:?}");
+        }
+        for ch in ['a', 'z', 'é', 'ω', 'ж'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_lcls(f) && !is_ucls(f) && !is_n(f) && !is_ws(f), "lower {ch:?}");
+        }
+        // Titlecase letter (ǅ): U_LT -> letter + ucls, not lcls.
+        let lt = uflags('\u{01C5}' as u32);
+        assert!(is_l(lt) && is_ucls(lt) && !is_lcls(lt));
+        // Modifier letter (ʰ) and Lo CJK ideograph (中): letter + both ucls and lcls.
+        for ch in ['\u{02B0}', '中', 'あ'] {
+            let f = uflags(ch as u32);
+            assert!(is_l(f) && is_ucls(f) && is_lcls(f) && !is_n(f) && !is_ws(f), "lm/lo {ch:?}");
+        }
+        // Combining acute accent (U+0301): mark -> both ucls and lcls, not standalone is_l.
+        let mark = uflags('\u{0301}' as u32);
+        assert!(!is_l(mark) && is_ucls(mark) && is_lcls(mark) && !is_n(mark) && !is_ws(mark));
+        // Numbers across Nd / No scripts.
+        for ch in ['0', '9', '²', '٣'] {
+            let f = uflags(ch as u32);
+            assert!(is_n(f) && !is_l(f) && !is_ws(f), "number {ch:?}");
+        }
+        // Whitespace across ASCII and Unicode Zs.
+        for ch in [' ', '\t', '\r', '\n', '\u{00A0}', '\u{2003}', '\u{3000}'] {
+            let f = uflags(ch as u32);
+            assert!(is_ws(f) && !is_l(f) && !is_n(f), "ws {ch:?}");
+        }
+        // Punctuation, emoji, and supplementary-plane boundary.
+        for ch in ['!', '/', '+', '🦀', '\u{10FFFF}'] {
+            let f = uflags(ch as u32);
+            assert!(!is_l(f) && !is_n(f) && !is_ws(f), "other {ch:?}");
+        }
+    }
+
+    #[test]
+    fn piece_end_matches_o200k_contractions_digits_punctuation_and_whitespace() {
+        assert_eq!(
+            split_pieces("don't won't I'm we're they've you'll he'd IT'S WE'RE rock'n'roll"),
+            vec![
+                "don't", " won't", " I'm", " we're", " they've", " you'll", " he'd",
+                " IT'S", " WE'RE", " rock", "'n", "'roll",
+            ]
+        );
+        // CamelCase / acronym transitions (body1 merges acronym+title `HTTPServer`, while lowercase ` parse` stops before uppercase `JSON`).
+        assert_eq!(
+            split_pieces("HTTPServer HTML5 parseJSON"),
+            vec!["HTTPServer", " HTML", "5", " parse", "JSON"]
+        );
+        // 1-3 digit chunking across ASCII and Unicode digits.
+        assert_eq!(split_pieces("1234567890"), vec!["123", "456", "789", "0"]);
+        assert_eq!(split_pieces("١٢٣٤"), vec!["١٢٣", "٤"]);
+        // Optional leading space on punctuation + trailing slashes/CRLF consumption.
+        assert_eq!(
+            split_pieces("a += 1;//\r\nb"),
+            vec!["a", " +=", " ", "1", ";//\r\n", "b"]
+        );
+        // Whitespace lookahead: `\s+(?!\S)` leaves the final space attached to the next word,
+        // while trailing whitespace at end-of-string stays one piece and `\s*[\r\n]+` splits after last newline.
+        assert_eq!(split_pieces("x    y   "), vec!["x", "   ", " y", "   "]);
+        assert_eq!(split_pieces("  \r\n  z"), vec!["  \r\n", " ", " z"]);
+        // Multi-script words + combining marks + emoji.
+        assert_eq!(
+            split_pieces("cafe\u{0301} Москва 日本語1234 🦀!"),
+            vec!["cafe\u{0301}", " Москва", " 日本語", "123", "4", " 🦀!"]
+        );
+    }
+
+    #[test]
+    fn production_byte_bpe_round_trips_multibyte_utf8_merges_and_specials() {
+        let mut t = Tokenizer::for_byte_test();
+        let map_bytes = |tk: &Tokenizer, s: &[u8]| -> String {
+            s.iter().map(|&b| tk.id_to_tok[tk.byte_to_id[b as usize] as usize].as_str()).collect()
+        };
+        let add_byte_merge = |tk: &mut Tokenizer, left: &[u8], right: &[u8], rank: u32| {
+            let l = map_bytes(tk, left);
+            let r = map_bytes(tk, right);
+            let lid = tk.tok_to_id[&l];
+            let rid = tk.tok_to_id[&r];
+            let merged = format!("{l}{r}");
+            let mid = tk.id_to_tok.len() as u32;
+            tk.max_bpe_token_bytes = tk.max_bpe_token_bytes.max(merged.chars().count());
+            tk.id_to_tok.push(merged.clone());
+            tk.tok_type.push(0);
+            tk.tok_to_id.insert(merged, mid);
+            tk.merges.insert((lid, rid), (rank, mid));
+        };
+        add_byte_merge(&mut t, b" ", b"t", 0);
+        add_byte_merge(&mut t, b" t", b"h", 1);
+        add_byte_merge(&mut t, b" th", b"e", 2);
+        add_byte_merge(&mut t, b"\xc3", b"\xa9", 3); // UTF-8 'é'
+        add_byte_merge(&mut t, b"c", b"a", 4);
+        add_byte_merge(&mut t, b"ca", b"f", 5);
+        add_byte_merge(&mut t, b"caf", "é".as_bytes(), 6);
+
+        let the_id = t.tok_to_id[&map_bytes(&t, b" the")];
+        let cafe_id = t.tok_to_id[&map_bytes(&t, "café".as_bytes())];
+        assert_eq!(t.encode("café the", false), vec![cafe_id, the_id]);
+
+        let rich = format!(
+            "<|message_user|><|content_text|>café the Москва 日本語 🦀 12345 {}\r\n<|end_message|>",
+            "café".repeat(20) // > 32 bytes in a single piece to exercise bpe_ranked heap path
+        );
+        let ids = t.encode(&rich, true);
+        let mut decoded = Vec::new();
+        for &id in &ids {
+            decoded.extend_from_slice(&t.decode_bytes(id));
+        }
+        assert_eq!(decoded, rich.as_bytes());
+    }
+
+    #[test]
+    fn try_load_rejects_missing_or_malformed_tokenizer_metadata() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("inky-tok-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("empty.gguf");
+        let mut file = b"GGUF".to_vec();
+        file.extend(3u32.to_le_bytes());
+        file.extend(0u64.to_le_bytes()); // tensors
+        file.extend(0u64.to_le_bytes()); // metadata entries
+        file.resize(32, 0);
+        std::fs::write(&path, &file).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let mut g = Gguf::open(path_str).unwrap();
+        assert!(Tokenizer::try_load(&g).is_err(), "missing tokens array must return Err");
+
+        let valid = Tokenizer::for_byte_test();
+        g.kv.insert("tokenizer.ggml.tokens".into(), Value::AS(valid.id_to_tok.clone()));
+        g.kv.insert("tokenizer.ggml.token_type".into(), Value::AI(vec![0; valid.id_to_tok.len() - 1]));
+        g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(Vec::new()));
+        g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::U(valid.eos as u64));
+        assert!(Tokenizer::try_load(&g).is_err(), "mismatched token_type length must return Err");
+
+        g.kv.insert("tokenizer.ggml.token_type".into(), Value::AI(valid.tok_type.clone()));
+        g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["badmerge_without_space".into()]));
+        assert!(Tokenizer::try_load(&g).is_err(), "malformed merge entry must return Err");
+
+        g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(Vec::new()));
+        g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::U(999_999));
+        assert!(Tokenizer::try_load(&g).is_err(), "out-of-range eos_token_id must return Err");
+
+        g.kv.insert("tokenizer.ggml.eos_token_id".into(), Value::U(valid.eos as u64));
+        let loaded = Tokenizer::try_load(&g).expect("complete byte-level tokenizer metadata must load");
+        assert!(loaded.decode_bytes(u32::MAX).is_empty(), "out-of-bounds token ID must not panic");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

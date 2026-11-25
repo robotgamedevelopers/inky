@@ -64,31 +64,37 @@ The helper runs as a LaunchDaemon and raises the GPU wired-memory limit while in
 
 ### Start the server
 
-Make `INKY_SERVE_KEY` available to the server and worker through their nova-secrets seats. Use the same value for both processes. Start the server on the Mac that runs the worker.
+Export a nonempty bearer secret in `INKY_SERVE_KEY` for both the server and client processes, and start `inky serve`:
 
 ```sh
-nova-secrets exec --only INKY_SERVE_KEY -- \
+INKY_SERVE_KEY="$YOUR_SECRET" \
   ./target/release/inky serve --bind 127.0.0.1:8096 \
-  --key-env INKY_SERVE_KEY --lanes 4 -c 65536 --queue 64
+  --key-env INKY_SERVE_KEY --lanes 64 -c 65536 --queue 64
 ```
 
 | Flag | Default | What it controls |
 |---|---|---|
 | `-m PATH` | LM Studio path above | Model GGUF |
-| `--bind ADDR` | `127.0.0.1:8090` | Listen address. This walkthrough uses port 8096. |
+| `--bind ADDR` | `127.0.0.1:8090` | Loopback or private-network listen address (`127.0.0.0/8`, `::1`, RFC 1918, RFC 6598, RFC 4193). |
 | `--key-env NAME` (`--api-key-env NAME`) | unset | Reads a nonempty key from the named environment variable. Accepts Bearer authorization or `x-api-key`. |
-| `--allow-unauthenticated-non-loopback` | off | Explicitly allows a non-loopback listen address without a key. |
+| `--allow-unauthenticated-non-loopback` | off | Explicitly allows a private non-loopback listen address without a key. |
 | `--lanes N` | Machine tuning (32 on M5 Pro 64 GB, otherwise 64) | Concurrent requests, subject to the memory budget |
 | `-c CTX` | 65536 | Context per lane, rounded up to a multiple of 64 tokens, with a maximum of 262,080 |
 | `--queue N` | 64 | Waiting requests beyond the active lanes. A full queue returns HTTP 429 with `Retry-After: 5`. |
 | `--effort E` | `medium` | Default model thinking effort |
+| `--loopcd OMEGA` | `0` (disabled) | Default adaptive `LoopCD-Logits` contrast weight $\omega_{\max} \in [0, 4]$; overridable per request via JSON `loopcd_omega` |
+| `--isolate-cache` | off | Give every request a distinct cache namespace (disables cross-request prefix reuse and cache-timing/count inference) |
+| `--hide-cached-tokens` | off | Report `0` cached prompt tokens in HTTP usage fields while keeping internal server prefix reuse |
 | `--kv8` | off | 8-bit K/V cache: doubles paged `BlockPool` capacity and halves KV read bandwidth (NOT exact; default is fp16) |
-| `--loopcd OMEGA` | 0 | Maximum adaptive contrast weight (0 to 4). Both generation APIs accept a per-request `loopcd_omega` override. |
+| `--spill-dir DIR` | unset | Optional NVMe SSD spill directory for LRU-evicted `ServeBlockCache` checkpoints (`--max-spill-bytes` caps disk usage) |
+| `--record-dir DIR` | unset | Optional private (`0700`) JSONL card-turn recording directory (`--record-max-bytes` caps per-file rotation) |
 | `-n MAX` | 16384 | Positive default reply budget for Chat Completions. Messages requires `max_tokens` in the request. |
 
-An unkeyed server binds only to loopback by default. A non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`. If you pass `--key-env`, startup requires a usable key in the named variable.
+An unkeyed server binds only to loopback by default. A private non-loopback address requires `--key-env` or `--allow-unauthenticated-non-loopback`; public routable bind addresses are refused. If you pass `--key-env`, startup requires a usable key in the named variable.
 
-An extending request can reuse a lane's previous prompt while its sliding-window history is still in the cache. Decode writes that overwrite that history discard the saved prompt. At prefill completion, another lane can copy the cache and the prompt-end convolution state and prefill only the suffix. `inky xcopy` checks that this copy is bit-identical to cold prefill. Partial overlaps start cold because the convolution state is saved only at the prompt's end.
+`inky serve` shares sealed 64-token K/V blocks zero-copy across lanes through Layer 3 `ServeBlockCache` (`EntryTree` + `BlockPools`), saving recurrent convolution checkpoints at periodic 2,048/4,096-token boundaries and at each prompt's last 64-token boundary, coalescing simultaneous cold turn-1 prefills via singleflight follower rebinding, and optionally spilling cold checkpoints to SSD (`--spill-dir` with SHA-256 verification on restore). Decode writes stay in private unsealed blocks and never overwrite retained prompt checkpoints. (`inky xcopy` separately verifies the standalone Layer 2 `Engine::copy_lane_prefix` primitive against cold prefill.)
+
+Cache lookups and singleflight coalescing are scoped by `(credential, X-Inky-Namespace)`: workers sharing a fleet key reuse prefixes across cards, while requests presenting a different credential or distinct `X-Inky-Namespace` header ( up to 128 printable ASCII bytes) observe zero cross-principal hits or SSD restores. Pass `--isolate-cache` to isolate every request even under one shared key, or `--hide-cached-tokens` to report `0` in `cached_tokens` / `cache_read_input_tokens`. Both `/v1/chat/completions` and `/v1/messages` also accept an optional finite `loopcd_omega` in `[0, 4]` to override `--loopcd` per request (`0` disables LoopCD for that request).
 
 `GET /health` is available without a key. `GET /v1/models` lists `inkling-2-mini` and `inky/inkling-2-mini`. `POST /v1/messages` supports streaming, thinking effort mapping, and tool turns, and `POST /v1/messages/count_tokens` counts the rendered input without generating a reply. OpenAI-compatible clients can use `POST /v1/chat/completions` with `http://127.0.0.1:8096/v1` as their base URL, `stream_options.include_usage: true`, model `inkling-2-mini` or `inky/inkling-2-mini`, and the server key. On a cache hit, Messages reports reused prompt tokens in `cache_read_input_tokens` and Chat Completions reports them in `usage.prompt_tokens_details.cached_tokens`.
 
@@ -108,33 +114,21 @@ Each completed request logs its queue wait (`queue_ms`), the time spent readying
 
 Once a minute, including idle periods, the summary reports the time-weighted mean occupied lanes, newly prefilled and sampled output tokens per second over the whole interval, and the number of requests currently waiting for a lane. Use these interval-wide rates to distinguish slow inference from idle time between tool turns.
 
-### Route Claude Code through nova-sprint
+### Route Claude Code or OpenAI-compatible workers
 
-On the sprint's configuration host, register the provider with concurrency matching the server's lane count. Use the URL the worker can reach. Here the worker runs on the server Mac.
-
-```sh
-nova-config provider add inky --url http://127.0.0.1:8096 \
-  --api anthropic --key INKY_SERVE_KEY --concurrency 4
-nova-config model add inky/inkling-2-mini --harness claude
-```
-
-Put Claude Code on the worker's PATH. Set `NOVA_PG_DSN` and `NOVA_BUS_REDIS` for the sprint. In the active sprint policy, list `inky/inkling-2-mini` as a bench model for the tiers this worker should serve. The worker probes its configured models before it hooks in.
-
-Start the v2.0.58 worker for its assigned row, replacing `<row>` with that row's name. Include `NOVA_BUS_PASSWORD` in `--only` and set `NOVA_BUS_USER` if the sprint bus requires authentication.
+Point Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8096`, `ANTHROPIC_API_KEY="$INKY_SERVE_KEY"`, model `inkling-2-mini`) or an OpenAI-compatible client/proxy (`http://127.0.0.1:8096/v1`, Bearer `$INKY_SERVE_KEY`, model `inkling-2-mini` or `inky/inkling-2-mini`) at the server origin, sizing client concurrency to match `--lanes`:
 
 ```sh
-nova-secrets exec --only INKY_SERVE_KEY,NOVA_SPRINT_PG_PASSWORD,GH_GATE_TOKEN -- \
-  nova-sprint worker --as '<row>' --harness claude \
-  --providers inky=http://127.0.0.1:8096@INKY_SERVE_KEY
+ANTHROPIC_BASE_URL=http://127.0.0.1:8096 \
+ANTHROPIC_API_KEY="$INKY_SERVE_KEY" \
+  claude -p --model inkling-2-mini "Run the test suite and summarize any failures."
 ```
-
-Deal the row work using model `inky/inkling-2-mini`. The worker gives Claude Code the local proxy URL, the bare model ID `inkling-2-mini`, and a per-job placeholder token. The proxy forwards the request to inky with `INKY_SERVE_KEY` as a Bearer token. Use the server origin in the provider URL. Claude Code supplies the `/v1/messages` path. Keep the secret name in the configuration and command arguments. Nova-secrets supplies the value to the server and worker.
 
 ### Troubleshoot
 
-- **Connection refused.** Run `curl --fail http://127.0.0.1:8096/health` on the worker Mac. Inky loads the model before listening. Check its startup log for the model path and bind address.
-- **HTTP 404 on Messages.** Check the inky revision for Messages support and verify the worker route points to the Anthropic provider's server origin.
-- **HTTP 401 from inky or HTTP 503 with “missing API key” from the proxy.** Check that both processes started through `nova-secrets exec` with the same `INKY_SERVE_KEY`. Verify the secret name in `--key-env` and `--providers`.
+- **Connection refused.** Run `curl --fail http://127.0.0.1:8096/health` on the host. Inky loads the model before listening. Check its startup log for the model path and bind address.
+- **HTTP 404 on Messages.** Check the inky revision for Messages support and verify the client route points to the server origin (`Claude Code` appends `/v1/messages`).
+- **HTTP 401 from inky or HTTP 503 with “missing API key” from a proxy.** Check that both server and client carry the same secret value in the variable named by `--key-env`.
 - **HTTP 400 for context.** The rendered prompt, requested output budget, and two reserved tokens must fit the lane's context. Shorten the prompt or output budget, or raise `-c` if the Mac has room.
 - **Worker probe times out.** The v2.0.58 worker holds the row if its Claude Code startup probe exceeds the launch timeout. Inspect the worker's probe log. On a shared M5 Pro, the probe reached Inky and generated a tool call before hitting the 20-second limit. A healthy server can still have a held worker.
 - **HTTP 429 or memory pressure.** For sustained 429s, lower the worker load or add lanes if memory permits. For memory pressure, reduce lanes or context and check the inky-mode line in the startup log.
@@ -351,7 +345,29 @@ tools/ref_logits.cpp  llama.cpp reference-logit dumper (validation oracle)
 `inky prof -n POS` / `inky prof_pf -f prompt.txt` attribute GPU time per kernel class (skip-mask method);
 `inky kmoepf -f prompt.txt` times the MoE GEMMs alone on the prompt's real routing, `inky ksg` the tile kernel vs
 threadgroup size and fill, `inky kpeak` / `kmode` the tensor units' ceiling and precision modes, `inky kvdump` dumps the K/V payload, `inky kvscreen` measures how
-concentrated full attention is over its keys, `INK_KVQ=kbits,vbits inky check` simulates a coarser cache; `INK_TIER_MIN=n` / `INK_TIER_HOT=n` make `--kv-disk` start at a smaller context / with tiny rings for tests. `INK_CHUNK=N` caps the prefill batch. It accepts multiples of 32 from 32 to 4096 and defaults to 4096. If the tensor accumulator layout differs from what the register epilogues expect, the engine falls back to a slower tensor path (`INK_NO_HGEMM=1` forces it). `INK_NO_TENSOR=1` uses simdgroup matrices. Serving requires the fp16 tensor path and enough arena space for its requested lanes. For example, a 128-token context with the default chunk supports up to 64 lanes.
+concentrated full attention is over its keys, and `INK_KVQ=kbits,vbits inky check` simulates a coarser cache.
+
+### Engine environment variables (`src/engine.rs`)
+
+The engine reads the following `INK_*` environment variables at startup or during execution (including under `inky serve`):
+
+| Variable | Default | Effect on serving and engine execution |
+|---|---|---|
+| `INK_CHUNK=N` | `4096` | Prefill batch chunk ceiling (multiple of 32 in `32..=4096`). Also bounds `decode_span_limit()` (`min(128, chunk, batch_cap / 2)`); serving requires `--lanes <= decode_span_limit()`. |
+| `INK_NO_GRP_DEC=1` | unset (`0`) | Disables multi-query shared-KV decode grouping (`k_attn_grp_dec`), forcing `count = 1` solo decode groups (`k_attn_dec_solo`). |
+| `INK_NO_HGEMM=1` | unset | Disables the fp16-activation register-epilogue tensor GEMM path (`hgemm = false`). `inky serve` refuses to start when `hgemm` is disabled because batched decode requires it. |
+| `INK_NO_TENSOR=1` | unset | Disables Metal 4 `matmul2d` tensor GEMMs (`tensor = false`, `hgemm = false`), falling back to simdgroup matrices (`inky serve` requires `hgemm`). |
+| `INK_FUSE_COMB=1` | unset | Uses fused single-pass attention combine (`sep_comb = false`). `inky serve` requires separate split-attention combines and refuses to start if `INK_FUSE_COMB` is set. |
+| `INK_SEP_TOPK=1` | unset | Disables fused `k_moe_topk_route3`, running `k_topk_b` and `k_moe_route3` as separate dispatches. |
+| `INK_NO_TAIL=1` | unset | Disables the last-layer tail optimization during prefill (computes queries/FFN for all prefill rows instead of only the final 8 rows). |
+| `INK_NO_WARM=1` | unset | Skips the one-time GPU weight page pre-wiring pass at `Engine::load`. |
+| `INK_OLD_MIXB=1` | unset | Forces batched prefill residual depth-mixes (`mix_t`) onto the generic `k_mix` kernel instead of specialized `k_mix_b_*` dispatches. |
+| `INK_DBATCH_A=1` | unset | Stops `encode_decode` after stage A (attention/mix diagnostic cutoff; for `dbatch` profiling only, never set in production serving). |
+| `INK_HEADROOM=div,min` | `16,0` | Layer 2 contiguous KV growth slack (`need + max(need / div, min)` rounded to 64); no-op on `inky serve`'s paged `Lane::new_blocked` lanes. |
+| `INK_POISON_RANGE=lo,hi` | `0,usize::MAX` | Restricts `Engine::poison_scratch` word range `[lo, hi)` during diagnostic scratch-poisoning gates. |
+| `INK_SPLITS=N` | `8` | Target attention split count for the `--kv-disk` streaming tier (`CLI` single-lane mode). |
+| `INK_TIER_MIN=N`, `INK_TIER_HOT=N`, `INK_TIER_PIECE=MiB`, `INK_TIER_THREADS=N` | `512`, auto, `4`, `4` | `--kv-disk` activation threshold, forced hot-ring size (positions), per-read chunk size (MiB), and reader thread count. |
+| `INKY_MEMD_SOCKET=PATH` | `/private/var/db/inky/memd.sock` | Overrides the Unix domain socket path used to contact `inky memd` for inky mode. |
 
 ## Releasing
 

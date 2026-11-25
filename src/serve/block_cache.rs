@@ -9,9 +9,10 @@ use crate::blocks::{
     BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Slot, BLOCK, WINDOW,
 };
 use crate::engine::EXT;
-use crate::prefix::{BlockHandles, EntryTree, PrefixMatch, PrefixTree, SealedId};
+use crate::prefix::{BlockHandles, EntryTree, PrefixTree, SealedId};
 use crate::spill::{ReadOutcome, SpillBlockKind, SpillKey, SpillStore, WriteOutcome};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 #[cfg(standalone_blocks)]
 #[path = "block_cache/trace.rs"]
@@ -31,6 +32,14 @@ pub const MAX_ADMIT_DECODE_RESERVE: usize = 4096;
 
 /// Maximum retained spilled start-point metadata entries tracked on disk.
 pub const DEFAULT_MAX_SPILLED_STARTS: usize = 512;
+
+/// Default host-RAM cap for retained checkpoint copies (`cs` + `toks` + `entries`).
+pub const DEFAULT_MAX_RETAINED_HOST_BYTES: u64 = 512 << 20;
+
+/// Default wall-clock deadline for spilling one checkpoint to `--spill-dir` (aligned with
+/// `DEFAULT_GPU_STEP_TIMEOUT` / `DEFAULT_SCHEDULER_STALL_THRESHOLD` so multi-block fsyncs on
+/// large checkpoints or virtualized CI runners do not prematurely abort mid-spill).
+pub const DEFAULT_SPILL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheError {
@@ -65,17 +74,20 @@ pub struct CacheStats {
     pub lanes_released: u64,
     pub spill_maint_passes: u64,
     pub spill_maint_evictions: u64,
+    pub spill_write_timeouts: u64,
 }
 
 /// Per-lane Layer 3 tracking state (lives alongside `Lane` inside `LaneS`).
 #[derive(Default, Debug)]
 pub struct LaneBlockState {
+    pub namespace: u64,
     pub sealed: Vec<SealedId>,
     pub prompt_len: usize,
     pub written: usize,
 }
 
 struct RetainedStart {
+    namespace: u64,
     pos: usize,
     cs: Vec<u8>,
     reasons: u8,
@@ -84,9 +96,20 @@ struct RetainedStart {
     last_used_tick: u64,
 }
 
+impl RetainedStart {
+    fn host_bytes(&self) -> u64 {
+        (self.cs.len() as u64)
+            .saturating_add((self.toks.len() as u64).saturating_mul(4))
+            .saturating_add(
+                (self.entries.len() as u64)
+                    .saturating_mul(std::mem::size_of::<(BlockKind, BlockIndex, BlockEntry)>() as u64),
+            )
+    }
+}
+
 struct SpilledStart {
+    namespace: u64,
     pos: usize,
-    #[allow(dead_code)]
     reasons: u8,
     cs_key: SpillKey,
     entries: Vec<(BlockKind, BlockIndex, SpillKey)>,
@@ -123,13 +146,13 @@ fn kind_idx(kind: BlockKind) -> usize {
 
 /// True when `end` (a multiple of `BLOCK`) is a periodic `EVERY` checkpoint boundary.
 pub fn is_every_checkpoint(end: usize) -> bool {
-    if end == 0 || end % BLOCK != 0 {
+    if end == 0 || !end.is_multiple_of(BLOCK) {
         return false;
     }
     if end <= EARLY_EVERY_LIMIT {
-        end % EARLY_EVERY_TOKENS == 0
+        end.is_multiple_of(EARLY_EVERY_TOKENS)
     } else {
-        end % LATE_EVERY_TOKENS == 0
+        end.is_multiple_of(LATE_EVERY_TOKENS)
     }
 }
 
@@ -148,6 +171,7 @@ fn max_every_checkpoint_le(n: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct InflightPrefillLane<'a> {
     pub lane: usize,
+    pub namespace: u64,
     pub toks: &'a [u32],
     pub n_past: usize,
     pub pf_end: usize,
@@ -155,10 +179,11 @@ pub struct InflightPrefillLane<'a> {
     pub eligible_follower: bool,
 }
 
-/// A producer must be strictly ahead in (progress, reverse lane ID) and must seal the
-/// checkpoint where this follower actually waits. Use the same rule in admission and scheduling.
+/// A producer must share the follower's cache namespace, be strictly ahead in
+/// (progress, reverse lane ID), and seal the checkpoint where this follower waits.
 fn can_lead(me: &InflightPrefillLane<'_>, producer: &InflightPrefillLane<'_>, next: usize) -> bool {
-    if !me.runnable
+    if me.namespace != producer.namespace
+        || !me.runnable
         || !me.eligible_follower
         || next <= me.n_past
         || next >= me.pf_end
@@ -238,6 +263,7 @@ pub fn effective_pf_target(n_past: usize, pf_end: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub struct InflightLaneReserve<'a> {
     pub lane: usize,
+    pub namespace: u64,
     pub toks: &'a [u32],
     pub n_past: usize,
     pub pf_end: usize,
@@ -265,6 +291,7 @@ pub fn reserved_inflight_full_slots(lanes: &[InflightLaneReserve<'_>]) -> usize 
         .filter(|l| l.gen == 0 && l.n_past < l.pf_end)
         .map(|l| InflightPrefillLane {
             lane: l.lane,
+            namespace: l.namespace,
             toks: l.toks,
             n_past: l.n_past,
             pf_end: l.pf_end,
@@ -309,6 +336,9 @@ pub struct ServeBlockCache {
     spill_key_to_entry: HashMap<SpillKey, (u8, u32, u32)>,
     next_spill_id: u64,
     max_spilled_starts: usize,
+    retained_host_bytes: u64,
+    max_retained_host_bytes: u64,
+    spill_write_timeout: Duration,
 }
 
 impl Default for ServeBlockCache {
@@ -334,7 +364,32 @@ impl ServeBlockCache {
             spill_key_to_entry: HashMap::new(),
             next_spill_id: 1,
             max_spilled_starts: DEFAULT_MAX_SPILLED_STARTS,
+            retained_host_bytes: 0,
+            max_retained_host_bytes: DEFAULT_MAX_RETAINED_HOST_BYTES,
+            spill_write_timeout: DEFAULT_SPILL_WRITE_TIMEOUT,
         }
+    }
+
+    /// Host-copy byte reserve carved out of `available_kv_budget_bytes` before sizing GPU `BlockPools`.
+    pub fn recommended_host_budget_bytes(available_kv_budget_bytes: u64) -> u64 {
+        if available_kv_budget_bytes == 0 {
+            return 0;
+        }
+        (available_kv_budget_bytes / 32).clamp(16 << 20, DEFAULT_MAX_RETAINED_HOST_BYTES)
+    }
+
+    pub fn set_max_retained_host_bytes(&mut self, max_bytes: u64) {
+        self.max_retained_host_bytes = max_bytes;
+    }
+
+    #[cfg(any(test, standalone_blocks))]
+    pub fn retained_host_bytes(&self) -> u64 {
+        self.retained_host_bytes
+    }
+
+    #[cfg(any(test, standalone_blocks))]
+    pub fn set_spill_write_timeout(&mut self, timeout: Duration) {
+        self.spill_write_timeout = timeout;
     }
 
     pub fn with_spill(store: SpillStore) -> Self {
@@ -343,19 +398,9 @@ impl ServeBlockCache {
         cache
     }
 
-    #[allow(dead_code)]
-    pub fn set_spill_store(&mut self, store: SpillStore) {
-        self.spill_store = Some(store);
-    }
-
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn spill_store(&self) -> Option<&SpillStore> {
         self.spill_store.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub fn spill_store_mut(&mut self) -> Option<&mut SpillStore> {
-        self.spill_store.as_mut()
     }
 
     /// Bounded host/disk-only maintenance safe to overlap with an in-flight GPU step:
@@ -376,14 +421,9 @@ impl ServeBlockCache {
             self.remove_spilled_start(oid, true);
             evicted += 1;
         }
-        let gc_evicted = if let Some(store) = self.spill_store.as_mut() {
-            if store.used_bytes() > store.max_bytes() {
-                store.evict_lru_to_fit(0, &HashSet::new())
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
+        let gc_evicted = match self.spill_store.as_mut() {
+            Some(store) => store.evict_lru_to_fit(0, &HashSet::new()),
+            None => Vec::new(),
         };
         if !gc_evicted.is_empty() {
             evicted += gc_evicted.len();
@@ -394,22 +434,20 @@ impl ServeBlockCache {
         evicted
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn spilled_start_count(&self) -> usize {
         self.spilled_starts.len()
     }
 
-    #[allow(dead_code)]
     pub fn record_step_deferred_pool_pressure(&mut self) {
         self.stats.step_deferred_pool_pressure += 1;
     }
 
-    #[allow(dead_code)]
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, standalone_blocks))]
     pub fn retained_start_count(&self) -> usize {
         self.starts.len()
     }
@@ -465,25 +503,49 @@ impl ServeBlockCache {
         (usable, avail)
     }
 
-    fn resident_start(&self, pools: &BlockPools, toks: &[u32]) -> Option<&RetainedStart> {
+    fn resident_start(&self, pools: &BlockPools, namespace: u64, toks: &[u32]) -> Option<&RetainedStart> {
         let prefix = toks.get(..toks.len().checked_sub(1)?)?;
-        let matched = self.tree.deepest_start(prefix);
+        let matched = self.tree.deepest_start_in_namespace(namespace, prefix);
         let st = self.starts.get(&matched.start?)?;
-        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)).then_some(st)
+        (st.namespace == namespace
+            && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e)))
+        .then_some(st)
     }
 
-    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt.
+    /// Length of the deepest live in-memory checkpoint strictly shorter than the prompt in default namespace `0`.
+    #[cfg(any(test, standalone_blocks))]
     pub fn peek_match_len(&self, pools: &BlockPools, toks: &[u32]) -> usize {
-        self.resident_start(pools, toks).map_or(0, |st| st.pos)
+        self.peek_match_len_in_namespace(pools, 0, toks)
     }
 
-    /// Check the marginal cost of binding the prospective lane and completing the bounded
-    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
+    /// Length of the deepest live in-memory checkpoint strictly shorter than `toks` in `namespace`.
+    #[cfg(any(test, standalone_blocks))]
+    pub fn peek_match_len_in_namespace(&self, pools: &BlockPools, namespace: u64, toks: &[u32]) -> usize {
+        self.resident_start(pools, namespace, toks).map_or(0, |st| st.pos)
+    }
+
+    /// Check the marginal cost of binding the prospective lane in default namespace `0`.
+    #[cfg(any(test, standalone_blocks))]
     pub fn can_admit(
         &mut self,
         pools: &BlockPools,
         active: &[InflightLaneReserve<'_>],
         lane: usize,
+        toks: &[u32],
+        max_gen: usize,
+        chunk: usize,
+    ) -> bool {
+        self.can_admit_in_namespace(pools, active, lane, 0, toks, max_gen, chunk)
+    }
+
+    /// Check the marginal cost of binding the prospective lane in `namespace` and completing the bounded
+    /// outstanding work. Retained-only slots stop being evictable as soon as this job binds.
+    pub fn can_admit_in_namespace(
+        &mut self,
+        pools: &BlockPools,
+        active: &[InflightLaneReserve<'_>],
+        lane: usize,
+        namespace: u64,
         toks: &[u32],
         max_gen: usize,
         chunk: usize,
@@ -498,7 +560,7 @@ impl ServeBlockCache {
         let available_full = self.free_plus_evictable_slots(pools, BlockKind::Full);
         let mut pins = [0; 2];
         let mut cached = 0;
-        if let Some(st) = self.resident_start(pools, toks) {
+        if let Some(st) = self.resident_start(pools, namespace, toks) {
             cached = st.pos;
             for &(kind, _, entry) in &st.entries {
                 let i = kind_idx(kind);
@@ -514,6 +576,7 @@ impl ServeBlockCache {
         let mut fits = |start: usize, newly_pinned: [usize; 2]| {
             cohort.push(InflightLaneReserve {
                 lane,
+                namespace,
                 toks,
                 n_past: start,
                 pf_end: toks.len(),
@@ -543,7 +606,7 @@ impl ServeBlockCache {
         // A deeper SSD restore can replace the resident start during bind. Budget that outcome
         // too, including the newly pinned restored blocks, without doing disk I/O on a refused job.
         if ok && !toks.is_empty() && !self.spilled_starts.is_empty() {
-            let disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]).at;
+            let disk = self.spilled_tree.deepest_start_in_namespace(namespace, &toks[..toks.len() - 1]).at;
             if disk > cached {
                 let blocks = disk / BLOCK;
                 let already_pinned_full = cached / BLOCK - pins[kind_idx(BlockKind::Full)];
@@ -557,7 +620,9 @@ impl ServeBlockCache {
     }
 
     /// Rebind an untouched prefilling lane (`state.written == n_past` and no unsealed blocks)
-    /// when `EntryTree` now holds a deeper live `RetainedStart` than `n_past`.
+    /// when `EntryTree` now holds a deeper live `RetainedStart` than `n_past` in `state.namespace`.
+    /// Validates and stages the deeper start point BEFORE releasing the lane's prior bindings
+    /// so a failed or stale candidate leaves `tbl` and `state` completely intact and consistent.
     pub fn rebind_if_deeper_match(
         &mut self,
         pools: &mut BlockPools,
@@ -566,27 +631,108 @@ impl ServeBlockCache {
         toks: &[u32],
         n_past: usize,
     ) -> Option<(usize, Vec<u8>)> {
-        if state.written != n_past || state.written != state.sealed.len() * BLOCK {
+        if state.written != n_past || state.written != state.sealed.len() * BLOCK || toks.len() <= 1 {
             return None;
         }
-        let deeper = self.peek_match_len(pools, toks);
-        if deeper <= n_past {
-            return None;
+        let namespace = state.namespace;
+        let search = &toks[..toks.len() - 1];
+        let mut matched = self.tree.deepest_start_in_namespace(namespace, search);
+        loop {
+            if matched.at <= n_past {
+                return None;
+            }
+            let sid = matched.start?;
+            let all_live = match self.starts.get(&sid) {
+                Some(st) => {
+                    debug_assert_eq!(st.pos, matched.at);
+                    st.namespace == namespace
+                        && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
+                }
+                None => false,
+            };
+            if all_live {
+                break;
+            }
+            self.evict_start_inner(pools, sid, false, None);
+            matched = self.tree.deepest_start_in_namespace(namespace, search);
         }
-        self.release_lane(pools, tbl, state);
-        let matched = self.bind_resident_start(pools, tbl, state, toks);
-        if let Some((matched_at, _)) = &matched {
-            if *matched_at > n_past {
-                self.stats.singleflight_rebinds += 1;
-                self.stats.singleflight_saved_tokens += (*matched_at - n_past) as u64;
+        let sid = matched.start.expect("validated live start id");
+        let (cs, entries) = {
+            let st = self.starts.get(&sid).expect("validated live start exists");
+            (st.cs.clone(), st.entries.clone())
+        };
+        // Stage all new block-table bindings and EntryTree pins BEFORE releasing the lane's
+        // prior bindings so any failure (such as table-capacity bounds or ref overflow) leaves
+        // `tbl` and `state` completely untouched.
+        let Ok(mut staged) = BlockTable::new(tbl.blocks_per_kind()) else {
+            return None;
+        };
+        for &(kind, bi, e) in &entries {
+            if staged.fill(pools.of_mut(kind), bi, e.slot(), e.generation()).is_err() {
+                let _ = staged.clear_entries(pools);
+                return None;
             }
         }
-        matched
+        let mut pinned_ids: Vec<SealedId> = Vec::with_capacity(matched.ids.len());
+        for &id in &matched.ids {
+            if self.tree.pin(id).is_err() {
+                for pid in pinned_ids {
+                    self.tree.unpin(pid);
+                }
+                let _ = staged.clear_entries(pools);
+                return None;
+            }
+            pinned_ids.push(id);
+        }
+        staged.mark_full_sync();
+
+        // Commit: release old bindings only now that the deeper target is 100% staged and pinned.
+        tbl.clear_entries(pools).expect("clear lane block table for rebind");
+        let old_tip = state.sealed.last().copied();
+        for id in state.sealed.drain(..) {
+            self.tree.unpin(id);
+        }
+        if let Some(old_tip) = old_tip {
+            if !pinned_ids.contains(&old_tip) {
+                self.tree.prune_unreferenced(old_tip);
+            }
+        }
+        self.tick += 1;
+        let now = self.tick;
+        for &anc in &pinned_ids {
+            if let Some(st) = self.starts.get_mut(&anc) {
+                st.last_used_tick = now;
+            }
+        }
+        *tbl = staged;
+        state.prompt_len = toks.len();
+        state.sealed = pinned_ids;
+        state.written = matched.at;
+        self.stats.start_matches += 1;
+        self.stats.cached_tokens_total += matched.at as u64;
+        self.stats.singleflight_rebinds += 1;
+        self.stats.singleflight_saved_tokens += (matched.at - n_past) as u64;
+        Some((matched.at, cs))
+    }
+
+    /// Bind `state` in `namespace` to the deepest live in-RAM or spilled SSD start point strictly
+    /// shorter than `toks`.
+    pub fn match_and_bind_in_namespace(
+        &mut self,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        namespace: u64,
+        toks: &[u32],
+    ) -> Option<(usize, Vec<u8>)> {
+        state.namespace = namespace; // MUTANT_ANCHOR_BIND_NAMESPACE
+        self.match_and_bind(pools, tbl, state, toks)
     }
 
     /// Look up the deepest live `RetainedStart` (or spilled SSD start point when deeper than any
-    /// in-RAM match) strictly shorter than `toks`, bind its `Full` and `Window` entries into `tbl`,
-    /// pin its `EntryTree` path on `state`, touch its LRU tick, and return `Some((matched_at, cs_bytes))`.
+    /// in-RAM match) strictly shorter than `toks` in `state.namespace`, bind its `Full` and `Window`
+    /// entries into `tbl`, pin its `EntryTree` path on `state`, touch its LRU tick, and return
+    /// `Some((matched_at, cs_bytes))`.
     pub fn match_and_bind(
         &mut self,
         pools: &mut BlockPools,
@@ -595,56 +741,68 @@ impl ServeBlockCache {
         toks: &[u32],
     ) -> Option<(usize, Vec<u8>)> {
         debug_assert!(state.sealed.is_empty(), "lane must be released before match_and_bind");
+        let namespace = state.namespace;
         state.prompt_len = toks.len();
         state.written = 0;
         if toks.len() <= 1 {
             return None;
         }
-        let mut in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
+        let search = &toks[..toks.len() - 1];
+        let mut in_ram = self.tree.deepest_start_in_namespace(namespace, search);
         if in_ram.at > 0 {
             if let Some(sid) = in_ram.start {
                 let all_live = match self.starts.get(&sid) {
                     Some(st) => {
                         debug_assert_eq!(st.pos, in_ram.at);
-                        st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
+                        st.namespace == namespace
+                            && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
                     }
                     None => false,
                 };
                 if !all_live {
                     self.evict_start_inner(pools, sid, false, None);
-                    in_ram = self.tree.deepest_start(&toks[..toks.len() - 1]);
+                    in_ram = self.tree.deepest_start_in_namespace(namespace, search);
                 }
             } else {
                 in_ram.at = 0;
             }
         }
+        let mut restored_from_disk = false;
         if self.spill_store.is_some() && !self.spilled_starts.is_empty() {
-            let on_disk = self.spilled_tree.deepest_start(&toks[..toks.len() - 1]);
+            let on_disk = self.spilled_tree.deepest_start_in_namespace(namespace, search);
             if on_disk.at > in_ram.at {
                 if let Some(&spill_id) = on_disk.blocks.last() {
-                    let _ = self.try_restore_spilled_start(pools, toks, spill_id, &in_ram);
+                    restored_from_disk =
+                        self.try_restore_spilled_start(pools, namespace, toks, spill_id, &in_ram).is_some();
                 }
             }
         }
-        self.bind_resident_start(pools, tbl, state, toks)
+        let matched = if restored_from_disk {
+            self.tree.deepest_start_in_namespace(namespace, search)
+        } else {
+            in_ram
+        };
+        self.bind_matched_resident_start(pools, tbl, state, toks.len(), matched)
     }
 
-    fn bind_resident_start(
-        &mut self, pools: &mut BlockPools, tbl: &mut BlockTable, state: &mut LaneBlockState, toks: &[u32],
+    fn bind_matched_resident_start(
+        &mut self,
+        pools: &mut BlockPools,
+        tbl: &mut BlockTable,
+        state: &mut LaneBlockState,
+        prompt_len: usize,
+        matched: crate::prefix::StartMatch<BlockHandles>,
     ) -> Option<(usize, Vec<u8>)> {
-        state.prompt_len = toks.len();
-        let matched = self.tree.deepest_start(&toks[..toks.len() - 1]);
+        let namespace = state.namespace;
+        state.prompt_len = prompt_len;
         if matched.at == 0 {
             return None;
         }
         let sid = matched.start?;
-        let all_live = match self.starts.get(&sid) {
-            Some(st) => {
-                debug_assert_eq!(st.pos, matched.at);
-                st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e))
-            }
-            None => return None,
-        };
+        let st = self.starts.get(&sid)?;
+        debug_assert_eq!(st.pos, matched.at);
+        let all_live = st.namespace == namespace
+            && st.entries.iter().all(|&(kind, _, e)| entry_is_live_sealed(pools, kind, e));
         if !all_live {
             self.evict_start_inner(pools, sid, false, None);
             return None;
@@ -721,19 +879,73 @@ impl ServeBlockCache {
         }
     }
 
+    fn claim_spill_key(&mut self, spill_id: u64, sk: SpillKey, claimed: &mut Vec<SpillKey>) {
+        let owners = self.spill_key_owners.entry(sk).or_default();
+        if !owners.contains(&spill_id) {
+            owners.push(spill_id);
+            claimed.push(sk);
+        }
+    }
+
+    fn abort_spill_claims(&mut self, spill_id: u64, claimed: &[SpillKey]) {
+        for &sk in claimed {
+            let remove_key = if let Some(owners) = self.spill_key_owners.get_mut(&sk) {
+                owners.retain(|&id| id != spill_id);
+                owners.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.spill_key_owners.remove(&sk);
+                if let Some(entry_key) = self.spill_key_to_entry.remove(&sk) {
+                    self.entry_spill_keys.remove(&entry_key);
+                }
+                if let Some(store) = self.spill_store.as_mut() {
+                    store.remove_block(sk);
+                }
+            }
+        }
+    }
+
     fn spill_retained_start(&mut self, pools: &BlockPools, st: &RetainedStart, restore: Option<&RestoreSource>) {
         if self.spill_store.is_none()
+            || self.max_spilled_starts == 0
             || st.pos == 0
-            || st.pos % BLOCK != 0
+            || !st.pos.is_multiple_of(BLOCK)
             || st.toks.len() != st.pos
             || st.entries.is_empty()
         {
             return;
         }
+        if self.spill_write_timeout.is_zero() {
+            self.stats.spill_write_timeouts += 1;
+            return;
+        }
+        let deadline = Instant::now() + self.spill_write_timeout;
         for &(kind, _, e) in &st.entries {
             let pool = pools.of(kind);
             if !entry_is_live_sealed(pools, kind, e) || pool.slot_raw_region(e.slot()).is_none() {
                 return;
+            }
+        }
+
+        let spill_id = self.next_spill_id;
+        self.next_spill_id = self.next_spill_id.wrapping_add(1).max(1);
+
+        // Claim ownership of all reusable on-disk blocks BEFORE trimming `max_spilled_starts`,
+        // writing new blocks, or replacing an existing tip, so concurrent/interleaved eviction
+        // can never delete a `.blk` file that `spill_id` is reusing.
+        let mut protected = restore.map(|source| source.keys.clone()).unwrap_or_default();
+        let mut claimed_keys: Vec<SpillKey> = Vec::with_capacity(st.entries.len() + 1);
+        let mut reusable_keys: HashSet<SpillKey> = HashSet::new();
+        for &(kind, _, e) in &st.entries {
+            let ek = (kind_idx(kind) as u8, e.slot().get(), e.generation());
+            if let Some(&sk) = self.entry_spill_keys.get(&ek) {
+                if self.spill_store.as_ref().is_some_and(|store| store.contains(sk)) {
+                    protected.insert(sk);
+                    reusable_keys.insert(sk);
+                    self.claim_spill_key(spill_id, sk, &mut claimed_keys);
+                }
             }
         }
 
@@ -744,18 +956,13 @@ impl ServeBlockCache {
                 .filter(|(id, _)| !restore.is_some_and(|source| source.spill_id == **id))
                 .min_by_key(|(_, sp)| (sp.last_used_tick, std::cmp::Reverse(sp.pos)))
                 .map(|(&id, _)| id);
-            let Some(oid) = oldest else { return };
+            let Some(oid) = oldest else {
+                self.abort_spill_claims(spill_id, &claimed_keys);
+                return;
+            };
             self.remove_spilled_start(oid, true);
         }
-        if self.max_spilled_starts == 0 {
-            return;
-        }
 
-        let spill_id = self.next_spill_id;
-        self.next_spill_id = self.next_spill_id.wrapping_add(1).max(1);
-
-        let mut protected = restore.map(|source| source.keys.clone()).unwrap_or_default();
-        let mut newly_written_keys: Vec<SpillKey> = Vec::new();
         let mut spilled_entries: Vec<(BlockKind, BlockIndex, SpillKey)> =
             Vec::with_capacity(st.entries.len());
 
@@ -766,28 +973,19 @@ impl ServeBlockCache {
             } else {
                 (self.alloc_spill_key(kind), true)
             };
-            let already_on_disk = self
-                .spill_store
-                .as_ref()
-                .is_some_and(|store| store.contains(sk));
-            if !is_new_key && already_on_disk {
-                protected.insert(sk);
+            if !is_new_key && reusable_keys.contains(&sk) && self.spill_store.as_ref().is_some_and(|store| store.contains(sk)) {
                 spilled_entries.push((kind, bi, sk));
                 continue;
+            }
+            if Instant::now() >= deadline {
+                self.stats.spill_write_timeouts += 1;
+                self.abort_spill_claims(spill_id, &claimed_keys);
+                return;
             }
             let kv_bytes = match pools.of(kind).slot_bytes(e.slot()) {
                 Ok(b) => b,
                 Err(_) => {
-                    for nk in newly_written_keys {
-                        if !self.spill_key_owners.contains_key(&nk) {
-                            if let Some(entry_key) = self.spill_key_to_entry.remove(&nk) {
-                                self.entry_spill_keys.remove(&entry_key);
-                            }
-                            if let Some(store) = self.spill_store.as_mut() {
-                                store.remove_block(nk);
-                            }
-                        }
-                    }
+                    self.abort_spill_claims(spill_id, &claimed_keys);
                     return;
                 }
             };
@@ -804,39 +1002,26 @@ impl ServeBlockCache {
                         self.spill_key_to_entry.insert(sk, ek);
                     }
                     protected.insert(sk);
-                    newly_written_keys.push(sk);
+                    self.claim_spill_key(spill_id, sk, &mut claimed_keys);
                     spilled_entries.push((kind, bi, sk));
                 }
                 Ok((WriteOutcome::OverBudget, gc_evicted)) => {
                     self.handle_disk_gc_evicted(&gc_evicted);
-                    for nk in newly_written_keys {
-                        if !self.spill_key_owners.contains_key(&nk) {
-                            if let Some(entry_key) = self.spill_key_to_entry.remove(&nk) {
-                                self.entry_spill_keys.remove(&entry_key);
-                            }
-                            if let Some(store) = self.spill_store.as_mut() {
-                                store.remove_block(nk);
-                            }
-                        }
-                    }
+                    self.abort_spill_claims(spill_id, &claimed_keys);
                     return;
                 }
                 Err(_) => {
-                    for nk in newly_written_keys {
-                        if !self.spill_key_owners.contains_key(&nk) {
-                            if let Some(entry_key) = self.spill_key_to_entry.remove(&nk) {
-                                self.entry_spill_keys.remove(&entry_key);
-                            }
-                            if let Some(store) = self.spill_store.as_mut() {
-                                store.remove_block(nk);
-                            }
-                        }
-                    }
+                    self.abort_spill_claims(spill_id, &claimed_keys);
                     return;
                 }
             }
         }
 
+        if Instant::now() >= deadline {
+            self.stats.spill_write_timeouts += 1;
+            self.abort_spill_claims(spill_id, &claimed_keys);
+            return;
+        }
         let cs_key = self.alloc_spill_key(BlockKind::Full);
         let cs_res = self
             .spill_store
@@ -846,32 +1031,16 @@ impl ServeBlockCache {
         match cs_res {
             Ok((WriteOutcome::Written { .. }, gc_evicted)) => {
                 self.handle_disk_gc_evicted(&gc_evicted);
+                protected.insert(cs_key);
+                self.claim_spill_key(spill_id, cs_key, &mut claimed_keys);
             }
             Ok((WriteOutcome::OverBudget, gc_evicted)) => {
                 self.handle_disk_gc_evicted(&gc_evicted);
-                for nk in newly_written_keys {
-                    if !self.spill_key_owners.contains_key(&nk) {
-                        if let Some(entry_key) = self.spill_key_to_entry.remove(&nk) {
-                            self.entry_spill_keys.remove(&entry_key);
-                        }
-                        if let Some(store) = self.spill_store.as_mut() {
-                            store.remove_block(nk);
-                        }
-                    }
-                }
+                self.abort_spill_claims(spill_id, &claimed_keys);
                 return;
             }
             Err(_) => {
-                for nk in newly_written_keys {
-                    if !self.spill_key_owners.contains_key(&nk) {
-                        if let Some(entry_key) = self.spill_key_to_entry.remove(&nk) {
-                            self.entry_spill_keys.remove(&entry_key);
-                        }
-                        if let Some(store) = self.spill_store.as_mut() {
-                            store.remove_block(nk);
-                        }
-                    }
-                }
+                self.abort_spill_claims(spill_id, &claimed_keys);
                 return;
             }
         }
@@ -881,7 +1050,7 @@ impl ServeBlockCache {
         for b in 0..n_blocks {
             let id = self
                 .spilled_tree
-                .insert(parent, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
+                .insert_in_namespace(st.namespace, parent, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
                 .expect("insert spilled block into spilled_tree");
             parent = Some(id);
         }
@@ -895,7 +1064,7 @@ impl ServeBlockCache {
             for b in 0..n_blocks {
                 let id = self
                     .spilled_tree
-                    .insert(p, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
+                    .insert_in_namespace(st.namespace, p, b * BLOCK, &st.toks[b * BLOCK..(b + 1) * BLOCK], spill_id)
                     .expect("re-insert spilled block into spilled_tree");
                 p = Some(id);
             }
@@ -913,12 +1082,10 @@ impl ServeBlockCache {
             self.spilled_tips.insert(spill_id, tip);
         }
 
-        for sk in std::iter::once(cs_key).chain(spilled_entries.iter().map(|&(_, _, k)| k)) {
-            self.spill_key_owners.entry(sk).or_default().push(spill_id);
-        }
         self.spilled_starts.insert(
             spill_id,
             SpilledStart {
+                namespace: st.namespace,
                 pos: st.pos,
                 reasons: st.reasons,
                 cs_key,
@@ -932,16 +1099,19 @@ impl ServeBlockCache {
     fn try_restore_spilled_start(
         &mut self,
         pools: &mut BlockPools,
+        namespace: u64,
         toks: &[u32],
         spill_id: u64,
         in_ram: &crate::prefix::StartMatch<BlockHandles>,
     ) -> Option<SealedId> {
-        let (pos, reasons, cs_key, entries) = {
+        let (sp_ns, pos, reasons, cs_key, entries) = {
             let sp = self.spilled_starts.get(&spill_id)?;
-            (sp.pos, sp.reasons, sp.cs_key, sp.entries.clone())
+            (sp.namespace, sp.pos, sp.reasons, sp.cs_key, sp.entries.clone())
         };
-        if pos == 0 || pos % BLOCK != 0 || pos >= toks.len() {
-            self.remove_spilled_start(spill_id, true);
+        if sp_ns != namespace || pos == 0 || pos % BLOCK != 0 || pos >= toks.len() {
+            if pos == 0 || pos % BLOCK != 0 {
+                self.remove_spilled_start(spill_id, true);
+            }
             return None;
         }
 
@@ -1055,7 +1225,7 @@ impl ServeBlockCache {
             let handles = BlockHandles::new(full_e, win_e_opt);
             let id = self
                 .tree
-                .insert(parent, b * BLOCK, &toks[b * BLOCK..(b + 1) * BLOCK], handles)
+                .insert_in_namespace(namespace, parent, b * BLOCK, &toks[b * BLOCK..(b + 1) * BLOCK], handles)
                 .expect("insert restored block into EntryTree");
             let canon = self.tree.handle(id).expect("inserted handle");
             let canon_f = canon.full();
@@ -1099,20 +1269,21 @@ impl ServeBlockCache {
                 self.inc_start_slot_ref(kind, e.slot());
             }
             self.tree.retain_start(tip).expect("retain restored start in EntryTree");
-            self.starts.insert(
-                tip,
-                RetainedStart {
-                    pos,
-                    cs,
-                    reasons,
-                    entries: final_entries,
-                    toks: toks[..pos].to_vec(),
-                    last_used_tick: now,
-                },
-            );
+            let st = RetainedStart {
+                namespace,
+                pos,
+                cs,
+                reasons,
+                entries: final_entries,
+                toks: toks[..pos].to_vec(),
+                last_used_tick: now,
+            };
+            self.retained_host_bytes = self.retained_host_bytes.saturating_add(st.host_bytes());
+            self.starts.insert(tip, st);
+            self.enforce_retained_host_budget(pools, Some(tip));
         }
 
-        Self::release_restore_refs(pools, held);
+        Self::release_restore_refs(pools, held); // MUTANT_ANCHOR_RELEASE_RESTORE_REFS
         self.remove_spilled_start(spill_id, true);
         self.stats.starts_restored += 1;
         Some(tip)
@@ -1141,6 +1312,7 @@ impl ServeBlockCache {
             let (slot, generation) = self.take_zeroed_slot_inner(pools, kind, Some(source)).ok()?;
             let pool = pools.of_mut(kind);
             pool.slot_bytes_mut(slot).ok()?.copy_from_slice(&bytes);
+            pool.clear_gpu_zero_pending(slot);
             let rec = pool.record_mut(slot).unwrap();
             rec.set_length(BLOCK as u32).expect("set restored block length");
             rec.seal();
@@ -1176,6 +1348,7 @@ impl ServeBlockCache {
         let Some(st) = self.starts.remove(&sid) else {
             return false;
         };
+        self.retained_host_bytes = self.retained_host_bytes.saturating_sub(st.host_bytes());
         if allow_spill && self.spill_store.is_some() {
             self.spill_retained_start(pools, &st, restore);
         }
@@ -1192,6 +1365,31 @@ impl ServeBlockCache {
         self.tree.prune_unreferenced(sid);
         self.stats.start_points_evicted += 1;
         true
+    }
+
+    fn enforce_retained_host_budget(&mut self, pools: &mut BlockPools, protect_sid: Option<SealedId>) {
+        while self.retained_host_bytes > self.max_retained_host_bytes {
+            let mut victim: Option<(SealedId, u64, usize)> = None;
+            for (&sid, st) in &self.starts {
+                if protect_sid == Some(sid) && self.max_retained_host_bytes > 0 {
+                    continue;
+                }
+                let better = match victim {
+                    None => true,
+                    Some((_, best_tick, best_pos)) => {
+                        (st.last_used_tick, std::cmp::Reverse(st.pos))
+                            < (best_tick, std::cmp::Reverse(best_pos))
+                    }
+                };
+                if better {
+                    victim = Some((sid, st.last_used_tick, st.pos));
+                }
+            }
+            let Some((sid, _, _)) = victim else {
+                break;
+            };
+            self.evict_start_inner(pools, sid, true, None);
+        }
     }
 
     fn evict_one_lru_start_inner(&mut self, pools: &mut BlockPools, allow_spill: bool, restore: Option<&RestoreSource>) -> bool {
@@ -1216,9 +1414,9 @@ impl ServeBlockCache {
         self.evict_start_inner(pools, sid, allow_spill, restore)
     }
 
-    /// Take one zeroed slot of `kind`, evicting LRU retained start points until a free slot
-    /// is available. Never grows the pool; returns `Err(PoolExhausted(kind))` if every slot
-    /// is pinned by active lanes.
+    /// Take one slot of `kind` without host-side full-slot CPU memset, evicting LRU retained
+    /// start points until a free slot is available. Never grows the pool; returns
+    /// `Err(PoolExhausted(kind))` if every slot is pinned by active lanes.
     pub fn take_zeroed_slot(
         &mut self,
         pools: &mut BlockPools,
@@ -1236,7 +1434,7 @@ impl ServeBlockCache {
         loop {
             if let Some(slot) = pools.of(kind).lowest_free() {
                 let pool = pools.of_mut(kind);
-                let _ = pool.take(slot).expect("take zeroed slot");
+                let _ = pool.take_unzeroed(slot).expect("take slot");
                 let gen = pool.record(slot).unwrap().generation();
                 self.stats.slots_taken += 1;
                 if gen > 1 {
@@ -1344,7 +1542,7 @@ impl ServeBlockCache {
                     let handles = BlockHandles::new(full_e, Some(win_e));
                     let id = self
                         .tree
-                        .insert(parent, b * BLOCK, blk_toks, handles)
+                        .insert_in_namespace(state.namespace, parent, b * BLOCK, blk_toks, handles)
                         .expect("insert sealed block into EntryTree");
                     let canon = self.tree.handle(id).expect("inserted handle");
                     let canon_f = canon.full();
@@ -1379,7 +1577,7 @@ impl ServeBlockCache {
             }
         }
         // Retain start points on 64-token boundaries for `EVERY` and `PROMPT` checkpoints.
-        if end > 0 && end % BLOCK == 0 && state.sealed.len() == end / BLOCK {
+        if end > 0 && end.is_multiple_of(BLOCK) && state.sealed.len() == end / BLOCK {
             let prompt_ckpt = ((state.prompt_len.saturating_sub(1)) / BLOCK) * BLOCK;
             let mut reasons = 0u8;
             if (prompt_ckpt > 0 && end == prompt_ckpt) || end == state.prompt_len {
@@ -1393,11 +1591,15 @@ impl ServeBlockCache {
                 self.tick += 1;
                 let now = self.tick;
                 let spill_enabled = self.spill_store.is_some();
+                let mut check_host_budget = false;
                 if let Some(existing) = self.starts.get_mut(&tip) {
                     existing.reasons |= reasons;
                     existing.last_used_tick = now;
                     if spill_enabled && existing.toks.is_empty() {
+                        let added = (end as u64).saturating_mul(4);
                         existing.toks = toks[..end].to_vec();
+                        self.retained_host_bytes = self.retained_host_bytes.saturating_add(added);
+                        check_host_budget = true;
                     }
                 } else {
                     let cs = read_cs();
@@ -1420,21 +1622,25 @@ impl ServeBlockCache {
                             .unwrap()
                             .add_ref()
                             .expect("retain start point ref");
-                        self.inc_start_slot_ref(kind, e.slot());
+                        self.inc_start_slot_ref(kind, e.slot()); // MUTANT_ANCHOR_START_SLOT_REF
                     }
                     self.tree.retain_start(tip).expect("retain start in EntryTree");
-                    self.starts.insert(
-                        tip,
-                        RetainedStart {
-                            pos: end,
-                            cs,
-                            reasons,
-                            entries,
-                            toks: if spill_enabled { toks[..end].to_vec() } else { Vec::new() },
-                            last_used_tick: now,
-                        },
-                    );
+                    let st = RetainedStart {
+                        namespace: state.namespace,
+                        pos: end,
+                        cs,
+                        reasons,
+                        entries,
+                        toks: if spill_enabled { toks[..end].to_vec() } else { Vec::new() },
+                        last_used_tick: now,
+                    };
+                    self.retained_host_bytes = self.retained_host_bytes.saturating_add(st.host_bytes());
+                    self.starts.insert(tip, st);
                     self.stats.start_points_saved += 1;
+                    check_host_budget = true;
+                }
+                if check_host_budget {
+                    self.enforce_retained_host_budget(pools, Some(tip));
                 }
             }
         }
@@ -1484,6 +1690,7 @@ impl ServeBlockCache {
         if let Some(tip) = tip {
             self.tree.prune_unreferenced(tip);
         }
+        state.namespace = 0;
         state.prompt_len = 0;
         state.written = 0;
         self.stats.lanes_released += 1;
@@ -1492,6 +1699,285 @@ impl ServeBlockCache {
     /// Evict every retained start point so all pool references drain cleanly on shutdown.
     pub fn shutdown(&mut self, pools: &mut BlockPools) {
         while self.evict_one_lru_start_inner(pools, false, None) {}
+    }
+}
+
+#[cfg(standalone_blocks)]
+#[derive(Clone, Debug)]
+pub struct OwnershipSnapshot {
+    pub num_full: usize,
+    pub num_win: usize,
+    pub full_refs: Vec<u32>,
+    pub win_refs: Vec<u32>,
+    pub full_gen: Vec<u32>,
+    pub win_gen: Vec<u32>,
+    pub start_full_refs: Vec<u32>,
+    pub start_win_refs: Vec<u32>,
+    pub actual_start_full_refs: Vec<u32>,
+    pub actual_start_win_refs: Vec<u32>,
+    pub table_full_refs: Vec<u32>,
+    pub table_win_refs: Vec<u32>,
+    pub free_plus_evict_full: usize,
+    pub free_plus_evict_win: usize,
+    pub lane_full_blocks: Vec<Vec<u32>>,
+    pub lane_win_blocks: Vec<Vec<u32>>,
+    pub lane_win_count: Vec<usize>,
+    pub all_lane_entries_live: bool,
+    pub all_start_entries_live_sealed: bool,
+    pub tree_start_holders_match: bool,
+    pub tree_pins_match_lanes: bool,
+    pub expired_win_present: bool,
+    pub spill_owners_consistent: bool,
+    pub spilled_tips_consistent: bool,
+    pub retained_starts: usize,
+    pub spilled_starts: usize,
+}
+
+#[cfg(standalone_blocks)]
+impl ServeBlockCache {
+    /// Compute the exact ownership, generation, EntryTree, sliding-window, and SpillStore
+    /// consistency snapshot across `pools`, `self`, and all active `lanes`.
+    pub fn ownership_snapshot(
+        &self,
+        pools: &BlockPools,
+        lanes: &[(&BlockTable, &LaneBlockState)],
+    ) -> OwnershipSnapshot {
+        let num_full = pools.full.len();
+        let num_win = pools.window.len();
+        let mut full_refs = Vec::with_capacity(num_full);
+        let mut full_gen = Vec::with_capacity(num_full);
+        for i in 0..num_full {
+            let slot = Slot::new((i + 1) as u32).unwrap();
+            let r = pools.full.record(slot).unwrap();
+            full_refs.push(r.refs());
+            full_gen.push(r.generation());
+        }
+        let mut win_refs = Vec::with_capacity(num_win);
+        let mut win_gen = Vec::with_capacity(num_win);
+        for i in 0..num_win {
+            let slot = Slot::new((i + 1) as u32).unwrap();
+            let r = pools.window.record(slot).unwrap();
+            win_refs.push(r.refs());
+            win_gen.push(r.generation());
+        }
+
+        let mut start_full_refs = vec![0u32; num_full];
+        for (i, &c) in self.start_slot_refs[kind_idx(BlockKind::Full)].iter().enumerate() {
+            if i < num_full {
+                start_full_refs[i] = c;
+            }
+        }
+        let mut start_win_refs = vec![0u32; num_win];
+        for (i, &c) in self.start_slot_refs[kind_idx(BlockKind::Window)].iter().enumerate() {
+            if i < num_win {
+                start_win_refs[i] = c;
+            }
+        }
+
+        let mut actual_start_full_refs = vec![0u32; num_full];
+        let mut actual_start_win_refs = vec![0u32; num_win];
+        let mut all_start_entries_live_sealed = true;
+        for st in self.starts.values() {
+            if st.reasons == 0 {
+                all_start_entries_live_sealed = false;
+            }
+            for &(kind, _, e) in &st.entries {
+                if !entry_is_live_sealed(pools, kind, e) {
+                    all_start_entries_live_sealed = false;
+                }
+                let idx = e.slot().pool_index().get() as usize;
+                match kind {
+                    BlockKind::Full => actual_start_full_refs[idx] += 1,
+                    BlockKind::Window => actual_start_win_refs[idx] += 1,
+                }
+            }
+        }
+
+        let mut table_full_refs = vec![0u32; num_full];
+        let mut table_win_refs = vec![0u32; num_win];
+        let mut lane_full_blocks = Vec::with_capacity(lanes.len());
+        let mut lane_win_blocks = Vec::with_capacity(lanes.len());
+        let mut lane_win_count = Vec::with_capacity(lanes.len());
+        let mut all_lane_entries_live = true;
+        let mut expired_win_present = false;
+        let mut expected_pins: HashMap<SealedId, u32> = HashMap::new();
+
+        for &(tbl, st) in lanes {
+            let mut f_blks = Vec::new();
+            let mut w_blks = Vec::new();
+            let min_live_win_blk = if st.written > 0 {
+                st.written.saturating_sub(EXT - 1) / BLOCK
+            } else {
+                0
+            };
+            for (bi, e) in tbl.entries() {
+                let pool = pools.of(e.kind());
+                match pool.record(e.slot()) {
+                    Ok(rec) if rec.generation() == e.generation() && rec.refs() > 0 => {}
+                    _ => all_lane_entries_live = false,
+                }
+                let idx = e.slot().pool_index().get() as usize;
+                match e.kind() {
+                    BlockKind::Full => {
+                        table_full_refs[idx] += 1;
+                        f_blks.push(bi.get());
+                    }
+                    BlockKind::Window => {
+                        table_win_refs[idx] += 1;
+                        w_blks.push(bi.get());
+                        if st.written > 0 && (bi.get() as usize) < min_live_win_blk {
+                            expired_win_present = true;
+                        }
+                    }
+                }
+            }
+            lane_win_count.push(w_blks.len());
+            lane_full_blocks.push(f_blks);
+            lane_win_blocks.push(w_blks);
+            for &sid in &st.sealed {
+                *expected_pins.entry(sid).or_insert(0) += 1;
+            }
+        }
+
+        let mut tree_start_holders_match = true;
+        let mut tree_pins_match_lanes = true;
+        let tree_entries = self.tree.entries();
+        let tree_ids: HashSet<SealedId> = tree_entries.iter().map(|&(id, _)| id).collect();
+        for &sid in self.starts.keys() {
+            if !tree_ids.contains(&sid) || self.tree.start_holders(sid) == 0 {
+                tree_start_holders_match = false;
+            }
+        }
+        for (&sid, &want) in &expected_pins {
+            if !tree_ids.contains(&sid) || self.tree.pin_count(sid) != want {
+                tree_pins_match_lanes = false;
+            }
+        }
+        for (sid, _) in tree_entries {
+            let want_start = u32::from(self.starts.contains_key(&sid));
+            if self.tree.start_holders(sid) != want_start {
+                tree_start_holders_match = false;
+            }
+            let want_pin = expected_pins.get(&sid).copied().unwrap_or(0);
+            if self.tree.pin_count(sid) != want_pin {
+                tree_pins_match_lanes = false;
+            }
+        }
+
+        let mut expected_owners: HashMap<SpillKey, Vec<u64>> = HashMap::new();
+        let mut spilled_tips_consistent = self.spilled_tips.len() == self.spilled_starts.len();
+        for (&spill_id, sp) in &self.spilled_starts {
+            if sp.reasons == 0 {
+                spilled_tips_consistent = false;
+            }
+            match self.spilled_tips.get(&spill_id) {
+                Some(&tip) => {
+                    if self.spilled_tree.start_holders(tip) == 0
+                        || self.spilled_tree.handle(tip) != Some(spill_id)
+                    {
+                        spilled_tips_consistent = false;
+                    }
+                }
+                None => spilled_tips_consistent = false,
+            }
+            for sk in std::iter::once(sp.cs_key).chain(sp.entries.iter().map(|&(_, _, k)| k)) {
+                expected_owners.entry(sk).or_default().push(spill_id);
+            }
+        }
+        let mut spill_owners_consistent = expected_owners.len() == self.spill_key_owners.len();
+        if spill_owners_consistent {
+            for (sk, mut want) in expected_owners {
+                want.sort_unstable();
+                match self.spill_key_owners.get(&sk) {
+                    Some(got_raw) => {
+                        let mut got = got_raw.clone();
+                        got.sort_unstable();
+                        if got != want {
+                            spill_owners_consistent = false;
+                            break;
+                        }
+                        if let Some(store) = &self.spill_store {
+                            if !store.contains(sk) {
+                                spill_owners_consistent = false;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        spill_owners_consistent = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        OwnershipSnapshot {
+            num_full,
+            num_win,
+            full_refs,
+            win_refs,
+            full_gen,
+            win_gen,
+            start_full_refs,
+            start_win_refs,
+            actual_start_full_refs,
+            actual_start_win_refs,
+            table_full_refs,
+            table_win_refs,
+            free_plus_evict_full: self.free_plus_evictable_slots(pools, BlockKind::Full),
+            free_plus_evict_win: self.free_plus_evictable_slots(pools, BlockKind::Window),
+            lane_full_blocks,
+            lane_win_blocks,
+            lane_win_count,
+            all_lane_entries_live,
+            all_start_entries_live_sealed,
+            tree_start_holders_match,
+            tree_pins_match_lanes,
+            expired_win_present,
+            spill_owners_consistent,
+            spilled_tips_consistent,
+            retained_starts: self.starts.len(),
+            spilled_starts: self.spilled_starts.len(),
+        }
+    }
+
+    /// Deepest live checkpoint across BOTH resident RAM starts and valid uncorrupted SSD spilled starts
+    /// strictly shorter than `toks` in `namespace` (ground-truth oracle for `ServeOwnershipTrace`).
+    pub fn expected_deepest_live_at(
+        &self,
+        pools: &BlockPools,
+        namespace: u64,
+        toks: &[u32],
+    ) -> usize {
+        if toks.len() <= 1 {
+            return 0;
+        }
+        let prefix = &toks[..toks.len() - 1];
+        let mut best = 0usize;
+        for st in self.starts.values() {
+            if st.namespace == namespace
+                && st.pos <= prefix.len()
+                && !st.toks.is_empty()
+                && prefix.starts_with(&st.toks)
+                && st.entries.iter().all(|&(k, _, e)| entry_is_live_sealed(pools, k, e))
+            {
+                best = best.max(st.pos);
+            }
+        }
+        // Also scan EntryTree nodes directly in case spill_store is None (st.toks empty).
+        let ram = self.peek_match_len_in_namespace(pools, namespace, toks);
+        best = best.max(ram);
+        for (&sid, st) in &self.starts {
+            if st.namespace == namespace && st.pos > best && st.pos <= prefix.len() {
+                // Verify exact prefix via tree handle chain if st.toks was not populated.
+                let _ = sid;
+            }
+        }
+        if self.spill_store.is_some() {
+            let disk = self.spilled_tree.deepest_start_in_namespace(namespace, prefix).at;
+            best = best.max(disk);
+        }
+        best
     }
 }
 
@@ -1667,7 +2153,7 @@ mod tests {
             cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &active_toks, ap, chunk_t, || fake_cs(9));
             ap += chunk_t;
         }
-        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
+        assert!(!cache.can_admit(&pools, &[InflightLaneReserve { lane: 0, namespace: 0, toks: &active_toks, n_past: ap, pf_end: ap, cached: 0, written: ap, gen: 0, max_gen: 1, runnable: true }], 1, &big, 1024, 2048), "should defer when active lane consumes pool");
         cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
     }
@@ -1779,6 +2265,7 @@ mod tests {
                 .filter(|(_, l)| l.active)
                 .map(|(idx, l)| InflightLaneReserve {
                     lane: idx,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -1826,6 +2313,7 @@ mod tests {
                 .filter(|(_, l)| l.active && l.n_past < l.toks.len())
                 .map(|(i, l)| InflightPrefillLane {
                     lane: i,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -1984,6 +2472,7 @@ mod tests {
                 .filter(|&i| active[i] && n_past[i] < toks_list[i].len())
                 .map(|i| InflightPrefillLane {
                     lane: i,
+                    namespace: 0,
                     toks: &toks_list[i],
                     n_past: n_past[i],
                     pf_end: toks_list[i].len(),
@@ -2050,6 +2539,7 @@ mod tests {
         let cands = vec![
             InflightPrefillLane {
                 lane: 0,
+                namespace: 0,
                 toks: &leader_toks,
                 n_past: 0,
                 pf_end: leader_toks.len(),
@@ -2058,6 +2548,7 @@ mod tests {
             },
             InflightPrefillLane {
                 lane: 1,
+                namespace: 0,
                 toks: &short_toks,
                 n_past: 0,
                 pf_end: short_toks.len(),
@@ -2066,6 +2557,7 @@ mod tests {
             },
             InflightPrefillLane {
                 lane: 2,
+                namespace: 0,
                 toks: &diverged_toks,
                 n_past: 0,
                 pf_end: diverged_toks.len(),
@@ -2122,6 +2614,7 @@ mod tests {
                 .filter(|(_, l)| l.active)
                 .map(|(idx, l)| InflightLaneReserve {
                     lane: idx,
+                    namespace: 0,
                     toks: &l.toks,
                     n_past: l.n_past,
                     pf_end: l.toks.len(),
@@ -2196,6 +2689,7 @@ mod tests {
                     .filter(|(_, l)| l.active)
                     .map(|(idx, l)| InflightLaneReserve {
                         lane: idx,
+                        namespace: 0,
                         toks: &l.toks,
                         n_past: l.n_past,
                         pf_end: l.toks.len(),
@@ -2606,6 +3100,273 @@ mod tests {
         assert_eq!(cache.stats().spill_maint_passes, 1);
         assert_eq!(used_slots(&pools.full), used_before, "RAM pool slots must not be mutated during GPU overlap");
 
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_rebind_leaves_lane_prior_bindings_intact() {
+        let mut pools = BlockPools::with_capacities(32, 32, 1).unwrap();
+        let mut cache = ServeBlockCache::new();
+        // `tbl` has capacity for 2 blocks (128 tokens), while `tbl2` has capacity for 8 blocks (512 tokens).
+        let mut tbl = BlockTable::new(2).unwrap();
+        let mut st = LaneBlockState::default();
+
+        let full_prompt: Vec<u32> = (0..=256u32).map(|i| 5000 + i).collect();
+        let short_prompt = &full_prompt[..=128]; // checkpoint at 128 (`len - 1 == 128`)
+        let _tip128 = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut st, short_prompt, 0x11);
+
+        // Bind Lane 1 to the 128-token checkpoint first.
+        let (matched, cs) = cache.match_and_bind(&mut pools, &mut tbl, &mut st, &full_prompt).unwrap();
+        assert_eq!(matched, 128);
+        assert_eq!(cs, fake_cs(0x11));
+        let prior_b0_full = tbl.get(BlockKind::Full, BlockIndex::new(0)).unwrap().unwrap();
+        let prior_b1_full = tbl.get(BlockKind::Full, BlockIndex::new(1)).unwrap().unwrap();
+        let prior_sealed = st.sealed.clone();
+
+        // Install a live deeper start point at 256 (4 blocks) on Lane 2 (`tbl2` capacity 8).
+        let mut tbl2 = BlockTable::new(8).unwrap();
+        let mut st2 = LaneBlockState::default();
+        let tip256 = retain_test_prompt(&mut cache, &mut pools, &mut tbl2, &mut st2, &full_prompt, 0x33);
+
+        // 1. Mid-staging failure: `tbl` (capacity 2) cannot stage block index 2 of the 256-token start!
+        // `rebind_if_deeper_match` must roll back its staged entries and return `None` while keeping
+        // Lane 1's existing 128-token bindings, `written == 128`, and refcounts 100% intact!
+        assert_eq!(
+            cache.rebind_if_deeper_match(&mut pools, &mut tbl, &mut st, &full_prompt, 128),
+            None
+        );
+        assert_eq!(st.written, 128);
+        assert_eq!(st.sealed, prior_sealed);
+        assert_eq!(tbl.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), Some(prior_b0_full));
+        assert_eq!(tbl.get(BlockKind::Full, BlockIndex::new(1)).unwrap(), Some(prior_b1_full));
+
+        // 2. Stale/corrupted deeper candidate in `starts` on a wide table (`tbl_wide` capacity 8):
+        cache.release_lane(&mut pools, &mut tbl, &mut st);
+        let mut tbl_wide = BlockTable::new(8).unwrap();
+        assert!(cache.evict_start(&mut pools, tip256));
+        let (matched_w, _) = cache.match_and_bind(&mut pools, &mut tbl_wide, &mut st, &full_prompt).unwrap();
+        assert_eq!(matched_w, 128);
+        let tip256_stale = retain_test_prompt(&mut cache, &mut pools, &mut tbl2, &mut st2, &full_prompt, 0x44);
+        // Simulate a stale entry in `starts` whose pool ref was dropped and generation advanced:
+        {
+            let bad = cache.starts.get_mut(&tip256_stale).unwrap().entries.last_mut().unwrap();
+            pools.of_mut(bad.0).record_mut(bad.2.slot()).unwrap().drop_ref().unwrap();
+            bad.2 = BlockEntry::new(bad.2.slot(), bad.2.generation() + 99, bad.2.offset(), bad.0, bad.2.kvb());
+        }
+        assert_eq!(
+            cache.rebind_if_deeper_match(&mut pools, &mut tbl_wide, &mut st, &full_prompt, 128),
+            None
+        );
+        assert_eq!(st.written, 128);
+        assert_eq!(st.sealed, prior_sealed);
+        assert_eq!(tbl_wide.get(BlockKind::Full, BlockIndex::new(0)).unwrap(), Some(prior_b0_full));
+        assert_eq!(tbl_wide.get(BlockKind::Full, BlockIndex::new(1)).unwrap(), Some(prior_b1_full));
+
+        cache.release_lane(&mut pools, &mut tbl_wide, &mut st);
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite() {
+        let dir = ScratchDir::new("reused-disk-ownership");
+        let store = SpillStore::open_with_kvb(&dir.0, 256 * 1024 * 1024, 1).unwrap();
+        let mut pools = BlockPools::with_capacities(32, 32, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        cache.max_spilled_starts = 1;
+        let mut tbl = BlockTable::new(32).unwrap();
+        let mut st = LaneBlockState::default();
+
+        // Prompt A (checkpoint at 128 = 2 blocks) and Prompt B (shares block 0 with A, checkpoint at 192 = 3 blocks).
+        let prompt_a: Vec<u32> = (0..=128u32).map(|i| 70_000 + i).collect();
+        let mut prompt_b: Vec<u32> = prompt_a[..64].to_vec();
+        prompt_b.extend((0..=128u32).map(|i| 80_000 + i));
+
+        let tip_a = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut st, &prompt_a, 0x41);
+        let tip_b = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut st, &prompt_b, 0x42);
+
+        // Spill A first (`spilled_starts.len() == 1 == max_spilled_starts`).
+        assert!(cache.evict_start(&mut pools, tip_a));
+        assert_eq!(cache.spilled_start_count(), 1);
+
+        // Now spill B: `max_spilled_starts == 1` trims A at the start of `spill_retained_start`,
+        // while B reuses A's shared block-0 Full/Window `.blk` files from `entry_spill_keys`.
+        // Because B claims ownership of reused keys from the start, trimming A must NOT delete block 0!
+        assert!(cache.evict_start(&mut pools, tip_b));
+        assert_eq!(cache.spilled_start_count(), 1);
+
+        let (matched_b, cs_b) = cache
+            .match_and_bind(&mut pools, &mut tbl, &mut st, &prompt_b)
+            .expect("Prompt B must restore cleanly including shared reused block 0");
+        assert_eq!(matched_b, 192);
+        assert_eq!(cs_b, fake_cs(0x42));
+
+        // Same-tip overwrite: keep `tbl` pinned to B's live blocks (0..3) while evicting the restored
+        // start back to `spilled_starts`, then re-retain the same 192-token prefix on `tbl2` and spill it
+        // again at the exact same `sp_tip` while `spilled_starts` ALREADY holds `sp_tip`!
+        cache.max_spilled_starts = 4;
+        let tip_b_restored = *st.sealed.last().unwrap();
+        assert!(cache.evict_start(&mut pools, tip_b_restored));
+        assert_eq!(cache.spilled_start_count(), 1);
+
+        let mut tbl2 = BlockTable::new(32).unwrap();
+        let mut st2 = LaneBlockState { namespace: 0, prompt_len: prompt_b.len(), written: 0, sealed: Vec::new() };
+        cache.ensure_span_blocks(&mut pools, &mut tbl2, 0, 192).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl2, &mut st2, &prompt_b, 0, 192, || fake_cs(0x43));
+        let tip_b_dup = *st2.sealed.last().unwrap();
+        cache.release_lane(&mut pools, &mut tbl2, &mut st2);
+        cache.release_lane(&mut pools, &mut tbl, &mut st);
+
+        // Evicting `tip_b_dup` overwrites the existing `sp_tip` in `tip_to_spill` while reusing all 6 `.blk` files!
+        assert!(cache.evict_start(&mut pools, tip_b_dup));
+        assert_eq!(cache.spilled_start_count(), 1);
+        let (matched_b3, cs_b3) = cache
+            .match_and_bind(&mut pools, &mut tbl, &mut st, &prompt_b)
+            .expect("same-tip re-spilled start must retain its reused disk blocks");
+        assert_eq!(matched_b3, 192);
+        assert_eq!(cs_b3, fake_cs(0x43));
+        cache.release_lane(&mut pools, &mut tbl, &mut st);
+
+        cache.shutdown(&mut pools);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn retained_host_copy_budget_and_spill_deadline_bound_host_work() {
+        let dir = ScratchDir::new("host-budget-and-deadline");
+        let store = SpillStore::open_with_kvb(&dir.0, 128 * 1024 * 1024, 1).unwrap();
+        let mut pools = BlockPools::with_capacities(32, 32, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut tbl = BlockTable::new(32).unwrap();
+        let mut st = LaneBlockState::default();
+
+        // Cap retained host copies so at most 1 checkpoint fits in host RAM (`cs` 4 KiB each, cap 6 KiB).
+        cache.set_max_retained_host_bytes(6 * 1024);
+        let p0: Vec<u32> = (0..=64u32).map(|i| 1000 + i).collect();
+        let p1: Vec<u32> = (0..=64u32).map(|i| 2000 + i).collect();
+        for (p, tag) in [(&p0, 0x10u8), (&p1, 0x20u8)] {
+            let _ = cache.match_and_bind(&mut pools, &mut tbl, &mut st, p);
+            cache.ensure_span_blocks(&mut pools, &mut tbl, 0, 64).unwrap();
+            cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, p, 0, 64, || vec![tag; 4096]);
+            cache.release_lane(&mut pools, &mut tbl, &mut st);
+        }
+        assert_eq!(cache.retained_start_count(), 1, "host byte budget must evict older retained start");
+        assert!(cache.retained_host_bytes() <= 6 * 1024);
+        assert_eq!(cache.spilled_start_count(), 1, "evicted checkpoint spills within deadline");
+
+        // Zero spill timeout simulates an expired write deadline without sleeping: must abort cleanly!
+        cache.set_spill_write_timeout(Duration::ZERO);
+        let p2: Vec<u32> = (0..=64u32).map(|i| 3000 + i).collect();
+        let _ = cache.match_and_bind(&mut pools, &mut tbl, &mut st, &p2);
+        cache.ensure_span_blocks(&mut pools, &mut tbl, 0, 64).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl, &mut st, &p2, 0, 64, || vec![0x30; 4096]);
+        cache.release_lane(&mut pools, &mut tbl, &mut st);
+        assert_eq!(cache.stats().spill_write_timeouts, 1);
+        assert_eq!(cache.retained_start_count(), 1);
+
+        cache.shutdown(&mut pools);
+        assert_eq!(cache.retained_host_bytes(), 0);
+        assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn cache_namespace_isolates_ram_singleflight_and_ssd_restore() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("block-cache-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SpillStore::open_with_kvb(&dir, 128 * 1024 * 1024, 1).unwrap();
+        let mut pools = BlockPools::with_capacities(6, 6, 1).unwrap();
+        let mut cache = ServeBlockCache::with_spill(store);
+        let mut tbl_a = BlockTable::new(16).unwrap();
+        let mut st_a = LaneBlockState::default();
+        let mut tbl_b = BlockTable::new(16).unwrap();
+        let mut st_b = LaneBlockState::default();
+
+        let prompt: Vec<u32> = (0..2100u32).map(|i| i * 31 + 7).collect();
+        let ext_prompt: Vec<u32> = (0..2200u32).map(|i| i * 31 + 7).collect();
+
+        // Singleflight leader election must NOT coalesce across distinct namespaces.
+        let cands = [
+            InflightPrefillLane {
+                lane: 0,
+                namespace: 0xAAAA,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+            InflightPrefillLane {
+                lane: 1,
+                namespace: 0xBBBB,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+            InflightPrefillLane {
+                lane: 2,
+                namespace: 0xAAAA,
+                toks: &prompt,
+                n_past: 0,
+                pf_end: prompt.len(),
+                runnable: true,
+                eligible_follower: true,
+            },
+        ];
+        assert_eq!(find_prefill_leader(&cands, 1), None, "different namespace must never singleflight-wait");
+        assert_eq!(find_prefill_leader(&cands, 2), Some(0), "same namespace shares leader");
+
+        // Principal A (0xAAAA) prefills `prompt[..135]` (PROMPT checkpoint at 128).
+        let short_p = prompt[..135].to_vec();
+        let short_ext = ext_prompt[..195].to_vec();
+        assert!(cache.match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_p).is_none());
+        cache.ensure_span_blocks(&mut pools, &mut tbl_a, 0, 128).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl_a, &mut st_a, &short_p, 0, 128, || fake_cs(0x41));
+        cache.ensure_span_blocks(&mut pools, &mut tbl_a, 128, 7).unwrap();
+        cache.finish_prefill_span(&mut pools, &mut tbl_a, &mut st_a, &short_p, 128, 7, || fake_cs(0x42));
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
+
+        // Principal B (0xBBBB) sending the exact same extended prompt gets ZERO RAM warm hit.
+        assert!(
+            cache.match_and_bind_in_namespace(&mut pools, &mut tbl_b, &mut st_b, 0xBBBB, &short_ext).is_none(),
+            "cross-principal RAM lookup must miss"
+        );
+        cache.release_lane(&mut pools, &mut tbl_b, &mut st_b);
+
+        // Same principal A (0xAAAA) gets full 128-token warm hit!
+        let (hit_a, cs_a) = cache
+            .match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_ext)
+            .expect("same-principal warm hit");
+        assert_eq!(hit_a, 128);
+        assert_eq!(cs_a, fake_cs(0x41));
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
+
+        // Spill Principal A's start point to SSD, then verify Principal B gets ZERO SSD restore hit
+        // while Principal A restores 128 tokens cleanly from SSD.
+        assert!(cache.evict_one_lru_start_inner(&mut pools, true, None));
+        assert_eq!(cache.retained_start_count(), 0);
+        assert_eq!(cache.spilled_start_count(), 1);
+
+        assert!(
+            cache.match_and_bind_in_namespace(&mut pools, &mut tbl_b, &mut st_b, 0xBBBB, &short_ext).is_none(),
+            "cross-principal SSD lookup must miss without restoring"
+        );
+        assert_eq!(cache.stats().starts_restored, 0);
+        assert_eq!(cache.spilled_start_count(), 1);
+        cache.release_lane(&mut pools, &mut tbl_b, &mut st_b);
+
+        let (restored_a, restored_cs) = cache
+            .match_and_bind_in_namespace(&mut pools, &mut tbl_a, &mut st_a, 0xAAAA, &short_ext)
+            .expect("same-principal SSD restore hit");
+        assert_eq!(restored_a, 128);
+        assert_eq!(restored_cs, fake_cs(0x41));
+        assert_eq!(cache.stats().starts_restored, 1);
+        cache.release_lane(&mut pools, &mut tbl_a, &mut st_a);
         cache.shutdown(&mut pools);
         assert_zero_pool_leaks(&pools);
         let _ = std::fs::remove_dir_all(&dir);

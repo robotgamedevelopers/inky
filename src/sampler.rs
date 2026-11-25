@@ -196,14 +196,14 @@ impl Sampler {
     }
 
     fn draw_dist(&mut self, dist: &[(u32, f32)]) -> u32 {
-        assert!(!dist.is_empty(), "empty sampling distribution");
+        let Some(&(last_tok, _)) = dist.last() else { return 0 };
         let total: f32 = dist.iter().map(|d| d.1).sum();
         let mut r = self.next_f32() * total;
         for &(tok, p) in dist {
             r -= p;
             if r <= 0.0 { return tok; }
         }
-        dist[dist.len() - 1].0
+        last_tok
     }
 
     /// p and q on the union of the surviving target and draft candidates, ordered by token ID.
@@ -229,7 +229,6 @@ impl Sampler {
 pub const DRAFT_SEED_MIX: u64 = 0x85ebca6b;
 
 struct Mass { token: u32, p: f32, q: f32 }
-
 fn prob_of(masses: &[Mass], token: u32, target_side: bool) -> f32 {
     match masses.iter().find(|m| m.token == token) {
         Some(m) => if target_side { m.p } else { m.q },

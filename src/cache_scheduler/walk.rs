@@ -128,7 +128,7 @@ pub fn walk_cache_scheduler(
 
     // Opening scenario when `max_queue >= 2` and `lanes.len() >= 3` and `max_len > min_len`:
     // deterministically exercise BOTH `admit` queue-bypass (`wait_ticks += 1`) AND `build_step` `StepBypassed` (`wait_ticks += 1`).
-    if seed % 2 == 0
+    if seed.is_multiple_of(2)
         && cfg.max_queue >= 2
         && lanes.len() >= 3
         && sched.worst_case_for(min_len) * 2 <= cfg.mem_budget

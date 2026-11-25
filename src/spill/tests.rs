@@ -828,6 +828,7 @@ fn kill9_writer_helper() {
 ///   ground-truth recomputation with bit-identical outputs.
 #[cfg(unix)]
 #[test]
+#[ignore = "spawns SIGKILL writer subprocesses; run explicitly in CI unit job"]
 fn kill9_mid_write_loses_cache_never_correctness() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -1075,6 +1076,7 @@ fn concurrent_restores_of_shared_disk_block_deduplicate_without_slot_leak() {
 
 #[test]
 fn full_scale_block_and_recurrent_state_roundtrip() {
+    const FULL_STRIDE: usize = 2 * 1024 * 1024;
     let scratch = ScratchTestDir::new("full-scale");
     let dir = scratch.path().join("spill");
     // Real Layer 3 Full block (2 MiB) + Inkling 2 Mini recurrent state (~3.66 MiB).

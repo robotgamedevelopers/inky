@@ -5,7 +5,6 @@ mod cache_trace;
 mod blockbook;
 mod engine;
 mod gguf;
-#[allow(dead_code)] // not yet called by the scheduler; the pool and table workers land next
 mod prefix;
 mod metal;
 mod sampler;
@@ -85,6 +84,9 @@ const SERVE_USAGE: &str = "usage: inky serve [options]
   --spill-dir DIR   directory for lazy LRU SSD block spill (mode 0700; files 0600)
   --max-spill-bytes N
                     maximum bytes kept in --spill-dir before LRU disk GC (default 64 GiB)
+  --isolate-cache   give every request a distinct cache namespace (disables cross-request prefix reuse)
+  --hide-cached-tokens
+                    report 0 cached prompt tokens in API usage fields while keeping server cache reuse
   --kv8             8-bit K/V cache: doubles BlockPool capacity and halves KV bandwidth (NOT exact)
   -n MAX            positive default Chat Completions reply budget (default 16384)";
 
@@ -144,6 +146,7 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
         max_tokens: 16384, key: None, queue: 64, thinking_budget: 0, loopcd_omega: 0.0, record_dir: None,
         record_max_bytes: record::DEFAULT_MAX_FILE_BYTES,
         spill_dir: None, max_spill_bytes: spill::DEFAULT_MAX_SPILL_BYTES,
+        isolate_cache: false, hide_cached_tokens: false,
         kv8: false,
     };
     let mut bind = "127.0.0.1:8090";
@@ -157,7 +160,11 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "-c" | "--ctx" => o.ctx = parse_context(flag, value()?)?,
             "--bind" => bind = value()?,
             "--lanes" => o.lanes = parse_usize(flag, value()?)?,
-            "--effort" => o.effort = value()?.into(),
+            "--effort" => {
+                let v = value()?;
+                serve::validate_effort(v)?;
+                o.effort = v.into();
+            }
             "-n" => o.max_tokens = parse_usize(flag, value()?)?,
             "--key-env" | "--api-key-env" => {
                 let name = value()?;
@@ -177,6 +184,8 @@ fn parse_serve(args: &[String], default_lanes: usize, read_key: impl Fn(&str) ->
             "--record-max-bytes" => o.record_max_bytes = parse_u64_positive(flag, value()?)?,
             "--spill-dir" => o.spill_dir = Some(std::path::PathBuf::from(value()?)),
             "--max-spill-bytes" => o.max_spill_bytes = parse_u64(flag, value()?)?,
+            "--isolate-cache" => o.isolate_cache = true,
+            "--hide-cached-tokens" => o.hide_cached_tokens = true,
             "--kv8" => o.kv8 = true,
             "--allow-unauthenticated-non-loopback" => allow_unauthenticated = true,
             _ => return Err(format!("unknown serve option {flag}\n\n{SERVE_USAGE}")),
@@ -253,6 +262,8 @@ mod cli_tests {
             (&["--loopcd", "-inf"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "5.0"], "--loopcd must be a finite number between 0 and 4"),
             (&["--loopcd", "abc"], "--loopcd must be a finite number between 0 and 4"),
+            (&["--effort", "bogus"], "unknown effort level"),
+            (&["--effort", "2.0"], "unknown effort level"),
             (&["--typo"], "unknown serve option --typo"),
         ] {
             let err = serve_args(args).err().unwrap();
@@ -303,6 +314,10 @@ mod cli_tests {
         assert_eq!(serve_args(&["--loopcd", "0"]).unwrap().loopcd_omega, 0.0);
         assert_eq!(serve_args(&["--loopcd", "0.3"]).unwrap().loopcd_omega, 0.3);
         assert_eq!(serve_args(&["--loopcd", "4.0"]).unwrap().loopcd_omega, 4.0);
+        assert!(!serve_args(&[]).unwrap().isolate_cache);
+        assert!(!serve_args(&[]).unwrap().hide_cached_tokens);
+        assert!(serve_args(&["--isolate-cache"]).unwrap().isolate_cache);
+        assert!(serve_args(&["--hide-cached-tokens"]).unwrap().hide_cached_tokens);
 
         let cli = |args: &[&str]| {
             parse_cli_args(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
@@ -375,7 +390,7 @@ fn parse() -> (String, Opts) {
     let (cmd, mut o) = parse_cli_args(&raw).unwrap_or_else(|e| cli_error(e));
     if o.kv8 { engine::KV8.store(true, std::sync::atomic::Ordering::Relaxed); }
     if o.kv_disk { engine::KV_DISK.store(true, std::sync::atomic::Ordering::Relaxed); }
-    if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64; }
+    if o.seed == 0 { o.seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64; }
     (cmd, o)
 }
 
@@ -520,13 +535,13 @@ fn reference_tokens(text: &str, context: usize) -> Result<Vec<u32>, String> {
 
 fn reference_logits(raw: &[u8], tokens: usize, vocab: usize) -> Result<Vec<f32>, String> {
     let row_bytes = vocab * size_of::<f32>();
-    if raw.is_empty() || row_bytes == 0 || raw.len() % row_bytes != 0 || raw.len() / row_bytes > tokens {
+    if raw.is_empty() || row_bytes == 0 || !raw.len().is_multiple_of(row_bytes) || raw.len() / row_bytes > tokens {
         return Err(format!("expected 1 to {tokens} complete reference logit rows of width {vocab}, got {} bytes", raw.len()));
     }
     // Trimmed dumps cover the last positions of the token list.
     let first_pos = tokens - raw.len() / row_bytes;
-    raw.chunks_exact(size_of::<f32>()).enumerate().map(|(i, bytes)| {
-        let logit = f32::from_le_bytes(bytes.try_into().unwrap());
+    raw.as_chunks::<{ size_of::<f32>() }>().0.iter().enumerate().map(|(i, &bytes)| {
+        let logit = f32::from_le_bytes(bytes);
         if logit.is_finite() {
             Ok(logit)
         } else {
@@ -722,9 +737,9 @@ fn rows(o: &Opts) {
     cb.commit();
     cb.waitUntilCompleted();
     let mut ok = true;
-    for r in 0..1 + k {
+    for (r, exp) in expect.iter().enumerate().take(1 + k) {
         let got = eng.span_logits(r);
-        let same = got == expect[r].as_slice();
+        let same = got == exp.as_slice();
         ok &= same;
         println!("row {r} pos {} {}", p - 1 + r, if same { "same" } else { "DIFFERENT" });
     }
@@ -758,7 +773,7 @@ fn rollback(o: &Opts) {
         cb.waitUntilCompleted();
     };
     let mut ok = true;
-    for (name, n_keep) in [("middle", (k + 1) / 2), ("last", k)] {
+    for (name, n_keep) in [("middle", k.div_ceil(2)), ("last", k)] {
         let reject_at = p0 + n_keep;
         assert!(n_keep >= 1 && n_keep < t && reject_at < ntok);
         let draft_tok = |i: usize| if i >= reject_at { ((i * 17 + 9) % 1000) as u32 } else { true_tok(i) };
@@ -919,7 +934,9 @@ fn lanes(o: &Opts) {
 /// dev, layer 2's gate: N lanes advanced together in steps of several spans must each give exactly what they give alone:
 /// the same logits at every step, the same cache and convolution rows at the end. Lane i reads the --ref tokens rotated by
 /// 17 i; it prefills in prime-sized chunks with one-token chunks among them, then decodes; lanes start staggered, so a step
-/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try.
+/// mixes prefill spans of several sizes with decode spans. INK_LANES lists the lane counts to try (including 64, matching
+/// serve's M5 Max default; counts up to engine::MAX_SPANS = 128 run in one encode_spans call, and larger counts such as 129
+/// dispatch in waves of at most MAX_SPANS spans).
 /// INK_SPANS_SABOTAGE=1 is the negative control: one span is bound to the next lane's state, and the gate must then
 /// fail; tests/ci.sh runs it and requires that failure, so the gate is known to catch a wrong-lane binding.
 fn spans(o: &Opts) {
@@ -935,7 +952,7 @@ fn spans(o: &Opts) {
     let stream = |i: usize| -> Vec<u32> { let mut v = base.clone(); v.rotate_left((17 * i) % base.len()); v.truncate(len + 1); v };
     let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
     let fresh = |i: usize| { let l = Lane::new(&eng); let r = eng.on(&l); r.reserve(len + 1, false); r.set_tokens(0, &stream(i)); l };
-    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("1,2,3,17,64,65,128,129".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let sabotage = std::env::var("INK_SPANS_SABOTAGE").is_ok();
     let nmax = *counts.iter().max().unwrap();
     // each lane alone: one span per step
@@ -961,16 +978,18 @@ fn spans(o: &Opts) {
             let mut sp = Vec::new(); let mut who = Vec::new();
             for i in 0..n { if s >= delay(i) && s - delay(i) < work.len() { let (p0, t) = work[s - delay(i)]; sp.push(Span { lane: &lanes[i], p0, t }); who.push(i); } }
             if sp.is_empty() { continue; }
-            if sabotage && !sabotaged && sp.len() >= 2 {
-                // negative control: bind the first span to the next lane's state; its logits and cache must then differ
-                println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", who[0], who[1]);
-                sp[0].lane = &lanes[who[1]];
-                sabotaged = true;
+            for (w_sp_slice, w_who) in sp.chunks_mut(engine::MAX_SPANS).zip(who.chunks(engine::MAX_SPANS)) {
+                if sabotage && !sabotaged && w_sp_slice.len() >= 2 {
+                    // negative control: bind the first span to the next lane's state; its logits and cache must then differ
+                    println!("INK_SPANS_SABOTAGE: span of lane {} bound to lane {}'s state", w_who[0], w_who[1]);
+                    w_sp_slice[0].lane = &lanes[w_who[1]];
+                    sabotaged = true;
+                }
+                if w_sp_slice.iter().any(|x| x.t > 1) && w_sp_slice.iter().any(|x| x.t == 1) { mixed += 1; }
+                nsteps += 1;
+                let cb = eng.gpu.cmd(); eng.encode_spans(&cb, w_sp_slice, true, false); cb.commit(); cb.waitUntilCompleted();
+                for (k, &i) in w_who.iter().enumerate() { hs[i].push(fnv(if w_sp_slice.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
             }
-            if sp.iter().any(|x| x.t > 1) && sp.iter().any(|x| x.t == 1) { mixed += 1; }
-            nsteps += 1;
-            let cb = eng.gpu.cmd(); eng.encode_spans(&cb, &sp, true, false); cb.commit(); cb.waitUntilCompleted();
-            for (k, &i) in who.iter().enumerate() { hs[i].push(fnv(if sp.len() == 1 { eng.logits() } else { eng.span_logits(k) })); }
         }
         let mut bad = Vec::new();
         for i in 0..n {
@@ -985,28 +1004,32 @@ fn spans(o: &Opts) {
     if !ok { std::process::exit(1); }
 }
 
-/// dev, layer 3's output gate (src/poolgate.rs): lanes run together with every pool slot outside the step poisoned must
-/// give exactly the logits and greedy tokens of layer 2's path, each lane alone. Today the candidate is layer 2 itself,
-/// over each lane's own buffers; the block cache replaces it in `cand` below. INK_POOLGATE_LANES (default 3),
-/// INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position block boundary) and
-/// INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a long one.
-/// INK_POOLGATE_SABOTAGE=1 is the reversed witness: one step's own slots are poisoned, and the gate must then fail.
+/// dev, layer 3's output gate (src/poolgate.rs): lanes run together over production `ServeBlockCache` with every pool
+/// slot outside the step poisoned must give exactly the logits and greedy tokens of layer 2's path, each lane alone.
+/// INK_POOLGATE_LANES (default 3), INK_POOLGATE_CHUNKS (prefill chunk sizes, default 31,1,23,17: across a 64-position
+/// block boundary) and INK_POOLGATE_DECODE (default 8) size the run; tests/ci.sh runs the default, tests/nightly.sh a
+/// 17-lane >1024-token window-crossing run.
+/// INK_POOLGATE_SABOTAGE=1 poisons one step's own slots and must fail in that lane alone; INK_POOLGATE_CACHE_SABOTAGE=1
+/// plants a ServeBlockCache shared-prefix/start-point corruption and must also fail closed with POOL GATE DIFFERS.
 fn poolgate(o: &Opts) {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
     let n: usize = env("INK_POOLGATE_LANES", "3").parse().expect("INK_POOLGATE_LANES");
     let chunks: Vec<usize> = env("INK_POOLGATE_CHUNKS", "31,1,23,17").split(',').map(|v| v.parse().expect("INK_POOLGATE_CHUNKS")).collect();
     let decode: usize = env("INK_POOLGATE_DECODE", "8").parse().expect("INK_POOLGATE_DECODE");
     let sabotage = std::env::var("INK_POOLGATE_SABOTAGE").is_ok();
+    let cache_sabotage = std::env::var("INK_POOLGATE_CACHE_SABOTAGE").is_ok();
     let base: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens").lines().map(|l| l.trim().parse().unwrap()).collect();
+    let plen: usize = chunks.iter().sum();
     let w = poolgate::Workload::from_tokens(&base, n, chunks, decode);
     let eng = Engine::load(&o.model, o.ctx);
     let want = poolgate::reference(&poolgate::Layer2::new(&eng, n), &w);
-    // the candidate: real Layer 3 BlockPool + BlockTable + PrefixTree over the same engine
-    let cand = poolgate::Layer3Pool::new(&eng, n);
+    // Primary candidate: production ServeBlockCache + BlockPools + BlockTable + EntryTree
+    let cand = poolgate::ServePoolCandidate::new(&eng, n, plen + decode + 2, cache_sabotage);
     let label = cand.candidate_label();
     println!("poolgate candidate: {label}");
     let got = poolgate::poisoned(&cand, &w, sabotage);
     let st = cand.stats();
+    let cache_sab_hit = cand.cache_sabotage_triggered();
     cand.shutdown();
     if sabotage && got.sabotaged.is_none() { println!("INK_POOLGATE_SABOTAGE: no step read earlier cache, nothing sabotaged"); std::process::exit(2); }
     // the poisoned lane must differ and no other lane may: lanes share no unpoisoned cache with a sabotaged lane,
@@ -1019,12 +1042,34 @@ fn poolgate(o: &Opts) {
     match poolgate::compare(&want, &got) {
         Ok(lines) => {
             for l in lines { println!("{l}"); }
-            println!("layer 3 stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, tails_dropped={}",
-                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.tails_dropped);
+            println!("serve block cache stats: taken={}, reused={}, sealed={}, shared_dedups={}, window_pruned={}, starts_saved={}, starts_matched={}",
+                st.slots_taken, st.slots_reused, st.blocks_sealed, st.shared_dedups, st.window_pruned, st.start_points_saved, st.start_matches);
+            if !sabotage && n >= 2 && plen >= 64 && st.shared_dedups == 0 {
+                println!("POOL GATE DIFFERS [{label}]: expected shared_dedups > 0 across shared-prefix lanes");
+                std::process::exit(1);
+            }
+            if !sabotage && plen + decode > engine::EXT && st.window_pruned == 0 {
+                println!("POOL GATE DIFFERS [{label}]: expected window_pruned > 0 past EXT={}", engine::EXT);
+                std::process::exit(1);
+            }
             if !sabotage {
+                match poolgate::verify_serve_cache_start_points(&eng, &base, o.ctx, cache_sabotage) {
+                    Ok(msg) => {
+                        if cache_sabotage {
+                            println!("INK_POOLGATE_CACHE_SABOTAGE: sabotage did not cause divergence (hit={cache_sab_hit})");
+                            std::process::exit(2);
+                        }
+                        println!("{msg}");
+                    }
+                    Err(err) => {
+                        println!("SERVE CACHE START-POINT GATE: {err}");
+                        println!("POOL GATE DIFFERS [{label}]");
+                        std::process::exit(1);
+                    }
+                }
                 match poolgate::verify_prefix_start_points(&eng, &base, o.ctx) {
                     Ok(msg) => println!("{msg}"),
-                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); std::process::exit(1); }
+                    Err(err) => { println!("PREFIX START-POINT GATE DIFFERS: {err}"); println!("POOL GATE DIFFERS [{label}]"); std::process::exit(1); }
                 }
             }
             println!("pool gate identical [{label}]: poisoned slots, every lane gives exactly layer 2's outputs");
@@ -1033,13 +1078,14 @@ fn poolgate(o: &Opts) {
     }
 }
 
-/// dev, the cross-lane prefix gate (`inky serve`'s copy): a source lane prefilled with a shared head is copied
-/// into a lane that prefills a different tail — `copy_lane_prefix` of the head, then the head's convolution
-/// state, as serve admits such a request — and the result must be exactly a cold prefill of head + tail: the
-/// same logits at every shared boundary and decode step, and the same cache and convolution rows at the end,
-/// with the scratch poisoned before every step. Two tails share the one head. The copy must not move the
-/// source. INK_XCOPY_SABOTAGE=1 is the reversed witness: it copies one head token too few while the tail
-/// still starts at the head's end, and the gate must then fail (tests/ci.sh requires that failure).
+/// dev, the standalone Layer 2 cross-lane prefix gate (`Engine::copy_lane_prefix`): a source lane prefilled
+/// with a shared head is copied into a lane that prefills a different tail — `copy_lane_prefix` of the head,
+/// then the head's convolution state (`inky serve` uses zero-copy Layer 3 `ServeBlockCache` instead) — and
+/// the result must be bit-identical to a cold prefill of head + tail: the same logits at every shared boundary
+/// and decode step, and the same cache and convolution rows at the end, with the scratch poisoned before every
+/// step. Two tails share the one head. The copy must not move the source. `INK_XCOPY_SABOTAGE=1` is the reversed
+/// witness: it copies one head token too few while the tail still starts at the head's end, and the gate must
+/// then fail (`tests/ci.sh` requires that failure).
 fn xcopy(o: &Opts) {
     use engine::Span;
     let eng = Engine::load(&o.model, o.ctx);
@@ -1507,7 +1553,7 @@ fn dbatch(o: &Opts) {
             let cb = eng.gpu.cmd();
             if old { eng.encode_dbatch(&cb, &b, true); } else { let sp: Vec<Span> = b.iter().map(|(l, p)| Span { lane: l, p0: *p, t: 1 }).collect(); eng.encode_decode(&cb, &sp, true, false); }
             cb.commit(); cb.waitUntilCompleted();
-            for j in 0..n { hs[j].push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
+            for (j, h) in hs.iter_mut().enumerate().take(n) { h.push(fnv(if old { eng.dbatch_logits(j) } else { eng.span_logits(j) })); }
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
         let bad: Vec<usize> = (0..n).filter(|&j| hs[j] != alone[j].0 || eng.lane_hash(&lanes[j]) != alone[j].1).collect();
@@ -1526,7 +1572,7 @@ fn dbatch(o: &Opts) {
 fn sharedkv(o: &Opts) {
     use poolgate::{Layer3Pool, StepPath};
     let prefix_len: usize = std::env::var("INK_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
-    assert!(prefix_len >= 64 && prefix_len % 64 == 0, "INK_PREFIX must be a non-zero multiple of 64");
+    assert!(prefix_len >= 64 && prefix_len.is_multiple_of(64), "INK_PREFIX must be a non-zero multiple of 64");
     let nd: usize = std::env::var("INK_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
     let counts: Vec<usize> = std::env::var("INK_LANES").unwrap_or("16,32".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let max_suffix = 256usize;
@@ -1679,7 +1725,7 @@ fn maxctx(o: &Opts) {
     let steps = 8usize;
     let ckpts: Vec<usize> = std::env::var("INK_CKPTS").unwrap_or("16384,65536,131072,262000".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let last = *ckpts.iter().max().unwrap();
-    assert!(last + steps + 1 <= eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
+    assert!(last + steps < eng.max_ctx && toks.len() > last + steps, "need -c > {} and more text ({} tokens)", last + steps, toks.len());
     toks.truncate(last + steps + 1);
     // lane memory: what Metal's working set leaves after everything allocated so far, less the tuning's margin
     let budget = std::env::var("INK_LANE_GIB").ok().and_then(|v| v.parse::<f64>().ok()).map(|g| g * (1u64 << 30) as f64).unwrap_or_else(|| {
@@ -1896,12 +1942,20 @@ fn enter_inky_mode() -> Option<memd::Lease> {
     let (chip, mem) = tuning::this_machine();
     let t = tuning::select(&chip, mem);
     let sock = std::env::var("INKY_MEMD_SOCKET").unwrap_or(memd::SOCKET.into());     // tests point it elsewhere
-    let lease = memd::enter(&sock);
-    match &lease {
-        Some(lease) => eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, lease.initial_limit),
-        None => eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes),
+    match memd::enter_lease(&sock) {
+        memd::LeaseOutcome::Entered(lease) => {
+            eprintln!("[inky] inky mode: tuning {} (default_lanes {}), GPU wired limit {} MB while connected", t.name, t.default_lanes, lease.initial_limit);
+            Some(lease)
+        }
+        memd::LeaseOutcome::NotInstalled => {
+            eprintln!("[inky] not in inky mode: the GPU keeps the macOS default limit (sudo inky tune-memory installs inky mode; tuning {}, default_lanes {})", t.name, t.default_lanes);
+            None
+        }
+        memd::LeaseOutcome::Refused(reason) => {
+            eprintln!("[inky] inky mode refused ({reason}): continuing with current GPU wired limit (tuning {}, default_lanes {})", t.name, t.default_lanes);
+            None
+        }
     }
-    lease
 }
 
 /// Current physical footprint charged to this process by the macOS kernel, in bytes.
@@ -1936,8 +1990,7 @@ fn main() {
             }
             let (chip, memory) = tuning::this_machine();
             let options = parse_serve(args, tuning::select(&chip, memory).default_lanes, |name| std::env::var(name)).unwrap_or_else(|e| cli_error(e));
-            let _lease = enter_inky_mode();
-            serve::serve(options);
+            serve::serve_with_mode(options, enter_inky_mode);
             return;
         }
         Some("mode") => {

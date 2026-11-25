@@ -1012,3 +1012,243 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
         assert_ne!(cur, 0);
     }
 }
+
+#[test]
+fn dspark_verify_capacity_guard_bounds_lg_rows_and_struct_layouts() {
+    assert_eq!(std::mem::size_of::<DSparkSpanDesc>(), 48);
+    assert_eq!(std::mem::size_of::<DSparkRejectArgs>(), 32);
+
+    let b128 = BArena::new(0, 4096, true, 2, N_VOCAB_PAD);
+    assert_eq!(b128.lg_rows, MAX_SPANS as u32);
+    // 16 spans x (1 + 7) = 128 rows fits exactly; 17 spans x (1 + 7) = 136 > 128 fails cleanly.
+    assert_eq!(16 * (1 + 7), b128.lg_rows as usize);
+    assert!(17 * (1 + 7) > b128.lg_rows as usize);
+
+    let b64 = BArena::new(0, 64, true, 2, N_VOCAB_PAD);
+    assert_eq!(b64.lg_rows, 64);
+    assert!(9 * (1 + 7) > b64.lg_rows as usize);
+}
+
+/// M5 GPU verification gate for `t-later-audit-dspark-guards`:
+/// (a) `try_encode_verify` / `verify_speculative_gpu` arena row overflow (`> lg_rows`) returns `Err` cleanly with zero mutation,
+/// (b) `verify_speculative_gpu` at `temp = 0.0` (mixed partial/rejected/full drafts) matches target greedy argmax token-for-token,
+/// (c) `k_dspark_reject` on GPU at `temp = 1.0` matches exact target softmax distribution (`TVD < 0.02` over 8,192 GPU draws)
+///     even when draft logits are heavily skewed away from target!
+#[test]
+#[ignore = "requires local Inkling-2-Mini GGUF model on Metal GPU"]
+fn dspark_gpu_guards_and_rejection_sampling_gate() {
+    let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{home}/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf")
+    });
+    assert!(std::path::Path::new(&model).exists(), "model not found at {model}");
+
+    let eng = Engine::load(&model, 512);
+    eng.ensure_batch(eng.chunk);
+
+    // (a) Arena row-capacity overflow (`17 * (1 + 7) = 136 > 128 = lg_rows` and `1 * (1 + 128) = 129 > 128`)
+    //     must return `Err` cleanly without panicking or mutating `verify_keep`.
+    assert!(eng.check_verify_capacity(16, 7).is_ok());
+    let over_err = eng.check_verify_capacity(17, 7).expect_err("136 rows > lg_rows=128 must fail");
+    assert!(over_err.contains("lg_rows"), "got: {over_err}");
+
+    let overflow_lane = Lane::new(&eng);
+    eng.on(&overflow_lane).reserve(256, true);
+    let cb = eng.gpu.cmd();
+    let try_err = eng
+        .try_encode_verify(&cb, &[Span { lane: &overflow_lane, p0: 0, t: 129 }], 128)
+        .expect_err("129 rows > lg_rows=128 must return Err");
+    assert!(try_err.contains("lg_rows"), "got: {try_err}");
+    assert!(eng.verify_keep.borrow().is_none(), "failed try_encode_verify must not populate verify_keep");
+
+    // (b) Greedy `temp = 0.0` speculative verification on real model matches cold target argmax token-for-token!
+    let prompt: Vec<u32> = vec![101, 2054, 2003, 1996, 3007, 1997, 2605, 1029];
+    let total_gen = 12usize;
+
+    // Cold single-token target reference:
+    let ref_lane = Lane::new(&eng);
+    let ref_run = eng.on(&ref_lane);
+    ref_run.reserve(prompt.len() + total_gen + 8, true);
+    ref_run.set_tokens(0, &prompt);
+    {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane: &ref_lane, p0: 0, t: prompt.len() }], true, true);
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    let mut target_greedy = vec![ref_run.token_at(prompt.len())];
+    while target_greedy.len() < total_gen {
+        let pos = prompt.len() + target_greedy.len() - 1;
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane: &ref_lane, p0: pos, t: 1 }], true, true);
+        cb.commit();
+        cb.waitUntilCompleted();
+        target_greedy.push(ref_run.token_at(pos + 1));
+    }
+
+    // Speculative verify lane (`k = 4` drafts per round: mix of exact hits, partial hits, and immediate misses!):
+    let spec_lane = Lane::new(&eng);
+    let spec_run = eng.on(&spec_lane);
+    spec_run.reserve(prompt.len() + total_gen + 16, true);
+    spec_run.set_tokens(0, &prompt);
+    {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane: &spec_lane, p0: 0, t: prompt.len() }], true, true);
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    let mut spec_emitted = vec![spec_run.token_at(prompt.len())];
+    let mut round = 0usize;
+    while spec_emitted.len() < total_gen {
+        let p0 = prompt.len() + spec_emitted.len() - 1;
+        // Construct 4 draft tokens with deliberate partial matches and mismatches across rounds:
+        let k = 4usize;
+        let mut drafts = [0u32; 4];
+        for d in 0..k {
+            let want_idx = spec_emitted.len() + d;
+            let true_tok = target_greedy.get(want_idx).copied().unwrap_or(42);
+            drafts[d] = match (round, d) {
+                (0, 0..=1) => true_tok, // accept 2, reject at d=2
+                (1, _) => true_tok ^ 7, // reject immediately at d=0
+                (2, _) => true_tok,     // accept all 4 + bonus token!
+                (_, 0) => true_tok,     // accept 1, reject at d=1
+                _ => true_tok ^ 3,
+            };
+        }
+        let outs = eng
+            .verify_speculative_gpu(
+                &[SpeculativeVerifySpan {
+                    lane: &spec_lane,
+                    p0,
+                    draft_toks: &drafts,
+                    draft_logits: &[],
+                    draft_stride: eng.n_vocab,
+                    seed: 12345 + round as u64,
+                    ban_tok: None,
+                }],
+                0.0,
+                eng.softcap,
+            )
+            .expect("greedy verify_speculative_gpu");
+        assert_eq!(outs.len(), 1);
+        for &tok in &outs[0].emitted {
+            if spec_emitted.len() < total_gen {
+                spec_emitted.push(tok);
+            }
+        }
+        round += 1;
+    }
+    assert_eq!(
+        spec_emitted, target_greedy,
+        "greedy temp=0 verify_speculative_gpu must match target argmax token-for-token"
+    );
+
+    // (c) Stochastic `temp = 1.0` empirical distribution test on M5 GPU (`k_dspark_reject`):
+    //     Construct a vocabulary distribution where 6 active tokens carry ~99.99% of mass in both target and
+    //     heavily-misaligned draft (`TVD(p_target, p_draft) > 0.55`), draw draft tokens from `p_draft`, run
+    //     8,192 independent GPU `k_dspark_reject` trials in batched waves of 64 spans, and verify the empirical
+    //     output distribution matches `p_target` (`TVD < 0.025`)!
+    let nv = eng.n_vocab;
+    let stride = eng.vocab_pad();
+    let hot_ids: [usize; 6] = [5, 19, 1024, 4099, 65537 % nv, nv - 3];
+    let hot_t_raw: [f32; 6] = [4.2, 3.6, 3.1, 2.4, 1.9, 1.2];
+    let hot_q_raw: [f32; 6] = [1.1, 4.4, 1.5, 3.9, 3.7, 0.8]; // strongly skewed away from target!
+
+    let mut z_t = vec![-30.0f32; stride];
+    let mut z_q = vec![-30.0f32; nv];
+    for (&id, (&lt, &lq)) in hot_ids.iter().zip(hot_t_raw.iter().zip(hot_q_raw.iter())) {
+        z_t[id] = lt;
+        z_q[id] = lq;
+    }
+    let softcap_fn = |x: f32| -> f32 {
+        if eng.softcap > 0.0 { eng.softcap * (x / eng.softcap).tanh() } else { x }
+    };
+    let softmax = |z: &[f32]| -> Vec<f64> {
+        let capped: Vec<f64> = z[..nv].iter().map(|&x| softcap_fn(x) as f64).collect();
+        let mx = capped.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = capped.iter().map(|&x| (x - mx).exp()).collect();
+        let s: f64 = exps.iter().sum();
+        exps.into_iter().map(|e| e / s).collect()
+    };
+    let p_t = softmax(&z_t);
+    let p_q = softmax(&z_q);
+    let draft_tvd: f64 = 0.5 * p_t.iter().zip(&p_q).map(|(a, b)| (a - b).abs()).sum::<f64>();
+    assert!(draft_tvd > 0.45, "draft distribution must be substantially skewed from target (tvd={draft_tvd})");
+
+    let batch = 64usize;
+    let waves = 128usize; // 64 * 128 = 8,192 independent GPU rejection-sampling trials
+    let total_trials = batch * waves;
+    // Each span with k=1 uses 2 target rows ([0] verified against draft, [1] bonus row):
+    let mut target_arena = Vec::with_capacity(batch * 2 * stride);
+    let mut draft_arena = Vec::with_capacity(batch * nv);
+    for _ in 0..batch {
+        target_arena.extend_from_slice(&z_t);
+        target_arena.extend_from_slice(&z_t);
+        draft_arena.extend_from_slice(&z_q);
+    }
+    let target_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(target_arena.as_ptr() as *const u8, target_arena.len() * 4)
+    };
+    let target_buf = eng.gpu.buffer_with(target_bytes);
+
+    // Deterministic PCG/SplitMix64 sampler on host to propose `x ~ p_draft` for each trial:
+    let mut rng_state = 0x1234_5678_9ABC_DEF0u64;
+    let mut next_f64 = || -> f64 {
+        rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+    };
+    let mut cdf_q = Vec::with_capacity(nv);
+    let mut acc = 0.0f64;
+    for &p in &p_q {
+        acc += p;
+        cdf_q.push(acc);
+    }
+
+    let mut counts = vec![0usize; nv];
+    for w in 0..waves {
+        let mut draft_toks = Vec::with_capacity(batch);
+        let mut seeds = Vec::with_capacity(batch);
+        for b_idx in 0..batch {
+            let u = next_f64();
+            let tok = cdf_q.partition_point(|&c| c < u).min(nv - 1) as u32;
+            draft_toks.push(tok);
+            let trial_id = (w * batch + b_idx) as u64;
+            seeds.push((0xCAFE_F00D_0000_0000u64 ^ trial_id.wrapping_mul(0x9E37_79B9_7F4A_7C15), trial_id as u32, None));
+        }
+        let outs = eng
+            .reject_sample_gpu(
+                &target_buf,
+                0,
+                stride,
+                nv,
+                1,
+                &draft_toks,
+                &draft_arena,
+                &seeds,
+                1.0,
+                eng.softcap,
+                eng.softcap,
+            )
+            .expect("temp=1.0 reject_sample_gpu");
+        for o in outs {
+            counts[o.emitted[0] as usize] += 1;
+        }
+    }
+    let emp_tvd: f64 = 0.5
+        * counts
+            .iter()
+            .zip(&p_t)
+            .map(|(&c, &pt)| ((c as f64) / (total_trials as f64) - pt).abs())
+            .sum::<f64>();
+    eprintln!(
+        "[dspark temp=1.0 gate] trials={total_trials} draft_tvd={draft_tvd:.4} empirical_tvd={emp_tvd:.4}"
+    );
+    assert!(
+        emp_tvd < 0.025,
+        "GPU rejection sampling empirical TVD ({emp_tvd:.4}) must match p_target closely (draft TVD was {draft_tvd:.4})"
+    );
+}

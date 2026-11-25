@@ -764,29 +764,29 @@ impl BlockLayoutState {
             return Err(TraceError::InvalidSchema("pool metadata length mismatch".into()));
         }
         let mut full_out = Vec::with_capacity(pools.full.len());
-        for i in 0..pools.full.len() {
+        for (i, (block, data)) in full_meta.iter().enumerate() {
             let slot = Slot::new((i + 1) as u32).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             let rec = pools.full.record(slot).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             full_out.push(PoolSlotSnapshot {
                 slot: slot.get(),
                 generation: rec.generation(),
                 kind: BlockKind::Full,
-                block: full_meta[i].0,
+                block: *block,
                 length: rec.length(),
-                data: full_meta[i].1.clone(),
+                data: data.clone(),
             });
         }
         let mut win_out = Vec::with_capacity(pools.window.len());
-        for i in 0..pools.window.len() {
+        for (i, (block, data)) in win_meta.iter().enumerate() {
             let slot = Slot::new((i + 1) as u32).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             let rec = pools.window.record(slot).map_err(|e| TraceError::InvalidSchema(e.to_string()))?;
             win_out.push(PoolSlotSnapshot {
                 slot: slot.get(),
                 generation: rec.generation(),
                 kind: BlockKind::Window,
-                block: win_meta[i].0,
+                block: *block,
                 length: rec.length(),
-                data: win_meta[i].1.clone(),
+                data: data.clone(),
             });
         }
         Ok((full_out, win_out))
@@ -1181,16 +1181,16 @@ pub fn render_block_layout_tla_bundle(
             grid[ki][e.block as usize] = Some(e);
         }
         out.push_str("<<");
-        for ki in 0..2 {
+        for (ki, row) in grid.iter().enumerate() {
             if ki > 0 {
                 out.push_str(", ");
             }
             out.push_str("<<");
-            for bi in 0..(num_blocks as usize) {
+            for (bi, cell) in row.iter().enumerate() {
                 if bi > 0 {
                     out.push_str(", ");
                 }
-                if let Some(e) = grid[ki][bi] {
+                if let Some(e) = cell {
                     let kcode = if e.kind == BlockKind::Full { 1 } else { 2 };
                     let _ = write!(
                         out,
@@ -1329,7 +1329,8 @@ pub fn render_block_layout_tla_bundle(
 EXTENDS BlockLayout, TraceData, Sequences
 
 LaneSeq == <<{lane_seq_lit}>>
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+LaneIdx(l) == LaneIdxMap[l]
 KindIdx(k) == IF k = \"full\" THEN 1 ELSE 2
 DecodeKind(c) == IF c = 1 THEN \"full\" ELSE IF c = 2 THEN \"window\" ELSE \"none\"
 DecodeEntry(e) ==
@@ -1551,7 +1552,7 @@ impl CacheSchedulerConfig {
         if self.block_size == 0 || self.window_size < self.block_size {
             return Err(TraceError::InvalidSchema("invalid block_size/window_size".into()));
         }
-        if self.max_pos < self.block_size || self.max_pos % self.block_size != 0 {
+        if self.max_pos < self.block_size || !self.max_pos.is_multiple_of(self.block_size) {
             return Err(TraceError::InvalidSchema("max_pos must be a positive multiple of block_size".into()));
         }
         for &r in &self.request_lengths {
@@ -2323,10 +2324,15 @@ PrefixSeq == <<{pfx_seq_lit}>>
 BoundarySeq == <<{bnd_seq_lit}>>
 BlockSeq == <<{blk_seq_lit}>>
 
-LaneIdx(l) == CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l
-PrefixIdx(p) == CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p
-BoundaryIdx(k) == CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k
-BlockIdxOf(b) == CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b
+LaneIdxMap == [l \\in Lanes |-> CHOOSE i \\in 1..Len(LaneSeq) : LaneSeq[i] = l]
+PrefixIdxMap == [p \\in Prefixes |-> CHOOSE i \\in 1..Len(PrefixSeq) : PrefixSeq[i] = p]
+BoundaryIdxMap == [k \\in Boundaries |-> CHOOSE i \\in 1..Len(BoundarySeq) : BoundarySeq[i] = k]
+BlockIdxMap == [b \\in BlockIds |-> CHOOSE i \\in 1..Len(BlockSeq) : BlockSeq[i] = b]
+
+LaneIdx(l) == LaneIdxMap[l]
+PrefixIdx(p) == PrefixIdxMap[p]
+BoundaryIdx(k) == BoundaryIdxMap[k]
+BlockIdxOf(b) == BlockIdxMap[b]
 
 DecodeTier(c) ==
   IF c = 1 THEN \"memory\"
@@ -2407,7 +2413,20 @@ ReplayNext ==
        /\\ gpuDone' = nxt.gpuDone
 
 ReplaySpec == ReplayInit /\\ [][ReplayNext]_<<vars, traceIdx, stepIdx>>
-Conforms == Init /\\ [][Next]_vars
+\\* Exact one-point specialization of AnyBuildStep (BuildStep fixes stepActive'=TRUE,
+\\* stepLanes'=chosen, stepSpan'=spans), avoiding 15 * 81 = 1,215 blind enumerations per step.
+TraceAnyBuildStep ==
+  /\\ stepActive' = TRUE
+  /\\ stepLanes' \\in ((SUBSET Lanes) \\ {{}})
+  /\\ stepSpan' \\in [Lanes -> 0..MaxSpan]
+  /\\ BuildStep(stepLanes', stepSpan')
+TraceNext ==
+  \\/ (\\E l \\in Lanes : AdvanceLane(l))
+  \\/ MemReclaim
+  \\/ TraceAnyBuildStep
+  \\/ StepProgress
+  \\/ UnfairEnvActions
+Conforms == Init /\\ [][TraceNext]_vars
 =============================================================================
 "
     );

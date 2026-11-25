@@ -38,6 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(all(unix, standalone_blocks))]
+use crate::libc;
 
 mod store;
 pub use store::SpillStore;
@@ -233,13 +235,6 @@ impl SpillBlockKind {
         match self {
             Self::Full => 'f',
             Self::Window => 'w',
-        }
-    }
-
-    pub fn default_stride(self) -> usize {
-        match self {
-            Self::Full => FULL_STRIDE,
-            Self::Window => WINDOW_STRIDE,
         }
     }
 }
@@ -1171,7 +1166,7 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         })();
 
         if claim.is_err() {
-            for s in full_slots.into_iter().chain(window_slots.into_iter()) {
+            for s in full_slots.into_iter().chain(window_slots) {
                 let _ = self.pool.drop_ref(s);
                 let _ = self.pool.release_cold_slot(s);
             }
@@ -1190,7 +1185,7 @@ impl<P: SpillPoolBackend> SpillManager<P> {
     /// `Restoring`), returning every reserved slot to free & zero-filled state.
     pub fn release_reservation(&mut self, reservation: WorkingSetReservation) {
         self.active_reservations.remove(&reservation.id);
-        for s in reservation.full_slots.into_iter().chain(reservation.window_slots.into_iter()) {
+        for s in reservation.full_slots.into_iter().chain(reservation.window_slots) {
             let _ = self.pool.drop_ref(s);
             let _ = self.pool.release_cold_slot(s);
         }
@@ -1401,8 +1396,8 @@ impl<P: SpillPoolBackend> SpillManager<P> {
 
         for ((&key, maybe_blk), slot) in disk_full
             .iter()
-            .zip(verified_full.into_iter())
-            .zip(reservation.full_slots.into_iter())
+            .zip(verified_full)
+            .zip(reservation.full_slots)
         {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 // Concurrent lane already restored `key`; pin existing slot and free redundant slot.
@@ -1441,8 +1436,8 @@ impl<P: SpillPoolBackend> SpillManager<P> {
 
         for ((&key, maybe_blk), slot) in disk_window
             .iter()
-            .zip(verified_window.into_iter())
-            .zip(reservation.window_slots.into_iter())
+            .zip(verified_window)
+            .zip(reservation.window_slots)
         {
             if let Some(existing) = self.blocks.get(&key).and_then(|b| b.resident) {
                 self.pool.add_ref(existing).expect("pin existing restored window slot");

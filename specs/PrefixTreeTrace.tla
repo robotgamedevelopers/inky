@@ -1,21 +1,19 @@
 --------------------------- MODULE PrefixTreeTrace ---------------------------
-\* The trace binding for PrefixTree: the code's seeded walk
-\* (src/prefix.rs, prefix_trace_dump) emits one row per operation with
-\* the state it actually reached, PrefixTreeTraceData holds the rows,
-\* and this spec admits exactly the walk's behaviour — each step must
-\* be the named action of PrefixTree.tla landing in the emitted state.
-\* If the code and the model ever disagree (as they did on eviction),
-\* some row has no model step and TLC says which.
-\*
-\* Abstract generations are the records' generations minus one, so
-\* the model starts at 0; slots are the integers 1..3 here.
+\* The trace binding for PrefixTree: the code's multi-seed walks
+\* (src/prefix.rs, prefix_trace_dump) emit one row per operation with
+\* the state actually reached across multiple seeds (Traces), and this
+\* spec requires every row in every seed trace to be a valid transition
+\* of PrefixTree.tla with separate Full and Window pool generations and
+\* per-kind pool reference books.
 
 EXTENDS PrefixTree, PrefixTreeTraceData
 
-VARIABLE step
-tvars == <<vars, step>>
+VARIABLES traceIdx, step
+tvars == <<vars, traceIdx, step>>
 
-Matches(sv, tv, ov, gv, wv, wg, pv, rv, qv, hv, row) ==
+CurTrace == Traces[traceIdx]
+
+Matches(sv, tv, ov, gv, wv, wg, pv, wpv, rv, qv, hv, rqv, row) ==
     /\ sv = row.sealed
     /\ tv = row.starts
     /\ ov = row.slotOf
@@ -23,22 +21,22 @@ Matches(sv, tv, ov, gv, wv, wg, pv, rv, qv, hv, row) ==
     /\ wv = row.winSlotOf
     /\ wg = row.winGenOf
     /\ pv = row.poolGen
+    /\ wpv = row.winPoolGen
     /\ rv = row.refs
     /\ qv = row.result
     /\ hv = row.sought
+    /\ rqv = row.req
     /\ row.bad = FALSE
 
-Now(row) == Matches(sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, refs, result, sought, row)
-Post(row) == Matches(sealed', starts', slotOf', genOf', winSlotOf', winGenOf', poolGen', refs', result', sought', row)
+Now(row) == Matches(sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, winPoolGen, refs, result, sought, req, row)
+Post(row) == Matches(sealed', starts', slotOf', genOf', winSlotOf', winGenOf', poolGen', winPoolGen', refs', result', sought', req', row)
 
-\* A refused stale insert is no model step at all: the code left the
-\* state untouched, and the correct model (Bug = "evict", so
-\* SealClaimed is disabled) has no action that could take it.
 StepOp(row) ==
     CASE row.op = "seal" -> Seal(row.s, row.slot, row.wslot)
       [] row.op = "seal-stale" ->
-            /\ UNCHANGED <<sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, refs, badInsert>>
+            /\ UNCHANGED <<sealed, starts, slotOf, genOf, winSlotOf, winGenOf, poolGen, winPoolGen, refs, badInsert>>
             /\ sought' = FALSE
+            /\ req' = ReqFull
             /\ result' = <<>>
       [] row.op = "seal-dup" -> Dedup(row.s)
       [] row.op = "seal-twin" -> ReSeal(row.s, row.slot, row.wslot)
@@ -46,31 +44,33 @@ StepOp(row) ==
       [] row.op = "unpin" -> Unpin(row.s)
       [] row.op = "retain" -> Retain(row.s)
       [] row.op = "release" -> Release(row.s)
-      [] row.op = "reuse" -> Reuse(row.slot)
+      [] row.op = "reuse-full" -> ReuseFull(row.slot)
+      [] row.op = "reuse-window" -> ReuseWindow(row.wslot)
       [] row.op = "remove" -> Evict(row.s)
-      [] row.op = "seek" -> Seek
+      [] row.op = "seek" -> Seek(row.req)
 
-\* The pool's books, read from the records at every row: the refs the
-\* pool holds on a slot are exactly the live blocks sealed onto it.
-\* The model's own refs are per block; this binds the pool's counts,
-\* so a dropped ref (or a leaked one) has nowhere to hide.
+\* Per-kind pool reference books: Full and Window reference counts on each
+\* slot are checked independently rather than summed.
 PoolBooks ==
-    LET row == Trace[step] IN
+    LET row == CurTrace[step] IN
         \A slot \in Slots :
-            row.poolRefs[slot] =
+            /\ row.poolRefs[slot] =
                 Cardinality({s \in sealed \ {<<>>} : refs[s] = 1 /\ slotOf[s] = slot})
-                + Cardinality({s \in sealed \ {<<>>} : refs[s] = 1 /\ winSlotOf[s] = slot})
+            /\ row.winPoolRefs[slot] =
+                Cardinality({s \in sealed \ {<<>>} : refs[s] = 1 /\ winSlotOf[s] = slot})
 
 TInit ==
+    /\ traceIdx \in 1..Len(Traces)
     /\ Init
-    /\ Now(Trace[1])
+    /\ Now(CurTrace[1])
     /\ step = 1
 
 TNext ==
-    \/ /\ step < Len(Trace)
-       /\ LET row == Trace[step + 1] IN StepOp(row) /\ Post(row)
+    \/ /\ step < Len(CurTrace)
+       /\ LET row == CurTrace[step + 1] IN StepOp(row) /\ Post(row)
        /\ step' = step + 1
-    \/ /\ step = Len(Trace)
+       /\ UNCHANGED traceIdx
+    \/ /\ step = Len(CurTrace)
        /\ UNCHANGED tvars
 
 TSpec == TInit /\ [][TNext]_tvars

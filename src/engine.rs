@@ -9,7 +9,7 @@ use std::os::unix::fs::FileExt;
 use std::rc::Rc;
 
 mod model;
-pub use model::{Layer, LoopW, QW};
+pub use model::{Layer, LoopW, PreparedModel, QW};
 
 pub const E: usize = 2304;
 pub const NH: usize = 24;
@@ -34,8 +34,8 @@ const CS_STRIDE_BYTES: usize = CS_STRIDE_F32 * 4;
 /// Align each blocked lane's `full` and `win` GPU block tables to 32 `u64`s (256 bytes)
 /// so `setBuffer_offset_atIndex` is always 256-byte aligned on Apple Silicon.
 const BT_STRIDE_ALIGN_U64: usize = 32;
-const _: () = assert!(CS_STRIDE_BYTES % 256 == 0);
-const _: () = assert!((BT_STRIDE_ALIGN_U64 * 8) % 256 == 0);
+const _: () = assert!(CS_STRIDE_BYTES.is_multiple_of(256));
+const _: () = assert!((BT_STRIDE_ALIGN_U64 * 8).is_multiple_of(256));
 const _: () = assert!(crate::blocks::NKV == NKV && crate::blocks::HD == HD);
 const _: () = assert!(crate::blocks::WINDOW_PASSES + crate::blocks::FULL_PASSES == N_SLOT);
 pub const BLOCK: usize = 6;
@@ -115,7 +115,7 @@ const C_OMIX: u32 = 12; const C_LMHEAD: u32 = 13; const C_ARGMAX: u32 = 14;
 
 pub const KERNELS: &[&str] = &[
     "k_embed", "k_embed_dec", "k_mix", "k_mv", "k_mvb", "k_epi", "k_ctrl_down", "k_ctrl_apply", "k_attn", "k_attn_blk", "k_attn_blk_dec", "k_kvprep_dec", "k_attn_dec_solo", "k_attn_grp_dec", "k_attn_combine", "k_attn_combine_dec",
-    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend",
+    "k_moe_gu", "k_moe_down", "k_argmax1", "k_argmax2", "k_gumbel", "k_loopcd_blend", "k_dspark_reject",
     "k_topk", "k_norm",
     "k_gemm", "k_moe_gemm", "k_gemm_t", "k_moe_gemm_t", "k_topk_b", "k_moe_route", "k_moe_comb_b", "k_postconv_b", "k_postconv_state_dec", "k_state_upd", "k_state_keep", "k_kvprep_b", "k_kvprep_b_blk", "k_attn_b", "k_attn_b_blk", "k_attn_bt", "k_attn_bt_blk", "k_ctrl_apply_b", "k_tohalf", "k_gemm_sg8", "k_gemm_sg4", "k_moe_sg8", "k_moe_sg4", "k_ctrl_gf", "k_moe_route3", "k_moe_topk_route3", "k_moe_comb_h", "k_attn_h", "k_attn_h_blk", "k_kvcopy", "k_devcopy", "k_zero", "k_mix_b_1_1", "k_mix_b_2_1", "k_mix_b_3_1", "k_mix_b_4_1", "k_mix_b_5_1", "k_mix_b_6_1", "k_mix_b_1_3", "k_mix_b_2_3", "k_mix_b_3_3", "k_mix_b_4_3", "k_mix_b_5_3", "k_mix_b_6_3", "k_mix_b_1_4", "k_mix_b_2_4", "k_mix_b_3_4", "k_mix_b_4_4", "k_mix_b_5_4", "k_mix_b_6_4", "k_mix_b_id",
     "k_touch",
@@ -147,7 +147,7 @@ struct DecodeSpanDesc {
 struct EmbedDecArgs { emb_lo: u32, emb_hi: u32, row_bytes: u32, norm_off: u32, out_off: u32, desc_off: u32, eps: f32, pad: u32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct CombineDecArgs { desc_off: u32, gate_off: u32, out_off: u32, swa: u32, hout: u32, pad: [u32; 3] }
-#[allow(dead_code)]
+#[cfg(test)]
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct AttnBlkDecArgs {
     desc_off: u32, pass_idx: u32, cs_slot: u32, swa: u32,
@@ -313,7 +313,7 @@ impl BArena {
     /// fallback kernels and keeps q / gate / the per-assignment outputs as half.
     fn new(start: u32, t: usize, lean: bool, kvb: usize, vocab_pad: usize) -> BArena {
         let mut o = start;
-        let mut take = |n: usize| { let r = o; o += ((n + 63) / 64 * 64) as u32; r };
+        let mut take = |n: usize| { let r = o; o += (n.div_ceil(64) * 64) as u32; r };
         let fb = |n: usize| if lean { 0 } else { n };      // only the fallback paths use it
         let hf = |n: usize| if lean { n / 2 } else { n };  // half in the fp16 path
         let mut b = BArena { cap: t, ..Default::default() };
@@ -354,6 +354,57 @@ struct ArgmaxArgs { logits_off: u32, n: u32, part_off: u32, nparts: u32, out_ind
 struct SampArgs { logits_off: u32, n: u32, seed_lo: u32, seed_hi: u32, pos: u32, ban_tok: u32, temp: f32, softcap: f32 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
 struct LoopCdArgs { logits_off: u32, n: u32, stride: u32, pad0: u32, softcap: f32, pad1: u32, pad2: u32, pad3: u32 }
+#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct DSparkSpanDesc {
+    target_off: u32,
+    draft_lg_off: u32,
+    draft_tok_off: u32,
+    out_off: u32,
+    k: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    base_pos: u32,
+    ban_tok: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+#[repr(C)] #[derive(Clone, Copy, Default)]
+struct DSparkRejectArgs {
+    n_vocab: u32,
+    target_stride: u32,
+    draft_stride: u32,
+    temp: f32,
+    target_softcap: f32,
+    draft_softcap: f32,
+    pad0: u32,
+    pad1: u32,
+}
+
+/// Per-span input to [`Engine::verify_speculative_gpu`]: verifies `draft_toks` (length `k`) starting
+/// from the committed token already placed at `p0` (with `draft_toks` placed at `p0 + 1 .. p0 + 1 + k`).
+#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+pub struct SpeculativeVerifySpan<'a> {
+    pub lane: &'a Lane,
+    pub p0: usize,
+    pub draft_toks: &'a [u32],
+    /// Contiguous `[k][draft_stride]` f32 draft logits when `temp > 0.0` (may be empty when `temp <= 0.0` or `k == 0`).
+    pub draft_logits: &'a [f32],
+    pub draft_stride: usize,
+    pub seed: u64,
+    pub ban_tok: Option<u32>,
+}
+
+/// Output of GPU speculative rejection sampling for one span: `n_accepted` (`0..=k`) accepted draft
+/// tokens, and `emitted` of length `n_accepted + 1` (`draft_toks[..n_accepted]` + resampled/bonus token).
+#[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeculativeVerifyOut {
+    pub n_accepted: usize,
+    pub emitted: Vec<u32>,
+}
 
 // ----------------------------------------------------------------------------- activation arena (f32 offsets)
 #[derive(Clone, Copy)]
@@ -370,7 +421,7 @@ const B_NVEC: usize = 10;
 impl Arena {
     fn new(max_split: usize, vocab_pad: usize) -> Arena {
         let mut o = (N_VEC * E) as u32;
-        let mut take = |n: usize| { let r = o; o += ((n + 63) / 64 * 64) as u32; r };
+        let mut take = |n: usize| { let r = o; o += (n.div_ceil(64) * 64) as u32; r };
         let q = take(NH * HD); let gate = take(NH * HD); let k = take(NKV * HD); let v = take(NKV * HD);
         let rel = take(NH * NREL); let sink = take(NH); let kdyn = take(32); let vdyn = take(32);
         let attn_g = take(NH * HD);
@@ -611,7 +662,6 @@ pub struct Lane {
 }
 
 /// One lane's GPU Gumbel-max sampling request for [`Engine::encode_gumbel_spans`].
-#[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
 #[derive(Clone, Copy)]
 pub struct GumbelSpan<'a> {
     pub span_idx: usize,
@@ -750,29 +800,9 @@ impl Lane {
         f(buf, base_u64 * 8, slot.bt_blocks)
     }
 
-    #[allow(dead_code)]
-    pub fn is_blocked(&self) -> bool { self.use_blocks.get() }
-
-    /// The lane's block table. `fill_block` writes it; `attn_key_offset` reads it.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // the GPU kernels still address the layer-2 buffers; the pools are not allocated
+    /// The lane's 64-bit paged block table (`Lane::new_blocked`), synced incrementally to GPU memory
+    /// by [`Engine::sync_lane_block_table`] and read by `ServeBlockCache` and `Layer3Pool`.
     pub fn block_table(&self) -> &std::cell::RefCell<crate::blocks::BlockTable> { &self.block_table }
-
-    /// Install one block. The entry's offset is `byte_offset` for `slot` in `kind`'s pool
-    /// at that pool's `kvb`. The generation must match the pool record. An empty pool
-    /// is `NoSlots`. Does not allocate a GPU buffer.
-    #[allow(dead_code)]
-    pub fn fill_block(&self, pools: &mut crate::blocks::BlockPools, kind: crate::blocks::BlockKind, block: crate::blocks::BlockIndex, slot: crate::blocks::Slot, generation: u32) -> Result<(), crate::blocks::BlockError> {
-        self.block_table.borrow_mut().fill(pools.of_mut(kind), block, slot, generation)
-    }
-
-    /// Byte offset of one key row at `pos` for this pass, K or V, and head.
-    /// The slot base comes from the lane table. The width is the pool's `kvb`.
-    /// Not `kv_swa` / `kv_full` indexed by `pos` or `pos % cap`.
-    #[allow(dead_code)]
-    pub fn attn_key_offset(&self, pools: &crate::blocks::BlockPools, kind: crate::blocks::BlockKind, pos: usize, pass: u32, kv: crate::blocks::Kv, head: u32) -> Result<u64, crate::blocks::BlockError> {
-        self.block_table.borrow().read_key(pools.of(kind), pos)?.row(pass, kv, head)
-    }
 }
 
 fn slot_of(pass: usize, ip: usize) -> usize {
@@ -782,9 +812,8 @@ fn slot_of(pass: usize, ip: usize) -> usize {
 impl Engine {
     /// the vocabulary as the arena stores it (rounded up to 64)
     fn vocab_pad(&self) -> usize { (self.ar.amax - self.ar.logits) as usize }
-    /// Both block pools. One GPU slab per kind, sized at load to `kvb` and the initial cache block.
-    /// Interior mutability: callers borrow through the `RefCell`.
-    #[allow(dead_code)] // published for the layer-3 workers; nothing in this commit calls it
+    /// Shared Layer 3 `Window` and `Full` GPU block pools (`init_serve_block_pools` sizes multi-slab pools for
+    /// `inky serve` and `Layer3Pool`). Interior mutability: callers borrow through the `RefCell`.
     pub fn block_pool(&self) -> &std::cell::RefCell<crate::blocks::BlockPools> { &self.block_pool }
 
     /// One convolution image: `N_SLOT × NCH × 3` floats. The page's 3.66 MiB.
@@ -860,6 +889,7 @@ impl Engine {
     }
     /// Pure worst-case per-lane GPU memory formula at `max_ctx`: full KV + sliding-window KV +
     /// convolution/recurrent state + per-lane token buffer + per-lane decode-batch arena slice.
+    #[cfg(test)]
     pub fn lane_worst_case_bytes_for(n_swa: usize, n_full: usize, max_ctx: usize, kvb: usize, arena_floats: usize) -> u64 {
         let kv_row = 2usize.saturating_mul(NKV).saturating_mul(HD).saturating_mul(kvb);
         let swa_kv = n_swa.saturating_mul(max_ctx.min(EXT)).saturating_mul(kv_row);
@@ -869,13 +899,6 @@ impl Engine {
         let dbatch_arena = arena_floats.saturating_mul(4);
         swa_kv.saturating_add(full_kv).saturating_add(cs).saturating_add(toks).saturating_add(dbatch_arena) as u64
     }
-    /// Worst-case GPU memory required by a single lane at `self.max_ctx`.
-    #[allow(dead_code)]
-    pub fn per_lane_worst_case_bytes(&self) -> u64 {
-        let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
-        let n_full = N_SLOT - n_swa;
-        Self::lane_worst_case_bytes_for(n_swa, n_full, self.max_ctx, self.kvb, self.ar.total as usize)
-    }
     /// Realistic paged per-lane working reserve for Layer 3 `serve`: KV blocks are paged from
     /// shared `BlockPools` rather than pre-allocated to `max_ctx`, so admission sizes lanes using
     /// `min(max_ctx, 32768)` KV tokens plus full `max_ctx` token/block-table metadata.
@@ -883,10 +906,57 @@ impl Engine {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
         let n_full = N_SLOT - n_swa;
         let working_ctx = self.max_ctx.min(32768);
-        let base = Self::lane_worst_case_bytes_for(n_swa, n_full, working_ctx, self.kvb, self.ar.total as usize);
-        let extra_toks = self.max_ctx.saturating_sub(working_ctx).saturating_mul(4) as u64;
-        let bt_bytes = self.max_ctx.div_ceil(crate::blocks::BLOCK).saturating_mul(16) as u64;
-        base.saturating_add(extra_toks).saturating_add(bt_bytes)
+        let kv_row = 2usize.saturating_mul(NKV).saturating_mul(HD).saturating_mul(self.kvb);
+        let swa_kv = n_swa.saturating_mul(working_ctx.min(EXT)).saturating_mul(kv_row) as u64;
+        let full_kv = n_full.saturating_mul(working_ctx).saturating_mul(kv_row) as u64;
+        let non_kv = Self::serve_non_kv_bytes_for(
+            1,
+            self.max_ctx,
+            self.ar.total as usize,
+            self.vocab_pad(),
+            self.loopcd_omega.get() > 0.0,
+        );
+        swa_kv.saturating_add(full_kv).saturating_add(non_kv)
+    }
+    /// Pure non-KV GPU allocation required by `lanes` Layer 3 `serve` lanes after `ensure_batch`:
+    /// decode-batch arena slice + shared decode descriptors, `BlockedSlab` (`cs_buf` + `bt_buf`),
+    /// per-lane `toks` (+ stub buffers), and `lg_weak` when LoopCD is enabled.
+    pub fn serve_non_kv_bytes_for(
+        lanes: usize,
+        max_ctx: usize,
+        arena_floats: usize,
+        vocab_padded: usize,
+        loopcd_enabled: bool,
+    ) -> u64 {
+        let n = lanes.max(1);
+        let dbatch_bytes = n
+            .saturating_mul(arena_floats)
+            .saturating_add(decode_batch_extra_floats(n))
+            .saturating_mul(4) as u64;
+        let blocks = max_ctx.div_ceil(crate::blocks::BLOCK).max(1);
+        let slab_cs = (n as u64).saturating_mul(Self::cs_image_bytes() as u64);
+        let slab_bt = (n as u64).saturating_mul(blocks as u64).saturating_mul(16);
+        let toks_and_stubs = (n as u64).saturating_mul((max_ctx.saturating_add(8).saturating_mul(4) + 32) as u64);
+        let loopcd_bytes = if loopcd_enabled {
+            (n as u64).saturating_mul(vocab_padded as u64).saturating_mul(4)
+        } else {
+            0
+        };
+        dbatch_bytes
+            .saturating_add(slab_cs)
+            .saturating_add(slab_bt)
+            .saturating_add(toks_and_stubs)
+            .saturating_add(loopcd_bytes)
+    }
+    /// Non-KV GPU bytes consumed by `lanes` Layer 3 `serve` lanes beyond `model_and_scratch_bytes()`.
+    pub fn serve_non_kv_bytes(&self, lanes: usize) -> u64 {
+        Self::serve_non_kv_bytes_for(
+            lanes,
+            self.max_ctx,
+            self.ar.total as usize,
+            self.vocab_pad(),
+            self.loopcd_omega.get() > 0.0,
+        )
     }
     /// Pure Layer 3 block-pool sizing from `kv_budget_bytes`: allocates ~15% to `Window` slots
     /// and ~85% to `Full` slots while ensuring at least `max_lanes * span_bound(chunk) + 256`
@@ -971,6 +1041,11 @@ impl Engine {
         *self.block_pool.borrow_mut() = pools;
         (n_window, n_full)
     }
+    /// Allocate exact `(n_window, n_full)` GPU Layer 3 `BlockPools` (used by `poolgate`'s poisoned-slot `ServeBlockCache` gate).
+    pub fn init_block_pools_exact(&self, n_window: usize, n_full: usize) {
+        let pools = crate::blocks::BlockPools::gpu(&self.gpu.dev, n_window.max(1), n_full.max(1), self.kvb as u32);
+        *self.block_pool.borrow_mut() = pools;
+    }
     /// Vocabulary row `i` in `b.lg` from the last step that wrote it. A prefill with several spans stores one
     /// row per span, so `i` is the span. A verify span stores `1 + k` rows, so `i` is the position in that span
     /// (span `s`, position `r`, at `s * (1 + k) + r`).
@@ -1033,8 +1108,7 @@ impl Engine {
     /// Batched GPU Gumbel-max sampling for multiple batch spans inside a SINGLE `MTLComputeCommandEncoder`:
     /// dispatches all `k_gumbel`s concurrently, one barrier, all `k_argmax1`s concurrently into disjoint
     /// partial slices of `ar.part`, one barrier, then all `k_argmax2`s concurrently into each lane's `toks`.
-    /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item.
-    #[allow(dead_code)] // wired by serve.rs after Track 1 + Track 2 merge
+    /// Bit-identical to calling [`Engine::encode_gumbel_span`] per item; called by `inky serve` batched sampling.
     pub fn encode_gumbel_spans(&self, cb: &CmdBuf, items: &[GumbelSpan<'_>]) {
         if items.is_empty() { return; }
         let b = self.ba.get();
@@ -1107,7 +1181,7 @@ impl Engine {
     /// the decode path's arena at the current base
     fn ar_at(&self) -> Arena { self.ar.shift(self.abase.get()) }
     /// offset of residual vector `i` of the decode path at the current base
-    fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) as u32 }
+    fn v(&self, i: usize) -> u32 { self.abase.get() + Arena::vec(i) }
     fn decode_span_limit(&self) -> usize { MAX_SPANS.min(self.chunk).min(self.ba.get().cap / 2) }
 
     /// The server builds a batch from every ready decoding lane. Check the eventual batch size and GPU path
@@ -1444,7 +1518,7 @@ impl Engine {
     pub fn kbench_moe_pf(&self, t: usize) -> (f64, f64) {
         let b = self.ba.get();
         let mut res = [0.0f64; 2];
-        for which in 0..2 {
+        for (which, slot_res) in res.iter_mut().enumerate() {
             for _ in 0..3 {
                 let cb = self.gpu.cmd();
                 let e = Enc::new(&cb);
@@ -1469,7 +1543,7 @@ impl Engine {
                 }
                 e.end(); cb.commit(); cb.waitUntilCompleted();
                 let flops = self.layers.len() as f64 * (t * TOPK) as f64 * 2.0 * (E * FF) as f64 * if which == 0 { 2.0 } else { 1.0 };
-                res[which] = res[which].max(flops / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
+                *slot_res = slot_res.max(flops / (cb.GPUEndTime() - cb.GPUStartTime()) / 1e12);
             }
         }
         (res[0], res[1])
@@ -1956,10 +2030,10 @@ impl Engine {
                 at(jl);
                 let ar = self.ar_at();
                 let mut cj = Vec::new();
-                for j in 0..3 {
+                for (j, &norm_w) in norms.iter().enumerate() {
                     let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
                     cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
-                                      forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
+                                      forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w, ctr: 8 + j as u32 });
                 }
                 self.ctrl_dec(e, &cj);
             }
@@ -2004,7 +2078,7 @@ impl Engine {
         }
         at(0);
         // ---- output projection once for every lane, then each lane's post-conv (+ residual) on its own state
-        let block_start = ip % BLOCK == 0;
+        let block_start = ip.is_multiple_of(BLOCK);
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         self.mvb(e, C_WO, &[Engine::seg(&l.wo, ar.attn_g, self.v(mid))], MvArgs::default(), n);
@@ -2076,11 +2150,67 @@ impl Engine {
     /// argument, not a fixed 8. Writes one vocabulary row per position into `b.lg`; `span_logits` names the row.
     /// Argmax is off: that flag writes `toks[p0 + t]`, where the host has just placed the draft tokens.
     /// Long prefills stay on `encode_spans` (one row per span, the last). This does not grow `lg` to one row per token.
-    pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
-        assert!(!spans.is_empty() && spans.iter().all(|s| s.t == 1 + k), "a verify span has length 1 + k");
-        // A --kv-disk lane stages cache from the single-token step path. This span does not, and it must not run there.
-        assert!(spans.iter().all(|s| s.lane.tier.is_none()), "verify does not run on a --kv-disk lane");
+    /// Validate that a speculative verify batch of `n_spans` spans with `k` draft tokens each
+    /// (`n_spans * (1 + k)` total positions and logits rows) fits within `MAX_SPANS`, `chunk`,
+    /// `ba.cap`, and the batch logits arena `ba.lg_rows` (`<= 128`).
+    pub fn check_verify_capacity(&self, n_spans: usize, k: usize) -> Result<usize, String> {
+        if n_spans == 0 {
+            return Err("verify batch requires at least 1 span".into());
+        }
+        if n_spans > MAX_SPANS {
+            return Err(format!("verify span count {n_spans} exceeds MAX_SPANS ({MAX_SPANS})"));
+        }
+        let step_len = 1usize.checked_add(k).ok_or_else(|| "verify 1 + k overflowed usize".to_string())?;
+        let total_rows = n_spans
+            .checked_mul(step_len)
+            .ok_or_else(|| "verify total_rows overflowed usize".to_string())?;
+        let b = self.ba.get();
+        if total_rows > self.chunk || total_rows > b.cap {
+            return Err(format!(
+                "verify batch needs {total_rows} token rows ({n_spans} spans x {step_len}), exceeding batch arena capacity {} (chunk {})",
+                b.cap, self.chunk
+            ));
+        }
+        let lg_rows = b.lg_rows as usize;
+        if total_rows > lg_rows {
+            return Err(format!(
+                "verify batch needs {total_rows} logits rows ({n_spans} spans x (1 + {k})), exceeding lg_rows capacity of {lg_rows}"
+            ));
+        }
+        Ok(total_rows)
+    }
+
+    /// Fallible speculative verify step: checks arena row capacity (`spans.len() * (1 + k) <= lg_rows`),
+    /// span lengths, distinct non-tiered lanes, and KV reserve BEFORE allocating snapshots or encoding GPU work.
+    pub fn try_encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) -> Result<(), String> {
+        let _total_rows = self.check_verify_capacity(spans.len(), k)?;
         let t = 1 + k;
+        if spans.iter().any(|s| s.t != t) {
+            return Err(format!("every verify span must have length 1 + k = {t}"));
+        }
+        if spans.iter().any(|s| s.lane.tier.is_some()) {
+            return Err("verify does not run on a --kv-disk lane".into());
+        }
+        if spans.iter().any(|s| s.lane.use_blocks.get()) {
+            return Err("Layer 2 verify rollback requires non-blocked lanes".into());
+        }
+        if spans.len() > 1 && !self.hgemm {
+            return Err("multi-span verify requires the fp16 tensor path".into());
+        }
+        for i in 0..spans.len() {
+            for j in (i + 1)..spans.len() {
+                if std::ptr::eq(spans[i].lane, spans[j].lane) {
+                    return Err(format!("verify spans {i} and {j} reference the same lane"));
+                }
+            }
+            let kv_cap = self.on(spans[i].lane).kv_capacity();
+            if spans[i].p0.saturating_add(t) > kv_cap {
+                return Err(format!(
+                    "verify span {i} end {} exceeds lane K/V capacity {kv_cap}: call reserve() first",
+                    spans[i].p0.saturating_add(t)
+                ));
+            }
+        }
         let stride = N_SLOT * NCH * 3;
         let cs = self.gpu.buffer(spans.len() * t * stride * 4);
         unsafe { std::ptr::write_bytes(cs.contents().as_ptr() as *mut u8, 0, spans.len() * t * stride * 4); }
@@ -2092,6 +2222,213 @@ impl Engine {
         }).collect();
         *self.verify_keep.borrow_mut() = Some(VerifyKeep { cs, stride, t, spans: kept });
         self.encode_spans_x(cb, spans, true, false, false, Some(k), None);
+        Ok(())
+    }
+
+    pub fn encode_verify(&self, cb: &CmdBuf, spans: &[Span], k: usize) {
+        self.try_encode_verify(cb, spans, k).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Execute `k_dspark_reject` on the GPU over pre-populated target logits (`target_buf`, `[n_spans * (1 + k)][target_stride]`)
+    /// and draft proposals/logits, returning exact speculative rejection-sampling decisions per span.
+    #[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+    pub fn reject_sample_gpu(
+        &self,
+        target_buf: &Buf,
+        base_target_off: u32,
+        target_stride: usize,
+        draft_stride: usize,
+        k: usize,
+        draft_toks_flat: &[u32],
+        draft_logits_flat: &[f32],
+        seeds_and_pos: &[(u64, u32, Option<u32>)],
+        temp: f32,
+        target_softcap: f32,
+        draft_softcap: f32,
+    ) -> Result<Vec<SpeculativeVerifyOut>, String> {
+        let n_spans = seeds_and_pos.len();
+        if n_spans == 0 {
+            return Ok(Vec::new());
+        }
+        if !temp.is_finite() || temp < 0.0 {
+            return Err(format!("invalid temperature {temp}"));
+        }
+        if draft_toks_flat.len() != n_spans * k {
+            return Err(format!("draft_toks length {} != {} * {k}", draft_toks_flat.len(), n_spans));
+        }
+        if temp > 0.0 && k > 0 && draft_logits_flat.len() < n_spans * k * draft_stride {
+            return Err(format!(
+                "draft_logits length {} < {} * {k} * {draft_stride}",
+                draft_logits_flat.len(),
+                n_spans
+            ));
+        }
+        let out_stride = k + 3;
+        let mut descs = Vec::with_capacity(n_spans);
+        for (si, &(seed, base_pos, ban_tok)) in seeds_and_pos.iter().enumerate() {
+            let span_target_off = base_target_off
+                .checked_add(u32::try_from(si * (1 + k) * target_stride).map_err(|_| "target_off overflow".to_string())?)
+                .ok_or_else(|| "target_off overflow".to_string())?;
+            descs.push(DSparkSpanDesc {
+                target_off: span_target_off,
+                draft_lg_off: (si * k * draft_stride) as u32,
+                draft_tok_off: (si * k) as u32,
+                out_off: (si * out_stride) as u32,
+                k: k as u32,
+                seed_lo: seed as u32,
+                seed_hi: (seed >> 32) as u32,
+                base_pos,
+                ban_tok: ban_tok.unwrap_or(u32::MAX),
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            });
+        }
+        let args = DSparkRejectArgs {
+            n_vocab: self.n_vocab as u32,
+            target_stride: target_stride as u32,
+            draft_stride: draft_stride.max(1) as u32,
+            temp,
+            target_softcap,
+            draft_softcap,
+            pad0: 0,
+            pad1: 0,
+        };
+        let desc_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                descs.as_ptr() as *const u8,
+                descs.len() * std::mem::size_of::<DSparkSpanDesc>(),
+            )
+        };
+        let dtok_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(draft_toks_flat.as_ptr() as *const u8, draft_toks_flat.len() * 4)
+        };
+        let dlg_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(draft_logits_flat.as_ptr() as *const u8, draft_logits_flat.len() * 4)
+        };
+        let desc_buf = self.gpu.buffer_with(desc_bytes);
+        let dtok_buf = self.gpu.buffer_with(dtok_bytes);
+        let dlg_buf = self.gpu.buffer_with(dlg_bytes);
+        let out_buf = self.gpu.buffer(n_spans * out_stride * 4);
+        unsafe { std::ptr::write_bytes(out_buf.contents().as_ptr() as *mut u8, 0, n_spans * out_stride * 4); }
+
+        let cb = self.gpu.cmd();
+        let e = Enc::new(&cb);
+        e.pso(&self.gpu.pso("k_dspark_reject"));
+        e.buf(target_buf, 0, 2);
+        e.bytes(&args, 5);
+        e.buf(&desc_buf, 0, 6);
+        e.buf(&dtok_buf, 0, 8);
+        e.buf(&dlg_buf, 0, 9);
+        e.buf(&out_buf, 0, 10);
+        e.dispatch((1, n_spans, 1), 1024);
+        e.end();
+        cb.commit();
+        cb.waitUntilCompleted();
+        if cb.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            return Err(format!("k_dspark_reject GPU command buffer failed: {:?}", cb.status()));
+        }
+
+        let raw_out = unsafe {
+            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const u32, n_spans * out_stride)
+        };
+        let mut results = Vec::with_capacity(n_spans);
+        for si in 0..n_spans {
+            let base = si * out_stride;
+            let status = raw_out[base];
+            if status == 1 {
+                return Err(format!("span {si}: target model returned non-finite logits"));
+            }
+            if status != 0 {
+                return Err(format!("span {si}: invalid draft logits or out-of-range draft token (status={status})"));
+            }
+            let n_accepted = raw_out[base + 1] as usize;
+            if n_accepted > k {
+                return Err(format!("span {si}: kernel reported n_accepted={n_accepted} > k={k}"));
+            }
+            let emitted = raw_out[base + 2..base + 2 + n_accepted + 1].to_vec();
+            results.push(SpeculativeVerifyOut { n_accepted, emitted });
+        }
+        Ok(results)
+    }
+
+    /// End-to-end fallible GPU speculative verification:
+    /// 1. Validates batch-arena row capacity (`spans.len() * (1 + k) <= lg_rows`) and lane preconditions.
+    /// 2. Runs `try_encode_verify` to compute target logits across all `1 + k` positions per span while recording `CS` & `KV`.
+    /// 3. Dispatches `k_dspark_reject` on the GPU to accept/reject draft tokens and draw the exact residual/bonus token.
+    /// 4. Rolls back each lane's `CS` and `KV` to `n_keep = n_accepted + 1` via `rollback_verify` and writes the final
+    ///    resampled/bonus token into `lane.toks[p0 + 1 + n_accepted]` ready for the next step.
+    #[allow(dead_code)] // wired into serve once DSpark speculative decoding is enabled
+    pub fn verify_speculative_gpu(
+        &self,
+        reqs: &[SpeculativeVerifySpan<'_>],
+        temp: f32,
+        draft_softcap: f32,
+    ) -> Result<Vec<SpeculativeVerifyOut>, String> {
+        if reqs.is_empty() {
+            return Err("verify_speculative_gpu requires at least 1 span".into());
+        }
+        let k = reqs[0].draft_toks.len();
+        if reqs.iter().any(|r| r.draft_toks.len() != k) {
+            return Err("all spans in verify_speculative_gpu must share the same draft length k".into());
+        }
+        let draft_stride = reqs[0].draft_stride.max(self.n_vocab);
+        if temp > 0.0 && k > 0 && reqs.iter().any(|r| r.draft_stride != reqs[0].draft_stride || r.draft_logits.len() < k * reqs[0].draft_stride) {
+            return Err("when temp > 0 and k > 0, each span must supply k * draft_stride draft logits".into());
+        }
+        let _ = self.check_verify_capacity(reqs.len(), k)?;
+        for (si, r) in reqs.iter().enumerate() {
+            if r.draft_toks.iter().any(|&tok| tok as usize >= self.n_vocab) {
+                return Err(format!("span {si}: draft token out of vocabulary range (n_vocab={})", self.n_vocab));
+            }
+            if !r.draft_toks.is_empty() {
+                self.on(r.lane).set_tokens(r.p0 + 1, r.draft_toks);
+            }
+        }
+        let spans: Vec<Span<'_>> = reqs
+            .iter()
+            .map(|r| Span { lane: r.lane, p0: r.p0, t: 1 + k })
+            .collect();
+        let cb = self.gpu.cmd();
+        self.try_encode_verify(&cb, &spans, k)?;
+        cb.commit();
+        cb.waitUntilCompleted();
+        if cb.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+            return Err(format!("verify_speculative_gpu forward command buffer failed: {:?}", cb.status()));
+        }
+
+        let mut draft_toks_flat = Vec::with_capacity(reqs.len() * k);
+        let mut draft_logits_flat = Vec::with_capacity(if temp > 0.0 { reqs.len() * k * draft_stride } else { 0 });
+        let mut seeds_and_pos = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            draft_toks_flat.extend_from_slice(r.draft_toks);
+            if temp > 0.0 && k > 0 {
+                draft_logits_flat.extend_from_slice(&r.draft_logits[..k * r.draft_stride]);
+            }
+            seeds_and_pos.push((r.seed, (r.p0 + 1) as u32, r.ban_tok));
+        }
+        let b = self.ba.get();
+        let act_buf = self.act.borrow().clone();
+        let outs = self.reject_sample_gpu(
+            &act_buf,
+            b.lg,
+            self.vocab_pad(),
+            if temp > 0.0 && k > 0 { reqs[0].draft_stride } else { draft_stride },
+            k,
+            &draft_toks_flat,
+            &draft_logits_flat,
+            &seeds_and_pos,
+            temp,
+            self.softcap,
+            draft_softcap,
+        )?;
+        for (si, (r, out)) in reqs.iter().zip(&outs).enumerate() {
+            let n_keep = out.n_accepted + 1;
+            self.rollback_verify(r.lane, si, n_keep);
+            let last_tok = *out.emitted.last().expect("verify emits >= 1 token");
+            self.on(r.lane).set_tokens(r.p0 + n_keep, &[last_tok]);
+        }
+        Ok(outs)
     }
     /// Put span `si` of the last `encode_verify` back to its first `n_keep` positions (1..=1+k).
     /// The convolution image at that position replaces `cs`. K/V rows past it are put back to the bytes from before
@@ -2246,6 +2583,45 @@ impl Engine {
         let mut row0 = Vec::with_capacity(spans.len());
         { let mut r = 0; for sp in spans { row0.push(r); r += sp.t; } }
         let e = Enc::new(cb);
+        if blocked {
+            // Clear any reused GPU block-pool slots that will NOT be completely overwritten
+            // by a 64-token prefill chunk on the GPU via `k_zero`, avoiding 2-10 MiB host CPU memsets.
+            let mut pending_zeros: Vec<(Buf, usize, u32)> = Vec::new();
+            {
+                let mut pools = self.block_pool.borrow_mut();
+                for sp in spans {
+                    let tbl = sp.lane.block_table.borrow();
+                    let lo_blk = sp.p0 / crate::blocks::BLOCK;
+                    let hi_blk = (sp.p0 + sp.t - 1) / crate::blocks::BLOCK;
+                    for b in lo_blk..=hi_blk {
+                        let full_overwrite = !dec
+                            && verify_k.is_none()
+                            && sp.p0 <= b * crate::blocks::BLOCK
+                            && sp.p0 + sp.t >= (b + 1) * crate::blocks::BLOCK;
+                        let bi = crate::blocks::BlockIndex::new(b as u32);
+                        for kind in [crate::blocks::BlockKind::Window, crate::blocks::BlockKind::Full] {
+                            let Some(entry) = tbl.get(kind, bi).ok().flatten() else { continue };
+                            let pool = pools.of_mut(kind);
+                            if pool.take_gpu_zero_pending(entry.slot()) && !full_overwrite {
+                                if let Ok(Some((buf, off, len))) = pool.gpu_slot_region(entry.slot()) {
+                                    pending_zeros.push((buf.clone(), off, (len / 4) as u32));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_zeros.is_empty() {
+                e.pso(&self.gpu.pso("k_zero"));
+                for (buf, off, words) in &pending_zeros {
+                    let zr = [0u32, *words];
+                    e.buf(buf, *off, 2);
+                    e.bytes(&zr, 5);
+                    e.dispatch(((*words as usize).div_ceil(1024), 1, 1), 256);
+                }
+                e.barrier();
+            }
+        }
         self.bind_eng(&e);
         let b = self.ba.get();
         let dec_meta = if dec && blocked {
@@ -2404,7 +2780,7 @@ impl Engine {
         let mut blocks: Vec<usize> = Vec::new();
         let mut cur = 0usize;
         if verify_k.is_some() { self.verify_record.set(true); }
-        for ip in 0..LOOP_START { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], false); }
+        for (ip, &tr) in trim.iter().enumerate().take(LOOP_START) { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], tr, false); }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
         let mut bank = (0usize, 0usize);
@@ -2441,7 +2817,7 @@ impl Engine {
                 lg_weak_buf = Some(weak_buf);
             }
         }
-        for ip in LOOP_END..N_PHYS { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], trim[ip], false); }
+        for (ip, &tr) in trim.iter().enumerate().take(N_PHYS).skip(LOOP_END) { cur = self.layer_b_ex(&e, spans, &row0, t, dec, dec_meta, ip, ip, cur, &mut blocks, None, &mut va, &[], tr, false); }
         self.verify_record.set(false);
         // Three logit destinations stay as they are. A single-span prefill reads ar.logits. A multi-span prefill
         // reads b.lg, one row per span. Decode writes gemm_h into b.lg with ldo = vocab_pad. Verify is a fourth
@@ -2840,7 +3216,7 @@ impl Engine {
         } else {
             self.gemm(e, C_WO, &[Engine::gseg(&l.wo, b.attn_g, b.wo_y)], t);
         }
-        let block_start = ip % BLOCK == 0;
+        let block_start = ip.is_multiple_of(BLOCK);
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         // (tail mode: the first 3 tail rows see the conv state instead of their real predecessors; they are never used)
@@ -3031,7 +3407,7 @@ impl<'a> Run<'a> {
     }
     /// (k_base, v_base, cap) of a slot's K/V inside its layer-2 buffer (offsets in cache
     /// elements: fp16, or bytes with --kv8). This is the contiguous cache, not the block
-    /// table. A block-cache key address is `Lane::attn_key_offset`, a `u64` from the table.
+    /// table. A block-cache key address comes from `BlockPool::gpu_table_entry` and `key_row_at`.
     fn kv_slot(&self, slot: usize) -> (u32, u32, u32) {
         let (swa, i) = self.slot_kind[slot];
         let cap = if swa { self.lane.swa_cap.get() } else { self.lane.full_cap.get() };
@@ -3505,7 +3881,7 @@ impl<'a> Run<'a> {
                         sc_[j] = s; if s > m { m = s; }
                     }
                     let mut z = (sink - m).exp();
-                    for j in 0..=t { sc_[j] = (sc_[j] - m).exp(); z += sc_[j]; }
+                    for sc in sc_.iter_mut().take(t + 1) { *sc = (*sc - m).exp(); z += *sc; }
                     match mode {
                         "max" => for j in 0..=t { let p = sc_[j] / z; if p > imp[j] { imp[j] = p; } },
                         // only what a key received while it was inside one window of the query / only from further away
@@ -3801,10 +4177,10 @@ impl<'a> Run<'a> {
             for j in 0..4 { jm.ncopy[j][0] = (ar.cat[j] + E as u32) as i32; }
             self.mix(e, C_MIXA, &[ja, jm]);
             let mut cj = Vec::new();
-            for j in 0..3 {
+            for (j, &norm_w) in norms.iter().enumerate() {
                 let u = if l.swa { ar.inp[0] } else { ar.inp[j] };
                 cj.push(CtrlJob { u_off: u, m_off: ar.msg[j], d_off: lw.down[j], out_off: ar.ctrlg[j], gain_off: lw.gain[j],
-                                  forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w: norms[j], ctr: 8 + j as u32 });
+                                  forget_off: lw.forget[j], res_out: ar.cin[j], ss_off: ar.ssp[j], norm_w, ctr: 8 + j as u32 });
             }
             self.ctrl_dec(e, &cj);
             xin = ar.cin;
@@ -3887,7 +4263,7 @@ impl<'a> Run<'a> {
             self.go(e, C_COMB, "k_attn_combine", &ca, (NH, 1, 1), 128);
         }
         // ---- output projection + post-conv (+ residual unless this layer starts a new block)
-        let block_start = ip % BLOCK == 0;
+        let block_start = ip.is_multiple_of(BLOCK);
         let mut live: Vec<usize> = blocks.clone(); live.push(cur); live.extend_from_slice(pinned);
         let mid = va.alloc(&live);
         let mut so = Engine::seg(&l.wo, ar.attn_g, self.v(mid));
@@ -4026,7 +4402,7 @@ pub fn build_decode_groups<F>(
 where
     F: FnMut(usize, usize) -> Option<(u32, u32)>,
 {
-    debug_assert!(kps >= crate::blocks::BLOCK && kps % crate::blocks::BLOCK == 0);
+    debug_assert!(kps >= crate::blocks::BLOCK && kps.is_multiple_of(crate::blocks::BLOCK));
     let blks_per_split = kps / crate::blocks::BLOCK;
     let n = ranges.len();
     let mut out = Vec::with_capacity(n * if blks_per_split == 1 { MAX_SWA_SPLIT } else { 16 });

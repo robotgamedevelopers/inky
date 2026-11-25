@@ -4,7 +4,7 @@
 # run in parallel. `check-memmode-traces.sh --list` prints the run names (production and each mutant) and runs nothing;
 # scripts/check-tla-tiers.sh reads it.
 set -euo pipefail
-mutants=(early-release no-rollback no-readback lost-seed skip-keep)
+mutants=(early-release no-rollback no-readback lost-seed lower-higher skip-keep)
 case ${1:-} in
     '') ;;
     --list) printf '%s\n' production "${mutants[@]}"; exit 0 ;;
@@ -23,7 +23,7 @@ source = pathlib.Path(sys.argv[1]).read_text()
 start = source.index('#[derive(Default)]\npub struct Mode')
 end = source.index('\nfn get_limit()', start)
 pathlib.Path(sys.argv[2]).write_text(source[start:end])
-start = source.index('\nfn read_saved(')
+start = source.index('\n#[derive(Debug, PartialEq, Eq)]\nenum SavedRecord')
 end = source.index('\nfn checked_directory(', start)
 pathlib.Path(sys.argv[2]).with_name('startup.rs').write_text(source[start:end])
 PY
@@ -31,9 +31,9 @@ PY
 run_trace() {
     local dir=$1
     : > "$dir/tlc.log"
-    rustc --edition=2021 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
+    rustc --edition=2021 -C debug-assertions=on -C debuginfo=0 "$dir/main.rs" -o "$dir/generate" 2> "$dir/rustc.log" || { cat "$dir/rustc.log" >&2; return 1; }
     "$dir/generate" "$dir/saved" "${2:-positive}" > "$dir/TraceData.tla" 2> "$dir/faults.log" || { cat "$dir/faults.log" >&2; return 1; }
-    (cd "$dir" && "${TLC_JAVA:-java}" -Xmx1g -XX:+UseParallelGC -cp "$jar" tlc2.TLC -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
+    (cd "$dir" && "${TLC_JAVA:-java}" -Xmx512m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -cp "$jar" tlc2.TLC -noGenerateSpecTE -workers 1 -metadir "$dir/states" \
         -config TraceCheck.cfg TraceCheck.tla) > "$dir/tlc.log" 2>&1
 }
 # setup NAME: a private copy of the models, the walk and the unmutated extract.
@@ -62,10 +62,34 @@ check_mutant() {
     fi
     echo "$mutant rejected (TLC exit $status)" > "$dir/result"
 }
+JOBS=${INKY_TRACE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+if [[ "$JOBS" -lt 1 ]]; then JOBS=1; fi
+
 names=() pids=()
-check_production & names+=(production) pids+=($!)
+has_slot() {
+    local n=0 pid st
+    for pid in "${pids[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ st _ < "/proc/$pid/stat" 2>/dev/null || continue
+            [[ "$st" != "Z" ]] && n=$((n + 1))
+        elif kill -0 "$pid" 2>/dev/null; then
+            n=$((n + 1))
+        fi
+    done
+    [[ "$n" -lt "$JOBS" ]]
+}
+start() {
+    while ! has_slot; do
+        sleep 0.05
+    done
+    names+=("$1")
+    "${@:2}" &
+    pids+=($!)
+}
+start production check_production
 for mutant in "${mutants[@]}"; do
-    check_mutant "$mutant" & names+=("$mutant") pids+=($!)
+    start "$mutant" check_mutant "$mutant"
 done
 failed=0
 for i in "${!pids[@]}"; do
