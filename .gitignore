@@ -1,5 +1,6 @@
 /target/
 /build/
+/logs/
 # local llama.cpp checkout + build, only used to produce the reference logits
 /third_party/
 # reference dumps: large (regenerate with tools/ref_logits.cpp) and logs with local paths

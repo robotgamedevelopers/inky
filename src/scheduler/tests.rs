@@ -624,3 +624,35 @@ fn walk_scheduler_trace_satisfies_invariants_across_seeds() {
     assert!(check.contains("Conforms == Init /\\ [][Next]_vars"));
     assert!(tlc_cfg.contains("BypassBoundHolds"));
 }
+
+#[test]
+fn serve_step_planner_skips_restoring_lanes_without_blocking_ready_decoders() {
+    let mut p = ServeStepPlanner::new(3, 4);
+    p.on_admit(0);
+    p.admit_queued(1, LaneState::Queued);
+    p.start_restore(1);
+    p.admit_queued(2, LaneState::Queued);
+    p.start_restore(2);
+    assert_eq!(p.state(1), LaneState::Restoring);
+    assert_eq!(p.state(2), LaneState::Restoring);
+
+    let inputs = [
+        ServeLaneInput { runnable: true, n_past: 64, pf_end: 64, has_pending_decode: true },
+        ServeLaneInput { runnable: true, n_past: 0, pf_end: 1024, has_pending_decode: false },
+        ServeLaneInput { runnable: true, n_past: 0, pf_end: 1024, has_pending_decode: false },
+    ];
+    for _ in 0..6 {
+        let plan = p.plan_and_begin_step(&inputs, 4096, 64).unwrap();
+        assert_eq!(plan, ServeStepPlan::Decode(vec![0]));
+        assert_eq!(p.wait_ticks(1), 0, "Restoring lane must not accrue wait_ticks");
+        assert!(p.complete_step().is_empty());
+    }
+
+    // Mid-restore cancel immediately transitions Restoring -> Cancelled.
+    assert!(p.request_cancel(2));
+    assert_eq!(p.state(2), LaneState::Cancelled);
+
+    // Finishing restore transitions Restoring -> Ready so lane 1 joins step planning.
+    p.finish_restore(1);
+    assert_eq!(p.state(1), LaneState::Ready);
+}

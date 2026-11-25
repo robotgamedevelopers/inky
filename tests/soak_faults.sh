@@ -166,6 +166,50 @@ stop_serve() {
     fi
 }
 
+verify_record_dir_intact() {
+    local rec_dir=$1 label=$2
+    python3 - "$rec_dir" "$label" <<'PY'
+import json, pathlib, sys
+
+rec_dir = pathlib.Path(sys.argv[1])
+label = sys.argv[2]
+if not rec_dir.exists():
+    sys.exit(0)
+files = sorted(
+    p for p in rec_dir.iterdir()
+    if p.is_file() and p.name.startswith("cards-") and (p.name.endswith(".jsonl") or p.name.endswith(".jsonl.1"))
+)
+required = {"schema_version", "recorded_at_ms", "card_id", "turn_index", "request", "response"}
+checked_lines = 0
+for path in files:
+    raw = path.read_bytes()
+    if not raw:
+        continue
+    if not raw.endswith(b"\n"):
+        print(f"FAIL [{label}]: torn trailing record (missing newline) in {path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(f"FAIL [{label}]: invalid UTF-8 in {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    for idx, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            print(f"FAIL [{label}]: unexpected blank line {idx} in {path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            obj = json.loads(line)
+        except Exception as exc:
+            print(f"FAIL [{label}]: invalid JSON at {path}:{idx}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(obj, dict) or not required.issubset(obj.keys()):
+            print(f"FAIL [{label}]: incomplete record schema at {path}:{idx}: keys={list(obj) if isinstance(obj, dict) else type(obj)}", file=sys.stderr)
+            sys.exit(1)
+        checked_lines += 1
+print(f"record_integrity_ok=1 label={label} files={len(files)} lines={checked_lines}")
+PY
+}
+
 print -r -- "=== [1/4] Longitudinal Zero-Drift Soak & Bounded Record Rotation ==="
 rec1="$work/rec-soak"
 log1="$work/serve-1.log"
@@ -196,6 +240,7 @@ ls -la "$rec1"
 # Ensure rotation kept disk bounded and created at most active + .1
 rot_files=( "$rec1"/cards-*.jsonl.1(N) )
 (( ${#rot_files} >= 1 )) || { print -r -- "FAIL: expected bounded rotation .1 file in $rec1"; exit 1 }
+verify_record_dir_intact "$rec1" "step1-rotation"
 
 print -r -- "=== [2/4] Client Disconnect Storm (72 overlapping requests) ==="
 rec2="$work/rec-storm"
@@ -214,6 +259,7 @@ grep -q '^drain_ok=1$' "$work/storm.out" && grep -q '^ref_match=1$' "$work/storm
     exit 1
 }
 stop_serve
+verify_record_dir_intact "$rec2" "step2-disconnect-storm"
 
 print -r -- "=== [3/4] Full-Disk (ENOSPC) Record Fault Isolation ==="
 mounted_dir="$work/mnt-full"
@@ -238,6 +284,7 @@ start_serve "$rec3" 1048576 "$log3"
 grep -q '^drain_ok=1$' "$work/full-disk.out" || { print -r -- "FAIL: full-disk drain failed"; exit 1 }
 stop_serve
 grep -q '\[record\]' "$log3" || { print -r -- "FAIL: expected [record] error log under ENOSPC"; exit 1 }
+verify_record_dir_intact "$rec3" "step3-enospc"
 hdiutil detach "$mounted_dir" >/dev/null 2>&1 || hdiutil detach -force "$mounted_dir" >/dev/null 2>&1
 mounted_dir=
 
@@ -284,6 +331,7 @@ wait "$serve_pid" 2>/dev/null || crash_status=$?
 serve_pid=0
 stop_pid "$bg_pid" KILL
 bg_pid=0
+verify_record_dir_intact "$crash_rec" "step4-post-sigkill"
 
 # Verify MemMode.tla socket-close cleanup restored limit=0 and removed .saved file.
 restored=0
@@ -310,6 +358,7 @@ start_serve "$crash_rec" 1048576 "$log4b" "$memd_sock"
 grep -q '^reference_match=1 ' "$work/restart-ref.out" || { print -r -- "FAIL: post-crash seeded reference mismatch"; exit 1 }
 
 stop_serve
+verify_record_dir_intact "$crash_rec" "step4-post-restart"
 stop_pid "$memd_pid" TERM
 memd_pid=0
 

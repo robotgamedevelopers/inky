@@ -8,8 +8,12 @@ ValueAfter(cs, n, kind, initial) ==
     IN IF writes = {} THEN initial
        ELSE cs[CHOOSE i \in writes : \A j \in writes : j <= i].arg
 Effects(p,s,cs) ==
-    /\ s.op = "owner" \/ s.limit = ValueAfter(cs,Len(cs),"set",p.limit)
+    /\ s.op \in {"owner", "reboot"} \/ s.limit = ValueAfter(cs,Len(cs),"set",p.limit)
     /\ s.disk = ValueAfter(cs,Len(cs),"keep",p.disk)
+    /\ s.diskStale = IF s.op = "reboot" THEN (s.disk # -1)
+                     ELSE IF (\E i \in 1..Len(cs) : cs[i].kind = "keep" /\ cs[i].effect = "assigned")
+                          THEN FALSE
+                          ELSE p.diskStale
     /\ \A i \in 1..Len(cs) : cs[i].kind = "get" =>
           cs[i].result \in {-1, ValueAfter(cs,i-1,"set",p.limit)}
 At(cs, i) == IF i <= Len(cs) THEN cs[i] ELSE [kind |-> "missing", arg |-> -2, result |-> -2]
@@ -45,6 +49,7 @@ CloseCalls(p,s,cs) ==
                     ELSE End(s,cs,2,p.saved,TRUE,0)
 RestartCalls(p,s,cs) ==
     IF p.disk = -1 THEN End(s,cs,0,-1,FALSE,0)
+    ELSE IF p.diskStale THEN Call(cs,1,"keep",-1) /\ End(s,cs,1,-1,FALSE,0)
     ELSE /\ Call(cs,1,"set",p.disk)
          /\ IF At(cs,1).result = 0 THEN Forget(s,cs,2,0)
             ELSE End(s,cs,1,p.disk,TRUE,0)
@@ -54,5 +59,6 @@ Protocol(p,s,target) ==
       [] s.op = "close" -> CloseCalls(p,s,s.calls)
       [] s.op = "restart" -> RestartCalls(p,s,s.calls)
       [] s.op = "crash" -> End(s,s.calls,0,-1,FALSE,0)
+      [] s.op = "reboot" -> End(s,s.calls,0,-1,FALSE,0)
       [] OTHER -> End(s,s.calls,0,p.saved,p.owed,Cardinality(p.conns))
 =============================================================================

@@ -35,7 +35,8 @@ mod scheduler_trace;
 mod step;
 mod timing;
 use block_cache::{
-    effective_pf_target, find_prefill_leader, InflightLaneReserve, InflightPrefillLane, LaneBlockState,
+    compute_block_hashes, effective_pf_target, find_prefill_leaders, AdmitBindOutcome,
+    InflightLaneReserve, InflightPrefillLane, LaneBlockState, PreparedInflightCohort,
     ServeBlockCache,
 };
 use messages::translate_messages;
@@ -48,6 +49,7 @@ use reply::{
     anthropic_content, anthropic_stop_reason, anthropic_usage, parse, sse_text,
     streaming_delta_usage, take_stream_text, BlockStream,
 };
+use std::sync::atomic::AtomicU64;
 use step::SERVE_STEP_MAX_BYPASS;
 use timing::{Counters, RequestTiming, TimingSnapshot};
 
@@ -96,7 +98,8 @@ pub(crate) fn startup_nonce() -> String {
 struct Job {
     seq: u64,
     queued_at: Instant,
-    toks: Vec<u32>,
+    toks: Arc<[u32]>,
+    block_hashes: Arc<[u64]>,
     max: usize,
     temp: f32,
     top_k: usize,
@@ -107,6 +110,78 @@ struct Job {
     out: JobOutput,
     // Capacity follows the job through the channel, the scheduler queue and its lane.
     _permit: LanePermit,
+}
+
+impl Job {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seq: u64,
+        queued_at: Instant,
+        toks: Vec<u32>,
+        max: usize,
+        temp: f32,
+        top_k: usize,
+        top_p: f32,
+        seed: u64,
+        thinking_budget: usize,
+        loopcd_omega: f32,
+        out: JobOutput,
+        permit: LanePermit,
+    ) -> Self {
+        let block_hashes: Arc<[u64]> = compute_block_hashes(&toks).into();
+        let toks: Arc<[u32]> = toks.into();
+        Self {
+            seq,
+            queued_at,
+            toks,
+            block_hashes,
+            max,
+            temp,
+            top_k,
+            top_p,
+            seed,
+            thinking_budget,
+            loopcd_omega,
+            out,
+            _permit: permit,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpillTelemetry {
+    starts_spilled: AtomicU64,
+    starts_restored: AtomicU64,
+    spilled_starts_indexed: AtomicU64,
+    corrupt_fallbacks: AtomicU64,
+    corrupt_files_removed: AtomicU64,
+    last_restore_us: AtomicU64,
+    writes_committed: AtomicU64,
+    reads_hit: AtomicU64,
+    bytes_used: AtomicU64,
+}
+
+impl SpillTelemetry {
+    fn sync_from(&self, cache: &ServeBlockCache) {
+        let cs = cache.stats();
+        self.starts_spilled.store(cs.starts_spilled, Ordering::Relaxed);
+        self.starts_restored.store(cs.starts_restored, Ordering::Relaxed);
+        self.spilled_starts_indexed
+            .store(cache.spilled_start_count() as u64, Ordering::Relaxed);
+        self.corrupt_fallbacks
+            .store(cs.corrupt_fallbacks, Ordering::Relaxed);
+        self.last_restore_us
+            .store(cs.last_restore_us, Ordering::Relaxed);
+        if let Some(store) = cache.spill_store() {
+            let ss = store.stats();
+            self.corrupt_files_removed
+                .store(ss.corrupt_files_removed, Ordering::Relaxed);
+            self.writes_committed
+                .store(ss.writes_committed, Ordering::Relaxed);
+            self.reads_hit.store(ss.reads_hit, Ordering::Relaxed);
+            self.bytes_used.store(store.used_bytes(), Ordering::Relaxed);
+        }
+    }
 }
 
 /// Hard thinking-token budget state machine (chadlyb/erisinky): after `budget` tokens inside
@@ -265,6 +340,7 @@ impl LaneS {
 
 struct Active {
     job: Job, n_past: usize, pf_end: usize, cached: usize, gen: usize,
+    restoring_target: Option<usize>,
     timing: RequestTiming,
     sampler: Sampler,
     /// Draft stream, seeded once per request (`seed ^ DRAFT_SEED_MIX`). A verify round advances it.
@@ -388,7 +464,7 @@ fn overlap_host_work_step<'a>(
                     debug_assert!(!released_now, "InStep cancel must defer release until complete_step");
                 }
             }
-            crate::scheduler::LaneState::Ready => {
+            crate::scheduler::LaneState::Ready | crate::scheduler::LaneState::Restoring => {
                 if a.job.out.cancelled()
                     || (a.n_past < a.pf_end && a.job.out.queued() == 0 && a.job.out.send(Ev::Alive).is_err())
                 {
@@ -430,7 +506,12 @@ fn release_cancelled_waiting(
     tick_seq: &mut u64,
 ) {
     for &i in waiting_cancelled {
+        let was_restoring = planner.state(i) == crate::scheduler::LaneState::Restoring;
         if planner.request_cancel(i) {
+            if was_restoring {
+                let mut pools = eng.block_pool().borrow_mut();
+                cache.cancel_restore(&mut pools, i);
+            }
             if let Some(a) = lanes[i].release_job(eng, cache, metrics, tick_seq) {
                 a.log_cancellation(i);
             }
@@ -454,12 +535,174 @@ fn fail_step(
 
 fn cleanup_scheduler(eng: &Engine, lanes: &mut [LaneS], cache: &mut ServeBlockCache) {
     let mut pools = eng.block_pool().borrow_mut();
+    cache.cancel_all_restores(&mut pools);
     for l in lanes.iter_mut() {
         l.job = None;
         let mut tbl = l.lane.block_table().borrow_mut();
         cache.release_lane(&mut pools, &mut tbl, &mut l.blocks);
     }
     cache.shutdown(&mut pools);
+}
+
+fn complete_ready_restores(
+    eng: &Engine,
+    cache: &mut ServeBlockCache,
+    lanes: &mut [LaneS],
+    planner: &mut crate::scheduler::ServeStepPlanner,
+    checkpoints_sealed: &mut bool,
+    #[cfg(test)] admissions: &mut Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
+) {
+    let mut tbl_ptrs: Vec<Option<(*mut crate::blocks::BlockTable, *mut LaneBlockState)>> =
+        Vec::with_capacity(lanes.len());
+    let mut guards: Vec<Option<std::cell::RefMut<'_, crate::blocks::BlockTable>>> =
+        Vec::with_capacity(lanes.len());
+    for l in lanes.iter_mut() {
+        if l.job.as_ref().is_some_and(|a| a.restoring_target.is_some()) {
+            let mut g = l.lane.block_table().borrow_mut();
+            let tp: *mut crate::blocks::BlockTable = &mut *g;
+            let sp: *mut LaneBlockState = &mut l.blocks;
+            guards.push(Some(g));
+            tbl_ptrs.push(Some((tp, sp)));
+        } else {
+            guards.push(None);
+            tbl_ptrs.push(None);
+        }
+    }
+    let completed = {
+        let mut pools = eng.block_pool().borrow_mut();
+        cache.poll_restores(&mut pools, |idx| {
+            tbl_ptrs.get(idx).copied().flatten().map(|(tp, sp)| (&(), tp, sp))
+        })
+    };
+    drop(guards);
+    for c in completed {
+        let l = &mut lanes[c.lane];
+        let Some(a) = l.job.as_mut() else { continue };
+        a.restoring_target = None;
+        a.timing.prep += c.elapsed;
+        if c.corrupt_fallback {
+            eprintln!(
+                "[serve] lane {}: SSD spill restore fell back cleanly after missing/corrupt block (#{})",
+                c.lane, a.job.seq
+            );
+        }
+        match c.matched {
+            Some((matched_at, cs)) => {
+                eng.on(&l.lane).set_cs(&cs);
+                a.n_past = matched_at;
+                a.cached = matched_at;
+                *checkpoints_sealed = true;
+            }
+            None => {
+                eng.on(&l.lane).reset();
+                a.n_past = 0;
+                a.cached = 0;
+            }
+        }
+        if planner.state(c.lane) == crate::scheduler::LaneState::Restoring {
+            planner.finish_restore(c.lane);
+            #[cfg(test)]
+            if let Some(admissions) = admissions.as_mut() {
+                admissions.push([
+                    crate::scheduler::LaneState::Queued,
+                    crate::scheduler::LaneState::Admitted,
+                    crate::scheduler::LaneState::Restoring,
+                    planner.state(c.lane),
+                ]);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PoolWakeSnapshot {
+    lanes_released: u64,
+    window_pruned: u64,
+    shared_dedups: u64,
+    start_points_saved: u64,
+    starts_restored: u64,
+    avail_full: usize,
+    avail_window: usize,
+}
+
+impl PoolWakeSnapshot {
+    fn capture(cache: &ServeBlockCache, pools: &crate::blocks::BlockPools) -> Self {
+        let s = cache.stats();
+        Self {
+            lanes_released: s.lanes_released,
+            window_pruned: s.window_pruned,
+            shared_dedups: s.shared_dedups,
+            start_points_saved: s.start_points_saved,
+            starts_restored: s.starts_restored,
+            avail_full: cache.free_plus_evictable_slots(pools, crate::blocks::BlockKind::Full),
+            avail_window: cache.free_plus_evictable_slots(pools, crate::blocks::BlockKind::Window),
+        }
+    }
+}
+
+fn planned_next_span_len(
+    n_past: usize,
+    pf_target: usize,
+    has_pending_decode: bool,
+    window_slots: usize,
+    chunk: usize,
+) -> Option<usize> {
+    if n_past < pf_target {
+        let target = pf_target.min(window_span_end(n_past, window_slots));
+        if target <= n_past {
+            return None;
+        }
+        let budget = chunk.max(1);
+        let raw_t = (target - n_past).min(budget);
+        let t = if n_past + raw_t < target && raw_t > crate::blocks::BLOCK {
+            let aligned = raw_t - ((n_past + raw_t) % crate::blocks::BLOCK);
+            if aligned > 0 { aligned } else { raw_t }
+        } else {
+            raw_t
+        };
+        Some(t.max(1))
+    } else if has_pending_decode {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Wake any `pool_deferred` lane whose next planned span can now be satisfied from free +
+/// evictable pool capacity (including `< EXT = 1024` progress via singleflight checkpoint
+/// sealing + follower rebind, `shared_dedups` freeing duplicate blocks, restore fallback,
+/// or holder release/pruning) without busy-spinning when capacity still cannot fit the span.
+fn refresh_pool_deferred<'a>(
+    cache: &ServeBlockCache,
+    pools: &crate::blocks::BlockPools,
+    prev: &mut PoolWakeSnapshot,
+    pool_deferred: &mut [bool],
+    window_slots: usize,
+    chunk: usize,
+    lane_iter: impl IntoIterator<Item = (usize, &'a crate::blocks::BlockTable, usize, usize, bool)>,
+) {
+    let cur = PoolWakeSnapshot::capture(cache, pools);
+    let global_release_or_prune =
+        cur.lanes_released != prev.lanes_released || cur.window_pruned != prev.window_pruned;
+    *prev = cur;
+
+    if !pool_deferred.iter().any(|&d| d) {
+        return;
+    }
+    for (i, tbl, n_past, pf_target, has_pending_decode) in lane_iter {
+        if !pool_deferred[i] {
+            continue;
+        }
+        if let Some(span_len) =
+            planned_next_span_len(n_past, pf_target, has_pending_decode, window_slots, chunk)
+        {
+            if cache.can_satisfy_span(pools, tbl, n_past, span_len) {
+                pool_deferred[i] = false;
+            }
+        } else if global_release_or_prune {
+            pool_deferred[i] = false;
+        }
+    }
 }
 
 /// Partition `ensure_span_blocks` failures into `(to_defer, to_fail)`.
@@ -484,6 +727,7 @@ fn partition_pool_exhausted(
     (to_defer, vec![victim])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scheduler(
     eng: &Engine,
     tk: &Tokenizer,
@@ -492,7 +736,8 @@ fn scheduler(
     rx: Receiver<Job>,
     active_lanes: Arc<AtomicUsize>,
     metrics: &Mutex<Counters>,
-    spill_store: Option<crate::spill::SpillStore>,
+    mut cache: ServeBlockCache,
+    spill_telemetry: Option<&SpillTelemetry>,
     #[cfg(test)] mut admissions: Option<&mut Vec<[crate::scheduler::LaneState; 4]>>,
 ) {
     let mut lanes: Vec<LaneS> = (0..nlanes)
@@ -504,10 +749,9 @@ fn scheduler(
             job: None,
         })
         .collect();
-    let mut cache = match spill_store {
-        Some(store) => ServeBlockCache::with_spill(store),
-        None => ServeBlockCache::new(),
-    };
+    if let Some(st) = spill_telemetry {
+        st.sync_from(&cache);
+    }
     let mut tick_seq = nlanes as u64;
     let mut queue: VecDeque<QueuedJob> = VecDeque::new();
     let stop = [tk.eos, sp.end_sampling];
@@ -517,20 +761,29 @@ fn scheduler(
         (pooled_context(eng.max_ctx, pools.full.len(), pools.window.len()), pools.window.len())
     };
     let mut pool_deferred = vec![false; nlanes];
-    let mut prev_lanes_released = cache.stats().lanes_released;
-    let mut prev_window_pruned = cache.stats().window_pruned;
+    let mut wake_snap = {
+        let pools = eng.block_pool().borrow();
+        PoolWakeSnapshot::capture(&cache, &pools)
+    };
     let mut prev_starts_spilled = 0;
     let mut checkpoints_sealed = false;
     loop {
+        complete_ready_restores(
+            eng,
+            &mut cache,
+            &mut lanes,
+            &mut planner,
+            &mut checkpoints_sealed,
+            #[cfg(test)]
+            &mut admissions,
+        );
+        if let Some(st) = spill_telemetry {
+            st.sync_from(&cache);
+        }
         let cur_stats = cache.stats();
         if cur_stats.starts_spilled != prev_starts_spilled {
             metrics.lock().unwrap_or_else(|e| e.into_inner()).starts_spilled = cur_stats.starts_spilled;
             prev_starts_spilled = cur_stats.starts_spilled;
-        }
-        if cur_stats.lanes_released != prev_lanes_released || cur_stats.window_pruned != prev_window_pruned {
-            pool_deferred.fill(false);
-            prev_lanes_released = cur_stats.lanes_released;
-            prev_window_pruned = cur_stats.window_pruned;
         }
         let busy_count = lanes.iter().filter(|l| l.job.is_some()).count();
         active_lanes.store(busy_count, Ordering::Relaxed);
@@ -561,122 +814,231 @@ fn scheduler(
             m.queued = m.queued.saturating_sub(dropped);
         }
         for (i, lane) in lanes.iter_mut().enumerate() {
-            if lane.job.as_ref().is_some_and(|a| a.job.out.cancelled()) && planner.request_cancel(i) {
-                if let Some(a) = lane.release_job(eng, &mut cache, metrics, &mut tick_seq) {
-                    a.log_cancellation(i);
+            if lane.job.as_ref().is_some_and(|a| a.job.out.cancelled()) {
+                let was_restoring = planner.state(i) == crate::scheduler::LaneState::Restoring;
+                if planner.request_cancel(i) {
+                    if was_restoring {
+                        let mut pools = eng.block_pool().borrow_mut();
+                        cache.cancel_restore(&mut pools, i);
+                    }
+                    if let Some(a) = lane.release_job(eng, &mut cache, metrics, &mut tick_seq) {
+                        a.log_cancellation(i);
+                    }
                 }
             }
         }
         // Admit queued jobs onto free Layer 3 lanes with zero-copy prefix matching via EntryTree
-        // + BlockPools, guarded by pool-pressure headroom (always allowing >= 1 active lane).
-        while let Some(queued) = queue.front() {
-            let j = &queued.job;
-            let Some(i) = lanes
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.job.is_none())
-                .min_by_key(|(_, l)| l.tick)
-                .map(|(i, _)| i)
-            else {
-                break;
-            };
-            if j.out.cancelled() {
-                let _ = queue.pop_front();
-                let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                m.queued = m.queued.saturating_sub(1);
-                continue;
+        // + BlockPools, guarded by linear shared-prefix pool-pressure headroom (`U331`).
+        // Pre-clone Arcs into an immutable backing slice so `PreparedInflightCohort` is built
+        // ONCE per scheduler pass and updated incrementally with zero all-pairs rescans.
+        if !queue.is_empty() {
+            let mut backing: Vec<(Arc<[u32]>, Arc<[u64]>)> =
+                Vec::with_capacity(lanes.len() + queue.len());
+            let mut init_meta: Vec<(usize, usize, usize, usize, usize, usize, usize, usize, bool)> =
+                Vec::with_capacity(lanes.len());
+            for (idx, l) in lanes.iter().enumerate() {
+                let Some(a) = l.job.as_ref() else { continue };
+                let b_idx = backing.len();
+                backing.push((a.job.toks.clone(), a.job.block_hashes.clone()));
+                let (eff_past, eff_cached, eff_written, eff_run) = match a.restoring_target {
+                    Some(target) => (target, target, target, false),
+                    None => (
+                        a.n_past,
+                        a.cached,
+                        l.blocks.written,
+                        !a.job.out.cancelled()
+                            && !a.job.out.backpressured()
+                            && !pool_deferred[idx]
+                            && planner.state(idx) == crate::scheduler::LaneState::Ready,
+                    ),
+                };
+                init_meta.push((
+                    b_idx,
+                    idx,
+                    eff_past,
+                    a.pf_end,
+                    eff_cached,
+                    eff_written,
+                    a.gen,
+                    a.job.max,
+                    eff_run,
+                ));
             }
-            if context_over(j.toks.len(), j.max, context) {
-                let j = queue.pop_front().unwrap().job;
-                let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                m.queued = m.queued.saturating_sub(1);
-                let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
-                continue;
+            let queue_backing_base = backing.len();
+            for q in &queue {
+                backing.push((q.job.toks.clone(), q.job.block_hashes.clone()));
             }
+            let mut cohort = PreparedInflightCohort::empty();
+            for (b_idx, lane_idx, n_past, pf_end, cached, written, gen, max_gen, runnable) in
+                init_meta
             {
-                let pools = eng.block_pool().borrow();
-                let active_reserves: Vec<InflightLaneReserve<'_>> = lanes
+                cohort.push_admitted(InflightLaneReserve {
+                    lane: lane_idx,
+                    toks: &backing[b_idx].0,
+                    block_hashes: Some(&backing[b_idx].1),
+                    n_past,
+                    pf_end,
+                    cached,
+                    written,
+                    gen,
+                    max_gen,
+                    runnable,
+                });
+            }
+            let mut q_cursor = 0usize;
+            while let Some(queued) = queue.front() {
+                let j = &queued.job;
+                let Some(i) = lanes
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, l)| {
-                        let a = l.job.as_ref()?;
-                        let run = !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[idx];
-                        Some(InflightLaneReserve {
-                            lane: idx,
-                            toks: &a.job.toks,
-                            n_past: a.n_past,
-                            pf_end: a.pf_end,
-                            cached: a.cached,
-                            written: l.blocks.written,
-                            gen: a.gen,
-                            max_gen: a.job.max,
-                            runnable: run,
-                        })
-                    })
-                    .collect();
-                if !cache.can_admit(&pools, &active_reserves, i, &j.toks, j.max, eng.chunk) {
+                    .filter(|(_, l)| l.job.is_none())
+                    .min_by_key(|(_, l)| l.tick)
+                    .map(|(i, _)| i)
+                else {
+                    break;
+                };
+                if j.out.cancelled() {
+                    let _ = queue.pop_front();
+                    q_cursor += 1;
+                    let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    m.queued = m.queued.saturating_sub(1);
+                    continue;
+                }
+                if context_over(j.toks.len(), j.max, context) {
+                    let j = queue.pop_front().unwrap().job;
+                    q_cursor += 1;
+                    let mut m = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    m.queued = m.queued.saturating_sub(1);
+                    let _ = j.out.send(Ev::Err(context_full_message(j.toks.len(), j.max, context)));
+                    continue;
+                }
+                let q_b_idx = queue_backing_base + q_cursor;
+                let can_fit = {
+                    let pools = eng.block_pool().borrow();
+                    cache.can_admit_with_cohort(
+                        &pools,
+                        &cohort,
+                        i,
+                        &backing[q_b_idx].0,
+                        Some(&backing[q_b_idx].1),
+                        j.max,
+                        eng.chunk,
+                    )
+                };
+                if !can_fit {
                     break;
                 }
-            }
-            let QueuedJob { job: j, state } = queue.pop_front().unwrap();
-            planner.admit_queued(i, state);
-            #[cfg(test)]
-            let admitted = planner.state(i);
-            // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
-            let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
-            let prep_began = Instant::now();
-            planner.start_restore(i);
-            #[cfg(test)]
-            let restoring = planner.state(i);
-            let start = {
-                let l = &mut lanes[i];
-                let mut pools = eng.block_pool().borrow_mut();
-                let matched = {
-                    let mut tbl = l.lane.block_table().borrow_mut();
-                    cache.match_and_bind(&mut pools, &mut tbl, &mut l.blocks, &j.toks)
+                let QueuedJob { job: j, state } = queue.pop_front().unwrap();
+                q_cursor += 1;
+                let j_max = j.max;
+                let j_len = j.toks.len();
+                planner.admit_queued(i, state);
+                #[cfg(test)]
+                let admitted = planner.state(i);
+                // queue wait ends at admission; readying the lane is its own phase, before any prefill batch
+                let mut timing = metrics.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), j.queued_at);
+                let prep_began = Instant::now();
+                planner.start_restore(i);
+                #[cfg(test)]
+                let restoring = planner.state(i);
+                let (start, restoring_target) = {
+                    let l = &mut lanes[i];
+                    let mut pools = eng.block_pool().borrow_mut();
+                    let outcome = {
+                        let mut tbl = l.lane.block_table().borrow_mut();
+                        cache.begin_admit_bind(&mut pools, i, &mut tbl, &mut l.blocks, &j.toks)
+                    };
+                    match outcome {
+                        AdmitBindOutcome::Immediate(Some((matched_at, cs))) => {
+                            eng.on(&l.lane).set_cs(&cs);
+                            (matched_at, None)
+                        }
+                        AdmitBindOutcome::Immediate(None) => {
+                            eng.on(&l.lane).reset();
+                            (0, None)
+                        }
+                        AdmitBindOutcome::Restoring { target_pos } => (0, Some(target_pos)),
+                    }
                 };
-                match matched {
-                    Some((matched_at, cs)) => {
-                        eng.on(&l.lane).set_cs(&cs);
-                        matched_at
+                eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
+                timing.prep = prep_began.elapsed();
+                let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
+                // once per request, not per round and not per emitted token
+                let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
+                let think = ThinkBudget::new(j.thinking_budget);
+                lanes[i].job = Some(Active {
+                    pf_end: j_len,
+                    n_past: start,
+                    cached: start,
+                    gen: 0,
+                    restoring_target,
+                    timing,
+                    sampler,
+                    draft_sampler,
+                    think,
+                    pending: None,
+                    job: j,
+                });
+                pool_deferred[i] = false;
+                if let Some(target_pos) = restoring_target {
+                    cohort.invalidate_headroom();
+                    cohort.push_admitted(InflightLaneReserve {
+                        lane: i,
+                        toks: &backing[q_b_idx].0,
+                        block_hashes: Some(&backing[q_b_idx].1),
+                        n_past: target_pos,
+                        pf_end: j_len,
+                        cached: target_pos,
+                        written: target_pos,
+                        gen: 0,
+                        max_gen: j_max,
+                        runnable: false,
+                    });
+                } else {
+                    if start > 0 {
+                        cohort.invalidate_headroom();
                     }
-                    None => {
-                        eng.on(&l.lane).reset();
-                        0
+                    planner.finish_restore(i);
+                    #[cfg(test)]
+                    if let Some(admissions) = admissions.as_mut() {
+                        admissions.push([state, admitted, restoring, planner.state(i)]);
                     }
+                    cohort.push_admitted(InflightLaneReserve {
+                        lane: i,
+                        toks: &backing[q_b_idx].0,
+                        block_hashes: Some(&backing[q_b_idx].1),
+                        n_past: start,
+                        pf_end: j_len,
+                        cached: start,
+                        written: start,
+                        gen: 0,
+                        max_gen: j_max,
+                        runnable: true,
+                    });
                 }
-            };
-            eng.on(&lanes[i].lane).set_tokens(0, &j.toks);
-            timing.prep = prep_began.elapsed();
-            let sampler = Sampler::new(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
-            // once per request, not per round and not per emitted token
-            let draft_sampler = Sampler::draft(j.temp, j.top_k, j.top_p, eng.softcap, j.seed);
-            let think = ThinkBudget::new(j.thinking_budget);
-            lanes[i].job = Some(Active {
-                pf_end: j.toks.len(),
-                n_past: start,
-                cached: start,
-                gen: 0,
-                timing,
-                sampler,
-                draft_sampler,
-                think,
-                pending: None,
-                job: j,
-            });
-            pool_deferred[i] = false;
-            planner.finish_restore(i);
-            #[cfg(test)]
-            if let Some(admissions) = admissions.as_mut() {
-                admissions.push([state, admitted, restoring, planner.state(i)]);
             }
         }
         active_lanes.store(lanes.iter().filter(|l| l.job.is_some()).count(), Ordering::Relaxed);
-        // Rebind eligible untouched followers whenever the prior prefill step sealed new checkpoints.
+        complete_ready_restores(
+            eng,
+            &mut cache,
+            &mut lanes,
+            &mut planner,
+            &mut checkpoints_sealed,
+            #[cfg(test)]
+            &mut admissions,
+        );
+        if let Some(st) = spill_telemetry {
+            st.sync_from(&cache);
+        }
+        // Rebind eligible untouched followers whenever the prior step or restore sealed new checkpoints.
         if checkpoints_sealed {
             checkpoints_sealed = false;
             let mut pools = eng.block_pool().borrow_mut();
-            for l in lanes.iter_mut() {
+            for (idx, l) in lanes.iter_mut().enumerate() {
+                if planner.state(idx) != crate::scheduler::LaneState::Ready {
+                    continue;
+                }
                 let Some(a) = l.job.as_mut() else { continue };
                 if a.gen == 0 && a.n_past == a.cached && l.blocks.written == a.n_past && !a.job.out.cancelled() {
                     let rebound = {
@@ -691,32 +1053,71 @@ fn scheduler(
                 }
             }
         }
+        // Wake pool-deferred lanes whenever pool availability or rebind progress allows their next
+        // planned span to fit (including `< EXT = 1024` before any window block expires).
+        {
+            let pools = eng.block_pool().borrow();
+            let tbl_refs: Vec<Option<(std::cell::Ref<'_, crate::blocks::BlockTable>, usize, usize, bool)>> = lanes
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    if !pool_deferred[i] {
+                        return None;
+                    }
+                    let a = l.job.as_ref()?;
+                    let inp = a.step_input(true);
+                    Some((l.lane.block_table().borrow(), inp.n_past, inp.pf_end, inp.has_pending_decode))
+                })
+                .collect();
+            refresh_pool_deferred(
+                &cache,
+                &pools,
+                &mut wake_snap,
+                &mut pool_deferred,
+                window_slots,
+                eng.chunk,
+                tbl_refs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, opt)| opt.as_ref().map(|(t, np, pf, hd)| (i, &**t, *np, *pf, *hd))),
+            );
+        }
         // Starvation-bounded Layer 4 step selection: ceiling >= W, longest-waiting first,
         // active 1-token decoding lanes, then 64-aligned prefill spans capped at checkpoint boundaries.
-        let runnable = |i: usize, a: &Active| !a.job.out.cancelled() && !a.job.out.backpressured() && !pool_deferred[i];
+        let runnable = |i: usize, a: &Active, p: &crate::scheduler::ServeStepPlanner| {
+            p.state(i) == crate::scheduler::LaneState::Ready
+                && !a.job.out.cancelled()
+                && !a.job.out.backpressured()
+                && !pool_deferred[i]
+        };
         let prefill_cands: Vec<InflightPrefillLane<'_>> = lanes
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
+                if planner.state(i) != crate::scheduler::LaneState::Ready {
+                    return None;
+                }
                 let a = l.job.as_ref()?;
                 (a.gen == 0 && a.n_past < a.pf_end).then_some(InflightPrefillLane {
                     lane: i,
                     toks: &a.job.toks,
+                    block_hashes: Some(&a.job.block_hashes),
                     n_past: a.n_past,
                     pf_end: a.pf_end,
-                    runnable: runnable(i, a),
+                    runnable: runnable(i, a, &planner),
                     eligible_follower: a.n_past == a.cached && l.blocks.written == a.n_past,
                 })
             })
             .collect();
+        let leaders = find_prefill_leaders(&prefill_cands);
         let mut deferred_by_singleflight = vec![false; lanes.len()];
         for (idx, cand) in prefill_cands.iter().enumerate() {
-            if find_prefill_leader(&prefill_cands, idx).is_some() {
+            if leaders[idx].is_some() {
                 deferred_by_singleflight[cand.lane] = true;
             }
         }
         let mut step_inputs: Vec<crate::scheduler::ServeLaneInput> = lanes.iter().enumerate().map(|(i, l)| match &l.job {
-            Some(a) => a.step_input(runnable(i, a) && !deferred_by_singleflight[i]),
+            Some(a) => a.step_input(runnable(i, a, &planner) && !deferred_by_singleflight[i]),
             None => crate::scheduler::ServeLaneInput { runnable: false, n_past: 0, pf_end: 0, has_pending_decode: false },
         }).collect();
         for input in &mut step_inputs {
@@ -740,7 +1141,8 @@ fn scheduler(
                 if !exhausted.is_empty() {
                     let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !sp_list.iter().any(|&(k, _, _)| k == j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && (planner.state(j) == crate::scheduler::LaneState::Restoring
+                                || l.job.as_ref().is_some_and(|a| runnable(j, a, &planner) && !deferred_by_singleflight[j]))
                     });
                     let (to_defer, to_fail) =
                         partition_pool_exhausted(exhausted, !live_sp.is_empty(), other_runnable_exists);
@@ -880,7 +1282,8 @@ fn scheduler(
                 if !exhausted.is_empty() {
                     let other_runnable_exists = lanes.iter().enumerate().any(|(j, l)| {
                         !need_dec.contains(&j)
-                            && l.job.as_ref().is_some_and(|a| runnable(j, a) && !deferred_by_singleflight[j])
+                            && (planner.state(j) == crate::scheduler::LaneState::Restoring
+                                || l.job.as_ref().is_some_and(|a| runnable(j, a, &planner) && !deferred_by_singleflight[j]))
                     });
                     let (to_defer, to_fail) =
                         partition_pool_exhausted(exhausted, !live_dec.is_empty(), other_runnable_exists);
@@ -989,9 +1392,11 @@ fn scheduler(
                 release_cancelled_waiting(&waiting_cancelled, eng, &mut cache, &mut lanes, &mut planner, metrics, &mut tick_seq);
             }
             None => {
-                // No GPU work can proceed while every live lane's output buffer is full.
-                // Recheck consumption and cancellation shortly, waking sooner for another request.
-                if lanes.iter().any(|l| l.job.is_some()) {
+                // No GPU work can proceed right now (e.g. cold SSD restore in flight or every
+                // Ready lane's output buffer is full). Wake immediately on restore completion.
+                if cache.has_inflight_restores() {
+                    cache.wait_restore_activity(Duration::from_micros(250));
+                } else if lanes.iter().any(|l| l.job.is_some()) {
                     match rx.recv_timeout(Duration::from_millis(2)) {
                         Ok(job) => queue.push_back(QueuedJob::new(job)),
                         Err(RecvTimeoutError::Timeout) => {}
@@ -1076,7 +1481,20 @@ fn models_body() -> String {
 }
 
 /// A request's line and headers; the body is read only after the caller has checked the key.
-struct Head { method: String, path: String, len: usize, auth: Option<String>, api_key: Option<String>, card_id: Option<String>, chunked: bool }
+#[derive(Default, Debug, Clone)]
+struct Head {
+    method: String,
+    path: String,
+    len: usize,
+    auth: Option<String>,
+    api_key: Option<String>,
+    card_id: Option<String>,
+    chunked: bool,
+    host: Option<String>,
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    content_type: Option<String>,
+}
 const MAX_BODY: usize = 32 << 20;
 // Counting can accept prompts larger than the lane context. Cap the JSON before
 // allocating or translating it, since the token limit alone does not bound BPE scratch.
@@ -1087,9 +1505,41 @@ const MAX_IN_FLIGHT_BODY_BYTES: usize = 128 << 20;
 const MAX_FRAMING: usize = 64 << 10;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const BODY_READ_TIMEOUT: Duration = REQUEST_READ_TIMEOUT;
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(600);
+const MAX_STREAM_WRITE_TIME: Duration = Duration::from_secs(15);
+
+trait ServeClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn wait_timeout<'a>(
+        &self,
+        cvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, AdmissionInner>,
+        dur: Duration,
+    ) -> std::sync::MutexGuard<'a, AdmissionInner>;
+    fn on_admission_parked(&self) {}
+}
+
+struct SystemServeClock;
+
+impl ServeClock for SystemServeClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wait_timeout<'a>(
+        &self,
+        cvar: &Condvar,
+        guard: std::sync::MutexGuard<'a, AdmissionInner>,
+        dur: Duration,
+    ) -> std::sync::MutexGuard<'a, AdmissionInner> {
+        cvar.wait_timeout(guard, dur).unwrap_or_else(|e| e.into_inner()).0
+    }
+}
 
 /// Bounds an entire phase (such as reading the HTTP request head) by a single wall-clock deadline
 /// rather than resetting a timeout on every read syscall.
+#[cfg(test)]
 struct DeadlineReader<R, N, S> {
     inner: R,
     deadline: Instant,
@@ -1097,6 +1547,7 @@ struct DeadlineReader<R, N, S> {
     set_timeout: S,
 }
 
+#[cfg(test)]
 impl<R, N, S> DeadlineReader<R, N, S> {
     fn new(inner: R, deadline: Instant, now: N, set_timeout: S) -> Self {
         Self { inner, deadline, now, set_timeout }
@@ -1107,6 +1558,7 @@ impl<R, N, S> DeadlineReader<R, N, S> {
     }
 }
 
+#[cfg(test)]
 impl<R, N: FnMut() -> Instant, S> DeadlineReader<R, N, S> {
     fn remaining(&mut self) -> std::io::Result<Duration> {
         let remaining = self.deadline.saturating_duration_since((self.now)());
@@ -1117,11 +1569,176 @@ impl<R, N: FnMut() -> Instant, S> DeadlineReader<R, N, S> {
     }
 }
 
+#[cfg(test)]
 impl<R: Read, N: FnMut() -> Instant, S: FnMut(Duration) -> std::io::Result<()>> Read for DeadlineReader<R, N, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let remaining = self.remaining()?;
         (self.set_timeout)(remaining)?;
         self.inner.read(buf)
+    }
+}
+
+trait ConnIo: Read + Write {
+    fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+    #[cfg(test)]
+    fn set_nonblocking_opt(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        let _ = nonblocking;
+        Ok(())
+    }
+    #[cfg(test)]
+    fn peer_ip(&self) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    }
+    fn peer_disconnected(&self) -> bool;
+}
+
+impl ConnIo for TcpStream {
+    fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(dur)
+    }
+    fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(dur)
+    }
+    #[cfg(test)]
+    fn set_nonblocking_opt(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        self.set_nonblocking(nonblocking)
+    }
+    #[cfg(test)]
+    fn peer_ip(&self) -> IpAddr {
+        self.peer_addr()
+            .map(|a| a.ip())
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+    fn peer_disconnected(&self) -> bool {
+        peer_gone(self)
+    }
+}
+
+struct ConnDeadlineReader<'a, S> {
+    inner: &'a mut S,
+    clock: &'a dyn ServeClock,
+    deadline: Option<Instant>,
+    timeout_msg: &'static str,
+}
+
+impl<'a, S: ConnIo> ConnDeadlineReader<'a, S> {
+    fn new(inner: &'a mut S, clock: &'a dyn ServeClock, deadline: Instant, timeout_msg: &'static str) -> Self {
+        Self { inner, clock, deadline: Some(deadline), timeout_msg }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant, timeout_msg: &'static str) {
+        self.deadline = Some(deadline);
+        self.timeout_msg = timeout_msg;
+    }
+
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let Some(deadline) = self.deadline else {
+            return Ok(Duration::MAX);
+        };
+        let rem = deadline.saturating_duration_since(self.clock.now());
+        if rem.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, self.timeout_msg));
+        }
+        Ok(rem)
+    }
+}
+
+impl<S: ConnIo> Read for ConnDeadlineReader<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let rem = deadline.saturating_duration_since(self.clock.now());
+            if rem.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, self.timeout_msg));
+            }
+            self.inner.set_read_timeout_opt(Some(rem))?;
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Bounds response / SSE writes across an entire connection so a dribbling reader that drains
+/// a few bytes under each per-syscall write timeout is still cut off once cumulative write stall
+/// (`max_write_time`) or total stream wall time (`max_total_duration`) expires.
+struct StreamDeadlineWriter<'a, S> {
+    inner: &'a mut S,
+    clock: &'a dyn ServeClock,
+    stream_deadline: Instant,
+    max_write_time: Duration,
+    per_write_timeout: Duration,
+    write_elapsed: Duration,
+}
+
+impl<'a, S: ConnIo> StreamDeadlineWriter<'a, S> {
+    fn new(
+        inner: &'a mut S,
+        clock: &'a dyn ServeClock,
+        max_total_duration: Duration,
+        max_write_time: Duration,
+        per_write_timeout: Duration,
+    ) -> Self {
+        let now = clock.now();
+        Self {
+            inner,
+            clock,
+            stream_deadline: now + max_total_duration,
+            max_write_time,
+            per_write_timeout,
+            write_elapsed: Duration::ZERO,
+        }
+    }
+
+    fn prepare_write_window(&mut self) -> std::io::Result<Instant> {
+        let now = self.clock.now();
+        let rem_total = self.stream_deadline.saturating_duration_since(now);
+        let rem_write = self.max_write_time.saturating_sub(self.write_elapsed);
+        let rem = rem_total.min(rem_write).min(self.per_write_timeout);
+        if rem.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streaming response write deadline exceeded",
+            ));
+        }
+        self.inner.set_write_timeout_opt(Some(rem))?;
+        Ok(now)
+    }
+
+    fn finish_write_window(&mut self, started_at: Instant) -> std::io::Result<()> {
+        let now = self.clock.now();
+        self.write_elapsed = self.write_elapsed.saturating_add(now.saturating_duration_since(started_at));
+        if self.write_elapsed >= self.max_write_time || now >= self.stream_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streaming response write deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<S: ConnIo> Write for StreamDeadlineWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let started_at = self.prepare_write_window()?;
+        let n = match self.inner.write(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, e));
+            }
+            Err(e) => return Err(e),
+        };
+        self.finish_write_window(started_at)?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let started_at = self.prepare_write_window()?;
+        if let Err(e) = self.inner.flush() {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, e));
+            }
+            return Err(e);
+        }
+        self.finish_write_window(started_at)
     }
 }
 
@@ -1138,7 +1755,11 @@ fn read_bounded_line(r: &mut impl BufRead, limit: usize) -> std::io::Result<Stri
 fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
     let line = read_bounded_line(r, 8192)?;
     let mut it = line.split_whitespace();
-    let mut h = Head { method: it.next().unwrap_or("").to_string(), path: it.next().unwrap_or("").to_string(), len: 0, auth: None, api_key: None, card_id: None, chunked: false };
+    let mut h = Head {
+        method: it.next().unwrap_or("").to_string(),
+        path: it.next().unwrap_or("").to_string(),
+        ..Head::default()
+    };
     for _ in 0..128 {
         let l = read_bounded_line(r, 16384)?;
         if l == "\r\n" || l == "\n" { return Ok(h); }
@@ -1151,6 +1772,15 @@ fn read_head(r: &mut impl BufRead) -> std::io::Result<Head> {
             }
             if k.eq_ignore_ascii_case("x-api-key") { h.api_key = Some(v.to_string()); }
             if k.eq_ignore_ascii_case("x-inky-card-id") { h.card_id = crate::record::sanitize_card_id(Some(v)); }
+            if k.eq_ignore_ascii_case("host") {
+                if h.host.is_some() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate Host header"));
+                }
+                h.host = Some(v.to_string());
+            }
+            if k.eq_ignore_ascii_case("origin") { h.origin = Some(v.to_string()); }
+            if k.eq_ignore_ascii_case("sec-fetch-site") { h.sec_fetch_site = Some(v.to_string()); }
+            if k.eq_ignore_ascii_case("content-type") { h.content_type = Some(v.to_string()); }
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many headers"))
@@ -1229,15 +1859,30 @@ impl<'a> RequestBody<'a> {
 enum BodyError {
     TooLarge,
     Busy,
+    TimedOut,
     Incomplete,
     Malformed(String),
     InvalidJson(serde_json::Error),
 }
 
+fn map_chunk_io_err(ctx: &str, e: std::io::Error) -> BodyError {
+    if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+        BodyError::TimedOut
+    } else {
+        BodyError::Malformed(format!("{ctx}: {e}"))
+    }
+}
+
 fn read_fixed<'a>(r: &mut impl Read, len: usize, budget: &'a BodyBudget) -> Result<RequestBody<'a>, BodyError> {
     let mut body = RequestBody::new(budget);
     body.grow(len, len)?;
-    r.read_exact(&mut body.bytes).map_err(|_| BodyError::Incomplete)?;
+    r.read_exact(&mut body.bytes).map_err(|e| {
+        if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+            BodyError::TimedOut
+        } else {
+            BodyError::Incomplete
+        }
+    })?;
     Ok(body)
 }
 
@@ -1250,27 +1895,27 @@ fn read_chunked<'a>(r: &mut impl BufRead, max: usize, budget: &'a BodyBudget) ->
     let mut body = RequestBody::new(budget);
     let mut framing = 0usize;
     loop {
-        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("chunk size: {e}")))?;
+        let line = read_bounded_line(r, 8192.min(MAX_FRAMING - framing)).map_err(|e| map_chunk_io_err("chunk size", e))?;
         framing += line.len();
         let size = line.trim_end_matches(['\r', '\n']).split(';').next().unwrap_or("").trim();
         let n = usize::try_from(u64::from_str_radix(size, 16).map_err(|_| bad("bad chunk size"))?).map_err(|_| bad("chunk size too large"))?;
         if n == 0 {
             for _ in 0..128 {
-                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| bad(&format!("trailer: {e}")))?;
+                let t = read_bounded_line(r, 16384.min(MAX_FRAMING - framing)).map_err(|e| map_chunk_io_err("trailer", e))?;
                 framing += t.len();
                 if t == "\r\n" || t == "\n" { return Ok(body); }
                 if !t.contains(':') { return Err(bad("bad trailer")); }
             }
             return Err(bad("too many trailers"));
         }
-        if n > max - body.bytes.len() { return Err(BodyError::TooLarge); }
+        if n > max - body.bytes.len().min(max) { return Err(BodyError::TooLarge); }
         let at = body.bytes.len();
         body.grow(at + n, max)?;
-        r.read_exact(&mut body.bytes[at..]).map_err(|e| bad(&format!("chunk body: {e}")))?;
+        r.read_exact(&mut body.bytes[at..]).map_err(|e| map_chunk_io_err("chunk body", e))?;
         let mut eol = [0u8; 1];
-        r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+        r.read_exact(&mut eol).map_err(|e| map_chunk_io_err("chunk end", e))?;
         let eol_len = if eol[0] == b'\r' {
-            r.read_exact(&mut eol).map_err(|e| bad(&format!("chunk end: {e}")))?;
+            r.read_exact(&mut eol).map_err(|e| map_chunk_io_err("chunk end", e))?;
             2
         } else { 1 };
         if eol[0] != b'\n' { return Err(bad("chunk not followed by CRLF")); }
@@ -1315,14 +1960,90 @@ fn route(method: &str, path: &str) -> Route {
     }
 }
 
+fn parse_host_authority(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    if s.is_empty() || s.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let (inside, tail) = rest.split_once(']')?;
+        if inside.is_empty() {
+            return None;
+        }
+        if !tail.is_empty() {
+            let port_s = tail.strip_prefix(':')?;
+            let _: u16 = port_s.parse().ok()?;
+        }
+        return Some(inside);
+    }
+    if let Some((host_part, port_s)) = s.rsplit_once(':') {
+        if host_part.is_empty() || host_part.contains(':') {
+            return None;
+        }
+        let _: u16 = port_s.parse().ok()?;
+        return Some(host_part);
+    }
+    Some(s)
+}
+
+fn is_allowed_unkeyed_host(raw: &str, allow_private_non_loopback: bool) -> bool {
+    let Some(host) = parse_host_authority(raw) else { return false };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else { return false };
+    if allow_private_non_loopback {
+        is_private_ip(ip)
+    } else {
+        ip.to_canonical().is_loopback()
+    }
+}
+
+fn has_json_content_type(ct: Option<&str>) -> bool {
+    let Some(raw) = ct else { return false };
+    let media = raw.split(';').next().unwrap_or("").trim();
+    media.eq_ignore_ascii_case("application/json")
+}
+
 /// Decide header-only rejections before allocating or reading the request body.
 /// A chunked body has no length to check here: its cap is enforced chunk by
 /// chunk in `read_chunked`, after this gate and after the key check.
+#[cfg(test)]
 fn check_headers(h: &Head, path: &str, key: Option<&str>, body_limit: usize) -> Result<(), (u16, String)> {
+    check_headers_with_policy(h, path, key, false, body_limit)
+}
+
+fn check_headers_with_policy(
+    h: &Head,
+    path: &str,
+    key: Option<&str>,
+    allow_private_non_loopback: bool,
+    body_limit: usize,
+) -> Result<(), (u16, String)> {
     if let Some(k) = key {
         let authed = h.auth.as_deref().is_some_and(|a| same_key(a, k)) || h.api_key.as_deref().is_some_and(|a| same_key(a, k));
         if path != "/health" && !authed {
             return Err((401, "a valid x-api-key or Authorization: Bearer [REDACTED] is required".into()));
+        }
+    } else {
+        if h.origin.is_some()
+            || h.sec_fetch_site
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case("none"))
+        {
+            return Err((403, "browser Origin / Fetch requests are refused on an unauthenticated server".into()));
+        }
+        if !h
+            .host
+            .as_deref()
+            .is_some_and(|host| is_allowed_unkeyed_host(host, allow_private_non_loopback))
+        {
+            return Err((403, "Host header must name a loopback address on an unauthenticated server".into()));
+        }
+        if matches!(route(&h.method, path), Route::Chat | Route::Messages | Route::CountTokens)
+            && !has_json_content_type(h.content_type.as_deref())
+        {
+            return Err((415, "Content-Type must be application/json".into()));
         }
     }
     if !h.chunked && h.len > body_limit { return Err((413, format!("the body is over {body_limit} bytes"))); }
@@ -1399,6 +2120,9 @@ fn check_serve_shape(ctx: usize, max_tokens: usize) -> Result<(), String> {
 trait ClientWrite: Write {
     fn client_gone(&self) -> bool;
 }
+impl<S: ConnIo> ClientWrite for StreamDeadlineWriter<'_, S> {
+    fn client_gone(&self) -> bool { self.inner.peer_disconnected() }
+}
 impl ClientWrite for TcpStream {
     fn client_gone(&self) -> bool { peer_gone(self) }
 }
@@ -1461,22 +2185,69 @@ struct AdmissionInner {
     waiters: VecDeque<u64>,
 }
 
+/// Server-side negative-control faults for `tests/servecheck`, strictly inert unless BOTH
+/// `INKY_SERVE_ALLOW_FAULT_INJECTION=1` AND `INKY_SERVE_FAULT` are set in the environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ServeFaults {
+    health_status: bool,
+    ignore_budget: bool,
+    skip_thinking_cancel: bool,
+    leak_permit: bool,
+}
+
+impl ServeFaults {
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        if get("INKY_SERVE_ALLOW_FAULT_INJECTION").as_deref() != Some("1") {
+            return Ok(Self::default());
+        }
+        let Some(raw) = get("INKY_SERVE_FAULT") else {
+            return Ok(Self::default());
+        };
+        let mut out = Self::default();
+        for token in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match token {
+                "all" => {
+                    out.health_status = true;
+                    out.ignore_budget = true;
+                    out.skip_thinking_cancel = true;
+                    out.leak_permit = true;
+                }
+                "health-status" => out.health_status = true,
+                "ignore-budget" => out.ignore_budget = true,
+                "skip-thinking-cancel" => out.skip_thinking_cancel = true,
+                "leak-permit" => out.leak_permit = true,
+                other => return Err(format!("unknown INKY_SERVE_FAULT {other:?} (expected health-status|leak-permit|skip-thinking-cancel|ignore-budget|all)")),
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Bounded FIFO admission gate: up to `max_lanes` requests hold active lane slots,
 /// up to `max_queue` additional requests wait with a bounded timeout, and any request
 /// beyond queue capacity (or timing out waiting for admission) is refused with 429 + Retry-After.
 struct AdmissionGate {
     inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+    clock: Arc<dyn ServeClock>,
     queue_timeout: Duration,
     poll_interval: Duration,
     retry_after_secs: u64,
+    leak_first_release: Option<Arc<std::sync::atomic::AtomicBool>>,
+    faults: ServeFaults,
 }
 
 struct LanePermit {
     inner: Arc<(Mutex<AdmissionInner>, Condvar)>,
+    leak_first_release: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for LanePermit {
     fn drop(&mut self) {
+        if let Some(flag) = &self.leak_first_release {
+            if !flag.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
         let (lock, cvar) = &*self.inner;
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         st.admitted = st.admitted.saturating_sub(1);
@@ -1514,6 +2285,24 @@ impl AdmissionGate {
         poll_interval: Duration,
         retry_after_secs: u64,
     ) -> Self {
+        Self::with_clock(
+            max_lanes,
+            max_queue,
+            queue_timeout,
+            poll_interval,
+            retry_after_secs,
+            Arc::new(SystemServeClock),
+        )
+    }
+
+    fn with_clock(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        poll_interval: Duration,
+        retry_after_secs: u64,
+        clock: Arc<dyn ServeClock>,
+    ) -> Self {
         Self {
             inner: Arc::new((
                 Mutex::new(AdmissionInner {
@@ -1525,10 +2314,21 @@ impl AdmissionGate {
                 }),
                 Condvar::new(),
             )),
+            clock,
             queue_timeout,
             poll_interval: poll_interval.max(Duration::from_millis(1)),
             retry_after_secs: retry_after_secs.max(1),
+            leak_first_release: None,
+            faults: ServeFaults::default(),
         }
+    }
+
+    fn with_faults(mut self, faults: ServeFaults) -> Self {
+        if faults.leak_permit {
+            self.leak_first_release = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        }
+        self.faults = faults;
+        self
     }
 
     #[cfg(test)]
@@ -1537,7 +2337,7 @@ impl AdmissionGate {
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.admitted < st.max_lanes && st.waiters.is_empty() {
             st.admitted += 1;
-            return Some(LanePermit { inner: self.inner.clone() });
+            return Some(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
         }
         None
     }
@@ -1547,7 +2347,7 @@ impl AdmissionGate {
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.admitted < st.max_lanes && st.waiters.is_empty() {
             st.admitted += 1;
-            return Ok(LanePermit { inner: self.inner.clone() });
+            return Ok(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
         }
         if st.waiters.len() >= st.max_queue {
             return Err(AdmissionReject::QueueFull);
@@ -1556,29 +2356,33 @@ impl AdmissionGate {
         st.next_ticket = st.next_ticket.wrapping_add(1);
         st.waiters.push_back(ticket);
         let mut guard = WaiterGuard { inner: &self.inner, ticket, armed: true };
-        let deadline = Instant::now() + self.queue_timeout;
+        let deadline = self.clock.now() + self.queue_timeout;
+        let mut announced_park = false;
         loop {
             if st.waiters.front() == Some(&ticket) && st.admitted < st.max_lanes {
                 st.waiters.pop_front();
                 st.admitted += 1;
                 guard.armed = false;
                 cvar.notify_all();
-                return Ok(LanePermit { inner: self.inner.clone() });
+                return Ok(LanePermit { inner: self.inner.clone(), leak_first_release: self.leak_first_release.clone() });
             }
             if is_gone() {
                 drop(st);
                 drop(guard);
                 return Err(AdmissionReject::ClientGone);
             }
-            let rem = deadline.saturating_duration_since(Instant::now());
+            let rem = deadline.saturating_duration_since(self.clock.now());
             if rem.is_zero() {
                 drop(st);
                 drop(guard);
                 return Err(AdmissionReject::QueueTimeout);
             }
+            if !announced_park {
+                announced_park = true;
+                self.clock.on_admission_parked();
+            }
             let wait = rem.min(self.poll_interval);
-            let (next_st, _) = cvar.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
-            st = next_st;
+            st = self.clock.wait_timeout(cvar, st, wait);
         }
     }
 
@@ -1610,16 +2414,25 @@ struct Ctx { metrics: Arc<Mutex<Counters>>, tk: Arc<Tokenizer>, sp: Specials, jo
              count_preprocess: PermitPool,
              /// Lanes currently occupied by an active job in the scheduler.
              active_lanes: Arc<AtomicUsize>,
-             /// Live connections, capped globally and per peer.
+             /// Live connections, capped globally (clamped below soft RLIMIT_NOFILE) and per peer.
              conns: ConnectionSlots,
              /// opt-in non-blocking JSONL card traffic recorder
-             recorder: Option<Arc<crate::record::Recorder>> }
+             recorder: Option<Arc<crate::record::Recorder>>,
+             /// opt-in Layer 4 SSD spill telemetry (`--spill-dir`)
+             spill_telemetry: Option<Arc<SpillTelemetry>> }
 const MAX_CONNS: usize = 512;
 const MAX_PEER_CONNS: usize = 128;
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-#[derive(Default)]
-struct ConnectionSlots(Arc<Mutex<ConnectionCounts>>);
+struct ConnectionSlots {
+    counts: Arc<Mutex<ConnectionCounts>>,
+    max_total: usize,
+}
+
+impl Default for ConnectionSlots {
+    fn default() -> Self {
+        Self::with_max_total(MAX_CONNS)
+    }
+}
 
 #[derive(Default)]
 struct ConnectionCounts {
@@ -1633,10 +2446,20 @@ struct ConnectionSlot {
 }
 
 impl ConnectionSlots {
+    fn with_max_total(max_total: usize) -> Self {
+        Self { counts: Arc::new(Mutex::new(ConnectionCounts::default())), max_total }
+    }
+
+    #[cfg(test)]
     fn acquire(&self, peer: IpAddr) -> Option<ConnectionSlot> {
+        self.acquire_capped(peer, self.max_total)
+    }
+
+    fn acquire_capped(&self, peer: IpAddr, max_total: usize) -> Option<ConnectionSlot> {
+        let limit = self.max_total.min(max_total);
         let peer = peer.to_canonical();
-        let mut counts = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if counts.total >= MAX_CONNS {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if counts.total >= limit {
             return None;
         }
         let active = counts.peers.entry(peer).or_default();
@@ -1645,7 +2468,17 @@ impl ConnectionSlots {
         }
         *active += 1;
         counts.total += 1;
-        Some(ConnectionSlot { counts: self.0.clone(), peer })
+        Some(ConnectionSlot { counts: self.counts.clone(), peer })
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).total
+    }
+
+    #[cfg(test)]
+    fn set_total_for_test(&self, total: usize) {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).total = total;
     }
 }
 
@@ -1717,6 +2550,18 @@ fn health_body(cx: &Ctx) -> String {
         obj.insert("record_dropped".into(), json!(rec.dropped_count()));
         obj.insert("record_write_errors".into(), json!(rec.write_error_count()));
         obj.insert("record_rotations".into(), json!(rec.rotation_count()));
+    }
+    if let Some(sp) = &cx.spill_telemetry {
+        obj.insert("spill_starts_spilled".into(), json!(sp.starts_spilled.load(Ordering::Relaxed)));
+        obj.insert("spill_starts_restored".into(), json!(sp.starts_restored.load(Ordering::Relaxed)));
+        obj.insert("spill_spilled_starts_indexed".into(), json!(sp.spilled_starts_indexed.load(Ordering::Relaxed)));
+        obj.insert("spill_corrupt_fallbacks".into(), json!(sp.corrupt_fallbacks.load(Ordering::Relaxed)));
+        obj.insert("spill_corrupt_files_removed".into(), json!(sp.corrupt_files_removed.load(Ordering::Relaxed)));
+        let restore_ms = sp.last_restore_us.load(Ordering::Relaxed) as f64 / 1000.0;
+        obj.insert("spill_last_restore_ms".into(), json!(restore_ms));
+        obj.insert("spill_writes_committed".into(), json!(sp.writes_committed.load(Ordering::Relaxed)));
+        obj.insert("spill_reads_hit".into(), json!(sp.reads_hit.load(Ordering::Relaxed)));
+        obj.insert("spill_bytes_used".into(), json!(sp.bytes_used.load(Ordering::Relaxed)));
     }
     Value::Object(obj).to_string()
 }
@@ -1842,12 +2687,23 @@ impl TurnDelivery {
 }
 
 fn record_delivery(
-    cx: &Ctx, req: &Value, card_id: Option<&str>, endpoint: &str,
+    cx: &Ctx,
+    req: &Value,
+    card_id: Option<&str>,
+    endpoint: &str,
+    start: Instant,
+    prompt_tokens: usize,
     respond: impl FnOnce(&mut TurnDelivery) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let mut turn = TurnDelivery {
-        start: Instant::now(), first_token: None, prompt_tokens: 0, completion_tokens: 0,
-        phase_ms: (0, 0, 0), finish_reason: "cancelled", status_code: 499, generation_finish_reason: None,
+        start,
+        first_token: None,
+        prompt_tokens,
+        completion_tokens: 0,
+        phase_ms: (0, 0, 0),
+        finish_reason: "cancelled",
+        status_code: 499,
+        generation_finish_reason: None,
     };
     let recording = cx.recorder.as_ref().map(|rec| (rec, rec.allocate_turn(card_id)));
     let result = respond(&mut turn);
@@ -1880,15 +2736,10 @@ fn chat<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::io::R
 }
 
 fn chat_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    record_delivery(cx, req, card_id, "/v1/chat/completions", |turn| chat_response(cx, req, s, turn))
-}
-
-fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
-    // every client-controlled number is checked here, never in the scheduler
-    let mut bad = |m: String| {
-        turn.status(400, "invalid_request");
-        respond(s, 400, &json!({"error": {"message": m}}).to_string())
-    };
+    let req_start = Instant::now();
+    // every client-controlled number is checked here, never in the scheduler;
+    // refused requests (400 / 429 / pre-admission 499 / 503) never allocate a turn or clone `req` into the recorder.
+    let mut bad = |m: String| respond(s, 400, &json!({"error": {"message": m}}).to_string());
     if let Err(message) = check_generation_controls(req, Route::Chat) { return bad(message); }
     let mut budgets = [None, None];
     for (i, name) in ["max_tokens", "max_completion_tokens"].iter().enumerate() {
@@ -1937,11 +2788,9 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
         Err(AdmitError::Overloaded(e)) => {
-            turn.status(429, "overloaded");
             return openai_overloaded(s, cx.admission.retry_after_secs(), e);
         }
         Err(AdmitError::ClientGone) => {
-            turn.status(499, "cancelled");
             return Ok(());
         }
     };
@@ -1956,15 +2805,14 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                 RenderError::Invalid(message) => message,
                 RenderError::TooLong => format!("context full: more than {prompt_limit} prompt tokens and at least 1 to generate, {} per lane", cx.ctx),
             };
-            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
-    let max = match clamped_chat_max(toks.len(), requested_max, cx.ctx) {
+    let prompt_len = toks.len();
+    let max = match clamped_chat_max(prompt_len, requested_max, cx.ctx) {
         Ok(m) => m,
         Err(message) => {
             drop(permit);
-            turn.status(400, "invalid_request");
             return respond(s, 400, &json!({"error": {"message": message}}).to_string());
         }
     };
@@ -1976,12 +2824,24 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         h
     });
     let (tx, rx) = job_events();
-    turn.prompt_tokens = toks.len();
-    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
     if enqueue(cx, job).is_err() {
-        turn.status(503, "unavailable");
         return respond(s, 503, &json!({"error": {"message": "the scheduler stopped"}}).to_string());
     }
+    record_delivery(cx, req, card_id, "/v1/chat/completions", req_start, prompt_len, |turn| {
+        chat_stream_or_reply(cx, req, seq, include_usage, rx, s, turn)
+    })
+}
+
+fn chat_stream_or_reply<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    seq: u64,
+    include_usage: bool,
+    rx: JobEvents,
+    s: &mut W,
+    turn: &mut TurnDelivery,
+) -> std::io::Result<()> {
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("chatcmpl-{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -1992,6 +2852,8 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         s.flush()?;
     }
     let sp = cx.sp;
+    let skip_thinking_cancel = cx.admission.faults.skip_thinking_cancel;
+    let mut saw_thinking = false;
     let (mut gen, mut mode, mut pend) = (Vec::<u32>::new(), 0u8, Vec::<u8>::new());
     loop {
         // wait for the scheduler, watching the client: a client gone drops `rx`, and the scheduler's next send to this
@@ -1999,7 +2861,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         let ev = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2009,7 +2871,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
         };
         match ev {
             Ev::Alive => {
-                if s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2017,7 +2879,7 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
             Ev::Tok(t) => {
                 turn.token();
                 gen.push(t);
-                if gen.len() % 16 == 0 && s.client_gone() {
+                if !(skip_thinking_cancel && saw_thinking) && gen.len() % 16 == 0 && s.client_gone() {
                     turn.status(499, "cancelled");
                     return Ok(());
                 }
@@ -2026,11 +2888,16 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                     let text = take_stream_text(&mut pend, true);
                     if !text.is_empty() && (mode == 1 || mode == 2) {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        let line = format!("data: {}\n\n", chunk(json!({key: text}), Value::Null));
+                        if skip_thinking_cancel && saw_thinking {
+                            let _ = s.write_all(line.as_bytes()).and_then(|()| s.flush());
+                        } else {
+                            s.write_all(line.as_bytes())?;
+                            s.flush()?;
+                        }
                     }
                 }
-                if t == sp.c_think { mode = 1; continue; }
+                if t == sp.c_think { mode = 1; saw_thinking = true; continue; }
                 if t == sp.c_text { mode = 2; continue; }
                 if t == sp.c_tool { mode = 3; continue; }
                 if t == sp.msg_model || t == sp.end || t == sp.end_sampling || t == cx.tk.eos { mode = 0; pend.clear(); continue; }
@@ -2040,8 +2907,13 @@ fn chat_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn
                     if !text.is_empty() {
                         let key = if mode == 1 { "reasoning_content" } else { "content" };
                         // a failed write drops `rx`: the scheduler sees the client gone and cancels the lane
-                        write!(s, "data: {}\n\n", chunk(json!({key: text}), Value::Null))?;
-                        s.flush()?;
+                        let line = format!("data: {}\n\n", chunk(json!({key: text}), Value::Null));
+                        if skip_thinking_cancel && saw_thinking {
+                            let _ = s.write_all(line.as_bytes()).and_then(|()| s.flush());
+                        } else {
+                            s.write_all(line.as_bytes())?;
+                            s.flush()?;
+                        }
                     }
                 }
             }
@@ -2108,19 +2980,16 @@ fn messages<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W) -> std::i
 }
 
 fn messages_with_card<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, card_id: Option<&str>, s: &mut W) -> std::io::Result<()> {
-    record_delivery(cx, req, card_id, "/v1/messages", |turn| messages_response(cx, req, s, turn))
-}
-
-fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, turn: &mut TurnDelivery) -> std::io::Result<()> {
-    // every client-controlled number is checked here, never in the scheduler (the chat path's rule)
+    let req_start = Instant::now();
+    // every client-controlled number is checked here, never in the scheduler (the chat path's rule);
+    // refused requests (400 / 429 / pre-admission 499 / 503) never allocate a turn or clone `req` into the recorder.
     if let Err(message) = check_generation_controls(req, Route::Messages) {
-        turn.status(400, "invalid_request_error");
         return anthropic_error(s, 400, "invalid_request_error", &message);
     }
     let max = match req["max_tokens"].as_u64() {
-        Some(0) => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"); }
+        Some(0) => return anthropic_error(s, 400, "invalid_request_error", "max_tokens must be positive"),
         Some(v) => usize::try_from(v).unwrap_or(usize::MAX),
-        None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"); }
+        None => return anthropic_error(s, 400, "invalid_request_error", "max_tokens is required"),
     };
     let temp = req["temperature"].as_f64().unwrap_or(1.0);
     let top_p = req["top_p"].as_f64().unwrap_or(0.95);
@@ -2128,7 +2997,7 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         None | Some(Value::Null) => 64,
         Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
             Some(k) => k,
-            None => { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"); }
+            None => return anthropic_error(s, 400, "invalid_request_error", "top_k must be a nonnegative integer"),
         },
     };
     let thinking_budget = match req.get("thinking").and_then(|t| t.as_object()) {
@@ -2141,18 +3010,15 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         None | Some(Value::Null) => cx.loopcd_omega,
         Some(v) => match v.as_f64() {
             Some(w) if w.is_finite() && (0.0..=4.0).contains(&w) => w as f32,
-            _ => {
-                turn.status(400, "invalid_request_error");
-                return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4");
-            }
+            _ => return anthropic_error(s, 400, "invalid_request_error", "loopcd_omega must be a finite number between 0 and 4"),
         },
     };
-    if !(0.0..=2.0).contains(&temp) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
-    if !(top_p > 0.0 && top_p <= 1.0) { turn.status(400, "invalid_request_error"); return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
+    if !(0.0..=2.0).contains(&temp) { return anthropic_error(s, 400, "invalid_request_error", "temperature must be between 0 and 2"); }
+    if !(top_p > 0.0 && top_p <= 1.0) { return anthropic_error(s, 400, "invalid_request_error", "top_p must be in (0, 1]"); }
     let (permit, preprocess) = match cx.admit_for_render(|| s.client_gone()) {
         Ok(permits) => permits,
-        Err(AdmitError::Overloaded(e)) => { turn.status(429, "rate_limit_error"); return anthropic_overloaded(s, cx.admission.retry_after_secs(), e); }
-        Err(AdmitError::ClientGone) => { turn.status(499, "cancelled"); return Ok(()); }
+        Err(AdmitError::Overloaded(e)) => return anthropic_overloaded(s, cx.admission.retry_after_secs(), e),
+        Err(AdmitError::ClientGone) => return Ok(()),
     };
     let prompt_limit = cx.ctx.saturating_sub(3);
     let rendered = render_messages(cx, req, prompt_limit);
@@ -2166,7 +3032,6 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
                 // Retain the numeric error format used by clients for reactive compaction.
                 RenderError::TooLong => format!("prompt is too long: {} tokens > {prompt_limit} maximum", prompt_limit + 1),
             };
-            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &message);
         }
     };
@@ -2175,7 +3040,6 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         Ok(m) => m,
         Err(e) => {
             drop(permit);
-            turn.status(400, "invalid_request_error");
             return anthropic_error(s, 400, "invalid_request_error", &e);
         }
     };
@@ -2187,9 +3051,22 @@ fn messages_response<W: ClientWrite + ?Sized>(cx: &Ctx, req: &Value, s: &mut W, 
         h
     };
     let (tx, rx) = job_events();
-    turn.prompt_tokens = toks.len();
-    let job = Job { seq, queued_at: turn.start, toks, max, temp: temp as f32, top_k, top_p: top_p as f32, seed, thinking_budget, loopcd_omega, out: tx, _permit: permit };
-    if enqueue(cx, job).is_err() { turn.status(503, "api_error"); return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    let job = Job::new(seq, req_start, toks, max, temp as f32, top_k, top_p as f32, seed, thinking_budget, loopcd_omega, tx, permit);
+    if enqueue(cx, job).is_err() { return anthropic_error(s, 503, "api_error", "the scheduler stopped"); }
+    record_delivery(cx, req, card_id, "/v1/messages", req_start, prompt_len, |turn| {
+        messages_stream_or_reply(cx, req, seq, prompt_len, rx, s, turn)
+    })
+}
+
+fn messages_stream_or_reply<W: ClientWrite + ?Sized>(
+    cx: &Ctx,
+    req: &Value,
+    seq: u64,
+    prompt_len: usize,
+    rx: JobEvents,
+    s: &mut W,
+    turn: &mut TurnDelivery,
+) -> std::io::Result<()> {
     let stream = req["stream"].as_bool().unwrap_or(false);
     let id = format!("msg_{seq}");
     let model = req["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("inkling-2-mini").to_string();
@@ -2306,16 +3183,272 @@ pub fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Validates resolved `--bind` socket addresses against `serve`'s binding and authentication rules:
+/// every bound IP must be loopback or private/Tailscale/link-local/ULA (wildcard `0.0.0.0` / `::`
+/// and public addresses are refused), and non-loopback binds require `--key-env` unless
+/// `--allow-unauthenticated-non-loopback` is explicitly set.
+pub fn validate_bind_addrs(
+    addrs: &[std::net::SocketAddr],
+    has_key: bool,
+    allow_unauthenticated_non_loopback: bool,
+) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err("--bind resolved to no addresses".into());
+    }
+    if let Some(bad) = addrs.iter().find(|addr| !is_private_ip(addr.ip())) {
+        return Err(format!(
+            "--bind address {} is neither loopback nor a private/Tailscale network address",
+            bad.ip()
+        ));
+    }
+    if !has_key
+        && !allow_unauthenticated_non_loopback
+        && addrs.iter().any(|addr| !addr.ip().to_canonical().is_loopback())
+    {
+        return Err("a non-loopback --bind requires --key-env or --allow-unauthenticated-non-loopback".into());
+    }
+    Ok(())
+}
+
+struct ConnConfig {
+    clock: Arc<dyn ServeClock>,
+    max_conns: usize,
+    max_body: usize,
+    max_count_body: usize,
+    allow_private_non_loopback_host: bool,
+    header_read_timeout: Duration,
+    body_read_timeout: Duration,
+    client_write_timeout: Duration,
+    stream_total_timeout: Duration,
+    stream_write_budget: Duration,
+}
+
+impl ConnConfig {
+    fn production(max_conns: usize, allow_private_non_loopback_host: bool) -> Self {
+        Self {
+            clock: Arc::new(SystemServeClock),
+            max_conns,
+            max_body: MAX_BODY,
+            max_count_body: MAX_COUNT_BODY,
+            allow_private_non_loopback_host,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            body_read_timeout: REQUEST_READ_TIMEOUT,
+            client_write_timeout: CLIENT_WRITE_TIMEOUT,
+            stream_total_timeout: MAX_STREAM_DURATION,
+            stream_write_budget: MAX_STREAM_WRITE_TIME,
+        }
+    }
+}
+
+#[cfg(test)]
+fn try_acquire_conn_slot<S: ConnIo>(cx: &Ctx, s: &mut S, cfg: &ConnConfig) -> Option<ConnectionSlot> {
+    let Some(slot) = cx.conns.acquire_capped(s.peer_ip(), cfg.max_conns) else {
+        let _ = s.set_nonblocking_opt(true);
+        let _ = s.set_write_timeout_opt(Some(cfg.client_write_timeout));
+        let _ = respond(s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
+        return None;
+    };
+    if s.set_write_timeout_opt(Some(cfg.client_write_timeout)).is_err() {
+        return None;
+    }
+    Some(slot)
+}
+
+fn respond_header_or_body_error<W: Write + ?Sized>(s: &mut W, path: &str, code: u16, message: &str) -> std::io::Result<()> {
+    if path.starts_with("/v1/messages") {
+        let kind = match code {
+            401 => "authentication_error",
+            403 => "permission_error",
+            413 => "request_too_large",
+            _ => "invalid_request_error",
+        };
+        anthropic_error(s, code, kind, message)
+    } else if code == 401 {
+        respond(
+            s,
+            code,
+            &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string(),
+        )
+    } else {
+        respond(s, code, &json!({"error": {"message": message}}).to_string())
+    }
+}
+
+fn handle_connection<S: ConnIo>(
+    cx: &Ctx,
+    body_budget: &BodyBudget,
+    mut s: S,
+    _conn: ConnectionSlot,
+    accepted_at: Instant,
+    cfg: &ConnConfig,
+) {
+    let clock = cfg.clock.as_ref();
+    let request_deadline = accepted_at + cfg.body_read_timeout;
+    let header_deadline = (accepted_at + cfg.header_read_timeout).min(request_deadline);
+    let mut r = BufReader::new(ConnDeadlineReader::new(
+        &mut s,
+        clock,
+        header_deadline,
+        "request header read deadline exceeded",
+    ));
+    let h = match read_head(&mut r) {
+        Ok(h) => h,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+            drop(r);
+            let _ = respond(&mut s, 408, &json!({"error": {"message": "request header read timed out"}}).to_string());
+            return;
+        }
+        Err(_) => return,
+    };
+    if r.get_mut().remaining().is_err() {
+        drop(r);
+        let _ = respond(&mut s, 408, &json!({"error": {"message": "request header read timed out"}}).to_string());
+        return;
+    }
+    let path = route_path(&h.path);
+    let method = h.method.clone();
+    let route = route(&method, &path);
+    let body_limit = if route == Route::CountTokens {
+        cfg.max_count_body.min(cfg.max_body)
+    } else {
+        cfg.max_body
+    };
+    // Header checks (auth, Origin/Host/Content-Type on unkeyed servers, fixed Content-Length cap)
+    // execute strictly before reading any request body bytes.
+    if let Err((code, message)) = check_headers_with_policy(
+        &h,
+        &path,
+        cx.key.as_deref(),
+        cfg.allow_private_non_loopback_host,
+        body_limit,
+    ) {
+        drop(r);
+        let _ = respond_header_or_body_error(&mut s, &path, code, &message);
+        return;
+    }
+    // Routes that do not use a body can answer without waiting for one.
+    if matches!(route, Route::Models | Route::Health | Route::NotFound) {
+        drop(r);
+        let result = match route {
+            Route::Models => respond(&mut s, 200, &models_body()),
+            Route::Health if cx.admission.faults.health_status => {
+                respond(&mut s, 503, &json!({"ok": false, "error": {"message": "injected health-status fault"}}).to_string())
+            }
+            Route::Health => respond(&mut s, 200, &health_body(cx)),
+            Route::NotFound if path.starts_with("/v1/messages") => {
+                anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}"))
+            }
+            Route::NotFound => {
+                respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string())
+            }
+            _ => unreachable!("body routes are handled below"),
+        };
+        if let Err(e) = result {
+            eprintln!("[serve] client: {e}");
+        }
+        return;
+    }
+    // Bound the entire request upload by `request_deadline`, read only after the header gate above.
+    r.get_mut()
+        .set_deadline(request_deadline, "request body read deadline exceeded");
+    let body = if h.chunked {
+        read_chunked(&mut r, body_limit, body_budget)
+    } else {
+        read_fixed(&mut r, h.len, body_budget)
+    };
+    // A completed body may have come entirely from BufReader's buffer; check the deadline anyway.
+    let body = body.and_then(|body| match r.get_mut().remaining() {
+        Ok(_) => Ok(body),
+        Err(_) => Err(BodyError::TimedOut),
+    });
+    drop(r);
+    let _ = s.set_read_timeout_opt(None);
+    let anthropic = matches!(route, Route::Messages | Route::CountTokens);
+    let _count_preprocess = if route == Route::CountTokens && body.is_ok() {
+        match cx.count_preprocess.acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let _ = anthropic_overloaded(&mut s, cx.admission.retry_after_secs(), "inky is busy: a token count is in progress");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
+        Ok(decoded) => decoded,
+        Err(BodyError::Busy) => {
+            let message = "inky is busy: the request body budget is full";
+            let retry = cx.admission.retry_after_secs();
+            let _ = if anthropic {
+                anthropic_overloaded(&mut s, retry, message)
+            } else {
+                openai_overloaded(&mut s, retry, message)
+            };
+            return;
+        }
+        Err(BodyError::Incomplete) => return,
+        Err(e) => {
+            let (code, message) = match e {
+                BodyError::TooLarge => (413, format!("the body is over {body_limit} bytes")),
+                BodyError::TimedOut => (408, "request body read timed out".to_string()),
+                BodyError::Malformed(m) => (400, format!("malformed chunked body: {m}")),
+                BodyError::InvalidJson(e) => (400, e.to_string()),
+                BodyError::Busy | BodyError::Incomplete => unreachable!(),
+            };
+            if let Err(e) = respond_header_or_body_error(&mut s, &path, code, &message) {
+                eprintln!("[serve] client: {e}");
+            }
+            return;
+        }
+    };
+    let card_id = h.card_id.as_deref();
+    let mut writer = StreamDeadlineWriter::new(
+        &mut s,
+        clock,
+        cfg.stream_total_timeout,
+        cfg.stream_write_budget,
+        cfg.client_write_timeout,
+    );
+    let result = match route {
+        Route::Chat => chat_with_card(cx, &decoded.value, card_id, &mut writer),
+        Route::Messages => messages_with_card(cx, &decoded.value, card_id, &mut writer),
+        Route::CountTokens => count_tokens(cx, &decoded.value, &mut writer),
+        _ => unreachable!("bodyless routes were handled above"),
+    };
+    drop(decoded);
+    if let Err(e) = result {
+        eprintln!("[serve] client: {e}");
+    }
+}
+
+#[cfg(test)]
+fn serve_one_connection<S: ConnIo>(cx: &Ctx, mut s: S, cfg: &ConnConfig) {
+    let accepted_at = cfg.clock.now();
+    let body_budget = BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
+    if let Some(guard) = try_acquire_conn_slot(cx, &mut s, cfg) {
+        handle_connection(cx, &body_budget, s, guard, accepted_at, cfg);
+    }
+}
+
 pub fn serve(o: ServeOpts) {
     if let Err(e) = check_serve_shape(o.ctx, o.max_tokens) { eprintln!("{e}"); std::process::exit(2); }
     if o.lanes == 0 || o.lanes > crate::engine::MAX_SPANS { eprintln!("--lanes must be between 1 and {}", crate::engine::MAX_SPANS); std::process::exit(2); }
+    if o.bind.is_empty() || o.bind.iter().any(|a| !is_private_ip(a.ip())) {
+        eprintln!("--bind must resolve only to loopback or private/Tailscale network addresses");
+        std::process::exit(2);
+    }
+    let allow_private_non_loopback_host =
+        o.key.is_none() && o.bind.iter().any(|a| !a.ip().to_canonical().is_loopback());
+    let faults = ServeFaults::from_lookup(|k| std::env::var(k).ok()).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2); });
+    let max_conns = crate::memd::raise_and_clamp_max_conns(MAX_CONNS, 64);
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     let eng = Engine::load(&o.model, o.ctx);
     eng.set_loopcd_omega(o.loopcd_omega);
     eng.ensure_batch(eng.chunk);
     let (chip, mem) = crate::tuning::this_machine();
     let safety_headroom_bytes = (crate::tuning::select(&chip, mem).lane_margin_gib * (1u64 << 30) as f64).round() as u64;
-    let budget = MemoryBudget::compute(
+    let mut budget = MemoryBudget::compute(
         eng.gpu.recommended_max_working_set_size(),
         eng.model_and_scratch_bytes(),
         safety_headroom_bytes,
@@ -2325,7 +3458,16 @@ pub fn serve(o: ServeOpts) {
     let effective_lanes = budget.max_admitted_lanes;
     if let Err(e) = eng.check_serve_decode(effective_lanes) { eprintln!("{e}"); std::process::exit(2); }
     eng.ensure_dbatch(effective_lanes);
-    let (pool_win_slots, pool_full_slots) = eng.init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes);
+    let (pool_win_slots, pool_full_slots) = match eng.try_init_serve_block_pools(budget.available_kv_budget_bytes, effective_lanes) {
+        Ok(slots) => slots,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    if faults.ignore_budget {
+        budget.recommended_working_set_bytes = 0;
+    }
     let context = pooled_context(o.ctx, pool_full_slots, pool_win_slots);
     let tk = Arc::new(Tokenizer::load(&eng.g));
     let sp = Specials {
@@ -2335,7 +3477,7 @@ pub fn serve(o: ServeOpts) {
         end_sampling: special(&tk, "<|content_model_end_sampling|>"),
     };
     let (jtx, jrx) = channel::<Job>();
-    let effective_queue = o.queue.min(MAX_CONNS.saturating_sub(effective_lanes));
+    let effective_queue = o.queue.min(max_conns.saturating_sub(effective_lanes));
     let active_lanes = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(Mutex::new(Counters::new(Instant::now())));
     let recorder = o.record_dir.as_ref().map(|d| Arc::new(crate::record::Recorder::with_options(d.clone(), crate::record::DEFAULT_QUEUE_CAPACITY, o.record_max_bytes)));
@@ -2361,11 +3503,22 @@ pub fn serve(o: ServeOpts) {
     } else {
         None
     };
+    let admission = AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT)
+        .with_faults(faults);
+    let cache = match spill_store {
+        Some(store) => ServeBlockCache::with_spill(store),
+        None => ServeBlockCache::new(),
+    };
+    let spill_telemetry = cache.spill_store().map(|_| {
+        let st = Arc::new(SpillTelemetry::default());
+        st.sync_from(&cache);
+        st
+    });
     let cx = Arc::new(Ctx { metrics: metrics.clone(), tk: tk.clone(), sp, jobs: jtx, effort: o.effort.clone(), max_tokens: o.max_tokens, thinking_budget: o.thinking_budget, loopcd_omega: o.loopcd_omega, kv8: eng.kv8, seq: Default::default(),
         nonce: startup_nonce(), key: o.key.clone(), ctx: context,
-        admission: AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT),
+        admission,
         budget,
-        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: Default::default(), recorder });
+        preprocess: PermitPool::new(effective_lanes.max(PREPROCESS_LIMIT)), count_preprocess: PermitPool::new(1), active_lanes: active_lanes.clone(), conns: ConnectionSlots::with_max_total(max_conns), recorder, spill_telemetry: spill_telemetry.clone() });
     let reporter_cx = Arc::downgrade(&cx);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -2409,139 +3562,53 @@ pub fn serve(o: ServeOpts) {
         eprintln!("[serve] adaptive LoopCD-Logits enabled: default omega_max = {:.3}", o.loopcd_omega);
     }
     eprintln!("[serve] http://{addr}/v1: {} lanes, context {} per lane, effort {}, queue {}, {auth}", effective_lanes, context, o.effort, effective_queue);
+    let conn_cfg = Arc::new(ConnConfig::production(max_conns, allow_private_non_loopback_host));
     std::thread::spawn(move || {
         let body_budget = Arc::new(BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES));
+        let mut backoff = crate::memd::AcceptBackoff::new("serve");
         loop {
             let (mut s, peer) = match l.accept() {
-                Ok(connection) => connection,
+                Ok(connection) => {
+                    backoff.on_accept_ok();
+                    connection
+                }
                 Err(e) => {
-                    eprintln!("[serve] accept: {e}");
-                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    backoff.on_accept_err(&e);
                     continue;
                 }
             };
-            let accepted_at = Instant::now();
-            let Some(slot) = cx.conns.acquire(peer.ip()) else {
+            let accepted_at = conn_cfg.clock.now();
+            let Some(slot) = cx.conns.acquire_capped(peer.ip(), conn_cfg.max_conns) else {
                 // A rejected socket must never stall the listener while writing its reply.
                 if s.set_nonblocking(true).is_ok() {
                     let _ = respond(&mut s, 503, &json!({"error": {"message": "too many connections"}}).to_string());
                 }
                 continue;
             };
-            if s.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).is_err() { continue; }
+            if s.set_write_timeout(Some(conn_cfg.client_write_timeout)).is_err() { continue; }
             let cx = cx.clone();
             let body_budget = body_budget.clone();
+            let cfg = conn_cfg.clone();
             if let Err(e) = std::thread::Builder::new().spawn(move || {
-                let _slot = slot;
-                handle_connection(&cx, &body_budget, s, accepted_at, REQUEST_READ_TIMEOUT);
+                handle_connection(&cx, &body_budget, s, slot, accepted_at, &cfg);
             }) {
                 eprintln!("[serve] connection worker: {e}");
             }
         }
     });
     scheduler(
-        &eng, &tk, sp, effective_lanes, jrx, active_lanes, &metrics, spill_store,
+        &eng,
+        &tk,
+        sp,
+        effective_lanes,
+        jrx,
+        active_lanes,
+        &metrics,
+        cache,
+        spill_telemetry.as_deref(),
         #[cfg(test)]
         None,
     );
-}
-
-fn handle_connection(cx: &Ctx, body_budget: &BodyBudget, mut s: TcpStream, accepted_at: Instant, read_timeout: Duration) {
-    let request_deadline = accepted_at + read_timeout;
-    let header_deadline = (accepted_at + HEADER_READ_TIMEOUT).min(request_deadline);
-    let mut r = BufReader::new(DeadlineReader::new(&s, header_deadline, Instant::now, |d| s.set_read_timeout(Some(d))));
-    let Ok(h) = read_head(&mut r) else { return };
-    if r.get_mut().remaining().is_err() { return; }
-    r.get_mut().set_deadline(request_deadline);
-    let path = route_path(&h.path);
-    let method = &h.method;
-    let route = route(method, &path);
-    let body_limit = if route == Route::CountTokens { MAX_COUNT_BODY } else { MAX_BODY };
-    // the key is checked before any body is read
-    if let Err((code, message)) = check_headers(&h, &path, cx.key.as_deref(), body_limit) {
-        drop(r);
-        let _ = if path.starts_with("/v1/messages") { anthropic_error(&mut s, code, if code == 401 { "authentication_error" } else { "request_too_large" }, &message) }
-                else if code == 401 { respond(&mut s, code, &json!({"error": {"type": "authentication_error", "code": "invalid_api_key", "message": message}}).to_string()) }
-                else { respond(&mut s, code, &json!({"error": {"message": message}}).to_string()) };
-        return;
-    }
-    // Routes that do not use a body can answer without waiting for one.
-    if matches!(route, Route::Models | Route::Health | Route::NotFound) {
-        drop(r);
-        let result = match route {
-            Route::Models => respond(&mut s, 200, &models_body()),
-            Route::Health => respond(&mut s, 200, &health_body(cx)),
-            Route::NotFound if path.starts_with("/v1/messages") => anthropic_error(&mut s, 404, "not_found_error", &format!("no route {method} {path}")),
-            Route::NotFound => respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path}")}}).to_string()),
-            _ => unreachable!("body routes are handled below"),
-        };
-        if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-        return;
-    }
-    let body = if h.chunked {
-        read_chunked(&mut r, body_limit, body_budget)
-    } else {
-        read_fixed(&mut r, h.len, body_budget)
-    };
-    // A completed body may have come entirely from BufReader's
-    // buffer. Check the deadline even if no socket read was needed.
-    let body = body.and_then(|body| match r.get_mut().remaining() {
-        Ok(_) => Ok(body),
-        Err(e) if h.chunked => Err(BodyError::Malformed(e.to_string())),
-        Err(_) => Err(BodyError::Incomplete),
-    });
-    drop(r);
-    let _ = s.set_read_timeout(None);
-    let anthropic = matches!(route, Route::Messages | Route::CountTokens);
-    let _count_preprocess = if route == Route::CountTokens && body.is_ok() {
-        match cx.count_preprocess.acquire() {
-            Some(permit) => Some(permit),
-            None => {
-                let _ = anthropic_overloaded(&mut s, cx.admission.retry_after_secs(), "inky is busy: a token count is in progress");
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let decoded = match body.and_then(|body| body.decode().map_err(BodyError::InvalidJson)) {
-        Ok(decoded) => decoded,
-        Err(BodyError::Busy) => {
-            let message = "inky is busy: the request body budget is full";
-            let retry = cx.admission.retry_after_secs();
-            let _ = if anthropic {
-                anthropic_overloaded(&mut s, retry, message)
-            } else {
-                openai_overloaded(&mut s, retry, message)
-            };
-            return;
-        }
-        Err(BodyError::Incomplete) => return,
-        Err(e) => {
-            let (code, kind, message) = match e {
-                BodyError::TooLarge => (413, "request_too_large", format!("the body is over {body_limit} bytes")),
-                BodyError::Malformed(m) => (400, "invalid_request_error", format!("malformed chunked body: {m}")),
-                BodyError::InvalidJson(e) => (400, "invalid_request_error", e.to_string()),
-                BodyError::Busy | BodyError::Incomplete => unreachable!(),
-            };
-            let result = if anthropic {
-                anthropic_error(&mut s, code, kind, &message)
-            } else {
-                respond(&mut s, code, &json!({"error": {"message": message}}).to_string())
-            };
-            if let Err(e) = result { eprintln!("[serve] client: {e}"); }
-            return;
-        }
-    };
-    let card_id = h.card_id.as_deref();
-    let result = match route {
-        Route::Chat => chat_with_card(cx, &decoded.value, card_id, &mut s),
-        Route::Messages => messages_with_card(cx, &decoded.value, card_id, &mut s),
-        Route::CountTokens => count_tokens(cx, &decoded.value, &mut s),
-        _ => unreachable!("bodyless routes were handled above"),
-    };
-    drop(decoded);
-    if let Err(e) = result { eprintln!("[serve] client: {e}"); }
 }
 
 #[cfg(test)]
@@ -2555,6 +3622,55 @@ mod tests {
     }
 
     include!("serve/physical_context_tests.rs");
+
+    #[test]
+    fn serve_fault_injection_requires_explicit_allow_gate_and_leaks_once() {
+        // Without INKY_SERVE_ALLOW_FAULT_INJECTION=1, INKY_SERVE_FAULT is unconditionally ignored.
+        for allow in [None, Some("0"), Some("true"), Some("yes")] {
+            let f = ServeFaults::from_lookup(|k| match k {
+                "INKY_SERVE_ALLOW_FAULT_INJECTION" => allow.map(str::to_owned),
+                "INKY_SERVE_FAULT" => Some("all".into()),
+                _ => None,
+            }).unwrap();
+            assert_eq!(f, ServeFaults::default());
+        }
+
+        // With INKY_SERVE_ALLOW_FAULT_INJECTION=1, individual, comma-separated, and "all" faults parse cleanly.
+        let parsed = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("health-status,leak-permit".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(parsed, ServeFaults { health_status: true, ignore_budget: false, skip_thinking_cancel: false, leak_permit: true });
+
+        let all = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("all".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(all, ServeFaults { health_status: true, ignore_budget: true, skip_thinking_cancel: true, leak_permit: true });
+
+        // Unknown fault names fail closed when fault injection is enabled.
+        let bad = ServeFaults::from_lookup(|k| match k {
+            "INKY_SERVE_ALLOW_FAULT_INJECTION" => Some("1".into()),
+            "INKY_SERVE_FAULT" => Some("not-a-fault".into()),
+            _ => None,
+        });
+        assert!(bad.is_err());
+
+        // leak-permit leaks the first released LanePermit and releases subsequent permits cleanly.
+        let gate = AdmissionGate::new(2, 1, Duration::from_millis(50)).with_faults(ServeFaults {
+            leak_permit: true,
+            ..ServeFaults::default()
+        });
+        let p1 = gate.try_acquire().unwrap();
+        let p2 = gate.try_acquire().unwrap();
+        assert_eq!(gate.inflight(), 2);
+        drop(p1);
+        assert_eq!(gate.inflight(), 2, "first permit release must leak under leak-permit fault");
+        drop(p2);
+        assert_eq!(gate.inflight(), 1, "subsequent permit releases decrement normally, leaving 1 leaked permit");
+    }
     fn test_sp(tk: &Tokenizer) -> Specials {
         Specials {
             msg_user: special(tk, "<|message_user|>"), msg_model: special(tk, "<|message_model|>"), msg_system: special(tk, "<|message_system|>"),
@@ -2574,29 +3690,113 @@ mod tests {
         )
     }
 
+    struct FakeServeClock {
+        now: Mutex<Instant>,
+        auto_advance_on_wait: bool,
+        wait_calls: AtomicUsize,
+        parked_tx: Mutex<Option<Sender<()>>>,
+    }
+
+    impl FakeServeClock {
+        fn auto_advancing() -> Arc<Self> {
+            Arc::new(Self {
+                now: Mutex::new(Instant::now()),
+                auto_advance_on_wait: true,
+                wait_calls: AtomicUsize::new(0),
+                parked_tx: Mutex::new(None),
+            })
+        }
+
+        fn parkable() -> (Arc<Self>, Receiver<()>) {
+            let (tx, rx) = channel();
+            (
+                Arc::new(Self {
+                    now: Mutex::new(Instant::now()),
+                    auto_advance_on_wait: false,
+                    wait_calls: AtomicUsize::new(0),
+                    parked_tx: Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+
+        fn advance(&self, dur: Duration) {
+            let mut now = self.now.lock().unwrap_or_else(|e| e.into_inner());
+            *now += dur;
+        }
+
+        fn wait_calls(&self) -> usize {
+            self.wait_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ServeClock for FakeServeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn wait_timeout<'a>(
+            &self,
+            cvar: &Condvar,
+            guard: std::sync::MutexGuard<'a, AdmissionInner>,
+            dur: Duration,
+        ) -> std::sync::MutexGuard<'a, AdmissionInner> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            if self.auto_advance_on_wait {
+                self.advance(dur);
+                guard
+            } else {
+                cvar.wait(guard).unwrap_or_else(|e| e.into_inner())
+            }
+        }
+
+        fn on_admission_parked(&self) {
+            if let Some(tx) = self.parked_tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn admission_test_ctx_with_clock(
+        max_lanes: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+        preprocess_limit: usize,
+        clock: Arc<dyn ServeClock>,
+    ) -> (Ctx, Receiver<Job>) {
+        let tk = Arc::new(Tokenizer::for_test());
+        let (jobs, rx) = channel();
+        let cx = Ctx {
+            metrics: Arc::new(Mutex::new(Counters::new(clock.now()))),
+            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
+            seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
+            admission: AdmissionGate::with_clock(
+                max_lanes,
+                max_queue,
+                queue_timeout,
+                Duration::from_millis(5),
+                DEFAULT_RETRY_AFTER_SECS,
+                clock,
+            ),
+            budget: test_budget(max_lanes),
+            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
+        };
+        (cx, rx)
+    }
+
     fn admission_test_ctx_with(
         max_lanes: usize,
         max_queue: usize,
         queue_timeout: Duration,
         preprocess_limit: usize,
     ) -> (Ctx, Receiver<Job>) {
-        let tk = Arc::new(Tokenizer::for_test());
-        let (jobs, rx) = channel();
-        let cx = Ctx {
-            metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))),
-            sp: test_sp(&tk), tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
-            seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::with_timings(
-                max_lanes,
-                max_queue,
-                queue_timeout,
-                Duration::from_millis(5),
-                DEFAULT_RETRY_AFTER_SECS,
-            ),
-            budget: test_budget(max_lanes),
-            preprocess: PermitPool::new(preprocess_limit), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
-        };
-        (cx, rx)
+        admission_test_ctx_with_clock(
+            max_lanes,
+            max_queue,
+            queue_timeout,
+            preprocess_limit,
+            FakeServeClock::auto_advancing(),
+        )
     }
 
     fn admission_test_ctx(lanes_and_queue: usize) -> (Ctx, Receiver<Job>) {
@@ -2701,11 +3901,24 @@ mod tests {
         (client, server)
     }
 
+    fn handle_test_tcp_connection(
+        cx: &Ctx,
+        budget: &BodyBudget,
+        mut server: TcpStream,
+        accepted_at: Instant,
+        read_timeout: Duration,
+    ) {
+        let mut cfg = ConnConfig::production(MAX_CONNS, false);
+        cfg.body_read_timeout = read_timeout;
+        let slot = try_acquire_conn_slot(cx, &mut server, &cfg).expect("test connection slot");
+        handle_connection(cx, budget, server, slot, accepted_at, &cfg);
+    }
+
     fn http_test_exchange(cx: &Ctx, request: &[u8]) -> String {
         let (mut client, server) = open_http_test_connection();
         let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
         std::thread::scope(|scope| {
-            scope.spawn(move || handle_connection(cx, budget, server, Instant::now(), REQUEST_READ_TIMEOUT));
+            scope.spawn(move || handle_test_tcp_connection(cx, budget, server, Instant::now(), REQUEST_READ_TIMEOUT));
             client.write_all(request).unwrap();
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
@@ -2714,7 +3927,10 @@ mod tests {
     }
 
     fn json_request(path: &str, body: &str) -> String {
-        format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     #[test]
@@ -2722,8 +3938,12 @@ mod tests {
         let (cx, jobs) = admission_test_ctx(1);
         let path = "/v1/messages/count_tokens/?beta=true";
         let declared = MAX_COUNT_BODY + 1;
-        let fixed = format!("POST {path} HTTP/1.1\r\nContent-Length: {declared}\r\n\r\n");
-        let chunked = format!("POST {path} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{declared:x}\r\n");
+        let fixed = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+        );
+        let chunked = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{declared:x}\r\n"
+        );
         for request in [fixed, chunked] {
             let response = http_test_exchange(&cx, request.as_bytes());
             assert!(response.starts_with("HTTP/1.1 413"));
@@ -2765,29 +3985,29 @@ mod tests {
     #[test]
     fn partial_http_bodies_expire_within_the_request_read_deadline() {
         let (cx, jobs) = admission_test_ctx(1);
-        for (framing, expected) in [
-            ("Content-Length: 8\r\n\r\n{", ""),
-            ("Transfer-Encoding: chunked\r\n\r\n8\r\n{", "HTTP/1.1 400"),
+        for framing in [
+            "Content-Length: 8\r\n\r\n{",
+            "Transfer-Encoding: chunked\r\n\r\n8\r\n{",
         ] {
             let (mut client, server) = open_http_test_connection();
-            write!(client, "POST /v1/messages/count_tokens HTTP/1.1\r\n{framing}").unwrap();
+            write!(
+                client,
+                "POST /v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n{framing}"
+            )
+            .unwrap();
             let budget = &BodyBudget::new(MAX_IN_FLIGHT_BODY_BYTES);
             std::thread::scope(|scope| {
                 let cx = &cx;
                 // Start with most of the request budget already spent so a fresh
                 // body budget would outlast the client's two-second read timeout.
                 let accepted_at = Instant::now() - Duration::from_millis(2800);
-                scope.spawn(move || handle_connection(cx, budget, server, accepted_at, Duration::from_secs(3)));
+                scope.spawn(move || handle_test_tcp_connection(cx, budget, server, accepted_at, Duration::from_secs(3)));
                 let mut response = String::new();
                 // Keep the write side open, so only the server deadline ends the request.
                 let result = client.read_to_string(&mut response);
                 let _ = client.shutdown(std::net::Shutdown::Both);
                 result.unwrap();
-                if expected.is_empty() {
-                    assert!(response.is_empty());
-                } else {
-                    assert!(response.starts_with(expected));
-                }
+                assert!(response.starts_with("HTTP/1.1 408"), "got: {response}");
             });
         }
         assert!(jobs.try_recv().is_err());
@@ -2812,7 +4032,7 @@ mod tests {
         held.pop();
         held.push(slots.acquire(other).unwrap());
         drop(held);
-        let counts = slots.0.lock().unwrap();
+        let counts = slots.counts.lock().unwrap();
         assert_eq!(counts.total, 0);
         assert!(counts.peers.is_empty());
     }
@@ -2923,7 +4143,7 @@ mod tests {
         clock.set(start + tick);
         reader.get_mut().set_deadline(start + 3 * tick);
         let budget = BodyBudget::new(4);
-        assert!(matches!(read_fixed(&mut reader, 4, &budget), Err(BodyError::Incomplete)));
+        assert!(matches!(read_fixed(&mut reader, 4, &budget), Err(BodyError::TimedOut)));
         assert!(budget.reserve(4).is_ok());
     }
 
@@ -3296,7 +4516,7 @@ mod tests {
                 for &id in &tokens { job.out.send(Ev::Tok(id)).unwrap(); }
                 job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: tokens.len(), reason: "stop", timing: Default::default() }).unwrap();
                 worker.join().unwrap().unwrap();
-                assert_eq!(job.toks, prompt, "submitted assistant turn changed during rendering");
+                assert_eq!(&*job.toks, prompt.as_slice(), "submitted assistant turn changed during rendering");
             });
             let body = std::str::from_utf8(&output).unwrap().split_once("\r\n\r\n").unwrap().1;
             if !stream {
@@ -3452,7 +4672,7 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         for name in ["max_tokens", "max_completion_tokens"] {
             for value in [json!(-1), json!(1.5), json!(null), json!(0), json!(MAX_CHAT_TOKEN_BUDGET + 1), json!(u64::MAX), json!("8")] {
                 let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -3475,14 +4695,14 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let req = json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 128000, "stream": false});
         let expected_prompt = render(&cx.tk, &sp, &req, &cx.effort).unwrap().len();
         let expected_clamped = 64 - expected_prompt - 2;
         assert!(expected_clamped > 0 && expected_clamped < 64);
 
         let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("opencode-style 128000 max_tokens request must reach scheduler");
+            let job = jrx.recv().expect("opencode-style 128000 max_tokens request must reach scheduler");
             assert_eq!(job.max, expected_clamped, "positive max_tokens above ctx must clamp to remaining lane budget");
             let _ = job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() });
         });
@@ -3514,9 +4734,9 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
             max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+            admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let scheduler = std::thread::spawn(move || {
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+            let job = jrx.recv().expect("messages request must reach scheduler");
             let _ = job.out.send(Ev::Tok(sp.c_think));
             for _ in 0..50 { if job.out.send(Ev::Tok(sp.c_think)).is_err() { break; } }
         });
@@ -3542,9 +4762,9 @@ mod tests {
             let (jtx, jrx) = channel::<Job>();
             let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp, jobs: jtx, effort: "medium".into(),
                 max_tokens: 64, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
             let scheduler = std::thread::spawn(move || {
-                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+                let job = jrx.recv().expect("messages request must reach scheduler");
                 let mut sent = 0usize;
                 if job.out.send(Ev::Tok(sp.c_tool)).is_ok() {
                     sent += 1;
@@ -3555,7 +4775,7 @@ mod tests {
                 }
                 sent
             });
-            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::new(0) };
+            let mut out = Gone { bytes: Vec::new(), checks: std::cell::Cell::<usize>::new(0) };
             if use_chat {
                 chat(&cx, &json!({"max_tokens": 8, "stream": true, "messages": [{"role": "user", "content": "hi"}]}), &mut out).unwrap();
             } else {
@@ -3583,14 +4803,15 @@ mod tests {
         let (jtx, jrx) = channel::<Job>();
         let cx = Arc::new(Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None });
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None });
         let req = json!({"model": "m", "max_tokens": 64000, "messages": [{"role": "user", "content": "x".repeat(8)}]});
         let prompt = render(&cx.tk, &cx.sp, &anthropic_to_openai(&req).unwrap(), "medium").unwrap().len();
         let want = clamped_messages_max(prompt, 64000, 64).unwrap();
         assert!(want < 63, "the test prompt must actually overrun with max_tokens 63 (prompt {prompt})");
         let (cx2, req2) = (cx.clone(), req.clone());
+        drop(cx);
         let worker = std::thread::spawn(move || { let mut out: Vec<u8> = Vec::new(); messages(&cx2, &req2, &mut out).unwrap(); out });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+        let job = jrx.recv().expect("messages request must reach scheduler");
         assert_eq!(job.max, want, "the job carries the clamped budget, not the refused 63");
         job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
         let out = String::from_utf8(worker.join().unwrap()).unwrap();
@@ -3605,7 +4826,7 @@ mod tests {
         let (jtx, _jrx) = channel::<Job>();
         let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: Arc::new(Tokenizer::for_test()), sp: test_sp(&tk0), jobs: jtx, effort: "medium".into(),
                        max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                       admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(PREPROCESS_LIMIT), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
         let long = "x".repeat(200);
         let mut out: Vec<u8> = Vec::new();
         messages(&cx, &json!({"model": "m", "max_tokens": 8, "stream": true,
@@ -3628,6 +4849,7 @@ mod tests {
         let mut head = Head {
             method: "POST".into(), path: "/v1/chat/completions".into(),
             len: MAX_BODY + 1, auth: None, api_key: None, card_id: None, chunked: false,
+            ..Head::default()
         };
         let status = |h: &Head| check_headers(h, &h.path, Some("test"), MAX_BODY).map_err(|(code, _)| code);
         assert_eq!(status(&head), Err(401), "authentication precedes length checks");
@@ -3640,10 +4862,50 @@ mod tests {
         head.chunked = true;
         head.len = 0;
         assert_eq!(status(&head), Ok(()), "chunked is decoded, not refused at the headers");
-        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false };
+        let mut by_key = Head { method: "POST".into(), path: "/v1/messages".into(), len: 1, auth: None, api_key: Some("test".into()), card_id: None, chunked: false, ..Head::default() };
         assert_eq!(status(&by_key), Ok(()), "x-api-key authenticates as the bearer does");
         by_key.api_key = Some("wrong".into());
         assert_eq!(status(&by_key), Err(401));
+
+        // Unkeyed loopback policy (U94): checks Origin, Sec-Fetch-Site, Host, and Content-Type.
+        let unkeyed = |h: &Head| check_headers(h, &h.path, None, MAX_BODY).map_err(|(code, _)| code);
+        let mut local_post = Head {
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            len: 16,
+            host: Some("127.0.0.1:8090".into()),
+            content_type: Some("application/json; charset=utf-8".into()),
+            ..Head::default()
+        };
+        assert_eq!(unkeyed(&local_post), Ok(()));
+        for valid_host in ["localhost", "localhost:8090", "127.0.0.1", "127.0.0.1:8090", "[::1]", "[::1]:8090", "[::ffff:127.0.0.1]:8090"] {
+            local_post.host = Some(valid_host.into());
+            assert_eq!(unkeyed(&local_post), Ok(()), "valid loopback host {valid_host}");
+        }
+        for bad_host in ["", "rebind.attacker.tld:8090", "evil.example", "10.0.0.1:8090", "0.0.0.0:8090", "[::]:8090"] {
+            local_post.host = Some(bad_host.into());
+            assert_eq!(unkeyed(&local_post), Err(403), "bad host {bad_host}");
+        }
+        local_post.host = None;
+        assert_eq!(unkeyed(&local_post), Err(403), "missing Host must be refused on unkeyed server");
+        local_post.host = Some("localhost:8090".into());
+
+        local_post.origin = Some("https://evil.example".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "browser Origin header must be refused");
+        local_post.origin = Some("null".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "sandboxed/file Origin: null must be refused");
+        local_post.origin = None;
+
+        local_post.sec_fetch_site = Some("cross-site".into());
+        assert_eq!(unkeyed(&local_post), Err(403), "Sec-Fetch-Site: cross-site must be refused");
+        local_post.sec_fetch_site = Some("none".into());
+        assert_eq!(unkeyed(&local_post), Ok(()));
+        local_post.sec_fetch_site = None;
+
+        for bad_ct in [None, Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data")] {
+            local_post.content_type = bad_ct.map(str::to_owned);
+            assert_eq!(unkeyed(&local_post), Err(415), "POST without application/json must be refused: {bad_ct:?}");
+        }
     }
     #[test] fn serve_shape_refuses_an_empty_context_and_a_budget_outside_it() {
         assert!(check_serve_shape(0, 1).is_err(), "no context to serve in");
@@ -3685,15 +4947,16 @@ mod tests {
                 let (jtx, jrx) = channel::<Job>();
                 let cx = Ctx { metrics: Arc::new(Mutex::new(Counters::new(Instant::now()))), tk: tk.clone(), sp: test_sp(&tk), jobs: jtx, effort: "medium".into(),
                     max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false, seq: Default::default(), nonce: "test".into(), key: None, ctx: 64,
-                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None };
+                    admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None };
                 let scheduler = std::thread::spawn(move || {
-                    let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+                    let job = jrx.recv().expect("messages request must reach scheduler");
                     job.out.send(Ev::Failed("model returned non-finite logits".into())).unwrap();
                 });
                 let req = json!({"max_tokens": 8, "stream": stream, "messages": [{"role": "user", "content": "hi"}]});
                 let mut out = Vec::new();
                 if anthropic { messages(&cx, &req, &mut out).unwrap(); }
                 else { chat(&cx, &req, &mut out).unwrap(); }
+                drop(cx);
                 scheduler.join().unwrap();
                 let response = String::from_utf8(out).unwrap();
                 assert!(response.contains("model returned non-finite logits"));
@@ -3762,28 +5025,27 @@ mod tests {
         assert_eq!(tb.ban_token(&sp), Some(sp.c_think));
 
         // Verify both /v1/chat/completions and /v1/messages propagate thinking_budget onto Job
-        let (cx, jrx) = admission_test_ctx(4);
+        let (cx, mut jrx) = admission_test_ctx(4);
         let cx = Arc::new(cx);
         for (is_msg, req, want_budget, want_top_k) in [
             (false, json!({"max_tokens": 8, "thinking_budget": 128, "top_k": 0, "top_p": 1.0, "messages": [{"role": "user", "content": "hi"}]}), 128usize, 0usize),
             (true, json!({"max_tokens": 8, "thinking": {"type": "enabled", "budget_tokens": 1024}, "top_k": 0, "top_p": 1.0, "messages": [{"role": "user", "content": "hi"}]}), 1024usize, 0usize),
         ] {
-            let cx2 = cx.clone();
-            let req2 = req.clone();
-            let worker = std::thread::spawn(move || {
-                let mut out = Vec::new();
-                if is_msg { messages(&cx2, &req2, &mut out).unwrap(); } else { chat(&cx2, &req2, &mut out).unwrap(); }
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("messages request must reach scheduler");
+                assert_eq!(job.thinking_budget, want_budget);
+                assert_eq!(job.top_k, want_top_k);
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+                jrx
             });
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-            assert_eq!(job.thinking_budget, want_budget);
-            assert_eq!(job.top_k, want_top_k);
-            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
-            worker.join().unwrap();
+            let mut out = Vec::new();
+            if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+            jrx = scheduler.join().unwrap();
         }
     }
 
     #[test] fn loopcd_omega_defaults_overrides_and_rejects_invalid_on_both_apis() {
-        let (mut cx, jrx) = admission_test_ctx(4);
+        let (mut cx, mut jrx) = admission_test_ctx(4);
         cx.loopcd_omega = 0.25;
         let cx = Arc::new(cx);
 
@@ -3807,28 +5069,38 @@ mod tests {
             (false, json!({"max_tokens": 1, "loopcd_omega": 0.6, "messages": [{"role": "user", "content": "hi"}]}), 0.6f32),
             (true, json!({"max_tokens": 1, "loopcd_omega": 0.0, "messages": [{"role": "user", "content": "hi"}]}), 0.0f32),
         ] {
-            let cx2 = cx.clone();
-            let req2 = req.clone();
-            let worker = std::thread::spawn(move || {
-                let mut out = Vec::new();
-                if is_msg { messages(&cx2, &req2, &mut out).unwrap(); } else { chat(&cx2, &req2, &mut out).unwrap(); }
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("request must reach scheduler");
+                assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
+                // Reaching length - 1 can follow either a prefill step or a checkpoint hit.
+                // A one-token reply must enter guided decode before any generated token is pending.
+                let pf_end = job.toks.len();
+                let timing = Counters::new(Instant::now()).admit(Instant::now(), job.queued_at);
+                let sampler = Sampler::new(job.temp, job.top_k, job.top_p, 30.0, job.seed);
+                let draft_sampler = Sampler::draft(job.temp, job.top_k, job.top_p, 30.0, job.seed);
+                let mut a = Active {
+                    job,
+                    n_past: pf_end - 1,
+                    pf_end,
+                    cached: 0,
+                    gen: 0,
+                    restoring_target: None,
+                    timing,
+                    sampler,
+                    draft_sampler,
+                    think: ThinkBudget::new(0),
+                    pending: None,
+                };
+                assert_eq!(a.step_input(true).needs_decode(), want > 0.0);
+                assert_eq!(a.step_input(true).needs_prefill(), want == 0.0);
+                a.n_past = pf_end;
+                assert!(!a.step_input(true).needs_decode(), "first token has not yet been emitted");
+                a.job.out.send(Ev::Done { prompt: pf_end, cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
+                jrx
             });
-            let job = jrx.recv_timeout(Duration::from_secs(5)).expect("request must reach scheduler");
-            assert!((job.loopcd_omega - want).abs() < 1e-6, "is_msg={is_msg} got={} want={want}", job.loopcd_omega);
-            // Reaching length - 1 can follow either a prefill step or a checkpoint hit.
-            // A one-token reply must enter guided decode before any generated token is pending.
-            let pf_end = job.toks.len();
-            let timing = Counters::new(Instant::now()).admit(Instant::now(), job.queued_at);
-            let sampler = Sampler::new(job.temp, job.top_k, job.top_p, 30.0, job.seed);
-            let draft_sampler = Sampler::draft(job.temp, job.top_k, job.top_p, 30.0, job.seed);
-            let mut a = Active { job, n_past: pf_end - 1, pf_end, cached: 0, gen: 0,
-                timing, sampler, draft_sampler, think: ThinkBudget::new(0), pending: None };
-            assert_eq!(a.step_input(true).needs_decode(), want > 0.0);
-            assert_eq!(a.step_input(true).needs_prefill(), want == 0.0);
-            a.n_past = pf_end;
-            assert!(!a.step_input(true).needs_decode(), "first token has not yet been emitted");
-            a.job.out.send(Ev::Done { prompt: pf_end, cached: 0, gen: 0, reason: "stop", timing: Default::default() }).unwrap();
-            worker.join().unwrap();
+            let mut out = Vec::new();
+            if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+            jrx = scheduler.join().unwrap();
         }
     }
 
@@ -4076,13 +5348,14 @@ mod tests {
     }
 
     #[test] fn admission_queue_overflow_and_fifo_wakeup_with_health_telemetry() {
-        // Fake tight budget: 1 admitted lane, bounded queue of 1.
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        // Fake tight budget: 1 admitted lane, bounded queue of 1, deterministic injected clock.
+        let (clock, parked_rx) = FakeServeClock::parkable();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock);
         let cx = Arc::new(cx);
         let held_lane = cx.admission.try_acquire().unwrap();
         cx.active_lanes.store(1, Ordering::Relaxed);
 
-        // Request 2 enters the bounded wait queue and blocks until held_lane is dropped.
+        // Request 2 enters the bounded wait queue and parks deterministically until held_lane is dropped.
         let cx_q = cx.clone();
         let queued_worker = std::thread::spawn(move || {
             let mut out = Vec::new();
@@ -4090,12 +5363,8 @@ mod tests {
             out
         });
 
-        // Wait until request 2 is visibly sitting in the wait queue via /health telemetry.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while cx.admission.queued() != 1 {
-            assert!(Instant::now() < deadline, "queued request did not enter wait queue");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Deterministic handshake: notified the instant request 2 registers in `waiters`.
+        parked_rx.recv().expect("queued request must park in wait queue");
         let snap: Value = serde_json::from_str(&health_body(&cx)).unwrap();
         assert_eq!(snap["active_lanes"], 1);
         assert_eq!(snap["queued_requests"], 1);
@@ -4114,10 +5383,10 @@ mod tests {
         assert_eq!(body["error"]["code"], "rate_limit_exceeded");
         assert_eq!(body["error"]["message"], QUEUE_FULL);
 
-        // Free lane 1 -> queued request 2 wakes up, enters scheduler, and completes with HTTP 200.
+        // Free lane 1 -> queued request 2 wakes up via Condvar, enters scheduler, and completes with HTTP 200.
         cx.active_lanes.store(0, Ordering::Relaxed);
         drop(held_lane);
-        let job = jrx.recv_timeout(Duration::from_secs(2)).expect("queued job must be admitted once lane frees");
+        let job = jrx.recv().expect("queued job must be admitted once lane frees");
         job.out.send(Ev::Tok(cx.sp.msg_model)).unwrap();
         job.out.send(Ev::Tok(cx.sp.c_text)).unwrap();
         for tok in cx.tk.encode("ok", false) { job.out.send(Ev::Tok(tok)).unwrap(); }
@@ -4132,7 +5401,9 @@ mod tests {
     }
 
     #[test] fn admission_queue_timeout_returns_429_with_retry_after_for_stream_and_nonstream() {
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_millis(25), 4);
+        // Auto-advancing FakeServeClock exercises the full 60s QUEUE_WAIT_TIMEOUT with zero real sleeping.
+        let clock = FakeServeClock::auto_advancing();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
         let _held = cx.admission.try_acquire().unwrap();
 
         for stream in [false, true] {
@@ -4145,6 +5416,7 @@ mod tests {
             let body: Value = serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
             assert_eq!(body["error"]["message"], QUEUE_TIMED_OUT);
         }
+        assert!(clock.wait_calls() > 0, "fake clock must advance across poll intervals");
 
         // Anthropic /v1/messages also returns 429 + Retry-After on queue timeout.
         let mut out = Vec::new();
@@ -4167,11 +5439,11 @@ mod tests {
             fn client_gone(&self) -> bool { true }
         }
 
-        let (cx, jrx) = admission_test_ctx_with(1, 1, Duration::from_secs(5), 4);
+        let (clock, _parked_rx) = FakeServeClock::parkable();
+        let (cx, jrx) = admission_test_ctx_with_clock(1, 1, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
         let _held = cx.admission.try_acquire().unwrap();
-        let start = Instant::now();
         chat(&cx, &json!({"max_tokens": 4, "stream": true, "messages": [{"role": "user", "content": "bye"}]}), &mut GoneWriter).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1), "disconnected queued client must exit promptly");
+        assert_eq!(clock.wait_calls(), 0, "disconnected queued client must exit before parking on Condvar");
         assert_eq!(cx.admission.queued(), 0, "disconnected client must free its queue slot");
         assert_eq!(cx.admission.inflight(), 1);
         assert!(jrx.try_recv().is_err());
@@ -4192,7 +5464,7 @@ mod tests {
             sp, tk, jobs, effort: "medium".into(), max_tokens: 8, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: Some("secret-bearer-key".into()), ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)), budget: test_budget(4), preprocess: PermitPool::new(2),
-            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()),
+            count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: Some(rec.clone()), spill_telemetry: None,
         };
 
         let raw_req = b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\nAuthorization: Bearer secret-bearer-key\r\nCookie: s=secret\r\nX-Inky-Card-Id: card-multi-7\r\nContent-Length: 2\r\n\r\n{}";
@@ -4334,21 +5606,20 @@ mod tests {
             assert_eq!(m["owned_by"], "inky");
         }
 
-        let (cx, jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
+        let (cx, mut jrx) = admission_test_ctx_with(4, 0, Duration::from_millis(20), 4);
         let cx = Arc::new(cx);
         for alias in ["inkling-2-mini", "inky/inkling-2-mini", "custom/caller-alias"] {
             for is_msg in [false, true] {
-                let cx2 = cx.clone();
-                let alias_s = alias.to_string();
-                let worker = std::thread::spawn(move || {
-                    let mut out = Vec::new();
-                    let req = json!({"model": alias_s, "max_tokens": 8, "stream": false, "messages": [{"role": "user", "content": "hi"}]});
-                    if is_msg { messages(&cx2, &req, &mut out).unwrap(); } else { chat(&cx2, &req, &mut out).unwrap(); }
-                    out
+                let scheduler = std::thread::spawn(move || {
+                    let job = jrx.recv().expect("messages request must reach scheduler");
+                    job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+                    jrx
                 });
-                let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
-                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
-                let resp = String::from_utf8(worker.join().unwrap()).unwrap();
+                let mut out = Vec::new();
+                let req = json!({"model": alias, "max_tokens": 8, "stream": false, "messages": [{"role": "user", "content": "hi"}]});
+                if is_msg { messages(&cx, &req, &mut out).unwrap(); } else { chat(&cx, &req, &mut out).unwrap(); }
+                jrx = scheduler.join().unwrap();
+                let resp = String::from_utf8(out).unwrap();
                 assert!(resp.starts_with("HTTP/1.1 200"));
                 let body: Value = serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                 assert_eq!(body["model"], alias, "is_msg={is_msg} must accept and echo model alias {alias}");
@@ -4371,9 +5642,15 @@ mod tests {
             api_key: api_key.map(str::to_owned),
             card_id: None,
             chunked: false,
+            host: Some("127.0.0.1:8090".into()),
+            ..Head::default()
         };
-        // Unkeyed server permits loopback requests without headers
+        // Unkeyed server permits loopback Host requests without auth headers
         assert!(check_headers(&req("/v1/models", None, None), "/v1/models", None, MAX_BODY).is_ok());
+        // Unkeyed server refuses missing or non-loopback Host
+        let mut missing_host = req("/v1/models", None, None);
+        missing_host.host = None;
+        assert_eq!(check_headers(&missing_host, "/v1/models", None, MAX_BODY).unwrap_err().0, 403);
         // Keyed server keeps /health public and requires Bearer or x-api-key on /v1/*
         assert!(check_headers(&req("/health", None, None), "/health", Some("k"), MAX_BODY).is_ok());
         assert_eq!(check_headers(&req("/v1/models", None, None), "/v1/models", Some("k"), MAX_BODY).unwrap_err().0, 401);
@@ -4392,7 +5669,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "test".into(), key: None, ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
         });
         let stream_toks = reply_stream(&cx.tk, &sp);
 
@@ -4408,6 +5685,7 @@ mod tests {
 
         // Streaming with stream_options.include_usage=true emits finish_reason chunk then final choices:[] usage chunk before [DONE]
         let cx2 = cx.clone();
+        drop(cx);
         let worker = std::thread::spawn(move || {
             let mut out = Vec::new();
             let req = json!({
@@ -4421,7 +5699,7 @@ mod tests {
             chat(&cx2, &req, &mut out).unwrap();
             out
         });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("chat request must reach scheduler");
+        let job = jrx.recv().expect("chat request must reach scheduler");
         let prompt_len = job.toks.len();
         for &tok in &stream_toks { job.out.send(Ev::Tok(tok)).unwrap(); }
         job.out.send(Ev::Done { prompt: prompt_len, cached: 5, gen: stream_toks.len(), reason: "stop", timing: Default::default() }).unwrap();
@@ -4452,7 +5730,7 @@ mod tests {
             tk: tk.clone(), sp, jobs, effort: "medium".into(), max_tokens: 32, thinking_budget: 0, loopcd_omega: 0.0, kv8: false,
             seq: Default::default(), nonce: "nonce123".into(), key: Some("sprint-secret".into()), ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
-            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None,
+            budget: test_budget(4), preprocess: PermitPool::new(4), count_preprocess: PermitPool::new(1), active_lanes: Default::default(), conns: Default::default(), recorder: None, spill_telemetry: None,
         });
 
         let req = json!({
@@ -4486,13 +5764,14 @@ mod tests {
 
         let stream_toks = reply_stream(&tk, &sp);
         let cx2 = cx.clone();
+        drop(cx);
         let req2 = req.clone();
         let worker = std::thread::spawn(move || {
             let mut out = Vec::new();
             messages(&cx2, &req2, &mut out).unwrap();
             out
         });
-        let job = jrx.recv_timeout(Duration::from_secs(5)).expect("messages request must reach scheduler");
+        let job = jrx.recv().expect("messages request must reach scheduler");
         assert_eq!(job.thinking_budget, 1024);
         let prompt_len = job.toks.len();
         for &tok in &stream_toks { job.out.send(Ev::Tok(tok)).unwrap(); }
@@ -4783,20 +6062,20 @@ mod tests {
             let admission = AdmissionGate::new(4, 4, Duration::from_secs(5));
             let send_turn = |seq: u64, prompt: Vec<u32>| -> (Vec<u32>, usize, usize) {
                 let (out, events) = job_events();
-                let job = Job {
+                let job = Job::new(
                     seq,
-                    toks: prompt,
-                    max: n_gen,
-                    temp: 0.0,
-                    top_k: 0,
-                    top_p: 1.0,
-                    seed: 1,
-                    thinking_budget: 0,
-                    loopcd_omega: 0.0,
-                    queued_at: Instant::now(),
+                    Instant::now(),
+                    prompt,
+                    n_gen,
+                    0.0,
+                    0,
+                    1.0,
+                    1,
+                    0,
+                    0.0,
                     out,
-                    _permit: admission.try_acquire().unwrap(),
-                };
+                    admission.try_acquire().unwrap(),
+                );
                 jtx.send(job).unwrap();
                 let mut toks = Vec::new();
                 loop {
@@ -4842,7 +6121,18 @@ mod tests {
         use crate::scheduler::LaneState::{Admitted, Queued, Ready, Restoring};
         let mut admissions = Vec::new();
         scheduler_trace::capture_if_requested(|| {
-            scheduler(&eng, &tk, sp, 4, jrx, active_lanes, &metrics, None, Some(&mut admissions))
+            scheduler(
+                &eng,
+                &tk,
+                sp,
+                4,
+                jrx,
+                active_lanes,
+                &metrics,
+                ServeBlockCache::new(),
+                None,
+                Some(&mut admissions),
+            )
         });
         assert_eq!(admissions, [[Queued, Admitted, Restoring, Ready]; 3]);
         let (turn2, turn3, t1_out, t2_out, t3_out) = client.join().unwrap();
@@ -4928,13 +6218,14 @@ mod tests {
         toks0.extend(30000..30300);
 
         let cands = [
-            InflightPrefillLane { lane: 0, toks: &toks0, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 1, toks: &toks1, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
-            InflightPrefillLane { lane: 2, toks: &toks2, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 0, toks: &toks0, block_hashes: None, n_past: 0, pf_end: toks0.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 1, toks: &toks1, block_hashes: None, n_past: 0, pf_end: toks1.len(), runnable: true, eligible_follower: true },
+            InflightPrefillLane { lane: 2, toks: &toks2, block_hashes: None, n_past: 0, pf_end: toks2.len(), runnable: true, eligible_follower: true },
         ];
-        assert_eq!(find_prefill_leader(&cands, 0), None);
-        assert_eq!(find_prefill_leader(&cands, 1), Some(0));
-        assert_eq!(find_prefill_leader(&cands, 2), Some(0));
+        assert_eq!(block_cache::find_prefill_leader(&cands, 0), None);
+        assert_eq!(block_cache::find_prefill_leader(&cands, 1), Some(0));
+        assert_eq!(block_cache::find_prefill_leader(&cands, 2), Some(0));
+        assert_eq!(find_prefill_leaders(&cands), vec![None, Some(0), Some(0)]);
 
         let inputs = [
             crate::scheduler::ServeLaneInput { runnable: true, n_past: 0, pf_end: effective_pf_target(0, toks0.len()), has_pending_decode: false },
@@ -5031,24 +6322,25 @@ mod tests {
         let (out0, ev0) = job_events();
         let (out1, ev1) = job_events();
         let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
-            job: Job {
+            job: Job::new(
                 seq,
-                toks: (0..pf_end as u32).collect(),
-                max: 32,
-                temp: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                seed: 1,
-                thinking_budget: 0,
-                loopcd_omega: 0.0,
-                queued_at: Instant::now(),
+                Instant::now(),
+                (0..pf_end as u32).collect(),
+                32,
+                0.0,
+                0,
+                1.0,
+                1,
+                0,
+                0.0,
                 out,
-                _permit: admission.try_acquire().unwrap(),
-            },
+                admission.try_acquire().unwrap(),
+            ),
             n_past,
             pf_end,
             cached: 0,
             gen,
+            restoring_target: None,
             timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
@@ -5094,16 +6386,14 @@ mod tests {
         let (arr_dead_out, arr_dead_ev) = job_events();
         drop(arr_dead_ev);
         metrics.lock().unwrap().queued = 2;
-        jtx.send(Job {
-            seq: 10, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_live_out,
-            _permit: admission.try_acquire().unwrap(),
-        }).unwrap();
-        jtx.send(Job {
-            seq: 11, toks: vec![1, 2], max: 4, temp: 0.0, top_k: 0, top_p: 1.0, seed: 1,
-            thinking_budget: 0, loopcd_omega: 0.0, queued_at: Instant::now(), out: arr_dead_out,
-            _permit: admission.try_acquire().unwrap(),
-        }).unwrap();
+        jtx.send(Job::new(
+            10, Instant::now(), vec![1, 2], 4, 0.0, 0, 1.0, 1, 0, 0.0, arr_live_out,
+            admission.try_acquire().unwrap(),
+        )).unwrap();
+        jtx.send(Job::new(
+            11, Instant::now(), vec![1, 2], 4, 0.0, 0, 1.0, 1, 0, 0.0, arr_dead_out,
+            admission.try_acquire().unwrap(),
+        )).unwrap();
 
         // Client disconnects while GPU step is executing!
         drop(ev0);
@@ -5174,24 +6464,25 @@ mod tests {
         let (out0, ev0) = job_events();
         let (out1, ev1) = job_events();
         let make_active = |seq: u64, n_past: usize, pf_end: usize, gen: usize, out: JobOutput| Active {
-            job: Job {
+            job: Job::new(
                 seq,
-                toks: (0..pf_end as u32).collect(),
-                max: 16,
-                temp: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                seed: 1,
-                thinking_budget: 0,
-                loopcd_omega: 0.0,
-                queued_at: Instant::now(),
+                Instant::now(),
+                (0..pf_end as u32).collect(),
+                16,
+                0.0,
+                0,
+                1.0,
+                1,
+                0,
+                0.0,
                 out,
-                _permit: admission.try_acquire().unwrap(),
-            },
+                admission.try_acquire().unwrap(),
+            ),
             n_past,
             pf_end,
             cached: 0,
             gen,
+            restoring_target: None,
             timing: Counters::new(Instant::now()).admit(Instant::now(), Instant::now()),
             sampler: Sampler::new(0.0, 0, 1.0, 0.0, 1),
             draft_sampler: Sampler::draft(0.0, 0, 1.0, 0.0, 1),
@@ -5232,5 +6523,720 @@ mod tests {
         assert_eq!(planner.state(1), LaneState::Ready);
         assert!(matches!(ev1.recv_timeout(Duration::ZERO), Ok(Ev::Alive)));
         assert!(ev0.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[derive(Default)]
+    struct ScriptedConnState {
+        written: Vec<u8>,
+        read_timeouts: Vec<Option<Duration>>,
+        write_timeouts: Vec<Option<Duration>>,
+        body_reads: usize,
+    }
+
+    struct ScriptedConnIo {
+        head: Vec<u8>,
+        head_pos: usize,
+        body: Vec<u8>,
+        body_pos: usize,
+        read_chunk_max: usize,
+        read_advance: Duration,
+        body_read_advance: Duration,
+        write_advance: Duration,
+        flush_advance: Duration,
+        forbid_body_read: bool,
+        disconnected: bool,
+        clock: Arc<FakeServeClock>,
+        state: Arc<Mutex<ScriptedConnState>>,
+    }
+
+    impl ScriptedConnIo {
+        fn new(head: impl Into<Vec<u8>>, body: impl Into<Vec<u8>>, clock: Arc<FakeServeClock>) -> (Self, Arc<Mutex<ScriptedConnState>>) {
+            let state = Arc::new(Mutex::new(ScriptedConnState::default()));
+            (
+                Self {
+                    head: head.into(),
+                    head_pos: 0,
+                    body: body.into(),
+                    body_pos: 0,
+                    read_chunk_max: usize::MAX,
+                    read_advance: Duration::ZERO,
+                    body_read_advance: Duration::ZERO,
+                    write_advance: Duration::ZERO,
+                    flush_advance: Duration::ZERO,
+                    forbid_body_read: false,
+                    disconnected: false,
+                    clock,
+                    state: state.clone(),
+                },
+                state,
+            )
+        }
+    }
+
+    impl Read for ScriptedConnIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.head_pos < self.head.len() {
+                let n = (self.head.len() - self.head_pos).min(buf.len()).min(self.read_chunk_max.max(1));
+                buf[..n].copy_from_slice(&self.head[self.head_pos..self.head_pos + n]);
+                self.head_pos += n;
+                if !self.read_advance.is_zero() {
+                    self.clock.advance(self.read_advance);
+                }
+                return Ok(n);
+            }
+            assert!(!self.forbid_body_read, "handle_connection must not read body bytes before check_headers rejects");
+            self.state.lock().unwrap().body_reads += 1;
+            if self.body_pos >= self.body.len() {
+                return Ok(0);
+            }
+            let cur_to = self.state.lock().unwrap().read_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.body_read_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket read timeout"));
+                }
+            }
+            let n = (self.body.len() - self.body_pos).min(buf.len()).min(self.read_chunk_max.max(1));
+            buf[..n].copy_from_slice(&self.body[self.body_pos..self.body_pos + n]);
+            self.body_pos += n;
+            if !self.body_read_advance.is_zero() {
+                self.clock.advance(self.body_read_advance);
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for ScriptedConnIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let cur_to = self.state.lock().unwrap().write_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.write_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket write timeout"));
+                }
+            }
+            if !self.write_advance.is_zero() {
+                self.clock.advance(self.write_advance);
+            }
+            self.state.lock().unwrap().written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let cur_to = self.state.lock().unwrap().write_timeouts.last().copied().flatten();
+            if let Some(limit) = cur_to {
+                if self.flush_advance > limit {
+                    self.clock.advance(limit);
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated socket flush timeout"));
+                }
+            }
+            if !self.flush_advance.is_zero() {
+                self.clock.advance(self.flush_advance);
+            }
+            Ok(())
+        }
+    }
+
+    impl ConnIo for ScriptedConnIo {
+        fn set_read_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+            self.state.lock().unwrap().read_timeouts.push(dur);
+            Ok(())
+        }
+        fn set_write_timeout_opt(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+            self.state.lock().unwrap().write_timeouts.push(dur);
+            Ok(())
+        }
+        fn peer_disconnected(&self) -> bool {
+            self.disconnected
+        }
+    }
+
+    fn test_conn_config(clock: Arc<FakeServeClock>) -> ConnConfig {
+        ConnConfig {
+            clock,
+            max_conns: MAX_CONNS,
+            max_body: 1024,
+            max_count_body: MAX_COUNT_BODY,
+            allow_private_non_loopback_host: false,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            body_read_timeout: BODY_READ_TIMEOUT,
+            client_write_timeout: CLIENT_WRITE_TIMEOUT,
+            stream_total_timeout: MAX_STREAM_DURATION,
+            stream_write_budget: MAX_STREAM_WRITE_TIME,
+        }
+    }
+
+    #[test]
+    fn validate_bind_addrs_accepts_loopback_and_private_and_refuses_public_or_wildcard() {
+        assert!(validate_bind_addrs(&[], true, false).is_err());
+        let sock = |s: &str| vec![s.parse::<std::net::SocketAddr>().unwrap()];
+        for loopback in ["127.0.0.1:8090", "[::1]:8090", "[::ffff:127.0.0.1]:8090"] {
+            assert_eq!(validate_bind_addrs(&sock(loopback), false, false), Ok(()));
+        }
+        for priv_addr in [
+            "10.0.0.1:8096",
+            "172.16.0.1:8096",
+            "192.168.1.10:8096",
+            "100.64.0.1:8096",
+            "169.254.1.1:8096",
+            "[fd7a:115c:a1e0::1]:8096",
+            "[fe80::1]:8096",
+        ] {
+            assert!(validate_bind_addrs(&sock(priv_addr), false, false).is_err());
+            assert_eq!(validate_bind_addrs(&sock(priv_addr), true, false), Ok(()));
+            assert_eq!(validate_bind_addrs(&sock(priv_addr), false, true), Ok(()));
+        }
+        for disallowed in [
+            "0.0.0.0:8096",
+            "[::]:8096",
+            "8.8.8.8:8096",
+            "192.0.2.1:8096",
+            "[2001:4860:4860::8888]:8096",
+        ] {
+            for (has_key, allow_unauth) in [(false, false), (true, false), (false, true), (true, true)] {
+                let err = validate_bind_addrs(&sock(disallowed), has_key, allow_unauth).unwrap_err();
+                assert!(err.contains("neither loopback nor a private"), "{disallowed}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn checked_serve_block_pool_counts_enforces_hard_floor_and_preserves_usable_context() {
+        let gib = 1u64 << 30;
+        let win_stride = crate::blocks::stride_at(crate::blocks::BlockKind::Window, 2).unwrap();
+        let full_stride = crate::blocks::stride_at(crate::blocks::BlockKind::Full, 2).unwrap();
+        let (min_win, min_full) = Engine::serve_pool_floor_counts(4096, 6144);
+        assert_eq!((min_win, min_full), (81, 96));
+        let floor_bytes = (min_win as u64) * win_stride + (min_full as u64) * full_stride;
+
+        for bad_budget in [0u64, 64 << 20, floor_bytes - 1] {
+            let err = Engine::checked_serve_block_pool_counts(bad_budget, 2, 4096, 6144, 1, 32 * gib).unwrap_err();
+            assert!(err.contains("insufficient Metal K/V pool budget"), "{bad_budget}: {err}");
+        }
+
+        let (w_exact, f_exact) = Engine::checked_serve_block_pool_counts(floor_bytes, 2, 4096, 6144, 1, 32 * gib).unwrap();
+        assert_eq!((w_exact, f_exact), (min_win, min_full));
+        assert_eq!(pooled_context(6144, f_exact, w_exact), 6144);
+
+        // Verify servecheck's `-c 6144 --lanes 1..4` capped budgets comfortably satisfy the floor.
+        for lanes in [1usize, 4usize] {
+            let capped = Engine::capped_serve_kv_budget(27 * gib, 2, 4096, 6144, lanes);
+            let (w, f) = Engine::checked_serve_block_pool_counts(capped, 2, 4096, 6144, lanes, 32 * gib).unwrap();
+            assert!(w >= min_win && f >= min_full, "lanes={lanes}: w={w} f={f}");
+            assert_eq!(pooled_context(6144, f, w), 6144);
+        }
+    }
+
+    #[test]
+    fn unkeyed_loopback_refuses_browser_origin_dns_rebinding_and_non_json_post() {
+        let clock = FakeServeClock::auto_advancing();
+        let (cx, jrx) = admission_test_ctx_with_clock(2, 2, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
+        let cfg = test_conn_config(clock.clone());
+        let body = br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#.to_vec();
+
+        // 1. Browser Origin header on unkeyed server -> 403 before reading body.
+        let head_origin = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_origin, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got: {resp}");
+
+        // 2. DNS-rebinding Host header -> 403 before reading body.
+        let head_rebind = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: rebind.attacker.tld:8090\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_rebind, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got: {resp}");
+        assert!(resp.contains("permission_error"), "got: {resp}");
+
+        // 3. Simple-CORS text/plain POST -> 415 before reading body.
+        let head_plain = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost:8090\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_plain, body.clone(), clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 415 "), "got: {resp}");
+        assert!(jrx.try_recv().is_err());
+
+        // 4. Legitimate local CLI/SDK request (loopback Host, application/json; charset=utf-8, no Origin) -> 200 OK.
+        let head_ok = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost:8090\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (io, st) = ScriptedConnIo::new(head_ok, body, clock);
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv().unwrap();
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+        });
+        serve_one_connection(&cx, io, &cfg);
+        scheduler.join().unwrap();
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
+    }
+
+    #[test]
+    fn dribbling_stream_reader_hits_total_write_deadline_and_frees_lane_on_both_apis() {
+        for (path, body) in [
+            ("/v1/chat/completions", br#"{"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#.as_slice()),
+            ("/v1/messages", br#"{"max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#.as_slice()),
+        ] {
+            let clock = FakeServeClock::auto_advancing();
+            let (cx, jrx) = admission_test_ctx_with_clock(1, 0, QUEUE_WAIT_TIMEOUT, 2, clock.clone());
+            let tok_a = cx.tk.encode("a", false)[0];
+            let sp = cx.sp;
+            let cfg = test_conn_config(clock.clone());
+            let head = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            // Each flush stalls 4s (< 5s per-write CLIENT_WRITE_TIMEOUT), accumulating past 15s MAX_STREAM_WRITE_TIME.
+            let (mut io, st) = ScriptedConnIo::new(head, body.to_vec(), clock.clone());
+            io.flush_advance = Duration::from_secs(4);
+
+            let scheduler = std::thread::spawn(move || {
+                let job = jrx.recv().expect("streaming job must reach scheduler");
+                let _ = job.out.send(Ev::Tok(sp.msg_model));
+                let _ = job.out.send(Ev::Tok(sp.c_text));
+                for _ in 0..12 {
+                    if job.out.send(Ev::Tok(tok_a)).is_err() {
+                        break;
+                    }
+                }
+                job
+            });
+            serve_one_connection(&cx, io, &cfg);
+            let job = scheduler.join().unwrap();
+
+            assert!(job.out.cancelled(), "{path}: slow streaming reader must drop rx and mark job cancelled");
+            assert!(job.out.queued() > 0, "{path}: dribbling reader must be cut off before draining queued tokens");
+            let write_tos: Vec<Duration> = st.lock().unwrap().write_timeouts.iter().filter_map(|&d| d).collect();
+            assert!(
+                write_tos.iter().any(|&d| d < CLIENT_WRITE_TIMEOUT),
+                "{path}: remaining stream write budget must shrink socket write timeout below 5s: {write_tos:?}"
+            );
+            assert!(cx.admission.try_acquire().is_none(), "{path}: permit held while cancelled job awaits scheduler step");
+            drop(job);
+            assert!(cx.admission.try_acquire().is_some(), "{path}: dropping cancelled job must immediately free its lane permit");
+            assert_eq!(cx.conns.total(), 0);
+        }
+
+        // Fast client over a 120s GPU generation (1ms per flush, 30s GPU compute between tokens)
+        // stays well under MAX_STREAM_WRITE_TIME (15s), whereas exceeding MAX_STREAM_DURATION (600s)
+        // cuts off cleanly with TimedOut.
+        let clock = FakeServeClock::auto_advancing();
+        let (mut io, st) = ScriptedConnIo::new(Vec::new(), Vec::new(), clock.clone());
+        io.write_advance = Duration::from_millis(1);
+        io.flush_advance = Duration::from_millis(1);
+        {
+            let mut sw = StreamDeadlineWriter::new(
+                &mut io,
+                clock.as_ref(),
+                MAX_STREAM_DURATION,
+                MAX_STREAM_WRITE_TIME,
+                CLIENT_WRITE_TIMEOUT,
+            );
+            for step in 0..4 {
+                clock.advance(Duration::from_secs(30)); // 30s of GPU prefill/decode outside socket writes
+                write!(sw, "data: {{\"step\":{step}}}\n\n").unwrap();
+                sw.flush().unwrap();
+            }
+            assert!(sw.write_elapsed < Duration::from_millis(50));
+            clock.advance(MAX_STREAM_DURATION);
+            let err = sw.write(b"data: late\n\n").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        }
+        let written = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(written.contains("{\"step\":3}"), "fast reader over 120s GPU run must complete: {written}");
+    }
+
+    #[test]
+    fn serve_connection_handler_covers_chunked_413_prebody_401_slow_408_and_max_conns_503() {
+        let clock = FakeServeClock::auto_advancing();
+        let (mut cx, jrx) = admission_test_ctx_with_clock(2, 2, QUEUE_WAIT_TIMEOUT, 4, clock.clone());
+        cx.key = Some("top-secret".into());
+        let mut cfg = test_conn_config(clock.clone());
+        cfg.max_body = 128;
+
+        // (a) Valid chunked request body -> 200 OK.
+        let payload = br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#;
+        let split = payload.len() / 2;
+        let chunked_body = format!(
+            "{:x}\r\n{}\r\n{:x};ext=ok\r\n{}\r\n0\r\nX-Trailer: 1\r\n\r\n",
+            split,
+            std::str::from_utf8(&payload[..split]).unwrap(),
+            payload.len() - split,
+            std::str::from_utf8(&payload[split..]).unwrap(),
+        );
+        let head_chunked = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (io, st) = ScriptedConnIo::new(head_chunked, chunked_body.into_bytes(), clock.clone());
+        let scheduler = std::thread::spawn(move || {
+            let job = jrx.recv().unwrap();
+            job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+            jrx
+        });
+        serve_one_connection(&cx, io, &cfg);
+        let jrx = scheduler.join().unwrap();
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "(a) valid chunked: {resp}");
+        assert_eq!(cx.conns.total(), 0);
+
+        // (b1) 413 oversized fixed Content-Length -> rejected before reading body!
+        let head_fixed_413 = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nContent-Length: {}\r\n\r\n",
+            cfg.max_body + 1
+        );
+        let (mut io, st) = ScriptedConnIo::new(head_fixed_413, vec![b'x'; cfg.max_body + 1], clock.clone());
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 "), "(b1) fixed 413: {resp}");
+
+        // (b2) 413 oversized chunked body -> rejected without allocating past max_body!
+        let head_chunk_413 = "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let over_chunk = format!("{:x}\r\n{}\r\n0\r\n\r\n", cfg.max_body + 1, "a".repeat(cfg.max_body + 1));
+        let (io, st) = ScriptedConnIo::new(head_chunk_413, over_chunk.into_bytes(), clock.clone());
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 "), "(b2) chunked 413: {resp}");
+        assert!(resp.contains("request_too_large"), "(b2) anthropic 413 body: {resp}");
+
+        // (c) Unauthenticated request with oversized/invalid body rejected with 401 STRICTLY BEFORE reading body!
+        for raw_head in [
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nContent-Length: {}\r\n\r\n",
+                cfg.max_body + 9999
+            ),
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer wrong\r\nTransfer-Encoding: chunked\r\n\r\n".to_string(),
+        ] {
+            let (mut io, st) = ScriptedConnIo::new(raw_head, b"not-hex\r\ngarbage".to_vec(), clock.clone());
+            io.forbid_body_read = true;
+            serve_one_connection(&cx, io, &cfg);
+            let guard = st.lock().unwrap();
+            assert_eq!(guard.body_reads, 0);
+            let resp = String::from_utf8(guard.written.clone()).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 401 "), "(c) unauth must return 401 before body read: {resp}");
+        }
+
+        // (d1) Slow header read exceeding HEADER_READ_TIMEOUT -> 408 Request Timeout.
+        let slow_head = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n\r\n";
+        let (mut io, st) = ScriptedConnIo::new(slow_head, Vec::new(), clock.clone());
+        io.read_chunk_max = 1;
+        io.read_advance = Duration::from_secs(1);
+        serve_one_connection(&cx, io, &cfg);
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 408 "), "(d1) slow header read: {resp}");
+        assert_eq!(cx.conns.total(), 0);
+
+        // (d2) Slow fixed-length and chunked body reads exceeding BODY_READ_TIMEOUT -> 408 Request Timeout.
+        for (head_s, body_s) in [
+            (
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nContent-Length: 16\r\n\r\n",
+                b"{\"messages\":[]} ".as_slice(),
+            ),
+            (
+                "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:8090\r\nAuthorization: Bearer top-secret\r\nTransfer-Encoding: chunked\r\n\r\n",
+                b"4\r\n{\"a\"\r\n4\r\n:1} \r\n0\r\n\r\n".as_slice(),
+            ),
+        ] {
+            let (mut io, st) = ScriptedConnIo::new(head_s, body_s.to_vec(), clock.clone());
+            io.read_chunk_max = 2;
+            io.body_read_advance = Duration::from_secs(25);
+            serve_one_connection(&cx, io, &cfg);
+            let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 408 "), "(d2) slow body read: {resp}");
+            assert_eq!(cx.conns.total(), 0);
+        }
+
+        // (e) Over-max_conns -> immediate 503 with connection counter preserved.
+        cfg.max_conns = 2;
+        cx.conns.set_total_for_test(2);
+        let (mut io, st) = ScriptedConnIo::new("GET /health HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n\r\n", Vec::new(), clock);
+        io.forbid_body_read = true;
+        serve_one_connection(&cx, io, &cfg);
+        assert_eq!(cx.conns.total(), 2, "rejected over-cap connection must restore cx.conns");
+        let resp = String::from_utf8(st.lock().unwrap().written.clone()).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 503 "), "(e) max_conns 503: {resp}");
+        assert!(resp.contains("too many connections"), "(e) max_conns body: {resp}");
+        assert!(jrx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recorder_ignores_refused_requests_and_preserves_contiguous_card_turns() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("serve-refused-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::new(dir.clone()));
+        let clock = FakeServeClock::auto_advancing();
+        let (mut cx, jrx) = admission_test_ctx_with_clock(1, 0, Duration::from_millis(10), 2, clock.clone());
+        cx.key = Some("secret".into());
+        cx.recorder = Some(rec.clone());
+        let mut cfg = test_conn_config(clock.clone());
+        cfg.max_body = 256;
+
+        // Exercise 401, 413, 400 (malformed JSON), 400 (bad max_tokens), and 429 (queue full) with X-Inky-Card-Id.
+        let post = |cx: &Ctx, auth: &str, body: &[u8]| {
+            let head = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8090\r\n{auth}X-Inky-Card-Id: card-clean\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let (io, st) = ScriptedConnIo::new(head, body.to_vec(), clock.clone());
+            serve_one_connection(cx, io, &cfg);
+            let written = st.lock().unwrap().written.clone();
+            String::from_utf8(written).unwrap()
+        };
+        assert!(post(&cx, "", b"{}").starts_with("HTTP/1.1 401 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", &vec![b'a'; 300]).starts_with("HTTP/1.1 413 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", b"{not json").starts_with("HTTP/1.1 400 "));
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":0,"messages":[{"role":"user","content":"hi"}]}"#).starts_with("HTTP/1.1 400 "));
+        let held = cx.admission.try_acquire().unwrap();
+        assert!(post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#).starts_with("HTTP/1.1 429 "));
+        drop(held);
+
+        assert_eq!(rec.queued_bytes(), 0);
+        assert_eq!(rec.written_count(), 0);
+        assert_eq!(rec.dropped_count(), 0);
+
+        // Now send two valid requests on `card-clean` and verify they record as turns 0 and 1.
+        let scheduler = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let job = jrx.recv().unwrap();
+                job.out.send(Ev::Done { prompt: job.toks.len(), cached: 0, gen: 1, reason: "stop", timing: Default::default() }).unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let r = post(&cx, "Authorization: Bearer secret\r\n", br#"{"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}"#);
+            assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+        }
+        scheduler.join().unwrap();
+        drop(cx);
+        drop(rec);
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|p| p.path()))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let entries = crate::record::parse_jsonl(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(entries.len(), 2, "only admitted turns may be recorded");
+        assert_eq!(entries[0].card_id, "card-clean");
+        assert_eq!(entries[0].turn_index, 0);
+        assert_eq!(entries[1].turn_index, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pool_deferred_lane_wakes_before_first_window_prune_on_sub_ext_progress() {
+        use crate::blocks::{BlockPools, BlockTable, BLOCK};
+        use crate::scheduler::{ServeLaneInput, ServeStepPlan, ServeStepPlanner};
+
+        // 1. Sub-EXT (< 1024) shared PROMPT checkpoint seal + follower rebind while holder stays active:
+        // Pool has 12 Full + 12 Window slots (< 16 blocks = 1024 EXT, so `window_pruned` is ALWAYS 0!).
+        // - Lane 0 has a 600-token prompt (`PROMPT` checkpoint at 576 = 9 blocks) + 120 decode tokens (< 1024).
+        // - Lane 1 shares the first 576 tokens and extends to 644 tokens (`PROMPT` checkpoint at 640 = 10 blocks).
+        // Because 576 != 640 and both are < EARLY_EVERY_TOKENS (2048), singleflight does NOT defer Lane 1
+        // at pos 0; both enter Prefill step 1 together (`9 + 10 = 19 > 12` slots).
+        // Lane 0 takes 9 slots (3 free left); Lane 1 hits PoolExhausted and becomes `pool_deferred[1] = true`.
+        // When Lane 0 finishes `[0..576)` (`pos = 576 < 1024`, `lanes_released == 0`, `window_pruned == 0`),
+        // Lane 1 rebinds to 576 (`rebind_if_deeper_match`) and now needs ONLY 1 block (`<= 3` free)!
+        // `refresh_pool_deferred` MUST wake Lane 1 immediately instead of stalling across 120 holder decodes!
+        let mut pools = BlockPools::with_capacities(12, 12, 1).unwrap();
+        let mut cache = ServeBlockCache::new();
+        let mut planner = ServeStepPlanner::new(2, 2);
+        planner.on_admit(0);
+        planner.on_admit(1);
+
+        let shared_576: Vec<u32> = (0..576u32).map(|i| 5_000 + i).collect();
+        let mut toks0 = shared_576.clone();
+        toks0.extend(10_000..10_024); // 600 tokens total (< 1024)
+        let mut toks1 = shared_576;
+        toks1.extend(20_000..20_068); // 644 tokens total (< 1024)
+
+        let mut tbls = [BlockTable::new(32).unwrap(), BlockTable::new(32).unwrap()];
+        let mut blocks = [LaneBlockState::default(), LaneBlockState::default()];
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[0], &mut blocks[0], &toks0).is_none());
+        assert!(cache.match_and_bind(&mut pools, &mut tbls[1], &mut blocks[1], &toks1).is_none());
+
+        let mut n_past = [0usize, 0usize];
+        let mut cached = [0usize, 0usize];
+        let pf_end = [toks0.len(), toks1.len()];
+        let mut gen = [0usize, 0usize];
+        let max_gen = [64usize, 1usize];
+        let mut pool_deferred = [false, false];
+        let mut wake_snap = PoolWakeSnapshot::capture(&cache, &pools);
+
+        // Step 1: Both lanes planned in Prefill; Lane 0 allocates 9 blocks, Lane 1 defers!
+        let inputs1: Vec<ServeLaneInput> = (0..2)
+            .map(|i| ServeLaneInput {
+                runnable: !pool_deferred[i],
+                n_past: n_past[i],
+                pf_end: effective_pf_target(n_past[i], pf_end[i]),
+                has_pending_decode: false,
+            })
+            .collect();
+        let Some(ServeStepPlan::Prefill(sp1)) = planner.plan_and_begin_step(&inputs1, 2048, BLOCK) else {
+            panic!("expected step 1 prefill");
+        };
+        assert_eq!(sp1, vec![(0, 0, 576), (1, 0, 640)]);
+        cache.ensure_span_blocks(&mut pools, &mut tbls[0], 0, 576).unwrap();
+        assert!(cache.ensure_span_blocks(&mut pools, &mut tbls[1], 0, 640).is_err());
+        pool_deferred[1] = true;
+        cache.finish_prefill_span(&mut pools, &mut tbls[0], &mut blocks[0], &toks0, 0, 576, || vec![9u8; 16]);
+        n_past[0] = 576;
+        let checkpoints_sealed = true;
+        assert!(planner.complete_step().is_empty());
+        assert_eq!(cache.stats().window_pruned, 0, "sub-EXT step never prunes window blocks");
+        assert_eq!(cache.stats().lanes_released, 0, "holder lane 0 is still active");
+
+        // Next iteration: follower rebinds to 576, then `refresh_pool_deferred` wakes Lane 1 immediately!
+        if checkpoints_sealed {
+            if let Some((m, _)) = cache.rebind_if_deeper_match(&mut pools, &mut tbls[1], &mut blocks[1], &toks1, n_past[1]) {
+                n_past[1] = m;
+                cached[1] = m;
+            }
+        }
+        assert_eq!(n_past[1], 576);
+        assert_eq!(cached[1], 576);
+        refresh_pool_deferred(
+            &cache,
+            &pools,
+            &mut wake_snap,
+            &mut pool_deferred,
+            12,
+            2048,
+            [(0, &tbls[0], n_past[0], pf_end[0], false), (1, &tbls[1], n_past[1], pf_end[1], false)],
+        );
+        assert!(!pool_deferred[1], "Lane 1 must wake immediately at pos 576 (< EXT=1024) before any window prune or holder release!");
+
+        // Verify Lane 1 finishes its remaining prefill `[576..644)` while Lane 0 is STILL active (< 1024)!
+        let mut lane1_finished_while_holder_active = false;
+        for _ in 0..12 {
+            let inputs: Vec<ServeLaneInput> = (0..2)
+                .map(|i| ServeLaneInput {
+                    runnable: (i == 0 || gen[1] == 0) && !pool_deferred[i],
+                    n_past: n_past[i],
+                    pf_end: if n_past[i] < pf_end[i] {
+                        effective_pf_target(n_past[i], pf_end[i])
+                    } else {
+                        pf_end[i]
+                    },
+                    has_pending_decode: n_past[i] >= pf_end[i] && gen[i] < max_gen[i],
+                })
+                .collect();
+            let plan = planner.plan_and_begin_step(&inputs, 2048, BLOCK).unwrap();
+            match plan {
+                ServeStepPlan::Prefill(sps) => {
+                    for (i, p0, t) in sps {
+                        cache.ensure_span_blocks(&mut pools, &mut tbls[i], p0, t).unwrap();
+                        let t_ref = if i == 0 { &toks0 } else { &toks1 };
+                        cache.finish_prefill_span(&mut pools, &mut tbls[i], &mut blocks[i], t_ref, p0, t, || vec![1u8; 16]);
+                        n_past[i] = p0 + t;
+                        if i == 1 && n_past[1] == pf_end[1] {
+                            gen[1] = 1;
+                            lane1_finished_while_holder_active = gen[0] < max_gen[0];
+                        }
+                    }
+                }
+                ServeStepPlan::Decode(decs) => {
+                    for i in decs {
+                        cache.ensure_span_blocks(&mut pools, &mut tbls[i], n_past[i], 1).unwrap();
+                        cache.finish_decode_span(&mut pools, &mut tbls[i], &mut blocks[i], n_past[i]);
+                        n_past[i] += 1;
+                        gen[i] += 1;
+                    }
+                }
+            }
+            assert!(planner.complete_step().is_empty());
+            if gen[1] >= 1 {
+                break;
+            }
+        }
+        assert!(lane1_finished_while_holder_active, "Lane 1 must complete while holder Lane 0 is still decoding < 1024");
+        assert_eq!(cache.stats().window_pruned, 0);
+        // Only the 1 internal release inside `rebind_if_deeper_match` occurred; neither active job released!
+        assert_eq!(cache.stats().lanes_released, 1);
+
+        cache.release_lane(&mut pools, &mut tbls[0], &mut blocks[0]);
+        cache.release_lane(&mut pools, &mut tbls[1], &mut blocks[1]);
+        cache.shutdown(&mut pools);
+
+        // 2. Sub-EXT (< 1024) `shared_dedups` wakeup with ZERO `lanes_released` delta and ZERO `window_pruned`:
+        // - Pin a 512-token prompt (`prior`, 8 blocks) on active Lane 2 in a 16-slot pool (8 slots left).
+        // - Holder Lane 0 shares the first 384 tokens (6 blocks) with `prior` then diverges to 460 tokens
+        //   (`match_and_bind` returns `None` because `prior`'s start is at 512 > 460).
+        // - Deferred Lane 1 has a disjoint 320-token prompt (5 blocks).
+        // - Step 1: Lane 0 allocates 6 blocks (`[0..384)` -> 2 slots left); Lane 1 needs 5 blocks -> defers!
+        //   When Lane 0 finishes `[0..384)`, all 6 blocks deduplicate against `prior` (`shared_dedups == 6`),
+        //   dropping Lane 0's 6 private slots back to `refs == 0` (8 free slots!) while BOTH
+        //   `lanes_released` delta == 0 AND `window_pruned == 0` (`pos = 384 < 1024`)!
+        let mut pools2 = BlockPools::with_capacities(16, 16, 1).unwrap();
+        let mut cache2 = ServeBlockCache::new();
+        let prior: Vec<u32> = (0..520u32).map(|i| 30_000 + i).collect();
+        let mut tbl_pin = BlockTable::new(32).unwrap();
+        let mut st_pin = LaneBlockState::default();
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_pin, &mut st_pin, &prior).is_none());
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_pin, 0, 512).unwrap();
+        cache2.finish_prefill_span(&mut pools2, &mut tbl_pin, &mut st_pin, &prior, 0, 512, || vec![7u8; 16]);
+        cache2.release_lane(&mut pools2, &mut tbl_pin, &mut st_pin);
+        let mut prior_cont = prior[..512].to_vec();
+        prior_cont.push(99_999);
+        assert_eq!(cache2.match_and_bind(&mut pools2, &mut tbl_pin, &mut st_pin, &prior_cont).unwrap().0, 512);
+
+        let mut holder = prior[..384].to_vec();
+        holder.extend(40_000..40_076); // 460 tokens -> prompt_ckpt = 448, shares first 6 blocks with `prior`!
+        let disjoint: Vec<u32> = (0..320u32).map(|i| 50_000 + i).collect(); // 5 blocks
+
+        let mut tbl_h = BlockTable::new(32).unwrap();
+        let mut st_h = LaneBlockState::default();
+        let mut tbl_d = BlockTable::new(32).unwrap();
+        let mut st_d = LaneBlockState::default();
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_h, &mut st_h, &holder).is_none());
+        assert!(cache2.match_and_bind(&mut pools2, &mut tbl_d, &mut st_d, &disjoint).is_none());
+
+        let released_before = cache2.stats().lanes_released;
+        let mut snap2 = PoolWakeSnapshot::capture(&cache2, &pools2);
+        let mut deferred2 = [false, false];
+
+        // Holder allocates 6 blocks [0..384) -> 2 free slots left; disjoint needs 5 blocks -> defers!
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_h, 0, 384).unwrap();
+        assert!(cache2.ensure_span_blocks(&mut pools2, &mut tbl_d, 0, 320).is_err());
+        deferred2[1] = true;
+
+        // Holder finishes [0..384): 6 blocks dedup against `prior`, freeing 6 slots at pos=384 (< 1024)!
+        cache2.finish_prefill_span(&mut pools2, &mut tbl_h, &mut st_h, &holder, 0, 384, || vec![8u8; 16]);
+        assert_eq!(cache2.stats().lanes_released, released_before, "zero lanes released");
+        assert_eq!(cache2.stats().window_pruned, 0, "zero window blocks pruned");
+        assert!(cache2.stats().shared_dedups >= 6);
+
+        refresh_pool_deferred(
+            &cache2,
+            &pools2,
+            &mut snap2,
+            &mut deferred2,
+            16,
+            2048,
+            [(0, &tbl_h, 384, holder.len(), false), (1, &tbl_d, 0, disjoint.len(), false)],
+        );
+        assert!(!deferred2[1], "Deferred lane must wake immediately when shared_dedups frees slots < 1024!");
+        cache2.ensure_span_blocks(&mut pools2, &mut tbl_d, 0, 320).unwrap();
+
+        cache2.release_lane(&mut pools2, &mut tbl_h, &mut st_h);
+        cache2.release_lane(&mut pools2, &mut tbl_d, &mut st_d);
+        cache2.release_lane(&mut pools2, &mut tbl_pin, &mut st_pin);
+        cache2.shutdown(&mut pools2);
     }
 }

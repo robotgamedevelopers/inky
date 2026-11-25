@@ -7,17 +7,18 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+pub const DEFAULT_MAX_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRACKED_CARDS: usize = 16_384;
 const MAX_CARD_ID_LEN: usize = 128;
 
@@ -349,13 +350,27 @@ impl Stats {
     }
 }
 
+struct QueuedRecord {
+    recorded_at_ms: u64,
+    bytes: Vec<u8>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedRecord {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes.len(), Ordering::Release);
+    }
+}
+
 pub struct Recorder {
-    tx: Option<SyncSender<RecordEntry>>,
+    tx: Option<SyncSender<QueuedRecord>>,
     worker: Option<JoinHandle<()>>,
     anonymous_nonce: String,
     next_card_seq: AtomicU64,
     turns: Mutex<TurnTracker>,
-    stats: std::sync::Arc<Stats>,
+    queued_bytes: Arc<AtomicUsize>,
+    max_queue_bytes: usize,
+    stats: Arc<Stats>,
 }
 
 impl Recorder {
@@ -370,15 +385,28 @@ impl Recorder {
     }
 
     pub fn with_options(dir: PathBuf, capacity: usize, max_file_bytes: u64) -> Self {
-        let (tx, rx) = sync_channel::<RecordEntry>(capacity.max(1));
-        let stats = std::sync::Arc::new(Stats::new());
+        Self::with_limits(dir, capacity, DEFAULT_MAX_QUEUE_BYTES, max_file_bytes)
+    }
+
+    pub fn with_limits(
+        dir: PathBuf,
+        capacity: usize,
+        max_queue_bytes: usize,
+        max_file_bytes: u64,
+    ) -> Self {
+        let (tx, rx) = sync_channel::<QueuedRecord>(capacity.max(1));
+        let stats = Arc::new(Stats::new());
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         let worker_stats = stats.clone();
         let worker = std::thread::spawn(move || {
             let mut dir_ready = false;
-            while let Ok(entry) = rx.recv() {
+            while let Ok(item) = rx.recv() {
                 if !dir_ready {
                     match fs::create_dir_all(&dir) {
-                        Ok(()) => dir_ready = true,
+                        Ok(()) => {
+                            let _ = repair_existing_record_files(&dir);
+                            dir_ready = true;
+                        }
                         Err(e) => {
                             let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
                             if n == 1 || n.is_power_of_two() {
@@ -388,7 +416,7 @@ impl Recorder {
                         }
                     }
                 }
-                if let Err(e) = append_entry(&dir, &entry, max_file_bytes, &worker_stats) {
+                if let Err(e) = append_serialized_entry(&dir, item.recorded_at_ms, &item.bytes, max_file_bytes, &worker_stats) {
                     let n = worker_stats.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || n.is_power_of_two() {
                         eprintln!("[record] write failed in {} (errors={n}): {e}", dir.display());
@@ -402,6 +430,8 @@ impl Recorder {
             anonymous_nonce: crate::serve::startup_nonce(),
             next_card_seq: AtomicU64::new(1),
             turns: Mutex::new(TurnTracker::default()),
+            queued_bytes,
+            max_queue_bytes: max_queue_bytes.max(1),
             stats,
         }
     }
@@ -417,20 +447,70 @@ impl Recorder {
         (format!("card-{}-{seq}", self.anonymous_nonce), 0)
     }
 
-    /// Enqueues an entry without blocking the caller. Returns `false` if the bounded channel was full.
+    fn note_drop(&self, reason: &str) {
+        let n = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            eprintln!("[record] {reason}; dropped {n} record(s)");
+        }
+    }
+
+    fn try_reserve_bytes(&self, len: usize) -> bool {
+        if len > self.max_queue_bytes {
+            return false;
+        }
+        let mut cur = self.queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_add(len) else { return false };
+            if next > self.max_queue_bytes {
+                return false;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Enqueues an entry without blocking the caller. Returns `false` if the bounded channel or
+    /// byte budget (`max_queue_bytes`) was full.
     pub fn record(&self, entry: RecordEntry) -> bool {
         let Some(tx) = &self.tx else { return false };
-        match tx.try_send(entry) {
+        let recorded_at_ms = entry.recorded_at_ms;
+        let mut bytes = match serde_json::to_vec(&entry.to_json()) {
+            Ok(b) => b,
+            Err(_) => {
+                self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        bytes.push(b'\n');
+        if !self.try_reserve_bytes(bytes.len()) {
+            self.note_drop("queue byte budget full");
+            return false;
+        }
+        let item = QueuedRecord {
+            recorded_at_ms,
+            bytes,
+            queued_bytes: self.queued_bytes.clone(),
+        };
+        match tx.try_send(item) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                let n = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_power_of_two() {
-                    eprintln!("[record] queue full; dropped {n} record(s)");
-                }
+            Err(TrySendError::Full(_item)) => {
+                self.note_drop("queue full");
                 false
             }
-            Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Disconnected(_item)) => false,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
     }
 
     pub fn written_count(&self) -> usize {
@@ -521,15 +601,72 @@ fn rotate_and_prune(
     Ok(())
 }
 
-fn append_entry(
+/// Truncates any incomplete or invalid trailing JSONL fragment in `path` (such as a partial write
+/// left behind by `SIGKILL` or an earlier `ENOSPC`), returning the repaired byte length.
+pub fn repair_torn_jsonl_file(path: &Path) -> std::io::Result<u64> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    // Scan backwards from `len - 1` to find the start of the final line so we do not read
+    // an entire 100 MiB segment into memory during normal appends.
+    let mut scan_end = if len > 0 { len - 1 } else { 0 };
+    let mut last_line_start = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    while scan_end > 0 {
+        let chunk_len = scan_end.min(buf.len() as u64) as usize;
+        let chunk_pos = scan_end - chunk_len as u64;
+        file.seek(SeekFrom::Start(chunk_pos))?;
+        file.read_exact(&mut buf[..chunk_len])?;
+        if let Some(rel) = buf[..chunk_len].iter().rposition(|&b| b == b'\n') {
+            last_line_start = chunk_pos + rel as u64 + 1;
+            break;
+        }
+        scan_end = chunk_pos;
+    }
+    let tail_len = usize::try_from(len - last_line_start)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "record line exceeds usize"))?;
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::Start(last_line_start))?;
+    file.read_exact(&mut tail)?;
+    let valid_last_line = tail.ends_with(b"\n")
+        && serde_json::from_slice::<Value>(&tail[..tail.len() - 1])
+            .ok()
+            .and_then(|v| RecordEntry::from_json(&v).ok())
+            .is_some();
+    if valid_last_line {
+        return Ok(len);
+    }
+    file.set_len(last_line_start)?;
+    file.sync_data()?;
+    Ok(last_line_start)
+}
+
+fn repair_existing_record_files(dir: &Path) -> std::io::Result<()> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if is_card_record_file(&name) {
+            let _ = repair_torn_jsonl_file(&item.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn append_serialized_entry(
     dir: &Path,
-    entry: &RecordEntry,
+    recorded_at_ms: u64,
+    line_with_nl: &[u8],
     max_file_bytes: u64,
     stats: &Stats,
 ) -> std::io::Result<()> {
-    let line = serde_json::to_string(&entry.to_json())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let needed_bytes = (line.len() as u64).saturating_add(1);
+    debug_assert!(line_with_nl.ends_with(b"\n"));
+    let needed_bytes = line_with_nl.len() as u64;
     if max_file_bytes != 0 && needed_bytes > max_file_bytes {
         let n = stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n.is_power_of_two() {
@@ -537,11 +674,12 @@ fn append_entry(
         }
         return Ok(());
     }
-    let filename = format!("cards-{}.jsonl", yyyymmdd_utc(entry.recorded_at_ms));
+    let filename = format!("cards-{}.jsonl", yyyymmdd_utc(recorded_at_ms));
     let path = dir.join(&filename);
+    let _ = repair_torn_jsonl_file(&path)?;
     rotate_and_prune(dir, &filename, &path, needed_bytes, max_file_bytes, stats)?;
     let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -553,8 +691,11 @@ fn append_entry(
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    writeln!(file, "{line}")?;
-    file.flush()?;
+    let prior_len = file.seek(SeekFrom::End(0))?;
+    if let Err(e) = file.write_all(line_with_nl).and_then(|()| file.flush()) {
+        let _ = file.set_len(prior_len);
+        return Err(e);
+    }
     stats.written.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -875,14 +1016,16 @@ mod tests {
     fn bounded_channel_drops_without_blocking_when_full() {
         let dir = temp_dir("bounded");
         let _ = fs::remove_dir_all(&dir);
-        let (tx, _rx) = sync_channel::<RecordEntry>(1);
+        let (tx, _rx) = sync_channel::<QueuedRecord>(1);
         let rec = Recorder {
             tx: Some(tx),
             worker: None,
             anonymous_nonce: "test".into(),
             next_card_seq: AtomicU64::new(1),
             turns: Mutex::new(TurnTracker::default()),
-            stats: std::sync::Arc::new(Stats::new()),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            max_queue_bytes: DEFAULT_MAX_QUEUE_BYTES,
+            stats: Arc::new(Stats::new()),
         };
         let mk = || RecordEntry {
             schema_version: SCHEMA_VERSION,
@@ -906,8 +1049,124 @@ mod tests {
             },
         };
         assert!(rec.record(mk()));
+        assert!(rec.queued_bytes() > 0);
         assert!(!rec.record(mk()), "full bounded queue must drop non-blockingly");
         assert_eq!(rec.dropped_count(), 1);
+    }
+
+    #[test]
+    fn bounded_queue_bytes_drops_when_byte_cap_reached_and_releases_on_pop() {
+        let (tx, rx) = sync_channel::<QueuedRecord>(64);
+        let mk = |pad: usize| RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: 1_795_543_200_000,
+            card_id: "card-bytes".into(),
+            turn_index: 0,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"messages": [{"role": "user", "content": "x".repeat(pad)}]}),
+            response: ResponseMetrics {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                ttft_ms: 1,
+                total_ms: 1,
+                queue_ms: 0,
+                prefill_ms: 0,
+                decode_ms: 0,
+                finish_reason: "stop".into(),
+                status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
+            },
+        };
+        let sample_len = serde_json::to_vec(&mk(200).to_json()).unwrap().len() + 1;
+        let rec = Recorder {
+            tx: Some(tx),
+            worker: None,
+            anonymous_nonce: "test".into(),
+            next_card_seq: AtomicU64::new(1),
+            turns: Mutex::new(TurnTracker::default()),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            max_queue_bytes: sample_len * 2 + 16,
+            stats: Arc::new(Stats::new()),
+        };
+
+        // Single entry larger than max_queue_bytes is dropped without reserving bytes.
+        assert!(!rec.record(mk(sample_len * 3)));
+        assert_eq!(rec.queued_bytes(), 0);
+        assert_eq!(rec.dropped_count(), 1);
+
+        // Two normal entries fit; third exceeds max_queue_bytes even though 62 channel slots remain.
+        assert!(rec.record(mk(200)));
+        assert_eq!(rec.queued_bytes(), sample_len);
+        assert!(rec.record(mk(200)));
+        assert_eq!(rec.queued_bytes(), sample_len * 2);
+        assert!(!rec.record(mk(200)), "must drop when queued byte cap is exceeded");
+        assert_eq!(rec.queued_bytes(), sample_len * 2);
+        assert_eq!(rec.dropped_count(), 2);
+
+        // Popping and dropping one queued item releases its bytes so another entry can enqueue.
+        let popped = rx.try_recv().unwrap();
+        drop(popped);
+        assert_eq!(rec.queued_bytes(), sample_len);
+        assert!(rec.record(mk(200)));
+        assert_eq!(rec.queued_bytes(), sample_len * 2);
+    }
+
+    #[test]
+    fn repair_torn_jsonl_file_truncates_partial_tail_before_append() {
+        let dir = temp_dir("torn");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ts = 1_795_543_200_000u64; // 2026-11-24
+        let path = dir.join("cards-20261124.jsonl");
+        let mk = |turn: u64| RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: ts + turn,
+            card_id: "card-torn".into(),
+            turn_index: turn,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"messages": [{"role": "user", "content": format!("turn {turn}")}]}),
+            response: ResponseMetrics {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                ttft_ms: 1,
+                total_ms: 3,
+                queue_ms: 0,
+                prefill_ms: 1,
+                decode_ms: 2,
+                finish_reason: "stop".into(),
+                status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
+            },
+        };
+        let mut raw = Vec::new();
+        for turn in [0u64, 1u64] {
+            raw.extend_from_slice(&serde_json::to_vec(&mk(turn).to_json()).unwrap());
+            raw.push(b'\n');
+        }
+        let clean_len = raw.len() as u64;
+        // Simulate SIGKILL / ENOSPC leaving an unterminated partial JSON fragment at EOF.
+        raw.extend_from_slice(br#"{"schema_version":1,"recorded_at_ms":1795543200999,"card_id":"torn"#);
+        fs::write(&path, &raw).unwrap();
+
+        let repaired_len = repair_torn_jsonl_file(&path).unwrap();
+        assert_eq!(repaired_len, clean_len);
+        assert_eq!(parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap().len(), 2);
+
+        // Simulate a corrupted newline-terminated tail and verify Recorder repairs it on startup/append.
+        let mut with_corrupt_nl = fs::read(&path).unwrap();
+        with_corrupt_nl.extend_from_slice(b"{\"schema_version\":1,\"broken\n");
+        fs::write(&path, &with_corrupt_nl).unwrap();
+        {
+            let rec = Recorder::new(dir.clone());
+            assert!(rec.record(mk(2)));
+        }
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(final_content.ends_with('\n'));
+        let entries = parse_jsonl(&final_content).unwrap();
+        assert_eq!(entries.iter().map(|e| e.turn_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

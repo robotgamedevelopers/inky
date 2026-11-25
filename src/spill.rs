@@ -40,9 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 mod store;
-pub use store::SpillStore;
-#[allow(unused_imports)]
-pub use store::SpillStoreStats;
+pub use store::{read_block_from_dir, RawDiskRead, SpillStore};
 
 /// Positions in one sealed block (`docs/DESIGN.md`, Blocks).
 pub const BLOCK_POSITIONS: usize = 64;
@@ -66,8 +64,37 @@ pub const SPILL_FORMAT_VERSION: u32 = 2;
 /// magic(8) + version(4) + kind(2) + kvb(2) + block_id(8) + generation(8) + kv_len(8) + state_len(8) + sha256(32).
 pub const SPILL_HEADER_LEN: usize = 80;
 const HEADER_PREFIX_LEN: usize = 48;
+/// Persistent start-point metadata manifest stored inside `--spill-dir`.
+pub const SPILL_INDEX_FILENAME: &str = "spill-index.bin";
+const SPILL_INDEX_TMP_PREFIX: &str = "spill-index.tmp.";
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+type SpillReadHook = dyn Fn(&Path, SpillKey) + Send + Sync + 'static;
+
+#[cfg(test)]
+fn spill_read_hook_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc<SpillReadHook>>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<SpillReadHook>>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub fn set_test_spill_read_hook(hook: Option<std::sync::Arc<SpillReadHook>>) {
+    *spill_read_hook_slot().lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+#[cfg(test)]
+pub(super) fn run_test_spill_read_hook(dir: &Path, key: SpillKey) {
+    let hook = spill_read_hook_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(h) = hook {
+        h(dir, key);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pure-Rust FIPS 180-4 SHA-256 (zero external crate dependencies)

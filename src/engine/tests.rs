@@ -1012,3 +1012,186 @@ fn vecalloc_liveness_loopcd_zero_collisions() {
         assert_ne!(cur, 0);
     }
 }
+
+#[test]
+fn sync_lane_block_table_64_decode_positions_writes_once_then_63_zero_steps() {
+    use crate::blocks::{BlockIndex, BlockKind, BlockPools, BlockTable, BLOCK as KV_BLOCK};
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    if MTLCreateSystemDefaultDevice().is_none() {
+        eprintln!("skipping Metal block-table sync test: no Metal device");
+        return;
+    }
+    let trivial_metal = "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_nop() {}\n";
+    let gpu = Gpu::new(trivial_metal, &["k_nop"]);
+    let mut pools = BlockPools::gpu(&gpu.dev, 8, 8, 2);
+    let slab = Rc::new(RefCell::new(BlockedSlab::new(32)));
+    let slot_idx = slab.borrow_mut().alloc_slot(&gpu, 32);
+    let lane = Lane {
+        kv_swa: RefCell::new(gpu.buffer(16)),
+        kv_full: RefCell::new(gpu.buffer(16)),
+        swa_cap: Cell::new(0),
+        full_cap: Cell::new(0),
+        cs_own: None,
+        toks: gpu.buffer(2048 * 4),
+        tier: None,
+        prune: RefCell::new(None),
+        block_table: RefCell::new(BlockTable::new(32).unwrap()),
+        use_blocks: Cell::new(true),
+        blocked_slot: Some(BlockedSlot {
+            slab: slab.clone(),
+            slot_idx,
+            bt_blocks: 32,
+        }),
+    };
+
+    let ensure_blocks = |pools: &mut BlockPools, lane: &Lane, p0: usize, t: usize| {
+        let mut tbl = lane.block_table.borrow_mut();
+        for b in (p0 / KV_BLOCK)..=((p0 + t - 1) / KV_BLOCK) {
+            let bi = BlockIndex::new(b as u32);
+            for kind in [BlockKind::Full, BlockKind::Window] {
+                if tbl.get(kind, bi).unwrap().is_none() {
+                    let pool = pools.of_mut(kind);
+                    let (s, _) = pool.take_free().unwrap();
+                    let gen = pool.record(s).unwrap().generation();
+                    tbl.fill(pool, bi, s, gen).unwrap();
+                }
+            }
+        }
+    };
+    let finish_span = |pools: &mut BlockPools, lane: &Lane, p0: usize, t: usize, seal_full: bool| {
+        let end = p0 + t;
+        let tbl = lane.block_table.borrow();
+        for b in (p0 / KV_BLOCK)..=((end - 1) / KV_BLOCK) {
+            let bi = BlockIndex::new(b as u32);
+            let blen = (end - b * KV_BLOCK).min(KV_BLOCK) as u32;
+            for kind in [BlockKind::Full, BlockKind::Window] {
+                let e = tbl.get(kind, bi).unwrap().unwrap();
+                let rec = pools.of_mut(kind).record_mut(e.slot()).unwrap();
+                rec.set_length(blen).unwrap();
+                if seal_full && blen == KV_BLOCK as u32 {
+                    rec.seal();
+                }
+            }
+        }
+    };
+
+    // Prefill block 0 (`[0, 64)`): initial full sync writes all 32 entries per kind, sealing block 0.
+    ensure_blocks(&mut pools, &lane, 0, 64);
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((0, 31)));
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((0, 31)));
+    assert_eq!(sync_blocked_lane_table(&pools, &lane, 0, 64), (32, 32));
+    finish_span(&mut pools, &lane, 0, 64, true);
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), None);
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), None);
+
+    // Plant sentinels in unused GPU block-table entries `[2..32)` to prove steady-state sync touches nothing.
+    for swa in [false, true] {
+        lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                    cap_blk,
+                )
+            };
+            for w in &mut dst[2..32] {
+                *w = 0xDEAD_BEEF_CAFE_BABEu64;
+            }
+        });
+    }
+
+    // Step across 64 consecutive decode positions `pos = 64..128` (the entire second 64-token block):
+    // - `pos == 64` allocates block 1 -> `dirty_range == Some((1, 1))` -> writes `(1, 1)` table words.
+    // - `pos == 65..128` (63 steady-state decode steps) -> `dirty_range == None` -> writes `(0, 0)` words!
+    for pos in 64..128 {
+        ensure_blocks(&mut pools, &lane, pos, 1);
+        if pos == 64 {
+            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((1, 1)));
+            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((1, 1)));
+        } else {
+            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), None, "pos={pos} must have clean Full table");
+            assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), None, "pos={pos} must have clean Window table");
+        }
+        let written = sync_blocked_lane_table(&pools, &lane, pos, 1);
+        if pos == 64 {
+            assert_eq!(written, (1, 1), "pos=64 must write only newly allocated block 1");
+        } else {
+            assert_eq!(written, (0, 0), "steady-state decode at pos={pos} must write 0 table words");
+        }
+        finish_span(&mut pools, &lane, pos, 1, false);
+    }
+
+    // Sentinels in `[2..32)` are still completely untouched after all 64 decode steps.
+    for swa in [false, true] {
+        lane.with_bt_buf(swa, |bt_buf, byte_off, cap_blk| {
+            let dst = unsafe {
+                std::slice::from_raw_parts(
+                    (bt_buf.contents().as_ptr() as *mut u8).add(byte_off) as *mut u64,
+                    cap_blk,
+                )
+            };
+            assert!(dst[2..32].iter().all(|&w| w == 0xDEAD_BEEF_CAFE_BABEu64));
+        });
+    }
+
+    // Next block boundary at `pos = 128` allocates block 2 -> writes `(1, 1)` table words.
+    ensure_blocks(&mut pools, &lane, 128, 1);
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Full), Some((2, 2)));
+    assert_eq!(lane.block_table.borrow().dirty_range(BlockKind::Window), Some((2, 2)));
+    assert_eq!(sync_blocked_lane_table(&pools, &lane, 128, 1), (1, 1));
+    let full_b2 = lane.block_table.borrow().get(BlockKind::Full, BlockIndex::new(2)).unwrap().unwrap();
+    assert_eq!(pools.full.record(full_b2.slot()).unwrap().refs(), 1);
+}
+
+#[test]
+#[ignore = "requires Inkling Q4_K_M model and Metal 4"]
+fn engine_encode_decode_64_positions_syncs_once_then_63_zero_steps() {
+    use crate::blocks::{BlockIndex, BlockKind};
+    use objc2_metal::MTLCommandBuffer;
+
+    let model = std::env::var("INKY_MODEL").unwrap_or_else(|_| crate::default_model());
+    let eng = Engine::load(&model, 256);
+    eng.ensure_batch(64);
+    eng.ensure_dbatch(1);
+    let lane = Lane::new_blocked(&eng, 192);
+    let toks: Vec<u32> = (0..130).map(|i| ((i * 17 + 5) % 500) as u32).collect();
+    eng.on(&lane).set_tokens(0, &toks);
+    let alloc_blk = |b: u32| {
+        let mut pools = eng.block_pool().borrow_mut();
+        let mut tbl = lane.block_table().borrow_mut();
+        let bi = BlockIndex::new(b);
+        for kind in [BlockKind::Full, BlockKind::Window] {
+            let pool = pools.of_mut(kind);
+            let s = pool.lowest_free().unwrap_or_else(|| pool.grow().unwrap());
+            let _ = pool.take(s).unwrap();
+            let gen = pool.record(s).unwrap().generation();
+            tbl.fill(pool, bi, s, gen).unwrap();
+        }
+    };
+    alloc_blk(0);
+    {
+        let cb = eng.gpu.cmd();
+        eng.encode_spans(&cb, &[Span { lane: &lane, p0: 0, t: 64 }], false, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    alloc_blk(1);
+    for pos in 64..128 {
+        if pos == 64 {
+            assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Full), Some((1, 1)));
+            assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Window), Some((1, 1)));
+            assert_eq!(eng.sync_lane_block_table_counts(&lane, pos, 1), (1, 1));
+        } else {
+            assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Full), None);
+            assert_eq!(lane.block_table().borrow().dirty_range(BlockKind::Window), None);
+            assert_eq!(eng.sync_lane_block_table_counts(&lane, pos, 1), (0, 0));
+        }
+        let cb = eng.gpu.cmd();
+        eng.encode_decode(&cb, &[Span { lane: &lane, p0: pos, t: 1 }], true, false);
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert!(eng.span_logits(0).iter().all(|x| x.is_finite()));
+    }
+    let mut pools = eng.block_pool().borrow_mut();
+    lane.block_table().borrow_mut().clear_entries(&mut pools).unwrap();
+}
