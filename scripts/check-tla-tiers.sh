@@ -16,23 +16,13 @@ check() {
     local root=$1 out
     local wf=$root/.github/workflows tla=$root/scripts/check-tla.sh
     out=$(mktemp -d "${TMPDIR:-/tmp}/inky-tiers.XXXXXX")
-    # parts FILE: the check-tla.sh parts a workflow runs, one per line; a bare scripts/check-tla.sh runs all of them.
-    parts() {
-        grep -v '^[[:space:]]*#' "$1" | grep -E '^[[:space:]]*part:[[:space:]]*\[' | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' | tr -d ' ' || true
-        grep -v '^[[:space:]]*#' "$1" | grep -oE 'check-tla\.sh([[:space:]]+[^[:space:]]+)?' | while read -r _ arg; do
-            case ${arg:-} in
-                '') echo all ;;
-                '$'*) ;;  # the matrix value, read above
-                *) echo "$arg" ;;
-            esac
-        done
-    }
     : > "$out/placed"
     for tier in ci nightly; do
         [ -f "$wf/$tier.yml" ] || { echo "tier check: $wf/$tier.yml missing" >&2; return 1; }
-        for p in $(parts "$wf/$tier.yml" | sort -u); do
+        ruby "$root/scripts/tla-workflow-parts.rb" "$wf/$tier.yml" > "$out/parts" || return 1
+        while IFS= read -r p; do
             sh "$tla" --list "$p" | sed "s|^|$tier $p |" >> "$out/placed" || { echo "tier check: check-tla.sh --list $p failed" >&2; return 1; }
-        done
+        done < "$out/parts"
     done
     sh "$tla" --list all > "$out/known"
     # A config no runner lists and no trace script names has lost its check.
@@ -115,10 +105,15 @@ if [ "${1:-}" = --self-test ]; then
         drop_line scripts/check-tla.sh '^StaleSaved RestoredWhenIdle$'
     plant 'a dropped mutant' 'TIER LOST: mutation skip-keep in scripts/mutate-memmode.py is run by no trace check' "$root" \
         sub_line scripts/check-memmode-traces.sh 's/ skip-keep\)/)/'
+    plant 'a declared matrix with no runner' 'TIER GAP: memmode:MemMode runs in no CI tier' "$root" \
+        sub_line .github/workflows/ci.yml 's|^        run: TLA_JAR_CACHE=.*check-tla.sh.*$|        run: echo skipped|'
+    plant 'a disabled TLA job' 'TLA tier coverage requires an unconditional, required runner' "$root" \
+        sub_line .github/workflows/ci.yml 's/^  tla:$/  tla:\
+    if: false/'
     plant 'a part no workflow runs' 'TIER GAP: memmode:MemMode runs in no CI tier' "$root" \
         sub_line .github/workflows/ci.yml 's/part: \[memmode, /part: [/'
     plant 'a part in both tiers' 'TIER DUP: memmode:MemMode runs 2 times: ci (memmode), nightly (memmode)' "$root" \
-        add_line .github/workflows/nightly.yml '        run: scripts/check-tla.sh memmode'
+        add_line .github/workflows/nightly.yml '      - run: scripts/check-tla.sh memmode'
     plant 'an unwired trace script' 'TIER GAP: trace-script:check-planted-traces.sh runs in no CI tier' "$root" \
         add_line scripts/check-planted-traces.sh 'exit 0'
     plant 'the traces part dropped' 'TIER GAP: memmode-traces:skip-keep runs in no CI tier' "$root" \
