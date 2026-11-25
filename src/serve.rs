@@ -1920,10 +1920,16 @@ impl PermitPool {
     }
 
     fn acquire(&self) -> Option<Permit> {
-        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            (used < self.limit).then(|| used + 1)
-        }).ok()?;
-        Some(Permit(self.used.clone()))
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            if used >= self.limit {
+                return None;
+            }
+            match self.used.compare_exchange_weak(used, used + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Permit(self.used.clone())),
+                Err(cur) => used = cur,
+            }
+        }
     }
 }
 

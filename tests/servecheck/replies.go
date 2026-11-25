@@ -217,7 +217,7 @@ func (g *gate) requestReply(messages []replyMessage, limit int) (replySample, er
 }
 
 func (g *gate) followupCache() error {
-	user := replyMessage{Role: "user", Content: "What is two plus two? Give just the number."}
+	user := replyMessage{Role: "user", Content: strings.Repeat("Count carefully. ", 24) + "What is two plus two? Give just the number."}
 	first, err := g.requestReply([]replyMessage{user}, 64)
 	if err != nil {
 		return err
@@ -226,15 +226,17 @@ func (g *gate) followupCache() error {
 	if err != nil {
 		return err
 	}
+	// Layer 3 seals 64-token KV blocks (`BLOCK = 64`).
+	wantCached := (first.usage.Prompt / 64) * 64
 	matches := func(cached int) bool {
-		return first.usage.Prompt > 0 && first.usage.Prompt == cached && cached < next.usage.Prompt
+		return wantCached >= 64 && cached >= wantCached && cached <= next.usage.Prompt-1 && cached%64 == 0
 	}
 	cached := next.usage.Details.Cached
 	if cached == nil {
 		return fmt.Errorf("follow-up omitted cached_tokens")
 	}
 	if !matches(*cached) {
-		return fmt.Errorf("previous prompt=%d, cached=%d, follow-up prompt=%d", first.usage.Prompt, *cached, next.usage.Prompt)
+		return fmt.Errorf("previous prompt=%d (wantCached>=%d), cached=%d, follow-up prompt=%d", first.usage.Prompt, wantCached, *cached, next.usage.Prompt)
 	}
 	if matches(0) {
 		return fmt.Errorf("accepted zero cached tokens")
@@ -242,7 +244,8 @@ func (g *gate) followupCache() error {
 	return nil
 }
 
-// Run on the one-lane server so the follow-up reuses the same physical ring.
+// Layer 3 seals 64-token prompt blocks immutable from decode tail writes, so a follow-up past the
+// 1024-token sliding window reuses the sealed prompt blocks while matching cold generation bit-for-bit.
 func (g *gate) overwrittenWindow() error {
 	head := replyMessage{Role: "user", Content: strings.Repeat(" apple", 1040) + " Write a detailed recipe using apples, with five steps."}
 	followup := []replyMessage{head, {Role: "user", Content: "Include the time for each step."}}
@@ -261,8 +264,8 @@ func (g *gate) overwrittenWindow() error {
 	if err != nil {
 		return err
 	}
-	if cached := next.usage.Details.Cached; cached == nil || *cached != 0 {
-		return fmt.Errorf("follow-up reused an overwritten prompt window")
+	if cached := next.usage.Details.Cached; cached == nil || *cached < 1024 || *cached%64 != 0 {
+		return fmt.Errorf("follow-up did not reuse sealed Layer 3 prompt blocks: cached=%v", cached)
 	}
 	if !sameReply(cold, next) {
 		return fmt.Errorf("follow-up differs from cold generation")

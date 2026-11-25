@@ -135,7 +135,7 @@ struct DecodeSpanDesc {
     full_kps: u32,
     full_nsplit: u32,
     full_tau: f32,
-    pad0: u32,
+    swa_tau: f32,
     pad1: u32,
 }
 #[repr(C)] #[derive(Clone, Copy, Default)]
@@ -2526,7 +2526,7 @@ impl Engine {
                         full_kps: full_kps as u32,
                         full_nsplit: full_nsplit as u32,
                         full_tau,
-                        pad0: 0,
+                        swa_tau: 1.0,
                         pad1: 0,
                     };
                 }
@@ -2772,9 +2772,10 @@ impl Engine {
         let pass_idx = self.slot_kind[slot].1 as u32;
         if let Some(dm) = dec_meta {
             // Layer 3 blocked 3D-batched decode attention + 2D-batched combine: 1 dispatch each across all spans.
-            // Shared `CS` (buffer 4) and `BT` (buffer 8) stay bound for the entire decode step.
+            // Shared `CS` (buffer 4) stays bound; rebind `BT` (buffer 8) after `mix_t`'s inline buffer(8) constants.
             assert!(self.sep_comb, "a decode step combines the splits in a separate pass");
             self.bind_pool_slabs(e, l.swa);
+            e.buf(self.blocked_slab.borrow().bt_buf.as_ref().expect("blocked slab missing bt_buf"), 0, 8);
             let aa = AttnBlkDecArgs {
                 desc_off: dm.desc_off,
                 pass_idx,
@@ -4249,7 +4250,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_kps), 44);
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_nsplit), 48);
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, full_tau), 52);
-        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad0), 56);
+        assert_eq!(std::mem::offset_of!(DecodeSpanDesc, swa_tau), 56);
         assert_eq!(std::mem::offset_of!(DecodeSpanDesc, pad1), 60);
 
         // Verify `CombineArgs`, `CombineDecArgs`, `AttnBlkDecArgs`, `PostConvDecArgs`, and `TopkRoute3Args` offsets match Metal structs.

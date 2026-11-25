@@ -320,7 +320,7 @@ struct DecodeSpanDesc {
     uint  full_kps;
     uint  full_nsplit;
     float full_tau;
-    uint  pad0;
+    float swa_tau;
     uint  pad1;
 };
 
@@ -700,6 +700,7 @@ struct AttnArgs {
 
 #define KPS_MAX 256
 
+#pragma clang fp contract(off) reassociate(off)
 kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device kv_t * KV [[buffer(3)]],
                    device float * CS [[buffer(4)]], constant AttnArgs & a [[buffer(5)]], device atomic_uint * CTR [[buffer(7)]],
                    uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
@@ -891,6 +892,8 @@ kernel void k_attn(device const uchar * PB [[buffer(1)]], device float * A [[buf
         }
     }
 }
+
+#pragma clang fp contract(fast) reassociate(on)
 
 // combine split partials (+ zero-logit sink) and apply the sigmoid output gate. grid: NH TGs x 128 threads
 // hout != 0: write half directly to ((device half *) (A + a.out_off))[i] instead of f32.
@@ -1168,7 +1171,7 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
     const float c = a.softcap;
 
     threadgroup float sm1[32], sm2[32], ssum[32];
-    threadgroup float g_max1, g_max2, g_omega;
+    threadgroup float g_shared[3];
 
     // Fast path when this lane disables LoopCD (omega_max <= 0): apply exact softcap only
     // so every lane in a mixed decode batch produces post-softcap logits consistently.
@@ -1203,13 +1206,13 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
             const float o2 = simd_shuffle_xor(bm2, off);
             top2_merge(bm1, bm2, o1, o2);
         }
-        if (lane == 0) { g_max1 = bm1; g_max2 = bm2; }
+        if (lane == 0) { g_shared[0] = bm1; g_shared[1] = bm2; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Pass 2: exact softmax partition function Z = sum_v exp(s3(v) - max1) and adaptive omega_t.
-    const float max1 = g_max1;
-    const float max2 = g_max2;
+    const float max1 = g_shared[0];
+    const float max2 = g_shared[1];
     float sum_e = 0.0f;
     for (uint v = tid; v < a.n; v += 1024u) {
         const float raw = Z3[v];
@@ -1225,13 +1228,13 @@ kernel void k_loopcd_blend(device float * A [[buffer(2)]],
             const bool z_ok = ((as_type<uint>(z) & 0x7f800000u) != 0x7f800000u) && (z > 0.0f);
             const float p1 = z_ok ? (1.0f / z) : 1.0f;
             const float p2 = (z_ok && max2 > -1e30f) ? (precise::exp(max2 - max1) / z) : 0.0f;
-            g_omega = z_ok ? (omega_max * clamp(1.0f - (p1 - p2), 0.0f, 1.0f)) : 0.0f;
+            g_shared[2] = z_ok ? (omega_max * clamp(1.0f - (p1 - p2), 0.0f, 1.0f)) : 0.0f;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Pass 3: write guided post-softcap logits s3 + omega_t * (s3 - s1) back to Z3.
-    const float omega = g_omega;
+    const float omega = g_shared[2];
     for (uint v = tid; v < a.n; v += 1024u) {
         const float raw3 = Z3[v];
         const float s3 = c > 0.0f ? c * precise::tanh(raw3 / c) : raw3;
@@ -1269,6 +1272,7 @@ inline device kv_t * kv_blk_ptr(
     return (device kv_t *) (base + off + in_slot_off);
 }
 
+#pragma clang fp contract(off) reassociate(off)
 // Block-addressed split-K decode attention: identical arithmetic to `k_attn`, reading/writing
 // through the lane's 64-bit block table `BT` into the pool slabs `KV0..KV3`. `a.k_base` is `pass`.
 kernel void k_attn_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
@@ -1488,8 +1492,6 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
     threadgroup float rs[3][NREL];
     threadgroup float kc[HD], vc[HD];
     threadgroup float red[4][8];
-    threadgroup float ms_[4][3], ls_[4][3];
-    threadgroup float4 os_[4][3][32];
     const uint sp = tgp.x, g = tgp.y, si = tgp.z;
     const bool is_swa = (a.swa & 1u) != 0u;
     const bool dry = (a.swa & 2u) != 0u;
@@ -1500,7 +1502,7 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
     const uint nkeys = is_swa ? d.swa_nkeys : d.full_nkeys;
     const uint first_pos = is_swa ? d.swa_first_pos : 0u;
     const uint kps = is_swa ? d.swa_kps : d.full_kps;
-    const float tau = is_swa ? 1.0f : d.full_tau;
+    const float tau = is_swa ? d.swa_tau : d.full_tau;
     const uint cs_off = d.cs_base + a.cs_slot;
     device const ulong * BT = BT_ALL + (is_swa ? d.bt_win_base : d.bt_full_base);
     const uint q_off = a.q_off + si * (NH * HD);
@@ -1655,6 +1657,8 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
             for (int h = 0; h < 3; h++) o[h] += simd_shuffle(pr[h], q * 4) * v;
         }
     }
+    threadgroup float ms_[4][3], ls_[4][3];
+    threadgroup float4 os_[4][3][32];
     if (lane == 0) for (int h = 0; h < 3; h++) { ms_[sg][h] = m[h]; ls_[sg][h] = l[h]; }
     for (int h = 0; h < 3; h++) os_[sg][h][lane] = o[h];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1672,3 +1676,4 @@ kernel void k_attn_blk_dec(device const uchar * PB [[buffer(1)]], device float *
         P[2 + tid] = O;
     }
 }
+#pragma clang fp contract(fast) reassociate(on)
