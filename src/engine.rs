@@ -3243,9 +3243,13 @@ impl<'a> Run<'a> {
         if let Some(h) = std::env::var("INK_TIER_HOT").ok().and_then(|v| v.parse::<usize>().ok()) { return (h, h, 2 << 20); }
         let c = self.kv_exact_bytes(n);
         // staging: two halves, each at least one split of the longest attention (see `step`)
-        let s = (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps(n) * REC);
+        let s = Self::tier_staging(c, n, Self::split_target());
         let hot = (c / 2).saturating_sub(s);
         ((n.min(EXT) * hot / c / 64 * 64).max(64), (n * hot / c / 64 * 64).max(64), s)
+    }
+    // Reserve enough for every decode step before the next 64-position resize check.
+    fn tier_staging(c: usize, n: usize, target: usize) -> usize {
+        (((c / 16) >> 20).clamp(2, 32) << 20).max(2 * Self::split_kps_for(n.saturating_add(64), target) * REC)
     }
     fn tier_foff(&self, kind: usize, i: usize, p: usize) -> u64 {
         let n_swa = self.slot_kind.iter().filter(|k| k.0).count();
@@ -3254,7 +3258,8 @@ impl<'a> Run<'a> {
     fn split_target() -> usize { std::env::var("INK_SPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) }
     /// keys per split of a decode attention over `nk` keys (the same division with and without the disk tier, so both sum
     /// the same keys in the same order)
-    fn split_kps(nk: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * Self::split_target()).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
+    fn split_kps(nk: usize) -> usize { Self::split_kps_for(nk, Self::split_target()) }
+    fn split_kps_for(nk: usize, target: usize) -> usize { KPS_CHUNK * nk.div_ceil(KPS_CHUNK * target).max(nk.div_ceil(KPS_CHUNK * MAX_SPLIT)) }
     /// file pieces (offset, positions) that hold positions [a, b) of a slot, in position order (a sliding-window slot's
     /// file is a ring of one window)
     fn tier_pieces(&self, kind: usize, i: usize, a: usize, b: usize) -> Vec<(u64, usize)> {
@@ -4129,6 +4134,31 @@ pub fn loopcd_blend_row(z3: &mut [f32], z1: &[f32], softcap: f32, omega_max: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_staging_preserves_split_groups_until_next_resize() {
+        // At this prompt the default staging half used to hold 4096 positions,
+        // while the in-memory split grows to 4128 at position 32768.
+        let prompt = 32_760usize;
+        let c = (40 * prompt.min(EXT) + 8 * prompt) * REC;
+        let half = Run::tier_staging(c, prompt + 1, 8) / 2 / REC;
+        for pos in prompt..prompt + 64 {
+            let kps = Run::split_kps_for(pos + 1, 8);
+            assert!(kps <= half, "pos={pos}: split {kps} exceeds staging half {half}");
+            // Use the production hot-ring sizing and overlap rules, then check
+            // that the file/ring boundary divides the in-memory split groups.
+            let hot = (c / 2).saturating_sub(2 * half * REC);
+            let h = ((prompt + 1) * hot / c / 64 * 64).max(64);
+            let lo = (pos + 1).saturating_sub(h);
+            let cold = (lo + kps).min(pos);
+            let b = lo.div_ceil(kps) * kps;
+            assert!(b <= pos && b <= cold, "no common boundary at {pos}");
+            let groups: Vec<_> = (0..pos + 1).step_by(kps).map(|start| (start, (start + kps).min(pos + 1))).collect();
+            let disk: Vec<_> = (0..b).step_by(kps).chain((b..pos + 1).step_by(kps))
+                .map(|start| (start, (start + kps).min(pos + 1))).collect();
+            assert_eq!(disk, groups, "pos={pos}");
+        }
+    }
 
     #[test]
     fn prefill_chunk_requires_a_supported_positive_size() {
