@@ -184,7 +184,7 @@ fn is_known_cli_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "help" | "-h" | "--help"
-            | "check" | "rows" | "rollback" | "binv" | "lanes" | "spans" | "xcopy" | "poolgate"
+            | "check" | "rows" | "rollback" | "binv" | "crosspath" | "lanes" | "spans" | "xcopy" | "poolgate"
             | "loopcdgate" | "blockedinv" | "temp1"
             | "lanebench" | "dbatch" | "sharedkv" | "maxctx" | "debug" | "prof" | "routes" | "vcost" | "prof_pf"
             | "kmoe" | "kgemm" | "kmoepf" | "ksg" | "qclip" | "lazytest" | "kvprune" | "kvscreen" | "kvdump"
@@ -503,6 +503,7 @@ mod cli_tests {
         }
         assert_eq!(cli(&[]).unwrap().0, "help");
         assert_eq!(cli(&["--help"]).unwrap().0, "help");
+        assert_eq!(cli(&["crosspath", "--ref", "ref/long.tokens"]).unwrap().0, "crosspath");
 
         // Context headroom check refuses prompts >= ctx cleanly
         assert!(check_prompt_fits_ctx(0, 64).is_err());
@@ -1223,7 +1224,7 @@ fn crosspath(o: &Opts) {
         }
         run_prefill(&split, target, 1, true);
         let actual = eng.logits();
-        let first_bad = expected.iter().zip(actual).position(|(&a, &b)| {
+        let first_bad = expected.iter().zip(actual.iter()).position(|(&a, &b)| {
             !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
         });
         let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&split);
