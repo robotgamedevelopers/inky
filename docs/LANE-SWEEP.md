@@ -1,6 +1,6 @@
 # Layer 6: Candidate Machine Measurements, Replay Sweep & Default Knee
 
-Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using real multi-turn coding-agent card traffic recorded through `inky serve --record-dir` into [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
+Measured on **2026-11-24** against `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped, `73.2 MiB` params) on both candidate Apple Silicon hosts, using the scripted multi-turn replay fixture [`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) and replayed via [`tools/replay`](../tools/replay).
 
 ## 1. Candidate Machine Measurements
 
@@ -25,7 +25,9 @@ The M5 Max (`574.0 GB/s` peak weight read) runs ~1.98× the memory bandwidth of 
 
 ## 2. Recorded Multi-Turn Replay Set
 
-[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) was captured from live `inky serve --record-dir` (`cards-20261124.jsonl`) across **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
+[`tests/replay/recorded_cards.jsonl`](../tests/replay/recorded_cards.jsonl) contains scripted requests and canned tool results representing **7 multi-turn coding-agent cards** (**22 recorded turns**, all with `read_file` / `edit_file` / `run_test` tool declarations and multi-turn `tool_calls` + `tool` result follow-ups; `12,636` prompt tokens and `1,920` completion tokens recorded).
+
+> **Qualification:** This fixture is not verified real fleet traffic. The historical replay mixed streamed and buffered latency, and the reported memory values were admission estimates rather than sampled footprint. These results do not establish a fleet-derived lane knee or the latency and memory limits. Repeat the sweep using authorized real fleet traffic and the corrected replay measurements before setting regression thresholds.
 
 ## 3. Lane-Count Sweep (`8..128` Lanes on `macbook`, M5 Max 128 GB)
 
@@ -61,15 +63,17 @@ Measured results (after sizing `serve()`'s preprocessing permit pool to `effecti
 | 96 | 368.61 | 3.84 | 5858.4 | 20689.1 | 87,798,524,928 (81.77 GiB) | 96 | 4848.9 | 0 | 0 |
 | 128 | 401.96 | 3.14 | 7020.8 | 25447.6 | 110,613,778,432 (103.02 GiB) | 128 | 5283.9 | 0 | 0 |
 
-## 4. Knee Selection & Default Lane Count
+## 4. Historical Selection & Default Lane Count
+
+The following selection describes the historical fixture run and is not a verified operational knee.
 
 - **Unconstrained scaling (`PickKnee` with `--min-gain 0.05`)**: Total throughput continues scaling cleanly at short-to-medium prompt sizes through `128` lanes (`401.96 tok/s`, `5,283.9 cards/hr`, `+21.8%/doubling` from `96` to `128`), because per-lane KV cache traffic at `< 2K` tokens is small relative to weight bandwidth.
-- **Selected Operational Knee (`PickKnee` with `--max-ttft-p95-ms 20000 --min-per-lane-tok-s 4.0`): `64` lanes**:
+- **Historical fixture selection (`PickKnee` with `--max-ttft-p95-ms 20000 --min-per-lane-tok-s 4.0`): `64` lanes**:
   1. **Marginal gain inflection**: `48 -> 64` jumps `+38.5%` (`232.94 -> 322.66 tok/s`, `+92.8%/doubling`), whereas `64 -> 96` drops to `+14.2%` (`+24.3%/doubling`) and `96 -> 128` drops to `+9.0%` (`+21.8%/doubling`).
   2. **Worker probe & latency SLO**: At `64` lanes, `ttft_p95_ms = 16,331.1 ms` stays under the `20,000 ms` (`20 s`) `nova-sprint` worker startup probe ceiling (`docs/README.md`) and `per_lane_tok_s = 5.04` stays above `4.0 tok/s`; `96` (`20,689.1 ms`, `3.84 tok/s`) and `128` (`25,447.6 ms`, `3.14 tok/s`) cross both thresholds.
   3. **Working-set headroom**: At `64` lanes (`60.52 GiB` peak worst-case at `-c 16384`), `54.7 GiB` of working set remains free for macOS/spill/longer turns, whereas `128` lanes consumes `103.02 GiB` (`89%` of the `115.23 GiB` working set). When running at higher per-lane context (`-c 65536`), `MemoryBudget` automatically caps admission to `43` lanes on M5 Max 128 GB.
 
-The chosen default lane count **`64`** is set in:
+The existing **`64`** lane default is configured in:
 - [`src/main.rs`](../src/main.rs) (`DEFAULT_SERVE_LANES = 64`, `SERVE_USAGE`)
 - [`tunings/m5-max-128gb.tuning`](../tunings/m5-max-128gb.tuning) (`default_lanes = 64`) & [`src/tuning.rs`](../src/tuning.rs) (`tunings/m5-pro-64gb.tuning` sets `default_lanes = 32` for 64 GB M5 Pro)
 - [`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) (`INKY_LANES=${INKY_LANES:-64}`)

@@ -9,7 +9,7 @@
 #   INKY_BIN          Path to inky binary (default: <repo>/target/release/inky)
 #   INKY_MODEL        Path to GGUF (default: ~/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling-2-Mini-Q4_K_M.gguf)
 #   INKY_BIND         Listen address (default: <tailscale-ipv4>:18096)
-#   INKY_LANES        Active lane count (default: 64 — measured M5 Max knee)
+#   INKY_LANES        Active lane count (default: 64 — fleet-derived knee unverified)
 #   INKY_CTX          Context per lane (default: 16384)
 #   INKY_QUEUE        Bounded admission queue depth (default: 64)
 #   INKY_EFFORT       Default reasoning effort (default: medium)

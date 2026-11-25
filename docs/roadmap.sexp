@@ -1257,7 +1257,7 @@
      ("l7-machines" "done" "t-l7-machines")
      ("l7-knee" "done" "t-l7-knee")
    ))
-  (:id "t-l7-record" :type :task :title "Real card traffic recorded as a replay set" :state :done :evidence ("tests/replay/recorded_cards.jsonl" "src/record.rs"))
+  (:id "t-l7-record" :type :task :title "Real card traffic recorded as a replay set" :state :todo :evidence ("tests/replay/recorded_cards.jsonl" "src/record.rs"))
   (:id "t-l7-sweep" :type :task :title "Replay at 8, 16, 32, 48, 64, 96 and 128 lanes: total and per-lane tok/s, memory, cards per hour" :state :doing :evidence ("docs/LANE-SWEEP.md" "tools/replay (8..128 lane sweep on M5 Max)"))
   (:id "t-l7-machines" :type :task :title "Each candidate machine measured: memory bandwidth, single-stream decode, prefill" :state :done :evidence ("docs/LANE-SWEEP.md (M5 Max 128GB & M5 Pro 64GB bandwidth, decode, prefill)"))
   (:id "t-l7-knee" :type :task :title "Measure the lane-count knee against streamed first-token latency and observed memory, then apply each machine profile" :state :doing :evidence ("docs/LANE-SWEEP.md (historical throughput at 64 lanes was 322.66 tok/s and 4259 cards/hr)" "src/main.rs: parse_serve and src/tuning.rs: machine profile" "tunings/m5-max-128gb.tuning" "tunings/m5-pro-64gb.tuning"))
