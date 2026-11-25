@@ -746,10 +746,28 @@ mod tests {
     // bind_socket temporarily sets process-wide umask(0o177); serialize filesystem tests within this binary.
     static TEST_FS_LOCK: Mutex<()> = Mutex::new(());
 
+    // Darwin bounds the full pathname stored in sockaddr_un, including the scratch directory.
+    struct SocketTestDir(std::path::PathBuf);
+
+    impl SocketTestDir {
+        fn new() -> Self {
+            let mut template = *b"/tmp/inky-memd-XXXXXX\0";
+            let dir = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+            assert!(!dir.is_null(), "creating socket test directory: {}", io::Error::last_os_error());
+            let path = std::ffi::CStr::from_bytes_until_nul(&template).unwrap().to_str().unwrap();
+            Self(path.into())
+        }
+    }
+
+    impl Drop for SocketTestDir {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
     #[test]
     fn dropping_client_lease_closes_its_connection() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let path = std::env::temp_dir().join(format!("inky-owned-{}.sock", std::process::id()));
+        let scratch = SocketTestDir::new();
+        let path = scratch.0.join("owned.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let helper = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -761,7 +779,6 @@ mod tests {
         });
         let lease = enter(path.to_str().unwrap()).unwrap();
         let mut peer = helper.join().unwrap();
-        fs::remove_file(path).unwrap();
         assert_eq!(lease.initial_limit, 12345);
         peer.set_nonblocking(true).unwrap();
         let mut byte = [0; 1];
@@ -892,9 +909,8 @@ mod tests {
     #[test]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-bind-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let path = base.join("memd.sock");
+        let scratch = SocketTestDir::new();
+        let path = scratch.0.join("helper").join("memd.sock");
         let uid = unsafe { libc::geteuid() };
         drop(bind_socket(&path, uid, uid, true).unwrap());
         let listener = bind_socket(&path, uid, uid, true).unwrap();
@@ -903,14 +919,12 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         assert_eq!(peer_uid(&client), Some(uid));
         assert_eq!(peer_uid(&accepted), Some(uid));
-        drop(listener);
-        fs::remove_dir_all(&base).unwrap();
     }
     #[test]
     fn legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::current_dir().unwrap().join(format!("inky-memd-old-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
+        let scratch = SocketTestDir::new();
+        let base = scratch.0.join("legacy");
         fs::create_dir(&base).unwrap();
         let socket = base.join("memd.sock");
         drop(UnixListener::bind(&socket).unwrap());
