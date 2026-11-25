@@ -852,12 +852,11 @@ fn binv(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
-/// Compare the same target row through tensor prefill and tensor decode. Every checked end gets its own
+/// Compare the same target row through two chunkings of the prefill arithmetic. Every checked end gets its own
 /// span of CROSSPATH_SPAN rows ending at that end (fewer only when the end is shorter), started from one
-/// base lane that never takes part in a comparison: the prefill lane runs the whole span as one multi-row
-/// prefill, the decode lane prefills all but its last row and decodes that row. A one-row prefill would take
-/// the decode path's ring write (`ring = l.swa && t == 1` in engine.rs) and compare decode with itself, so
-/// every span has at least two rows, and a span ending just past a split boundary crosses it.
+/// base lane that never takes part in a comparison: one lane prefills the full multi-row span, while the
+/// other prefills its first rows and last row separately. Every span has at least two rows, and one ending
+/// just past a split boundary crosses it. Decode has a different arithmetic and is not expected to match.
 const CROSSPATH_SPAN: usize = 17;
 const CROSSPATH_ENDS: &str = "63,64,65,255,256,257,1023,1024,1025,2047,2048,2049";
 
@@ -900,8 +899,6 @@ mod crosspath_tests {
 }
 
 fn crosspath(o: &Opts) {
-    use engine::Span;
-
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference).expect("--ref FILE.tokens")
         .lines().map(|line| line.trim().parse().unwrap()).collect();
     let ends: Vec<usize> = std::env::var("INK_COMPARE_ENDS").unwrap_or_else(|_| {
@@ -914,12 +911,11 @@ fn crosspath(o: &Opts) {
 
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
-    eng.ensure_dbatch(1);
     assert!(CROSSPATH_SPAN <= eng.chunk, "a crosspath span must fit one prefill chunk");
     let base = Lane::new(&eng);
     let prefill = Lane::new(&eng);
-    let decode = Lane::new(&eng);
-    for lane in [&base, &prefill, &decode] {
+    let split = Lane::new(&eng);
+    for lane in [&base, &prefill, &split] {
         let run = eng.on(lane);
         run.reserve(len, false);
         run.set_tokens(0, &toks[..len]);
@@ -944,21 +940,22 @@ fn crosspath(o: &Opts) {
             cursor += count;
         }
         eng.copy_lane(&base, &prefill);
-        eng.copy_lane(&base, &decode);
-        run_prefill(&decode, start, target - start, false);
+        eng.copy_lane(&base, &split);
+        eng.on(&split).set_tokens(0, &toks[..len]);
+        run_prefill(&split, start, target - start, false);
         run_prefill(&prefill, start, end - start, true);
         let expected = eng.logits().to_vec();
-        let cb = eng.gpu.cmd();
-        eng.encode_decode(&cb, &[Span { lane: &decode, p0: target, t: 1 }], true, false);
-        cb.commit();
-        wait_crosspath(&cb);
-        let actual = eng.span_logits(0);
+        if std::env::var_os("INK_CROSSPATH_SABOTAGE").is_some() {
+            eng.on(&split).set_tokens(target, &[(toks[target] + 1) % eng.n_vocab as u32]);
+        }
+        run_prefill(&split, target, 1, true);
+        let actual = eng.logits();
         let first_bad = expected.iter().zip(actual).position(|(&a, &b)| {
             !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits()
         });
-        let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&decode);
+        let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&split);
         if let Some(i) = first_bad {
-            println!("after {end} tokens: logit {i} differs (prefill {:08x}, decode {:08x}), prefill span [{start}, {end})",
+            println!("after {end} tokens: logit {i} differs (prefill {:08x}, split {:08x}), prefill span [{start}, {end})",
                      expected[i].to_bits(), actual[i].to_bits());
         }
         if !state_equal {
@@ -973,7 +970,7 @@ fn crosspath(o: &Opts) {
         println!("CROSSPATH MISMATCH");
         std::process::exit(1);
     }
-    println!("crosspath exact: tensor prefill and decode agree");
+    println!("crosspath exact: prefill chunkings agree");
 }
 
 /// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
