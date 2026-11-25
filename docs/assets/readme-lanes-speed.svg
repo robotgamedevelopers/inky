@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" role="img" aria-labelledby="chart-title chart-desc">
+  <title id="chart-title">Throughput vs. Parallel Lanes at 20K Context — Apple M5 Max (128 GB)</title>
+  <desc id="chart-desc">Aggregate decode throughput in tokens per second from 1 to 64 parallel lanes on Apple M5 Max (128 GB) with Inkling-2-Mini-Q4_K_M.gguf at 20,480 tokens per lane (434 tok/s / 202% with --kv8, 323 tok/s / 150% with exact FP16 KV) compared to vanilla llama.cpp (215 tok/s = 100%).</desc>
+  <style>
+    svg { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .frame { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+    .plot-bg { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1; }
+    .title { font-size: 16px; font-weight: 700; fill: #1f2328; }
+    .subtitle { font-size: 11.8px; fill: #656d76; }
+    .axis-label { font-size: 11.5px; font-weight: 600; fill: #57606a; }
+    .tick { font-size: 11px; fill: #656d76; }
+    .grid { stroke: #e1e4e8; stroke-width: 1; }
+    .axis { stroke: #57606a; stroke-width: 1.25; }
+    .ref-100 { stroke: #8c959f; stroke-width: 1.25; stroke-dasharray: 4 4; }
+    .ref-label { font-size: 10.5px; font-weight: 600; fill: #57606a; }
+    .sub-txt { font-size: 10px; fill: #656d76; }
+    .foot { font-size: 10.5px; fill: #656d76; }
+    .c-kv8-line { stroke: #059669; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .c-kv8-dot { fill: #059669; stroke: #ffffff; stroke-width: 1.5; }
+    .c-kv8-txt { font-size: 12px; font-weight: 700; fill: #059669; }
+    .c-kv8-ldr { stroke: #059669; fill: none; stroke-width: 1.2; opacity: 0.8; }
+    .c-fp16-line { stroke: #2563eb; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .c-fp16-dot { fill: #2563eb; stroke: #ffffff; stroke-width: 1.5; }
+    .c-fp16-txt { font-size: 12px; font-weight: 700; fill: #2563eb; }
+    .c-fp16-ldr { stroke: #2563eb; fill: none; stroke-width: 1.2; opacity: 0.8; }
+    .c-llama-line { stroke: #64748b; fill: none; stroke-dasharray: 6 4; stroke-linecap: round; stroke-linejoin: round; }
+    .c-llama-dot { fill: #64748b; stroke: #ffffff; stroke-width: 1.5; }
+    .c-llama-txt { font-size: 12px; font-weight: 700; fill: #64748b; }
+    .c-llama-ldr { stroke: #64748b; fill: none; stroke-width: 1.2; opacity: 0.8; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #0d1117; stroke: #30363d; }
+      .plot-bg { fill: #161b22; stroke: #30363d; }
+      .title { fill: #e6edf3; }
+      .subtitle { fill: #8b949e; }
+      .axis-label { fill: #8b949e; }
+      .tick { fill: #8b949e; }
+      .grid { stroke: #21262d; }
+      .axis { stroke: #8b949e; }
+      .ref-100 { stroke: #6e7681; }
+      .ref-label { fill: #8b949e; }
+      .sub-txt { fill: #8b949e; }
+      .foot { fill: #8b949e; }
+      .c-kv8-line { stroke: #34d399; }
+      .c-kv8-dot { fill: #34d399; stroke: #0d1117; }
+      .c-kv8-txt { fill: #34d399; }
+      .c-kv8-ldr { stroke: #34d399; }
+      .c-fp16-line { stroke: #60a5fa; }
+      .c-fp16-dot { fill: #60a5fa; stroke: #0d1117; }
+      .c-fp16-txt { fill: #60a5fa; }
+      .c-fp16-ldr { stroke: #60a5fa; }
+      .c-llama-line { stroke: #94a3b8; }
+      .c-llama-dot { fill: #94a3b8; stroke: #0d1117; }
+      .c-llama-txt { fill: #94a3b8; }
+      .c-llama-ldr { stroke: #94a3b8; }
+    }
+  </style>
+  <rect x="0.5" y="0.5" width="899" height="459" rx="10" class="frame"/>
+  <text x="24" y="31" class="title">Throughput vs. Parallel Lanes at 20K Context — Apple M5 Max (128 GB)</text>
+  <text x="24" y="51" class="subtitle">Inkling-2-Mini-Q4_K_M.gguf · 20,480 tokens per lane (average coding-agent working context) vs. llama.cpp ceiling</text>
+  <rect x="72.0" y="78.0" width="552.0" height="326.0" rx="4" class="plot-bg"/>
+  <text x="62.0" y="408.0" text-anchor="end" class="tick">0</text>
+  <line x1="72.0" y1="338.8" x2="624.0" y2="338.8" class="grid"/>
+  <text x="62.0" y="342.8" text-anchor="end" class="tick">100</text>
+  <line x1="72.0" y1="273.6" x2="624.0" y2="273.6" class="grid"/>
+  <text x="62.0" y="277.6" text-anchor="end" class="tick">200</text>
+  <line x1="72.0" y1="208.4" x2="624.0" y2="208.4" class="grid"/>
+  <text x="62.0" y="212.4" text-anchor="end" class="tick">300</text>
+  <line x1="72.0" y1="143.2" x2="624.0" y2="143.2" class="grid"/>
+  <text x="62.0" y="147.2" text-anchor="end" class="tick">400</text>
+  <text x="62.0" y="82.0" text-anchor="end" class="tick">500</text>
+  <line x1="72.0" y1="404.0" x2="72.0" y2="409.0" class="axis"/>
+  <text x="72.0" y="423.0" text-anchor="middle" class="tick">1</text>
+  <line x1="133.3" y1="78.0" x2="133.3" y2="404.0" class="grid"/>
+  <line x1="133.3" y1="404.0" x2="133.3" y2="409.0" class="axis"/>
+  <text x="133.3" y="423.0" text-anchor="middle" class="tick">8</text>
+  <line x1="203.4" y1="78.0" x2="203.4" y2="404.0" class="grid"/>
+  <line x1="203.4" y1="404.0" x2="203.4" y2="409.0" class="axis"/>
+  <text x="203.4" y="423.0" text-anchor="middle" class="tick">16</text>
+  <line x1="343.6" y1="78.0" x2="343.6" y2="404.0" class="grid"/>
+  <line x1="343.6" y1="404.0" x2="343.6" y2="409.0" class="axis"/>
+  <text x="343.6" y="423.0" text-anchor="middle" class="tick">32</text>
+  <line x1="624.0" y1="404.0" x2="624.0" y2="409.0" class="axis"/>
+  <text x="624.0" y="423.0" text-anchor="middle" class="tick">64</text>
+  <line x1="72.0" y1="78.0" x2="72.0" y2="404.0" class="axis"/>
+  <line x1="72.0" y1="404.0" x2="624.0" y2="404.0" class="axis"/>
+  <text x="348.0" y="440.0" text-anchor="middle" class="axis-label">Parallel Lanes</text>
+  <text x="20" y="241.0" text-anchor="middle" transform="rotate(-90 20 241.0)" class="axis-label">Aggregate Speed (tok/s)</text>
+  <line x1="72.0" y1="263.8" x2="624.0" y2="263.8" class="ref-100"/>
+  <text x="614.0" y="256.8" text-anchor="end" class="ref-label">100% = 215 tok/s (64-lane llama.cpp)</text>
+  <polyline points="72.0,377.3 80.8,363.6 98.3,338.8 133.3,311.4 203.4,302.9 343.6,277.5 624.0,263.8" stroke-width="2.6" class="c-llama-line"/>
+  <polyline points="72.0,364.6 133.3,305.6 203.4,274.1 343.6,218.2 624.0,193.7" stroke-width="3.0" class="c-fp16-line"/>
+  <polyline points="72.0,373.6 133.3,298.4 203.4,248.1 343.6,197.4 624.0,121.2" stroke-width="3.0" class="c-kv8-line"/>
+  <circle cx="72.0" cy="377.3" r="3.8" class="c-llama-dot"/>
+  <circle cx="80.8" cy="363.6" r="3.8" class="c-llama-dot"/>
+  <circle cx="98.3" cy="338.8" r="3.8" class="c-llama-dot"/>
+  <circle cx="133.3" cy="311.4" r="3.8" class="c-llama-dot"/>
+  <circle cx="203.4" cy="302.9" r="3.8" class="c-llama-dot"/>
+  <circle cx="343.6" cy="277.5" r="3.8" class="c-llama-dot"/>
+  <circle cx="624.0" cy="263.8" r="3.8" class="c-llama-dot"/>
+  <circle cx="72.0" cy="364.6" r="4.4" class="c-fp16-dot"/>
+  <circle cx="133.3" cy="305.6" r="4.4" class="c-fp16-dot"/>
+  <circle cx="203.4" cy="274.1" r="4.4" class="c-fp16-dot"/>
+  <circle cx="343.6" cy="218.2" r="4.4" class="c-fp16-dot"/>
+  <circle cx="624.0" cy="193.7" r="4.4" class="c-fp16-dot"/>
+  <circle cx="72.0" cy="373.6" r="4.4" class="c-kv8-dot"/>
+  <circle cx="133.3" cy="298.4" r="4.4" class="c-kv8-dot"/>
+  <circle cx="203.4" cy="248.1" r="4.4" class="c-kv8-dot"/>
+  <circle cx="343.6" cy="197.4" r="4.4" class="c-kv8-dot"/>
+  <circle cx="624.0" cy="121.2" r="4.4" class="c-kv8-dot"/>
+  <line x1="631.0" y1="121.2" x2="639.0" y2="121.2" class="c-kv8-ldr"/>
+  <text x="644.0" y="122.2" class="c-kv8-txt">inky --kv8 (20K): 434 tok/s (202%)</text>
+  <text x="644.0" y="137.2" class="sub-txt">43.6 GiB total GPU memory @ 64 lanes</text>
+  <line x1="631.0" y1="193.7" x2="639.0" y2="193.7" class="c-fp16-ldr"/>
+  <text x="644.0" y="194.7" class="c-fp16-txt">inky FP16 (20K): 323 tok/s (150%)</text>
+  <text x="644.0" y="209.7" class="sub-txt">68.7 GiB total GPU memory · exact FP16 KV</text>
+  <line x1="631.0" y1="263.8" x2="639.0" y2="263.8" class="c-llama-ldr"/>
+  <text x="644.0" y="264.8" class="c-llama-txt">llama.cpp: 215 tok/s (100%)</text>
+  <text x="644.0" y="279.8" class="sub-txt">llama-server ceiling (short 256-tok slots)</text>
+  <text x="24" y="449" class="foot">Measured on Apple M5 Max MacBook Pro (128 GB) · --kv8 is opt-in 8-bit KV cache · Click chart for 2K–256K tables &amp; methodology</text>
+</svg>

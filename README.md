@@ -7,9 +7,12 @@ Fast local inference for [**Inkling 2 Mini**](https://thinkingmachines.ai/news/i
 With **inky**, you can:
 
 * Run Thinking Machines' Inkling 2 Mini on an M5 Mac, from the LM Studio GGUF
-* Decode about 1.9x and prefill about 5.8x faster than LM Studio's runtime
+* Decode at **95–106 tok/s** on a single lane (**2.3x–2.6x** faster than llama.cpp's 41 tok/s on Apple M5 Max) and prefill prompts at **4,186–4,531 tok/s**
+* Scale across **64 parallel lanes** to **323–434 tok/s** at 20K context (**1.5x–2.0x** faster than llama.cpp's 215 tok/s short-context ceiling), **530–578 tok/s** at 2K context, and **322 tok/s** at 42K context
 * Match llama.cpp argmaxes (worst KL <= 0.01) across CI's checked reference positions: 58/58 on short-prompt decode, 24/24 after a 2380-token long-prompt prefill, and 58/58 on short-prompt decode steps
-* Run many coding-agent tasks served at once from one process, each its own lane. The [design](docs/DESIGN.md) and the [roadmap](docs/ROADMAP.md) say how.
+* Serve many coding-agent tasks at once over HTTP from one process, sharing cached prompt prefixes in memory (**6.8x** lower KV at 16×8K) and on SSD. See [performance](docs/PERFORMANCE.md), [design](docs/DESIGN.md), and [roadmap](docs/ROADMAP.md).
+
+[![Throughput vs. parallel lanes at 20K context on Apple M5 Max (128 GB)](docs/assets/readme-lanes-speed.svg)](docs/PERFORMANCE.md)
 
 This is a fork of [erisinky](https://github.com/Eriskii/erisinky) by Eris.
 

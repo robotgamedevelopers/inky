@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -51,7 +54,25 @@ func TestBestOfN_FirstPassingCancelsRemainingLanes(t *testing.T) {
 		activeBeforeWin atomic.Int32
 	)
 	allArrived := make(chan struct{})
+	bothSlowReady := make(chan struct{})
+	slowHandlerDone := make(chan struct{}, 2)
 	var arrivedCount atomic.Int32
+
+	fifoPath := filepath.Join(t.TempDir(), "lane0.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	fifoFile, err := os.OpenFile(fifoPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open fifo: %v", err)
+	}
+	defer fifoFile.Close()
+	lane0Checked := make(chan struct{})
+	go func() {
+		var b [1]byte
+		_, _ = fifoFile.Read(b[:])
+		close(lane0Checked)
+	}()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatRequest
@@ -82,16 +103,31 @@ func TestBestOfN_FirstPassingCancelsRemainingLanes(t *testing.T) {
 			// Lane 0: fast response, fails deterministic check.
 			writeSSE(w, flusher, "```txt\nWRONG\n```", 256, 0, 8)
 		case 1003:
-			// Lane 2: fast response, passes deterministic check and should cancel lanes 1 & 3.
-			time.Sleep(25 * time.Millisecond)
+			// Lane 2: wait until both slow lanes have flushed their initial chunk and
+			// lane 0 has entered its deterministic check, then emit the passing response.
+			select {
+			case <-bothSlowReady:
+			case <-r.Context().Done():
+				cancelledOnSrv.Add(1)
+				return
+			}
+			select {
+			case <-lane0Checked:
+			case <-r.Context().Done():
+				cancelledOnSrv.Add(1)
+				return
+			}
 			writeSSE(w, flusher, "```txt\nPASS_TOKEN\n```", 256, 256, 8)
 		default:
 			// Lanes 1 and 3: slow streams that wait until cancelled by winner.
-			activeBeforeWin.Add(1)
+			defer func() { slowHandlerDone <- struct{}{} }()
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"thinking...\"}}]}\n\n")
 			flusher.Flush()
+			if activeBeforeWin.Add(1) == 2 {
+				close(bothSlowReady)
+			}
 			select {
 			case <-r.Context().Done():
 				cancelledOnSrv.Add(1)
@@ -115,7 +151,7 @@ func TestBestOfN_FirstPassingCancelsRemainingLanes(t *testing.T) {
 		Tier:       "flash+",
 		Prompt:     "Print PASS_TOKEN into out.txt.",
 		TargetFile: "out.txt",
-		CheckCmd:   `grep -qx "PASS_TOKEN" out.txt`,
+		CheckCmd:   fmt.Sprintf(`if [ "$BESTOFN_SEED" = "1001" ]; then printf x > %q; fi; grep -qx "PASS_TOKEN" out.txt`, fifoPath),
 	}
 
 	res, err := RunCard(context.Background(), cfg, card)
@@ -136,6 +172,15 @@ func TestBestOfN_FirstPassingCancelsRemainingLanes(t *testing.T) {
 	}
 	if res.WallDuration >= 2*time.Second {
 		t.Fatalf("expected early return well before 10s slow lanes, got %v", res.WallDuration)
+	}
+	teardownTimer := time.NewTimer(2 * time.Second)
+	defer teardownTimer.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-slowHandlerDone:
+		case <-teardownTimer.C:
+			t.Fatalf("timed out waiting for slow server handler %d/2 to observe cancellation", i+1)
+		}
 	}
 	if got := cancelledOnSrv.Load(); got != 2 {
 		t.Fatalf("expected server to observe 2 cancelled requests, got %d", got)
