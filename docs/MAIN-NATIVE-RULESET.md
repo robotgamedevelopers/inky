@@ -1,36 +1,30 @@
-# Main ruleset with native CI
+# Main ruleset
 
-After the `m5-pr-result` job has passed on a same-repository pull request,
-create an active branch ruleset in **Settings → Rules → Rulesets**. Target
+Pull requests and pushes to main run `.github/workflows/ci.yml`: unit tests and a smoke test, nothing else
+(Glenn, 2026-11-25), on GitHub-hosted runners, in about a minute. Everything else (the Go tool suites, every
+TLA+ model and trace check, the slower unit extras, the release-profile build, and every GPU and serve gate on
+the M5 Macs) runs in `.github/workflows/nightly.yml` on the fleet's self-hosted runners, and the dependency
+audit runs daily in `.github/workflows/dependency-audit.yml`. Neither of those reports on a pull request, so
+neither is a required check.
+
+Create an active branch ruleset in **Settings → Rules → Rulesets**. Target
 only `refs/heads/main`. Leave the bypass list empty and restrict deletion
 and force pushes. Require a pull request with zero required approving reviews
 and require status checks with **Require branches to be up to date before
 merging** enabled. [GitHub ruleset options](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
 Select these exact status checks and select **GitHub Actions** as each
-check's expected source.
+check's expected source. They are every job of `ci.yml`, and the same set
+`scripts/release_ci.py` (`REQUIRED_JOBS`) waits for on the main push before a release.
 
 - `unit`
-- `go`
-- `audit` (the dependency audit workflow)
-- `tla (memmode)`
-- `tla (blocks)`
-- `tla (grouped)`
-- `tla (traces)`
-- `m5-gpu`
-- `m5-serve`
-- `m5-pr-result`
+- `smoke`
 
-The hosted `m5-pr-result` job checks that both native M5 jobs actually
-succeeded. GitHub's required status rule treats a skipped job as successful,
-so the two native M5 jobs alone would not enforce this. A fork PR needs a
-maintainer to stage its reviewed change on an up-to-date branch inside
-Inky and open a same-repository PR.
-[GitHub required check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)
+Both run on GitHub-hosted runners, so a fork pull request runs them too; no
+self-hosted runner ever runs pull-request code.
 
 Confirm the active rules using `gh api repos/robotgamedevelopers/inky/rules/branches/main`.
-Verify a current same-repository PR can merge after all checks pass, an
-out-of-date PR needs a branch update, and a fork PR with skipped M5 checks is
-blocked. This ruleset covers the native CI topology. Changes to self-hosted
-runner access or M5 triggers require a corresponding change to the required
-M5 contexts.
+Verify a current pull request can merge after both checks pass and an
+out-of-date pull request needs a branch update. A change to the jobs in
+`ci.yml` needs the same change to the required contexts here, in the live
+ruleset, and in `REQUIRED_JOBS`.

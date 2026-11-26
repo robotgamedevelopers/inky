@@ -8,14 +8,16 @@ proof of GPU arithmetic or wall-clock timing.
 Run on a designated Linux or Apple Silicon M5 bench, never a laptop.
 Every check, `.cfg` file, trace script, and mutation is verified by
 `scripts/check-tla-tiers.sh` (and `scripts/check-tla-tiers.sh --self-test`) to run in
-**exactly one** CI tier (`143` checks and mutants: `107` per pull request, `36` nightly):
+**exactly one** part of the nightly tier, and none per pull request (`157` checks and mutants: `0` per pull
+request, `157` nightly). Pull-request CI runs unit tests and a smoke test only (Glenn, 2026-11-25); all TLA+ runs in
+`.github/workflows/nightly.yml` on the fleet's self-hosted runners:
 
-- **Pull-request tier (`.github/workflows/ci.yml`, `tla` matrix)**:
+- **Nightly `tla` matrix (Linux fleet hosts)**:
   - `scripts/check-tla.sh memmode` — `specs/memmode/MemMode.tla` (`1` positive + `9` reversed witnesses, including temporal liveness `UnfairRestart`), plus `scripts/check-tla-tiers.sh` and `--self-test`.
-  - `scripts/check-tla.sh blocks` — `specs/run_tlc.zsh` non-grouped PR checks (`66` runs across `PrefixTree`, `PrefixTreeTrace`, `BlockLayout`, `SlabWord`, `BlockedSlab`, `VecAlloc`, `VerifyRollback`, `KvDiskTier`, `SwaRing`, `SpanPins`, `StartTails`, `InBlock`, `InBlockTrace`).
-  - `scripts/check-tla.sh grouped` — `specs/run_tlc.zsh` grouped PR checks (`19` runs across `GroupedLayout`, `PoisonGate`, `ScratchTail`).
+  - `scripts/check-tla.sh blocks` — `specs/run_tlc.zsh` non-grouped matrix checks (`66` runs across `PrefixTree`, `PrefixTreeTrace`, `BlockLayout`, `SlabWord`, `BlockedSlab`, `VecAlloc`, `VerifyRollback`, `KvDiskTier`, `SwaRing`, `SpanPins`, `StartTails`, `InBlock`, `InBlockTrace`).
+  - `scripts/check-tla.sh grouped` — `specs/run_tlc.zsh` grouped matrix checks (`19` runs across `GroupedLayout`, `PoisonGate`, `ScratchTail`).
   - `scripts/check-tla.sh traces` — all seven CPU-only trace-conformance scripts in parallel (`check-memmode-traces.sh`, `check-blockbook-traces.sh`, `check-cache-traces.sh`, `check-scheduler-traces.sh`, `check-poisongate-traces.sh`, `check-serve-step-traces.sh`, `check-serve-cache-traces.sh`), each pinning every single-line Rust mutation to the exact TLA+ invariant or action property it violates.
-- **Nightly tier (`.github/workflows/nightly.yml`, `TLA_NIGHTLY=1`)**:
+- **Nightly `tla-layout-nightly` (M5 Mac) and `tla-scheduler` (Linux fleet host) jobs, `TLA_NIGHTLY=1`**:
   - `scripts/check-tla.sh layout-nightly` — exhaustive `PrefixTreeNightly` (`2` slots, up to `3` sealed nodes), simulated 21-node `PrefixTree` (`256` traces x `128` steps), three `src/prefix.rs` trace mutants (`no-evict`, `full-match`, `ref-leak`), and `StartTails3` (`Capacity = 3` per kind).
   - `scripts/check-tla.sh scheduler` (`specs/run_cache_scheduler.sh`) — `30` exhaustive `CacheScheduler` runs (`11` positive safety + liveness + action-property configs and `19` reversed witnesses; `-Xmx8g` on Linux).
 

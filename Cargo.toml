@@ -30,8 +30,8 @@ codegen-units = 1
 panic = "abort"
 debug = 1
 
-# Pull-request CI on the M5 runners (.github/workflows/ci.yml): release optimisation without fat LTO, incremental,
-# so a warm runner rebuilds in about a second instead of 13-19 s. Releases and the nightly gates use [profile.release].
+# Quick local M5 gate runs (docs/CONTRIBUTING.md): release optimisation without fat LTO, incremental, so a warm
+# checkout rebuilds in about a second instead of 13-19 s. Releases and the nightly gates use [profile.release].
 [profile.ci]
 inherits = "release"
 lto = false

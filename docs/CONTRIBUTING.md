@@ -8,7 +8,7 @@
 |---|---|
 | **Any Apple Silicon or Intel Mac (no M5 needed)** | Full `cargo build --locked`, `cargo test --locked --bins --tests` (CPU unit tests, HTTP framing/auth/deadline tests, 10,000-mutation GGUF/tokenizer fuzz suite), `cargo publish --locked --dry-run`, all Go `-race` suites, and all TLA+ model & trace-mutation checks. Metal shaders compile at runtime (`newLibraryWithSource`), so compiling and running unit tests requires no M5 GPU or model weights. |
 | **Linux (`x86_64` or `aarch64`)** | Workflow/release gate tests (`tests/test_release_ci.py`), all 6 Go `-race` suites (`soak_client`, `tools/load`, `tools/inkconvert`, `tests/fleetcheck` with `bubblewrap`, `tests/servecheck`, `tools/replay`), TLA+ model & trace checks (`scripts/check-tla-tiers.sh`, `scripts/check-tla.sh`), and `cargo-fuzz` against `fuzz/fuzz_targets/gguf_load.rs` (GGUF + BPE tokenizer parser without Metal). |
-| **Apple M5 Mac (self-hosted CI: `m5-gpu`, `m5-serve`, `m5-full`)** | Live GPU logit agreement against `llama.cpp` (`tests/ci.sh`), GPU negative-control sabotage gates (`INK_*_SABOTAGE=1`), long poisoned-pool & SSD-spill gates (`tests/nightly.sh`), golden logit hashes (`tests/golden.sh`), and live `inky serve` HTTP/SSE probes (`tests/serve.sh`, `tests/serve-negative.sh`). |
+| **Apple M5 Mac (self-hosted nightly CI: `release-cpu`, `unit-extras`, `tla-layout-nightly`, `m5-full`)** | Live GPU logit agreement against `llama.cpp` (`tests/ci.sh`), GPU negative-control sabotage gates (`INK_*_SABOTAGE=1`), long poisoned-pool & SSD-spill gates (`tests/nightly.sh`), golden logit hashes (`tests/golden.sh`), and live `inky serve` HTTP/SSE probes (`tests/serve.sh`, `tests/serve-negative.sh`). |
 
 ## 1. macOS (Without an M5 GPU or Model File)
 
@@ -46,7 +46,7 @@ Requires Java `21+` (`scripts/check-tla.sh` downloads and verifies the SHA-256-p
 scripts/check-tla-tiers.sh
 scripts/check-tla-tiers.sh --self-test
 
-# Pull-request TLA+ suites (MemMode, BlockLayout/InBlock, GroupedDecode, production traces + mutants)
+# The nightly `tla` matrix parts (MemMode, BlockLayout/InBlock, GroupedDecode, production traces + mutants)
 TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh memmode
 TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh blocks
 TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh grouped
@@ -70,10 +70,12 @@ cargo +nightly fuzz run --fuzz-dir fuzz gguf_load -- -max_total_time=60
 On an M5 Mac with `Inkling-2-Mini-Q4_K_M.gguf` and reference logits in `~/inky-ci/ref`:
 
 ```sh
-cargo build --locked --profile ci
-INKY_BIN=./target/ci/inky tests/ci.sh pr
-INKY_SERVE_PROBES_ONLY=1 tests/serve.sh ./target/ci/inky
-INKY_SERVE_PROBES_ONLY=1 tests/serve-negative.sh tests/serve.sh ./target/ci/inky
+cargo build --locked --release
+INKY_BIN=./target/release/inky tests/ci.sh full
+tests/serve.sh
+tests/serve-negative.sh tests/serve.sh
 ```
 
-Outside pull requests run the `unit`, `go`, and `tla` jobs automatically on GitHub-hosted runners; maintainer review triggers the self-hosted `m5-gpu` and `m5-serve` jobs before merge.
+`tests/ci.sh pr` runs the quicker subset of `tests/ci.sh full`.
+
+Every pull request, outside ones included, runs only the `unit` and `smoke` jobs of `.github/workflows/ci.yml`, on GitHub-hosted runners, in about a minute. Everything else (the Go suites, every TLA+ part, the unit extras, the release-profile build and every GPU and serve gate) runs in `.github/workflows/nightly.yml` on the fleet's self-hosted runners, and the dependency audit runs daily; no self-hosted runner runs pull-request code.

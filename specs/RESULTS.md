@@ -12,17 +12,17 @@ temporal violation.
 
 `scripts/check-tla-tiers.sh` and `scripts/check-tla-tiers.sh --self-test` verify that
 every `.cfg` file, runner entry, trace script, and trace mutation sits in **exactly one**
-CI tier:
+part of the nightly tier, and none runs per pull request:
 
-- **Total**: `143` checks and mutants (`107` per pull request in `.github/workflows/ci.yml`,
-  `36` nightly in `.github/workflows/nightly.yml`), `0` gaps, `0` duplicates.
-- **Self-test**: all `9` planted faults (`PoisonGate4` dropped, `StaleSaved` dropped,
+- **Total** (2026-11-25): `157` checks and mutants (`0` per pull request in `.github/workflows/ci.yml`,
+  `157` nightly in `.github/workflows/nightly.yml`), `0` gaps, `0` duplicates.
+- **Self-test**: all `10` planted faults (`PoisonGate4` dropped, `StaleSaved` dropped,
   `skip-keep` mutant dropped, matrix with no runner, disabled TLA job, `memmode` part
-  unscheduled, `memmode` scheduled in both tiers, unwired `check-planted-traces.sh`, and
-  `traces` dropped from `ci.yml`) failed red with their expected `TIER LOST` / `TIER GAP` /
-  `TIER DUP` diagnostics.
+  unscheduled, `memmode` scheduled in both tiers, `memmode` moved back to `ci.yml`, unwired
+  `check-planted-traces.sh`, and `traces` dropped from `nightly.yml`) failed red with their expected
+  `TIER LOST` / `TIER GAP` / `TIER DUP` / `TIER PR` diagnostics.
 
-## `memmode` PR part (`scripts/check-tla.sh memmode`)
+## `memmode` nightly matrix part (`scripts/check-tla.sh memmode`)
 
 10 runs in parallel (`-Xmx2g`, 1 worker per JVM):
 
@@ -39,7 +39,7 @@ CI tier:
 | `NoRollbackAttempted` | `Invariant RollbackAttempted is violated.` | Expected violation |
 | `UnfairRestart` | `Temporal property EventuallyRestored was violated.` | Expected temporal violation |
 
-## `blocks` PR part (`scripts/check-tla.sh blocks`)
+## `blocks` nightly matrix part (`scripts/check-tla.sh blocks`)
 
 66 runs via `specs/run_tlc.zsh` (`16` single-worker JVMs at a time, `48.8 s` total wall):
 
@@ -112,7 +112,7 @@ CI tier:
 | `InBlockTrace` | 1,489 | 1,488 | 2.031 | PASS |
 | `InBlockTraceKv8` | 1,489 | 1,488 | 2.085 | PASS |
 
-## `grouped` PR part (`scripts/check-tla.sh grouped`)
+## `grouped` nightly matrix part (`scripts/check-tla.sh grouped`)
 
 19 runs via `specs/run_tlc.zsh` (`8` single-worker JVMs at a time, `57.5 s` total wall):
 
@@ -146,7 +146,7 @@ CI tier:
 - **`scheduler`** (`.github/workflows/nightly.yml` `tla-scheduler`, `specs/run_cache_scheduler.sh`):
   all `30` runs (`11` exhaustive safety + liveness + action-property configs and `19` reversed witnesses) — **30/30 PASS**. Full per-run table and counterexamples are recorded in [CACHE_SCHEDULER.md](CACHE_SCHEDULER.md).
 
-## `traces` PR part (`scripts/check-tla.sh traces`)
+## `traces` nightly matrix part (`scripts/check-tla.sh traces`)
 
 All seven trace-conformance gates run in parallel (`tla2tools.jar` v1.8.0, zero network/GPU), and every mutation is pinned to the exact TLC counterexample:
 
