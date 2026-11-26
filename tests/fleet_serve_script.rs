@@ -52,10 +52,9 @@ fn fleet_serve_records_only_when_opted_in_and_fails_on_chmod_error() {
     fs::write(&fake_inky, "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n").unwrap();
     fs::set_permissions(&fake_inky, fs::Permissions::from_mode(0o755)).unwrap();
 
-    // 2. Default run: no --record-dir argument and no logs/ directory created.
+    // 2. Default run (no CLI --kv8): passes --kv8 automatically, no --record-dir, and no logs/ created.
     let out_default = Command::new("bash")
         .arg(&script)
-        .arg("--kv8")
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &sandbox.0)
@@ -77,11 +76,53 @@ fn fleet_serve_records_only_when_opted_in_and_fails_on_chmod_error() {
             .find(|w| w[0] == flag)
             .map(|w| w[1].as_str())
     };
+    assert_eq!(flag_val("-c"), Some("16384"), "default context must remain 16384");
     assert_eq!(flag_val("--lanes"), Some("64"), "default lanes must match M5 Max sweep knee (64)");
     assert_eq!(flag_val("--queue"), Some("128"), "default queue must match docs/LANE-SWEEP.md (128)");
     assert_eq!(flag_val("--effort"), Some("low"), "default effort must match docs/LANE-SWEEP.md (low)");
-    assert_eq!(args_default.last().map(String::as_str), Some("--kv8"));
+    assert!(args_default.iter().any(|a| a == "--kv8"), "default invocation must pass --kv8: {args_default:?}");
     assert!(!sandbox.0.join("logs").exists(), "default must not create <repo>/logs");
+
+    // 2b. INKY_KV8=0 omits --kv8 cleanly for exact FP16 serving.
+    let out_fp16 = Command::new("bash")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &sandbox.0)
+        .env("INKY_BIN", &fake_inky)
+        .env("INKY_MODEL", "/fake/model.gguf")
+        .env("INKY_BIND", "127.0.0.1:18096")
+        .env("INKY_SERVE_KEY", "unit-test-secret")
+        .env("INKY_KV8", "0")
+        .output()
+        .expect("run INKY_KV8=0");
+    assert!(out_fp16.status.success(), "stderr: {}", String::from_utf8_lossy(&out_fp16.stderr));
+    let args_fp16: Vec<String> = String::from_utf8_lossy(&out_fp16.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(!args_fp16.iter().any(|a| a == "--kv8"), "INKY_KV8=0 must omit --kv8: {args_fp16:?}");
+
+    // 2c. Invalid INKY_KV8=2 exits with code 2 and diagnostic message.
+    let out_bad_kv8 = Command::new("bash")
+        .arg(&script)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &sandbox.0)
+        .env("INKY_BIN", &fake_inky)
+        .env("INKY_MODEL", "/fake/model.gguf")
+        .env("INKY_BIND", "127.0.0.1:18096")
+        .env("INKY_SERVE_KEY", "unit-test-secret")
+        .env("INKY_KV8", "2")
+        .output()
+        .expect("run INKY_KV8=2");
+    assert_eq!(out_bad_kv8.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out_bad_kv8.stderr).contains("[fleet-serve] INKY_KV8 must be 0 or 1"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out_bad_kv8.stderr)
+    );
+    assert!(out_bad_kv8.stdout.is_empty(), "inky must not be exec'd on invalid INKY_KV8");
 
     // 3. Opt-in via INKY_RECORD_CARDS=1: creates <repo>/logs/cards with mode 0700 and passes --record-dir.
     let out_optin = Command::new("bash")

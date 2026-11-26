@@ -1,6 +1,6 @@
-# Quality Replay, `--kv8`, and Thinking Effort Sweep
+# Quality Replay, `--kv8` Long-Context Torture, and Thinking Effort Sweep
 
-This document records the deterministic quality replay suite (`tools/quality` + `tests/quality/cards.jsonl`) and measured results on **Apple M5 Pro (64 GiB)** running `inky serve` with `Inkling-2-Mini-Q4_K_M.gguf` (`-c 16384 -n 4096 --lanes 1`, `temperature=0`, `seed=42`).
+This document records the deterministic quality replay suite (`tools/quality` + `tests/quality/cards.jsonl`), the **Apple M5 Max (128 GB)** `FP16` vs. `--kv8` (`Q8_0` KV cache) evaluation across both standard coding cards and `21K–24K`-token long-context retrieval/bugfix torture cards, and the **Apple M5 Pro (64 GiB)** thinking-effort sweep.
 
 ## Suite Design (`tools/quality`, `tests/quality/cards.jsonl`)
 
@@ -38,7 +38,65 @@ cd tools/quality && go run . \
   -temp 0 -seed 42
 ```
 
-## Reference `fp16` vs `--kv8` (`t-later-quality`, `t-later-kv8`)
+---
+
+## Apple M5 Max (128 GB): `FP16` vs. `--kv8` Suite A & `21K–24K` Long-Context Torture Evaluation
+
+- **Hardware**: Apple M5 Max MacBook Pro (`18` CPU cores, `128.0 GiB` unified memory)
+- **Binary & Model**: `inky v0.2.15` release build, `Inkling-2-Mini-Q4_K_M.gguf` (`16.3 GiB` mapped)
+- **Server Config**: `inky serve [--kv8] -c 32768 -n 4096 --lanes 16 --effort low --bind 127.0.0.1:18951` (`temperature=0`, `seed=42`)
+- **KV Memory Footprint (`-c 32768`)**: `FP16` (`2 B/elem`, per-lane reserve `1.16 GiB`) vs. `--kv8` (`1 B/elem`, per-lane reserve `0.59 GiB`, **`1.99x` per-lane saving**)
+
+### Executive Summary (M5 Max 128 GB)
+
+| Suite | Description | `FP16` Score | `--kv8` Score | Check Parity | Exact `temp=0` Match | Mean Lexical Token Agreement | `FP16` Avg Wall | `--kv8` Avg Wall |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **Suite A (`tools/quality`)** | 9 short-context Go coding, unified-diff & JSON tool-call cards (`effort=low`) | **8/9 (88.9%)** | **9/9 (100.0%)** | 88.9% | 44.4% | 69.2% | `21,509.3 ms` | `19,079.9 ms` |
+| **Suite B (`21K–24K` Torture)** | 5 long-context (`>20K` tok) multi-file Go bugfix, 64-bit hex needle & multi-turn `go test -race` cards (`effort=low`) | **3/5 (60.0%)** | **3/5 (60.0%)** | **100.0%** | **80.0%** | **81.0%** | `51,084.2 ms` | `51,245.5 ms` |
+
+### Suite A: Standard `tools/quality` (`9` Cards, `effort=low`, `temp=0`, `seed=42`)
+
+| Card ID | Kind | `FP16` | `--kv8` | Prompt Tok | `FP16` Gen Tok | `--kv8` Gen Tok | `FP16` Decode `tok/s` | `--kv8` Decode `tok/s` | Exact Match | Token Agree |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|
+| `mech-rename-symbol` | `mechanical-edit` | PASS (13/13) | PASS (13/13) | 187 | 619 | 544 | 42.5 | 42.0 | Yes | 100.0% |
+| `mech-add-field-tag` | `mechanical-edit` | FAIL (0/4) | PASS (7/7) | 341 | 1,536 | 1,057 | 40.2 | 42.2 | No | 0.0% |
+| `mech-extract-const` | `mechanical-edit` | PASS (8/8) | PASS (8/8) | 180 | 257 | 280 | 36.3 | 41.1 | Yes | 100.0% |
+| `bugfix-clamp-upper` | `bugfix` | PASS (7/7) | PASS (7/7) | 271 | 372 | 302 | 33.6 | 40.6 | Yes | 100.0% |
+| `bugfix-ring-wrap` | `bugfix` | PASS (7/7) | PASS (7/7) | 260 | 712 | 428 | 27.5 | 40.0 | No | 34.4% |
+| `bugfix-binary-search-overflow` | `bugfix` | PASS (7/7) | PASS (7/7) | 236 | 249 | 327 | 25.8 | 39.2 | Yes | 100.0% |
+| `algo-lru-cache` | `multi-step-algorithm` | PASS (10/10) | PASS (10/10) | 195 | 746 | 920 | 29.3 | 35.8 | No | 67.2% |
+| `algo-topo-sort` | `multi-step-algorithm` | PASS (5/5) | PASS (5/5) | 176 | 954 | 888 | 32.4 | 22.8 | No | 32.0% |
+| `algo-interval-merge-tool` | `multi-step-algorithm` | PASS (4/4) | PASS (4/4) | 301 | 805 | 795 | 28.6 | 36.0 | No | 88.7% |
+
+*(On `FP16`'s sole miss, `mech-add-field-tag` hit the card's `max_tokens: 1536` cap mid-reasoning before emitting `edit_file`, whereas `--kv8` completed reasoning in `1,057` tokens and passed `7/7` checks.)*
+
+### Suite B: `21K–24K`-Token Long-Context Coding & Exact-Retrieval Torture Test (`5` Cards, `go test -race`)
+
+Every card places its target code or exact 64-bit hex/integer constants **7,000 to 20,000 tokens before the end of the prompt** (100% outside Inkling's 1,024-token sliding-window attention, forcing all retrieval through the 8 full-attention KV passes) and grades the model's patch/code/tool-call by compiling and running `go test -race`:
+
+| Card ID | Prompt Tok (`FP16`/`kv8`) | `FP16` (`go test -race`) | `--kv8` (`go test -race`) | `FP16` Gen Tok | `--kv8` Gen Tok | `FP16` Prefill / Decode `ms` | `--kv8` Prefill / Decode `ms` | `FP16` Decode `tok/s` | `--kv8` Decode `tok/s` | Exact Match | Token Agree |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|---:|
+| `b1-early-needle-offbyone` | 22,040 / 22,040 | **PASS** (3/3) | **PASS** (3/3) | 968 | 1,028 | 21,683 / 32,886 | 24,750 / 27,180 | 29.4 | 37.8 | Yes | 100.0% |
+| `b2-mid-crossfile-refactor` | 22,385 / 22,385 | **PASS** (3/3) | **PASS** (3/3) | 928 | 927 | 22,860 / 26,853 | 25,310 / 27,860 | 34.6 | 33.3 | Yes | 100.0% |
+| `b3-four-needle-config-reconcile` | 21,151 / 21,151 | **PASS** (3/3) | **PASS** (3/3) | 1,645 | 1,872 | 22,238 / 45,546 | 22,976 / 50,332 | 36.1 | 37.2 | No | 4.8% |
+| `b4-buried-ringbuf-concurrency` | 23,734 / 23,734 | **FAIL** (2/3) | **FAIL** (2/3) | 786 | 789 | 27,815 / 22,680 | 26,617 / 21,270 | 34.7 | 37.1 | Yes | 100.0% |
+| `b5-multiturn-tool-22k` | 23,915 / 23,915 | **FAIL** (1/3) | **FAIL** (1/3) | 195 | 87 | 26,639 / 5,214 | 26,717 / 2,190 | 37.4 | 39.7 | Yes | 100.0% |
+
+### Root-Cause Notes (`FP16` vs. `--kv8` at `21K–24K` Context)
+
+1. **Exact Long-Range Needle & 64-Bit Hex Retrieval Through Quantized Full-Attention KV (`b1`, `b2`, `b3` — All `3/3` `PASS` on Both `FP16` and `--kv8`)**:
+   - **`b1-early-needle-offbyone` (`22,040` prompt tokens)**: Target `pkg/frame/frame.go` sat at token ~1,500 (~20,500 tokens before generation, outside the 1,024-token sliding window). `--kv8` reproduced `FrameMagic = 0x51A7E90D`, `TagSalt = 0x9E3779B97F4A7C15`, and `MaxPayload = 4096` verbatim, fixed all 3 `DecodeFrame` bugs, matched `FP16` character-for-character, and passed `go test`.
+   - **`b2-mid-crossfile-refactor` (`22,385` prompt tokens)**: Cross-referenced `internal/lease/types.go` (token ~8,000) and `internal/lease/gate.go` (token ~15,000), emitted a character-for-character identical `edit_file` JSON tool call to `FP16`, and passed `go test`.
+   - **`b3-four-needle-config-reconcile` (`21,151` prompt tokens)**: Retrieved all four 64-bit hex keys (`0x517CC1B727220A95`, `0x9E3779B97F4A7C15`, `0xBF58476D1CE4E5B9`, `0x94D049BB133111EB`), four ports, and four capacities placed at ~2K, ~7K, ~13K, and ~18K tokens with zero digit errors on both `FP16` and `--kv8`, passing `go test` (`TotalCapacity() == 2304`, `PortSpread() == 195`, `RingDigest() == 0x199d5a50bbdf40be`).
+2. **Identical Single-Step / `effort=low` Behavior on `b4` and `b5` (Zero `--kv8` Degradation)**:
+   - **`b4-buried-ringbuf-concurrency` (`23,734` prompt tokens)**: `FP16` and `--kv8` emitted character-for-character identical unified diffs — both retrieved `pkg/workq/bounded_queue.go` from token ~10,000, fixed `Push` and `Close`, and placed `+ q.notFull.Signal()` one line after `return item, true` (`./bounded_queue.go:61:1: missing return`).
+   - **`b5-multiturn-tool-22k` (`23,915` prompt tokens)**: `FP16` and `--kv8` emitted character-for-character identical JSON tool calls (`run_test({"command": "grep -n \"nextLSN\\|gotCRC\\|lsnBuf\" pkg/wal/wal.go"})`), recalling the exact buggy identifiers from ~22,000 tokens earlier and requesting an extra `grep` step before `edit_file` in the single-step evaluator.
+
+Based on zero quality or long-range retrieval regressions (`9/9` vs. `8/9` on Suite A; `3/5` vs. `3/5` with `4/5` byte-identical outputs on `21K–24K` Suite B) alongside `1.99x` KV memory savings and `+23.6%–34.5%` 64-lane `20K` decode speedup, [`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) enables `--kv8` by default (`INKY_KV8=1`; set `INKY_KV8=0` for exact FP16).
+
+---
+
+## Reference `fp16` vs `--kv8` on Apple M5 Pro 64 GiB (`t-later-quality`, `t-later-kv8`)
 
 Measured on **Apple M5 Pro (64 GiB)** at `reasoning_effort=medium`, `temperature=0`, `seed=42` (`tests/quality/results_m5_pro.json`):
 

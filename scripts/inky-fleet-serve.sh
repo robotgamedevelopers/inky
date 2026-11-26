@@ -14,6 +14,7 @@
 #   INKY_QUEUE         Bounded admission queue depth (default: 128, matching docs/LANE-SWEEP.md)
 #   INKY_EFFORT        Default reasoning effort (default: low, matching docs/LANE-SWEEP.md)
 #   INKY_MAX_TOKENS    Default reply token budget (default: 8192, must be < INKY_CTX)
+#   INKY_KV8           Set to 1 to pass --kv8 (8-bit KV cache) by default; set to 0 for exact FP16 (default: 1)
 #   INKY_RECORD_CARDS  Set to 1 to record card traffic into <repo>/logs/cards (default: 0, disabled)
 #   INKY_RECORD_DIR    Explicit directory for cards-YYYYMMDD.jsonl (enables recording when non-empty)
 #   INKY_KEY_ENV       Env var carrying bearer API key (default: INKY_SERVE_KEY)
@@ -29,6 +30,7 @@ INKY_CTX=${INKY_CTX:-16384}
 INKY_QUEUE=${INKY_QUEUE:-128}
 INKY_EFFORT=${INKY_EFFORT:-low}
 INKY_MAX_TOKENS=${INKY_MAX_TOKENS:-8192}
+INKY_KV8=${INKY_KV8:-1}
 INKY_KEY_ENV=${INKY_KEY_ENV:-INKY_SERVE_KEY}
 
 if [[ ! -x "$INKY_BIN" ]]; then
@@ -40,6 +42,16 @@ if [[ -z "${!INKY_KEY_ENV:-}" ]]; then
     printf '%s\n' "[fleet-serve] required key env var $INKY_KEY_ENV is unset or empty" >&2
     exit 2
 fi
+
+KV8_ARGS=()
+case "$INKY_KV8" in
+    1) KV8_ARGS=(--kv8) ;;
+    0) KV8_ARGS=() ;;
+    *)
+        printf '%s\n' "[fleet-serve] INKY_KV8 must be 0 or 1 (got ${INKY_KV8})" >&2
+        exit 2
+        ;;
+esac
 
 RECORD_DIR=""
 if [[ -n "${INKY_RECORD_DIR:-}" ]]; then
@@ -71,5 +83,6 @@ exec "$INKY_BIN" serve \
     --effort "$INKY_EFFORT" \
     --bind "$INKY_BIND" \
     --key-env "$INKY_KEY_ENV" \
+    ${KV8_ARGS[@]+"${KV8_ARGS[@]}"} \
     ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} \
     "$@"

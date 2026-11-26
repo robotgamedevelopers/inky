@@ -4,7 +4,7 @@
 
 ## 1. Service Wrapper (`scripts/inky-fleet-serve.sh`)
 
-[`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) launches `inky serve` bound to `INKY_BIND` (default `127.0.0.1:8096`, or any private-network `IP:PORT` supplied by the operator) with `--key-env INKY_SERVE_KEY`, `--lanes 64` (the M5 Max profile default, configurable with `INKY_LANES`), `-c 16384`, `-n 8192`, and `--record-dir`:
+[`scripts/inky-fleet-serve.sh`](../scripts/inky-fleet-serve.sh) launches `inky serve` bound to `INKY_BIND` (default `127.0.0.1:8096`, or any private-network `IP:PORT` supplied by the operator) with `--key-env INKY_SERVE_KEY`, `--kv8` (`INKY_KV8=1` default; set `INKY_KV8=0` for exact FP16 KV), `--lanes 64` (the M5 Max profile default, configurable with `INKY_LANES`), `-c 16384`, `-n 8192`, `--queue 128`, `--effort low`, and opt-in `--record-dir` (`INKY_RECORD_CARDS=1`):
 
 ```sh
 INKY_BIND=<inky-host>:8096 INKY_SERVE_KEY="$YOUR_SECRET" \

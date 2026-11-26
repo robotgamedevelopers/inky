@@ -1,163 +1,140 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 480" width="880" height="480">
-
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 500" width="920" height="500" role="img" aria-labelledby="p1-title p1-desc">
+  <title id="p1-title">Matched 20K-Context Throughput: inky vs. llama-server (FP16 &amp; Q8_0) — Apple M5 Max (128 GB)</title>
+  <desc id="p1-desc">All four 20K-token/lane configurations from 1 to 64 parallel lanes on Apple M5 Max (128 GB): inky --kv8 (430.8 tok/s, 43.6 GiB Metal), inky FP16 (348.5 tok/s, 68.7 GiB Metal), llama-server Q8_0 (190.3 tok/s, 51.7 GiB MTL0 / 80.1 GiB RSS), and llama-server FP16 (156.7 tok/s, 77.8 GiB MTL0 / 74.4 GiB RSS).</desc>
   <style>
-    :root {
-      --bg: #ffffff;
-      --panel: #f6f8fa;
-      --border: #d0d7de;
-      --grid: #e1e4e8;
-      --axis: #57606a;
-      --text: #1f2328;
-      --muted: #656d76;
-      --blue: #0969da;
-      --blue-soft: #54aeff;
-      --teal: #0e8a6d;
-      --green: #1a7f37;
-      --amber: #9a6700;
-      --purple: #8250df;
-      --orange: #bc4c00;
-      --gray-line: #6e7781;
-      --bar-muted: #afb8c1;
-      --badge-bg: #ddf4ff;
-      --badge-text: #0969da;
-      --callout-bg: #ffffff;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #0d1117;
-        --panel: #161b22;
-        --border: #30363d;
-        --grid: #21262d;
-        --axis: #8b949e;
-        --text: #e6edf3;
-        --muted: #8b949e;
-        --blue: #58a6ff;
-        --blue-soft: #79c0ff;
-        --teal: #39d353;
-        --green: #3fb950;
-        --amber: #d29922;
-        --purple: #bc8cff;
-        --orange: #ffa657;
-        --gray-line: #8b949e;
-        --bar-muted: #484f58;
-        --badge-bg: #1f334d;
-        --badge-text: #79c0ff;
-        --callout-bg: #161b22;
-      }
-    }
     svg { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
-    .bg { fill: var(--bg); }
-    .panel { fill: var(--panel); stroke: var(--border); stroke-width: 1; }
-    .title { font-size: 16px; font-weight: 700; fill: var(--text); }
-    .subtitle { font-size: 12px; fill: var(--muted); }
-    .panel-title { font-size: 13.5px; font-weight: 600; fill: var(--text); }
-    .axis-label { font-size: 11.5px; font-weight: 600; fill: var(--muted); }
-    .tick { font-size: 10.5px; fill: var(--muted); }
-    .grid { stroke: var(--grid); stroke-width: 1; }
-    .axis { stroke: var(--axis); stroke-width: 1.2; }
-    .legend-text { font-size: 11px; fill: var(--text); }
-    .legend-muted { font-size: 10.5px; fill: var(--muted); }
-    .val { font-size: 10.5px; font-weight: 600; fill: var(--text); }
-    .val-blue { font-size: 10.5px; font-weight: 700; fill: var(--blue); }
-    .val-green { font-size: 10.5px; font-weight: 700; fill: var(--green); }
-    .val-purple { font-size: 10.5px; font-weight: 700; fill: var(--purple); }
-    .val-orange { font-size: 10.5px; font-weight: 700; fill: var(--orange); }
-    .val-muted { font-size: 10.5px; font-weight: 600; fill: var(--muted); }
-    .badge-bg { fill: var(--badge-bg); stroke: var(--border); stroke-width: 1; }
-    .badge-text { font-size: 10.5px; font-weight: 700; fill: var(--badge-text); }
-    .callout-box { fill: var(--callout-bg); stroke: var(--border); stroke-width: 1; opacity: 0.94; }
+    .frame { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+    .plot-bg { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1; }
+    .title { font-size: 16px; font-weight: 700; fill: #1f2328; }
+    .subtitle { font-size: 11.8px; fill: #656d76; }
+    .axis-label { font-size: 11.5px; font-weight: 600; fill: #57606a; }
+    .tick { font-size: 11px; fill: #656d76; }
+    .grid { stroke: #e1e4e8; stroke-width: 1; }
+    .axis { stroke: #57606a; stroke-width: 1.25; }
+    .sub-txt { font-size: 10px; fill: #656d76; }
+    .foot { font-size: 10.5px; fill: #656d76; }
+    .c-kv8-line { stroke: #059669; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .c-kv8-dot { fill: #059669; stroke: #ffffff; stroke-width: 1.4; }
+    .c-kv8-txt { font-size: 11.5px; font-weight: 700; fill: #059669; }
+    .c-kv8-ldr { stroke: #059669; fill: none; stroke-width: 1.2; opacity: 0.82; }
+    .c-fp16-line { stroke: #2563eb; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .c-fp16-dot { fill: #2563eb; stroke: #ffffff; stroke-width: 1.4; }
+    .c-fp16-txt { font-size: 11.5px; font-weight: 700; fill: #2563eb; }
+    .c-fp16-ldr { stroke: #2563eb; fill: none; stroke-width: 1.2; opacity: 0.82; }
+    .c-lq8-line { stroke: #d97706; fill: none; stroke-dasharray: 6 4; stroke-linecap: round; stroke-linejoin: round; }
+    .c-lq8-dot { fill: #d97706; stroke: #ffffff; stroke-width: 1.4; }
+    .c-lq8-txt { font-size: 11.5px; font-weight: 700; fill: #d97706; }
+    .c-lq8-ldr { stroke: #d97706; fill: none; stroke-width: 1.2; opacity: 0.82; }
+    .c-lfp16-line { stroke: #64748b; fill: none; stroke-dasharray: 6 4; stroke-linecap: round; stroke-linejoin: round; }
+    .c-lfp16-dot { fill: #64748b; stroke: #ffffff; stroke-width: 1.4; }
+    .c-lfp16-txt { font-size: 11.5px; font-weight: 700; fill: #64748b; }
+    .c-lfp16-ldr { stroke: #64748b; fill: none; stroke-width: 1.2; opacity: 0.82; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #0d1117; stroke: #30363d; }
+      .plot-bg { fill: #161b22; stroke: #30363d; }
+      .title { fill: #e6edf3; }
+      .subtitle { fill: #8b949e; }
+      .axis-label { fill: #8b949e; }
+      .tick { fill: #8b949e; }
+      .grid { stroke: #21262d; }
+      .axis { stroke: #8b949e; }
+      .sub-txt { fill: #8b949e; }
+      .foot { fill: #8b949e; }
+      .c-kv8-line { stroke: #34d399; }
+      .c-kv8-dot { fill: #34d399; stroke: #0d1117; }
+      .c-kv8-txt { fill: #34d399; }
+      .c-kv8-ldr { stroke: #34d399; }
+      .c-fp16-line { stroke: #60a5fa; }
+      .c-fp16-dot { fill: #60a5fa; stroke: #0d1117; }
+      .c-fp16-txt { fill: #60a5fa; }
+      .c-fp16-ldr { stroke: #60a5fa; }
+      .c-lq8-line { stroke: #fbbf24; }
+      .c-lq8-dot { fill: #fbbf24; stroke: #0d1117; }
+      .c-lq8-txt { fill: #fbbf24; }
+      .c-lq8-ldr { stroke: #fbbf24; }
+      .c-lfp16-line { stroke: #94a3b8; }
+      .c-lfp16-dot { fill: #94a3b8; stroke: #0d1117; }
+      .c-lfp16-txt { fill: #94a3b8; }
+      .c-lfp16-ldr { stroke: #94a3b8; }
+    }
   </style>
-
-<rect class="bg" x="0" y="0" width="880" height="480" rx="8"/>
-<rect class="panel" x="82" y="84" width="758" height="305" rx="4"/>
-<text class="title" x="28" y="34">Aggregate Throughput vs. Parallel Lanes — Apple M5 Max MacBook Pro (128 GB)</text>
-<text class="subtitle" x="28" y="54">Inkling-2-Mini-Q4_K_M.gguf • 1 to 64 concurrent lanes • vs. vanilla llama-server (master, 64 slots)</text>
-<line class="grid" x1="82" y1="389.0" x2="840" y2="389.0"/>
-<text class="tick" x="72" y="393.0" text-anchor="end">0</text>
-<line class="grid" x1="82" y1="342.1" x2="840" y2="342.1"/>
-<text class="tick" x="72" y="346.1" text-anchor="end">100</text>
-<line class="grid" x1="82" y1="295.2" x2="840" y2="295.2"/>
-<text class="tick" x="72" y="299.2" text-anchor="end">200</text>
-<line class="grid" x1="82" y1="248.2" x2="840" y2="248.2"/>
-<text class="tick" x="72" y="252.2" text-anchor="end">300</text>
-<line class="grid" x1="82" y1="201.3" x2="840" y2="201.3"/>
-<text class="tick" x="72" y="205.3" text-anchor="end">400</text>
-<line class="grid" x1="82" y1="154.4" x2="840" y2="154.4"/>
-<text class="tick" x="72" y="158.4" text-anchor="end">500</text>
-<line class="grid" x1="82" y1="107.5" x2="840" y2="107.5"/>
-<text class="tick" x="72" y="111.5" text-anchor="end">600</text>
-<line class="grid" x1="118.0" y1="84" x2="118.0" y2="389"/>
-<text class="tick" x="118.0" y="407" text-anchor="middle">1</text>
-<line class="grid" x1="221.3" y1="84" x2="221.3" y2="389"/>
-<text class="tick" x="221.3" y="407" text-anchor="middle">2</text>
-<line class="grid" x1="324.7" y1="84" x2="324.7" y2="389"/>
-<text class="tick" x="324.7" y="407" text-anchor="middle">4</text>
-<line class="grid" x1="428.0" y1="84" x2="428.0" y2="389"/>
-<text class="tick" x="428.0" y="407" text-anchor="middle">8</text>
-<line class="grid" x1="531.3" y1="84" x2="531.3" y2="389"/>
-<text class="tick" x="531.3" y="407" text-anchor="middle">16</text>
-<line class="grid" x1="634.7" y1="84" x2="634.7" y2="389"/>
-<text class="tick" x="634.7" y="407" text-anchor="middle">32</text>
-<line class="grid" x1="738.0" y1="84" x2="738.0" y2="389"/>
-<text class="tick" x="738.0" y="407" text-anchor="middle">64</text>
-<line class="axis" x1="82" y1="389" x2="840" y2="389"/>
-<line class="axis" x1="82" y1="84" x2="82" y2="389"/>
-<text class="axis-label" x="461.0" y="429" text-anchor="middle">Concurrent Lanes / Parallel Slots</text>
-<text class="axis-label" x="24" y="236.5" text-anchor="middle" transform="rotate(-90 24 236.5)">Aggregate Throughput (tok/s)</text>
-<polyline fill="none" stroke="var(--orange)" stroke-width="2.4" stroke-dasharray="6,4" points="118.0,369.8 221.3,359.9 324.7,342.1 428.0,322.4 531.3,316.3 634.7,298.0 738.0,288.1"/>
-<polyline fill="none" stroke="var(--blue)" stroke-width="2.8" points="118.0,344.3 428.0,311.0 531.3,274.4 634.7,213.9 738.0,140.4"/>
-<polyline fill="none" stroke="var(--green)" stroke-width="2.6" points="118.0,374.4 428.0,328.7 531.3,298.2 634.7,250.3 738.0,135.2"/>
-<rect x="114.5" y="366.3" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="118.0" y="384.8" text-anchor="middle">41</text>
-<rect x="217.8" y="356.4" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="221.3" y="349.9" text-anchor="middle">62</text>
-<rect x="321.2" y="338.6" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="324.7" y="332.1" text-anchor="middle">100</text>
-<rect x="424.5" y="318.9" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="428.0" y="338.4" text-anchor="middle">142</text>
-<rect x="527.8" y="312.8" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="531.3" y="332.3" text-anchor="middle">155</text>
-<rect x="631.2" y="294.5" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="634.7" y="314.0" text-anchor="middle">194</text>
-<rect x="734.5" y="284.6" width="7" height="7" fill="var(--orange)"/>
-<text class="val-orange" x="738.0" y="304.1" text-anchor="middle">215</text>
-<circle cx="118.0" cy="344.3" r="4.5" fill="var(--blue)"/>
-<text class="val-blue" x="126.0" y="333.3" text-anchor="middle">95.3</text>
-<circle cx="428.0" cy="311.0" r="4.5" fill="var(--blue)"/>
-<text class="val-blue" x="422.0" y="300.0" text-anchor="middle">166.2</text>
-<circle cx="531.3" cy="274.4" r="4.5" fill="var(--blue)"/>
-<text class="val-blue" x="523.3" y="263.4" text-anchor="middle">244.3</text>
-<circle cx="634.7" cy="213.9" r="4.5" fill="var(--blue)"/>
-<text class="val-blue" x="624.7" y="202.9" text-anchor="middle">373.1</text>
-<circle cx="738.0" cy="140.4" r="4.5" fill="var(--blue)"/>
-<text class="val-blue" x="726.0" y="156.4" text-anchor="end">529.7 (FP16)</text>
-<circle cx="738.0" cy="117.8" r="4.5" fill="none" stroke="var(--blue)" stroke-width="2"/>
-<text class="val-blue" x="728.0" y="111.8" text-anchor="end">578 (short 2K)</text>
-<polygon points="118.0,369.4 123.0,374.4 118.0,379.4 113.0,374.4" fill="var(--green)"/>
-<text class="val-green" x="130.0" y="390.4" text-anchor="middle">31.1</text>
-<polygon points="428.0,323.7 433.0,328.7 428.0,333.7 423.0,328.7" fill="var(--green)"/>
-<text class="val-green" x="442.0" y="343.7" text-anchor="middle">128.5</text>
-<polygon points="531.3,293.2 536.3,298.2 531.3,303.2 526.3,298.2" fill="var(--green)"/>
-<text class="val-green" x="545.3" y="313.2" text-anchor="middle">193.5</text>
-<polygon points="634.7,245.3 639.7,250.3 634.7,255.3 629.7,250.3" fill="var(--green)"/>
-<text class="val-green" x="648.7" y="265.3" text-anchor="middle">295.5</text>
-<polygon points="738.0,130.2 743.0,135.2 738.0,140.2 733.0,135.2" fill="var(--green)"/>
-<text class="val-green" x="726.0" y="130.2" text-anchor="end">540.8 (serve / 541.5 kv8)</text>
-<line x1="782.0" y1="135.2" x2="782.0" y2="288.1" stroke="var(--blue)" stroke-width="1.5"/>
-<line x1="777.0" y1="135.2" x2="787.0" y2="135.2" stroke="var(--blue)" stroke-width="1.5"/>
-<line x1="777.0" y1="288.1" x2="787.0" y2="288.1" stroke="var(--blue)" stroke-width="1.5"/>
-<rect class="badge-bg" x="749.0" y="195.7" width="66" height="32" rx="4"/>
-<text class="badge-text" x="782.0" y="209.7" text-anchor="middle">2.46–2.69x</text>
-<text class="badge-text" x="782.0" y="222.7" text-anchor="middle">vs llama.cpp</text>
-<rect class="callout-box" x="98" y="98" width="376" height="84" rx="5"/>
-<line x1="110" y1="118" x2="134" y2="118" stroke="var(--blue)" stroke-width="2.8"/>
-<circle cx="122" cy="118" r="4" fill="var(--blue)"/>
-<text class="legend-text" x="142" y="122">inky 2K Decode (1L bench 95.3; perfgate FP16 -&gt; 529.7; 2K 578)</text>
-<line x1="110" y1="141" x2="134" y2="141" stroke="var(--green)" stroke-width="2.6"/>
-<polygon points="122,136 127,141 122,146 117,141" fill="var(--green)"/>
-<text class="legend-text" x="142" y="145">inky serve 16K Multi-Turn Cards (streamed -&gt; 540.8 / 7,132/hr)</text>
-<line x1="110" y1="164" x2="134" y2="164" stroke="var(--orange)" stroke-width="2.4" stroke-dasharray="5,3"/>
-<rect x="118.5" y="160.5" width="7" height="7" fill="var(--orange)"/>
-<text class="legend-text" x="142" y="168">llama-server (master, 64 slots, short prompts -&gt; 215 tok/s)</text>
-<text class="legend-muted" x="82" y="466">Note: 1L inky decode uses single-stream pipelined bench (95.3 tok/s; unpipelined batched path = 39.2 tok/s). 64L --kv8 reaches 541.5 tok/s.</text>
+  <rect x="0.5" y="0.5" width="919" height="499" rx="10" class="frame"/>
+  <text x="24" y="32" class="title">Matched 20K-Context Scaling: inky vs. llama-server (FP16 &amp; Q8_0) — M5 Max (128 GB)</text>
+  <text x="24" y="53" class="subtitle">Inkling-2-Mini-Q4_K_M.gguf · Single-tenant uncontended 20,418–20,482 tokens per lane/slot across 1–64 concurrent lanes</text>
+  <rect x="72.0" y="82.0" width="526.0" height="308.0" rx="4" class="plot-bg"/>
+  <text x="62.0" y="394.0" text-anchor="end" class="tick">0</text>
+  <line x1="72.0" y1="328.4" x2="598.0" y2="328.4" class="grid"/>
+  <text x="62.0" y="332.4" text-anchor="end" class="tick">100</text>
+  <line x1="72.0" y1="266.8" x2="598.0" y2="266.8" class="grid"/>
+  <text x="62.0" y="270.8" text-anchor="end" class="tick">200</text>
+  <line x1="72.0" y1="205.2" x2="598.0" y2="205.2" class="grid"/>
+  <text x="62.0" y="209.2" text-anchor="end" class="tick">300</text>
+  <line x1="72.0" y1="143.6" x2="598.0" y2="143.6" class="grid"/>
+  <text x="62.0" y="147.6" text-anchor="end" class="tick">400</text>
+  <text x="62.0" y="86.0" text-anchor="end" class="tick">500</text>
+  <line x1="72.0" y1="390.0" x2="72.0" y2="395.0" class="axis"/>
+  <text x="72.0" y="414" text-anchor="middle" class="tick">1</text>
+  <line x1="97.0" y1="82.0" x2="97.0" y2="390.0" class="grid"/>
+  <line x1="97.0" y1="390.0" x2="97.0" y2="395.0" class="axis"/>
+  <text x="97.0" y="414" text-anchor="middle" class="tick">4</text>
+  <line x1="130.4" y1="82.0" x2="130.4" y2="390.0" class="grid"/>
+  <line x1="130.4" y1="390.0" x2="130.4" y2="395.0" class="axis"/>
+  <text x="130.4" y="414" text-anchor="middle" class="tick">8</text>
+  <line x1="197.2" y1="82.0" x2="197.2" y2="390.0" class="grid"/>
+  <line x1="197.2" y1="390.0" x2="197.2" y2="395.0" class="axis"/>
+  <text x="197.2" y="414" text-anchor="middle" class="tick">16</text>
+  <line x1="330.8" y1="82.0" x2="330.8" y2="390.0" class="grid"/>
+  <line x1="330.8" y1="390.0" x2="330.8" y2="395.0" class="axis"/>
+  <text x="330.8" y="414" text-anchor="middle" class="tick">32</text>
+  <line x1="598.0" y1="390.0" x2="598.0" y2="395.0" class="axis"/>
+  <text x="598.0" y="414" text-anchor="middle" class="tick">64</text>
+  <line x1="72.0" y1="82.0" x2="72.0" y2="390.0" class="axis"/>
+  <line x1="72.0" y1="390.0" x2="598.0" y2="390.0" class="axis"/>
+  <text x="335.0" y="444" text-anchor="middle" class="axis-label">Concurrent Lanes / Parallel Slots (~20.4K tokens per lane)</text>
+  <text x="20" y="236.0" text-anchor="middle" transform="rotate(-90 20 236.0)" class="axis-label">Aggregate Decode Throughput (tok/s)</text>
+  <polyline points="72.0,360.8 80.3,347.6 97.0,333.6 130.4,319.7 197.2,311.8 330.8,303.6 598.0,293.5" stroke-width="2.5" class="c-lfp16-line"/>
+  <polyline points="72.0,361.5 80.3,347.5 97.0,332.8 130.4,322.3 197.2,314.6 330.8,294.1 598.0,272.8" stroke-width="2.4" class="c-lq8-line"/>
+  <polyline points="72.0,344.8 80.3,349.3 97.0,327.4 130.4,296.3 197.2,258.9 330.8,216.2 598.0,175.3" stroke-width="2.7" class="c-fp16-line"/>
+  <polyline points="72.0,343.4 80.3,348.4 97.0,324.3 130.4,288.8 197.2,244.4 330.8,187.8 598.0,124.6" stroke-width="3.0" class="c-kv8-line"/>
+  <circle cx="72.0" cy="360.8" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="80.3" cy="347.6" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="97.0" cy="333.6" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="130.4" cy="319.7" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="197.2" cy="311.8" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="330.8" cy="303.6" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="598.0" cy="293.5" r="3.6" class="c-lfp16-dot"/>
+  <circle cx="72.0" cy="361.5" r="3.6" class="c-lq8-dot"/>
+  <circle cx="80.3" cy="347.5" r="3.6" class="c-lq8-dot"/>
+  <circle cx="97.0" cy="332.8" r="3.6" class="c-lq8-dot"/>
+  <circle cx="130.4" cy="322.3" r="3.6" class="c-lq8-dot"/>
+  <circle cx="197.2" cy="314.6" r="3.6" class="c-lq8-dot"/>
+  <circle cx="330.8" cy="294.1" r="3.6" class="c-lq8-dot"/>
+  <circle cx="598.0" cy="272.8" r="3.6" class="c-lq8-dot"/>
+  <circle cx="72.0" cy="344.8" r="4.0" class="c-fp16-dot"/>
+  <circle cx="80.3" cy="349.3" r="4.0" class="c-fp16-dot"/>
+  <circle cx="97.0" cy="327.4" r="4.0" class="c-fp16-dot"/>
+  <circle cx="130.4" cy="296.3" r="4.0" class="c-fp16-dot"/>
+  <circle cx="197.2" cy="258.9" r="4.0" class="c-fp16-dot"/>
+  <circle cx="330.8" cy="216.2" r="4.0" class="c-fp16-dot"/>
+  <circle cx="598.0" cy="175.3" r="4.0" class="c-fp16-dot"/>
+  <circle cx="72.0" cy="343.4" r="4.2" class="c-kv8-dot"/>
+  <circle cx="80.3" cy="348.4" r="4.2" class="c-kv8-dot"/>
+  <circle cx="97.0" cy="324.3" r="4.2" class="c-kv8-dot"/>
+  <circle cx="130.4" cy="288.8" r="4.2" class="c-kv8-dot"/>
+  <circle cx="197.2" cy="244.4" r="4.2" class="c-kv8-dot"/>
+  <circle cx="330.8" cy="187.8" r="4.2" class="c-kv8-dot"/>
+  <circle cx="598.0" cy="124.6" r="4.2" class="c-kv8-dot"/>
+  <polyline points="604.0,124.6 613.0,124.6" class="c-kv8-ldr"/>
+  <text x="618.0" y="125.6" class="c-kv8-txt">inky --kv8: 430.8 tok/s (2.75×)</text>
+  <text x="618.0" y="140.1" class="sub-txt">43.6 GiB Metal · default fleet mode</text>
+  <polyline points="604.0,175.3 613.0,175.3" class="c-fp16-ldr"/>
+  <text x="618.0" y="176.3" class="c-fp16-txt">inky FP16: 348.5 tok/s (2.22×)</text>
+  <text x="618.0" y="190.8" class="sub-txt">68.7 GiB Metal · exact FP16 KV</text>
+  <polyline points="604.0,272.8 613.0,264.1 613.0,264.1" class="c-lq8-ldr"/>
+  <text x="618.0" y="265.1" class="c-lq8-txt">llama-server Q8_0: 190.3 tok/s (1.21×)</text>
+  <text x="618.0" y="279.6" class="sub-txt">51.7 GiB MTL0 / 80.1 GiB RSS (-ctk/-ctv q8_0)</text>
+  <polyline points="604.0,293.5 613.0,302.1 613.0,302.1" class="c-lfp16-ldr"/>
+  <text x="618.0" y="303.1" class="c-lfp16-txt">llama-server FP16: 156.7 tok/s (1.00×)</text>
+  <text x="618.0" y="317.6" class="sub-txt">77.8 GiB MTL0 / 74.4 GiB RSS (default FP16)</text>
+  <text x="24" y="478" class="foot">Note: 1L inky points use solo encode_step (forced dbatch B=1 = 41.1 --kv8 / 40.5 FP16 tok/s; 2L = 67.6 / 66.1 tok/s). Zero cross-slot KV sharing.</text>
 </svg>

@@ -91,7 +91,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Apply the machine profile before clamping serving lanes ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Compute first-token percentiles from observable streamed output ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Separate sampled process footprint from the admission estimate ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
-| Repeat the M5 Max lane sweep with corrected measurements | ❌ |
+| Repeat the M5 Max lane sweep with corrected measurements | ✅ |
 | Replay both retained recording segments ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Keep unrelated anonymous requests separate across restarts ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
 | Enforce recording byte limits on individual rows ([#91](https://github.com/robotgamedevelopers/inky/pull/91)) | ✅ |
@@ -120,7 +120,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Represent generation and delivery outcomes independently ([#90](https://github.com/robotgamedevelopers/inky/pull/90)) | ✅ |
 | Keep count_tokens from filling the generation preprocess pool | ✅ |
 | Fail ci.sh sabotage probes on the command status, not only on grep ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 94% |
+| complete | 97% |
 
 [Source data](roadmap.sexp)
 
@@ -256,7 +256,7 @@ Gates that do not run, that test a different path from the one served, or that p
 |---|:---:|
 | Lanes in inky serve pass through Queued, Admitted and Restoring, and the Layer 4 rows cite tests of the serving path | ✅ |
 | A GPU gate runs LoopCD, the dry weak pass, k_loopcd_blend and a mixed-omega batch, with a planted-bug control ([#86](https://github.com/robotgamedevelopers/inky/pull/86), [#106](https://github.com/robotgamedevelopers/inky/pull/106), [#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| The replay set is real fleet card traffic, and the lane-count knee is derived from it | ❌ |
+| The replay set is real fleet card traffic, and the lane-count knee is derived from it | ✅ |
 | Batch-invariance gates run the blocked kernels inky serve uses, past 17 lanes, past 1024 positions and at full-size spans ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | servecheck's negative controls plant a fault in the server, so each one shows a probe going red on a real server bug ([#109](https://github.com/robotgamedevelopers/inky/pull/109)) | ✅ |
 | The poisoned-slot gate checks poisoned and saved slots after each step, catching stray writes as well as reads ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
@@ -265,7 +265,7 @@ Gates that do not run, that test a different path from the one served, or that p
 | The full-disk and kill steps read the record files back and fail on a torn line ([#111](https://github.com/robotgamedevelopers/inky/pull/111)) | ✅ |
 | The soak and fault gates run in a blocking nightly, and the soak fails on 429s under capacity and on a wired limit that never moved | ✅ |
 | Every GPU gate in ci.sh has a planted-bug control that CI requires to fail ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) | ✅ |
-| complete | 90% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
