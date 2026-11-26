@@ -1,6 +1,6 @@
 [package]
 name = "inky-engine"
-version = "0.2.17"
+version = "1.0.0"
 edition = "2021"
 description = "A hand-fused Metal inference engine for Thinking Machines' Inkling 2 Mini, for Apple Silicon M5 Macs (Metal 4)"
 license = "GPL-3.0-or-later"
