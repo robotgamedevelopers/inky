@@ -344,11 +344,11 @@ func (g *gate) toolGrammarConstrainedSampling() error {
 			"messages": []map[string]string{
 				{
 					"role":    "system",
-					"content": "You are a weather tool caller. Always call forecast_weather immediately with the city and integer number of days requested by the user.",
+					"content": "You are a tool-using assistant. Whenever the user asks for a forecast, immediately invoke forecast_weather with the requested city and integer days and do not write any message text before calling the tool.",
 				},
 				{
 					"role":    "user",
-					"content": "Fetch the 5-day forecast for Tokyo, Japan using forecast_weather now.",
+					"content": "What is the 5-day forecast for Tokyo, Japan?",
 				},
 			},
 			"tools": []map[string]any{
