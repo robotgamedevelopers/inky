@@ -55,7 +55,6 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Preserve the previous model if conversion fails ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Reject nonfinite weights and handle zero reference rows ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
 | Reject unrecognized expert row layouts ([#74](https://github.com/robotgamedevelopers/inky/pull/74)) | ✅ |
-| Qualify a converted official native checkpoint on M5 | ❌ |
 | Record the pinned tokenizer and GGUF geometry controls | ✅ |
 | Isolate LoopCD transforms by sampling lane ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
 | Apply LoopCD to the first output token ([#86](https://github.com/robotgamedevelopers/inky/pull/86)) | ✅ |
@@ -71,7 +70,7 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | Make the published agreement sentences match the CI gate, and fail inky check on an argmax miss ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Name both decode-dispatch counters in the v0.2.2 note ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
 | Tie the 63/64 dirty-range claim to a real decode step ([#110](https://github.com/robotgamedevelopers/inky/pull/110)) | ✅ |
-| complete | 95% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
@@ -281,7 +280,7 @@ The self-hosted runner, branch protection, per-pull-request CI time and the nigh
 | feature | done |
 |---|:---:|
 | The self-hosted M5 runner runs only reviewed code from trusted triggers, as a dedicated unprivileged user | ❌ |
-| main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main | ❌ |
+| main is protected by a ruleset: changes land by pull request with cpu, go and m5 green against current main | ✅ |
 | Settle the dead-code candidates that are not certain: held for open pull requests, stale attributes and test-only groups ([#124](https://github.com/robotgamedevelopers/inky/pull/124)) | ✅ |
 | Remove decode_overwrites_prompt and its unit test ([#118](https://github.com/robotgamedevelopers/inky/pull/118)) | ✅ |
 | Remove record::card_id_from_headers and the test lines that call it ([#118](https://github.com/robotgamedevelopers/inky/pull/118)) | ✅ |
@@ -301,7 +300,7 @@ The self-hosted runner, branch protection, per-pull-request CI time and the nigh
 | Nightly runs and blocks on every slow gate the roadmap cites: temp1, soak faults, the live fleet card, wide batches and all sabotages | ✅ |
 | The per-pull-request Go job runs unit tests with no sockets, sleeps or child processes, inside the time budget ([#109](https://github.com/robotgamedevelopers/inky/pull/109)) | ✅ |
 | The cache trace checker's mutant builds and TLC runs leave the per-pull-request job or fit its one-minute budget ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) | ✅ |
-| complete | 90% |
+| complete | 95% |
 
 [Source data](roadmap.sexp)
 
@@ -626,8 +625,6 @@ Improvements that wait for the layers above. Those that change the model's numbe
 
 Hardening from a comprehensive audit (Aurora Muse, 2026-11-24, at be82ef3 v0.2.2; the full report was shared on the fleet bus): the last eight rows below. The audit's top finding stands behind them — inky is a genuinely impressive, unusually well-verified niche engine, narrowly locked to M5 and Metal 4, with very large core files and a heavy unsafe and panic surface — so the rows favour reviewability, supply-chain hygiene, and safe serving defaults over new capability.
 
-Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in parallel lanes and lands the first whose check passes; the N attempts share their prompt through cross-lane prompt-prefix reuse (pull request 22). Its gate is the tier test from the flash+ provider goal (pull request 17): land rate per tier, 1 attempt against best-of-4, on mas-bandwidth/sprint-corpus. Aggregation and critic start only if pro still misses the flash+ bar after best-of-N.
-
 <!-- nova-work:later:start -->
 
 | feature | done |
@@ -650,9 +647,6 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Tool calls constrained to valid JSON while sampling (later) | ✅ |
 | Sampling on the GPU ([#64](https://github.com/robotgamedevelopers/inky/pull/64)) (later) | ✅ |
 | General fixes sent upstream to inkling (later) | ❌ |
-| Best-of-N against the check: N attempts at one card in parallel lanes, landing the first whose check passes; gate on the tier test, land rate per tier for 1 attempt against best-of-4 on mas-bandwidth/sprint-corpus (later) | ❌ |
-| Aggregation: N drafts and an aggregator lane that writes the combined fix, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
-| Critic: a writer lane and a fresh-context critic lane, then a revision, behind pro still missing the flash+ bar after best-of-N (later) | ❌ |
 | Split the largest core files (engine.rs, serve.rs, scheduler.rs, cache_scheduler.rs, spill.rs) behind the TLA trace checks, so each change stays reviewable (later) | ✅ |
 | Dependency hygiene in CI: cargo audit and Dependabot, so a vulnerable crate is caught without a human noticing (later) | ✅ |
 | Unauthenticated serving is loopback-only: warn loudly or refuse a non-loopback bind with no API key set (later) | ✅ |
@@ -668,7 +662,7 @@ Three rows spend lanes on one card, in this order. Best-of-N runs N attempts in 
 | Planted-bug negative controls for remaining gates (agreement, binv, lanes, dbatch, golden, servecheck), distinct prompts on overlapping reply tests, and 74K real-tokenizer corpus check ([#113](https://github.com/robotgamedevelopers/inky/pull/113)) (later) | ✅ |
 | Non-vacuous SlideWindow and disk-pressure prefill positive TLC configs in CacheScheduler, falsifiable Address64 witness in BlockLayout, and a verify/rollback layout model ([#114](https://github.com/robotgamedevelopers/inky/pull/114)) (later) | ✅ |
 | Enforce verify batch-arena row capacity (spans * (1 + k) <= lg_rows) and GPU rejection-sampling kernels before wiring DSpark into serve ([#123](https://github.com/robotgamedevelopers/inky/pull/123)) (later) | ✅ |
-| complete | 86% |
+| complete | 93% |
 
 [Source data](roadmap.sexp)
 
