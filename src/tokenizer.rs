@@ -68,8 +68,10 @@ impl Tokenizer {
         };
 
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len().saturating_mul(2));
-        for (i, t) in id_to_tok.iter().enumerate() {
-            tok_to_id.insert(t.clone(), i as u32);
+        for (i, (t, &ty)) in id_to_tok.iter().zip(&tok_type).enumerate() {
+            if ty != 3 {
+                tok_to_id.insert(t.clone(), i as u32);
+            }
         }
 
         let mut merges = HashMap::with_capacity(merges_s.len().saturating_mul(2));
@@ -98,7 +100,7 @@ impl Tokenizer {
             .iter()
             .zip(&tok_type)
             .enumerate()
-            .filter(|&(_, (_, &ty))| ty == 3)
+            .filter(|&(_, (t, &ty))| ty == 3 && !t.is_empty())
             .map(|(i, (t, _))| (t.clone(), i as u32))
             .collect();
         specials.sort_by_key(|s| Reverse(s.0.len()));
@@ -232,7 +234,7 @@ impl Tokenizer {
         let mapped: String = piece.bytes()
             .map(|b| self.id_to_tok[self.byte_to_id[b as usize] as usize].as_str())
             .collect();
-        if let Some(&id) = self.tok_to_id.get(&mapped) {
+        if let Some(&id) = self.tok_to_id.get(&mapped).filter(|&&id| !self.is_special(id)) {
             if remaining == 0 { return false; }
             out.push(id);
             return true;
@@ -342,7 +344,7 @@ impl Tokenizer {
         let mut pos = 0;
         while pos < bytes.len() {
             if parse_special && bytes[pos] == b'<' {
-                if let Some((s, id)) = self.specials.iter().find(|(s, _)| text[pos..].starts_with(s.as_str())) {
+                if let Some((s, id)) = self.specials.iter().find(|(s, _)| !s.is_empty() && text[pos..].starts_with(s.as_str())) {
                     self.encode_plain(&text[plain_start..pos], &mut out);
                     out.push(*id);
                     pos += s.len();
@@ -371,7 +373,9 @@ impl Tokenizer {
         let mut tok_type: Vec<i64> = vec![3; special_strs.len()];
         for b in 32u8..127 { id_to_tok.push((b as char).to_string()); tok_type.push(0); }
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
-        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        for (i, (t, &ty)) in id_to_tok.iter().zip(&tok_type).enumerate() {
+            if ty != 3 { tok_to_id.insert(t.clone(), i as u32); }
+        }
         let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         let fallback = *tok_to_id.get("?").unwrap();
@@ -405,7 +409,9 @@ impl Tokenizer {
             uni_to_byte.insert(ch, b as u8);
         }
         let mut tok_to_id = HashMap::with_capacity(id_to_tok.len() * 2);
-        for (i, t) in id_to_tok.iter().enumerate() { tok_to_id.insert(t.clone(), i as u32); }
+        for (i, (t, &ty)) in id_to_tok.iter().zip(&tok_type).enumerate() {
+            if ty != 3 { tok_to_id.insert(t.clone(), i as u32); }
+        }
         let mut specials: Vec<(String, u32)> = special_strs.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32)).collect();
         specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
         let eos = (special_strs.len() - 1) as u32;
@@ -435,7 +441,7 @@ mod tests {
     fn reference_piece(t: &Tokenizer, piece: &str) -> Vec<u32> {
         let mut symbols: Vec<u32> = piece.bytes().map(|b| t.byte_to_id[b as usize]).collect();
         let mapped: String = symbols.iter().map(|&id| t.id_to_tok[id as usize].as_str()).collect();
-        if let Some(&id) = t.tok_to_id.get(&mapped) {
+        if let Some(&id) = t.tok_to_id.get(&mapped).filter(|&&id| !t.is_special(id)) {
             return vec![id];
         }
         loop {
@@ -870,5 +876,77 @@ mod tests {
         let loaded = Tokenizer::try_load(&g).expect("complete byte-level tokenizer metadata must load");
         assert!(loaded.decode_bytes(u32::MAX).is_empty(), "out-of-bounds token ID must not panic");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_ignores_empty_special_token_without_hanging_encode() {
+        let seed = crate::gguf::test_builder::valid_gguf_with_tokenizer();
+        let mut g = Gguf::open_bytes(&seed).unwrap();
+        if let Some(Value::AS(toks)) = g.kv.get_mut("tokenizer.ggml.tokens") {
+            toks.push(String::new());
+        }
+        if let Some(Value::AI(types)) = g.kv.get_mut("tokenizer.ggml.token_type") {
+            types.push(3);
+        }
+        let tk = Tokenizer::try_load(&g).expect("empty special token should be ignored cleanly");
+        assert!(tk.specials.iter().all(|(s, _)| !s.is_empty()));
+
+        for input in ["<", "<hello>", "a<b<c"] {
+            let ids = tk.encode(input, true);
+            assert!(ids.iter().all(|&id| !tk.is_special(id)), "unexpected special id for {input:?}");
+            let decoded: Vec<u8> = ids.iter().flat_map(|&id| tk.decode_bytes(id)).collect();
+            assert_eq!(decoded, input.as_bytes());
+        }
+    }
+
+    #[test]
+    fn plain_encoding_never_emits_special_tokens_on_whole_piece_or_merge_paths() {
+        let seed = crate::gguf::test_builder::valid_gguf_with_tokenizer();
+        let mut g = Gguf::open_bytes(&seed).unwrap();
+        let mut special_ids = Vec::new();
+        let extra = ["<||>", "SPECIAL", "ab", "!"];
+        if let Some(Value::AS(toks)) = g.kv.get_mut("tokenizer.ggml.tokens") {
+            for s in extra {
+                special_ids.push(toks.len() as u32);
+                toks.push(s.into());
+            }
+        }
+        if let Some(Value::AI(types)) = g.kv.get_mut("tokenizer.ggml.token_type") {
+            for _ in extra {
+                types.push(3);
+            }
+        }
+        g.kv.insert("tokenizer.ggml.merges".into(), Value::AS(vec!["a b".into()]));
+
+        let tk = Tokenizer::try_load(&g).expect("tokenizer with single-piece specials must load");
+        let punct_special = special_ids[0];
+        assert_eq!(tk.encode("<||>", true), vec![punct_special]);
+
+        // Plain encode must never emit any special token ID on whole-piece lookup, small BPE,
+        // ranked BPE (> 32 bytes), or byte fallback (even when a duplicate special shares a byte token string).
+        let long_ab = "ab".repeat(20);
+        let plain_inputs = ["<||>", "SPECIAL", "ab", "!", "<||> SPECIAL ab !", &long_ab];
+        for text in plain_inputs {
+            let ids = tk.encode(text, false);
+            assert!(
+                ids.iter().all(|&id| !tk.is_special(id)),
+                "encode({text:?}, false) emitted special token in {ids:?}",
+            );
+            let decoded: Vec<u8> = ids.iter().flat_map(|&id| tk.decode_bytes(id)).collect();
+            assert_eq!(decoded, text.as_bytes());
+
+            let mut limited = Vec::new();
+            assert!(tk.encode_plain_limited(text, &mut limited, usize::MAX));
+            assert_eq!(limited, ids);
+        }
+
+        // Defense-in-depth: even if tok_to_id were populated directly with a special token ID,
+        // `bpe` whole-piece fast path refuses special IDs and falls back to plain bytes.
+        let mut tk_direct = Tokenizer::try_load(&g).unwrap();
+        tk_direct.tok_to_id.insert("<||>".into(), punct_special);
+        let ids = tk_direct.encode("<||>", false);
+        assert!(ids.iter().all(|&id| !tk_direct.is_special(id)));
+        let decoded: Vec<u8> = ids.iter().flat_map(|&id| tk_direct.decode_bytes(id)).collect();
+        assert_eq!(decoded, b"<||>");
     }
 }

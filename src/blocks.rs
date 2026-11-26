@@ -1084,11 +1084,16 @@ impl BlockPool {
         if end > u32::MAX as usize { return Err(BlockError::Overflow); }
         let last_idx = end - 1;
         let _ = mul_offset(last_idx as u64, self.stride)?;
+        if last_idx / self.slots_per_slab >= MAX_SLABS { return Err(BlockError::Slab); }
+        let orig_slabs = self.slabs.len();
         let mut idx = start;
         while idx <= last_idx {
             let slab_i = idx / self.slots_per_slab;
             let slab_end = ((slab_i + 1).saturating_mul(self.slots_per_slab) - 1).min(last_idx);
-            self.ensure_slot(slab_end)?;
+            if let Err(err) = self.ensure_slot(slab_end) {
+                self.slabs.truncate(orig_slabs);
+                return Err(err);
+            }
             idx = slab_end + 1;
         }
         self.slots.resize(end, SlotRecord::fresh(self.kind));
@@ -2516,5 +2521,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn grow_by_rejected_past_max_slabs_leaves_pool_intact_for_subsequent_growth() {
+        let stride = stride_at(BlockKind::Full, 2).unwrap();
+        let max_slots = MAX_SLABS * 2;
+        let mut pool = BlockPool::open_host(BlockKind::Full, 0, 2, stride * 2).unwrap();
+
+        // Reject oversized growth from an empty pool without allocating partial slabs.
+        assert_eq!(pool.grow_by(max_slots + 1), Err(BlockError::Slab));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.slab_count(), 0);
+
+        // Overflowing count must also leave the pool unchanged.
+        assert_eq!(pool.grow_by(usize::MAX), Err(BlockError::Overflow));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.slab_count(), 0);
+
+        // Subsequent single-slot and batch growth must succeed cleanly.
+        let s1 = pool.grow().unwrap();
+        assert_eq!(s1.pool_index().get(), 0);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.slab_count(), 1);
+
+        // Reject oversized growth from a partially populated pool without leaking slabs 1..MAX_SLABS.
+        assert_eq!(pool.grow_by(max_slots), Err(BlockError::Slab));
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.slab_count(), 1);
+
+        // Growing up to exact capacity across all MAX_SLABS succeeds, then one more is rejected cleanly.
+        pool.grow_by(1).unwrap();
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.slab_count(), 1);
+        pool.grow_by(max_slots - 2).unwrap();
+        assert_eq!(pool.len(), max_slots);
+        assert_eq!(pool.slab_count(), MAX_SLABS);
+        assert_eq!(pool.grow(), Err(BlockError::Slab));
+        assert_eq!(pool.grow_by(1), Err(BlockError::Slab));
+        assert_eq!(pool.len(), max_slots);
+        assert_eq!(pool.slab_count(), MAX_SLABS);
     }
 }

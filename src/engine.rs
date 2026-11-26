@@ -4819,6 +4819,7 @@ impl Engine {
         for slot in 0..N_SLOT {
             let (swa, i) = self.slot_kind[slot];
             let cap = if swa { lane.swa_cap.get() } else { lane.full_cap.get() };
+            assert!(swa || pos < cap, "full-attention row {pos} is past the cache");
             let idx = if swa { pos % cap } else { pos };
             let buf = if swa { lane.kv_swa.borrow() } else { lane.kv_full.borrow() };
             let base = buf.contents().as_ptr() as *mut u8;
@@ -6925,11 +6926,44 @@ impl<'a> Run<'a> {
         *t.stg.borrow_mut() = self.gpu.buffer(16384);
         t.on.set(false);
     }
+    /// Roll back any `--kv-disk` hot-ring and cold-file state past `n` so `kv_swa`/`kv_full`
+    /// sit in their normal in-memory layout (`full_cap >= n`) before restoring a turn checkpoint.
+    pub fn tier_rollback(&self, n: usize) {
+        let Some(t) = &self.lane.tier else { return };
+        if t.on.get() {
+            self.tier_leave(n);
+        } else {
+            self.tier_wait();
+        }
+        t.lo[0].set(0);
+        t.lo[1].set(0);
+        t.cold[0].set(0);
+        t.cold[1].set(0);
+        // SWA file storage is a modulo-EXT ring, so writes at >= n can overwrite earlier window
+        // slots in the file; rewrite SWA on the next tier_enter. Full-attention file storage is
+        // linear (0..max_ctx), so [0..filed[1].min(n)) stays valid while >= n must be rewritten.
+        t.filed[0].set(0);
+        t.filed[1].set(t.filed[1].get().min(n));
+        t.next.set(0);
+        t.half.set(0);
+        t.plan.borrow_mut().clear();
+        t.execs.borrow_mut().clear();
+        t.loaded.set(usize::MAX);
+    }
     /// forget the cache (a new session)
     fn tier_reset(&self) {
         let Some(t) = &self.lane.tier else { return };
+        t.lo[0].set(0);
+        t.lo[1].set(0);
+        t.cold[0].set(0);
+        t.cold[1].set(0);
         t.filed[0].set(0);
         t.filed[1].set(0);
+        t.next.set(0);
+        t.half.set(0);
+        t.plan.borrow_mut().clear();
+        t.execs.borrow_mut().clear();
+        t.loaded.set(usize::MAX);
         if !t.on.get() {
             return;
         }
