@@ -856,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8() {
         // Build an Inkling-2-Mini-shaped 24-layer native expert GGUF header + aligned tensor payload:
         // layers 0..20 use T_NV4 + .gscale (T_F32), layers 20..24 use T_MX8.

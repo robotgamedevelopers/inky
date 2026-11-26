@@ -66,6 +66,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "blocks::tests::gpu_pool_zero_fills_a_taken_slot",
         ),
         (
+            "src/blocks.rs",
+            "metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window",
+            ".github/workflows/nightly.yml",
+            "blocks::tests::metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window",
+        ),
+        (
             "src/cache_scheduler/tests.rs",
             "dump_block_layout",
             ".github/workflows/nightly.yml",
@@ -78,10 +84,10 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "cache_scheduler::tests::dump_cache_scheduler",
         ),
         (
-            "src/engine/tests.rs",
-            "dspark_gpu_guards_and_rejection_sampling_gate",
+            "src/cache_scheduler/tests.rs",
+            "walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill",
             ".github/workflows/nightly.yml",
-            "engine::tests::dspark_gpu_guards_and_rejection_sampling_gate",
+            "cache_scheduler::tests::walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill",
         ),
         (
             "src/engine/tests.rs",
@@ -94,6 +100,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "disk_tier_matches_resident_logits_across_32k_staging_resize_transition",
             "tests/nightly.sh",
             "engine::tests::disk_tier_matches_resident_logits_across_32k_staging_resize_transition",
+        ),
+        (
+            "src/engine/tests.rs",
+            "dspark_gpu_guards_and_rejection_sampling_gate",
+            ".github/workflows/nightly.yml",
+            "engine::tests::dspark_gpu_guards_and_rejection_sampling_gate",
         ),
         (
             "src/engine/tests.rs",
@@ -121,6 +133,18 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/engine/tests.rs",
+            "metal_shader_declarations_and_compiler_validation",
+            ".github/workflows/nightly.yml",
+            "engine::tests::metal_shader_declarations_and_compiler_validation",
+        ),
+        (
+            "src/engine/tests.rs",
+            "paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes",
+            ".github/workflows/nightly.yml",
+            "engine::tests::paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes",
+        ),
+        (
+            "src/engine/tests.rs",
             "private_prefill_clears_the_last_window_tile_between_lanes",
             "tests/ci.sh",
             "engine::tests::private_prefill_clears_the_last_window_tile_between_lanes",
@@ -142,6 +166,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5",
             "tests/nightly.sh",
             "engine::tests::sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5",
+        ),
+        (
+            "src/gguf.rs",
+            "multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8",
+            ".github/workflows/nightly.yml",
+            "gguf::tests::multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8",
         ),
         (
             "src/loopcd_tests.rs",
@@ -175,6 +205,18 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         ("src/prefix.rs", "prefix_trace_dump", "specs/run_tlc.zsh", "prefix::tests::prefix_trace_dump"),
         (
+            "src/sampler.rs",
+            "residual_emits_target_argmax_outside_draft_top64_softcap_after_topk",
+            ".github/workflows/nightly.yml",
+            "sampler::tests::residual_emits_target_argmax_outside_draft_top64_softcap_after_topk",
+        ),
+        (
+            "src/scheduler/tests.rs",
+            "bimodal_2k_64k_tight_budget_with_mid_step_disconnects",
+            ".github/workflows/nightly.yml",
+            "scheduler::tests::bimodal_2k_64k_tight_budget_with_mid_step_disconnects",
+        ),
+        (
             "src/serve.rs",
             "gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
             ".github/workflows/nightly.yml",
@@ -182,9 +224,63 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ),
         (
             "src/serve.rs",
+            "overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill",
+            ".github/workflows/nightly.yml",
+            "serve::tests::overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill",
+        ),
+        (
+            "src/serve.rs",
             "serve_layer3_three_turn_10k_cached_matches_cold_solo",
             "tests/nightly.sh",
             "serve::tests::serve_layer3_three_turn_10k_cached_matches_cold_solo",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "long_spill_restore_keeps_source_and_accepts_early_fork",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::long_spill_restore_keeps_source_and_accepts_early_fork",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "spill_index_persists_across_reopen_and_async_restore_keeps_decoding_responsive",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::spill_index_persists_across_reopen_and_async_restore_keeps_decoding_responsive",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "spill_read_failure_releases_provisional_blocks_and_preserves_resident_match",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::spill_read_failure_releases_provisional_blocks_and_preserves_resident_match",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite",
+        ),
+        (
+            "src/serve/block_cache.rs",
+            "spill_store_eviction_restore_and_corrupt_fallback",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::tests::spill_store_eviction_restore_and_corrupt_fallback",
+        ),
+        (
+            "src/serve/block_cache/admission_tests.rs",
+            "burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity",
+            ".github/workflows/nightly.yml",
+            "serve::block_cache::admission_tests::burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity",
         ),
         (
             "src/serve/block_cache/tests/spill_model.rs",

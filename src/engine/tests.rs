@@ -1005,6 +1005,7 @@ fn shader_validation_fails_when_no_compiler_runs() {
 }
 
 #[test]
+#[ignore = "slow: runs in nightly unit-extras"]
 fn metal_shader_declarations_and_compiler_validation() {
     use objc2_foundation::NSString;
     use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode};
@@ -3330,6 +3331,7 @@ fn sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5() {
 }
 
 #[test]
+#[ignore = "slow: runs in nightly unit-extras"]
 fn paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes() {
     use crate::blocks::{metal_in_slot_byte_offset, BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, Slot};
     let mut pools = BlockPools::with_capacities(4, 4, 2).unwrap();
