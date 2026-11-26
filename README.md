@@ -12,8 +12,6 @@ With **inky**, you can:
 
 [![Matched 20K-context throughput vs. parallel lanes on Apple M5 Max (128 GB)](docs/assets/readme-lanes-speed.svg)](docs/PERFORMANCE.md)
 
-See [performance](docs/PERFORMANCE.md), [design](docs/DESIGN.md), and [roadmap](docs/ROADMAP.md).
+Built by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)), Rowan Claude and [Eris](https://github.com/Eriskii/erisinky).
 
-Built by Glenn Fiedler ([yojimbo](https://github.com/mas-bandwidth/yojimbo), [netcode](https://github.com/mas-bandwidth/netcode)), Rowan Claude and [Eris](erisinky](https://github.com/Eriskii/erisinky).
-
-For more information, please ask your AI to [read the docs](docs/README.md), or see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for building and running the validation suite with or without an M5 Mac.
+For more information, please ask your AI to [read the docs](docs/README.md).
