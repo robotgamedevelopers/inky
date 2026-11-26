@@ -134,14 +134,14 @@ Rowan Claude's audit of the same release at `be82ef3` used 45 blind readers on t
 | feature | done |
 |---|:---:|
 | PR #37 — Port fixed-split attention to current main ([#88](https://github.com/robotgamedevelopers/inky/pull/88)) | ✅ |
-| PR #60 — Qualify chip goldens on integrated arithmetic | ❌ |
+| PR #60 — Qualify chip goldens on integrated arithmetic | ✅ |
 | PR #42 — Port speculative scheduler verification ([#80](https://github.com/robotgamedevelopers/inky/pull/80)) | ✅ |
 | PR #51 — Port CI scheduling while retaining main gates | ✅ |
 | PR #51 — Make TLA coverage inventory prove execution ([#89](https://github.com/robotgamedevelopers/inky/pull/89)) | ✅ |
 | PR #53 — Extract and qualify fold changes | ✅ |
 | PR #76 — Review and qualify GPU completion checks ([#76](https://github.com/robotgamedevelopers/inky/pull/76)) | ✅ |
 | PR #59 — Port private sliding-window scratch isolation ([#81](https://github.com/robotgamedevelopers/inky/pull/81)) | ✅ |
-| complete | 87% |
+| complete | 100% |
 
 [Source data](roadmap.sexp)
 
