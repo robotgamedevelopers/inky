@@ -74,6 +74,10 @@ func runCLI(args []string, getenv func(string) string, client *http.Client, clk 
 		fmt.Fprintln(stderr, "--efforts must contain at least one level")
 		return 2
 	}
+	if *kv8URL != "" && len(efforts) > 1 {
+		fmt.Fprintln(stderr, "--kv8-url cannot be combined with multiple --efforts levels")
+		return 2
+	}
 
 	var runs []ModeRun
 	var cmp *ModeComparison
@@ -128,7 +132,7 @@ func runCLI(args []string, getenv func(string) string, client *http.Client, clk 
 	}
 
 	var sweep *EffortSweepReport
-	if len(efforts) > 1 {
+	if len(efforts) > 1 && *kv8URL == "" {
 		s := BuildEffortSweep(runs, efforts)
 		sweep = &s
 	}

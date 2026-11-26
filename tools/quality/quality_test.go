@@ -399,4 +399,17 @@ func TestRunCLILiveAndMergeWithMockServers(t *testing.T) {
 	if merged.Comparison == nil || merged.EffortSweep == nil {
 		t.Fatalf("expected both Comparison and EffortSweep in merged report, got %+v", merged)
 	}
+
+	// Combining --kv8-url with multiple --efforts must exit 2 cleanly instead of corrupting EffortSweep.
+	stdout.Reset()
+	stderr.Reset()
+	code = runCLI([]string{
+		"-cards", cardsPath,
+		"-ref-url", "http://fp16.local",
+		"-kv8-url", "http://kv8.local",
+		"-efforts", "none,high",
+	}, func(string) string { return "" }, client, newFakeClock(), &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--kv8-url") {
+		t.Fatalf("expected exit 2 rejecting --kv8-url with multiple --efforts, got code=%d stderr=%q", code, stderr.String())
+	}
 }

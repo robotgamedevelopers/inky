@@ -40,8 +40,8 @@ fn fixed_attn_batch_fits_every_row_in_the_arena() {
         let slots = split_scratch_slots(max_ctx);
         let arena_limit = NH * slots;
         for swa in [true, false] {
-            let kps = if swa { 64 } else { 256 };
-            for &span_end in &[1usize, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096, max_ctx] {
+            let kps = decode_split_kps(swa, max_ctx);
+            for &span_end in &[1usize, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 4096, max_ctx] {
                 if span_end > max_ctx {
                     continue;
                 }
@@ -609,7 +609,8 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::size_of::<MvArgs>(), (8 + 12 * 20) * 4);
     assert_eq!(std::mem::size_of::<CtrlJob>(), 10 * 4);
     assert_eq!(std::mem::size_of::<CtrlArgs>(), (4 + 4 * 10) * 4);
-    assert_eq!(std::mem::size_of::<AttnArgs>(), 34 * 4);
+    assert_eq!(std::mem::size_of::<AttnArgs>(), 36 * 4);
+    assert_eq!(std::mem::size_of::<PreparedAttnArgs>(), 20 * 4);
     assert_eq!(std::mem::size_of::<DevCopyArgs>(), 4 * 4);
     assert_eq!(std::mem::size_of::<CombineArgs>(), 8 * 4);
     assert_eq!(std::mem::size_of::<EpiArgs>(), 8 * 4);
@@ -629,6 +630,7 @@ fn shader_arg_structs_match_metal_abi_sizes() {
     assert_eq!(std::mem::size_of::<RouteArgs>(), 8 * 4);
     assert_eq!(std::mem::size_of::<Route3Args>(), 12 * 4);
     assert_eq!(std::mem::size_of::<TopkRoute3Args>(), 16 * 4);
+    assert_eq!(std::mem::size_of::<TopkRouteDecArgs>(), 16 * 4);
     assert_eq!(std::mem::size_of::<MoeCombArgs>(), 4 * 4);
     assert_eq!(std::mem::size_of::<ConvBArgs>(), 8 * 4);
     assert_eq!(std::mem::size_of::<StateArgs>(), 8 * 4);
@@ -748,41 +750,45 @@ fn blocked_slab_geometry_and_decode_scratch_invariants() {
     // Verify Layer 3 batched-decode extra scratch bounds for all batch sizes 1..=MAX_SPANS.
     let align64 = |x: usize| x.div_ceil(64) * 64;
     let grp_floats = std::mem::size_of::<DecAttnGroup>() / 4;
-    for n in [1usize, 2, 8, 16, 32, 64, MAX_SPANS] {
-        let extra = decode_batch_extra_floats(n);
-        let desc = align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4));
-        let kv_cur = align64(n * 2 * NKV * HD);
-        let swa_g = align64(n * MAX_SWA_SPLIT * grp_floats);
-        let full_g = align64(n * MAX_SPLIT * grp_floats);
-        assert_eq!(extra, desc + kv_cur + swa_g + full_g);
-        assert_eq!(extra % 64, 0);
-        if n > 1 {
-            assert!(extra >= decode_batch_extra_floats(n - 1));
+    for max_ctx in [4096usize, 131_072, 262_144] {
+        let slots = split_scratch_slots(max_ctx);
+        let ar_ctx = Arena::new(slots, N_VOCAB_PAD);
+        for n in [1usize, 2, 8, 16, 32, 64, MAX_SPANS] {
+            let extra = decode_batch_extra_floats(n, max_ctx);
+            let desc = align64(n * (std::mem::size_of::<DecodeSpanDesc>() / 4));
+            let kv_cur = align64(n * 2 * NKV * HD);
+            let swa_g = align64(n * MAX_SWA_SPLIT * grp_floats);
+            let full_g = align64(n * slots * grp_floats);
+            assert_eq!(extra, desc + kv_cur + swa_g + full_g);
+            assert_eq!(extra % 64, 0);
+            if n > 1 {
+                assert!(extra >= decode_batch_extra_floats(n - 1, max_ctx));
+            }
+            // Must never overlap any lane's `ar.part` when placed at `dstart + n * ar.total`.
+            let lane_end = (n - 1) * ar_ctx.total as usize + ar_ctx.part as usize + NH * slots * (HD + 2);
+            assert!(lane_end <= n * ar_ctx.total as usize);
         }
-        // Must never overlap any lane's `ar.part` when placed at `dstart + n * ar.total`.
-        let lane_end = (n - 1) * ar.total as usize + ar.part as usize + NH * MAX_SPLIT * (HD + 2);
-        assert!(lane_end <= n * ar.total as usize);
     }
 }
 
 #[test]
 fn fixed_decode_split_grid_boundaries_and_max_ctx_scaling() {
-    // SWA always anchors at 64-token block boundaries, <= 17 splits <= MAX_SPLIT.
+    // SWA always anchors at 64-token block boundaries (`<= 17` splits); Full always anchors at 256-token
+    // boundaries (`4` blocks), completely independent of `max_ctx` (`specs/SplitArena.tla`).
     assert_eq!(decode_split_kps(true, 4096), 64);
     assert_eq!(decode_split_kps(true, 262_144), 64);
-    // Full anchors at 512 for max_ctx <= 131,072 and scales by ceil(max_ctx / 131_072) beyond.
-    assert_eq!(decode_split_kps(false, 4096), 512);
-    assert_eq!(decode_split_kps(false, 131_072), 512);
-    assert_eq!(decode_split_kps(false, 131_136), 1024);
-    assert_eq!(decode_split_kps(false, 262_144), 1024);
+    assert_eq!(decode_split_kps(false, 4096), 256);
+    assert_eq!(decode_split_kps(false, 131_072), 256);
+    assert_eq!(decode_split_kps(false, 131_136), 256);
+    assert_eq!(decode_split_kps(false, 262_144), 256);
 
     for &pos in &[
-        0usize, 1, 62, 63, 64, 65, 510, 511, 512, 513, 1022, 1023, 1024, 1025, 1086, 1087, 1088, 16_383, 16_384,
+        0usize, 1, 62, 63, 64, 65, 254, 255, 256, 257, 1022, 1023, 1024, 1025, 1086, 1087, 1088, 16_383, 16_384,
         131_071,
     ] {
         for &swa in &[true, false] {
             let (first_pos, kps, sp_lo, nsplit) = decode_split_grid(swa, pos, 131_072);
-            assert!((1..=MAX_SPLIT).contains(&nsplit));
+            assert!((1..=split_scratch_slots(131_072)).contains(&nsplit));
             if swa {
                 assert!(nsplit <= MAX_SWA_SPLIT);
                 assert_eq!(first_pos, (pos + 1).saturating_sub(EXT));
@@ -810,10 +816,10 @@ fn fixed_decode_split_grid_boundaries_and_max_ctx_scaling() {
     assert_eq!(decode_split_grid(true, 1024, 131_072), (1, 64, 0, 17));
     assert_eq!(decode_split_grid(true, 1086, 131_072), (63, 64, 0, 17));
     assert_eq!(decode_split_grid(true, 1087, 131_072), (64, 64, 1, 16));
-    assert_eq!(decode_split_grid(false, 511, 131_072), (0, 512, 0, 1));
-    assert_eq!(decode_split_grid(false, 512, 131_072), (0, 512, 0, 2));
-    assert_eq!(decode_split_grid(false, 131_071, 131_072), (0, 512, 0, 256));
-    assert_eq!(decode_split_grid(false, 262_143, 262_144), (0, 1024, 0, 256));
+    assert_eq!(decode_split_grid(false, 255, 131_072), (0, 256, 0, 1));
+    assert_eq!(decode_split_grid(false, 256, 131_072), (0, 256, 0, 2));
+    assert_eq!(decode_split_grid(false, 131_071, 131_072), (0, 256, 0, 512));
+    assert_eq!(decode_split_grid(false, 262_143, 262_144), (0, 256, 0, 1024));
 }
 
 #[test]
@@ -1028,7 +1034,11 @@ fn metal_shader_declarations_and_compiler_validation() {
     // Validate every kernel listed in `KERNELS` is declared in the shader source.
     for &name in KERNELS {
         let decl = format!("kernel void {name}(");
-        let macro_decl = name.starts_with("k_mix_b_") || name.starts_with("k_gemm_sg") || name.starts_with("k_moe_sg");
+        let macro_decl = name.starts_with("k_mix_b_")
+            || name.starts_with("k_gemm_sg")
+            || name.starts_with("k_gemm_dec_sg")
+            || name.starts_with("k_moe_sg")
+            || name.starts_with("k_moe_dec_sg");
         if !macro_decl {
             assert!(full_src.contains(&decl), "missing Metal kernel declaration `{decl}`");
         }
@@ -1038,11 +1048,13 @@ fn metal_shader_declarations_and_compiler_validation() {
         "struct EmbedDecArgs",
         "struct CombineArgs",
         "struct CombineDecArgs",
+        "struct PreparedAttnArgs",
         "struct DecAttnGroup",
         "struct KvPrepDecArgs",
         "struct AttnGrpDecArgs",
         "struct PostConvDecArgs",
         "struct TopkRoute3Args",
+        "struct TopkRouteDecArgs",
         "struct LoopCdArgs",
         "mem_flags::mem_device | mem_flags::mem_threadgroup",
         "#define KV_CLEARED_ENTRY (~0UL)",
@@ -1051,8 +1063,13 @@ fn metal_shader_declarations_and_compiler_validation() {
         "kernel void k_attn_dec_solo(",
         "kernel void k_attn_grp_dec(",
         "kernel void k_attn_combine_dec(",
+        "kernel void k_attn_fixed_b(",
+        "kernel void k_attn_fixed_b_blk(",
+        "kernel void k_attn_fixed_combine(",
         "kernel void k_postconv_state_dec(",
         "kernel void k_moe_topk_route3(",
+        "kernel void k_moe_topk_route_dec(",
+        "kernel void k_gemm_bf16_dec(",
         "kernel void k_loopcd_blend(",
     ] {
         assert!(full_src.contains(s), "missing expected Metal declaration `{s}`");
@@ -2660,7 +2677,7 @@ fn full_attn_decode_plan_reduces_key_reads_above_budget_and_matches_default_when
     assert_eq!(p_4k.nkeys, 1024);
     assert_eq!(p_4k.recent_start, 4608 - (1024 - FULL_ATTN_SINK));
     assert!(p_4k.nsplit < decode_split_grid(false, 4607, max_ctx).3);
-    assert_eq!(p_4k.nsplit, 3, "4608 keys pruned to 1024 touches split 0 (sink) + splits 7 and 8");
+    assert_eq!(p_4k.nsplit, 5, "4608 keys pruned to 1024 touches split 0 (sink) + splits 14..=17");
 
     // Verify Layer 3 group builder drops middle splits completely when pruned.
     let ranges = vec![(0usize, 4607usize), (0usize, 4607usize)];
@@ -3309,5 +3326,88 @@ fn sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5() {
         );
         assert!(mean_cos >= min_cos, "{label} real LM-head logit cosine {mean_cos} < {min_cos}");
         assert!(top1_match >= 4, "{label} real LM-head top-1 agreement {top1_match}/{} too low", prompts.len());
+    }
+}
+
+#[test]
+fn paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes() {
+    use crate::blocks::{metal_in_slot_byte_offset, BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, Slot};
+    let mut pools = BlockPools::with_capacities(4, 4, 2).unwrap();
+    let mut tbl = BlockTable::new(4).unwrap();
+    let win_slot = Slot::new(1).unwrap();
+    let full_slot = Slot::new(1).unwrap();
+    let win_off = pools.window.take(win_slot).unwrap();
+    let full_off = pools.full.take(full_slot).unwrap();
+    let win_gen = pools.window.record(win_slot).unwrap().generation();
+    let full_gen = pools.full.record(full_slot).unwrap().generation();
+    tbl.set(BlockKind::Window, BlockIndex::new(0), Some(BlockEntry::new(win_slot, win_gen, win_off, BlockKind::Window, 2))).unwrap();
+    tbl.set(BlockKind::Full, BlockIndex::new(0), Some(BlockEntry::new(full_slot, full_gen, full_off, BlockKind::Full, 2))).unwrap();
+
+    let loop_n = LOOP_END - LOOP_START;
+    let mut slot_kind = Vec::with_capacity(N_SLOT);
+    let (mut swa_i, mut full_i) = (0usize, 0usize);
+    for ip in 0..N_SLOT {
+        let phys = if ip < N_PHYS { ip } else { LOOP_START + (ip - N_PHYS) % loop_n };
+        let swa = !(phys + 1).is_multiple_of(BLOCK);
+        if swa {
+            slot_kind.push((true, swa_i));
+            swa_i += 1;
+        } else {
+            slot_kind.push((false, full_i));
+            full_i += 1;
+        }
+    }
+    assert_eq!(slot_kind.len(), N_SLOT);
+
+    let pos = 7usize;
+    let kvb = 2u32;
+    let row_bytes = HD * (kvb as usize);
+    // Stamp every single pass (0..48, including loop passes 1 and 2 at 24..48) with a distinct pre-verify pattern.
+    for (slot_idx, &(swa, pass_idx)) in slot_kind.iter().enumerate() {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of_mut(kind).slot_bytes_mut(entry.slot()).unwrap();
+        for (pi, plane) in [Kv::Key, Kv::Value].into_iter().enumerate() {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                let tag = ((slot_idx as u8).wrapping_mul(3)).wrapping_add((pi as u8) * 100).wrapping_add(h as u8) | 1;
+                bytes[off..off + row_bytes].fill(tag);
+            }
+        }
+    }
+
+    let undo = snapshot_paged_kv_pos(&pools, &tbl, &slot_kind, kvb, pos);
+    assert_eq!(undo.rows.len(), N_SLOT * 2 * NKV * row_bytes);
+
+    // Corrupt all 48 passes (simulating a rejected speculative draft write).
+    for &(swa, pass_idx) in &slot_kind {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of_mut(kind).slot_bytes_mut(entry.slot()).unwrap();
+        for plane in [Kv::Key, Kv::Value] {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                bytes[off..off + row_bytes].fill(0xEE);
+            }
+        }
+    }
+
+    restore_paged_kv_pos(&mut pools, &tbl, &slot_kind, kvb, &undo);
+
+    // Verify all 48 passes — specifically including loop passes 24..48 — are restored byte-for-byte.
+    for (slot_idx, &(swa, pass_idx)) in slot_kind.iter().enumerate() {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of(kind).slot_bytes(entry.slot()).unwrap();
+        for (pi, plane) in [Kv::Key, Kv::Value].into_iter().enumerate() {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                let want = ((slot_idx as u8).wrapping_mul(3)).wrapping_add((pi as u8) * 100).wrapping_add(h as u8) | 1;
+                assert!(
+                    bytes[off..off + row_bytes].iter().all(|&b| b == want),
+                    "slot {slot_idx} (kind={kind:?}, pass={pass_idx}, plane={plane:?}, head={h}) was not restored"
+                );
+            }
+        }
     }
 }

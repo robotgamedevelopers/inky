@@ -44,7 +44,13 @@ fi
 INK_LANES=24 INK_PF=1152 INK_DECODE=8 INK_FULL_SPAN=4096 \
     $B blockedinv --ref ref/long.tokens -c 4160 2>&1 | tail -1 | tee /dev/stderr | grep -q '^blockedinv exact' || { echo "FAIL: blockedinv long"; fail=1; }
 bi_out=$(INK_BLOCKEDINV_SABOTAGE=1 $B blockedinv --ref ref/long.tokens -c 1024 2>&1) && bi_rc=0 || bi_rc=$?
-if [ "$bi_rc" = 1 ] && print -r -- "$bi_out" | grep -q 'BLOCKED NOT INVARIANT'; then echo "blockedinv sabotage: detected, as required"; else print -r -- "$bi_out"; echo "FAIL: blockedinv sabotage not detected (exit $bi_rc)"; fail=1; fi
+if [ "$bi_rc" = 1 ] && print -r -- "$bi_out" | grep -q 'BLOCKED NOT INVARIANT'; then echo "blockedinv sabotage: detected, as required"; else print -r -- "$bi_out"; echo "FAIL: nightly blockedinv sabotage not detected (exit $bi_rc)"; fail=1; fi
+# Expert-grouped decode MoE A/B parity gate across 1..64 lanes (`0` bit difference vs `INK_NO_GRP_MOE=1`).
+INK_DB_AB=1 INK_PF=256 INK_DECODE=4 INK_LANES=1,8,16,32,64 "$B" dbatch --ref ref/long.tokens -c 4096 2>&1 | tee /dev/stderr | grep -q '^dbatch exact: grouped MoE decode matches INK_NO_GRP_MOE=1 bit for bit$' || { echo "FAIL: dbatch grouped MoE A/B parity"; fail=1; }
+# Layer 2 step-time and GPU-memory envelope gate at 2K, 20K, and 42K context (1..=64 fitting lanes) + sabotage negative control.
+"$B" perfgate --ref ref/long.tokens -c 43136 2>&1 | tee /dev/stderr | grep -q '^perfgate ok:' || { echo "FAIL: perfgate 2K/20K/42K"; fail=1; }
+pg_out=$(INK_PERFGATE_SABOTAGE=1 INK_CTXS=2048 INK_LANES=1,8 INK_STEPS=2 "$B" perfgate --ref ref/long.tokens -c 4096 2>&1) && pg_rc=0 || pg_rc=$?
+if [ "$pg_rc" = 1 ] && print -r -- "$pg_out" | grep -q '^PERFGATE FAILED$'; then echo "nightly perfgate sabotage: detected, as required"; else print -r -- "$pg_out"; echo "FAIL: nightly perfgate sabotage not detected (exit $pg_rc)"; fail=1; fi
 # Verify a real SSD restore and early prefix fork against both sets of cold model logits.
 spill_test=serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits
 if spill_result=$(cargo test --locked --release --bin inky "$spill_test" -- --ignored --exact --nocapture 2>&1); then

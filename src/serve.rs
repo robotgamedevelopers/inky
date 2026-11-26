@@ -2018,20 +2018,26 @@ fn scheduler(
                                                 } else {
                                                     let t_rows: Vec<Vec<f32>> =
                                                         (0..=k).map(|r| eng.span_logits(base + r).to_vec()).collect();
-                                                    let finite_ok =
-                                                        t_rows.iter().all(|row| row.iter().all(|x| x.is_finite()));
+                                                    let nv = eng.n_vocab;
+                                                    let d_refs: Vec<&[f32]> = (0..k)
+                                                        .map(|d| &prop.logits[d * nv..(d + 1) * nv])
+                                                        .collect();
+                                                    let finite_ok = t_rows
+                                                        .iter()
+                                                        .all(|row| row.iter().all(|x| x.is_finite()))
+                                                        && d_refs.iter().all(|row| row.iter().all(|x| x.is_finite()));
                                                     if !finite_ok {
                                                         span_decisions
                                                             .push(Err("model returned non-finite logits".into()));
                                                     } else {
                                                         let t_refs: Vec<&[f32]> =
                                                             t_rows.iter().map(Vec::as_slice).collect();
-                                                        let nv = eng.n_vocab;
-                                                        let d_refs: Vec<&[f32]> = (0..k)
-                                                            .map(|d| &prop.logits[d * nv..(d + 1) * nv])
-                                                            .collect();
-                                                        let emitted =
-                                                            a.sampler.verify_round(&prop.tokens, &t_refs, &d_refs);
+                                                        let emitted = a.sampler.verify_round_with_ban(
+                                                            &prop.tokens,
+                                                            &t_refs,
+                                                            &d_refs,
+                                                            ban,
+                                                        );
                                                         span_decisions.push(Ok(emitted));
                                                     }
                                                 }
@@ -2392,7 +2398,7 @@ fn scheduler(
                             a.emit_q.clear();
                             done_reason = Some("stop");
                             break;
-                        } else if a.gen >= a.job.max || a.n_past + 2 >= eng.max_ctx {
+                        } else if a.gen >= a.job.max || (a.emit_q.is_empty() && a.n_past + 2 >= eng.max_ctx) {
                             a.emit_q.clear();
                             done_reason = Some("length");
                             break;
@@ -2840,12 +2846,14 @@ impl BodyBudget {
     }
 
     fn reserve(&self, bytes: usize) -> Result<BodyCharge<'_>, BodyError> {
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|&total| total <= self.limit)
-            })
-            .map_err(|_| BodyError::Busy)?;
-        Ok(BodyCharge { budget: self, bytes })
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let total = used.checked_add(bytes).filter(|&t| t <= self.limit).ok_or(BodyError::Busy)?;
+            match self.used.compare_exchange_weak(used, total, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Ok(BodyCharge { budget: self, bytes }),
+                Err(cur) => used = cur,
+            }
+        }
     }
 }
 
@@ -3142,7 +3150,53 @@ fn check_headers_with_policy(
     Ok(())
 }
 
-/// Derive a 64-bit cache namespace tag from the server startup nonce, isolation policy,
+/// Persistent 32-byte random salt stored in `--spill-dir/namespace-salt.bin` (`0600`) so
+/// persisted SSD checkpoints stay reachable across `inky serve` restarts while still isolating
+/// credentials and tenant namespaces from other spill directories.
+fn load_or_create_spill_namespace_salt(dir: &std::path::Path) -> std::io::Result<String> {
+    const SALT_FILE: &str = "namespace-salt.bin";
+    const SALT_BYTES: usize = 32;
+    let path = dir.join(SALT_FILE);
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_file() {
+            if let Ok(raw) = std::fs::read(&path) {
+                if raw.len() == SALT_BYTES {
+                    return Ok(raw.iter().map(|b| format!("{b:02x}")).collect());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let mut salt = [0u8; SALT_BYTES];
+    let filled = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut salt)).is_ok();
+    if !filled {
+        let mut h = crate::spill::Sha256::new();
+        h.update(startup_nonce().as_bytes());
+        h.update(&std::process::id().to_le_bytes());
+        salt = h.finalize();
+    }
+    let tmp = dir.join(format!("{SALT_FILE}.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(&salt)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Ok(df) = std::fs::File::open(dir) {
+        let _ = df.sync_all();
+    }
+    Ok(salt.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Derive a 64-bit cache namespace tag from the cache namespace salt, isolation policy,
 /// caller credential, and optional `X-Inky-Namespace` header using SHA-256.
 fn derive_cache_namespace(
     nonce: &str,
@@ -3569,6 +3623,7 @@ struct Ctx {
     kv8: bool,
     seq: std::sync::atomic::AtomicU64,
     nonce: String,
+    cache_ns_salt: Option<String>,
     key: Option<String>,
     ctx: usize,
     /// Bounded lane admission and wait queue (admitted + queued <= max_admitted_lanes + max_queue).
@@ -4210,7 +4265,13 @@ fn chat_with_principal<W: ClientWrite + ?Sized>(
         }
         h
     });
-    let cache_namespace = derive_cache_namespace(&cx.nonce, cx.cache_policy.isolate_cache, seq, credential, tenant_ns);
+    let cache_namespace = derive_cache_namespace(
+        cx.cache_ns_salt.as_deref().unwrap_or(&cx.nonce),
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
     let job = Job::new(
         seq,
@@ -4617,7 +4678,13 @@ fn messages_with_principal<W: ClientWrite + ?Sized>(
         }
         h
     });
-    let cache_namespace = derive_cache_namespace(&cx.nonce, cx.cache_policy.isolate_cache, seq, credential, tenant_ns);
+    let cache_namespace = derive_cache_namespace(
+        cx.cache_ns_salt.as_deref().unwrap_or(&cx.nonce),
+        cx.cache_policy.isolate_cache,
+        seq,
+        credential,
+        tenant_ns,
+    );
     let (tx, rx) = job_events();
     let job = Job::new(
         seq,
@@ -5284,6 +5351,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
     crate::engine::KV8.store(o.kv8, Ordering::Relaxed);
     crate::engine::DISABLE_MPP.store(o.no_mpp, Ordering::Relaxed);
     crate::engine::FULL_ATTN_BUDGET.store(o.full_attn_budget.unwrap_or(0), Ordering::Relaxed);
+    let model_fingerprint = prepared.g.fingerprint_u64();
     let eng = match prepared.into_engine(o.kv8, chunk) {
         Ok(eng) => eng,
         Err(err) => {
@@ -5344,8 +5412,18 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
         ))
     });
     let admission = AdmissionGate::new(effective_lanes, effective_queue, QUEUE_WAIT_TIMEOUT).with_faults(faults);
+    let cache_ns_salt = match spill_store.as_ref() {
+        Some(store) => match load_or_create_spill_namespace_salt(store.dir()) {
+            Ok(salt) => Some(salt),
+            Err(e) => {
+                eprintln!("[serve] could not initialize spill namespace salt: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let mut cache = match spill_store {
-        Some(store) => ServeBlockCache::with_spill(store),
+        Some(store) => ServeBlockCache::with_spill_compat(store, o.full_attn_budget, model_fingerprint),
         None => ServeBlockCache::new(),
     };
     cache.set_max_retained_host_bytes(retained_host_budget_bytes);
@@ -5393,6 +5471,7 @@ pub fn serve_with_mode<G>(o: ServeOpts, enter_mode: impl FnOnce() -> G) {
         kv8: eng.kv8,
         seq: Default::default(),
         nonce: startup_nonce(),
+        cache_ns_salt,
         key: o.key.clone(),
         ctx: context,
         admission,
@@ -5658,6 +5737,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 64,
             admission: AdmissionGate::with_clock(
@@ -6930,6 +7010,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -6989,6 +7070,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -7081,6 +7163,7 @@ mod tests {
                 kv8: false,
                 seq: Default::default(),
                 nonce: "test".into(),
+            cache_ns_salt: None,
                 key: None,
                 ctx: 64,
                 admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -7188,6 +7271,7 @@ mod tests {
                 kv8: false,
                 seq: Default::default(),
                 nonce: "test".into(),
+            cache_ns_salt: None,
                 key: None,
                 ctx: 64,
                 admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -7275,6 +7359,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -7335,6 +7420,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -7528,6 +7614,7 @@ mod tests {
                     kv8: false,
                     seq: Default::default(),
                     nonce: "test".into(),
+            cache_ns_salt: None,
                     key: None,
                     ctx: 64,
                     admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -8307,6 +8394,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: Some("secret-bearer-key".into()),
             ctx: 64,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -8614,6 +8702,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "test".into(),
+            cache_ns_salt: None,
             key: None,
             ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -8709,6 +8798,7 @@ mod tests {
             kv8: false,
             seq: Default::default(),
             nonce: "nonce123".into(),
+            cache_ns_salt: None,
             key: Some("sprint-secret".into()),
             ctx: 512,
             admission: AdmissionGate::new(4, 0, Duration::from_millis(20)),
@@ -11736,5 +11826,54 @@ mod tests {
         assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Full), 1_040);
         assert_eq!(cache.free_plus_evictable_slots(&pools, BlockKind::Window), 48);
         cache.shutdown(&mut pools);
+    }
+
+    #[test]
+    fn spill_namespace_salt_persists_across_restarts_and_isolates_credentials() {
+        let dir = std::env::temp_dir().join(format!("inky-ns-salt-{}-{}", std::process::id(), startup_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let salt1 = load_or_create_spill_namespace_salt(&dir).unwrap();
+        assert_eq!(salt1.len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("namespace-salt.bin")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Simulated restart with a fresh process startup_nonce() reloads the same salt,
+        // so persisted SSD checkpoint namespaces remain reachable while credentials/tenants stay isolated.
+        let salt2 = load_or_create_spill_namespace_salt(&dir).unwrap();
+        assert_eq!(salt1, salt2);
+        let ns_a1 = derive_cache_namespace(&salt1, false, 1, Some("key-a"), Some("tenant-1"));
+        let ns_a2 = derive_cache_namespace(&salt2, false, 99, Some("key-a"), Some("tenant-1"));
+        let ns_b = derive_cache_namespace(&salt2, false, 99, Some("key-b"), Some("tenant-1"));
+        assert_eq!(ns_a1, ns_a2);
+        assert_ne!(ns_a1, ns_b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_emit_queue_drains_all_verified_tokens_at_max_ctx_boundary() {
+        // Mirrors src/serve.rs:2380-2400: when p0 + n_keep == max_ctx - 1, n_past + 2 >= max_ctx
+        // is already true after verify advances n_past, so every token in emit_q must still drain
+        // before stopping with reason "length".
+        let max_ctx = 128usize;
+        let job_max = 16usize;
+        let mut emit_q: std::collections::VecDeque<u32> = [10, 20, 30].into_iter().collect();
+        let n_past = max_ctx - 1;
+        let mut gen = 0usize;
+        let mut emitted = Vec::new();
+        let mut done_reason = None;
+        while let Some(tok) = emit_q.pop_front() {
+            emitted.push(tok);
+            gen += 1;
+            if gen >= job_max || (emit_q.is_empty() && n_past + 2 >= max_ctx) {
+                emit_q.clear();
+                done_reason = Some("length");
+                break;
+            }
+        }
+        assert_eq!(emitted, vec![10, 20, 30], "all already-verified tokens must emit before length stop");
+        assert_eq!(done_reason, Some("length"));
     }
 }

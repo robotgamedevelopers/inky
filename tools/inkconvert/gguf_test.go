@@ -192,3 +192,50 @@ func TestConvertPublishesThroughDanglingOutputLink(t *testing.T) {
 	}
 	g.Close()
 }
+
+func TestSafetensorsOverflowAndNestedGGUFArrayRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Safetensors offset int64 overflow (`s.base + math.MaxInt64` wraps negative).
+	overflowPath := filepath.Join(dir, "overflow.safetensors")
+	hdr := []byte(`{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,9223372036854775807]}}`)
+	var raw []byte
+	raw = binary.LittleEndian.AppendUint64(raw, uint64(len(hdr)))
+	raw = append(raw, hdr...)
+	if err := os.WriteFile(overflowPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openSafetensors(overflowPath); err == nil {
+		t.Fatal("expected int64 offset overflow in safetensors to be rejected")
+	}
+
+	// 2. Safetensors read int64 overflow and negative length.
+	validPath := filepath.Join(dir, "valid.safetensors")
+	vhdr := []byte(`{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}`)
+	var vraw []byte
+	vraw = binary.LittleEndian.AppendUint64(vraw, uint64(len(vhdr)))
+	vraw = append(vraw, vhdr...)
+	vraw = append(vraw, 0, 0, 0, 0)
+	if err := os.WriteFile(validPath, vraw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := openSafetensors(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.read("w", math.MaxInt64, 1); err == nil {
+		t.Fatal("expected int64 overflow in safetensors.read to be rejected")
+	}
+	if _, err := st.read("w", 0, -1); err == nil {
+		t.Fatal("expected negative length in safetensors.read to be rejected")
+	}
+
+	// 3. Nested GGUF array (typ=9, elemType=9) must be rejected by skipValue.
+	var nested []byte
+	nested = binary.LittleEndian.AppendUint32(nested, 9) // element type = array
+	nested = binary.LittleEndian.AppendUint64(nested, 1) // count = 1
+	if err := skipValue(bytes.NewReader(nested), 9); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Fatalf("expected nested array rejection, got err=%v", err)
+	}
+}

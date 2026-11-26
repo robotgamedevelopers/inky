@@ -707,6 +707,7 @@ impl NumStage {
     fn step_digit_or_part(&mut self, b: u8, int_only: bool) -> bool {
         match *self {
             Self::Sign => match b {
+                // Disallow `-0` for `int_only` so Rust `serde_json` `i64`/`as_i64` consumers never receive float `-0.0`.
                 b'0' if !int_only => {
                     *self = Self::Zero;
                     true
@@ -787,7 +788,7 @@ impl NumStage {
                 }
             }
             Self::Exp { digits } => {
-                if b.is_ascii_digit() && digits < 2 {
+                if b.is_ascii_digit() && digits < 4 {
                     *self = Self::Exp { digits: digits + 1 };
                     true
                 } else {
@@ -1186,34 +1187,32 @@ impl AutoState {
                                 break;
                             }
                         }
-                        let Some(j) = matched_idx else {
-                            return false;
-                        };
-                        if let Frame::Obj { seen_mask, .. } = self.top_mut() {
-                            *seen_mask |= 1u64 << j;
-                        }
-                        self.phase = Phase::ObjExpectColon(schema.props[j].spec);
-                        true
-                    } else {
-                        let mut next_mask = 0u64;
-                        let mut m = cand_mask;
-                        while m != 0 {
-                            let j = m.trailing_zeros() as usize;
-                            m &= m - 1;
-                            if schema.props[j].escaped.get(pos_usize) == Some(&b) {
-                                next_mask |= 1u64 << j;
+                        if let Some(j) = matched_idx {
+                            if let Frame::Obj { seen_mask, .. } = self.top_mut() {
+                                *seen_mask |= 1u64 << j;
                             }
+                            self.phase = Phase::ObjExpectColon(schema.props[j].spec);
+                            return true;
                         }
-                        if next_mask == 0 || pos == u16::MAX {
-                            return false;
-                        }
-                        self.phase = Phase::InKey(KeyMode::Restricted {
-                            schema_idx,
-                            cand_mask: next_mask,
-                            pos: pos + 1,
-                        });
-                        true
                     }
+                    let mut next_mask = 0u64;
+                    let mut m = cand_mask;
+                    while m != 0 {
+                        let j = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        if schema.props[j].escaped.get(pos_usize) == Some(&b) {
+                            next_mask |= 1u64 << j;
+                        }
+                    }
+                    if next_mask == 0 || pos == u16::MAX {
+                        return false;
+                    }
+                    self.phase = Phase::InKey(KeyMode::Restricted {
+                        schema_idx,
+                        cand_mask: next_mask,
+                        pos: pos + 1,
+                    });
+                    true
                 }
                 KeyMode::Free {
                     schema_idx,
@@ -1872,5 +1871,43 @@ mod tests {
             assert!(args.get("query").and_then(Value::as_str).is_some(), "trial {trial}: missing string 'query' in {parsed}");
             assert!(args.get("max_results").and_then(Value::as_i64).is_some(), "trial {trial}: missing integer 'max_results' in {parsed}");
         }
+    }
+
+    #[test]
+    fn restricted_key_with_escaped_quote_and_rfc8259_numbers() {
+        let accepts_full = |g: &JsonObjectGrammar, s: &str| {
+            let mut c = g.clone();
+            c.advance_bytes(s.as_bytes()) && c.is_complete()
+        };
+        // 1. Restricted required property name containing an escaped quote (`a"b`).
+        let schema: Value = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a\"b": { "type": "string" }
+            },
+            "required": ["a\"b"],
+            "additionalProperties": false
+        });
+        let g = JsonObjectGrammar::with_schema(&schema);
+        assert!(accepts_full(&g, r#"{"a\"b":"ok"}"#), "escaped quote inside restricted key must be accepted");
+        assert!(!accepts_full(&g, r#"{"a":"ok"}"#), "unmatched prefix must still be rejected");
+
+        // 2. Integer `-0` and 3-digit / 4-digit exponents on number fields.
+        let num_schema: Value = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer" },
+                "x": { "type": "number" }
+            },
+            "required": ["n", "x"],
+            "additionalProperties": false
+        });
+        let ng = JsonObjectGrammar::with_schema(&num_schema);
+        assert!(accepts_full(&ng, r#"{"n":0,"x":1e100}"#));
+        assert!(accepts_full(&ng, r#"{"n":-42,"x":1e-308}"#));
+        assert!(accepts_full(&ng, r#"{"n":0,"x":-0}"#), "number fields accept -0");
+        assert!(!accepts_full(&ng, r#"{"n":-0,"x":1}"#), "integer fields disallow -0 (parsed as float -0.0 by serde_json)");
+        assert!(!accepts_full(&ng, r#"{"n":-0.0,"x":1}"#), "integer must still reject fraction after -0");
+        assert!(!accepts_full(&ng, r#"{"n":-01,"x":1}"#), "integer must still reject leading zero -01");
     }
 }

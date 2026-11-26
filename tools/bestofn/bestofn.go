@@ -193,8 +193,31 @@ type chatChoice struct {
 }
 
 type chatResponse struct {
-	Choices []chatChoice  `json:"choices"`
-	Usage   *usagePayload `json:"usage,omitempty"`
+	Choices []chatChoice    `json:"choices"`
+	Usage   *usagePayload   `json:"usage,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
+}
+
+func formatChatError(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var obj struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal(trimmed, &obj); err == nil && obj.Message != "" {
+		if obj.Type != "" {
+			return fmt.Sprintf("%s: %s", obj.Type, obj.Message)
+		}
+		return obj.Message
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil && s != "" {
+		return s
+	}
+	return string(trimmed)
 }
 
 // RunCard dispatches N parallel attempts sharing one prompt prefix and returns as soon as
@@ -480,6 +503,9 @@ func callChatCompletion(
 		if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 			return "", nil, fmt.Errorf("decode response: %w", err)
 		}
+		if msg := formatChatError(parsed.Error); msg != "" {
+			return "", parsed.Usage, fmt.Errorf("server error: %s", msg)
+		}
 		if len(parsed.Choices) == 0 || parsed.Choices[0].Message == nil {
 			return "", parsed.Usage, errors.New("response contained no choices")
 		}
@@ -488,6 +514,7 @@ func callChatCompletion(
 
 	var content strings.Builder
 	var usage *usagePayload
+	sawDone := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -497,11 +524,15 @@ func callChatCompletion(
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk chatResponse
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return content.String(), usage, fmt.Errorf("decode SSE chunk: %w", err)
+		}
+		if msg := formatChatError(chunk.Error); msg != "" {
+			return content.String(), usage, fmt.Errorf("SSE error: %s", msg)
 		}
 		if chunk.Usage != nil {
 			u := *chunk.Usage
@@ -513,6 +544,9 @@ func callChatCompletion(
 	}
 	if err := scanner.Err(); err != nil {
 		return content.String(), usage, err
+	}
+	if !sawDone {
+		return content.String(), usage, errors.New("truncated SSE stream: missing data: [DONE]")
 	}
 	return content.String(), usage, nil
 }

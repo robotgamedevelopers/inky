@@ -1043,7 +1043,12 @@ impl<P: SpillPoolBackend> SpillManager<P> {
 
         if tier == BlockTier::Both && self.store.contains(key) {
             // Already cleanly persisted on disk; drop memory copy without rewriting.
-            self.pool.release_cold_slot(slot)?;
+            if let Err(err) = self.pool.release_cold_slot(slot) {
+                if let Some(b) = self.blocks.get_mut(&key) {
+                    b.io_pins = b.io_pins.saturating_sub(1);
+                }
+                return Err(err);
+            }
             if let Some(b) = self.blocks.get_mut(&key) {
                 b.tier = BlockTier::Disk;
                 b.resident = None;
@@ -1055,7 +1060,15 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         }
 
         // Copy immutable slot bytes and optional recurrent state for crash-safe writeback.
-        let kv_copy = self.pool.read_slot_bytes(slot)?.to_vec();
+        let kv_copy = match self.pool.read_slot_bytes(slot) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(err) => {
+                if let Some(b) = self.blocks.get_mut(&key) {
+                    b.io_pins = b.io_pins.saturating_sub(1);
+                }
+                return Err(err);
+            }
+        };
         let state_copy = self.blocks.get(&key).and_then(|b| b.recurrent_state.clone());
 
         // Protect any disk block currently undergoing I/O (active spill or pending restore) from disk GC.
@@ -1079,7 +1092,12 @@ impl<P: SpillPoolBackend> SpillManager<P> {
             Err(_) => {
                 // Disk write failed: unreferenced cold block is cleanly dropped from memory
                 // (loses cache, never correctness).
-                self.pool.release_cold_slot(slot)?;
+                if let Err(err) = self.pool.release_cold_slot(slot) {
+                    if let Some(b) = self.blocks.get_mut(&key) {
+                        b.io_pins = b.io_pins.saturating_sub(1);
+                    }
+                    return Err(err);
+                }
                 self.blocks.remove(&key);
                 self.stats.over_budget_mem_drops += 1;
                 return Ok(key);
@@ -1102,7 +1120,12 @@ impl<P: SpillPoolBackend> SpillManager<P> {
         }
 
         // Release the memory slot now that disk writeback has finished.
-        self.pool.release_cold_slot(slot)?;
+        if let Err(err) = self.pool.release_cold_slot(slot) {
+            if let Some(b) = self.blocks.get_mut(&key) {
+                b.io_pins = b.io_pins.saturating_sub(1);
+            }
+            return Err(err);
+        }
 
         match outcome {
             WriteOutcome::Written { .. } => {

@@ -135,6 +135,14 @@ fn parse_u64_positive(flag: &str, value: &str) -> Result<u64, String> {
     Ok(v)
 }
 
+fn parse_usize_positive(flag: &str, value: &str) -> Result<usize, String> {
+    let v: usize = value.parse().map_err(|_| format!("{flag} requires a positive integer"))?;
+    if v == 0 {
+        return Err(format!("{flag} must be greater than 0"));
+    }
+    Ok(v)
+}
+
 fn parse_context(flag: &str, value: &str) -> Result<usize, String> {
     let ctx = parse_usize(flag, value)?;
     if !(1..=MAX_CONTEXT).contains(&ctx) {
@@ -242,6 +250,7 @@ fn is_known_cli_command(cmd: &str) -> bool {
             | "blockedinv"
             | "temp1"
             | "prefixbench"
+            | "perfgate"
             | "lanebench"
             | "dbatch"
             | "sharedkv"
@@ -663,6 +672,49 @@ mod cli_tests {
         assert!(cli(&["bench", "--no-mpp"]).unwrap().1.no_mpp);
         assert!(!serve_args(&[]).unwrap().no_mpp);
         assert!(serve_args(&["--no-mpp"]).unwrap().no_mpp);
+
+        // perfgate CLI parsing & --max-lanes validation
+        assert_eq!(cli(&["perfgate", "--ref", "ref/long.tokens"]).unwrap().0, "perfgate");
+        assert_eq!(cli(&["perfgate", "--max-lanes", "32"]).unwrap().1.max_lanes, Some(32));
+        assert!(cli(&["perfgate", "--max-lanes", "0"]).err().unwrap().contains("--max-lanes must be greater than 0"));
+        assert!(cli(&["perfgate", "--max-lanes", "bad"]).err().unwrap().contains("--max-lanes requires a positive integer"));
+        assert!(cli(&["perfgate", "--max-lanes"]).err().unwrap().contains("missing value for --max-lanes"));
+    }
+
+    #[test]
+    fn perfgate_bounds_lanes_from_kv_budget_and_matches_design_lane_table() {
+        let arena_floats = 460_000usize;
+        // 128 GiB M5 Max in inky mode (~115.2 GiB working set, ~18.8 GiB model+scratch -> ~95.4 GiB KV budget):
+        // fits all 64 lanes across 2K, 20K, and 42K!
+        let m5_max_avail = perfgate_available_kv_budget_bytes((115.2 * (1u64 << 30) as f64) as u64, (18.8 * (1u64 << 30) as f64) as u64);
+        assert_eq!(perfgate_max_lanes_for_ctx(m5_max_avail, 40, 8, 2048, 2, arena_floats, 64), 64);
+        assert_eq!(perfgate_max_lanes_for_ctx(m5_max_avail, 40, 8, 20480, 2, arena_floats, 64), 64);
+        assert_eq!(perfgate_max_lanes_for_ctx(m5_max_avail, 40, 8, 43008, 2, arena_floats, 64), 64);
+
+        // 64 GiB M5 Pro (~48.0 GiB default working set or ~56.0 GiB inky mode, ~18.8 GiB model+scratch):
+        // fits full 64 lanes at 2K, and bounds 20K and 42K cleanly without exceeding working set!
+        for ws_gib in [48.0, 56.0] {
+            let m5_pro_avail = perfgate_available_kv_budget_bytes((ws_gib * (1u64 << 30) as f64) as u64, (18.8 * (1u64 << 30) as f64) as u64);
+            assert_eq!(perfgate_max_lanes_for_ctx(m5_pro_avail, 40, 8, 2048, 2, arena_floats, 64), 64);
+            let fit_20k = perfgate_max_lanes_for_ctx(m5_pro_avail, 40, 8, 20480, 2, arena_floats, 64);
+            let fit_42k = perfgate_max_lanes_for_ctx(m5_pro_avail, 40, 8, 43008, 2, arena_floats, 64);
+            assert!((32..64).contains(&fit_20k), "ws={ws_gib} GiB fit_20k={fit_20k}");
+            assert!((16..32).contains(&fit_42k), "ws={ws_gib} GiB fit_42k={fit_42k}");
+            assert_eq!(perfgate_rungs_for_ctx(&[1, 8, 16, 32, 64], fit_20k), vec![1, 8, 16, 32]);
+            assert_eq!(perfgate_rungs_for_ctx(&[1, 8, 16, 32, 64], fit_42k), vec![1, 8, 16]);
+            assert_eq!(perfgate_max_lanes_for_ctx(m5_pro_avail, 40, 8, 2048, 2, arena_floats, 12), 12);
+        }
+
+        // Verify M5 Max expected rates match docs/DESIGN.md lane table (~96/75/58 at 1 stream, ~200/130/90 at 16L, ~450/200/119 at 64L)
+        assert_eq!(perfgate_chip_bw_scale("Apple M5 Max"), 1.0);
+        assert_eq!(perfgate_chip_bw_scale("Apple M5 Pro"), 2.05);
+        let tps = |ctx, b, solo| (b as f64) * 1e3 / perfgate_expected_step_ms(ctx, b, solo, 1.0);
+        assert!((tps(2048, 1, true) - 95.1).abs() < 2.0);
+        assert!((tps(20480, 1, true) - 74.7).abs() < 2.0);
+        assert!((tps(43008, 1, true) - 59.1).abs() < 2.0);
+        assert!((tps(2048, 16, false) - 202.0).abs() < 5.0);
+        assert!((tps(2048, 64, false) - 439.0).abs() < 15.0);
+        assert!((tps(43008, 64, false) - 116.0).abs() < 5.0);
     }
 }
 
@@ -689,6 +741,7 @@ struct Opts {
     no_mpp: bool,
     full_attn_budget: Option<usize>,
     allow_mismatch: bool,
+    max_lanes: Option<usize>,
 }
 
 fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
@@ -721,6 +774,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
         no_mpp: false,
         full_attn_budget: None,
         allow_mismatch: std::env::var("INK_ALLOW_MISMATCH").is_ok_and(|v| !v.is_empty() && v != "0"),
+        max_lanes: None,
     };
     while let Some(a) = args.next() {
         let mut v = || args.next().ok_or_else(|| format!("missing value for {a}"));
@@ -751,6 +805,7 @@ fn parse_cli_args(raw_args: &[String]) -> Result<(String, Opts), String> {
             "--greedy" => o.temp = 0.0,
             "--hide-thinking" => o.hide_thinking = true,
             "--loopcd" => o.loopcd_omega = parse_loopcd_omega(a, v()?)?,
+            "--max-lanes" => o.max_lanes = Some(parse_usize_positive(a, v()?)?),
             "--ref" => o.reference = v()?.into(),
             "-q" => o.quiet = true,
             "--stop" => o.stop = parse_usize(a, v()?)?,
@@ -1914,6 +1969,42 @@ fn wait_crosspath(cb: &metal::CmdBuf) {
     }
 }
 
+/// Hash every live K/V byte and recurrent convolution-state float of a paged lane, ignoring only
+/// whether the final 64-token block was sealed (decode blocks stay private/unsealed by policy).
+fn paged_kv_cs_hash(eng: &Engine, lane: &Lane) -> u64 {
+    fn fnv_u64(h: u64, v: u64) -> u64 {
+        (h ^ v).wrapping_mul(0x100000001b3)
+    }
+    fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for c in chunks {
+            h = fnv_u64(h, u64::from_le_bytes(*c));
+        }
+        for &b in rem {
+            h = fnv_u64(h, u64::from(b));
+        }
+        h
+    }
+    let mut h = 0xcbf29ce484222325u64;
+    let pools = eng.block_pool().borrow();
+    let tbl = lane.block_table().borrow();
+    for (bi, entry) in tbl.entries() {
+        let pool = pools.of(entry.kind());
+        let rec = pool.record(entry.slot()).expect("live paged slot record");
+        assert_eq!(rec.generation(), entry.generation(), "stale block entry");
+        let kind_tag = match entry.kind() {
+            blocks::BlockKind::Full => 1u64,
+            blocks::BlockKind::Window => 2u64,
+        };
+        h = fnv_u64(h, (kind_tag << 48) | (u64::from(bi.get()) << 16) | u64::from(rec.length()));
+        h = fnv_bytes(h, pool.slot_bytes(entry.slot()).expect("slot bytes"));
+    }
+    drop(tbl);
+    drop(pools);
+    let cs = eng.on(lane).get_cs();
+    fnv_bytes(h, &cs)
+}
+
 #[cfg(test)]
 mod crosspath_tests {
     use super::*;
@@ -1940,6 +2031,9 @@ mod crosspath_tests {
 }
 
 fn crosspath(o: &Opts) {
+    use engine::Span;
+    use poolgate::{Layer3Pool, StepPath};
+
     let toks: Vec<u32> = std::fs::read_to_string(&o.reference)
         .expect("--ref FILE.tokens")
         .lines()
@@ -1956,14 +2050,16 @@ fn crosspath(o: &Opts) {
         "INK_COMPARE_ENDS must list increasing token counts of at least 2 (a span needs two rows)"
     );
     assert!(len <= toks.len() && len <= o.ctx, "crosspath fixture or context is too short");
+    let sabotage = std::env::var_os("INK_CROSSPATH_SABOTAGE").is_some();
 
     let eng = Engine::load(&o.model, o.ctx);
     eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(2);
     assert!(CROSSPATH_SPAN <= eng.chunk, "a crosspath span must fit one prefill chunk");
     let base = Lane::new(&eng);
     let prefill = Lane::new(&eng);
-    let split = Lane::new(&eng);
-    for lane in [&base, &prefill, &split] {
+    let decode = Lane::new(&eng);
+    for lane in [&base, &prefill, &decode] {
         let run = eng.on(lane);
         run.reserve(len, false);
         run.set_tokens(0, &toks[..len]);
@@ -1975,7 +2071,13 @@ fn crosspath(o: &Opts) {
         cb.commit();
         wait_crosspath(&cb);
     };
-    // `cursor` is how far the base lane has prefilled. Span starts increase with the ends, so it only advances.
+    let first_diff = |a: &[f32], b: &[f32]| -> Option<usize> {
+        a.iter().zip(b.iter()).position(|(&x, &y)| !x.is_finite() || !y.is_finite() || x.to_bits() != y.to_bits())
+    };
+    // Persistent paged pool with a single advancing donor so every endpoint reuses sealed blocks up to `(start / 64) * 64`.
+    let pool = Layer3Pool::with_persistent_starts(&eng, 4);
+    let mut paged_sealed = 0usize;
+    // `cursor` is how far the contiguous base lane has prefilled. Span starts increase with the ends, so it only advances.
     let mut cursor = 0;
     let mut ok = true;
     for end in ends {
@@ -1991,41 +2093,135 @@ fn crosspath(o: &Opts) {
             cursor += count;
         }
         eng.copy_lane(&base, &prefill);
-        eng.copy_lane(&base, &split);
-        eng.on(&split).set_tokens(0, &toks[..len]);
-        run_prefill(&split, start, target - start, false);
+        eng.copy_lane(&base, &decode);
+        eng.on(&decode).set_tokens(0, &toks[..len]);
+        run_prefill(&decode, start, target - start, false);
         run_prefill(&prefill, start, end - start, true);
         let expected = eng.logits().to_vec();
-        if std::env::var_os("INK_CROSSPATH_SABOTAGE").is_some() {
-            eng.on(&split).set_tokens(target, &[(toks[target] + 1) % eng.n_vocab as u32]);
+        if sabotage {
+            eng.on(&decode).set_tokens(target, &[(toks[target] + 1) % eng.n_vocab as u32]);
         }
-        run_prefill(&split, target, 1, true);
-        let actual = eng.logits();
-        let first_bad = expected
-            .iter()
-            .zip(actual.iter())
-            .position(|(&a, &b)| !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits());
-        let state_equal = eng.lane_hash(&prefill) == eng.lane_hash(&split);
-        if let Some(i) = first_bad {
+        let cb = eng.gpu.cmd();
+        eng.encode_decode(&cb, &[Span { lane: &decode, p0: target, t: 1 }], true, false);
+        cb.commit();
+        wait_crosspath(&cb);
+        let actual = eng.span_logits(0).to_vec();
+        let bad_l2 = first_diff(&expected, &actual);
+        let state_l2 = eng.lane_hash(&prefill) == eng.lane_hash(&decode);
+
+        // Paged (Layer 3): advance sealed donor blocks up to `(start / 64) * 64`, then run
+        // 17-row paged prefill vs 16-row paged prefill + 1-row paged `encode_decode`.
+        let seal_to = (start / blocks::BLOCK) * blocks::BLOCK;
+        if seal_to > paged_sealed {
+            let (donor, matched) = pool.new_lane_matched(&toks[..seal_to], o.ctx);
+            let mut p = matched;
+            while p < seal_to {
+                let c = (seal_to - p).min(eng.chunk);
+                pool.prefill(&[(donor, p, c)]);
+                p += c;
+            }
+            pool.end_lane(donor);
+            paged_sealed = seal_to;
+        }
+        let (p_pf, m_pf) = if seal_to == 0 {
+            (pool.new_lane(&toks[..end], o.ctx), 0)
+        } else {
+            let (id, m) = pool.new_lane_matched(&toks[..seal_to], o.ctx);
+            assert!(m <= start, "paged prefill lane matched {m} past span start {start}");
+            for (pos, &tok) in toks.iter().enumerate().take(end).skip(seal_to) {
+                pool.set_token(id, pos, tok);
+            }
+            (id, m)
+        };
+        if m_pf < start {
+            pool.prefill(&[(p_pf, m_pf, start - m_pf)]);
+        }
+        pool.prefill(&[(p_pf, start, end - start)]);
+        let paged_pf_logits = pool.logits(0);
+
+        let (p_dec, m_dec) = if seal_to == 0 {
+            let mut dec_toks = toks[..end].to_vec();
+            if sabotage {
+                dec_toks[target] = (toks[target] + 1) % eng.n_vocab as u32;
+            }
+            (pool.new_lane(&dec_toks, o.ctx), 0)
+        } else {
+            let (id, m) = pool.new_lane_matched(&toks[..seal_to], o.ctx);
+            assert!(m <= start, "paged decode lane matched {m} past span start {start}");
+            for (pos, &tok) in toks.iter().enumerate().take(end).skip(seal_to) {
+                let t = if sabotage && pos == target {
+                    (tok + 1) % eng.n_vocab as u32
+                } else {
+                    tok
+                };
+                pool.set_token(id, pos, t);
+            }
+            (id, m)
+        };
+        if m_dec < start {
+            pool.prefill(&[(p_dec, m_dec, start - m_dec)]);
+        }
+        pool.prefill(&[(p_dec, start, target - start)]);
+        pool.decode(&[(p_dec, target)]);
+        let paged_dec_logits = pool.logits(0);
+
+        let bad_l3 = first_diff(&paged_pf_logits, &paged_dec_logits);
+        let bad_pvc_pf = first_diff(&expected, &paged_pf_logits);
+        let bad_pvc_dec = first_diff(&actual, &paged_dec_logits);
+        let ptrs = pool.borrow_lane_ptrs(&[p_pf, p_dec]);
+        let state_l3 = unsafe { paged_kv_cs_hash(&eng, &*ptrs[0]) == paged_kv_cs_hash(&eng, &*ptrs[1]) };
+        pool.end_lane(p_pf);
+        pool.end_lane(p_dec);
+
+        if let Some(i) = bad_l2 {
             println!(
-                "after {end} tokens: logit {i} differs (prefill {:08x}, split {:08x}), prefill span [{start}, {end})",
+                "after {end} tokens (contiguous): logit {i} differs (prefill {:08x}, decode {:08x}), span [{start}, {end})",
                 expected[i].to_bits(),
                 actual[i].to_bits()
             );
         }
-        if !state_equal {
-            println!("after {end} tokens: cache or convolution state differs, prefill span [{start}, {end})");
+        if !state_l2 {
+            println!("after {end} tokens (contiguous): cache or convolution state differs, span [{start}, {end})");
         }
-        if first_bad.is_none() && state_equal {
-            println!("after {end} tokens: exact, prefill span [{start}, {end}) of {} rows", end - start);
+        if let Some(i) = bad_l3 {
+            println!(
+                "after {end} tokens (paged): logit {i} differs (prefill {:08x}, decode {:08x}), span [{start}, {end})",
+                paged_pf_logits[i].to_bits(),
+                paged_dec_logits[i].to_bits()
+            );
         }
-        ok &= first_bad.is_none() && state_equal;
+        if !state_l3 {
+            println!("after {end} tokens (paged): cache or convolution state differs, span [{start}, {end})");
+        }
+        if let Some(i) = bad_pvc_pf {
+            println!(
+                "after {end} tokens (paged_vs_contiguous prefill): logit {i} differs (contiguous {:08x}, paged {:08x})",
+                expected[i].to_bits(),
+                paged_pf_logits[i].to_bits()
+            );
+        }
+        if let Some(i) = bad_pvc_dec {
+            println!(
+                "after {end} tokens (paged_vs_contiguous decode): logit {i} differs (contiguous {:08x}, paged {:08x})",
+                actual[i].to_bits(),
+                paged_dec_logits[i].to_bits()
+            );
+        }
+        let end_ok = bad_l2.is_none() && state_l2 && bad_l3.is_none() && state_l3 && bad_pvc_pf.is_none() && bad_pvc_dec.is_none();
+        if end_ok {
+            println!(
+                "after {end} tokens: exact (contiguous + paged + paged_vs_contiguous), prefill span [{start}, {end}) of {} rows",
+                end - start
+            );
+        }
+        ok &= end_ok;
     }
+    pool.shutdown();
     if !ok {
         println!("CROSSPATH MISMATCH");
         std::process::exit(1);
     }
-    println!("crosspath exact: prefill chunkings agree");
+    println!("crosspath exact: tensor prefill and decode agree (contiguous and paged)");
 }
 
 /// dev, layer 1's gate: two lanes on one engine, interleaved, with the scratch arenas poisoned at every switch, must give
@@ -3200,6 +3396,300 @@ fn lanebench(o: &Opts) {
     println!("recommended GPU working set: {:.1} GiB", gib(ws));
 }
 
+const PERFGATE_WS_MARGIN_BYTES: u64 = 1 << 30;
+
+fn perfgate_available_kv_budget_bytes(working_set_bytes: u64, model_and_scratch_bytes: u64) -> u64 {
+    working_set_bytes.saturating_sub(model_and_scratch_bytes.saturating_add(PERFGATE_WS_MARGIN_BYTES))
+}
+
+fn perfgate_max_lanes_for_ctx(
+    available_kv_budget_bytes: u64,
+    n_swa: usize,
+    n_full: usize,
+    ctx: usize,
+    kvb: usize,
+    arena_floats: usize,
+    cap_lanes: usize,
+) -> usize {
+    let per_lane = Engine::lane_worst_case_bytes_for(n_swa, n_full, ctx, kvb, arena_floats).max(1);
+    let fit = (available_kv_budget_bytes / per_lane) as usize;
+    fit.clamp(1, cap_lanes.max(1))
+}
+
+fn perfgate_rungs_for_ctx(base_rungs: &[usize], fitting_max: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = base_rungs.iter().copied().filter(|&n| n >= 1 && n <= fitting_max).collect();
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() && fitting_max >= 1 {
+        out.push(fitting_max);
+    }
+    out
+}
+
+fn perfgate_chip_bw_scale(chip: &str) -> f64 {
+    if chip.contains("Max") || chip.contains("Ultra") {
+        1.0
+    } else if chip.contains("Pro") {
+        2.05
+    } else {
+        2.5
+    }
+}
+
+fn perfgate_expected_step_ms(ctx: usize, lanes: usize, single_stream_path: bool, bw_scale: f64) -> f64 {
+    let kv_bytes = ((40 * ctx.min(1024) + 8 * ctx) * 4096) as f64;
+    let kv_ms = kv_bytes / 210e9 * 1e3;
+    let max_ms = if single_stream_path {
+        9.4 + kv_ms
+    } else {
+        58.0 + (lanes as f64) * (0.21 + kv_ms)
+    };
+    max_ms * bw_scale
+}
+
+fn perfgate_step_ceiling_ms(ctx: usize, lanes: usize, single_stream_path: bool, bw_scale: f64) -> f64 {
+    let base = perfgate_expected_step_ms(ctx, lanes, single_stream_path, bw_scale) * 1.40;
+    if single_stream_path {
+        base + 8.0
+    } else {
+        base
+    }
+}
+
+/// Automated Layer 2 performance and GPU memory gate (`t-l2-gate-perf`):
+/// Measures decode step time (`ms/step`, `tok/s`) and allocated GPU memory (`MiB`/`GiB`) across
+/// 2K (2048), 20K (20480), and 42K (43008) context for 1..=64 lanes against the `docs/DESIGN.md`
+/// lane table and per-chip bandwidth/working-set envelope ceilings, bounding `20K`/`42K` max lanes
+/// automatically from `available_kv_budget_bytes` / `--max-lanes` (`INK_PERFGATE_SABOTAGE=1` negative control).
+fn perfgate(o: &Opts) {
+    use engine::Span;
+    let ctxs: Vec<usize> = std::env::var("INK_CTXS")
+        .unwrap_or_else(|_| "2048,20480,43008".into())
+        .split(',')
+        .map(|v| v.trim().parse::<usize>().expect("INK_CTXS integer"))
+        .collect();
+    let base_rungs: Vec<usize> = std::env::var("INK_LANES")
+        .unwrap_or_else(|_| "1,8,16,32,64".into())
+        .split(',')
+        .map(|v| v.trim().parse::<usize>().expect("INK_LANES integer"))
+        .collect();
+    let steps: usize = std::env::var("INK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    assert!(steps >= 1, "INK_STEPS must be >= 1");
+    let solo_warmup = 3usize;
+    let solo_steps = steps.max(16);
+    let env_max_lanes: Option<usize> = std::env::var("INK_MAX_LANES").ok().and_then(|v| v.parse().ok());
+    let cap_lanes = o.max_lanes.or(env_max_lanes).unwrap_or(64);
+    let custom_lanes_or_cap = o.max_lanes.is_some() || env_max_lanes.is_some() || std::env::var_os("INK_LANES").is_some();
+
+    let max_c = *ctxs.iter().max().expect("nonempty INK_CTXS");
+    let step_tail = (solo_warmup + solo_steps).max(steps + 1);
+    let load_ctx = o.ctx.max((max_c + step_tail + 64).div_ceil(64) * 64);
+    let eng = Engine::load(&o.model, load_ctx);
+    eng.ensure_batch(eng.chunk);
+    eng.ensure_dbatch(cap_lanes.clamp(1, engine::MAX_SPANS));
+    let base = load_gate_tokens(&eng, o);
+
+    let (chip, hw_mem) = tuning::this_machine();
+    let bw_scale = perfgate_chip_bw_scale(&chip);
+    let model_bytes = eng.model_and_scratch_bytes();
+    let (_, ws) = eng.gpu_mem();
+    let available_kv_budget_bytes = std::env::var("INK_KV_BUDGET_GIB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|g| (g * (1u64 << 30) as f64) as u64)
+        .unwrap_or_else(|| perfgate_available_kv_budget_bytes(ws as u64, model_bytes));
+
+    let mib = |b: u64| b as f64 / 1048576.0;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let kvb = if eng.kv8 { 1usize } else { 2usize };
+    let sabotage = std::env::var("INK_PERFGATE_SABOTAGE").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut sabotaged = false;
+    let mut all_ok = true;
+    let mut total_checks = 0usize;
+
+    println!(
+        "perfgate: chip={chip:?} ram={:.1} GiB ws={:.1} GiB model+scratch={:.2} GiB kv_budget={:.2} GiB bw_scale={bw_scale:.2} cap_lanes={cap_lanes}",
+        gib(hw_mem),
+        gib(ws as u64),
+        gib(model_bytes),
+        gib(available_kv_budget_bytes)
+    );
+    println!(
+        "{:>6} {:>10} {:>9} {:>9} {:>10} {:>11} {:>11} {:>8}",
+        "ctx", "lanes", "ms/step", "ceil ms", "total t/s", "alloc MiB", "ceil MiB", "status"
+    );
+
+    for &c in &ctxs {
+        let fitting_max = perfgate_max_lanes_for_ctx(
+            available_kv_budget_bytes,
+            40,
+            8,
+            c,
+            kvb,
+            eng.ar.total as usize,
+            cap_lanes,
+        );
+        let rungs_c = perfgate_rungs_for_ctx(&base_rungs, fitting_max);
+        let nmax = *rungs_c.last().expect("at least 1 lane rung");
+        let per_lane_bytes = Engine::lane_worst_case_bytes_for(40, 8, c, kvb, eng.ar.total as usize);
+
+        if c == 2048 && !custom_lanes_or_cap && hw_mem >= (60 << 30) && !rungs_c.contains(&64) {
+            println!("PERFGATE: expected 64 lanes to fit at 2K on >=64 GB host, got fitting_max={fitting_max}");
+            all_ok = false;
+        }
+
+        let len = c + step_tail + 1;
+        let toks: Vec<u32> = (0..len).map(|i| base[i % base.len()]).collect();
+        let src = Lane::new(&eng);
+        {
+            let r = eng.on(&src);
+            r.reserve(len, false);
+            r.set_tokens(0, &toks);
+            let mut p = 0;
+            while p < c {
+                let t = (c - p).min(eng.chunk);
+                let cb = eng.gpu.cmd();
+                eng.encode_spans(&cb, &[Span { lane: &src, p0: p, t }], false, false);
+                cb.commit();
+                wait_gate(&cb, "perfgate prefill", p);
+                p += t;
+            }
+        }
+
+        // 1. Single-stream decode path (`encode_step`) on a temporary clone so `src` stays clean at `0..c`.
+        {
+            let solo = Lane::new(&eng);
+            {
+                let r = eng.on(&solo);
+                r.reserve(len, false);
+                r.set_tokens(0, &toks);
+            }
+            eng.copy_lane(&src, &solo);
+            let r = eng.on(&solo);
+            for w in 0..solo_warmup {
+                let cb = eng.gpu.cmd();
+                r.encode_step(&cb, c + w, true, true);
+                cb.commit();
+                wait_gate(&cb, "perfgate solo warmup", c + w);
+            }
+            let mut times = Vec::with_capacity(solo_steps);
+            for q in 0..solo_steps {
+                let pos = c + solo_warmup + q;
+                let t0 = std::time::Instant::now();
+                let cb = eng.gpu.cmd();
+                r.encode_step(&cb, pos, true, true);
+                cb.commit();
+                wait_gate(&cb, "perfgate solo step", pos);
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let ms = times[times.len() / 2];
+            let ceil_ms = perfgate_step_ceiling_ms(c, 1, true, bw_scale);
+            let alloc_b = eng.gpu_mem().0 as u64;
+            let ceil_b = (ws as u64).min(model_bytes + 2 * per_lane_bytes + (2 << 30));
+            let ok = ms <= ceil_ms && alloc_b <= ceil_b;
+            all_ok &= ok;
+            total_checks += 1;
+            println!(
+                "{c:>6} {:>10} {ms:>9.2} {ceil_ms:>9.2} {:>10.1} {:>11.1} {:>11.1} {:>8}",
+                "1 (solo)",
+                1e3 / ms,
+                mib(alloc_b),
+                mib(ceil_b),
+                if ok { "ok" } else { "FAIL" }
+            );
+        }
+
+        // 2. Multi-lane batched decode (`encode_decode`) across all fitting rungs `1..=fitting_max`.
+        // Reuse `src` as the final (`nmax`-th) lane so peak resident lanes never exceed `nmax`.
+        let mut src_opt = Some(src);
+        let mut lanes: Vec<Lane> = Vec::with_capacity(nmax);
+        let set_tail = |l: &Lane, i: usize| {
+            let tail: Vec<u32> = (0..=steps).map(|q| base[(97 * i + q) % base.len()]).collect();
+            eng.on(l).set_tokens(c, &tail);
+        };
+
+        for &n in &rungs_c {
+            if let Some(s) = src_opt.as_ref() {
+                for (i, l) in lanes.iter().enumerate() {
+                    eng.copy_lane(s, l);
+                    set_tail(l, i);
+                }
+                let target_new_clones = if n == nmax { n.saturating_sub(1) } else { n };
+                while lanes.len() < target_new_clones {
+                    let i = lanes.len();
+                    let l = Lane::new(&eng);
+                    let r = eng.on(&l);
+                    r.reserve(len, false);
+                    r.set_tokens(0, &toks);
+                    eng.copy_lane(s, &l);
+                    set_tail(&l, i);
+                    lanes.push(l);
+                }
+            }
+            if n == nmax && lanes.len() < n {
+                let i = lanes.len();
+                let last = src_opt.take().expect("donor lane available for final rung");
+                set_tail(&last, i);
+                lanes.push(last);
+            }
+            eng.ensure_dbatch(n);
+            {
+                let sp0: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c, t: 1 }).collect();
+                let cb = eng.gpu.cmd();
+                eng.encode_decode(&cb, &sp0, true, false);
+                cb.commit();
+                wait_gate(&cb, "perfgate warmup", c);
+            }
+            let mut times = Vec::with_capacity(steps);
+            for q in 1..=steps {
+                let sp: Vec<Span> = lanes[..n].iter().map(|l| Span { lane: l, p0: c + q, t: 1 }).collect();
+                let t0 = std::time::Instant::now();
+                let cb = eng.gpu.cmd();
+                eng.encode_decode(&cb, &sp, true, false);
+                cb.commit();
+                wait_gate(&cb, "perfgate step", c + q);
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let mut ms = times[times.len() / 2];
+            let ceil_ms = perfgate_step_ceiling_ms(c, n, false, bw_scale);
+            if sabotage && !sabotaged {
+                ms = ceil_ms * 2.0 + 100.0;
+                println!("INK_PERFGATE_SABOTAGE: inflated ctx={c} lanes={n} step time to {ms:.2} ms (ceiling {ceil_ms:.2} ms)");
+                sabotaged = true;
+            }
+            let alloc_b = eng.gpu_mem().0 as u64;
+            let live_lanes = lanes.len() + usize::from(src_opt.is_some());
+            let expected_ceil_b = model_bytes + (live_lanes as u64) * per_lane_bytes + (2 << 30);
+            let ceil_b = if o.max_lanes.is_none() && env_max_lanes.is_none() && std::env::var_os("INK_KV_BUDGET_GIB").is_none() {
+                (ws as u64).min(expected_ceil_b)
+            } else {
+                expected_ceil_b
+            };
+            let ok = ms <= ceil_ms && alloc_b <= ceil_b;
+            all_ok &= ok;
+            total_checks += 1;
+            println!(
+                "{c:>6} {n:>10} {ms:>9.2} {ceil_ms:>9.2} {:>10.1} {:>11.1} {:>11.1} {:>8}",
+                (n as f64) * 1e3 / ms,
+                mib(alloc_b),
+                mib(ceil_b),
+                if ok { "ok" } else { "FAIL" }
+            );
+        }
+        drop(lanes);
+        drop(src_opt);
+    }
+
+    if all_ok {
+        println!("perfgate ok: {total_checks} (ctx, lanes) rungs within step-time and GPU-memory envelopes");
+    } else {
+        println!("PERFGATE FAILED");
+        std::process::exit(1);
+    }
+}
+
 /// dev, the batched decode gate: N lanes on different streams (the --ref tokens rotated by 97 i), each prefilled to
 /// INK_PF tokens, then INK_DECODE decode steps, twice: each lane alone through the single-stream decode path, and all
 /// lanes together through `encode_dbatch`. Every lane's logits at every step and its final cache and convolution rows
@@ -3244,7 +3734,7 @@ fn dbatch(o: &Opts) {
     // INK_DB_OLD: the decode-path batch (encode_dbatch) against the single-stream decode path; otherwise decode steps
     // (encode_decode) of N lanes against each lane's decode steps alone
     let old = std::env::var("INK_DB_OLD").is_ok();
-    // dev: INK_DB_PROF=1 times the batch with each kernel class skipped in turn (results then differ; timing only)
+    // dev: INK_DB_PROF=1 isolates each kernel class in turn on real multi-lane decode routing (timing only)
     if std::env::var("INK_DB_PROF").is_ok() {
         for &n in &counts {
             let lanes: Vec<Lane> = (0..n).map(prefilled).collect();
@@ -3268,18 +3758,102 @@ fn dbatch(o: &Opts) {
                 eng.skip.set(0);
                 best
             };
+            let _ = time(0);
             let full = time(0);
-            println!("{n} lanes: {full:.1} ms GPU per step");
+            let empty = time(u32::MAX);
+            if n > engine::MAX_SPANS || std::env::var_os("INK_OLD_MOE_DEC").is_some() {
+                let tl = eng.moe_tiles();
+                println!("{n} lanes: {full:.2} ms GPU per step (empty {empty:.2} ms, last-layer touched experts: {} x8sg + {} x4sg)", tl[0].len(), tl[1].len());
+            } else {
+                let tl = eng.moe_dec_tiles();
+                println!("{n} lanes: {full:.2} ms GPU per step (empty {empty:.2} ms, last-layer touched experts: {} x8sg + {} x4sg)", tl[0].len(), tl[1].len());
+            }
+            let mut sum = 0.0;
             for (c, name) in engine::CLS_NAMES.iter().enumerate() {
-                let d = full - time(1 << c);
-                if d > 0.5 {
-                    println!("  {name:>11}: {d:7.1} ms ({:4.1}%)", d / full * 100.0);
+                let _ = time(0);
+                let d = (time(!(1u32 << c) & !(1u32 << 21)) - empty).max(0.0);
+                sum += d;
+                if d > 0.2 {
+                    println!("  {name:>11}: {d:7.2} ms ({:4.1}%)", d / full * 100.0);
                 }
             }
+            println!("  isolated sum: {sum:.2} ms");
         }
         return;
     }
-    // alone, through the decode path
+    if std::env::var("INK_DB_AB").is_ok() {
+        println!(
+            "{:>5} {:>11} {:>11} {:>10} {:>10} {:>11} {:>11} {:>8} {:>8}",
+            "lanes", "no_grp ms", "grp_moe ms", "no_grp gpu", "grp_moe gpu", "no_grp t/s", "grp_moe t/s", "speedup", "parity"
+        );
+        let mut ab_ok = true;
+        for &n in &counts {
+            eng.ensure_dbatch(n);
+            let run_pass = |ls: &[Lane], no_grp: bool| -> (Vec<Vec<u64>>, Vec<u64>, f64, f64) {
+                eng.set_no_grp_moe(no_grp);
+                {
+                    let sp0: Vec<Span> = ls.iter().map(|l| Span { lane: l, p0: pf, t: 1 }).collect();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_decode(&cb, &sp0, true, false);
+                    cb.commit();
+                    wait_gate(&cb, "dbatch ab warmup", pf);
+                }
+                let mut hs = vec![Vec::with_capacity(nd); n];
+                let mut gpu_ms = Vec::with_capacity(nd);
+                let t0 = std::time::Instant::now();
+                for q in 1..=nd {
+                    let sp: Vec<Span> = ls.iter().map(|l| Span { lane: l, p0: pf + q, t: 1 }).collect();
+                    let cb = eng.gpu.cmd();
+                    eng.encode_decode(&cb, &sp, true, false);
+                    cb.commit();
+                    wait_gate(&cb, "dbatch ab step", pf + q);
+                    gpu_ms.push((cb.GPUEndTime() - cb.GPUStartTime()) * 1e3);
+                    for (j, h) in hs.iter_mut().enumerate().take(n) {
+                        h.push(fnv(&eng.span_logits(j)));
+                    }
+                }
+                let wall = t0.elapsed().as_secs_f64() * 1e3 / nd as f64;
+                gpu_ms.sort_by(|a, b| a.total_cmp(b));
+                let lhs: Vec<u64> = ls.iter().map(|l| eng.lane_hash(l)).collect();
+                (hs, lhs, wall, gpu_ms[gpu_ms.len() / 2])
+            };
+            let (hs_no, lh_no, wall_no, gpu_no) = {
+                let lanes_a: Vec<Lane> = (0..n).map(prefilled).collect();
+                run_pass(&lanes_a, true)
+            };
+            let (hs_gr, lh_gr, wall_gr, gpu_gr) = {
+                let lanes_b: Vec<Lane> = (0..n).map(prefilled).collect();
+                run_pass(&lanes_b, false)
+            };
+            eng.set_no_grp_moe(false);
+            let exact = hs_no == hs_gr && lh_no == lh_gr;
+            ab_ok &= exact;
+            println!(
+                "{:>5} {:>11.2} {:>11.2} {:>10.2} {:>10.2} {:>11.1} {:>11.1} {:>7.2}x {:>8}",
+                n,
+                wall_no,
+                wall_gr,
+                gpu_no,
+                gpu_gr,
+                (n as f64) * 1e3 / wall_no,
+                (n as f64) * 1e3 / wall_gr,
+                wall_no / wall_gr,
+                if exact { "exact" } else { "DIFF" }
+            );
+        }
+        if !ab_ok {
+            println!("DBATCH NOT EXACT");
+            std::process::exit(1);
+        }
+        println!("dbatch exact: grouped MoE decode matches INK_NO_GRP_MOE=1 bit for bit");
+        return;
+    }
+    // alone: when INK_NO_GRP_MOE is unset, run solo reference with no_grp_moe=true so dbatch simultaneously
+    // proves every grouped multi-lane batch is bit-identical to solo INK_NO_GRP_MOE=1 decode!
+    let orig_no_grp = eng.no_grp_moe();
+    if !old {
+        eng.set_no_grp_moe(true);
+    }
     let mut alone = Vec::new();
     let mut t_alone = 0.0;
     for i in 0..nmax {
@@ -3301,6 +3875,7 @@ fn dbatch(o: &Opts) {
         t_alone += t0.elapsed().as_secs_f64();
         alone.push((hs, eng.lane_hash(&l)));
     }
+    eng.set_no_grp_moe(orig_no_grp);
     let ms_alone = t_alone * 1e3 / (nmax * nd) as f64;
     println!(
         "alone ({}): {ms_alone:.1} ms/token, {:.0} tok/s",
@@ -3318,8 +3893,8 @@ fn dbatch(o: &Opts) {
         for q in 0..nd {
             let mut b: Vec<(&Lane, usize)> = lanes.iter().map(|l| (l, pf + q)).collect();
             if sabotage && !sabotaged && n >= 2 && q == 0 {
-                println!("INK_DBATCH_SABOTAGE: lane 0 decode span bound to lane 1 at step 0");
-                b[0].0 = &lanes[1];
+                println!("INK_DBATCH_SABOTAGE: swapping lane 0 and lane 1 decode spans at step 0");
+                b.swap(0, 1);
                 sabotaged = true;
             }
             let cb = eng.gpu.cmd();
@@ -5000,6 +5575,7 @@ fn main() {
         "loopcdgate" => loopcdgate(&o),
         "blockedinv" => blockedinv(&o),
         "temp1" => temp1(&o),
+        "perfgate" => perfgate(&o),
         "lanebench" => lanebench(&o),
         "dbatch" => dbatch(&o),
         "sharedkv" => sharedkv(&o),

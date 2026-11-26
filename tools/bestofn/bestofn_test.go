@@ -345,3 +345,41 @@ func TestExtractFiles(t *testing.T) {
 		t.Fatalf("unexpected unclosed-fence extract: %q", unclosed["out.py"])
 	}
 }
+
+func TestBestOfN_MidStreamSSEErrorAndTruncationFailAsRequestError(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "mid-stream error chunk",
+			body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"```txt\\nOK\\n```\"}}]}\n\ndata: {\"error\":{\"message\":\"upstream exploded\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n",
+		},
+		{
+			name: "truncated stream missing DONE",
+			body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"```txt\\nOK\\n```\"}}]}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+
+			cfg := DefaultConfig()
+			cfg.Endpoint = srv.URL
+			cfg.N = 1
+			card := Card{ID: "err-card", Prompt: "test", TargetFile: "out.txt", CheckCmd: `grep -qx "OK" out.txt`}
+			res, err := RunCard(context.Background(), cfg, card)
+			if err != nil {
+				t.Fatalf("RunCard returned unexpected error: %v", err)
+			}
+			if res.Attempts[0].Status != StatusRequestError {
+				t.Fatalf("expected StatusRequestError, got %s (err=%q)", res.Attempts[0].Status, res.Attempts[0].Error)
+			}
+		})
+	}
+}

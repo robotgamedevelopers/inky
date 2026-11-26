@@ -467,6 +467,100 @@ kernel void k_moe_topk_route3(device const uchar * PB [[buffer(1)]], device floa
     }
 }
 
+// ---- fused top-k + expert grouping for decode-size batches (T <= 128):
+// Groups active (row, slot) assignments by expert_id into two width classes:
+//   class 0: 65..128 tokens -> k_moe_dec_sg8 (256 threads, 8 simdgroups)
+//   class 1:  1..64  tokens -> k_moe_dec_sg4 (128 threads, 4 simdgroups)
+// Indirect dispatch grids are (ts[c], gu_y, 1) and (ts[c], dn_y, 1): Metal sweeps tgq.y fastest, so all 36 column
+// blocks of ~2 active experts run together while their gathered activations and page-table entries stay in SLC/TLB.
+// When a.no_grp != 0 (INK_NO_GRP_MOE=1), emits one cnt=1 tile per (row, slot) assignment in class 1 (0-bit-diff
+// ungrouped reference).
+#define NTC_DEC 2
+struct TopkRouteDecArgs {
+    uint logits_off, bias_off, sel_off, T;
+    float wscale; uint perm_off, inv_off, aw_off;
+    uint ind_off, gu_y, dn_y, no_grp;
+    uint tiles_off[NTC_DEC];
+    uint pad0, pad1;
+};
+kernel void k_moe_topk_route_dec(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                                 constant TopkRouteDecArgs & a [[buffer(5)]],
+                                 ushort tid [[thread_index_in_threadgroup]],
+                                 ushort sg [[simdgroup_index_in_threadgroup]],
+                                 ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup atomic_uint cnt[NEXP];
+    threadgroup uint off[NEXP], toff[NTC_DEC][NEXP];
+    threadgroup atomic_uint fill[NEXP];
+    if (tid < NEXP) {
+        atomic_store_explicit(&cnt[tid], 0, memory_order_relaxed);
+        atomic_store_explicit(&fill[tid], 0, memory_order_relaxed);
+    }
+    for (uint row = sg; row < a.T; row += 32) {
+        topk_sg(A, PB, a.logits_off + row * NEXP, a.bias_off, a.sel_off + row * 2 * TOPK, a.wscale, lane);
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    const uint n = a.T * TOPK;
+    device uint * perm = (device uint *) (A + a.perm_off);
+    device uint * inv = (device uint *) (A + a.inv_off);
+    if (a.no_grp != 0) {
+        for (uint i = tid; i < n; i += 1024) {
+            const uint t = i / TOPK, k = i % TOPK;
+            const uint e = (uint) A[a.sel_off + t * 16 + k];
+            perm[i] = t;
+            inv[i] = i;
+            A[a.aw_off + i] = A[a.sel_off + t * 16 + TOPK + k];
+            device uint * tt = (device uint *) (A + a.tiles_off[1]) + i * 4;
+            tt[0] = e; tt[1] = i; tt[2] = 1; tt[3] = 0;
+        }
+        if (tid == 0) {
+            device uint * ind = (device uint *) (A + a.ind_off);
+            ind[0] = 0;  ind[1] = a.gu_y; ind[2] = 1; ind[3] = 0;
+            ind[4] = n;  ind[5] = a.gu_y; ind[6] = 1; ind[7] = n;
+            ind[8] = 0;  ind[9] = a.dn_y; ind[10] = 1; ind[11] = 0;
+            ind[12] = n; ind[13] = a.dn_y; ind[14] = 1; ind[15] = n;
+        }
+        return;
+    }
+    for (uint i = tid; i < n; i += 1024) {
+        const uint e = (uint) A[a.sel_off + (i / TOPK) * 16 + (i % TOPK)];
+        atomic_fetch_add_explicit(&cnt[e], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint s = 0, ts[NTC_DEC] = {0, 0};
+        for (int e = 0; e < NEXP; e++) {
+            const uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed), r = c % 128;
+            off[e] = s; s += c;
+            toff[0][e] = ts[0]; toff[1][e] = ts[1];
+            ts[0] += c / 128 + (r > 64 ? 1 : 0);
+            ts[1] += (r > 0 && r <= 64) ? 1 : 0;
+        }
+        device uint * ind = (device uint *) (A + a.ind_off);
+        for (int c = 0; c < NTC_DEC; c++) {
+            ind[c * 4 + 0] = ts[c]; ind[c * 4 + 1] = a.gu_y; ind[c * 4 + 2] = 1; ind[c * 4 + 3] = ts[c];
+            ind[4 * NTC_DEC + c * 4 + 0] = ts[c]; ind[4 * NTC_DEC + c * 4 + 1] = a.dn_y; ind[4 * NTC_DEC + c * 4 + 2] = 1; ind[4 * NTC_DEC + c * 4 + 3] = ts[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += 1024) {
+        const uint t = i / TOPK, k = i % TOPK;
+        const uint e = (uint) A[a.sel_off + t * 16 + k];
+        const uint slot = off[e] + atomic_fetch_add_explicit(&fill[e], 1, memory_order_relaxed);
+        perm[slot] = t;
+        inv[i] = slot;
+        A[a.aw_off + slot] = A[a.sel_off + t * 16 + TOPK + k];
+    }
+    if (tid < NEXP) {
+        const uint c = atomic_load_explicit(&cnt[tid], memory_order_relaxed), n128 = c / 128, r = c % 128;
+        device uint * t8 = (device uint *) (A + a.tiles_off[0]) + toff[0][tid] * 4;
+        for (uint j = 0; j < n128; j++) { t8[j * 4] = tid; t8[j * 4 + 1] = off[tid] + j * 128; t8[j * 4 + 2] = 128; t8[j * 4 + 3] = 0; }
+        if (r > 0) {
+            device uint * tt = r > 64 ? t8 + n128 * 4 : (device uint *) (A + a.tiles_off[1]) + toff[1][tid] * 4;
+            tt[0] = tid; tt[1] = off[tid] + n128 * 128; tt[2] = r; tt[3] = 0;
+        }
+    }
+}
+
 // ---- expert sum per token for the fp16 path (routing weights are already folded into the activations):
 // y[t][c] = sum_k ydh[inv[t*8+k]][c], ydh half. grid (T, ceil(E/1024)), 256 threads x 4 columns
 kernel void k_moe_comb_h(device float * A [[buffer(2)]], constant MoeCombArgs & a [[buffer(5)]],
@@ -594,6 +688,7 @@ struct KvPrepArgs {
     uint k_off, v_off, r_off; int kdyn_off, vdyn_off; uint qp_off, rp_off, qhalf;
     uint kconv_w, vconv_w, qclip_w, relclip_w; float log_alpha, log_floor; uint is_full; int kpos0;   // kpos0: position of K/V index 0
 };
+#pragma clang fp contract(off) reassociate(off)
 kernel void k_kvprep_b(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]], device kv_t * KV [[buffer(3)]],
                        device float * CS [[buffer(4)]], constant KvPrepArgs & a [[buffer(5)]],
                        uint2 tgp [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
@@ -645,7 +740,7 @@ kernel void k_kvprep_b(device const uchar * PB [[buffer(1)]], device float * A [
     if (tid < 48) A[a.rp_off + t * (NH * NREL) + (g * 3 + tid / 16) * NREL + tid % 16] = r * clamp(REL_CLIP / (sqrt(rn) + 1e-6f), 0.0f, 1.0f) * tau;
     const float kf = clamp(QK_CLIP / (sqrt(tot[3]) + 1e-6f), 0.0f, 1.0f), vf = rsqrt(tot[4] / HD + 1e-6f);
     const float k = kv[0] * kf, v = kv[1] * vf;
-    const uint idx = (uint) ((int) pos - a.kpos0);
+    const uint idx = a.ring ? (pos % a.cap) : (uint) ((int) pos - a.kpos0);
 #ifdef KV8
     const uint ck = kv_code(max(max(red[0][5], red[1][5]), max(red[2][5], red[3][5])) * kf);
     const uint cv = kv_code(max(max(red[0][6], red[1][6]), max(red[2][6], red[3][6])) * vf);
@@ -656,6 +751,7 @@ kernel void k_kvprep_b(device const uchar * PB [[buffer(1)]], device float * A [
     KV[a.v_base + (g * a.cap + idx) * HD + tid] = half(v);
 #endif
 }
+#pragma clang fp contract(fast) reassociate(on)
 
 // ---- batched causal attention: TG = (8-token query tile, kv group g) -> 24 query rows. 128 threads.
 // keys are read from the KV cache (chunk keys already written). sink = zero logit (init m=0, l=1).
@@ -1435,6 +1531,289 @@ kernel void k_moe_sg(device const uchar * W [[buffer(0)]], device float * A [[bu
 template [[host_name("k_moe_sg8")]] kernel void k_moe_sg<8>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
 template [[host_name("k_moe_sg4")]] kernel void k_moe_sg<4>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort);
 
+// ---- Coalesced `16 rows x 128 k` tensor-core decode kernels (`k_moe_dec_sg` & `k_gemm_dec_sg`) + `k_gemm_bf16_dec`.
+// 1. In `k_moe_sg4` (`64 rows x 32 k`), only 2 threads stage each weight row (`16B` per thread, strided by `1.3..2.8 KB`
+//    across 16 disjoint cache lines per simdgroup, stalling on 72 barriers for K=2304).
+// 2. Here each tile is `DEC_M = 16` rows x `DEC_K = 128` k (`sa[2][16 * 128]` = 8 KiB total -> 4 threadgroups/core max
+//    occupancy): 8 consecutive threads (`sub = tid % 8`) stage 128 contiguous weights (`64..136` contiguous bytes) of
+//    the SAME weight row in one coalesced burst with zero cross-step duplicate nibble/qh reads and 4x fewer barriers
+//    (18 barriers for K=2304, 9 for K=1152), while M5 `matmul2d(16, 16, 128)` tensor cores execute at full throughput
+//    across 1..128 tokens.
+// 3. `k_gemm_bf16_dec` runs small BF16 projections (`router` 128 rows, `ctrl_down` 256 rows) in coalesced register
+//    batches (`3..6.6x` faster than tensor-tile staging) with `#pragma clang fp contract(off) reassociate(off)` so
+//    prefill and decode produce bit-identical results across all batch sizes.
+#define DEC_M 16
+#define DEC_K 128
+#define DEC_NR 2
+
+#define DEC_SGOP(mm) mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(16, DEC_M, DEC_K, false, true, false, \
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup> mm
+
+inline uint4 load_u16_aligned_16b(device const uchar * p) {
+    device const packed_ushort4 * u = (device const packed_ushort4 *) p;
+    const ushort4 a = ushort4(u[0]), b = ushort4(u[1]);
+    return uint4(
+        uint(a.x) | (uint(a.y) << 16),
+        uint(a.z) | (uint(a.w) << 16),
+        uint(b.x) | (uint(b.y) << 16),
+        uint(b.z) | (uint(b.w) << 16)
+    );
+}
+
+inline void wstage_16x128(device const uchar * wr, uint wtype, uint k0, uint sub, thread WHead & h, thread half4 * w) {
+    if (wtype == 12) {
+        device const block_q4_K * b = (device const block_q4_K *) wr + k0 / 256;
+        const uint half_sb = (k0 % 256) / 128;
+        if (half_sb == 0) {
+            h.d = b->d; h.m = b->dmin;
+            const uint3 sc3 = *(device const packed_uint3 *) b->scales;
+            h.s0 = sc3.x; h.s1 = sc3.y; h.s2 = sc3.z;
+        }
+        const uint j = half_sb * 4 + sub / 2, hp = sub & 1;
+        uint sc, mn;
+        if (j < 4) { sc = (h.s0 >> (8 * j)) & 63; mn = (h.s1 >> (8 * j)) & 63; }
+        else {
+            const uint hi = (h.s2 >> (8 * (j - 4))) & 0xFF;
+            sc = (hi & 0xF) | (((h.s0 >> (8 * (j - 4) + 6)) & 3) << 4);
+            mn = (hi >> 4)  | (((h.s1 >> (8 * (j - 4) + 6)) & 3) << 4);
+        }
+        const float df = h.d * float(sc), mf = h.m * float(mn);
+        const uint4 v = (*(device const uint4 *) (b->qs + (j / 2) * 32 + hp * 16) >> ((j & 1) * 4)) & 0x0F0F0F0Fu;
+        w[0] = half4(fma(float4(as_type<uchar4>(v.x)), df, -mf));
+        w[1] = half4(fma(float4(as_type<uchar4>(v.y)), df, -mf));
+        w[2] = half4(fma(float4(as_type<uchar4>(v.z)), df, -mf));
+        w[3] = half4(fma(float4(as_type<uchar4>(v.w)), df, -mf));
+        return;
+    }
+    if (wtype == 14) {
+        device const block_q6_K * b = (device const block_q6_K *) wr + k0 / 256;
+        const uint n = (k0 % 256) / 128, g = sub / 2, hp = sub & 1, l0 = hp * 16;
+        const float d = float(b->d) * float(b->scales[8 * n + hp + 2 * g]);
+        const uint4 ql_v = load_u16_aligned_16b(b->ql + 64 * n + (g & 1) * 32 + l0);
+        const uint4 qh_v = load_u16_aligned_16b(b->qh + 32 * n + l0);
+        const uint s4 = (g >> 1) * 4, s2 = 2 * g;
+        for (int i = 0; i < 4; i++) {
+            const uint u6 = ((ql_v[i] >> s4) & 0x0F0F0F0Fu) | (((qh_v[i] >> s2) & 0x03030303u) << 4);
+            w[i] = half4(d * float4(int4(as_type<uchar4>(u6)) - int4(32)));
+        }
+        return;
+    }
+    if (wtype == 6) {
+        device const block_q5_0 * b = (device const block_q5_0 *) wr + (k0 / 32 + sub / 2);
+        const half d = b->d;
+        const uint hp = sub & 1;
+        const uint4 v = load_u16_aligned_16b(b->qs);
+        const uint hb = ((device const ushort *) b->qh)[hp];
+        const uint sh = hp * 4;
+        for (int i = 0; i < 4; i++) {
+            const uint n = (v[i] >> sh) & 0x0F0F0F0Fu;
+            const uint h5 = (((hb >> (4 * i)) & 0xFu) * 0x00204081u) & 0x01010101u;
+            w[i] = half4(as_type<char4>(n | ((0x01010101u - h5) * 0xF0u))) * d;
+        }
+        return;
+    }
+    if (wtype == 8) {
+        device const block_q8_0 * b = (device const block_q8_0 *) wr + (k0 / 32 + sub / 2);
+        const half d = b->d;
+        device const packed_char4 * q = (device const packed_char4 *) (b->qs + (sub & 1) * 16);
+        for (int i = 0; i < 4; i++) w[i] = half4(char4(q[i])) * d;
+        return;
+    }
+    deq16(wr, wtype, k0 + sub * 16, (thread half *) w);
+}
+
+template <int NSG>
+kernel void k_gemm_dec_sg(device const uchar * W [[buffer(0)]], device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                          constant GemmHArgs & args [[buffer(5)]], uint2 tgq [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sa[2][DEC_M * DEC_K];
+    uint si = 0;
+    while (si + 1 < args.nseg && tgq.y >= args.seg[si + 1].tile_start) si++;
+    constant HSeg & S = args.seg[si];
+    const uint r0 = (tgq.y - S.tile_start) * DEC_M, t0 = (tgq.x * NSG + sg) * 16, K = S.K, T = args.T;
+    const bool on = t0 < T;
+    const int nt = on ? min(16, (int) (T - t0)) : 0;
+    auto tA0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(DEC_K, DEC_M));
+    auto tA1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(DEC_K, DEC_M));
+    auto tX = tensor((device half *) (A + S.xh_off) + (ulong) (on ? t0 : 0) * K, dextents<int32_t, 2>((int) K, nt), array<int, 2>({1, (int) K}));
+    DEC_SGOP(mm);
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+    const bool wact = tid < 128;
+    const uint rr = tid / 8, sub = tid % 8, widx = rr * DEC_K + sub * 16;
+    device const uchar * wr = (S.wsrc ? PB : W) + (ulong(S.w_hi) << 32 | S.w_lo) + (ulong) min(r0 + rr, S.nrows - 1) * S.row_bytes;
+    WHead wh; half4 wv[4];
+    if (wact) { wstage_16x128(wr, S.wtype, 0, sub, wh, wv); for (int i = 0; i < 4; i++) ((threadgroup half4 *) (sa[0] + widx))[i] = wv[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint buf = 0;
+    for (uint k0 = 0; k0 < K; k0 += DEC_K) {
+        const bool more = k0 + DEC_K < K;
+        if (more && wact) wstage_16x128(wr, S.wtype, k0 + DEC_K, sub, wh, wv);
+        if (on) { auto sx = tX.slice(k0, 0); if (buf == 0) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT); }
+        if (more && wact) for (int i = 0; i < 4; i++) ((threadgroup half4 *) (sa[buf ^ 1] + widx))[i] = wv[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1;
+    }
+    if (!on) return;
+    if (!S.hout) {
+        auto tC = tensor(A + S.out_off + (ulong) t0 * S.ldo + r0, dextents<int32_t, 2>(min(DEC_M, (int) (S.nrows - r0)), nt), array<int, 2>({1, (int) S.ldo}));
+        cT.store(tC);
+        return;
+    }
+    threadgroup float * my_out = ((threadgroup float *) sa) + uint(sg) * 256;
+    auto tOut = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(my_out, dextents<int32_t, 2>(DEC_M, 16));
+    cT.store(tOut);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    device half * yo = (device half *) (A + S.out_off);
+    const uint r4 = (lane % 4) * 4;
+    for (uint pass = 0; pass < 2; ++pass) {
+        const uint t = (lane / 4) + pass * 8;
+        if (t < uint(nt) && r0 + r4 < S.nrows) {
+            const float4 v = *(threadgroup const float4 *) (my_out + t * DEC_M + r4);
+            *(device half4 *) (yo + (ulong) (t0 + t) * S.ldo + r0 + r4) = half4(v);
+        }
+    }
+}
+template [[host_name("k_gemm_dec_sg4")]] kernel void k_gemm_dec_sg<4>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort, ushort);
+template [[host_name("k_gemm_dec_sg8")]] kernel void k_gemm_dec_sg<8>(device const uchar *, device const uchar *, device float *, constant GemmHArgs &, uint2, ushort, ushort, ushort);
+
+template <int NSG>
+kernel void k_moe_dec_sg(device const uchar * W [[buffer(0)]], device float * A [[buffer(2)]], constant MoeGemmHArgs & a [[buffer(5)]],
+                         uint2 tgq [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sa[2][DEC_M * DEC_K];
+    const uint cb = tgq.y;
+    if (tgq.x >= ((device const uint *) (A + a.ntiles_off))[0]) return;
+    device const uint * tl = (device const uint *) (A + a.tiles_off) + tgq.x * 4;
+    const uint e = tl[0], as0 = tl[1], cnt = tl[2], ts0 = sg * 16;
+    const bool on = ts0 < cnt;
+    const int nt = on ? min(16, (int) (cnt - ts0)) : 0;
+    const uint K = a.K;
+    auto tA0 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[0], dextents<int32_t, 2>(DEC_K, DEC_M));
+    auto tA1 = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa[1], dextents<int32_t, 2>(DEC_K, DEC_M));
+    auto tX = tensor((device half *) (A + a.xh_off) + (ulong) (as0 + (on ? ts0 : 0)) * K, dextents<int32_t, 2>((int) K, nt), array<int, 2>({1, (int) K}));
+    DEC_SGOP(mm);
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tX), decltype(tA0), float>();
+    const bool wact = tid < 128;
+    const uint rr = tid / 8, sub = tid % 8, widx = rr * DEC_K + sub * 16;
+    const uint wrow = a.situ ? ((rr < 8) ? cb * 8 + rr : FF + cb * 8 + (rr - 8)) : cb * DEC_M + rr;
+    device const uchar * wr = W + (ulong(a.w_hi) << 32 | a.w_lo) + (ulong) e * a.expert_bytes + (ulong) wrow * a.row_bytes;
+    WHead wh; half4 wv[4];
+    if (wact) { wstage_16x128(wr, a.wtype, 0, sub, wh, wv); for (int i = 0; i < 4; i++) ((threadgroup half4 *) (sa[0] + widx))[i] = wv[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint buf = 0;
+    for (uint k0 = 0; k0 < K; k0 += DEC_K) {
+        const bool more = k0 + DEC_K < K;
+        if (more && wact) wstage_16x128(wr, a.wtype, k0 + DEC_K, sub, wh, wv);
+        if (on) { auto sx = tX.slice(k0, 0); if (buf == 0) mm.run(sx, tA0, cT); else mm.run(sx, tA1, cT); }
+        if (more && wact) for (int i = 0; i < 4; i++) ((threadgroup half4 *) (sa[buf ^ 1] + widx))[i] = wv[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        buf ^= 1;
+    }
+    if (!on) return;
+    const float gsc = a.wtype == 200 ? gscale_at(W, a.gs_lo, a.gs_hi, e) : 1.0f;
+    threadgroup float * my_out = ((threadgroup float *) sa) + uint(sg) * 256;
+    auto tOut = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(my_out, dextents<int32_t, 2>(DEC_M, 16));
+    cT.store(tOut);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (!a.situ) {
+        device half * yd = (device half *) (A + a.out_off);
+        const uint r4 = (lane % 4) * 4;
+        for (uint pass = 0; pass < 2; ++pass) {
+            const uint t = (lane / 4) + pass * 8;
+            if (t < uint(nt)) {
+                const float4 v = *(threadgroup const float4 *) (my_out + t * DEC_M + r4) * gsc;
+                *(device half4 *) (yd + (ulong) (as0 + ts0 + t) * a.ldo + cb * DEC_M + r4) = half4(v);
+            }
+        }
+        return;
+    }
+    device half * act = (device half *) (A + a.out_off);
+    const uint t = lane / 2, r4 = (lane & 1) * 4;
+    if (t < uint(nt)) {
+        const float4 gt = *(threadgroup const float4 *) (my_out + t * DEC_M + r4) * gsc;
+        const float4 up = *(threadgroup const float4 *) (my_out + t * DEC_M + 8 + r4) * gsc;
+        const float4 su = a.lbeta > 0 ? a.lbeta * tanh(up / a.lbeta) : up;
+        const float4 o = (A[a.aw_off + as0 + ts0 + t] * a.beta) * tanh(gt / a.beta) / (1.0f + exp(-gt)) * su;
+        *(device half4 *) (act + (ulong) (as0 + ts0 + t) * FF + cb * 8 + r4) = half4(o);
+    }
+}
+template [[host_name("k_moe_dec_sg8")]] kernel void k_moe_dec_sg<8>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort, ushort);
+template [[host_name("k_moe_dec_sg4")]] kernel void k_moe_dec_sg<4>(device const uchar *, device float *, constant MoeGemmHArgs &, uint2, ushort, ushort, ushort);
+
+#pragma clang fp contract(off) reassociate(off)
+template <int M>
+inline void bf16_dec_batch(device const uchar * const * wp, constant HSeg & S, device float * A,
+                           device const half * xbase, uint t0, uint r0, ushort lane) {
+    float sumf[M][DEC_NR];
+    #pragma unroll
+    for (int m = 0; m < M; ++m) { sumf[m][0] = 0.0f; sumf[m][1] = 0.0f; }
+    for (int i = int(lane) * 8; i < int(S.K); i += 256) {
+        half4 xal[M], xbl[M];
+        #pragma unroll
+        for (int m = 0; m < M; ++m) {
+            device const half * xm = xbase + (ulong) (t0 + uint(m)) * S.K + i;
+            xal[m] = *(device const half4 *) xm;
+            xbl[m] = *(device const half4 *) (xm + 4);
+        }
+        #pragma unroll
+        for (int r = 0; r < DEC_NR; ++r) {
+            const ushort4 a = *(device const ushort4 *) (wp[r] + 2 * i);
+            const ushort4 b = *(device const ushort4 *) (wp[r] + 2 * i + 8);
+            const float4 wa = float4(bf16f(a.x), bf16f(a.y), bf16f(a.z), bf16f(a.w));
+            const float4 wb = float4(bf16f(b.x), bf16f(b.y), bf16f(b.z), bf16f(b.w));
+            #pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const float4 xa = float4(xal[m]), xb = float4(xbl[m]);
+                const float p0 = (xa.x * wa.x + xa.y * wa.y) + (xa.z * wa.z + xa.w * wa.w);
+                const float p1 = (xb.x * wb.x + xb.y * wb.y) + (xb.z * wb.z + xb.w * wb.w);
+                sumf[m][r] += p0 + p1;
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < M; ++m) {
+        const float y0 = simd_sum(sumf[m][0]);
+        const float y1 = simd_sum(sumf[m][1]);
+        if (lane == 0) {
+            const uint t = t0 + uint(m);
+            if (S.hout) {
+                device half * yo = (device half *) (A + S.out_off) + (ulong) t * S.ldo + r0;
+                if (r0 + 1 < S.nrows) *(device half2 *) yo = half2(half(y0), half(y1));
+                else if (r0 < S.nrows) yo[0] = half(y0);
+            } else {
+                device float * yo = A + S.out_off + (ulong) t * S.ldo + r0;
+                if (r0 + 1 < S.nrows) *(device float2 *) yo = float2(y0, y1);
+                else if (r0 < S.nrows) yo[0] = y0;
+            }
+        }
+    }
+}
+
+kernel void k_gemm_bf16_dec(device const uchar * W [[buffer(0)]], device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
+                            constant GemmHArgs & args [[buffer(5)]], uint2 tgq [[threadgroup_position_in_grid]],
+                            ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    uint si = 0;
+    while (si + 1 < args.nseg && tgq.y >= args.seg[si + 1].tile_start) si++;
+    constant HSeg & S = args.seg[si];
+    const uint r0 = (tgq.y - S.tile_start) * (4 * DEC_NR) + uint(sg) * DEC_NR;
+    if (r0 >= S.nrows) return;
+    const uint t_base = tgq.x * 16;
+    if (t_base >= args.T) return;
+    const uint nt = min(16u, args.T - t_base);
+    device const uchar * wbase = (S.wsrc ? PB : W) + (ulong(S.w_hi) << 32 | S.w_lo);
+    device const uchar * wp[DEC_NR] = {
+        wbase + (ulong) r0 * S.row_bytes,
+        wbase + (ulong) min(r0 + 1, S.nrows - 1) * S.row_bytes
+    };
+    device const half * xbase = (device const half *) (A + S.xh_off);
+    uint u0 = 0;
+    for (; u0 + 4 <= nt; u0 += 4) bf16_dec_batch<4>(wp, S, A, xbase, t_base + u0, r0, lane);
+    if (u0 + 2 <= nt) { bf16_dec_batch<2>(wp, S, A, xbase, t_base + u0, r0, lane); u0 += 2; }
+    if (u0 < nt) bf16_dec_batch<1>(wp, S, A, xbase, t_base + u0, r0, lane);
+}
+#pragma clang fp contract(fast) reassociate(on)
+
 // ---- loop controllers, gain/forget GEMM with the apply fused into the epilogue (fp16 path).
 // TG = (128-token tile, job, 32-channel block): rows = 32 gain + 32 forget rows of the block, K = 64 (the controller state g, half).
 // Every thread owns matching gain and forget accumulators, so raw = u - tanh(F.g)*u + tanh(G.g)*m is formed in registers and
@@ -1499,6 +1878,7 @@ kernel void k_layout_sg(device float * A [[buffer(2)]], constant uint & out_off 
 // contiguous cache addressing with 64-bit per-lane block-table lookups (`BT[pos >> 6]`).
 // `a.k_base` carries the pass index within the pool kind (0..40 window, 0..8 full).
 
+#pragma clang fp contract(off) reassociate(off)
 kernel void k_kvprep_b_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
                            device uchar * KV0 [[buffer(3)]], device float * CS [[buffer(4)]],
                            constant KvPrepArgs & a [[buffer(5)]], device const ulong * BT [[buffer(8)]],
@@ -1567,6 +1947,7 @@ kernel void k_kvprep_b_blk(device const uchar * PB [[buffer(1)]], device float *
     vp[tid] = half(v);
 #endif
 }
+#pragma clang fp contract(fast) reassociate(on)
 
 kernel void k_attn_b_blk(device const uchar * PB [[buffer(1)]], device float * A [[buffer(2)]],
                          device uchar * KV0 [[buffer(3)]], constant AttnBArgs & a [[buffer(5)]],

@@ -53,6 +53,7 @@ impl Sampler {
         Sampler::new(temp, top_k, top_p, softcap, request_seed ^ DRAFT_SEED_MIX)
     }
 
+    #[cfg(test)]
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         self.sample_next(logits).expect("model sampling failed")
     }
@@ -193,7 +194,7 @@ impl Sampler {
     /// `temp <= 0` does not belong here.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reject_one(&mut self, draft_tok: u32, target: &[f32], draft: &[f32]) -> u32 {
-        self.reject_at(draft_tok, target, draft).0
+        self.reject_at(draft_tok, target, draft, None).0
     }
 
     /// One verify round on the probabilistic path. `draft_tokens` are the actual drafted tokens
@@ -202,22 +203,34 @@ impl Sampler {
     /// stream. One call is one round: it is not reseeded per emitted token.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn verify_round(&mut self, draft_tokens: &[u32], target_rows: &[&[f32]], draft_rows: &[&[f32]]) -> Vec<u32> {
+        self.verify_round_with_ban(draft_tokens, target_rows, draft_rows, None)
+    }
+
+    /// Same as [`Self::verify_round`], while masking an optional `ban` token to zero target mass
+    /// (for hard thinking-budget enforcement, matching 1-token decode and GPU `k_dspark_reject`).
+    pub fn verify_round_with_ban(
+        &mut self,
+        draft_tokens: &[u32],
+        target_rows: &[&[f32]],
+        draft_rows: &[&[f32]],
+        ban: Option<u32>,
+    ) -> Vec<u32> {
         assert!(self.temp > 0.0, "greedy does not reject");
         assert_eq!(draft_tokens.len(), draft_rows.len(), "one draft token per draft row");
         assert_eq!(target_rows.len(), draft_rows.len() + 1, "one target row per draft token, plus the bonus");
         let mut out = Vec::with_capacity(target_rows.len());
         for i in 0..draft_rows.len() {
-            let (tok, accepted) = self.reject_at(draft_tokens[i], target_rows[i], draft_rows[i]);
+            let (tok, accepted) = self.reject_at(draft_tokens[i], target_rows[i], draft_rows[i], ban);
             out.push(tok);
             if !accepted { return out; }
         }
-        out.push(self.sample(target_rows[draft_rows.len()]));
+        out.push(self.sample_next_with_ban(target_rows[draft_rows.len()], ban).expect("model sampling failed"));
         out
     }
 
-    fn reject_at(&mut self, draft_tok: u32, target: &[f32], draft: &[f32]) -> (u32, bool) {
+    fn reject_at(&mut self, draft_tok: u32, target: &[f32], draft: &[f32], ban: Option<u32>) -> (u32, bool) {
         assert!(self.temp > 0.0, "greedy does not reject");
-        let masses = self.masses(target, draft);
+        let masses = self.masses(target, draft, ban);
         let x = draft_tok;
         let px = prob_of(&masses, x, true);
         let qx = prob_of(&masses, x, false);
@@ -248,9 +261,9 @@ impl Sampler {
     }
 
     /// p and q on the union of the surviving target and draft candidates, ordered by token ID.
-    fn masses(&mut self, target: &[f32], draft: &[f32]) -> Vec<Mass> {
+    fn masses(&mut self, target: &[f32], draft: &[f32], ban: Option<u32>) -> Vec<Mass> {
         let mut by_token = std::collections::BTreeMap::new();
-        let target_total = self.prepare_row(target, None, self.softcap).expect("invalid target sampling row");
+        let target_total = self.prepare_row(target, ban, self.softcap).expect("invalid target sampling row");
         for &(weight, token) in &self.cand {
             if weight > 0.0 {
                 by_token.insert(token, Mass { token, p: weight / target_total, q: 0.0 });
@@ -373,7 +386,7 @@ mod tests {
         assert!(!target_order[..K].contains(&150) && !draft_order[..K].contains(&150), "150 is in neither top-64");
 
         let mut sampler = Sampler::new(TEMP, K, TOP_P, SOFTCAP, 1);
-        let masses = sampler.masses(&target, &draft);
+        let masses = sampler.masses(&target, &draft, None);
         let exp_p = expected_side(&target, K, SOFTCAP, TEMP, TOP_P);
         let exp_q = expected_side(&draft, K, SOFTCAP, TEMP, TOP_P);
         assert!(exp_p.len() < K && exp_q.len() < K, "top-p cuts both sides on this draw");
@@ -756,6 +769,26 @@ mod tests {
                 let out = nz_verify.verify_round(&[cand_draft], &[row, row], &[row]);
                 assert_eq!(out[0], want_winner);
             }
+        }
+    }
+
+    #[test]
+    fn verify_round_with_ban_rejects_banned_draft_and_never_emits_banned_token() {
+        let mut s = Sampler::new(1.0, 64, 0.95, 30.0, 777);
+        // Token 2 (banned) overwhelmingly dominates both target and draft rows.
+        let target = [1.0f32, 2.0, 20.0, 1.5];
+        let draft = [1.0f32, 2.0, 20.0, 1.5];
+        for _ in 0..200 {
+            // Case A: drafter proposes the banned token 2 -> must reject and draw from {0, 1, 3}.
+            let out_rej = s.verify_round_with_ban(&[2], &[&target, &target], &[&draft], Some(2));
+            assert_eq!(out_rej.len(), 1);
+            assert_ne!(out_rej[0], 2, "banned token must never be accepted or sampled in residual");
+
+            // Case B: drafter proposes an allowed token 1 that is accepted -> bonus draw must also respect ban=Some(2).
+            let target_bonus_ban = [0.0f32, 10.0, 25.0, 0.0];
+            let draft_accept = [0.0f32, 10.0, 0.0, 0.0];
+            let out_acc = s.verify_round_with_ban(&[1], &[&target_bonus_ban, &target], &[&draft_accept], Some(2));
+            assert!(out_acc.iter().all(|&tok| tok != 2), "banned token must never be emitted in bonus draw: {out_acc:?}");
         }
     }
 }

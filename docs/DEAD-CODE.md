@@ -22,9 +22,7 @@ Every `allow(dead_code)` attribute in `src/` is audited against two independent 
 | `src/gguf.rs` | `AF(Vec<f64>),` | `kept-spec` | GGUF v3 binary metadata array variant populated by `read_val` (`ty == 12`). |
 | `src/gguf.rs` | `pub fn open_bytes(bytes: &[u8]) -> io::Result<Gguf> {` | `kept-api` | Anonymous-mapping in-memory GGUF parser entrypoint consumed by `fuzz/fuzz_targets/gguf_load.rs` and unit tests. |
 | `src/engine.rs` | `pub fn no_grp_dec(&self) -> bool {` | `kept-api` | Symmetric accessor paired with `Engine::set_no_grp_dec`. |
-| `src/engine.rs` | `pub const fn fixed_split_count(first: usize, end: usize, kps: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `SplitCount`, exercised by unit tests and `fixed_attn_batch`. |
-| `src/engine.rs` | `pub const fn split_scratch_slots(max_ctx: usize) -> usize {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `Slots`, exercised by unit tests and `fixed_attn_batch`. |
-| `src/engine.rs` | `pub const fn fixed_attn_batch(swa: bool, span_end: usize, max_ctx: usize) -> (usize, usize) {` | `kept-spec` | Pure-Rust mirror of `specs/SplitArena.tla` `NSplit` & `Rows`, exercised by unit tests across sliding-window edge splits. |
+| `src/engine.rs` | `struct AttnBArgs {` | `kept-api` | Argument struct for legacy `k_attn_b` / `k_attn_b_blk` Metal shaders exercised by split-invariance GPU tests after prefill unified onto `PreparedAttnArgs`. |
 | `src/poolgate.rs` | `pub fn borrow_lane_ptrs(&self, ids: &[LaneId]) -> Vec<*const Lane> {` | `kept-api` | Raw lane pointer borrow helper on `Layer3Pool` exercised by unit tests. |
 | `src/verify.rs` | `pub struct FixedDraftProducer {` | `held-open-pr` | Deterministic `DraftProducer` implementation exercised by unit tests and held for speculative serving (`#42`, `#80`). |
 | `src/verify.rs` | `pub struct SamplerDraftProducer<'a> {` | `held-open-pr` | Stochastic `Sampler::draft` `DraftProducer` implementation held for speculative serving (`#42`, `#80`). |

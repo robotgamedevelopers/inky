@@ -353,6 +353,9 @@ func skipValue(r io.Reader, typ uint32) error {
 		if err := binary.Read(r, binary.LittleEndian, &at); err != nil {
 			return err
 		}
+		if at == 9 {
+			return fmt.Errorf("nested arrays are not supported")
+		}
 		if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
 			return err
 		}

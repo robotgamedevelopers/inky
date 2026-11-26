@@ -379,6 +379,33 @@ impl Gguf {
     pub fn bytes(&self, t: &Tensor) -> &[u8] {
         &self.data()[t.file_off..][..t.nbytes]
     }
+
+    /// Fast, deterministic 64-bit identity fingerprint of this GGUF file (file size, header prefix,
+    /// and sorted tensor table metadata) used to reject incompatible persisted spill caches across restarts.
+    pub fn fingerprint_u64(&self) -> u64 {
+        let mut h = crate::spill::Sha256::new();
+        h.update(b"inky-gguf-fp-v1\0");
+        h.update(&(self.file_len as u64).to_le_bytes());
+        let data = self.data();
+        h.update(&data[..data.len().min(64 * 1024)]);
+        let mut names: Vec<&str> = self.tensors.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        h.update(&(names.len() as u64).to_le_bytes());
+        for name in names {
+            let t = &self.tensors[name];
+            h.update(&(name.len() as u64).to_le_bytes());
+            h.update(name.as_bytes());
+            h.update(&t.ty.to_le_bytes());
+            h.update(&(t.file_off as u64).to_le_bytes());
+            h.update(&(t.nbytes as u64).to_le_bytes());
+            h.update(&(t.ne.len() as u32).to_le_bytes());
+            for &d in &t.ne {
+                h.update(&(d as u64).to_le_bytes());
+            }
+        }
+        let digest = h.finalize();
+        u64::from_le_bytes(digest[..8].try_into().unwrap())
+    }
 }
 
 #[cfg(test)]
