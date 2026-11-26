@@ -67,7 +67,7 @@ func openSafetensors(path string) (*safetensors, error) {
 				return nil, fmt.Errorf("%s: tensor %s: negative dimension in %v", path, k, t.Shape)
 			}
 		}
-		if t.Offsets[0] < 0 || t.Offsets[1] < t.Offsets[0] || s.base+t.Offsets[1] > fileLen {
+		if t.Offsets[0] < 0 || t.Offsets[1] < t.Offsets[0] || fileLen < s.base || t.Offsets[1] > fileLen-s.base {
 			f.Close()
 			return nil, fmt.Errorf("%s: tensor %s: offsets %v out of file bounds (%d bytes)", path, k, t.Offsets, fileLen)
 		}
@@ -84,8 +84,9 @@ func (s *safetensors) read(name string, from, n int64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("no tensor %s", name)
 	}
-	if from < 0 || from+n > t.Offsets[1]-t.Offsets[0] {
-		return nil, fmt.Errorf("%s: read [%d, %d) out of range", name, from, from+n)
+	size := t.Offsets[1] - t.Offsets[0]
+	if from < 0 || n < 0 || from > size || n > size-from {
+		return nil, fmt.Errorf("%s: read [%d, %d+%d) out of range (size %d)", name, from, from, n, size)
 	}
 	buf := make([]byte, n)
 	_, err := s.f.ReadAt(buf, s.base+t.Offsets[0]+from)

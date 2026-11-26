@@ -41,9 +41,9 @@ pub const DEFAULT_MAX_SPILLED_STARTS: usize = 512;
 /// (`512 MiB`, strictly `< 15%` of the 4 GiB safety headroom even at 128K context).
 pub const MAX_INFLIGHT_RESTORE_STAGING_BYTES: usize = 512 * 1024 * 1024;
 const SPILL_INDEX_MAGIC: [u8; 8] = *b"INKYSPID";
-const SPILL_INDEX_VERSION: u32 = 2;
-const SPILL_INDEX_HEADER_LEN: usize = 68;
-const SPILL_INDEX_PREFIX_LEN: usize = 36;
+const SPILL_INDEX_VERSION: u32 = 3;
+const SPILL_INDEX_HEADER_LEN: usize = 84;
+const SPILL_INDEX_PREFIX_LEN: usize = 52;
 const MAX_SPILL_INDEX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default host-RAM cap for retained checkpoint copies (`cs` + `toks` + `entries`).
@@ -1037,6 +1037,8 @@ pub struct ServeBlockCache {
     retained_host_bytes: u64,
     max_retained_host_bytes: u64,
     spill_write_timeout: Duration,
+    spill_full_attn_budget: u64,
+    spill_model_fingerprint: u64,
 }
 
 impl Default for ServeBlockCache {
@@ -1070,6 +1072,8 @@ impl ServeBlockCache {
             retained_host_bytes: 0,
             max_retained_host_bytes: DEFAULT_MAX_RETAINED_HOST_BYTES,
             spill_write_timeout: DEFAULT_SPILL_WRITE_TIMEOUT,
+            spill_full_attn_budget: u64::MAX,
+            spill_model_fingerprint: 0,
         }
     }
 
@@ -1095,8 +1099,15 @@ impl ServeBlockCache {
         self.spill_write_timeout = timeout;
     }
 
+    #[cfg(any(test, standalone_blocks))]
     pub fn with_spill(store: SpillStore) -> Self {
+        Self::with_spill_compat(store, None, 0)
+    }
+
+    pub fn with_spill_compat(store: SpillStore, full_attn_budget: Option<usize>, model_fingerprint: u64) -> Self {
         let mut cache = Self::new();
+        cache.spill_full_attn_budget = full_attn_budget.map_or(u64::MAX, |b| b as u64);
+        cache.spill_model_fingerprint = model_fingerprint;
         cache.spill_store = Some(store);
         cache.load_spill_index_on_open();
         cache
@@ -1182,6 +1193,8 @@ impl ServeBlockCache {
         header[16..24].copy_from_slice(&self.next_spill_id.to_le_bytes());
         header[24..32].copy_from_slice(&self.tick.to_le_bytes());
         header[32..36].copy_from_slice(&valid_count.to_le_bytes());
+        header[36..44].copy_from_slice(&self.spill_full_attn_budget.to_le_bytes());
+        header[44..52].copy_from_slice(&self.spill_model_fingerprint.to_le_bytes());
         let payload_len = payload.len() as u64;
 
         let mut hasher = Sha256::new();
@@ -1189,7 +1202,7 @@ impl ServeBlockCache {
         hasher.update(&payload_len.to_le_bytes());
         hasher.update(&payload);
         let digest = hasher.finalize();
-        header[36..68].copy_from_slice(&digest);
+        header[52..84].copy_from_slice(&digest);
 
         let mut full = Vec::with_capacity(SPILL_INDEX_HEADER_LEN + 8 + payload.len());
         full.extend_from_slice(&header[0..SPILL_INDEX_PREFIX_LEN]);
@@ -1223,22 +1236,28 @@ impl ServeBlockCache {
         }
         let version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
         let file_kvb = u32::from_le_bytes(raw[12..16].try_into().unwrap());
-        if version != SPILL_INDEX_VERSION || file_kvb != store_kvb {
-            reject(self);
-            return;
-        }
         let saved_next_spill_id = u64::from_le_bytes(raw[16..24].try_into().unwrap());
         let saved_tick = u64::from_le_bytes(raw[24..32].try_into().unwrap());
         let count = u32::from_le_bytes(raw[32..36].try_into().unwrap()) as usize;
-        let payload_len = u64::from_le_bytes(raw[36..44].try_into().unwrap());
-        let stored_digest: [u8; 32] = raw[44..76].try_into().unwrap();
-        let payload = &raw[76..];
+        let file_budget = u64::from_le_bytes(raw[36..44].try_into().unwrap());
+        let file_model_fp = u64::from_le_bytes(raw[44..52].try_into().unwrap());
+        if version != SPILL_INDEX_VERSION
+            || file_kvb != store_kvb
+            || file_budget != self.spill_full_attn_budget
+            || file_model_fp != self.spill_model_fingerprint
+        {
+            reject(self);
+            return;
+        }
+        let payload_len = u64::from_le_bytes(raw[52..60].try_into().unwrap());
+        let stored_digest: [u8; 32] = raw[60..92].try_into().unwrap();
+        let payload = &raw[92..];
         if payload.len() as u64 != payload_len {
             reject(self);
             return;
         }
         let mut hasher = Sha256::new();
-        hasher.update(&raw[0..44]);
+        hasher.update(&raw[0..60]);
         hasher.update(payload);
         if hasher.finalize() != stored_digest {
             reject(self);
@@ -5432,6 +5451,62 @@ mod tests {
         cache.release_lane(&mut pools, &mut tbl, &mut st);
         cache.shutdown(&mut pools);
         assert_zero_pool_leaks(&pools);
+    }
+
+    #[test]
+    fn spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches() {
+        let dir = ScratchDir::new("spill-compat-header");
+        let prompt: Vec<u32> = (0..=128u32).map(|i| 20_000 + i).collect();
+
+        // 1. Spill one checkpoint under budget=Some(1024), model_fp=0x1111.
+        {
+            let mut pools = BlockPools::with_capacities(8, 8, 2).unwrap();
+            let store = SpillStore::open_with_kvb(&dir.0, 64 * 1024 * 1024, 2).unwrap();
+            let mut cache = ServeBlockCache::with_spill_compat(store, Some(1024), 0x1111);
+            let mut tbl = BlockTable::new(8).unwrap();
+            let mut st = LaneBlockState::default();
+            let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut st, &prompt, 9);
+            assert!(cache.evict_start(&mut pools, tip));
+            assert_eq!(cache.spilled_start_count(), 1);
+            cache.shutdown(&mut pools);
+            assert_zero_pool_leaks(&pools);
+        }
+
+        // 2. Reopen with matching (Some(1024), 0x1111): checkpoint reloads cleanly.
+        {
+            let store = SpillStore::open_with_kvb(&dir.0, 64 * 1024 * 1024, 2).unwrap();
+            let cache = ServeBlockCache::with_spill_compat(store, Some(1024), 0x1111);
+            assert_eq!(cache.spilled_start_count(), 1);
+            assert!(cache.spill_store().unwrap().entry_count() >= 1);
+        }
+
+        // 3. Reopen with different full_attn_budget (Some(2048)): rejects & sweeps stale blocks.
+        {
+            let store = SpillStore::open_with_kvb(&dir.0, 64 * 1024 * 1024, 2).unwrap();
+            let cache = ServeBlockCache::with_spill_compat(store, Some(2048), 0x1111);
+            assert_eq!(cache.spilled_start_count(), 0);
+            assert_eq!(cache.spill_store().unwrap().entry_count(), 0);
+        }
+
+        // 4. Re-spill under (None, 0xAAAA), then reopen with different model fingerprint (None, 0xBBBB): rejects & sweeps.
+        {
+            let mut pools = BlockPools::with_capacities(8, 8, 2).unwrap();
+            let store = SpillStore::open_with_kvb(&dir.0, 64 * 1024 * 1024, 2).unwrap();
+            let mut cache = ServeBlockCache::with_spill_compat(store, None, 0xAAAA);
+            let mut tbl = BlockTable::new(8).unwrap();
+            let mut st = LaneBlockState::default();
+            let tip = retain_test_prompt(&mut cache, &mut pools, &mut tbl, &mut st, &prompt, 9);
+            assert!(cache.evict_start(&mut pools, tip));
+            assert_eq!(cache.spilled_start_count(), 1);
+            cache.shutdown(&mut pools);
+            assert_zero_pool_leaks(&pools);
+        }
+        {
+            let store = SpillStore::open_with_kvb(&dir.0, 64 * 1024 * 1024, 2).unwrap();
+            let cache = ServeBlockCache::with_spill_compat(store, None, 0xBBBB);
+            assert_eq!(cache.spilled_start_count(), 0);
+            assert_eq!(cache.spill_store().unwrap().entry_count(), 0);
+        }
     }
 }
 

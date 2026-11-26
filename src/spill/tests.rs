@@ -1158,3 +1158,54 @@ fn kvb_mismatch_between_kv8_and_fp16_is_rejected_without_exposing_bytes() {
     assert_eq!(kv8_store.read_block(k_fp16, Some(kv_len)), ReadOutcome::Miss(MissReason::KvbMismatch));
     assert!(!kv8_store.block_path(k_fp16).exists());
 }
+
+#[test]
+fn evict_one_lru_cold_releases_io_pin_when_pool_returns_error() {
+    struct FailOncePool {
+        inner: HostBlockPoolBackend,
+        fail_read: bool,
+    }
+    impl SpillPoolBackend for FailOncePool {
+        fn stride_bytes(&self, kind: SpillBlockKind) -> usize { self.inner.stride_bytes(kind) }
+        fn capacity_slots(&self, kind: SpillBlockKind) -> usize { self.inner.capacity_slots(kind) }
+        fn used_slots(&self, kind: SpillBlockKind) -> usize { self.inner.used_slots(kind) }
+        fn free_slots(&self, kind: SpillBlockKind) -> usize { self.inner.free_slots(kind) }
+        fn read_slot_bytes(&self, slot: ResidentSlot) -> Result<&[u8], SpillError> {
+            if self.fail_read {
+                return Err(SpillError::Pool("injected read failure".into()));
+            }
+            self.inner.read_slot_bytes(slot)
+        }
+        fn take_free_slot(&mut self, kind: SpillBlockKind) -> Result<ResidentSlot, SpillError> {
+            self.inner.take_free_slot(kind)
+        }
+        fn release_cold_slot(&mut self, slot: ResidentSlot) -> Result<(), SpillError> {
+            self.inner.release_cold_slot(slot)
+        }
+        fn install_restored_slot(&mut self, slot: ResidentSlot, kv_bytes: &[u8]) -> Result<(), SpillError> {
+            self.inner.install_restored_slot(slot, kv_bytes)
+        }
+        fn add_ref(&mut self, slot: ResidentSlot) -> Result<u32, SpillError> { self.inner.add_ref(slot) }
+        fn drop_ref(&mut self, slot: ResidentSlot) -> Result<u32, SpillError> { self.inner.drop_ref(slot) }
+        fn refs(&self, slot: ResidentSlot) -> Result<u32, SpillError> { self.inner.refs(slot) }
+    }
+
+    let scratch = ScratchTestDir::new("evict-io-pin-rollback");
+    let store = SpillStore::open(scratch.path(), 64 * 1024 * 1024).unwrap();
+    let pool = FailOncePool { inner: HostBlockPoolBackend::new(1, 1, 64, 64), fail_read: false };
+    let mut mgr = SpillManager::new(pool, store);
+    let key = SpillKey::full(1);
+    let slot = mgr.pool_mut().take_free_slot(SpillBlockKind::Full).unwrap();
+    mgr.pool_mut().install_restored_slot(slot, &[7u8; 64]).unwrap();
+    mgr.register_sealed_block(key, slot, None).unwrap();
+    mgr.pool_mut().fail_read = true;
+
+    // First eviction attempt fails during `read_slot_bytes`; `io_pins` must drop back to 0.
+    assert!(mgr.evict_one_lru_cold(SpillBlockKind::Full).is_err());
+    assert_eq!(mgr.blocks.get(&key).unwrap().io_pins, 0, "io_pins must not leak on pool error");
+
+    // Once the transient failure clears, the block remains evictable and spills cleanly.
+    mgr.pool_mut().fail_read = false;
+    assert_eq!(mgr.evict_one_lru_cold(SpillBlockKind::Full).unwrap(), key);
+    assert_eq!(mgr.blocks.get(&key).unwrap().io_pins, 0);
+}

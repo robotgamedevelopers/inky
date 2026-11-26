@@ -1649,6 +1649,66 @@ pub(crate) struct KvUndo {
     pub(crate) pos: usize,
     pub(crate) rows: Vec<u8>,
 }
+
+pub(crate) fn snapshot_paged_kv_pos(
+    pools: &crate::blocks::BlockPools,
+    tbl: &crate::blocks::BlockTable,
+    slot_kind: &[(bool, usize)],
+    kvb: u32,
+    pos: usize,
+) -> KvUndo {
+    debug_assert_eq!(slot_kind.len(), N_SLOT);
+    let row = HD * (kvb as usize);
+    let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
+    let mut rows = Vec::with_capacity(N_SLOT * 2 * NKV * row);
+    for &(swa, pass_idx) in slot_kind.iter().take(N_SLOT) {
+        let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
+        let entry = tbl
+            .get(kind, bi)
+            .expect("paged block in range")
+            .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
+        let slot_slice = pools.of(kind).slot_bytes(entry.slot()).expect("paged slot bytes");
+        for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
+            for h in 0..NKV as u32 {
+                let off = crate::blocks::metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32)
+                    .expect("in-slot offset") as usize;
+                rows.extend_from_slice(&slot_slice[off..off + row]);
+            }
+        }
+    }
+    KvUndo { pos, rows }
+}
+
+pub(crate) fn restore_paged_kv_pos(
+    pools: &mut crate::blocks::BlockPools,
+    tbl: &crate::blocks::BlockTable,
+    slot_kind: &[(bool, usize)],
+    kvb: u32,
+    undo: &KvUndo,
+) {
+    debug_assert_eq!(slot_kind.len(), N_SLOT);
+    let row = HD * (kvb as usize);
+    let pos = undo.pos;
+    let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
+    let mut at = 0usize;
+    for &(swa, pass_idx) in slot_kind.iter().take(N_SLOT) {
+        let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
+        let entry = tbl
+            .get(kind, bi)
+            .expect("paged block in range")
+            .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
+        let slot_slice = pools.of_mut(kind).slot_bytes_mut(entry.slot()).expect("paged slot bytes mut");
+        for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
+            for h in 0..NKV as u32 {
+                let off = crate::blocks::metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32)
+                    .expect("in-slot offset") as usize;
+                slot_slice[off..off + row].copy_from_slice(&undo.rows[at..at + row]);
+                at += row;
+            }
+        }
+    }
+    assert_eq!(at, undo.rows.len());
+}
 struct VerifySpan {
     lane: *const Lane,
     p0: usize,
@@ -4624,7 +4684,9 @@ impl Engine {
             let n_keep = out.n_accepted + 1;
             self.rollback_verify(r.lane, si, n_keep);
             let last_tok = *out.emitted.last().expect("verify emits >= 1 token");
-            self.on(r.lane).set_tokens(r.p0 + n_keep, &[last_tok]);
+            if r.p0 + n_keep < self.max_ctx {
+                self.on(r.lane).set_tokens(r.p0 + n_keep, &[last_tok]);
+            }
         }
         Ok(outs)
     }
@@ -4716,33 +4778,7 @@ impl Engine {
             let tbl = lane.block_table.borrow();
             let kvb = eb as u32;
             for d in 0..t {
-                let pos = p0 + d;
-                let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
-                let mut rows = Vec::with_capacity(N_PHYS * 2 * NKV * row);
-                for ip in 0..N_PHYS {
-                    let (swa, pass_idx) = self.slot_kind[ip];
-                    let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
-                    let entry = tbl
-                        .get(kind, bi)
-                        .expect("paged block in range")
-                        .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
-                    let slot_slice = pools.of(kind).slot_bytes(entry.slot()).expect("paged slot bytes");
-                    for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
-                        for h in 0..NKV as u32 {
-                            let off = crate::blocks::metal_in_slot_byte_offset(
-                                kind,
-                                kvb,
-                                pass_idx as u32,
-                                plane,
-                                h,
-                                pos as u32,
-                            )
-                            .expect("in-slot offset") as usize;
-                            rows.extend_from_slice(&slot_slice[off..off + row]);
-                        }
-                    }
-                }
-                out.push(KvUndo { pos, rows });
+                out.push(snapshot_paged_kv_pos(&pools, &tbl, &self.slot_kind, kvb, p0 + d));
             }
             return out;
         }
@@ -4777,27 +4813,7 @@ impl Engine {
         if lane.use_blocks.get() {
             let mut pools = self.block_pool.borrow_mut();
             let tbl = lane.block_table.borrow();
-            let bi = crate::blocks::BlockIndex::new((pos / crate::blocks::BLOCK) as u32);
-            let kvb = eb as u32;
-            for ip in 0..N_PHYS {
-                let (swa, pass_idx) = self.slot_kind[ip];
-                let kind = if swa { crate::blocks::BlockKind::Window } else { crate::blocks::BlockKind::Full };
-                let entry = tbl
-                    .get(kind, bi)
-                    .expect("paged block in range")
-                    .unwrap_or_else(|| panic!("paged lane missing {kind:?} block at pos {pos}"));
-                let slot_slice = pools.of_mut(kind).slot_bytes_mut(entry.slot()).expect("paged slot bytes mut");
-                for plane in [crate::blocks::Kv::Key, crate::blocks::Kv::Value] {
-                    for h in 0..NKV as u32 {
-                        let off =
-                            crate::blocks::metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32)
-                                .expect("in-slot offset") as usize;
-                        slot_slice[off..off + row].copy_from_slice(&undo.rows[at..at + row]);
-                        at += row;
-                    }
-                }
-            }
-            assert_eq!(at, undo.rows.len());
+            restore_paged_kv_pos(&mut pools, &tbl, &self.slot_kind, eb as u32, undo);
             return;
         }
         for slot in 0..N_SLOT {

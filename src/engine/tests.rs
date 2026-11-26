@@ -3328,3 +3328,86 @@ fn sub4bit_quant_real_model_lmhead_logits_cosine_and_top1_on_m5() {
         assert!(top1_match >= 4, "{label} real LM-head top-1 agreement {top1_match}/{} too low", prompts.len());
     }
 }
+
+#[test]
+fn paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes() {
+    use crate::blocks::{metal_in_slot_byte_offset, BlockEntry, BlockIndex, BlockKind, BlockPools, BlockTable, Kv, Slot};
+    let mut pools = BlockPools::with_capacities(4, 4, 2).unwrap();
+    let mut tbl = BlockTable::new(4).unwrap();
+    let win_slot = Slot::new(1).unwrap();
+    let full_slot = Slot::new(1).unwrap();
+    let win_off = pools.window.take(win_slot).unwrap();
+    let full_off = pools.full.take(full_slot).unwrap();
+    let win_gen = pools.window.record(win_slot).unwrap().generation();
+    let full_gen = pools.full.record(full_slot).unwrap().generation();
+    tbl.set(BlockKind::Window, BlockIndex::new(0), Some(BlockEntry::new(win_slot, win_gen, win_off, BlockKind::Window, 2))).unwrap();
+    tbl.set(BlockKind::Full, BlockIndex::new(0), Some(BlockEntry::new(full_slot, full_gen, full_off, BlockKind::Full, 2))).unwrap();
+
+    let loop_n = LOOP_END - LOOP_START;
+    let mut slot_kind = Vec::with_capacity(N_SLOT);
+    let (mut swa_i, mut full_i) = (0usize, 0usize);
+    for ip in 0..N_SLOT {
+        let phys = if ip < N_PHYS { ip } else { LOOP_START + (ip - N_PHYS) % loop_n };
+        let swa = !(phys + 1).is_multiple_of(BLOCK);
+        if swa {
+            slot_kind.push((true, swa_i));
+            swa_i += 1;
+        } else {
+            slot_kind.push((false, full_i));
+            full_i += 1;
+        }
+    }
+    assert_eq!(slot_kind.len(), N_SLOT);
+
+    let pos = 7usize;
+    let kvb = 2u32;
+    let row_bytes = HD * (kvb as usize);
+    // Stamp every single pass (0..48, including loop passes 1 and 2 at 24..48) with a distinct pre-verify pattern.
+    for (slot_idx, &(swa, pass_idx)) in slot_kind.iter().enumerate() {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of_mut(kind).slot_bytes_mut(entry.slot()).unwrap();
+        for (pi, plane) in [Kv::Key, Kv::Value].into_iter().enumerate() {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                let tag = ((slot_idx as u8).wrapping_mul(3)).wrapping_add((pi as u8) * 100).wrapping_add(h as u8) | 1;
+                bytes[off..off + row_bytes].fill(tag);
+            }
+        }
+    }
+
+    let undo = snapshot_paged_kv_pos(&pools, &tbl, &slot_kind, kvb, pos);
+    assert_eq!(undo.rows.len(), N_SLOT * 2 * NKV * row_bytes);
+
+    // Corrupt all 48 passes (simulating a rejected speculative draft write).
+    for &(swa, pass_idx) in &slot_kind {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of_mut(kind).slot_bytes_mut(entry.slot()).unwrap();
+        for plane in [Kv::Key, Kv::Value] {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                bytes[off..off + row_bytes].fill(0xEE);
+            }
+        }
+    }
+
+    restore_paged_kv_pos(&mut pools, &tbl, &slot_kind, kvb, &undo);
+
+    // Verify all 48 passes — specifically including loop passes 24..48 — are restored byte-for-byte.
+    for (slot_idx, &(swa, pass_idx)) in slot_kind.iter().enumerate() {
+        let kind = if swa { BlockKind::Window } else { BlockKind::Full };
+        let entry = tbl.get(kind, BlockIndex::new(0)).unwrap().unwrap();
+        let bytes = pools.of(kind).slot_bytes(entry.slot()).unwrap();
+        for (pi, plane) in [Kv::Key, Kv::Value].into_iter().enumerate() {
+            for h in 0..NKV as u32 {
+                let off = metal_in_slot_byte_offset(kind, kvb, pass_idx as u32, plane, h, pos as u32).unwrap() as usize;
+                let want = ((slot_idx as u8).wrapping_mul(3)).wrapping_add((pi as u8) * 100).wrapping_add(h as u8) | 1;
+                assert!(
+                    bytes[off..off + row_bytes].iter().all(|&b| b == want),
+                    "slot {slot_idx} (kind={kind:?}, pass={pass_idx}, plane={plane:?}, head={h}) was not restored"
+                );
+            }
+        }
+    }
+}
