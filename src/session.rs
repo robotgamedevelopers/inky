@@ -56,7 +56,10 @@ impl<'a> Session<'a> {
     pub fn checkpoint(&self) -> TurnCheckpoint {
         let win_lo = self.n_past.saturating_sub(crate::blocks::WINDOW);
         let win_cnt = self.n_past - win_lo;
-        let window_kv = if win_cnt > 0 && !self.run().tier_on() {
+        if win_cnt > 0 && self.run().tier_on() {
+            self.run().tier_leave(self.n_past);
+        }
+        let window_kv = if win_cnt > 0 {
             self.eng.snapshot_kv_positions(&self.lane, win_lo, win_cnt)
         } else {
             Vec::new()
@@ -70,15 +73,16 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Restore `self` to `ckpt` after a failed turn. When `ckpt.n_past == 0` (or `--kv-disk` is
-    /// active, where file blocks cannot be un-staged cheaply), resets the lane cleanly when at 0;
-    /// otherwise restores `cs` and the live sliding-window K/V rows (`0..ckpt.n_past` in `kv_full`
-    /// is never overwritten by writes at `>= ckpt.n_past`).
+    /// Restore `self` to `ckpt` after a failed turn. When `ckpt.n_past == 0`, resets the lane
+    /// cleanly; otherwise leaves any active `--kv-disk` hot ring and truncates cold-file metadata
+    /// past `ckpt.n_past` before restoring `cs`, live sliding-window K/V rows, and zeroing the
+    /// uncommitted tail.
     pub fn rollback(&mut self, ckpt: TurnCheckpoint) {
         if ckpt.n_past == 0 {
             self.run().reset();
         } else {
             self.run().set_cs(&ckpt.cs);
+            self.run().tier_rollback(ckpt.n_past);
             for undo in &ckpt.window_kv {
                 self.eng.restore_kv_pos(&self.lane, undo);
             }
@@ -471,6 +475,183 @@ mod tests {
             assert_eq!(sess.n_past, want_npast, "{label}: retry n_past mismatch");
             assert_eq!(eng.lane_hash(&sess.lane), want_hash, "{label}: retry lane_hash mismatch");
             assert_eq!(&retry_out, want_out2, "{label}: retry output mismatch");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Inkling-2-Mini GGUF"]
+    fn cli_session_kv_disk_recovers_across_tier_entry_and_active_tier_rollback() {
+        use crate::engine::KV_DISK;
+        use crate::metal::{clear_wait_failure, inject_wait_failure};
+        use std::sync::atomic::Ordering;
+
+        struct KvDiskGuard;
+        impl Drop for KvDiskGuard {
+            fn drop(&mut self) {
+                KV_DISK.store(false, Ordering::Relaxed);
+                clear_wait_failure();
+            }
+        }
+        let _guard = KvDiskGuard;
+
+        let model = std::env::var("INKY_TEST_MODEL").unwrap_or_else(|_| crate::default_model());
+        let mut eng = Engine::load(&model, 2048);
+        eng.chunk = 128;
+        let tk = Tokenizer::load(&eng.g);
+
+        let make_turn = |target_tokens: usize, phrase: &str| -> Vec<u32> {
+            let mut toks = tk.encode("<|message_user|><|content_text|>", true);
+            let piece = tk.encode(phrase, false);
+            while toks.len() + 2 < target_tokens {
+                toks.extend_from_slice(&piece);
+            }
+            toks.extend(tk.encode("<|end_message|><|message_model|>", true));
+            toks
+        };
+
+        let make_disk_session = || -> Session<'_> {
+            KV_DISK.store(true, Ordering::Relaxed);
+            let sess = Session::new(&eng, &tk);
+            KV_DISK.store(false, Ordering::Relaxed);
+            sess
+        };
+
+        let snapshot_all_kv = |sess: &Session<'_>| -> Vec<Vec<u8>> {
+            if sess.run().tier_on() {
+                sess.run().tier_leave(sess.n_past);
+            }
+            eng.snapshot_kv_positions(&sess.lane, 0, sess.n_past)
+                .into_iter()
+                .map(|u| u.rows)
+                .collect()
+        };
+
+        // 0. Guard check: restore_kv_pos must panic cleanly rather than write OOB when pos >= full_cap.
+        {
+            let mut sess = make_disk_session();
+            let short = make_turn(16, " hello");
+            let mut s = Sampler::new(0.0, 64, 0.95, eng.softcap, 1);
+            let mut out = Vec::new();
+            sess.run_chat_turn(&short, 2, true, true, &mut s, &mut out).unwrap();
+            let mut oob = eng.snapshot_kv_positions(&sess.lane, 0, 1).pop().unwrap();
+            oob.pos = eng.max_ctx + 1;
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                eng.restore_kv_pos(&sess.lane, &oob);
+            }))
+            .is_err();
+            assert!(panicked, "restore_kv_pos must assert on out-of-range full-attention pos");
+        }
+
+        // 1. Trigger A: Turn 1 ends below tier.min_n (512, tier_on == false), Turn 2 crosses min_n
+        //    and calls tier_enter() (shrinking kv_full hot ring below turn1_npast), then fails
+        //    in decode and rolls back without OOB Metal writes.
+        let turn1_a = make_turn(360, " alpha beta gamma");
+        let turn2_a = make_turn(240, " delta epsilon zeta");
+        let (want_a_npast, want_a_hash, want_a_out2) = {
+            let mut sess = make_disk_session();
+            let mut s1 = Sampler::new(0.0, 64, 0.95, eng.softcap, 101);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1_a, 4, true, true, &mut s1, &mut out1).unwrap();
+            assert!(!sess.run().tier_on(), "Trigger A Turn 1 must stay below tier.min_n");
+            let mut s2 = Sampler::new(0.0, 64, 0.95, eng.softcap, 202);
+            let mut out2 = Vec::new();
+            sess.run_chat_turn(&turn2_a, 4, true, true, &mut s2, &mut out2).unwrap();
+            assert!(sess.run().tier_on(), "Trigger A Turn 2 must enter disk tier");
+            sess.run().tier_leave(sess.n_past);
+            (sess.n_past, eng.lane_hash(&sess.lane), out2)
+        };
+        {
+            let mut sess = make_disk_session();
+            let mut s1 = Sampler::new(0.0, 64, 0.95, eng.softcap, 101);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1_a, 4, true, true, &mut s1, &mut out1).unwrap();
+            assert!(!sess.run().tier_on());
+            let t1_npast = sess.n_past;
+            let t1_cs = sess.run().get_cs();
+            let t1_kv = snapshot_all_kv(&sess);
+
+            inject_wait_failure("decode", 0);
+            let mut s_fail = Sampler::new(0.0, 64, 0.95, eng.softcap, 202);
+            let mut fail_out = Vec::new();
+            let res = sess.run_chat_turn(&turn2_a, 4, true, true, &mut s_fail, &mut fail_out);
+            clear_wait_failure();
+            assert!(res.is_err(), "Trigger A injected decode failure must return Err");
+            assert!(!sess.run().tier_on(), "Trigger A rollback must leave disk tier cleanly");
+            assert_eq!(sess.n_past, t1_npast);
+            assert_eq!(sess.run().get_cs(), t1_cs);
+            assert_eq!(snapshot_all_kv(&sess), t1_kv, "Trigger A rollback must preserve Turn 1 KV");
+
+            let mut s2 = Sampler::new(0.0, 64, 0.95, eng.softcap, 202);
+            let mut retry_out2 = Vec::new();
+            sess.run_chat_turn(&turn2_a, 4, true, true, &mut s2, &mut retry_out2).unwrap();
+            assert!(sess.run().tier_on(), "Trigger A retry must re-enter disk tier cleanly");
+            sess.run().tier_leave(sess.n_past);
+            assert_eq!(sess.n_past, want_a_npast);
+            assert_eq!(eng.lane_hash(&sess.lane), want_a_hash);
+            assert_eq!(retry_out2, want_a_out2);
+        }
+
+        // 2. Trigger B: Turn 1 ends >= tier.min_n with tier_on() == true; Turn 2 fails either in
+        //    prefill (after overwriting SWA ring slots) or in decode (after re-entering tier and
+        //    writing Turn 2 cold data), rolls back, and Turn 2 retry + Turn 3 match baseline bit-for-bit.
+        let turn1_b = make_turn(560, " mercury venus earth");
+        let turn2_b = make_turn(220, " mars jupiter saturn");
+        let turn3_b = make_turn(160, " uranus neptune pluto");
+        let (want_b_npast, want_b_hash, want_b_out2, want_b_out3) = {
+            let mut sess = make_disk_session();
+            let mut s1 = Sampler::new(0.0, 64, 0.95, eng.softcap, 303);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1_b, 4, true, true, &mut s1, &mut out1).unwrap();
+            assert!(sess.run().tier_on(), "Trigger B Turn 1 must finish with tier_on()");
+            let mut s2 = Sampler::new(0.0, 64, 0.95, eng.softcap, 404);
+            let mut out2 = Vec::new();
+            sess.run_chat_turn(&turn2_b, 4, true, true, &mut s2, &mut out2).unwrap();
+            assert!(sess.run().tier_on(), "Trigger B Turn 2 must finish with tier_on()");
+            let mut s3 = Sampler::new(0.0, 64, 0.95, eng.softcap, 505);
+            let mut out3 = Vec::new();
+            sess.run_chat_turn(&turn3_b, 4, true, true, &mut s3, &mut out3).unwrap();
+            assert!(sess.run().tier_on(), "Trigger B Turn 3 must finish with tier_on()");
+            sess.run().tier_leave(sess.n_past);
+            (sess.n_past, eng.lane_hash(&sess.lane), out2, out3)
+        };
+
+        for (label, stage, call_idx) in [
+            ("Trigger B prefill failure", "prefill", 1usize),
+            ("Trigger B decode failure", "decode", 0usize),
+        ] {
+            let mut sess = make_disk_session();
+            let mut s1 = Sampler::new(0.0, 64, 0.95, eng.softcap, 303);
+            let mut out1 = Vec::new();
+            sess.run_chat_turn(&turn1_b, 4, true, true, &mut s1, &mut out1).unwrap();
+            assert!(sess.run().tier_on(), "{label}: Turn 1 must finish with tier_on()");
+            let t1_npast = sess.n_past;
+            let t1_cs = sess.run().get_cs();
+
+            inject_wait_failure(stage, call_idx);
+            let mut s_fail = Sampler::new(0.0, 64, 0.95, eng.softcap, 404);
+            let mut fail_out = Vec::new();
+            let res = sess.run_chat_turn(&turn2_b, 4, true, true, &mut s_fail, &mut fail_out);
+            clear_wait_failure();
+            assert!(res.is_err(), "{label}: injected {stage}[{call_idx}] failure must return Err");
+            assert!(!sess.run().tier_on(), "{label}: rollback must leave disk tier cleanly");
+            assert_eq!(sess.n_past, t1_npast, "{label}: n_past mismatch after rollback");
+            assert_eq!(sess.run().get_cs(), t1_cs, "{label}: cs mismatch after rollback");
+
+            // Continue cleanly with Turn 2 retry + Turn 3 (re-entering disk tier on both).
+            let mut s2 = Sampler::new(0.0, 64, 0.95, eng.softcap, 404);
+            let mut retry_out2 = Vec::new();
+            sess.run_chat_turn(&turn2_b, 4, true, true, &mut s2, &mut retry_out2).unwrap();
+            assert!(sess.run().tier_on(), "{label}: Turn 2 retry must re-enter disk tier");
+            let mut s3 = Sampler::new(0.0, 64, 0.95, eng.softcap, 505);
+            let mut retry_out3 = Vec::new();
+            sess.run_chat_turn(&turn3_b, 4, true, true, &mut s3, &mut retry_out3).unwrap();
+            assert!(sess.run().tier_on(), "{label}: Turn 3 must re-enter disk tier");
+            sess.run().tier_leave(sess.n_past);
+
+            assert_eq!(sess.n_past, want_b_npast, "{label}: final n_past mismatch");
+            assert_eq!(eng.lane_hash(&sess.lane), want_b_hash, "{label}: final lane_hash mismatch");
+            assert_eq!(retry_out2, want_b_out2, "{label}: Turn 2 retry output mismatch");
+            assert_eq!(retry_out3, want_b_out3, "{label}: Turn 3 output mismatch");
         }
     }
 }

@@ -719,42 +719,45 @@ pub fn repair_torn_jsonl_file(path: &Path) -> std::io::Result<u64> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    let len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(0);
-    }
-    // Scan backwards from `len - 1` to find the start of the final line so we do not read
-    // an entire 100 MiB segment into memory during normal appends.
-    let mut scan_end = if len > 0 { len - 1 } else { 0 };
-    let mut last_line_start = 0u64;
+    let orig_len = file.metadata()?.len();
+    let mut len = orig_len;
     let mut buf = [0u8; 64 * 1024];
-    while scan_end > 0 {
-        let chunk_len = scan_end.min(buf.len() as u64) as usize;
-        let chunk_pos = scan_end - chunk_len as u64;
-        file.seek(SeekFrom::Start(chunk_pos))?;
-        file.read_exact(&mut buf[..chunk_len])?;
-        if let Some(rel) = buf[..chunk_len].iter().rposition(|&b| b == b'\n') {
-            last_line_start = chunk_pos + rel as u64 + 1;
+    while len > 0 {
+        // Scan backwards from `len - 1` to find the start of the final line so we do not read
+        // an entire 100 MiB segment into memory during normal appends.
+        let mut scan_end = len - 1;
+        let mut last_line_start = 0u64;
+        while scan_end > 0 {
+            let chunk_len = scan_end.min(buf.len() as u64) as usize;
+            let chunk_pos = scan_end - chunk_len as u64;
+            file.seek(SeekFrom::Start(chunk_pos))?;
+            file.read_exact(&mut buf[..chunk_len])?;
+            if let Some(rel) = buf[..chunk_len].iter().rposition(|&b| b == b'\n') {
+                last_line_start = chunk_pos + rel as u64 + 1;
+                break;
+            }
+            scan_end = chunk_pos;
+        }
+        let tail_len = usize::try_from(len - last_line_start)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "record line exceeds usize"))?;
+        let mut tail = vec![0u8; tail_len];
+        file.seek(SeekFrom::Start(last_line_start))?;
+        file.read_exact(&mut tail)?;
+        let valid_last_line = tail.ends_with(b"\n")
+            && serde_json::from_slice::<Value>(&tail[..tail.len() - 1])
+                .ok()
+                .and_then(|v| RecordEntry::from_json(&v).ok())
+                .is_some();
+        if valid_last_line {
             break;
         }
-        scan_end = chunk_pos;
+        len = last_line_start;
     }
-    let tail_len = usize::try_from(len - last_line_start)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "record line exceeds usize"))?;
-    let mut tail = vec![0u8; tail_len];
-    file.seek(SeekFrom::Start(last_line_start))?;
-    file.read_exact(&mut tail)?;
-    let valid_last_line = tail.ends_with(b"\n")
-        && serde_json::from_slice::<Value>(&tail[..tail.len() - 1])
-            .ok()
-            .and_then(|v| RecordEntry::from_json(&v).ok())
-            .is_some();
-    if valid_last_line {
-        return Ok(len);
+    if len != orig_len {
+        file.set_len(len)?;
+        file.sync_data()?;
     }
-    file.set_len(last_line_start)?;
-    file.sync_data()?;
-    Ok(last_line_start)
+    Ok(len)
 }
 
 fn repair_existing_record_files(dir: &Path) -> std::io::Result<()> {
@@ -1400,6 +1403,60 @@ mod tests {
         assert!(final_content.ends_with('\n'));
         let entries = parse_jsonl(&final_content).unwrap();
         assert_eq!(entries.iter().map(|e| e.turn_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_torn_jsonl_file_strips_multiple_trailing_corrupt_and_blank_lines() {
+        let dir = temp_dir("torn-multi");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ts = 1_795_543_200_000u64;
+        let path = dir.join("cards-20261124.jsonl");
+        let valid_entry = RecordEntry {
+            schema_version: SCHEMA_VERSION,
+            recorded_at_ms: ts,
+            card_id: "card-multi".into(),
+            turn_index: 0,
+            endpoint: "/v1/chat/completions".into(),
+            request: json!({"messages": [{"role": "user", "content": "hi"}]}),
+            response: ResponseMetrics {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                ttft_ms: 1,
+                total_ms: 3,
+                queue_ms: 0,
+                prefill_ms: 1,
+                decode_ms: 2,
+                finish_reason: "stop".into(),
+                status_code: 200,
+                generation_finish_reason: None,
+                delivery_status: None,
+            },
+        };
+        let mut valid_line = serde_json::to_vec(&valid_entry.to_json()).unwrap();
+        valid_line.push(b'\n');
+        let clean_len = valid_line.len() as u64;
+
+        // Case 1: valid line followed by corrupt line and trailing blank lines.
+        let mut raw = valid_line.clone();
+        raw.extend_from_slice(b"{\"schema_version\":1,\"broken\n\n\n");
+        fs::write(&path, &raw).unwrap();
+        assert_eq!(repair_torn_jsonl_file(&path).unwrap(), clean_len);
+        assert_eq!(parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap().len(), 1);
+
+        // Case 2: valid line followed by two corrupt lines (last unterminated).
+        let mut raw2 = valid_line;
+        raw2.extend_from_slice(b"not-json\n{\"schema_version\":1,\"truncated");
+        fs::write(&path, &raw2).unwrap();
+        assert_eq!(repair_torn_jsonl_file(&path).unwrap(), clean_len);
+        assert_eq!(parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap().len(), 1);
+
+        // Case 3: only corrupt/blank lines -> truncates cleanly to 0 bytes.
+        fs::write(&path, b"corrupt1\n\ncorrupt2\n").unwrap();
+        assert_eq!(repair_torn_jsonl_file(&path).unwrap(), 0);
+        assert!(parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap().is_empty());
+
         let _ = fs::remove_dir_all(&dir);
     }
 

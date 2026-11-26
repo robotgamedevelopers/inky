@@ -195,6 +195,12 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         ("src/serve/step_trace.rs", "dump", ".github/workflows/ci.yml", "serve::scheduler_trace::dump"),
         (
             "src/session.rs",
+            "cli_session_kv_disk_recovers_across_tier_entry_and_active_tier_rollback",
+            "tests/nightly.sh",
+            "session::tests::cli_session_kv_disk_recovers_across_tier_entry_and_active_tier_rollback",
+        ),
+        (
+            "src/session.rs",
             "cli_session_recovers_from_injected_prefill_and_decode_failures",
             "tests/nightly.sh",
             "session::tests::cli_session_recovers_from_injected_prefill_and_decode_failures",

@@ -17,25 +17,37 @@ fn parse_tool_call(header: &[u8], body: &[u8]) -> (String, Value) {
 /// a truncated tool body must never become a call.
 fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut(ReplyPart)) {
     #[derive(PartialEq)] enum M { Header, Think, Text, Tool, None }
-    let (mut mode, mut cur, mut header) = (M::None, Vec::<u8>::new(), Vec::<u8>::new());
-    let flush_open = |mode: &M, cur: &mut Vec<u8>, emit: &mut dyn FnMut(ReplyPart)| {
+    let (mut mode, mut cur, mut header, mut text_acc) = (M::None, Vec::<u8>::new(), Vec::<u8>::new(), String::new());
+    let flush_open = |mode: &M, cur: &mut Vec<u8>, text_acc: &mut String, emit: &mut dyn FnMut(ReplyPart)| {
         match mode {
-            M::Think => emit(ReplyPart::Thinking(take_stream_text(cur, true))),
-            M::Text => emit(ReplyPart::Text(take_stream_text(cur, true))),
-            _ => cur.clear(),
+            M::Think => {
+                text_acc.push_str(&take_stream_text(cur, true));
+                emit(ReplyPart::Thinking(std::mem::take(text_acc)));
+            }
+            M::Text => {
+                text_acc.push_str(&take_stream_text(cur, true));
+                emit(ReplyPart::Text(std::mem::take(text_acc)));
+            }
+            _ => {
+                cur.clear();
+                text_acc.clear();
+            }
         }
     };
     for &t in toks {
         if sp.is_role_stop(t) {
-            flush_open(&mode, &mut cur, &mut emit);
+            flush_open(&mode, &mut cur, &mut text_acc, &mut emit);
             mode = M::None;
             break;
         }
         let ends = t == sp.end || t == sp.end_sampling || t == tk.eos;
         if t == sp.msg_model || t == sp.c_think || t == sp.c_text || t == sp.c_tool || ends {
-            if t == sp.c_text && mode == M::Text { continue; }
+            if t == sp.c_text && mode == M::Text {
+                text_acc.push_str(&take_stream_text(&mut cur, true));
+                continue;
+            }
             match mode {
-                M::Text | M::Think => flush_open(&mode, &mut cur, &mut emit),
+                M::Text | M::Think => flush_open(&mode, &mut cur, &mut text_acc, &mut emit),
                 M::Tool if ends => {
                     let (name, args) = parse_tool_call(&header, &cur);
                     emit(ReplyPart::Tool(name, args));
@@ -50,7 +62,7 @@ fn visit_reply(tk: &Tokenizer, sp: &Specials, toks: &[u32], mut emit: impl FnMut
             match mode { M::Header => header.extend(tk.decode_bytes(t)), M::None => {}, _ => cur.extend(tk.decode_bytes(t)) }
         }
     }
-    flush_open(&mode, &mut cur, &mut emit);
+    flush_open(&mode, &mut cur, &mut text_acc, &mut emit);
 }
 
 /// Chat represents text, reasoning and tool calls in separate fields.
@@ -208,6 +220,48 @@ impl BlockStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_content_text_flushes_incomplete_utf8_matching_block_stream() {
+        let tk = Tokenizer::for_byte_test();
+        let sp = Specials::try_from_tokenizer(&tk).unwrap();
+        let byte_tok = |b: u8| tk.eos + 1 + u32::from(b);
+
+        // Split 3-byte UTF-8 Euro sign (E2 82 AC) across consecutive <|content_text|> markers.
+        let toks = [sp.c_text, byte_tok(0xE2), sp.c_text, byte_tok(0x82), byte_tok(0xAC), sp.end];
+
+        let parsed = parse(&tk, &sp, &toks);
+        let content = anthropic_content(&tk, &sp, &toks, "test", 1);
+
+        let mut bs = BlockStream::new("test", 1);
+        let mut events: Vec<Value> = Vec::new();
+        for &t in &toks {
+            for raw in bs.on_token(&tk, &sp, t) {
+                let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+                events.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        for raw in bs.close_all() {
+            let data = raw.split("\ndata: ").nth(1).unwrap().trim_end();
+            events.push(serde_json::from_str(data).unwrap());
+        }
+        let bs_starts = events.iter().filter(|e| e["type"] == "content_block_start").count();
+        let bs_text: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .map(|e| e["delta"]["text"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(bs_starts, 1);
+        assert_eq!(bs_text, "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(parsed.text, bs_text);
+        assert_eq!(content, vec![json!({"type": "text", "text": "\u{FFFD}\u{FFFD}\u{FFFD}"})]);
+
+        // Normal ASCII split across consecutive <|content_text|> stays in one text block.
+        let ascii_toks = [sp.c_text, byte_tok(b'H'), byte_tok(b'i'), sp.c_text, byte_tok(b'!'), sp.end];
+        assert_eq!(parse(&tk, &sp, &ascii_toks).text, "Hi!");
+        assert_eq!(anthropic_content(&tk, &sp, &ascii_toks, "test", 2), vec![json!({"type": "text", "text": "Hi!"})]);
+    }
 
     #[test] fn stream_utf8_recovers_and_flushes_incomplete_sequences() {
         let mut pend = vec![0xff, b'h', b'i', 0xe2, 0x82];
