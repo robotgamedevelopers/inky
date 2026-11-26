@@ -62,25 +62,25 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/blocks.rs",
             "gpu_pool_zero_fills_a_taken_slot",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "blocks::tests::gpu_pool_zero_fills_a_taken_slot",
         ),
         (
             "src/cache_scheduler/tests.rs",
             "dump_block_layout",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "cache_scheduler::tests::dump_block_layout",
         ),
         (
             "src/cache_scheduler/tests.rs",
             "dump_cache_scheduler",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "cache_scheduler::tests::dump_cache_scheduler",
         ),
         (
             "src/engine/tests.rs",
             "dspark_gpu_guards_and_rejection_sampling_gate",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "engine::tests::dspark_gpu_guards_and_rejection_sampling_gate",
         ),
         (
@@ -98,7 +98,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/engine/tests.rs",
             "engine_encode_decode_64_positions_syncs_once_then_63_zero_steps",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "engine::tests::engine_encode_decode_64_positions_syncs_once_then_63_zero_steps",
         ),
         (
@@ -110,7 +110,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/engine/tests.rs",
             "k_attn_b_and_blk_are_split_invariant_across_sliding_window",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "engine::tests::k_attn_b_and_blk_are_split_invariant_across_sliding_window",
         ),
         (
@@ -128,7 +128,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/engine/tests.rs",
             "router_handles_nonfinite_scores",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "engine::tests::router_handles_nonfinite_scores",
         ),
         (
@@ -164,20 +164,20 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/memd.rs",
             "fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "memd::tests:: -- --ignored",
         ),
         (
             "src/memd.rs",
             "legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "memd::tests:: -- --ignored",
         ),
         ("src/prefix.rs", "prefix_trace_dump", "specs/run_tlc.zsh", "prefix::tests::prefix_trace_dump"),
         (
             "src/serve.rs",
             "gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "serve::tests::gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
         ),
         (
@@ -192,7 +192,7 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
             "tests/nightly.sh",
             "serve::block_cache::tests::spill_model::restored_long_prefix_and_early_fork_match_cold_logits",
         ),
-        ("src/serve/step_trace.rs", "dump", ".github/workflows/ci.yml", "serve::scheduler_trace::dump"),
+        ("src/serve/step_trace.rs", "dump", ".github/workflows/nightly.yml", "serve::scheduler_trace::dump"),
         (
             "src/session.rs",
             "cli_session_kv_disk_recovers_across_tier_entry_and_active_tier_rollback",
@@ -208,14 +208,14 @@ fn every_ignored_test_is_ledgered_and_wired_to_a_ci_tier() {
         (
             "src/spill/tests.rs",
             "kill9_mid_write_loses_cache_never_correctness",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "spill::tests::kill9_mid_write_loses_cache_never_correctness",
         ),
         ("src/spill/tests.rs", "kill9_writer_helper", "src/spill/tests.rs", "spill::tests::kill9_writer_helper"),
         (
             "src/tokenizer.rs",
             "real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism",
-            ".github/workflows/ci.yml",
+            ".github/workflows/nightly.yml",
             "tokenizer::tests::real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism",
         ),
     ];

@@ -47,16 +47,11 @@ def validate_no_main_cancellation(doc, workflow_name):
                 _validate_concurrency_block(job["concurrency"], f"{workflow_name}:jobs.{job_name}")
 
 
+# Every job of .github/workflows/ci.yml: since 2026-11-25 the main push runs unit tests and the smoke test only;
+# everything else is nightly (tests/test_release_ci.py keeps this set equal to ci.yml's jobs).
 REQUIRED_JOBS = {
     "unit",
-    "go",
-    "tla (memmode)",
-    "tla (blocks)",
-    "tla (grouped)",
-    "tla (traces)",
-    "m5-online-check",
-    "m5-gpu",
-    "m5-serve",
+    "smoke",
 }
 
 TAG_PATTERN = re.compile(r"^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$")

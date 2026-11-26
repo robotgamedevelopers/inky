@@ -14,8 +14,8 @@ model=${2:-$HOME/.lmstudio/models/lmstudio-community/Inkling-2-Mini-GGUF/Inkling
 bin_abs=${bin:A}
 model_abs=${model:A}
 # Exercise header rejection order on parsed metadata, entirely in-process.
-# INKY_SERVE_PROBES_ONLY=1 (the pull-request m5-serve job) runs serve_header_policy in unit and
-# serve_layer3_three_turn_10k_cached_matches_cold_solo in an explicit --profile ci step.
+# INKY_SERVE_PROBES_ONLY=1 skips both cargo tests and runs the probes alone, for a caller that runs
+# serve_header_policy (ci.yml's unit job does) and serve_layer3_three_turn_10k_cached_matches_cold_solo itself.
 if [[ "${INKY_SERVE_PROBES_ONLY:-}" == 1 ]]; then
     print -r -- "serve_header_policy: runs in the unit job (cargo test --bins), not here"
 else

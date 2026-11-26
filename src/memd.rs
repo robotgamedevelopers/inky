@@ -1355,7 +1355,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
     #[test]
-    #[ignore = "binds real Unix domain sockets; run in CI socket integration step"]
+    #[ignore = "binds real Unix domain sockets; run in nightly unit-extras socket integration step"]
     fn fake_socket_rebinds_with_private_mode_and_reports_its_peer_uid() {
         // bind_socket changes the process umask around bind. Run the real operation
         // in its own process so other tests can create directories concurrently.
@@ -1387,7 +1387,7 @@ mod tests {
         assert_eq!(peer_uid(&accepted), Some(uid));
     }
     #[test]
-    #[ignore = "binds real Unix domain sockets; run in CI socket integration step"]
+    #[ignore = "binds real Unix domain sockets; run in nightly unit-extras socket integration step"]
     fn legacy_cleanup_removes_the_socket_and_retries_after_a_directory_error() {
         let _fs = TEST_FS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = SocketTestDir::new("old");

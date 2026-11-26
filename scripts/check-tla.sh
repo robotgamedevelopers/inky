@@ -1,13 +1,14 @@
 #!/bin/sh
 # Check every available inky TLA+ model and its reversed witnesses.
 # Usage: scripts/check-tla.sh [all|memmode|layout|blocks|grouped|layout-nightly|scheduler|traces].
-# all (the default) runs every PR part, plus layout-nightly and scheduler when TLA_NIGHTLY=1.
+# all (the default) runs every matrix part (memmode, blocks, grouped, traces), plus layout-nightly and scheduler
+# when TLA_NIGHTLY=1.
 # layout is blocks + grouped: grouped is the GroupedLayout, PoisonGate and ScratchTail checks of
-# specs/run_tlc.zsh, blocks is every other PR check there, so a new model lands in blocks.
+# specs/run_tlc.zsh, blocks is every other matrix check there, so a new model lands in blocks.
 # layout-nightly runs the slow layout configs (PrefixTree, StartTails3) and PrefixTree trace mutants
-# (requires TLA_NIGHTLY=1). The pull-request workflow runs memmode, blocks, grouped and traces as
+# (requires TLA_NIGHTLY=1). The nightly workflow's tla matrix runs memmode, blocks, grouped and traces as
 # parallel jobs; layout-nightly and the CacheScheduler models (scheduler, which also requires
-# TLA_NIGHTLY=1) are exhaustive and slow, so they run nightly.
+# TLA_NIGHTLY=1) are exhaustive and slow, so they run as jobs of their own.
 # traces runs every trace-conformance script named in trace_scripts below, in parallel.
 #
 # scripts/check-tla.sh --list PART prints, one per line, every check and mutant PART runs, as RUNNER:NAME, and runs
