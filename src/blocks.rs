@@ -2235,6 +2235,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     #[cfg(not(standalone_blocks))]
     fn metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window() {
         let kernels_src = include_str!("kernels.metal");

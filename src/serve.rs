@@ -9516,6 +9516,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill() {
         use crate::blocks::{BlockIndex, BlockKind, BlockPools, BlockTable, BLOCK};
         use crate::scheduler::{LaneState, ServeLaneInput, ServeStepPlan, ServeStepPlanner};

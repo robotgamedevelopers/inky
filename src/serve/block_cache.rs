@@ -4628,6 +4628,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn long_spill_restore_keeps_source_and_accepts_early_fork() {
         let dir = ScratchDir::new("long-fork");
         let store = SpillStore::open(&dir.0, 100 * 1024 * 1024).unwrap();
@@ -4666,6 +4667,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn spill_read_failure_releases_provisional_blocks_and_preserves_resident_match() {
         let dir = ScratchDir::new("stream-rollback");
         let store = SpillStore::open(&dir.0, 64 * 1024 * 1024).unwrap();
@@ -4694,6 +4696,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn spill_store_eviction_restore_and_corrupt_fallback() {
         let dir = ScratchDir::new("e2e");
         let store = SpillStore::open_with_kvb(&dir.0, 256 * 1024 * 1024, 1).unwrap();
@@ -4807,6 +4810,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -5009,6 +5013,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite() {
         let dir = ScratchDir::new("reused-disk-ownership");
         let store = SpillStore::open_with_kvb(&dir.0, 256 * 1024 * 1024, 1).unwrap();
@@ -5073,6 +5078,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn spill_index_persists_across_reopen_and_async_restore_keeps_decoding_responsive() {
         let dir = ScratchDir::new("persist-and-async");
         {
@@ -5454,6 +5460,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches() {
         let dir = ScratchDir::new("spill-compat-header");
         let prompt: Vec<u32> = (0..=128u32).map(|i| 20_000 + i).collect();

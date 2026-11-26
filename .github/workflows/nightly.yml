@@ -94,6 +94,36 @@ jobs:
           out=$(cargo test --locked --bins spill::tests::kill9_mid_write_loses_cache_never_correctness -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'spill kill9 gate: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      # The slow unit tests, moved out of ci.yml's unit job on 2026-11-25 so pull-request CI stays near one minute.
+      # Each ran 1.9-28 s on an M5 (summed, 128 s of the 139 s the unit binary spent in tests). Same debug test
+      # profile as ci.yml's unit job, so debug asserts and overflow checks stay on. Each test must run and pass
+      # exactly once; every test runs, and the step fails red naming each one that did not pass.
+      - name: slow unit tests (moved from pull-request CI)
+        if: ${{ !cancelled() }}
+        run: |
+          failed=0
+          for t in \
+            gguf::tests::multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8 \
+            scheduler::tests::bimodal_2k_64k_tight_budget_with_mid_step_disconnects \
+            serve::block_cache::tests::spill_store_eviction_restore_and_corrupt_fallback \
+            serve::block_cache::tests::long_spill_restore_keeps_source_and_accepts_early_fork \
+            engine::tests::paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes \
+            blocks::tests::metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window \
+            serve::block_cache::tests::spill_index_persists_across_reopen_and_async_restore_keeps_decoding_responsive \
+            serve::block_cache::tests::maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools \
+            serve::block_cache::admission_tests::burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity \
+            engine::tests::metal_shader_declarations_and_compiler_validation \
+            cache_scheduler::tests::walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill \
+            sampler::tests::residual_emits_target_argmax_outside_draft_top64_softcap_after_topk \
+            serve::block_cache::tests::spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite \
+            serve::block_cache::tests::spill_read_failure_releases_provisional_blocks_and_preserves_resident_match \
+            serve::tests::overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill \
+            serve::block_cache::tests::spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches; do
+            out=$(cargo test --locked --bins "$t" -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; echo "::error::slow unit test $t failed" >&2; failed=1; continue; }
+            printf '%s\n' "$out"
+            printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo "::error::slow unit test $t: expected exactly 1 passed; 0 failed" >&2; failed=1; }
+          done
+          test "$failed" = 0
       - name: trace dump entrypoints emit non-empty JSONL
         if: ${{ !cancelled() }}
         run: |

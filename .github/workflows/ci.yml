@@ -14,7 +14,7 @@ concurrency:
 # about one minute. Both jobs run on GitHub-hosted runners; nothing here touches a self-hosted runner.
 # Everything else runs in .github/workflows/nightly.yml on the fleet, where it still fails red: the Go tool suites,
 # every TLA+ model, witness and trace check, the slower unit extras (soak qualification shell tests, socket and
-# SIGKILL integration tests, trace dumps, the crates.io dry-run), the release-profile build, and every GPU and
+# SIGKILL integration tests, the unit tests that take a second or more, trace dumps, the crates.io dry-run), the release-profile build, and every GPU and
 # serve gate on the M5 runners. The daily dependency audit is .github/workflows/dependency-audit.yml.
 jobs:
   # unit: a GitHub-hosted ARM Mac; clippy, the CPU-only unit tests in the test profile (overflow checks and debug
