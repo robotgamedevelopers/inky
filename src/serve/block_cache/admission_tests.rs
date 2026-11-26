@@ -283,6 +283,7 @@ fn reference_all_pairs_reserved_full_slots(lanes: &[InflightLaneReserve<'_>]) ->
 }
 
 #[test]
+#[ignore = "slow: runs in nightly unit-extras"]
 fn burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity() {
     const N_LANES: usize = 32;
     const PROMPT_LEN: usize = 65_536;

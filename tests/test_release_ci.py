@@ -1,6 +1,7 @@
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -196,39 +197,77 @@ class ReleaseCiTests(unittest.TestCase):
         self.assertTrue((ROOT / "docs/RELEASE-TAG-PROTECTION.md").is_file())
 
     def test_ci_and_nightly_runner_checks_and_timeouts(self):
+        # Pull requests and main pushes run unit tests and the smoke test only, on GitHub-hosted runners
+        # (Glenn, 2026-11-25); everything else runs nightly on the fleet.
         ci_jobs = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]
-        expanded = set()
+        self.assertEqual(set(ci_jobs), {"unit", "smoke"})
+        self.assertEqual(set(ci_jobs), release_ci.REQUIRED_JOBS)
         for key, job in ci_jobs.items():
             self.assertIn("timeout-minutes", job, f"ci.yml job {key} missing timeout-minutes")
-            if key == "m5-pr-result":
-                self.assertIn("github.event_name == 'pull_request'", job["if"])
-                continue
-            base = job.get("name", key)
-            parts = job.get("strategy", {}).get("matrix", {}).get("part")
-            if parts:
-                expanded.update(f"{base} ({part})" for part in parts)
-            else:
-                expanded.add(base)
-        self.assertEqual(expanded, release_ci.REQUIRED_JOBS)
-        linux = ci_jobs["go"]["steps"]
-        self.assertTrue(any("go test -race ./servecheck" in step.get("run", "")
-                            and step.get("working-directory") == "tests" for step in linux))
-        serve = [step.get("run", "") for step in ci_jobs["m5-serve"]["steps"]
-                 if not step.get("continue-on-error") and not step.get("if")]
-        self.assertTrue(any("serve_layer3_three_turn_10k_cached_matches_cold_solo" in cmd for cmd in serve))
-        self.assertLess(
-            serve.index("tests/serve.sh ./target/ci/inky"),
-            serve.index("tests/serve-negative.sh tests/serve.sh ./target/ci/inky"),
-        )
+            self.assertIsInstance(job["runs-on"], str, f"ci.yml job {key} must run GitHub-hosted")
+            self.assertFalse(job["runs-on"].startswith("self-hosted"), f"ci.yml job {key} runs self-hosted")
+            self.assertNotIn("strategy", job, f"ci.yml job {key} must not fan out")
+            for step in job["steps"]:
+                run = step.get("run", "")
+                self.assertNotIn("--ignored", run, f"ci.yml job {key} runs an ignored test: {run!r}")
+                for slow in (r"cargo publish", r"soak", r"check-tla", r"\bgo (test|vet)\b", r"--release", r"tests/ci\.sh"):
+                    self.assertIsNone(re.search(slow, run), f"ci.yml job {key} runs {slow!r}, which belongs nightly")
+        unit = [step.get("run", "") for step in ci_jobs["unit"]["steps"]]
+        for cmd in ("cargo clippy --locked --bins -- -D warnings", "cargo test --locked --bins --tests",
+                    "python3 tests/test_branch_hygiene.py", "python3 tests/test_release_ci.py"):
+            self.assertIn(cmd, unit)
+        smoke = "\n".join(step.get("run", "") for step in ci_jobs["smoke"]["steps"])
+        self.assertIn("cargo build --locked", smoke)
+        self.assertIn("./target/debug/inky --help", smoke)
 
+        linux = ["self-hosted", "Linux", "X64", "fleet", "tlc"]
+        m5 = ["self-hosted", "macOS", "ARM64", "m5"]
         nightly_jobs = workflow(ROOT / ".github/workflows/nightly.yml")["jobs"]
-        for key, job in nightly_jobs.items():
-            self.assertIn("timeout-minutes", job, f"nightly.yml job {key} missing timeout-minutes")
-        self.assertIn("m5-online-check", nightly_jobs)
-        for wf_jobs in (ci_jobs, nightly_jobs):
-            chk_steps = " ".join(s.get("run", "") for s in wf_jobs["m5-online-check"]["steps"])
-            self.assertNotIn("--cancel-on-offline", chk_steps)
-            self.assertEqual(wf_jobs["m5-online-check"]["permissions"], {"actions": "read", "contents": "read"})
+        dep_jobs = workflow(ROOT / ".github/workflows/dependency-audit.yml")["jobs"]
+        for wf_name, wf_jobs in (("nightly.yml", nightly_jobs), ("dependency-audit.yml", dep_jobs)):
+            for key, job in wf_jobs.items():
+                self.assertIn("timeout-minutes", job, f"{wf_name} job {key} missing timeout-minutes")
+                self.assertIn(job["runs-on"], (linux, m5), f"{wf_name} job {key} is not on a fleet runner")
+                self.assertFalse({"darwin", "services"} & set(job["runs-on"]), f"{wf_name} job {key} can land on a Studio")
+                if key != "guard":
+                    self.assertEqual(job.get("needs"), "guard", f"{wf_name} job {key} does not need guard")
+                for step in job["steps"]:
+                    self.assertNotIn("apt-get", step.get("run", ""), f"{wf_name} job {key} installs packages")
+            self.assertIn("robotgamedevelopers/inky", wf_jobs["guard"]["steps"][0]["run"])
+        expected = {"guard": linux, "go": linux, "tla": linux, "tla-scheduler": linux, "m5-online-check": linux,
+                    "release-cpu": m5, "unit-extras": m5, "tla-layout-nightly": m5, "m5-full": m5}
+        self.assertEqual({k: j["runs-on"] for k, j in nightly_jobs.items()}, expected)
+        self.assertEqual(nightly_jobs["tla"]["strategy"]["matrix"]["part"], ["memmode", "blocks", "grouped", "traces"])
+        go = nightly_jobs["go"]["steps"]
+        self.assertTrue(any("go test -race ./servecheck" in step.get("run", "")
+                            and step.get("working-directory") == "tests" for step in go))
+        self.assertTrue(any("command -v bwrap" in step.get("run", "") for step in go))
+        extras = "\n".join(step.get("run", "") for step in nightly_jobs["unit-extras"]["steps"])
+        for needle in ("tests/soak_qualification_test.sh", "check_branch_hygiene.py --offline-workflows",
+                       "serve_header_policy", "memd::tests:: -- --ignored", "kill9_mid_write_loses_cache_never_correctness",
+                       "serve::scheduler_trace::dump"):
+            self.assertIn(needle, extras)
+        full = [step for step in nightly_jobs["m5-full"]["steps"] if "run" in step]
+        for step in full[2:]:
+            self.assertEqual(step.get("if"), "${{ !cancelled() }}", f"m5-full step {step.get('name')} can be hidden")
+        full_runs = "\n".join(step["run"] for step in full)
+        for gate in ("router_handles_nonfinite_scores", "k_attn_b_and_blk_are_split_invariant_across_sliding_window",
+                     "gpu_pool_zero_fills_a_taken_slot", "dspark_gpu_guards_and_rejection_sampling_gate",
+                     "engine_encode_decode_64_positions_syncs_once_then_63_zero_steps",
+                     "real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism",
+                     "gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token",
+                     "tests/ci.sh full", "tests/serve.sh", "tests/serve-negative.sh tests/serve.sh"):
+            self.assertIn(gate, full_runs)
+        self.assertNotIn("--profile ci", full_runs)
+        chk_steps = " ".join(s.get("run", "") for s in nightly_jobs["m5-online-check"]["steps"])
+        self.assertNotIn("--cancel-on-offline", chk_steps)
+        self.assertIn("--jobs m5-full,release-cpu,unit-extras,tla-layout-nightly", chk_steps)
+        self.assertEqual(nightly_jobs["m5-online-check"]["permissions"], {"actions": "read", "contents": "read"})
+
+        dep_doc = workflow(ROOT / ".github/workflows/dependency-audit.yml")
+        dep_on = dep_doc["on"] if "on" in dep_doc else dep_doc["true"]  # Psych reads the bare key on as true.
+        self.assertEqual(set(dep_on), {"schedule", "workflow_dispatch"})
+        self.assertEqual(dep_on["schedule"], [{"cron": "17 6 * * *"}])
 
     def test_workflows_pin_actions_by_sha_rust_toolchain_and_locked_cargo(self):
         import re
@@ -268,13 +307,21 @@ class ReleaseCiTests(unittest.TestCase):
                         f"{wf_name}:{job_name} runs cargo without pinning Rust 1.98.1",
                     )
 
+    def test_linux_fleet_jobs_are_not_m5_activity(self):
+        fleet = {"name": "go", "status": "in_progress", "labels": ["self-hosted", "Linux", "X64", "fleet", "tlc"],
+                 "runner_name": "hetzner1"}
+        self.assertFalse(check_m5_runner.is_m5_job(fleet, {"m5-full"}))
+        self.assertFalse(check_m5_runner.is_recently_active_m5_job(fleet, {"m5-full"}, 0.0))
+        m5 = dict(fleet, name="release-cpu", labels=["self-hosted", "macOS", "ARM64", "m5"])
+        self.assertTrue(check_m5_runner.is_m5_job(m5, {"m5-full"}))
+
     def test_m5_runner_availability_direct_and_github_token_fallback(self):
         m5_labels = [{"name": "self-hosted"}, {"name": "macOS"}, {"name": "ARM64"}, {"name": "m5"}]
 
         # 1. Direct /actions/runners 200 with online M5 runner -> immediate 0.
         out = io.StringIO()
         rc = check_m5_runner.check_m5_availability(
-            "robotgamedevelopers/inky", 100, ["m5-gpu", "m5-serve"],
+            "robotgamedevelopers/inky", 100, ["m5-full", "unit-extras"],
             api_get=lambda ep: {"runners": [{"name": "m5-ci-runner-1", "status": "online", "labels": m5_labels}]},
             out=out,
         )
@@ -285,7 +332,7 @@ class ReleaseCiTests(unittest.TestCase):
         out = io.StringIO()
         cancelled = []
         rc = check_m5_runner.check_m5_availability(
-            "robotgamedevelopers/inky", 100, ["m5-gpu"],
+            "robotgamedevelopers/inky", 100, ["m5-full"],
             api_get=lambda ep: {"runners": [{"name": "m5-ci-runner-1", "status": "offline", "labels": m5_labels}]},
             api_post=cancelled.append,
             out=out,
@@ -302,14 +349,14 @@ class ReleaseCiTests(unittest.TestCase):
             if "/actions/runs/100/jobs" in ep:
                 calls["own"] += 1
                 st = "queued" if calls["own"] == 1 else "in_progress"
-                return {"jobs": [{"name": "m5-gpu", "status": st}]}
+                return {"jobs": [{"name": "m5-full", "status": st}]}
             if "status=in_progress" in ep or ep.endswith("/actions/runs?per_page=25"):
                 return {"workflow_runs": [{"id": 100}]}
             raise AssertionError(ep)
 
         now = [0.0]
         rc = check_m5_runner.check_m5_availability(
-            "robotgamedevelopers/inky", 100, ["m5-gpu", "m5-serve"],
+            "robotgamedevelopers/inky", 100, ["m5-full", "unit-extras"],
             max_queue_seconds=180, poll_seconds=5,
             api_get=api_picked_up,
             clock=lambda: now[0],
@@ -324,7 +371,7 @@ class ReleaseCiTests(unittest.TestCase):
             if ep.endswith("/actions/runners?per_page=100"):
                 raise check_m5_runner.GhHttpError(403, "HTTP 403")
             if "/actions/runs/100/jobs" in ep:
-                return {"jobs": [{"name": "m5-gpu", "status": "queued"}]}
+                return {"jobs": [{"name": "m5-full", "status": "queued"}]}
             if "status=in_progress" in ep:
                 return {"workflow_runs": []}
             if ep.endswith("/actions/runs?per_page=25"):
@@ -340,7 +387,7 @@ class ReleaseCiTests(unittest.TestCase):
             raise AssertionError(ep)
 
         rc = check_m5_runner.check_m5_availability(
-            "robotgamedevelopers/inky", 100, ["m5-gpu"],
+            "robotgamedevelopers/inky", 100, ["m5-full"],
             api_get=api_recent_other,
             clock=lambda: 0.0,
             wall_time=lambda: check_m5_runner.parse_iso_epoch("2026-11-25T12:42:00Z"),
@@ -354,7 +401,7 @@ class ReleaseCiTests(unittest.TestCase):
             if ep.endswith("/actions/runners?per_page=100"):
                 raise check_m5_runner.GhHttpError(403, "HTTP 403")
             if "/actions/runs/100/jobs" in ep:
-                return {"jobs": [{"name": "m5-gpu", "status": "queued"}, {"name": "m5-serve", "status": "queued"}]}
+                return {"jobs": [{"name": "m5-full", "status": "queued"}, {"name": "unit-extras", "status": "queued"}]}
             if "status=in_progress" in ep or ep.endswith("/actions/runs?per_page=25"):
                 return {"workflow_runs": [{"id": 100}]}
             raise AssertionError(ep)
@@ -363,7 +410,7 @@ class ReleaseCiTests(unittest.TestCase):
         cancelled = []
         out = io.StringIO()
         rc = check_m5_runner.check_m5_availability(
-            "robotgamedevelopers/inky", 100, ["m5-gpu", "m5-serve"],
+            "robotgamedevelopers/inky", 100, ["m5-full", "unit-extras"],
             max_queue_seconds=180, poll_seconds=15, cancel_on_offline=True,
             api_get=api_all_offline,
             api_post=cancelled.append,
@@ -376,31 +423,6 @@ class ReleaseCiTests(unittest.TestCase):
         self.assertIn("::error::No online M5 self-hosted runner picked up the job (0 active M5 runs", out.getvalue())
         self.assertEqual(cancelled, ["repos/robotgamedevelopers/inky/actions/runs/100/cancel"])
 
-
-    def test_pr_m5_result_requires_real_success_and_same_repository(self):
-        job = workflow(ROOT / ".github/workflows/ci.yml")["jobs"]["m5-pr-result"]
-        self.assertIn("always()", job["if"])
-        self.assertIn("github.base_ref == 'main'", job["if"])
-        self.assertEqual(job["needs"], ["m5-gpu", "m5-serve"])
-        step = job["steps"][0]
-        self.assertEqual(step["env"]["GPU"], "${{ needs.m5-gpu.result }}")
-        self.assertEqual(step["env"]["SERVE"], "${{ needs.m5-serve.result }}")
-        for same_repo, gpu, serve, passes in (
-            ("true", "success", "success", True),
-            ("false", "success", "success", False),
-            ("false", "skipped", "skipped", False),
-            ("true", "skipped", "success", False),
-            ("true", "success", "skipped", False),
-            ("true", "failure", "success", False),
-            ("true", "success", "cancelled", False),
-        ):
-            with self.subTest(same_repo=same_repo, gpu=gpu, serve=serve):
-                result = subprocess.run(
-                    ["bash", "-c", step["run"]],
-                    env={"SAME_REPOSITORY": same_repo, "GPU": gpu, "SERVE": serve},
-                    capture_output=True, text=True,
-                )
-                self.assertEqual(result.returncode == 0, passes, result.stderr)
 
     def test_workflows_never_cancel_main_runs(self):
         workflows_dir = ROOT / ".github/workflows"

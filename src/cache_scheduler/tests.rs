@@ -197,6 +197,7 @@ fn cache_scheduler_admit_bypass_step_bypass_and_cold_spill_restore_hold() {
 }
 
 #[test]
+#[ignore = "slow: runs in nightly unit-extras"]
 fn walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill() {
     struct FailAtSink {
         remaining: usize,

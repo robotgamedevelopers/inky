@@ -1,6 +1,11 @@
 name: nightly
-# The checks too slow for the one-minute pull-request CI (ci.yml). Each still fails red here.
-# Every job sets an explicit generous timeout-minutes bound, and m5-online-check fails fast if no M5 runner is online.
+# Everything that is not a unit test or the smoke test (ci.yml runs only those, Glenn, 2026-11-25). Each still fails
+# red here. Nightly runs on the fleet (Glenn, 2026-11-25: "Nightly should be run on the fleet."), never on
+# GitHub-hosted runners: Linux jobs on [self-hosted, Linux, X64, fleet, tlc], macOS jobs on inky's own M5 Macs
+# [self-hosted, macOS, ARM64, m5]. No label set here can land on a studio-* host. Host packages come from Ansible,
+# never from a CI step, so a missing tool fails loudly with its name instead of being installed here.
+# Every job sets an explicit generous timeout-minutes bound, every job needs guard, and m5-online-check fails fast
+# if no M5 runner is online.
 # GitHub runs a schedule only from the default branch, so the cron starts once this file is on main;
 # workflow_dispatch runs it on any branch by hand (gh workflow run nightly.yml --ref <branch>).
 on:
@@ -14,10 +19,22 @@ concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  # The release-profile build and unit tests on a clean GitHub-hosted ARM Mac (the old cpu job's build and
-  # cargo test --release --bins, about 100 s cold).
+  # Self-hosted runners serve this repository only. A run anywhere else (a fork's dispatch) fails here, loudly,
+  # and every other job needs this one, so none of them runs on a fleet host for another repository.
+  guard:
+    runs-on: [self-hosted, Linux, X64, fleet, tlc]
+    timeout-minutes: 5
+    steps:
+      - name: this repository owns the fleet runners
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          test "$REPO" = robotgamedevelopers/inky || { echo "nightly runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
+  # The release-profile build and unit tests on an M5 Mac (the old cpu job's build and cargo test --release --bins),
+  # and the crates.io package dry-run.
   release-cpu:
-    runs-on: macos-latest
+    needs: guard
+    runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,9 +47,174 @@ jobs:
         run: cargo test --locked --release --bins --tests
       - name: crates.io package dry-run
         run: cargo publish --locked --dry-run
-  # The slow layout models (PrefixTree full, StartTails3) and PrefixTree trace mutants on macOS.
+  # The CPU tests that are not plain unit tests: shell tests, real sockets, SIGKILLed child processes, trace dumps
+  # and the offline workflow audit. Moved from ci.yml's unit job on 2026-11-25. Each filtered cargo test requires
+  # its exact pass count, so a rename or removal fails here. The crates.io dry-run is release-cpu's.
+  unit-extras:
+    needs: guard
+    runs-on: [self-hosted, macOS, ARM64, m5]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        with:
+          toolchain: 1.98.1
+      - name: soak qualification shell tests
+        if: ${{ !cancelled() }}
+        run: tests/soak_qualification_test.sh
+      # Every TLA check and trace mutant must sit in exactly one nightly part, and none in ci.yml; the self-test
+      # plants a dropped check, a dropped mutant, an unwired trace script, a doubled part and a TLA part back in
+      # pull-request CI, and needs each red. Runs here, on macOS, because it parses YAML with ruby (not on the
+      # Linux fleet hosts).
+      - name: TLA tier coverage
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/check-tla-tiers.sh
+          scripts/check-tla-tiers.sh --self-test
+      - name: branch hygiene and CI non-cancellation audit
+        if: ${{ !cancelled() }}
+        run: python3 scripts/check_branch_hygiene.py --offline-workflows
+      # tests/serve.sh's in-process header test also runs in ci.yml's unit job (cargo test --bins). Like serve.sh,
+      # require exactly one serve_header_policy test to run and pass, so a rename or removal fails this job.
+      - name: serve_header_policy runs exactly once
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --bins serve_header_policy 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'serve_header_policy: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: memd socket integration tests
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --bins memd::tests:: -- --ignored 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 2 passed; 0 failed;' || { echo 'memd socket integration: expected 2 passed; 0 failed' >&2; exit 1; }
+      - name: spill SIGKILL crash-recovery integration test
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --bins spill::tests::kill9_mid_write_loses_cache_never_correctness -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'spill kill9 gate: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      # The slow unit tests, moved out of ci.yml's unit job on 2026-11-25 so pull-request CI stays near one minute.
+      # Each ran 1.9-28 s on an M5 (summed, 128 s of the 139 s the unit binary spent in tests). Same debug test
+      # profile as ci.yml's unit job, so debug asserts and overflow checks stay on. Each test must run and pass
+      # exactly once; every test runs, and the step fails red naming each one that did not pass.
+      - name: slow unit tests (moved from pull-request CI)
+        if: ${{ !cancelled() }}
+        run: |
+          failed=0
+          for t in \
+            gguf::tests::multi_layer_native_checkpoint_gguf_loads_nv4_gscale_and_mx8 \
+            scheduler::tests::bimodal_2k_64k_tight_budget_with_mid_step_disconnects \
+            serve::block_cache::tests::spill_store_eviction_restore_and_corrupt_fallback \
+            serve::block_cache::tests::long_spill_restore_keeps_source_and_accepts_early_fork \
+            engine::tests::paged_verify_kv_snapshot_and_restore_covers_all_48_loop_passes \
+            blocks::tests::metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window \
+            serve::block_cache::tests::spill_index_persists_across_reopen_and_async_restore_keeps_decoding_responsive \
+            serve::block_cache::tests::maintain_spill_during_gpu_trims_excess_spilled_starts_without_touching_pools \
+            serve::block_cache::admission_tests::burst_32_concurrent_65k_prompts_admits_in_under_2ms_with_exact_reference_parity \
+            engine::tests::metal_shader_declarations_and_compiler_validation \
+            cache_scheduler::tests::walk_cache_scheduler_propagates_trace_errors_on_every_action_and_reaches_drop_slide_spill \
+            sampler::tests::residual_emits_target_argmax_outside_draft_top64_softcap_after_topk \
+            serve::block_cache::tests::spill_retained_start_owns_reused_disk_blocks_across_trim_and_same_tip_overwrite \
+            serve::block_cache::tests::spill_read_failure_releases_provisional_blocks_and_preserves_resident_match \
+            serve::tests::overlap_host_work_drains_rx_preserves_cancel_in_step_pins_and_maintains_spill \
+            serve::block_cache::tests::spill_index_rejects_full_attn_budget_and_model_fingerprint_mismatches; do
+            out=$(cargo test --locked --bins "$t" -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; echo "::error::slow unit test $t failed" >&2; failed=1; continue; }
+            printf '%s\n' "$out"
+            printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo "::error::slow unit test $t: expected exactly 1 passed; 0 failed" >&2; failed=1; }
+          done
+          test "$failed" = 0
+      - name: trace dump entrypoints emit non-empty JSONL
+        if: ${{ !cancelled() }}
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          out=$(INKY_BLOCK_TRACE_OUT="$tmp/block.ndjson" cargo test --locked --bins cache_scheduler::tests::dump_block_layout -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/block.ndjson"
+          out=$(INKY_CACHE_TRACE_OUT="$tmp/cache.ndjson" cargo test --locked --bins cache_scheduler::tests::dump_cache_scheduler -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/cache.ndjson"
+          out=$(INKY_SCHED_TRACE_OUT="$tmp/sched.jsonl" cargo test --locked --bins serve::scheduler_trace::dump -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' && test -s "$tmp/sched.jsonl"
+  # go: the Go regression tests for the soak, load, inkconvert, fleetcheck, servecheck, replay, quality and bestofn
+  # tools, on a Linux fleet host. Moved from ci.yml on 2026-11-25.
+  go:
+    needs: guard
+    runs-on: [self-hosted, Linux, X64, fleet, tlc]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: soak client tests
+        if: ${{ !cancelled() }}
+        run: go test -race tests/soak_client.go tests/soak_client_test.go
+      - name: load client tests
+        if: ${{ !cancelled() }}
+        working-directory: tools/load
+        run: go test -race ./...
+      - name: inkconvert tests
+        if: ${{ !cancelled() }}
+        working-directory: tools/inkconvert
+        run: go test -race ./...
+      # The fleetcheck sandbox tests need bubblewrap. Fleet hosts get it from Ansible; CI never installs packages.
+      - name: fleetcheck sandbox present
+        if: ${{ !cancelled() }}
+        run: |
+          command -v bwrap >/dev/null 2>&1 || { echo "::error::bwrap is not on PATH on $(hostname): the fleetcheck sandbox tests need bubblewrap, installed on fleet hosts by Ansible" >&2; exit 1; }
+          bwrap --ro-bind / / true || { echo "::error::bwrap is installed on $(hostname) but cannot create a sandbox (unprivileged user namespaces or the AppArmor bwrap profile)" >&2; exit 1; }
+      - name: fleetcheck tests
+        if: ${{ !cancelled() }}
+        working-directory: tests
+        run: go vet ./fleetcheck/... && go test -race ./fleetcheck/...
+      - name: servecheck tests
+        if: ${{ !cancelled() }}
+        working-directory: tests
+        run: go vet ./servecheck && go test -race ./servecheck
+      - name: replay sweep tests
+        if: ${{ !cancelled() }}
+        working-directory: tools/replay
+        run: go vet ./... && go test -race ./...
+      - name: quality replay tests
+        if: ${{ !cancelled() }}
+        working-directory: tools/quality
+        run: go vet ./... && go test -race -count=1 ./...
+      - name: bestofn tests
+        if: ${{ !cancelled() }}
+        working-directory: tools/bestofn
+        run: go vet ./... && go test -race -count=1 ./...
+  # tla: the TLA+ models, witnesses and production traces, one part per job, in parallel. Moved from ci.yml on
+  # 2026-11-25. The trace scripts build their Rust standalone (no Metal), so they run on Linux.
+  tla:
+    needs: guard
+    runs-on: [self-hosted, Linux, X64, fleet, tlc]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [memmode, blocks, grouped, traces]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The pinned tla2tools.jar, kept across runs; check-tla.sh still checks its SHA-256 every time.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/inky-tla
+          key: tla2tools-fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable 1.98.1
+        if: matrix.part == 'traces'
+        with:
+          toolchain: 1.98.1
+      - name: TLA ${{ matrix.part }}
+        run: TLA_JAR_CACHE="$HOME/.cache/inky-tla" scripts/check-tla.sh ${{ matrix.part }}
+  # The slow layout models (PrefixTree full, StartTails3) and PrefixTree trace mutants on an M5 Mac.
   tla-layout-nightly:
-    runs-on: macos-latest
+    needs: guard
+    runs-on: [self-hosted, macOS, ARM64, m5]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,10 +228,11 @@ jobs:
         run: scripts/check-tla.sh layout-nightly
   # The exhaustive CacheScheduler safety and liveness models and their reversed witnesses
   # (about 195 s with two TLC workers on a 4-core Linux runner; CacheSchedulerTwoPrefixes alone is 61 s).
-  # run_cache_scheduler.sh gives TLC -Xmx8g. ubuntu-latest for a public repository has 4 CPUs and 16 GB of RAM;
-  # macos-latest (arm64) has 7 GB, too little for an 8 GB heap, so this job runs on Linux and checks the memory first.
+  # run_cache_scheduler.sh gives TLC -Xmx8g. The Linux fleet hosts have 16 GB or more; the job checks the memory
+  # first anyway, so a smaller host fails with a named cause.
   tla-scheduler:
-    runs-on: ubuntu-latest
+    needs: guard
+    runs-on: [self-hosted, Linux, X64, fleet, tlc]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,20 +251,9 @@ jobs:
           TLA_NIGHTLY: '1'
           TLC_WORKERS: '4'
         run: scripts/check-tla.sh scheduler
-  # Self-hosted runners serve this repository only. A run anywhere else (a fork's dispatch) fails here, loudly,
-  # instead of skipping m5-full or leaving it queued for a runner that does not exist.
-  guard:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: this repository owns the M5 runners
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          test "$REPO" = robotgamedevelopers/inky || { echo "m5-full runs only in robotgamedevelopers/inky, not $REPO" >&2; exit 1; }
   m5-online-check:
     needs: guard
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, fleet, tlc]
     timeout-minutes: 5
     permissions:
       actions: read
@@ -95,11 +267,14 @@ jobs:
           python3 scripts/check_m5_runner.py
           --repo "$GITHUB_REPOSITORY"
           --run-id "$GITHUB_RUN_ID"
-          --jobs m5-full
+          --jobs m5-full,release-cpu,unit-extras,tla-layout-nightly
           --max-queue-seconds 180
-  # The full M5 gate set on the true release profile: everything ci.yml's m5 jobs run, plus binv, lanes, spans and
-  # its sabotage, dbatch, CLI checks, the golden hashes, the long poolgate (tests/nightly.sh) and the serve API
-  # negative control.
+  # The full M5 gate set on the true release profile: every GPU and serve gate, including those the pull-request
+  # m5-gpu and m5-serve jobs ran until 2026-11-25 (router, split-invariance, pool zero-fill, DSpark, decode
+  # dirty-range sync, real GGUF tokenizer 74k, GGUF chat_template parity, tests/ci.sh pr as part of full, the
+  # serve_layer3 cached-vs-cold gate in tests/serve.sh and tests/nightly.sh, the serve API probes and negative
+  # controls), plus binv, lanes, spans and its sabotage, dbatch, CLI checks, the golden hashes, the long poolgate
+  # (tests/nightly.sh) and the soaks.
   # Every gate step runs even when an earlier one fails (if: !cancelled()), so one red gate never hides another.
   m5-full:
     needs: guard
@@ -138,6 +313,30 @@ jobs:
           out=$(cargo test --locked --bins --release blocks::tests::gpu_pool_zero_fills_a_taken_slot -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gpu_pool_zero_fills_a_taken_slot: expected exactly 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU DSpark verify capacity and rejection-sampling gate
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --release --bin inky engine::tests::dspark_gpu_guards_and_rejection_sampling_gate -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'dspark_gpu_guards_and_rejection_sampling_gate: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: GPU decode dirty-range sync regression
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --release --bin inky engine::tests::engine_encode_decode_64_positions_syncs_once_then_63_zero_steps -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'engine_encode_decode_64_positions_syncs_once_then_63_zero_steps: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: real GGUF tokenizer 74k corpus roundtrip and determinism
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --release --bin inky tokenizer::tests::real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'real_gguf_tokenizer_74k_corpus_roundtrip_and_determinism: expected 1 passed; 0 failed' >&2; exit 1; }
+      - name: GGUF embedded chat_template parity with serve prompt renderer
+        if: ${{ !cancelled() }}
+        run: |
+          out=$(cargo test --locked --release --bin inky serve::tests::gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token -- --ignored --exact 2>&1) || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -Eq '^test result: ok\. 1 passed; 0 failed;' || { echo 'gguf_embedded_chat_template_matches_serve_prompt_render_token_for_token: expected 1 passed; 0 failed' >&2; exit 1; }
       - name: GPU gates (full set)
         if: ${{ !cancelled() }}
         run: tests/ci.sh full

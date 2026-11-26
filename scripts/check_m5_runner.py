@@ -8,7 +8,8 @@ import time
 
 
 REQUIRED_LABELS = {"self-hosted", "macos", "arm64", "m5"}
-KNOWN_M5_JOBS = {"m5", "m5-gpu", "m5-serve", "m5-full"}
+# The nightly jobs on the M5 runners (.github/workflows/nightly.yml).
+KNOWN_M5_JOBS = {"m5-full", "release-cpu", "unit-extras", "tla-layout-nightly"}
 RECENT_COMPLETED_WINDOW_SECONDS = 600.0
 
 
@@ -74,7 +75,8 @@ def is_m5_job(job, target_names):
     if name in target_names or name in KNOWN_M5_JOBS:
         return True
     labels = {str(lbl).lower() for lbl in (job.get("labels") or [])}
-    if "m5" in labels or "self-hosted" in labels:
+    # Nightly also runs on Linux fleet hosts, which are self-hosted too: only the m5 label marks an M5 job.
+    if "m5" in labels:
         return True
     runner_name = str(job.get("runner_name") or "").lower()
     return bool(runner_name) and ("m5" in runner_name or "macbook" in runner_name)

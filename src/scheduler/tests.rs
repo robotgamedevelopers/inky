@@ -220,6 +220,7 @@ fn starvation_bound_enforced_across_ready_and_queued_adversarially() {
 /// bound promotion while clients disconnect mid-step (`InStep -> Cancelling -> Cancelled`),
 /// proving zero memory/slot leak and bounded wait ticks (`<= W`).
 #[test]
+#[ignore = "slow: runs in nightly unit-extras"]
 fn bimodal_2k_64k_tight_budget_with_mid_step_disconnects() {
     const BLK: u32 = 64;
     const WIN: u32 = 1024;

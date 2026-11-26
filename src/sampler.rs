@@ -372,6 +372,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     fn residual_emits_target_argmax_outside_draft_top64_softcap_after_topk() {
         let (target, draft) = logits();
         let argmax = target.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;

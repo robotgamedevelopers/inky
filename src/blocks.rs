@@ -1676,7 +1676,7 @@ mod tests {
 
     #[test]
     #[cfg(not(standalone_blocks))]
-    #[ignore = "requires a Metal GPU device; run in CI m5-gpu and nightly m5-full"]
+    #[ignore = "requires a Metal GPU device; run in nightly m5-full"]
     fn gpu_pool_zero_fills_a_taken_slot() {
         use objc2_metal::{MTLBuffer, MTLDevice};
         let dev = objc2_metal::MTLCreateSystemDefaultDevice().expect("metal device");
@@ -2235,6 +2235,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: runs in nightly unit-extras"]
     #[cfg(not(standalone_blocks))]
     fn metal_in_slot_formula_matches_key_row_and_inblock_trace_across_full_and_window() {
         let kernels_src = include_str!("kernels.metal");
