@@ -62,6 +62,15 @@ jobs:
       - name: soak qualification shell tests
         if: ${{ !cancelled() }}
         run: tests/soak_qualification_test.sh
+      # Every TLA check and trace mutant must sit in exactly one nightly part, and none in ci.yml; the self-test
+      # plants a dropped check, a dropped mutant, an unwired trace script, a doubled part and a TLA part back in
+      # pull-request CI, and needs each red. Runs here, on macOS, because it parses YAML with ruby (not on the
+      # Linux fleet hosts).
+      - name: TLA tier coverage
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/check-tla-tiers.sh
+          scripts/check-tla-tiers.sh --self-test
       - name: branch hygiene and CI non-cancellation audit
         if: ${{ !cancelled() }}
         run: python3 scripts/check_branch_hygiene.py --offline-workflows
@@ -157,14 +166,6 @@ jobs:
         part: [memmode, blocks, grouped, traces]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Every TLA check and trace mutant must sit in exactly one nightly part, and none in ci.yml; the self-test
-      # plants a dropped check, a dropped mutant, an unwired trace script, a doubled part and a TLA part back in
-      # pull-request CI, and needs each red.
-      - name: TLA tier coverage
-        if: matrix.part == 'memmode'
-        run: |
-          scripts/check-tla-tiers.sh
-          scripts/check-tla-tiers.sh --self-test
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
