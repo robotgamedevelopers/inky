@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "inky-engine"
-version = "0.2.17"
+version = "1.0.0"
 dependencies = [
  "block2",
  "libc",
